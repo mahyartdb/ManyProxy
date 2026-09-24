@@ -1,0 +1,10 @@
+[package]
+name = "manyproxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui-kit = "0.6"
+
+[dev-dependencies]
+gpui-kit = { version = "0.6", features = ["test-support"] }
