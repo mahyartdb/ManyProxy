@@ -6,7 +6,7 @@
 
 **Owns:** sqlite
 
-**Status:** ready-for-agent
+**Status:** done (commit 8d3f901; `cargo test` 20 passed, verified)
 
 - [ ] Scenario: empty library → Action: add a config with name, protocol params, loopback bind, auto port → Expected: disabled record appears in list, persists across restart. Verification: automated test. Priority: required.
 - [ ] Scenario: existing stopped config → Action: edit fields with invalid port (e.g. 99999) → Expected: field-level error, record unchanged. Verification: automated test. Priority: required.
