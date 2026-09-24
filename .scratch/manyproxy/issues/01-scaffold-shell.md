@@ -6,7 +6,7 @@
 
 **Owns:** gpui-kit
 
-**Status:** ready-for-agent
+**Status:** done (commit a5bc819; `cargo test` 1 passed)
 
 - [ ] Scenario: cold start → Action: launch app → Expected: main window opens with title bar, empty config list, status bar showing 0 configs. Verification: automated test. Priority: required.
 - [ ] Scenario: overlay layers mounted → Action: open add-dialog route in headless window test → Expected: dialog layer renders (not a blank/no-op). Verification: automated test. Priority: required.
