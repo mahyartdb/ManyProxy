@@ -44,6 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::store::ProxyConfig;
 
@@ -2382,6 +2383,13 @@ pub trait EngineBackend {
     fn is_running(&self) -> bool;
     /// `Some(cause)` once when a previously running sidecar has exited.
     fn poll_exit(&mut self) -> Option<String>;
+    /// Ticket 13: take buffered sidecar stderr lines (empty when none).
+    /// The real backend pipes stderr and pumps it on a reader thread; the
+    /// fake backend replays scripted lines. UI ingests the lines through
+    /// `LogStore::push_raw` (tag match + redact + bounded ring).
+    fn drain_log_lines(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     /// Ticket 08: point the extra-slot driver at one row's executable
     /// before `start` (real driver swaps its binary; the fake ignores it
     /// and keeps recording configs so tests stay hermetic).
@@ -2637,6 +2645,12 @@ fn truncate_detail(detail: &str) -> String {
 /// generated JSON lives in a temp `-c` file that is removed on stop so no
 /// secrets linger on disk.
 ///
+/// Ticket 13: sidecar stderr is piped (no longer nulled) and pumped by a
+/// reader thread into a bounded buffer; the UI drains it into `LogStore`
+/// (existing tag match, ingest-time redaction, bounded ring). The thread
+/// ends on EOF when the sidecar exits, so pipes close cleanly; an unreadable
+/// pipe records one named error line instead of stale output (fail-closed).
+///
 /// Ticket 07: the same driver serves the fork core ([`RealEngineBackend::fork`]
 /// resolves `sing-box-awg`, probes its version, and uses its own temp file
 /// so the stock and fork sidecars run beside each other).
@@ -2659,6 +2673,25 @@ pub struct RealEngineBackend {
     /// Ticket 08: user extra-core executable (its config is passed through
     /// as `-c <file>`); `None` for the bundled-core shapes.
     extra_exe: Option<PathBuf>,
+    /// Ticket 13: piped-stderr lines (raw until `LogStore` ingest redacts
+    /// them) plus at most one named pipe-error line; bounded, cleared on
+    /// every start/stop so restarts never replay stale lines.
+    log_buffer: Arc<Mutex<Vec<String>>>,
+}
+
+/// Ticket 13: pipe-reader buffer bound (the `LogStore` ring bounds display
+/// storage separately; this only caps lines awaiting drain).
+pub const LOG_PIPE_BUFFER: usize = 2000;
+
+/// Ticket 13: push one reader-thread line, dropping the oldest when full
+/// (bounded memory even if the UI never drains).
+fn push_pipe_line(buffer: &Arc<Mutex<Vec<String>>>, line: String) {
+    if let Ok(mut lines) = buffer.lock() {
+        if lines.len() >= LOG_PIPE_BUFFER {
+            lines.remove(0);
+        }
+        lines.push(line);
+    }
 }
 
 impl RealEngineBackend {
@@ -2669,6 +2702,7 @@ impl RealEngineBackend {
             fork: false,
             xray: false,
             extra_exe: None,
+            log_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2681,6 +2715,7 @@ impl RealEngineBackend {
             fork: true,
             xray: false,
             extra_exe: None,
+            log_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2692,6 +2727,7 @@ impl RealEngineBackend {
             fork: false,
             xray: true,
             extra_exe: None,
+            log_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2705,6 +2741,7 @@ impl RealEngineBackend {
             fork: false,
             xray: false,
             extra_exe: None,
+            log_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2780,14 +2817,42 @@ impl EngineBackend for RealEngineBackend {
         self.stop();
         // Unprivileged by construction: plain spawn, never elevated, no
         // admin for loopback use (spec boundary).
-        let child = std::process::Command::new(&binary)
+        // Ticket 13: stderr is piped (never nulled): a reader thread pumps
+        // lines into the bounded buffer so the pipe cannot stall the
+        // sidecar and the logs dialog shows live lines. The thread ends on
+        // EOF when the sidecar exits.
+        let mut child = std::process::Command::new(&binary)
             .args(self.start_args())
             .arg(&path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| format!("engine failed to start ({error})"))?;
+        match child.stderr.take() {
+            Some(pipe) => {
+                let buffer = self.log_buffer.clone();
+                std::thread::spawn(move || {
+                    use std::io::BufRead as _;
+                    let reader = std::io::BufReader::new(pipe);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(text) => push_pipe_line(&buffer, text),
+                            Err(error) => {
+                                push_pipe_line(&buffer, format!("log pipe unreadable ({error})"));
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            None => {
+                push_pipe_line(
+                    &self.log_buffer,
+                    "log pipe unavailable (sidecar stderr was not piped)".to_string(),
+                );
+            }
+        }
         self.child = Some(child);
         Ok(())
     }
@@ -2796,6 +2861,11 @@ impl EngineBackend for RealEngineBackend {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        // Ticket 13: drop buffered (raw) lines with the sidecar so a later
+        // start never replays stale output.
+        if let Ok(mut lines) = self.log_buffer.lock() {
+            lines.clear();
         }
         let _ = std::fs::remove_file(&self.config_path);
     }
@@ -2808,6 +2878,15 @@ impl EngineBackend for RealEngineBackend {
         let status = self.child.as_mut()?.try_wait().ok()??;
         self.child = None;
         Some(format!("engine exited ({status})"))
+    }
+
+    /// Ticket 13: take buffered stderr lines. A poisoned lock surfaces one
+    /// named error instead of raw state (fail-closed, never stale).
+    fn drain_log_lines(&mut self) -> Vec<String> {
+        match self.log_buffer.lock() {
+            Ok(mut lines) => std::mem::take(&mut *lines),
+            Err(_) => vec!["log pipe unreadable (log reader failed)".to_string()],
+        }
     }
 
     fn set_extra_exe(&mut self, exe: PathBuf) {
@@ -2823,6 +2902,7 @@ struct FakeState {
     check_calls: usize,
     fail_check: Option<String>,
     exited: Option<String>,
+    pending_logs: Vec<String>,
 }
 
 /// Read/write handle to a [`FakeEngineBackend`]'s recorded state (tests
@@ -2860,6 +2940,12 @@ impl FakeHandle {
         let mut state = self.state.borrow_mut();
         state.running = false;
         state.exited = Some(cause.to_string());
+    }
+
+    /// Ticket 13: script one mock-sidecar stderr line for the next
+    /// [`EngineBackend::drain_log_lines`].
+    pub fn emit_log(&self, line: &str) {
+        self.state.borrow_mut().pending_logs.push(line.to_string());
     }
 }
 
@@ -2917,6 +3003,10 @@ impl EngineBackend for FakeEngineBackend {
 
     fn poll_exit(&mut self) -> Option<String> {
         self.state.borrow_mut().exited.take()
+    }
+
+    fn drain_log_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.state.borrow_mut().pending_logs)
     }
 }
 
@@ -3443,6 +3533,17 @@ impl EngineController {
         Some(cause)
     }
 
+    /// Ticket 13: take buffered stderr lines from every sidecar (stock,
+    /// fork, xray, extra). The UI ingests them into `LogStore` on every
+    /// reload, so live lines appear without user clicks.
+    pub fn drain_log_lines(&mut self) -> Vec<String> {
+        let mut lines = self.backend.drain_log_lines();
+        lines.extend(self.fork_backend.drain_log_lines());
+        lines.extend(self.xray_backend.drain_log_lines());
+        lines.extend(self.extra_backend.drain_log_lines());
+        lines
+    }
+
     /// Ids of the active set.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn running_ids(&self) -> Vec<String> {
@@ -3926,6 +4027,54 @@ mod tests {
         assert!(matches!(controller.status(), EngineStatus::Crashed { .. }));
         assert!(controller.status_text().contains("segmentation fault"));
         assert!(controller.poll().is_none(), "cause reported once");
+    }
+
+    /// Ticket 13: mock sidecars emit stderr lines; the controller drains
+    /// every sidecar, the exit is noted once, the pipe closes cleanly
+    /// (later drains are empty, later polls are silent), nothing panics.
+    #[test]
+    fn log_pipe_drains_all_sidecars_and_closes_cleanly_on_exit() {
+        let (mut controller, stock, fork, _xray, _extra) = EngineController::fake_quartet();
+        controller.start_all(&three_standard()).expect("starts");
+        stock.emit_log("warn out-1: dial failed");
+        fork.emit_log("info fork sidecar ready");
+
+        let lines = controller.drain_log_lines();
+        assert_eq!(lines.len(), 2, "every sidecar drains, got {lines:?}");
+        assert!(lines.iter().any(|line| line.contains("out-1")));
+        assert!(lines.iter().any(|line| line.contains("fork sidecar")));
+        assert!(
+            controller.drain_log_lines().is_empty(),
+            "drain takes, never replays"
+        );
+
+        stock.inject_crash("signal: segmentation fault");
+        assert_eq!(
+            controller.poll().as_deref(),
+            Some("signal: segmentation fault"),
+            "exit noted once"
+        );
+        assert!(controller.poll().is_none(), "cause reported once");
+        assert!(
+            controller.drain_log_lines().is_empty(),
+            "pipe closed cleanly, no panic"
+        );
+    }
+
+    /// Ticket 13: the pipe-reader buffer is bounded (oldest lines drop when
+    /// full, memory never grows without bound).
+    #[test]
+    fn log_pipe_buffer_stays_bounded() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        for index in 0..(LOG_PIPE_BUFFER + 50) {
+            push_pipe_line(&buffer, format!("line {index}"));
+        }
+        let lines = buffer.lock().expect("lock works");
+        assert_eq!(lines.len(), LOG_PIPE_BUFFER, "capped, got {}", lines.len());
+        assert!(
+            lines.first().is_some_and(|line| line == "line 50"),
+            "oldest dropped first"
+        );
     }
 
     /// Binary resolution failure names the searched directories.

@@ -728,7 +728,6 @@ pub struct LogStore {
 impl LogStore {
     /// Ingest one raw sidecar line: tag by config where possible, redact
     /// secrets, classify severity.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn push_raw(&mut self, line: &str, active: &[ProxyConfig]) {
         self.push(LogRecord {
             at: now_unix(),
@@ -763,7 +762,6 @@ impl LogStore {
 /// either the `in-{id}`/`out-{id}` tag. Raw ids are deliberately NOT
 /// substring-matched (numeric rowids like `1` would claim every line
 /// containing the digit). Anything untagged stays engine-global (`None`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn tag_for_line(line: &str, active: &[ProxyConfig]) -> Option<String> {
     for config in active {
         if line.contains(&inbound_tag(&config.id)) || line.contains(&outbound_tag(&config.id)) {

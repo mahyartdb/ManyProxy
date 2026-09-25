@@ -697,6 +697,7 @@ impl AppView {
 
     /// Reload rows from the store, keeping the selection by id.
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.drain_engine_logs();
         self.poll_engine();
         if let Ok(rows) = self.store.list() {
             let health = self.health_map();
@@ -1065,6 +1066,22 @@ impl AppView {
         let outcomes = ping_all(std::slice::from_ref(&config), &mut *self.prober);
         self.record_and_persist(&outcomes);
         self.reload(cx);
+    }
+
+    /// Ticket 13: ingest buffered sidecar stderr into the session LogStore
+    /// (existing tag match, ingest-time redaction, bounded ring). Runs on
+    /// every reload, so live lines appear without user clicks and the exit
+    /// note path stays silent-free. Logs stay session-only (never
+    /// persisted).
+    fn drain_engine_logs(&mut self) {
+        let lines = self.engine.drain_log_lines();
+        if lines.is_empty() {
+            return;
+        }
+        let active = self.store.list().unwrap_or_default();
+        for line in &lines {
+            self.logs.push_raw(line, &active);
+        }
     }
 
     /// Ticket 06: visible log lines for the dialog — the selected config's
@@ -2571,6 +2588,97 @@ mod tests {
             handle.calls_for(&alpha.id).is_empty(),
             "stopped ticks never touch the network"
         );
+    }
+
+    // -- Ticket 13: live sidecar log pipe ------------------------------------
+
+    /// Mock sidecar emits tagged lines → drain → the logs dialog shows them
+    /// under the right config with secrets redacted; an untagged line stays
+    /// engine-global (never cross-config).
+    #[gpui_kit::test]
+    fn live_sidecar_lines_appear_under_right_config_redacted(cx: &mut TestAppContext) {
+        use crate::engine::{inbound_tag, EngineController};
+        use gpui_kit::component::IndexPath;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store.add(seed_input("Work")).expect("seed works");
+        let beta = store.add(seed_input("Play")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        let stock = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (controller, stock, _fork, _xray, _extra) = EngineController::fake_quartet();
+                view.engine = controller;
+                stock
+            })
+        });
+        stock.emit_log(&format!(
+            "warn {}: dial failed password=hunter2",
+            inbound_tag(&alpha.id)
+        ));
+        stock.emit_log("info engine listening on 127.0.0.1:10801");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.drain_engine_logs());
+        });
+
+        let (alpha_lines, beta_lines) = view.read_with(cx, |view, _| {
+            (
+                view.logs
+                    .for_config(&alpha.id)
+                    .iter()
+                    .map(|record| record.message.clone())
+                    .collect::<Vec<_>>(),
+                view.logs.for_config(&beta.id).len(),
+            )
+        });
+        assert_eq!(alpha_lines.len(), 1, "only its lines show");
+        assert!(
+            !alpha_lines[0].contains("hunter2"),
+            "redacted on ingest: {}",
+            alpha_lines[0]
+        );
+        assert!(
+            alpha_lines[0].contains(&inbound_tag(&alpha.id)),
+            "tag preserved: {}",
+            alpha_lines[0]
+        );
+        assert_eq!(beta_lines, 0, "no cross-config attribution");
+
+        // The dialog renders the live lines for the selected row.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+                view.reload(cx);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("log-lines").is_some()));
     }
 
     /// Ticket 04: the subscriptions dialog opens with a label/URL/group
