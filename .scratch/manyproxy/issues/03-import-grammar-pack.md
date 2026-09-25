@@ -6,7 +6,7 @@
 
 **Owns:** api-and-interface-design
 
-**Status:** ready-for-agent
+**Status:** done (commit c41724b; `cargo test` 58 passed, verified)
 
 - [ ] Scenario: clipboard with 5 mixed valid links → Action: paste-import into a group → Expected: 5 disabled records with correct host/port/protocol shown. Verification: automated test. Priority: required.
 - [ ] Scenario: batch with 2 broken items → Action: import → Expected: valid items import, failures reported with item index + reason, no partial silent import. Verification: automated test. Priority: required.
