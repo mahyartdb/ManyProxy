@@ -40,15 +40,19 @@
 
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::time::{Duration, Instant};
 
 use crate::store::ProxyConfig;
 
-/// Base name of the sidecar binary (resolved in the app dir, then `PATH`).
+/// Base name of the sidecar binary (resolved in the app dir).
 pub const ENGINE_BINARY_BASE: &str = "sing-box";
 
 /// Ticket 07: base name of the compatible fork-core binary (AWG/Noise/XHTTP
@@ -301,6 +305,16 @@ pub enum EngineError {
     },
     /// The sidecar process could not be spawned.
     SpawnFailed { detail: String },
+    /// Ticket 23: a local endpoint is already held (by another process or a
+    /// sibling sidecar). Names the bind, port, and row only — never secrets.
+    PortUnavailable {
+        bind: String,
+        port: u16,
+        name: String,
+    },
+    /// Ticket 23: a start would serve a non-loopback bind without an explicit
+    /// LAN confirm. Names the rows + binds only — never secrets.
+    LanConfirmRequired { names: String },
 }
 
 impl std::fmt::Display for EngineError {
@@ -415,6 +429,14 @@ impl std::fmt::Display for EngineError {
             EngineError::SpawnFailed { detail } => {
                 write!(f, "engine failed to start ({detail})")
             }
+            EngineError::PortUnavailable { bind, port, name } => write!(
+                f,
+                "port unavailable: {bind}:{port} is already in use (\"{name}\" cannot start there; another process may hold it)"
+            ),
+            EngineError::LanConfirmRequired { names } => write!(
+                f,
+                "LAN confirm required for {names} (confirm LAN exposure first)"
+            ),
         }
     }
 }
@@ -859,14 +881,18 @@ fn custom_full_config(
         None => serde_json::Value::Object(params.clone()),
     };
     let top = document.as_object().expect("config is an object");
-    for forbidden in ["tun", "dns"] {
-        if top.contains_key(forbidden) {
-            return Err(EngineError::BadCustom {
-                name: name.to_string(),
-                field: forbidden.to_string(),
-                detail: format!("custom full config must not carry \"{forbidden}\" (no system network mutation)"),
-            });
-        }
+    // Ticket 23 SEC-HIGH: the replacement is user JSON served by a bundled
+    // sidecar, so the recursive system-mutation scan runs here — not just in
+    // tests. A nested `tun`/`dns`/`set_system_proxy` at any depth names its
+    // key and path (never values).
+    if let Some((key, path)) = find_system_mutation_key(&document) {
+        return Err(EngineError::BadCustom {
+            name: name.to_string(),
+            field: key.clone(),
+            detail: format!(
+                "custom full config must not carry \"{key}\" at {path} (no system network mutation)"
+            ),
+        });
     }
     match top.get("outbounds") {
         Some(serde_json::Value::Array(_)) => {}
@@ -877,17 +903,6 @@ fn custom_full_config(
                 detail: "custom full config needs an \"outbounds\" array (or wrap it in {\"config\": {...}})".to_string(),
             });
         }
-    }
-    if top.values().any(|value| {
-        value
-            .as_object()
-            .is_some_and(|obj| obj.contains_key("set_system_proxy"))
-    }) {
-        return Err(EngineError::BadCustom {
-            name: name.to_string(),
-            field: "config".to_string(),
-            detail: "custom full config must not carry \"set_system_proxy\"".to_string(),
-        });
     }
     Ok((core, document))
 }
@@ -1143,12 +1158,16 @@ pub fn xray_egress_tag(id: &str) -> String {
 pub struct XrayEgress {
     /// Row or chain-hop owner name (for errors; never params values).
     pub owner: String,
-    pub owner_id: String,
     /// VLESS-shaped row params, or xray-shaped custom params when
     /// [`XrayEgress::xray_shaped`] is set.
     pub params: serde_json::Map<String, serde_json::Value>,
     pub xray_shaped: bool,
     pub bridge_port: u16,
+    /// Ticket 23 LOW: the bridge-map key for this leg (row id, or
+    /// `{chain-id}#hop{i}` for inline xray chain hops) — recorded at plan
+    /// time so `apply` reuses the bookkeeping instead of re-deriving it with
+    /// swallowed errors.
+    pub bridge_key: String,
     /// Pointer tag in the main config (`out-<id>` or `<chain>-hop-<i>`).
     pub main_tag: String,
     pub ingress_tag: String,
@@ -1471,12 +1490,25 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     }
     // Port conflicts across endpoint rows (custom full-config rows are
     // user-managed: their bind is documentation, not an endpoint we serve).
+    // Ticket 23 LOW: a duplicated id names the id (rows are keyed by id
+    // everywhere downstream, so two rows sharing one never serve sanely).
     let mut taken: HashMap<(String, u16), &str> = HashMap::new();
+    let mut seen_ids: HashMap<&str, &str> = HashMap::new();
     for config in configs {
+        if let Some(first) = seen_ids.get(config.id.as_str()) {
+            return Err(EngineError::InvalidGenerated {
+                detail: format!(
+                    "duplicate id \"{}\" (\"{first}\" and \"{}\")",
+                    config.id, config.name
+                ),
+            });
+        }
+        seen_ids.insert(config.id.as_str(), config.name.as_str());
         if is_custom_config_protocol(&config.protocol) {
             continue;
         }
-        let key = (config.bind_ip.to_ascii_lowercase(), config.port);
+        // Ticket 23: loopback aliases compare equal (localhost ≡ 127.0.0.1).
+        let key = (normalize_bind_key(&config.bind_ip), config.port);
         if let Some(first) = taken.get(&key) {
             return Err(EngineError::PortConflict {
                 bind: config.bind_ip.clone(),
@@ -1626,10 +1658,10 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             let params = params_object(config)?;
             egresses.push(XrayEgress {
                 owner: config.name.clone(),
-                owner_id: config.id.clone(),
                 params,
                 xray_shaped: false,
                 bridge_port: ports[&config.id],
+                bridge_key: config.id.clone(),
                 main_tag: outbound_tag(&config.id),
                 ingress_tag: xray_ingress_tag(&config.id),
                 egress_tag: xray_egress_tag(&config.id),
@@ -1640,10 +1672,10 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                 let (_, map) = validate_custom_outbound(&config.name, &params)?;
                 egresses.push(XrayEgress {
                     owner: config.name.clone(),
-                    owner_id: config.id.clone(),
                     params: map,
                     xray_shaped: true,
                     bridge_port: ports[&config.id],
+                    bridge_key: config.id.clone(),
                     main_tag: outbound_tag(&config.id),
                     ingress_tag: xray_ingress_tag(&config.id),
                     egress_tag: xray_egress_tag(&config.id),
@@ -1665,10 +1697,10 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                 }
                 egresses.push(XrayEgress {
                     owner: format!("{} {}", config.name, hop.label),
-                    owner_id: config.id.clone(),
                     params: map,
                     xray_shaped,
                     bridge_port: ports[&format!("{}#hop{}", config.id, index)],
+                    bridge_key: format!("{}#hop{}", config.id, index),
                     main_tag: format!("{}-hop-{index}", outbound_tag(&config.id)),
                     ingress_tag: format!("{}-hop-{index}", xray_ingress_tag(&config.id)),
                     egress_tag: format!("{}-hop-{index}", xray_egress_tag(&config.id)),
@@ -1786,7 +1818,8 @@ pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError>
     }
     let mut taken: HashMap<(String, u16), &str> = HashMap::new();
     for config in configs {
-        let key = (config.bind_ip.to_ascii_lowercase(), config.port);
+        // Ticket 23: loopback aliases compare equal (localhost ≡ 127.0.0.1).
+        let key = (normalize_bind_key(&config.bind_ip), config.port);
         if let Some(first) = taken.get(&key) {
             return Err(EngineError::PortConflict {
                 bind: config.bind_ip.clone(),
@@ -1798,7 +1831,14 @@ pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError>
         taken.insert(key, config.name.as_str());
     }
     let keys = bridge_keys_for(configs)?;
-    let taken_ports: HashSet<u16> = configs.iter().map(|row| row.port).collect();
+    // Ticket 23 LOW: bridge preview/apply agreement — custom full-config rows
+    // are user-managed (their bind is documentation), so their ports never
+    // reserve bridge space, exactly like `validate_activation`.
+    let taken_ports: HashSet<u16> = configs
+        .iter()
+        .filter(|row| !is_custom_config_protocol(&row.protocol))
+        .map(|row| row.port)
+        .collect();
     let bridges = assign_bridge_ports(&keys, &taken_ports)?;
     build_main_config(configs, &bridges)
 }
@@ -2394,6 +2434,15 @@ pub trait EngineBackend {
     /// before `start` (real driver swaps its binary; the fake ignores it
     /// and keeps recording configs so tests stay hermetic).
     fn set_extra_exe(&mut self, _exe: PathBuf) {}
+    /// Ticket 23 LOW: forget the extra-slot executable when the slot empties
+    /// (default no-op; the real driver clears it).
+    fn clear_extra_exe(&mut self) {}
+    /// Ticket 23: pin the probe-validated binary for the next `start` (no
+    /// probe/spawn skew; default no-op, the fake needs no binaries).
+    fn pin_binary(&mut self, _path: PathBuf) {}
+    /// Ticket 23: best-effort removal of the secret config file (crash and
+    /// check paths; default no-op, the fake writes no files).
+    fn remove_config_file(&self) {}
 }
 
 /// Binary file name for this platform.
@@ -2405,9 +2454,9 @@ pub fn engine_binary_file_name() -> String {
     }
 }
 
-/// Resolve the sidecar binary: app directory first, then `PATH`. Never
-/// downloads anything; the [`EngineError::MissingBinary`] names every
-/// directory searched.
+/// Resolve the sidecar binary in the app directory (never `PATH`, never
+/// downloads anything); the [`EngineError::MissingBinary`] names the
+/// directory searched. Candidates must be executable.
 pub fn resolve_engine_binary() -> Result<PathBuf, EngineError> {
     let app_dir = std::env::current_exe()
         .ok()
@@ -2416,33 +2465,28 @@ pub fn resolve_engine_binary() -> Result<PathBuf, EngineError> {
     resolve_engine_binary_in(app_dir.as_deref(), &path_env)
 }
 
-/// Testable core of [`resolve_engine_binary`] (explicit search roots).
+/// Testable core of [`resolve_engine_binary`] (explicit search root).
+///
+/// Ticket 23: app directory ONLY (never `PATH` — the bundled core must be
+/// the placed binary, not whatever the environment resolves; the extra slot
+/// was already app-dir-only). Candidates must also be executable.
 pub fn resolve_engine_binary_in(
     app_dir: Option<&Path>,
-    path_env: &str,
+    _path_env: &str,
 ) -> Result<PathBuf, EngineError> {
     let file = engine_binary_file_name();
-    let mut searched = Vec::new();
     if let Some(dir) = app_dir {
         let candidate = dir.join(&file);
-        if candidate.is_file() {
+        if is_executable(&candidate) {
             return Ok(candidate);
         }
-        searched.push(dir.to_path_buf());
+        return Err(EngineError::MissingBinary {
+            searched: dir.display().to_string(),
+        });
     }
-    for dir in std::env::split_paths(path_env) {
-        let candidate = dir.join(&file);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        searched.push(dir);
-    }
-    let searched = searched
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(EngineError::MissingBinary { searched })
+    Err(EngineError::MissingBinary {
+        searched: "no app directory".to_string(),
+    })
 }
 
 /// Ticket 07: binary file name for the fork core on this platform.
@@ -2454,31 +2498,20 @@ pub fn fork_binary_file_name() -> String {
     }
 }
 
-/// Ticket 07: resolve the fork-core binary (app dir first, then `PATH`).
-/// Never downloads; `Err` is the `; `-joined searched-directories list.
+/// Ticket 07: resolve the fork-core binary (app dir ONLY, never `PATH` —
+/// ticket 23: same rule as every bundled core; candidates must be
+/// executable). Never downloads; `Err` is the searched directory.
 /// Stock paths never call this: only exotic rows do.
-pub fn resolve_fork_binary_in(app_dir: Option<&Path>, path_env: &str) -> Result<PathBuf, String> {
+pub fn resolve_fork_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
     let file = fork_binary_file_name();
-    let mut searched = Vec::new();
     if let Some(dir) = app_dir {
         let candidate = dir.join(&file);
-        if candidate.is_file() {
+        if is_executable(&candidate) {
             return Ok(candidate);
         }
-        searched.push(dir.to_path_buf());
+        return Err(dir.display().to_string());
     }
-    for dir in std::env::split_paths(path_env) {
-        let candidate = dir.join(&file);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        searched.push(dir);
-    }
-    Err(searched
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("; "))
+    Err("no app directory".to_string())
 }
 
 /// Ticket 07: resolve the fork-core binary, naming the expected binary on
@@ -2543,31 +2576,20 @@ pub fn xray_binary_file_name() -> String {
     }
 }
 
-/// Ticket 08: resolve the Xray-core binary (app dir first, then `PATH`).
-/// Never downloads; `Err` is the `; `-joined searched-directories list.
+/// Ticket 08: resolve the Xray-core binary (app dir ONLY, never `PATH` —
+/// ticket 23: same rule as every bundled core; candidates must be
+/// executable). Never downloads; `Err` is the searched directory.
 /// Stock/fork paths never call this: only Xray rows do.
-pub fn resolve_xray_binary_in(app_dir: Option<&Path>, path_env: &str) -> Result<PathBuf, String> {
+pub fn resolve_xray_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
     let file = xray_binary_file_name();
-    let mut searched = Vec::new();
     if let Some(dir) = app_dir {
         let candidate = dir.join(&file);
-        if candidate.is_file() {
+        if is_executable(&candidate) {
             return Ok(candidate);
         }
-        searched.push(dir.to_path_buf());
+        return Err(dir.display().to_string());
     }
-    for dir in std::env::split_paths(path_env) {
-        let candidate = dir.join(&file);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-        searched.push(dir);
-    }
-    Err(searched
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("; "))
+    Err("no app directory".to_string())
 }
 
 /// Ticket 08: resolve the Xray-core binary, naming the expected binary on
@@ -2609,7 +2631,7 @@ pub fn resolve_extra_binary_in(app_dir: Option<&Path>, exe: &str) -> Result<Path
         return Err("no app directory to resolve the extra-core executable".to_string());
     };
     let candidate = dir.join(name);
-    if candidate.is_file() {
+    if is_executable(&candidate) {
         Ok(candidate)
     } else {
         Err(dir.display().to_string())
@@ -2639,6 +2661,191 @@ fn truncate_detail(detail: &str) -> String {
         text.push('…');
     }
     text
+}
+
+// -- Ticket 23: lifecycle hardening -----------------------------------------
+// Sidecar lifecycle that cannot orphan processes, leak secret files, or
+// split-brain on partial failure. Pure helpers first (tested directly);
+// the `RealEngineBackend` + `EngineController` changes below consume them.
+
+/// Per-instance config-file counter (pairs with the pid suffix so the four
+/// sidecar backends — and any two ManyProxy processes — never share a path).
+static CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-instance unique temp config path (`manyproxy-<stem>-<pid>-<n>.json`).
+fn unique_config_path(stem: &str) -> PathBuf {
+    let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("manyproxy-{stem}-{}-{n}.json", std::process::id()))
+}
+
+/// Notice line pushed when the log buffer lock is found poisoned (fail-open
+/// with a marker, never a silent drop — the reader keeps serving).
+const LOG_POISON_NOTICE: &str = "log pipe unreadable (log reader failed)";
+
+/// Write the sidecar config with owner-only permissions (0600 on Unix; the
+/// Windows temp dir is per-user by construction). The file holds secrets, so
+/// creation must not widen access.
+fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot write engine config ({error})"))?;
+    file.write_all(config_json.as_bytes())
+        .map_err(|error| format!("cannot write engine config ({error})"))?;
+    Ok(())
+}
+
+/// True when the path is a file the sidecar may execute: present plus the
+/// exec bit on Unix (Windows executability is the `.exe` association itself).
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        return path
+            .metadata()
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Canonical conflict key for a bind: loopback aliases (`127.0.0.1`,
+/// `localhost`, `::1`, `::ffff:127.0.0.1`; blank means the loopback default)
+/// compare equal so two rows can never claim the same local endpoint under
+/// different spellings. Anything else compares case-insensitively verbatim.
+fn normalize_bind_key(bind: &str) -> String {
+    match bind.trim().to_ascii_lowercase().as_str() {
+        "" | "localhost" | "127.0.0.1" | "::1" | "::ffff:127.0.0.1" => "loopback".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Probe-bind one endpoint before any sidecar is stopped: catches a foreign
+/// holder (or a sibling sidecar that kept its socket) while rollback is still
+/// cheap. Probes are serialized process-wide so parallel applies (and test
+/// threads sharing fixed ports) never fail on each other; a genuinely held
+/// port still fails after bounded retries. Blank binds probe the loopback
+/// default.
+fn probe_bind_available(bind: &str, port: u16) -> Result<(), String> {
+    static PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = PROBE_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let host = {
+        let key = normalize_bind_key(bind);
+        if key == "loopback" {
+            "127.0.0.1".to_string()
+        } else {
+            bind.trim().to_string()
+        }
+    };
+    let mut last = format!("probe failed for {host}:{port}");
+    for _ in 0..10 {
+        match std::net::TcpListener::bind(format!("{host}:{port}")) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(());
+            }
+            Err(error) => {
+                last = format!("{host}:{port} is already in use ({error})");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Recursive forbidden-key scan returning the offending `(key, path)` pair.
+/// Shared by [`assert_no_system_mutation`] (exact messages preserved) and the
+/// custom full-config replacement gate (ticket 23 SEC-HIGH: replacements are
+/// user JSON served by bundled sidecars, so nested `tun`/`dns` would mutate
+/// the system exactly like generated keys would).
+fn find_system_mutation_key(document: &serde_json::Value) -> Option<(String, String)> {
+    fn walk(node: &serde_json::Value, path: &str) -> Option<(String, String)> {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    let lowered = key.to_ascii_lowercase();
+                    if lowered == "tun" || lowered == "dns" || lowered == "set_system_proxy" {
+                        return Some((key.clone(), path.to_string()));
+                    }
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if let Some(hit) = walk(value, &child) {
+                        return Some(hit);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    if let Some(hit) = walk(item, &format!("{path}[{index}]")) {
+                        return Some(hit);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    walk(document, "$")
+}
+
+/// Rows in the candidate set whose non-loopback bind has no matching entry in
+/// the controller's confirmed set. `(id, name, bind)` triples; errors name
+/// rows + binds only.
+fn unconfirmed_lan(
+    configs: &[ProxyConfig],
+    confirmed: &HashSet<(String, String)>,
+) -> Vec<(String, String, String)> {
+    configs
+        .iter()
+        .filter(|row| requires_lan_confirm(&row.bind_ip))
+        .filter(|row| !confirmed.contains(&(row.id.clone(), row.bind_ip.clone())))
+        .map(|row| (row.id.clone(), row.name.clone(), row.bind_ip.clone()))
+        .collect()
+}
+
+/// Bounded child reap: the caller must `kill()` first; this waits up to
+/// `timeout` for the exit, escalates with a second kill, then gives up rather
+/// than hanging the UI thread (a SIGKILL-equivalent reap is near-certain, so
+/// the give-up arm is pathological only).
+fn wait_child_bounded(child: &mut std::process::Child, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => return,
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => return,
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Production driver: `sing-box check` validates, `sing-box run` serves. The
@@ -2673,10 +2880,22 @@ pub struct RealEngineBackend {
     /// Ticket 08: user extra-core executable (its config is passed through
     /// as `-c <file>`); `None` for the bundled-core shapes.
     extra_exe: Option<PathBuf>,
+    /// Ticket 23: controller-pinned binary (the path the probe validated —
+    /// no probe/spawn skew). Falls back to fresh resolution when stale.
+    pinned_binary: Option<PathBuf>,
     /// Ticket 13: piped-stderr lines (raw until `LogStore` ingest redacts
     /// them) plus at most one named pipe-error line; bounded, cleared on
     /// every start/stop so restarts never replay stale lines.
-    log_buffer: Arc<Mutex<Vec<String>>>,
+    /// Ticket 23: `(reader generation, lines)`. The generation bumps on every
+    /// stop/start so a previous start's reader thread can never interleave
+    /// stale lines after a restart.
+    log_buffer: Arc<Mutex<(u64, VecDeque<String>)>>,
+    /// Ticket 23: current reader generation (mirrored into `log_buffer`).
+    reader_gen: u64,
+    /// Ticket 23: the live reader thread. Reaped when finished; a still-live
+    /// handle at stop is detached (it exits on pipe EOF after the kill) and
+    /// its lines are fenced out by the generation.
+    reader_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Ticket 13: pipe-reader buffer bound (the `LogStore` ring bounds display
@@ -2684,13 +2903,36 @@ pub struct RealEngineBackend {
 pub const LOG_PIPE_BUFFER: usize = 2000;
 
 /// Ticket 13: push one reader-thread line, dropping the oldest when full
-/// (bounded memory even if the UI never drains).
-fn push_pipe_line(buffer: &Arc<Mutex<Vec<String>>>, line: String) {
-    if let Ok(mut lines) = buffer.lock() {
-        if lines.len() >= LOG_PIPE_BUFFER {
-            lines.remove(0);
+/// (bounded memory even if the UI never drains; `VecDeque` makes the cap
+/// O(1)).
+/// Ticket 23: lines from a stale generation are dropped (a restart's reader
+/// cannot interleave output from the previous child). A poisoned lock
+/// recovers with a named notice line instead of a silent drop.
+fn push_pipe_line(buffer: &Arc<Mutex<(u64, VecDeque<String>)>>, expected_gen: u64, line: String) {
+    match buffer.lock() {
+        Ok(mut slot) => {
+            if slot.0 != expected_gen {
+                return;
+            }
+            if slot.1.len() >= LOG_PIPE_BUFFER {
+                slot.1.pop_front();
+            }
+            slot.1.push_back(line);
         }
-        lines.push(line);
+        Err(poison) => {
+            let mut slot = poison.into_inner();
+            slot.0 = expected_gen;
+            if !slot.1.back().is_some_and(|last| last == LOG_POISON_NOTICE) {
+                if slot.1.len() >= LOG_PIPE_BUFFER {
+                    slot.1.pop_front();
+                }
+                slot.1.push_back(LOG_POISON_NOTICE.to_string());
+            }
+            if slot.1.len() >= LOG_PIPE_BUFFER {
+                slot.1.pop_front();
+            }
+            slot.1.push_back(line);
+        }
     }
 }
 
@@ -2698,11 +2940,16 @@ impl RealEngineBackend {
     pub fn new() -> Self {
         Self {
             child: None,
-            config_path: std::env::temp_dir().join("manyproxy-singbox.json"),
+            // Ticket 23: per-instance unique path (pid suffix) so sidecars
+            // never share a secret file.
+            config_path: unique_config_path("singbox"),
             fork: false,
             xray: false,
             extra_exe: None,
-            log_buffer: Arc::new(Mutex::new(Vec::new())),
+            pinned_binary: None,
+            log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
+            reader_gen: 0,
+            reader_handle: None,
         }
     }
 
@@ -2711,11 +2958,14 @@ impl RealEngineBackend {
     pub fn fork() -> Self {
         Self {
             child: None,
-            config_path: std::env::temp_dir().join("manyproxy-fork.json"),
+            config_path: unique_config_path("fork"),
             fork: true,
             xray: false,
             extra_exe: None,
-            log_buffer: Arc::new(Mutex::new(Vec::new())),
+            pinned_binary: None,
+            log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
+            reader_gen: 0,
+            reader_handle: None,
         }
     }
 
@@ -2723,11 +2973,14 @@ impl RealEngineBackend {
     pub fn xray() -> Self {
         Self {
             child: None,
-            config_path: std::env::temp_dir().join("manyproxy-xray.json"),
+            config_path: unique_config_path("xray"),
             fork: false,
             xray: true,
             extra_exe: None,
-            log_buffer: Arc::new(Mutex::new(Vec::new())),
+            pinned_binary: None,
+            log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
+            reader_gen: 0,
+            reader_handle: None,
         }
     }
 
@@ -2737,17 +2990,35 @@ impl RealEngineBackend {
     pub fn extra_slot() -> Self {
         Self {
             child: None,
-            config_path: std::env::temp_dir().join("manyproxy-extra.json"),
+            config_path: unique_config_path("extra"),
             fork: false,
             xray: false,
             extra_exe: None,
-            log_buffer: Arc::new(Mutex::new(Vec::new())),
+            pinned_binary: None,
+            log_buffer: Arc::new(Mutex::new((0, VecDeque::new()))),
+            reader_gen: 0,
+            reader_handle: None,
         }
     }
 
     fn resolve_binary(&self) -> Result<PathBuf, String> {
         if let Some(exe) = &self.extra_exe {
+            if !is_executable(exe) {
+                return Err(format!(
+                    "extra-core executable is not executable: {}",
+                    exe.display()
+                ));
+            }
             return Ok(exe.clone());
+        }
+        // Ticket 23: the controller pins the probed path before `check`, so
+        // spawn uses the validated binary (no probe/spawn skew). A stale pin
+        // (deleted since) falls through to a fresh resolution, never to a
+        // stale spawn.
+        if let Some(pinned) = &self.pinned_binary {
+            if is_executable(pinned) {
+                return Ok(pinned.clone());
+            }
         }
         if self.xray {
             resolve_xray_binary().map_err(|error| error.to_string())
@@ -2770,9 +3041,50 @@ impl RealEngineBackend {
     }
 
     fn write_config(&self, config_json: &str) -> Result<PathBuf, String> {
-        std::fs::write(&self.config_path, config_json)
-            .map_err(|error| format!("cannot write engine config ({error})"))?;
+        // Ticket 23: owner-only permissions; the file holds secrets.
+        write_config_restricted(&self.config_path, config_json)?;
         Ok(self.config_path.clone())
+    }
+
+    /// Ticket 23: kill only the child process (bounded wait with kill
+    /// escalation, never a UI-thread hang) and fence out its reader thread.
+    /// The config file is left alone — file removal is
+    /// [`RealEngineBackend::remove_config_file`], so `start()` can
+    /// stop-then-write-then-spawn without deleting the file it just wrote.
+    fn stop_child(&mut self) {
+        self.reader_gen = self.reader_gen.wrapping_add(1);
+        let gen = self.reader_gen;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            wait_child_bounded(&mut child, Duration::from_secs(3));
+        }
+        // Ticket 13: drop buffered (raw) lines with the sidecar so a later
+        // start never replays stale output.
+        match self.log_buffer.lock() {
+            Ok(mut slot) => {
+                slot.1.clear();
+                slot.0 = gen;
+            }
+            Err(poison) => {
+                let mut slot = poison.into_inner();
+                slot.1.clear();
+                slot.0 = gen;
+            }
+        }
+        // Reap a finished reader; detach a still-live one (it exits on pipe
+        // EOF after the kill, and its lines are fenced out by the bumped
+        // generation).
+        let finished = self
+            .reader_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished());
+        if finished {
+            if let Some(handle) = self.reader_handle.take() {
+                let _ = handle.join();
+            }
+        } else {
+            self.reader_handle.take();
+        }
     }
 }
 
@@ -2795,6 +3107,9 @@ impl EngineBackend for RealEngineBackend {
         // surface via `poll` like every other crash.
         if self.xray || self.extra_exe.is_some() {
             self.write_config(config_json)?;
+            // Ticket 23: the check file holds secrets — remove it even
+            // though no process was spawned.
+            self.remove_config_file();
             return Ok(());
         }
         let path = self.write_config(config_json)?;
@@ -2804,6 +3119,8 @@ impl EngineBackend for RealEngineBackend {
             .arg(&path)
             .output()
             .map_err(|error| format!("engine check could not run ({error})"))?;
+        // Ticket 23: `check` leaves no secret file behind either way.
+        self.remove_config_file();
         if output.status.success() {
             Ok(())
         } else {
@@ -2813,42 +3130,59 @@ impl EngineBackend for RealEngineBackend {
 
     fn start(&mut self, config_json: &str) -> Result<(), String> {
         let binary = self.resolve_binary()?;
+        // Ticket 23 CRITICAL order: stop the previous child FIRST, then
+        // write, then spawn — the old write→stop→spawn order deleted the
+        // file it had just written, so the spawn read a deleted path.
+        self.stop_child();
         let path = self.write_config(config_json)?;
-        self.stop();
         // Unprivileged by construction: plain spawn, never elevated, no
         // admin for loopback use (spec boundary).
         // Ticket 13: stderr is piped (never nulled): a reader thread pumps
         // lines into the bounded buffer so the pipe cannot stall the
         // sidecar and the logs dialog shows live lines. The thread ends on
         // EOF when the sidecar exits.
-        let mut child = std::process::Command::new(&binary)
+        let spawn = std::process::Command::new(&binary)
             .args(self.start_args())
             .arg(&path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("engine failed to start ({error})"))?;
+            .spawn();
+        let mut child = match spawn {
+            Ok(child) => child,
+            // Ticket 23: a failed spawn leaves no secret file behind.
+            Err(error) => {
+                self.remove_config_file();
+                return Err(format!("engine failed to start ({error})"));
+            }
+        };
+        let gen = self.reader_gen;
         match child.stderr.take() {
             Some(pipe) => {
                 let buffer = self.log_buffer.clone();
-                std::thread::spawn(move || {
+                let handle = std::thread::spawn(move || {
                     use std::io::BufRead as _;
                     let reader = std::io::BufReader::new(pipe);
                     for line in reader.lines() {
                         match line {
-                            Ok(text) => push_pipe_line(&buffer, text),
+                            Ok(text) => push_pipe_line(&buffer, gen, text),
                             Err(error) => {
-                                push_pipe_line(&buffer, format!("log pipe unreadable ({error})"));
+                                push_pipe_line(
+                                    &buffer,
+                                    gen,
+                                    format!("log pipe unreadable ({error})"),
+                                );
                                 break;
                             }
                         }
                     }
                 });
+                self.reader_handle = Some(handle);
             }
             None => {
                 push_pipe_line(
                     &self.log_buffer,
+                    gen,
                     "log pipe unavailable (sidecar stderr was not piped)".to_string(),
                 );
             }
@@ -2858,16 +3192,8 @@ impl EngineBackend for RealEngineBackend {
     }
 
     fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        // Ticket 13: drop buffered (raw) lines with the sidecar so a later
-        // start never replays stale output.
-        if let Ok(mut lines) = self.log_buffer.lock() {
-            lines.clear();
-        }
-        let _ = std::fs::remove_file(&self.config_path);
+        self.stop_child();
+        self.remove_config_file();
     }
 
     fn is_running(&self) -> bool {
@@ -2877,6 +3203,9 @@ impl EngineBackend for RealEngineBackend {
     fn poll_exit(&mut self) -> Option<String> {
         let status = self.child.as_mut()?.try_wait().ok()??;
         self.child = None;
+        // Ticket 23: a reaped crash leaves no secret file behind. Buffered
+        // lines are kept for post-mortem (the next stop/start clears them).
+        self.remove_config_file();
         Some(format!("engine exited ({status})"))
     }
 
@@ -2884,13 +3213,46 @@ impl EngineBackend for RealEngineBackend {
     /// named error instead of raw state (fail-closed, never stale).
     fn drain_log_lines(&mut self) -> Vec<String> {
         match self.log_buffer.lock() {
-            Ok(mut lines) => std::mem::take(&mut *lines),
-            Err(_) => vec!["log pipe unreadable (log reader failed)".to_string()],
+            Ok(mut slot) => std::mem::take(&mut slot.1).into_iter().collect(),
+            Err(poison) => {
+                let mut slot = poison.into_inner();
+                let mut lines: Vec<String> = std::mem::take(&mut slot.1).into_iter().collect();
+                lines.push(LOG_POISON_NOTICE.to_string());
+                lines
+            }
         }
     }
 
     fn set_extra_exe(&mut self, exe: PathBuf) {
         self.extra_exe = Some(exe);
+    }
+
+    fn clear_extra_exe(&mut self) {
+        // Ticket 23 LOW: the slot must not keep pointing at a row that is no
+        // longer active.
+        self.extra_exe = None;
+    }
+
+    fn pin_binary(&mut self, path: PathBuf) {
+        self.pinned_binary = Some(path);
+    }
+
+    fn remove_config_file(&self) {
+        let _ = std::fs::remove_file(&self.config_path);
+    }
+}
+
+/// Ticket 23 HIGH: RAII teardown — dropping a backend (window close, panic
+/// unwind, controller teardown) kills the sidecar with a bounded reap and
+/// removes the secret config file, best-effort. No `main()` close hook is
+/// needed: teardown lives in the backend itself.
+impl Drop for RealEngineBackend {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            wait_child_bounded(&mut child, Duration::from_secs(1));
+        }
+        self.remove_config_file();
     }
 }
 
@@ -2901,6 +3263,9 @@ struct FakeState {
     last_config: Option<String>,
     check_calls: usize,
     fail_check: Option<String>,
+    /// Ticket 23: one-shot next-`start` failure (rollback tests). `None` by
+    /// default, so every existing consumer behaves exactly as before.
+    fail_start: Option<String>,
     exited: Option<String>,
     pending_logs: Vec<String>,
 }
@@ -2933,6 +3298,20 @@ impl FakeHandle {
     /// Make the next (and subsequent, until cleared) `check_config` fail.
     pub fn fail_check(&self, detail: &str) {
         self.state.borrow_mut().fail_check = Some(detail.to_string());
+    }
+
+    /// Ticket 23: fail the next `start` once (consumed on use), then behave
+    /// normally — lets rollback tests fail one spawn while the retry path
+    /// stays healthy.
+    pub fn fail_start(&self, detail: &str) {
+        self.state.borrow_mut().fail_start = Some(detail.to_string());
+    }
+
+    /// Ticket 23: clear injected `check`/`start` failures.
+    pub fn clear_failures(&self) {
+        let mut state = self.state.borrow_mut();
+        state.fail_check = None;
+        state.fail_start = None;
     }
 
     /// Simulate a sidecar crash; the next [`EngineController::poll`] reports it.
@@ -2986,6 +3365,10 @@ impl EngineBackend for FakeEngineBackend {
 
     fn start(&mut self, config_json: &str) -> Result<(), String> {
         let mut state = self.state.borrow_mut();
+        if let Some(detail) = state.fail_start.take() {
+            state.running = false;
+            return Err(detail);
+        }
         state.running = true;
         state.exited = None;
         state.last_config = Some(config_json.to_string());
@@ -3051,6 +3434,18 @@ pub struct EngineController {
     /// Ticket 08: extra-executable probe seam (app dir only, per exe name).
     #[allow(clippy::type_complexity)]
     extra_probe: Box<dyn Fn(&str) -> Result<PathBuf, EngineError>>,
+    /// Ticket 23: stock-binary probe seam (default: real resolution; lets the
+    /// controller fail a missing stock binary typed BEFORE touching anything,
+    /// and pin the validated path for spawn).
+    stock_probe: Box<dyn Fn() -> Result<PathBuf, EngineError>>,
+    /// Ticket 23: `(id, bind)` pairs the user explicitly confirmed for LAN
+    /// exposure. Unconfirmed starts carrying such pairs fail with
+    /// [`EngineError::LanConfirmRequired`] independent of any UI gate.
+    lan_confirmed: HashSet<(String, String)>,
+    /// Ticket 23: last configs successfully served per shard
+    /// (stock/fork/xray/extra) — the rollback target when a later apply's
+    /// spawn fails midway.
+    served: [Option<String>; 4],
     active: Vec<ProxyConfig>,
     status: EngineStatus,
     last_error: Option<String>,
@@ -3110,6 +3505,9 @@ impl EngineController {
             fork_probe: Box::new(resolve_fork_binary),
             xray_probe: Box::new(resolve_xray_binary),
             extra_probe: Box::new(resolve_extra_binary),
+            stock_probe: Box::new(resolve_engine_binary),
+            lan_confirmed: HashSet::new(),
+            served: [None, None, None, None],
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -3177,6 +3575,12 @@ impl EngineController {
                     searched: "test-seam (no app dir)".to_string(),
                 })
             }),
+            // Ticket 23: the stock probe defaults to present (no filesystem
+            // access); override with `set_stock_probe` for missing-binary
+            // scenarios.
+            stock_probe: Box::new(|| Ok(PathBuf::from("test-stock-bin"))),
+            lan_confirmed: HashSet::new(),
+            served: [None, None, None, None],
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -3209,8 +3613,64 @@ impl EngineController {
         self.extra_probe = Box::new(probe);
     }
 
+    /// Ticket 23: override the stock-binary probe (tests inject present /
+    /// missing without filesystem access).
+    #[cfg(test)]
+    pub fn set_stock_probe(&mut self, probe: impl Fn() -> Result<PathBuf, EngineError> + 'static) {
+        self.stock_probe = Box::new(probe);
+    }
+
+    /// Ticket 23: drop LAN confirms for rows that are no longer active (or
+    /// whose bind changed — confirms key on `(id, bind)`).
+    fn prune_lan_confirmed(&mut self) {
+        let live: HashSet<(String, String)> = self
+            .active
+            .iter()
+            .map(|row| (row.id.clone(), row.bind_ip.clone()))
+            .collect();
+        self.lan_confirmed.retain(|entry| live.contains(entry));
+    }
+
+    /// Ticket 23: shard backend by index (0 stock, 1 fork, 2 xray, 3 extra).
+    fn backend_at(&mut self, index: usize) -> &mut dyn EngineBackend {
+        match index {
+            0 => self.backend.as_mut(),
+            1 => self.fork_backend.as_mut(),
+            2 => self.xray_backend.as_mut(),
+            _ => self.extra_backend.as_mut(),
+        }
+    }
+
+    /// Ticket 23: true while any sidecar process handle is up (liveness is
+    /// handle presence, never a cached flag).
+    fn any_backend_running(&self) -> bool {
+        self.backend.is_running()
+            || self.fork_backend.is_running()
+            || self.xray_backend.is_running()
+            || self.extra_backend.is_running()
+    }
+
     /// Start one config (idempotent); restarts the sidecar with the union.
+    /// Ticket 23 SEC-MED: fails with [`EngineError::LanConfirmRequired`]
+    /// when the resulting set serves a non-loopback bind the user never
+    /// confirmed — independent of the UI dialog gate. Use
+    /// [`EngineController::start_one_confirmed`] past an explicit confirm.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_one(&mut self, config: &ProxyConfig) -> Result<(), EngineError> {
+        self.start_one_inner(config, false)
+    }
+
+    /// Ticket 23: [`EngineController::start_one`] past an explicit LAN
+    /// confirm (records the confirm for the set's LAN binds).
+    pub fn start_one_confirmed(&mut self, config: &ProxyConfig) -> Result<(), EngineError> {
+        self.start_one_inner(config, true)
+    }
+
+    fn start_one_inner(
+        &mut self,
+        config: &ProxyConfig,
+        confirmed: bool,
+    ) -> Result<(), EngineError> {
         let mut candidate = self.active.clone();
         if let Some(slot) = candidate.iter_mut().find(|row| row.id == config.id) {
             *slot = config.clone();
@@ -3221,8 +3681,57 @@ impl EngineController {
         validate_activation(&candidate).inspect_err(|error| {
             self.last_error = Some(error.to_string());
         })?;
+        self.enforce_lan_confirm(&candidate, confirmed)?;
+        // Ticket 23 HIGH: `active` commits only with a successful apply — a
+        // failed apply restores the previous membership instead of claiming
+        // rows nothing serves.
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
         self.active = candidate;
-        self.apply()
+        match self.apply() {
+            Ok(()) => {
+                self.prune_lan_confirmed();
+                Ok(())
+            }
+            Err(error) => {
+                self.active = prev;
+                self.status = prev_status;
+                self.prune_lan_confirmed();
+                Err(error)
+            }
+        }
+    }
+
+    /// Ticket 23: fail when the candidate set serves unconfirmed LAN binds
+    /// (or record the confirm when past the gate).
+    fn enforce_lan_confirm(
+        &mut self,
+        candidate: &[ProxyConfig],
+        confirmed: bool,
+    ) -> Result<(), EngineError> {
+        if confirmed {
+            for row in candidate {
+                if requires_lan_confirm(&row.bind_ip) {
+                    self.lan_confirmed
+                        .insert((row.id.clone(), row.bind_ip.clone()));
+                }
+            }
+            return Ok(());
+        }
+        let missing = unconfirmed_lan(candidate, &self.lan_confirmed);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut names: Vec<String> = missing
+            .iter()
+            .map(|(_, name, bind)| format!("\"{name}\" on {bind}"))
+            .collect();
+        names.sort();
+        let error = EngineError::LanConfirmRequired {
+            names: names.join(", "),
+        };
+        self.last_error = Some(error.to_string());
+        Err(error)
     }
 
     /// Stop one config; returns true when it was active. Stops the sidecar
@@ -3234,28 +3743,65 @@ impl EngineController {
             return false;
         }
         let _ = self.apply();
+        self.prune_lan_confirmed();
         true
     }
 
     /// Replace the active set (start-all path); validates before touching the
     /// running sidecar.
+    /// Ticket 23 SEC-MED: fails with [`EngineError::LanConfirmRequired`]
+    /// when the set serves a non-loopback bind the user never confirmed.
+    /// Use [`EngineController::start_all_confirmed`] past an explicit confirm.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_all(&mut self, configs: &[ProxyConfig]) -> Result<(), EngineError> {
+        self.start_all_inner(configs, false)
+    }
+
+    /// Ticket 23: [`EngineController::start_all`] past an explicit LAN
+    /// confirm (records the confirm for the set's LAN binds).
+    pub fn start_all_confirmed(&mut self, configs: &[ProxyConfig]) -> Result<(), EngineError> {
+        self.start_all_inner(configs, true)
+    }
+
+    fn start_all_inner(
+        &mut self,
+        configs: &[ProxyConfig],
+        confirmed: bool,
+    ) -> Result<(), EngineError> {
         let candidate = configs.to_vec();
         if candidate.is_empty() {
             self.active.clear();
-            return self.apply();
+            let result = self.apply();
+            self.prune_lan_confirmed();
+            return result;
         }
         validate_activation(&candidate).inspect_err(|error| {
             self.last_error = Some(error.to_string());
         })?;
+        self.enforce_lan_confirm(&candidate, confirmed)?;
+        // Ticket 23 HIGH: `active` commits only with a successful apply.
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
         self.active = candidate;
-        self.apply()
+        match self.apply() {
+            Ok(()) => {
+                self.prune_lan_confirmed();
+                Ok(())
+            }
+            Err(error) => {
+                self.active = prev;
+                self.status = prev_status;
+                self.prune_lan_confirmed();
+                Err(error)
+            }
+        }
     }
 
     /// Stop everything and take the sidecar down.
     pub fn stop_all(&mut self) {
         self.active.clear();
         let _ = self.apply();
+        self.prune_lan_confirmed();
     }
 
     fn apply(&mut self) -> Result<(), EngineError> {
@@ -3264,6 +3810,10 @@ impl EngineController {
             self.fork_backend.stop();
             self.xray_backend.stop();
             self.extra_backend.stop();
+            // Ticket 23 LOW: the emptied slot forgets its executable; the
+            // served snapshots reset with the membership.
+            self.extra_backend.clear_extra_exe();
+            self.served = [None, None, None, None];
             self.status = EngineStatus::Stopped;
             self.last_config_json = None;
             return Ok(());
@@ -3275,19 +3825,42 @@ impl EngineController {
             self.last_error = Some(error.to_string());
         })?;
         // Binary gates before touching anything: a missing sidecar binary
-        // fails only its own rows; the other sidecars keep serving.
+        // fails only its own rows; the other sidecars keep serving. Ticket
+        // 23: the stock gate is typed too (was: wrapped as CheckFailed deep
+        // in `check`), and every validated path is pinned for spawn (no
+        // probe/spawn skew).
+        let needs_stock = !plan.main_rows.is_empty()
+            || plan
+                .replacements
+                .iter()
+                .any(|(owned, _)| *owned == OwningCore::Stock);
+        if needs_stock {
+            match (self.stock_probe)() {
+                Ok(path) => self.backend.pin_binary(path),
+                Err(error) => {
+                    self.last_error = Some(error.to_string());
+                    return Err(error);
+                }
+            }
+        }
         if !plan.fork_rows.is_empty() {
-            if let Err(error) = (self.fork_probe)() {
-                let error = missing_fork_for(error, &plan.fork_names, plan.fork_xhttp);
-                self.last_error = Some(error.to_string());
-                return Err(error);
+            match (self.fork_probe)() {
+                Ok(path) => self.fork_backend.pin_binary(path),
+                Err(error) => {
+                    let error = missing_fork_for(error, &plan.fork_names, plan.fork_xhttp);
+                    self.last_error = Some(error.to_string());
+                    return Err(error);
+                }
             }
         }
         if !plan.egresses.is_empty() {
-            if let Err(error) = (self.xray_probe)() {
-                let error = missing_xray_for(error, &plan.xray_names);
-                self.last_error = Some(error.to_string());
-                return Err(error);
+            match (self.xray_probe)() {
+                Ok(path) => self.xray_backend.pin_binary(path),
+                Err(error) => {
+                    let error = missing_xray_for(error, &plan.xray_names);
+                    self.last_error = Some(error.to_string());
+                    return Err(error);
+                }
             }
         }
         let extra_path: Option<PathBuf> = match &plan.extra {
@@ -3315,48 +3888,14 @@ impl EngineController {
                 .find(|(owned, _)| *owned == core)
                 .map(|(_, json)| json.clone())
         };
-        // Bridge map for the main config: row ids plus `{chain-id}#hop{i}`
-        // legs, exactly the key scheme `build_main_config` expects, with
-        // the plan's ports (assigned over the union's taken ports) so
-        // pointers and sidecar ingress agree by construction.
-        let mut plan_bridges: HashMap<String, u16> = HashMap::new();
-        for config in &plan.main_rows {
-            if is_xray_protocol(&config.protocol) {
-                if let Some(egress) = plan.egresses.iter().find(|egress| {
-                    egress.owner_id == config.id && egress.main_tag == outbound_tag(&config.id)
-                }) {
-                    plan_bridges.insert(config.id.clone(), egress.bridge_port);
-                }
-            } else if is_custom_outbound_protocol(&config.protocol) {
-                if let Some(egress) = plan.egresses.iter().find(|egress| {
-                    egress.owner_id == config.id && egress.main_tag == outbound_tag(&config.id)
-                }) {
-                    plan_bridges.insert(config.id.clone(), egress.bridge_port);
-                }
-            } else if is_chain_protocol(&config.protocol) {
-                if let Ok(params) = params_object(config) {
-                    if let Ok(hops) = validate_chain_nodes(&config.name, &params, &|id| {
-                        plan.main_rows
-                            .iter()
-                            .find(|row| row.id == id)
-                            .map(|row| row.protocol.clone())
-                    }) {
-                        for (index, hop) in hops.iter().enumerate() {
-                            if hop.kind == ChainHopKind::Xray && hop.ref_id.is_none() {
-                                if let Some(egress) = plan.egresses.iter().find(|egress| {
-                                    egress.main_tag
-                                        == format!("{}-hop-{index}", outbound_tag(&config.id))
-                                }) {
-                                    plan_bridges.insert(
-                                        format!("{}#hop{}", config.id, index),
-                                        egress.bridge_port,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // Bridge map for the main config, straight from the plan's bridge
+        // bookkeeping (`bridge_key` is the exact key scheme `build_main_config`
+        // expects, with the plan's ports). Ticket 23 LOW: no re-derivation
+        // with swallowed validation context — the validated plan is the
+        // single source of truth.
+        let mut plan_bridges: HashMap<String, u16> = HashMap::with_capacity(plan.egresses.len());
+        for egress in &plan.egresses {
+            plan_bridges.insert(egress.bridge_key.clone(), egress.bridge_port);
         }
         let stock_gen: Option<String> = match replacement(OwningCore::Stock) {
             Some(json) => Some(json),
@@ -3449,6 +3988,60 @@ impl EngineController {
                 self.last_error = Some(error.to_string());
             })?;
         }
+        // Ticket 23 SEC-HIGH: replacements are user JSON served by bundled
+        // sidecars — the recursive system-mutation scan covers them here too
+        // (defense in depth: `validate_activation` already scanned them via
+        // `custom_full_config`, and this holds for any future path that
+        // reaches `apply` another way).
+        for (core, json) in &plan.replacements {
+            let document: serde_json::Value =
+                serde_json::from_str(json).map_err(|_| EngineError::BadCustom {
+                    name: format!("custom full-config ({})", core.as_str()),
+                    field: "config".to_string(),
+                    detail: "custom full config is not JSON".to_string(),
+                })?;
+            if let Some((key, path)) = find_system_mutation_key(&document) {
+                let error = EngineError::BadCustom {
+                    name: format!("custom full-config ({})", core.as_str()),
+                    field: key.clone(),
+                    detail: format!(
+                        "custom full config must not carry \"{key}\" at {path} (no system network mutation)"
+                    ),
+                };
+                self.last_error = Some(error.to_string());
+                return Err(error);
+            }
+        }
+        // Ticket 23 MED: probe-bind every serving endpoint (plus every
+        // bridge listener) BEFORE any sidecar is stopped — a foreign holder
+        // fails typed here, while rollback is still free.
+        {
+            let mut endpoints: Vec<(String, String, u16)> = Vec::new();
+            for row in plan.main_rows.iter().chain(plan.fork_rows.iter()) {
+                endpoints.push((row.name.clone(), row.bind_ip.clone(), row.port));
+            }
+            if let Some(row) = &plan.extra {
+                endpoints.push((row.name.clone(), row.bind_ip.clone(), row.port));
+            }
+            for egress in &plan.egresses {
+                endpoints.push((
+                    egress.owner.clone(),
+                    "127.0.0.1".to_string(),
+                    egress.bridge_port,
+                ));
+            }
+            for (name, bind, port) in &endpoints {
+                if probe_bind_available(bind, *port).is_err() {
+                    let error = EngineError::PortUnavailable {
+                        bind: bind.clone(),
+                        port: *port,
+                        name: name.clone(),
+                    };
+                    self.last_error = Some(error.to_string());
+                    return Err(error);
+                }
+            }
+        }
         for (label, backend, gen) in [
             ("stock", &mut self.backend, &stock_gen),
             ("fork", &mut self.fork_backend, &fork_gen),
@@ -3466,71 +4059,153 @@ impl EngineController {
                 }
             }
         }
-        // Restart only populated sidecars; empty subsets stay down. A failed
-        // start on one side never takes down the other side. The extra slot
-        // driver is pointed at the active row's executable first (single
-        // active row enforced by the plan).
+        // Restart only populated sidecars; empty subsets stay down. The extra
+        // slot driver is pointed at the active row's executable first (single
+        // active row enforced by the plan); when the slot empties it forgets
+        // the executable (ticket 23 LOW).
         if let Some(path) = &extra_path {
             self.extra_backend.set_extra_exe(path.clone());
+        } else {
+            self.extra_backend.clear_extra_exe();
         }
-        let mut first_error: Option<EngineError> = None;
-        for (backend, gen) in [
-            (&mut self.backend, &stock_gen),
-            (&mut self.fork_backend, &fork_gen),
-            (&mut self.xray_backend, &xray_gen),
-            (&mut self.extra_backend, &extra_gen),
-        ] {
-            match gen {
+        // Ticket 23 HIGH: a failed spawn rolls the shards this apply touched
+        // back to their previously served configs (snapshot below) instead of
+        // leaving a split brain — some shards on the new set, one shard down.
+        const SHARDS: [&str; 4] = ["stock", "fork", "xray", "extra"];
+        let gens: [Option<String>; 4] = [stock_gen, fork_gen, xray_gen, extra_gen];
+        let prev_served = self.served.clone();
+        let mut failures: Vec<(String, EngineError)> = Vec::new();
+        for index in 0..4 {
+            let json = gens[index].clone();
+            match json {
                 Some(json) => {
+                    let backend = self.backend_at(index);
                     backend.stop();
-                    if let Err(detail) = backend.start(json) {
-                        let error = EngineError::SpawnFailed { detail };
-                        self.last_error = Some(error.to_string());
-                        first_error = Some(error);
+                    match backend.start(&json) {
+                        Ok(()) => {
+                            self.served[index] = Some(json);
+                        }
+                        Err(detail) => {
+                            self.served[index] = None;
+                            failures.push((
+                                SHARDS[index].to_string(),
+                                EngineError::SpawnFailed { detail },
+                            ));
+                        }
                     }
                 }
-                None => backend.stop(),
+                None => {
+                    let backend = self.backend_at(index);
+                    backend.stop();
+                    self.served[index] = None;
+                }
             }
         }
-        self.status = if self.backend.is_running()
-            || self.fork_backend.is_running()
-            || self.xray_backend.is_running()
-            || self.extra_backend.is_running()
-        {
+        if !failures.is_empty() {
+            // Restore every shard to its pre-apply served config — including
+            // shards whose new spawn just failed (the failure may be
+            // transient; a persistent failure just leaves that shard down,
+            // still truthful, never half-serving). Shards already stopped
+            // with no previous config stay down.
+            for (index, prev) in prev_served.clone().into_iter().enumerate() {
+                let backend = self.backend_at(index);
+                backend.stop();
+                match prev {
+                    Some(prev) => match backend.start(&prev) {
+                        Ok(()) => self.served[index] = Some(prev),
+                        Err(_) => self.served[index] = None,
+                    },
+                    None => self.served[index] = None,
+                }
+            }
+            let detail = failures
+                .iter()
+                .map(|(shard, error)| format!("{shard}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.last_error = Some(detail);
+            let (_, first) = failures.into_iter().next().expect("failures non-empty");
+            self.status = if self.any_backend_running() {
+                EngineStatus::Running
+            } else {
+                EngineStatus::Stopped
+            };
+            return Err(first);
+        }
+        // Ticket 23: status agrees with per-row `is_running` — Running iff
+        // any sidecar handle is up (every running shard serves a non-empty
+        // subset, and every served row maps to its shard's handle).
+        self.status = if self.any_backend_running() {
             EngineStatus::Running
         } else {
             EngineStatus::Stopped
         };
-        self.last_config_json = stock_gen
+        self.last_config_json = gens[0]
             .clone()
-            .or_else(|| fork_gen.clone())
-            .or_else(|| xray_gen.clone())
-            .or(extra_gen.clone());
-        if let Some(error) = first_error {
-            return Err(error);
-        }
+            .or_else(|| gens[1].clone())
+            .or_else(|| gens[2].clone())
+            .or(gens[3].clone());
         self.last_error = None;
         Ok(())
     }
 
-    /// Crash detection: call on UI actions; reports the named cause once.
-    /// Ticket 07: watches both sidecars, stock first.
-    /// Ticket 08: watches all four sidecars, stock first.
-    pub fn poll(&mut self) -> Option<String> {
-        let cause = self
-            .backend
-            .poll_exit()
-            .or_else(|| self.fork_backend.poll_exit())
-            .or_else(|| self.xray_backend.poll_exit())
-            .or_else(|| self.extra_backend.poll_exit())?;
-        if self.active.is_empty() {
-            return None;
+    /// Crash detection: call on UI actions; reports every crashed shard.
+    /// Ticket 23 MED: all four sidecars are reaped per poll (stock first) —
+    /// a one-shot poll no longer loses N-1 causes. A single crash returns
+    /// its bare cause (previous contract); several join as
+    /// `"shard: cause; shard: cause"`. Any observed crash transitions the
+    /// status (and records `last_error`), so callers see the failure even
+    /// when they only need the per-shard list.
+    pub fn poll_shards(&mut self) -> Vec<(String, String)> {
+        let mut crashes = Vec::new();
+        for (shard, backend) in [
+            ("stock", &mut self.backend),
+            ("fork", &mut self.fork_backend),
+            ("xray", &mut self.xray_backend),
+            ("extra", &mut self.extra_backend),
+        ] {
+            // Ticket 23 HIGH: the failed shard's secret file is cleaned by
+            // `poll_exit` itself; siblings keep running untouched.
+            if let Some(cause) = backend.poll_exit() {
+                crashes.push((shard.to_string(), cause));
+            }
         }
+        if crashes.is_empty() || self.active.is_empty() {
+            return crashes;
+        }
+        let cause = if crashes.len() == 1 {
+            crashes.first().expect("one crash").1.clone()
+        } else {
+            crashes
+                .iter()
+                .map(|(shard, cause)| format!("{shard}: {cause}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
         self.status = EngineStatus::Crashed {
             cause: cause.clone(),
         };
         self.last_error = Some(format!("engine crashed ({cause})"));
-        Some(cause)
+        crashes
+    }
+
+    /// Crash detection: call on UI actions; reports the named cause(s) once.
+    /// Ticket 07: watches both sidecars, stock first.
+    /// Ticket 08: watches all four sidecars, stock first.
+    pub fn poll(&mut self) -> Option<String> {
+        let crashes = self.poll_shards();
+        if crashes.is_empty() || self.active.is_empty() {
+            return None;
+        }
+        Some(if crashes.len() == 1 {
+            crashes.into_iter().next().expect("one crash").1
+        } else {
+            crashes
+                .iter()
+                .map(|(shard, cause)| format!("{shard}: {cause}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
     }
 
     /// Ticket 13: take buffered stderr lines from every sidecar (stock,
@@ -3724,33 +4399,10 @@ pub fn lan_confirm_description(entries: &[(String, String)]) -> String {
 pub fn assert_no_system_mutation(config_json: &str) -> Result<(), String> {
     let document: serde_json::Value = serde_json::from_str(config_json)
         .map_err(|_| "generated config is not JSON".to_string())?;
-    fn walk(node: &serde_json::Value, path: &str) -> Result<(), String> {
-        match node {
-            serde_json::Value::Object(map) => {
-                for (key, value) in map {
-                    let lowered = key.to_ascii_lowercase();
-                    if lowered == "tun" || lowered == "dns" || lowered == "set_system_proxy" {
-                        return Err(format!("forbidden key \"{key}\" at {path}"));
-                    }
-                    let child = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    walk(value, &child)?;
-                }
-                Ok(())
-            }
-            serde_json::Value::Array(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    walk(item, &format!("{path}[{index}]"))?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+    if let Some((key, path)) = find_system_mutation_key(&document) {
+        return Err(format!("forbidden key \"{key}\" at {path}"));
     }
-    walk(&document, "$")
+    Ok(())
 }
 
 /// Ticket 09: fingerprint of everything the app controls across a session
@@ -4063,17 +4715,58 @@ mod tests {
 
     /// Ticket 13: the pipe-reader buffer is bounded (oldest lines drop when
     /// full, memory never grows without bound).
+    /// Ticket 23: stale generations are fenced out; a poisoned lock recovers
+    /// with a named notice instead of a silent drop.
     #[test]
     fn log_pipe_buffer_stays_bounded() {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let buffer = Arc::new(Mutex::new((0u64, VecDeque::new())));
         for index in 0..(LOG_PIPE_BUFFER + 50) {
-            push_pipe_line(&buffer, format!("line {index}"));
+            push_pipe_line(&buffer, 0, format!("line {index}"));
         }
-        let lines = buffer.lock().expect("lock works");
-        assert_eq!(lines.len(), LOG_PIPE_BUFFER, "capped, got {}", lines.len());
+        let slot = buffer.lock().expect("lock works");
+        assert_eq!(
+            slot.1.len(),
+            LOG_PIPE_BUFFER,
+            "capped, got {}",
+            slot.1.len()
+        );
         assert!(
-            lines.first().is_some_and(|line| line == "line 50"),
+            slot.1.front().is_some_and(|line| line == "line 50"),
             "oldest dropped first"
+        );
+    }
+
+    /// Ticket 23: a previous generation's reader cannot interleave lines
+    /// after a restart (generation fence).
+    #[test]
+    fn log_pipe_stale_generation_dropped() {
+        let buffer = Arc::new(Mutex::new((1u64, VecDeque::new())));
+        push_pipe_line(&buffer, 0, "stale line".to_string());
+        push_pipe_line(&buffer, 1, "fresh line".to_string());
+        let slot = buffer.lock().expect("lock works");
+        let lines: Vec<&String> = slot.1.iter().collect();
+        assert_eq!(lines, vec!["fresh line"], "stale dropped, got {lines:?}");
+    }
+
+    /// Ticket 23: a poisoned log lock recovers with a named notice line —
+    /// never a silent drop.
+    #[test]
+    fn log_pipe_poison_recovers_with_notice() {
+        let buffer = Arc::new(Mutex::new((0u64, VecDeque::new())));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = buffer.lock().expect("first lock works");
+            panic!("poison the log lock");
+        }));
+        push_pipe_line(&buffer, 0, "after poison".to_string());
+        let slot = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
+        let lines: Vec<&String> = slot.1.iter().collect();
+        assert!(
+            lines.iter().any(|line| line.as_str() == LOG_POISON_NOTICE),
+            "notice surfaced, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.as_str() == "after poison"),
+            "reader keeps serving, got {lines:?}"
         );
     }
 
@@ -4135,7 +4828,19 @@ mod tests {
         let (mut controller, _) = EngineController::fake();
         let mut rows = three_standard();
         rows[0].bind_ip = "0.0.0.0".to_string();
-        controller.start_all(&rows).expect("custom bind starts");
+        // Ticket 23: the unconfirmed start refuses the LAN bind; past the
+        // confirm the bind starts and still warns.
+        let error = controller
+            .start_all(&rows)
+            .expect_err("unconfirmed LAN bind fails");
+        assert!(
+            matches!(error, EngineError::LanConfirmRequired { .. }),
+            "typed gate, got {error}"
+        );
+        assert!(error.to_string().contains("\"Alpha\""), "got {error}");
+        controller
+            .start_all_confirmed(&rows)
+            .expect("custom bind starts");
         let warnings = controller.lan_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("\"Alpha\""));
@@ -5254,5 +5959,356 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    // -- Ticket 23: lifecycle hardening (TDD at the FakeEngineBackend seam) --
+
+    /// Scenario: start with no binaries → typed Missing* error, no crash, no
+    /// file left behind.
+    #[test]
+    fn t23_missing_binaries_fail_typed_without_side_effects() {
+        let (mut controller, stock, fork, xray, extra) = EngineController::fake_quartet();
+        controller.set_stock_probe(|| {
+            Err(EngineError::MissingBinary {
+                searched: "test-seam (no stock binary)".to_string(),
+            })
+        });
+        let error = controller
+            .start_all(&three_standard())
+            .expect_err("missing stock binary fails");
+        assert!(
+            matches!(error, EngineError::MissingBinary { .. }),
+            "typed, got {error}"
+        );
+        assert!(error.to_string().contains("never downloads"), "got {error}");
+        assert!(!stock.is_running());
+        assert!(!fork.is_running());
+        assert!(!xray.is_running());
+        assert!(!extra.is_running());
+        assert_eq!(controller.running_count(), 0, "active restored");
+        assert_eq!(controller.status(), &EngineStatus::Stopped);
+
+        // The check path writes no secret file when the binary is missing…
+        let mut real = RealEngineBackend::xray();
+        let path = real.config_path.clone();
+        assert!(
+            real.check_config("{\"secret\": true}").is_err(),
+            "no xray binary in test env"
+        );
+        assert!(!path.exists(), "no file left: {}", path.display());
+        // …and write-then-remove leaves nothing behind either.
+        let real = RealEngineBackend::new();
+        let path = real.config_path.clone();
+        real.write_config("{\"password\": \"hunter2\"}")
+            .expect("restricted write works");
+        assert!(path.exists());
+        real.remove_config_file();
+        assert!(!path.exists(), "removed: {}", path.display());
+    }
+
+    /// Scenario: one sidecar dies externally → the poll names its shard, its
+    /// file is cleaned, siblings keep running. Every crashed shard is
+    /// reported per poll (no N-1 loss).
+    #[test]
+    fn t23_crash_names_shard_keeps_siblings() {
+        let (mut controller, stock, _fork, xray, _extra) = EngineController::fake_quartet();
+        controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            xray_fixture("2", "XrayOne", 10802),
+        ];
+        controller.start_all(&rows).expect("starts");
+        assert!(stock.is_running() && xray.is_running());
+
+        xray.inject_crash("signal: killed");
+        let shards = controller.poll_shards();
+        assert_eq!(shards.len(), 1, "one crash, got {shards:?}");
+        assert_eq!(shards[0].0, "xray", "names the shard: {shards:?}");
+        assert_eq!(shards[0].1, "signal: killed");
+        assert!(stock.is_running(), "sibling keeps running");
+        assert!(!xray.is_running(), "failed shard is down");
+        assert!(controller.poll().is_none(), "cause reported once");
+        assert!(matches!(controller.status(), EngineStatus::Crashed { .. }));
+
+        // Two simultaneous crashes are both reported, shard-named.
+        stock.inject_crash("signal: segmentation fault");
+        xray.inject_crash("signal: killed");
+        // (xray is down already: re-arm it by restarting, then crash both)
+        controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
+        let _ = controller.start_all_confirmed(&rows);
+        stock.inject_crash("signal: segmentation fault");
+        xray.inject_crash("signal: killed");
+        let cause = controller.poll().expect("crashes reported");
+        assert!(cause.contains("segmentation fault"), "got {cause}");
+        assert!(cause.contains("killed"), "got {cause}");
+        assert!(cause.contains("stock"), "shard-named: {cause}");
+        assert!(cause.contains("xray"), "shard-named: {cause}");
+        assert!(controller.poll().is_none(), "causes reported once");
+    }
+
+    /// Scenario: custom full-config with nested tun/dns → rejected naming the
+    /// key and its path (never values).
+    #[test]
+    fn t23_nested_system_mutation_rejected_with_path() {
+        for (key, doc) in [
+            (
+                "tun",
+                json!({"core": "stock",
+                       "config": {"outbounds": [{"type": "direct", "tag": "direct"}],
+                                  "route": {"rules": [{"tun": {"secret": "hunter2"}}]}}}),
+            ),
+            (
+                "dns",
+                json!({"core": "fork",
+                       "config": {"outbounds": [{"type": "direct", "tag": "direct"}],
+                                  "dns": {"servers": ["example.com"]}}}),
+            ),
+            (
+                "set_system_proxy",
+                json!({"core": "xray",
+                       "config": {"outbounds": [{"type": "direct", "tag": "direct"}],
+                                  "inbounds": [{"set_system_proxy": true}]}}),
+            ),
+        ] {
+            let evil = fixture("7", "Evil", "custom-config", doc, "127.0.0.1", 10807);
+            let (mut controller, stock, fork, xray, _) = EngineController::fake_quartet();
+            let error = controller
+                .start_all(std::slice::from_ref(&evil))
+                .expect_err(&format!("nested {key} rejected"));
+            let text = error.to_string();
+            assert!(matches!(error, EngineError::BadCustom { .. }), "got {text}");
+            assert!(text.contains(key), "names the key: {text}");
+            assert!(text.contains('$'), "names the path: {text}");
+            assert!(!text.contains("hunter2"), "no values: {text}");
+            assert!(!stock.is_running() && !fork.is_running() && !xray.is_running());
+        }
+    }
+
+    /// SEC-MED: controller-level LAN enforcement, independent of any UI gate.
+    /// (`0.0.0.0` stands in for a LAN bind: non-loopback, and bindable on
+    /// any host so the port probe passes.)
+    #[test]
+    fn t23_lan_enforcement_without_ui_gate() {
+        let lan = fixture(
+            "9",
+            "LanRow",
+            "shadowsocks",
+            ss_params("pass1"),
+            "0.0.0.0",
+            10809,
+        );
+        let (mut controller, stock) = EngineController::fake();
+        let error = controller
+            .start_one(&lan)
+            .expect_err("unconfirmed LAN start fails");
+        assert!(
+            matches!(error, EngineError::LanConfirmRequired { .. }),
+            "typed gate, got {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("\"LanRow\""), "names row: {text}");
+        assert!(text.contains("0.0.0.0"), "names bind: {text}");
+        assert!(!stock.is_running(), "nothing started");
+        assert_eq!(controller.running_count(), 0);
+
+        controller
+            .start_one_confirmed(&lan)
+            .expect("confirmed LAN start works");
+        assert!(stock.is_running());
+        assert_eq!(controller.running_count(), 1);
+
+        // The confirm sticks to (id, bind): an edited bind re-requires it.
+        let mut moved = lan.clone();
+        moved.bind_ip = "10.0.0.5".to_string();
+        let error = controller
+            .start_one(&moved)
+            .expect_err("moved bind re-requires confirm");
+        assert!(matches!(error, EngineError::LanConfirmRequired { .. }));
+        // Loopback rows never trip the gate.
+        let loopback = fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            10801,
+        );
+        controller.start_one(&loopback).expect("loopback starts");
+    }
+
+    /// HIGH: a failed spawn rolls the touched shards back to their previously
+    /// served configs and restores the membership (no split brain, no lie).
+    #[test]
+    fn t23_spawn_failure_rolls_back_serving_set() {
+        let (mut controller, stock, _fork) = EngineController::fake_pair();
+        controller.set_fork_probe(|| Ok(PathBuf::from("test-fork-bin")));
+        let alpha = fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            10801,
+        );
+        controller.start_one(&alpha).expect("alpha starts");
+        let served_before = stock.last_config().expect("served config");
+        assert!(served_before.contains("pass1"));
+
+        // The next spawn fails once (then the driver is healthy again, so the
+        // rollback restore succeeds).
+        stock.fail_start("stock: address in use");
+        let beta = fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10802);
+        let error = controller.start_one(&beta).expect_err("spawn fails");
+        assert!(
+            matches!(error, EngineError::SpawnFailed { .. }),
+            "got {error}"
+        );
+        assert_eq!(
+            controller.running_ids(),
+            vec!["1".to_string()],
+            "membership restored"
+        );
+        assert!(stock.is_running(), "shard restored to previous config");
+        let served_after = stock.last_config().expect("restored config");
+        assert_eq!(served_before, served_after, "previous config re-served");
+        assert_eq!(controller.status(), &EngineStatus::Running);
+        stock.clear_failures();
+    }
+
+    /// MED: probe-bind catches a foreign holder before anything stops, and
+    /// loopback aliases conflict (localhost ≡ 127.0.0.1).
+    #[test]
+    fn t23_port_probe_and_alias_conflict() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = held.local_addr().expect("addr").port();
+        let squatter = fixture(
+            "9",
+            "Squatter",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            port,
+        );
+        let (mut controller, stock) = EngineController::fake();
+        let error = controller
+            .start_all(std::slice::from_ref(&squatter))
+            .expect_err("held port fails");
+        assert!(
+            matches!(error, EngineError::PortUnavailable { .. }),
+            "typed, got {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains(&port.to_string()), "names port: {text}");
+        assert!(text.contains("\"Squatter\""), "names row: {text}");
+        assert!(!stock.is_running(), "nothing stopped, nothing started");
+        drop(held);
+
+        let alias_rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10831,
+            ),
+            fixture("2", "Beta", "vless", vless_params(), "localhost", 10831),
+        ];
+        let error = validate_activation(&alias_rows).expect_err("alias conflict");
+        let text = error.to_string();
+        assert!(matches!(error, EngineError::PortConflict { .. }));
+        assert!(
+            text.contains("\"Alpha\"") && text.contains("\"Beta\""),
+            "{text}"
+        );
+    }
+
+    /// LOW: duplicated ids name the id instead of serving garbage.
+    #[test]
+    fn t23_duplicate_id_names_id() {
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            fixture(
+                "1",
+                "Clone",
+                "shadowsocks",
+                ss_params("pass2"),
+                "127.0.0.1",
+                10802,
+            ),
+        ];
+        let error = validate_activation(&rows).expect_err("dup id fails");
+        let text = error.to_string();
+        assert!(text.contains("\"1\""), "names the id: {text}");
+    }
+
+    /// LOW: the emptied extra slot forgets its executable.
+    #[test]
+    fn t23_extra_exe_cleared_when_slot_empties() {
+        let mut real = RealEngineBackend::extra_slot();
+        real.set_extra_exe(PathBuf::from("user-core.exe"));
+        assert!(real.extra_exe.is_some());
+        real.clear_extra_exe();
+        assert!(real.extra_exe.is_none(), "slot forgotten");
+    }
+
+    /// Unique temp paths per backend instance (pid-suffixed, never shared).
+    #[test]
+    fn t23_config_paths_unique_per_instance() {
+        let backends = [
+            RealEngineBackend::new(),
+            RealEngineBackend::fork(),
+            RealEngineBackend::xray(),
+            RealEngineBackend::extra_slot(),
+            RealEngineBackend::new(),
+        ];
+        let mut seen = HashSet::new();
+        for backend in &backends {
+            let path = &backend.config_path;
+            assert!(seen.insert(path.clone()), "shared path: {}", path.display());
+            let name = path.file_name().expect("file name").to_string_lossy();
+            assert!(
+                name.contains(&std::process::id().to_string()),
+                "pid suffix: {name}"
+            );
+        }
+    }
+
+    /// Restricted writes + Drop teardown leave no secret file behind.
+    #[test]
+    fn t23_drop_removes_secret_file() {
+        let path = {
+            let real = RealEngineBackend::new();
+            let path = real.config_path.clone();
+            real.write_config("{\"password\": \"hunter2\"}")
+                .expect("restricted write works");
+            assert!(path.exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "owner-only, got {mode:o}");
+            }
+            path
+        };
+        assert!(!path.exists(), "drop cleaned: {}", path.display());
     }
 }

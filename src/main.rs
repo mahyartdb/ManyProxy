@@ -29,8 +29,8 @@ use engine::{
     EngineController, LAN_CONFIRM_TITLE,
 };
 use health::{
-    ping_all, test_all, truncate, HealthProber, HealthStore, LogStore, RealHealthProber,
-    TestOutcome, DEFAULT_TEST_URL,
+    ping_all, redact_secrets, test_all, truncate, HealthProber, HealthStore, LogStore,
+    RealHealthProber, TestOutcome, DEFAULT_TEST_URL,
 };
 use import::{
     commit_batch, effective_hint_for_text, format_import_failures, import_file_content,
@@ -1339,6 +1339,8 @@ impl AppView {
 
     /// Ticket 09: the actual single start (post-gate). Looks the config up
     /// fresh so a confirmed dialog never starts a stale row.
+    /// Ticket 23: post-gate starts use the confirmed variant (the controller
+    /// enforces LAN confirms itself); check output is redacted for display.
     fn commit_start_selected(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(Some(config)) = self.store.get(id) else {
             return;
@@ -1346,7 +1348,7 @@ impl AppView {
         if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
             window.push_notification(Notification::warning(warning), cx);
         }
-        match self.engine.start_one(&config) {
+        match self.engine.start_one_confirmed(&config) {
             Ok(()) => {
                 let _ = self.store.set_enabled(id, true);
                 self.reload(window, cx);
@@ -1356,7 +1358,8 @@ impl AppView {
                 );
             }
             Err(error) => {
-                window.push_notification(Notification::error(error.to_string()), cx);
+                window
+                    .push_notification(Notification::error(redact_secrets(&error.to_string())), cx);
             }
         }
     }
@@ -1419,13 +1422,15 @@ impl AppView {
     /// Ticket 09: the actual start-all (post-gate). Rows are re-listed so a
     /// confirmed dialog never starts a stale set.
     /// Ticket 17: an empty library warns honestly (never "Started 0").
+    /// Ticket 23: post-gate starts use the confirmed variant; check output
+    /// is redacted for display.
     fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.store.list().unwrap_or_default();
         if rows.is_empty() {
             window.push_notification(Notification::warning(start_all_message(0)), cx);
             return;
         }
-        match self.engine.start_all(&rows) {
+        match self.engine.start_all_confirmed(&rows) {
             Ok(()) => {
                 for row in &rows {
                     let _ = self.store.set_enabled(&row.id, true);
@@ -1435,7 +1440,8 @@ impl AppView {
                 window.push_notification(Notification::success(start_all_message(rows.len())), cx);
             }
             Err(error) => {
-                window.push_notification(Notification::error(error.to_string()), cx);
+                window
+                    .push_notification(Notification::error(redact_secrets(&error.to_string())), cx);
             }
         }
     }
