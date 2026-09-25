@@ -12,3 +12,6 @@ futures = "0.3"
 
 [dev-dependencies]
 gpui-kit = { version = "0.6", features = ["test-support"] }
+
+[build-dependencies]
+embed-resource = "3"

@@ -53,6 +53,23 @@ pub const ENGINE_POLL_TICK_SECS: u64 = 5;
 pub const DUE_SUBSCRIPTION_TICK_SECS: u64 = 300;
 pub const REPROBE_TICK_SECS: u64 = 60;
 
+/// Ticket 21: single branding seam — the OS window title and the TitleBar
+/// caption both read this name (the exe icon is `assets/icon.ico`, wired
+/// through `manyproxy.rc` + `build.rs`).
+pub const APP_TITLE: &str = "ManyProxy";
+
+/// Ticket 21: window options with the branded OS title. The base is
+/// [`TitleBar::window_options`]; `WindowOptions` itself has no title field —
+/// the initial title lives in `TitlebarOptions::title`, which the base
+/// leaves as `None`.
+fn app_window_options() -> WindowOptions {
+    let mut options = TitleBar::window_options();
+    if let Some(titlebar) = options.titlebar.as_mut() {
+        titlebar.title = Some(APP_TITLE.into());
+    }
+    options
+}
+
 /// Delegate for the configuration library list.
 ///
 /// Ticket 02: renders stored rows with stable domain ids
@@ -2959,7 +2976,7 @@ impl Render for AppView {
                     view.import_dropped_files(paths, window, cx);
                 });
             })
-            .child(TitleBar::new())
+            .child(TitleBar::new().child(APP_TITLE))
             .child(
                 div()
                     .id("manyproxy-toolbar")
@@ -3049,7 +3066,7 @@ fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
         cx.spawn(async move |cx| {
-            cx.open_window(TitleBar::window_options(), |window, cx| {
+            cx.open_window(app_window_options(), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 view.update(cx, |view, cx| {
                     view.refresh_due_on_startup(cx);
@@ -3084,6 +3101,31 @@ mod tests {
             bind_ip: String::new(),
             port: String::new(),
         }
+    }
+
+    /// Ticket 21: the branded window options carry the OS title (the
+    /// `TitleBar::window_options` base leaves `TitlebarOptions::title` as
+    /// `None`, which renders as untitled).
+    #[test]
+    fn window_options_carry_app_title() {
+        let options = crate::app_window_options();
+        let title = options
+            .titlebar
+            .expect("titlebar options")
+            .title
+            .expect("window title");
+        assert_eq!(title.as_str(), crate::APP_TITLE);
+    }
+
+    /// Ticket 21: the exe icon asset is committed in the repo (no external
+    /// fetch at build) and is a well-formed ICO.
+    #[test]
+    fn exe_icon_asset_is_valid_ico() {
+        let bytes = std::fs::read("assets/icon.ico").expect("assets/icon.ico is committed");
+        assert!(bytes.len() > 6, "non-trivial icon file");
+        assert_eq!(&bytes[0..4], &[0, 0, 1, 0], "ICO magic");
+        let count = u16::from_le_bytes([bytes[4], bytes[5]]);
+        assert!(count >= 1, "at least one icon image");
     }
 
     /// Ticket 01, scenario 1: cold start shows an empty library.
