@@ -11,7 +11,7 @@ Users juggle many proxy configurations (personal, work, regional, test accounts)
 - **CAP-3 — Local proxy per config**: each active config exposes one local endpoint usable as SOCKS5 and HTTP proxy on the configured bind (default loopback). Intent: drop-in proxy URL per config. Success: `socks5://bind:port` and `http://bind:port` both route through that config only.
 - **CAP-4 — Protocol parity (Throne-like)**: supports Shadowsocks, Trojan, VMess, VLESS, TUIC, Hysteria, Hysteria2, AnyTLS, WireGuard, AmneziaWG variants + Noise obfuscation, SSH, custom outbound JSON, custom full config, chained outbounds, extra-core executable slot, Xray-only VLESS. Intent: no config left behind. Success: each listed type imports and connects.
 - **CAP-5 — Import & subscriptions**: paste share links, drag-drop, clipboard import, JSON array import, subscription URL with refresh. Intent: Throne-compatible intake. Success: link, JSON, subscription all land in library with group preserved.
-- **CAP-6 — Health & insight**: per-config URL test/latency, TCP ping, traffic counters, process/file logs. Intent: know what works. Success: dead config flagged, live latency shown, logs identify failing config.
+- **CAP-6 — Health & insight**: per-config URL test/latency, TCP ping, traffic counters, process/file logs. Intent: know what works. Success: dead config flagged, live latency shown, logs identify failing config. Note: v1 counters measure probe bytes; data-plane byte counts are deferred.
 - **CAP-7 — Desktop management UX**: searchable virtualized list, add/edit dialogs, copy-proxy-URL action, status bar totals, keyboard operable. Intent: fast at 50+ rows. Success: keyboard-only add→start→copy flow; list stays smooth at 50 rows.
 
 ### User Story 1 — Many local proxies, no system change (Priority: P1)
@@ -77,6 +77,7 @@ As a user with 20+ actives, I want latency and traffic per row plus logs, so tha
 - System proxy mode, TUN/virtual-interface mode, OS DNS rewriting.
 - Routing-rule editor / remote routing profiles (v1 uses default direct + block; per-endpoint isolation only).
 - Mobile apps, browser extensions, cloud sync, team management.
+- OS-keychain/DPAPI credential encryption (backlog; v1 relies on OS file ACLs + permission hardening).
 - Automatic protocol detection for malformed links beyond Throne-compatible formats.
 
 ## Success signal
@@ -95,7 +96,7 @@ As a user with 20+ actives, I want latency and traffic per row plus logs, so tha
 
 - **Always**: per-config enable/start/stop; unique loopback-default bind; port-conflict error naming both parties; secrets redacted in logs/clipboard; LAN bind behind explicit warning.
 - **Ask first**: any OS network mutation; new protocol/first sidecar; changing default port ranges; telemetry of any kind.
-- **Never**: require admin for default loopback use; silently fall back to a different egress; store or log private keys/tokens in plaintext export; invent tray/backend APIs (capability seam + fallback only).
+- **Never**: require admin for default loopback use; silently fall back to a different egress; export secrets without an explicit verbatim plaintext warning plus confirm; invent tray/backend APIs (capability seam + fallback only).
 
 ## Assumptions
 
@@ -105,6 +106,7 @@ ASSUMPTIONS I'M MAKING:
 2. Subscription formats: share links + JSON arrays + v2rayN + limited Clash/SS, same as Throne (not full Clash rule engine).
 3. AmneziaWG/Noise runs via compatible fork/sidecar, Xray-only via sidecar — not native schema fields.
 4. Tested scale target 50 stored / 20 concurrent; design imposes no hard cap.
+5. Extra-core slots are N named slots (not one); auto-port assignment spans an expanded range with spillover and honest exhaustion instead of a 199-port cap.
 5. Windows-first; Linux/macOS later.
    → Correct me now or I'll proceed with these.
 
