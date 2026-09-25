@@ -6,7 +6,7 @@
 
 **Owns:** rust-networking
 
-**Status:** ready-for-agent
+**Status:** done (commit 1715713; `cargo test` 95 passed, verified; live-egress/OS-snapshot proof deferred to 09)
 
 - [ ] Scenario: 3 stopped standard configs → Action: start all → Expected: 3 reachable endpoints, each returning its own egress on both socks5:// and http:// forms. Verification: integration check. Priority: required.
 - [ ] Scenario: 2 running, stop 1 → Action: stop one → Expected: its endpoint refuses connections, the other keeps serving. Verification: integration check. Priority: required.
