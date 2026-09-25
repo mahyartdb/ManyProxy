@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::button::Button;
-use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
+use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
@@ -221,6 +221,45 @@ fn dialog_field(id: &'static str, label: &str, state: Entity<InputState>) -> imp
         .gap_1()
         .child(Label::new(label))
         .child(Input::new(&state))
+}
+
+/// Ticket 18: shared commit signature for plain-dialog footers — the same
+/// closure runs on the Confirm key path (`button_props.on_ok`) and the
+/// footer OK click. Returns true when the dialog should close (false keeps
+/// it open, e.g. total import failure).
+type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
+
+/// Ticket 18: explicit mouse commit path for plain dialogs. A plain `Dialog`
+/// renders footer buttons ONLY via `.footer(...)` (`button_props.on_ok` fires
+/// on the Confirm key action alone), so every `open_dialog` dialog gets one
+/// of these footers. `commit` is the same `Rc`-shared closure the key path
+/// runs through `button_props.on_ok`: OK clicks commit identically (including
+/// stay-open-on-error — no close when it returns false) and Cancel closes
+/// with no side effects. The click never dispatches Confirm/Cancel, so one
+/// user action can never fire both paths (no double-commit). Button ids are
+/// stable per dialog; observability comes from the base button itself
+/// (`Button::new(id)` wraps a `div().id(id).test_support()`).
+fn dialog_footer(
+    ok_id: &'static str,
+    cancel_id: &'static str,
+    commit: DialogCommit,
+) -> DialogFooter {
+    let commit_click = commit.clone();
+    DialogFooter::new()
+        .child(
+            Button::new(cancel_id)
+                .label("Cancel")
+                .on_click(|_, window, cx| window.close_all_dialogs(cx)),
+        )
+        .child(
+            Button::new(ok_id)
+                .label("OK")
+                .on_click(move |_, window, cx| {
+                    if commit_click(window, cx) {
+                        window.close_all_dialogs(cx);
+                    }
+                }),
+        )
 }
 
 /// Handles to the add/edit dialog inputs. Entities are created once in the
@@ -1506,9 +1545,21 @@ impl AppView {
             Some(config) => format!("Logs — {}", config.name),
             None => "Logs".to_string(),
         };
+        // Ticket 18: Rc-shared with the footer OK button (mouse commits
+        // identically to the Confirm key path).
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let filter = reader.read(cx).value().to_string();
+            view.update(cx, |view, cx| {
+                view.log_filter = filter;
+                cx.notify();
+            });
+            window.close_all_dialogs(cx);
+            true
+        });
+        let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            let view = view.clone();
-            let reader = reader.clone();
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
             let mut body = div().flex().flex_col().gap_2().child(dialog_field(
                 "field-log-filter",
                 "Filter",
@@ -1527,20 +1578,19 @@ impl AppView {
                 list = list.child(line.clone());
             }
             body = body.child(list);
-            let view = view.clone();
-            dialog.title(title.clone()).child(body).button_props(
-                DialogButtonProps::default()
-                    .show_cancel(true)
-                    .on_ok(move |_, window, cx| {
-                        let filter = reader.read(cx).value().to_string();
-                        view.update(cx, |view, cx| {
-                            view.log_filter = filter;
-                            cx.notify();
-                        });
-                        window.close_all_dialogs(cx);
-                        true
-                    }),
-            )
+            dialog
+                .title(title.clone())
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "logs-dialog-ok",
+                    "logs-dialog-cancel",
+                    commit_click,
+                ))
         });
     }
 
@@ -1615,18 +1665,29 @@ impl AppView {
         let form = ConfigForm::blank(window, cx);
         let view = cx.entity();
         let reader = form.clone();
+        // Ticket 18: Rc-shared with the footer OK button (mouse commits
+        // identically to the Confirm key path, including stay-open-on-error).
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_add(reader.as_new(cx), window, cx)
+            })
+        });
+        let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
-            let view = view.clone();
-            let reader = reader.clone();
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
             dialog
                 .title("Add proxy configuration")
                 .child(form.clone().element(cx))
-                .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
-                    move |_, window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.commit_add(reader.as_new(cx), window, cx)
-                        })
-                    },
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "add-dialog-ok",
+                    "add-dialog-cancel",
+                    commit_click,
                 ))
         });
     }
@@ -1642,19 +1703,29 @@ impl AppView {
         let reader = form.clone();
         let id = config.id.clone();
         let title = format!("Edit {}", config.name);
+        // Ticket 18: Rc-shared with the footer OK button (mouse commits
+        // identically to the Confirm key path, including stay-open-on-error).
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit(&id, reader.as_patch(cx), window, cx)
+            })
+        });
+        let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
-            let view = view.clone();
-            let reader = reader.clone();
-            let id = id.clone();
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
             dialog
                 .title(title.clone())
                 .child(form.clone().element(cx))
-                .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
-                    move |_, window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.commit_edit(&id, reader.as_patch(cx), window, cx)
-                        })
-                    },
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "edit-dialog-ok",
+                    "edit-dialog-cancel",
+                    commit_click,
                 ))
         });
     }
@@ -1720,31 +1791,42 @@ impl AppView {
         };
         let view = cx.entity();
         let reader = form.clone();
+        // Ticket 18: Rc-shared with the footer OK button (mouse commits
+        // identically to the Confirm key path, including stay-open-on-error).
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let text = reader.text.read(cx).value().to_string();
+            let group = reader.group.read(cx).value().to_string();
+            let hint = reader.file_hint.clone();
+            let original = reader.original_text.clone();
+            let multi = reader.multi_files.clone();
+            view.update(cx, |view, cx| {
+                view.commit_import_with_context(
+                    text,
+                    group,
+                    hint,
+                    Some(original),
+                    multi,
+                    window,
+                    cx,
+                )
+            })
+        });
+        let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
-            let view = view.clone();
-            let reader = reader.clone();
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
             dialog
                 .title("Import proxy configurations")
                 .child(form.clone().element(cx))
-                .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
-                    move |_, window, cx| {
-                        let text = reader.text.read(cx).value().to_string();
-                        let group = reader.group.read(cx).value().to_string();
-                        let hint = reader.file_hint.clone();
-                        let original = reader.original_text.clone();
-                        let multi = reader.multi_files.clone();
-                        view.update(cx, |view, cx| {
-                            view.commit_import_with_context(
-                                text,
-                                group,
-                                hint,
-                                Some(original),
-                                multi,
-                                window,
-                                cx,
-                            )
-                        })
-                    },
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "import-dialog-ok",
+                    "import-dialog-cancel",
+                    commit_click,
                 ))
         });
     }
@@ -2407,7 +2489,27 @@ impl AppView {
                 *counts.entry(owner.to_string()).or_insert(0) += 1;
             }
         }
+        // Ticket 18: Rc-shared with the footer OK button (mouse commits
+        // identically to the Confirm key path; an empty add form just closes).
+        // `commit_view` is a clone: the builder below still needs `view` for
+        // the per-row Refresh / Auto / Remove buttons.
+        let commit_view = view.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let label = reader.label.read(cx).value().to_string();
+            let url = reader.url.read(cx).value().to_string();
+            let group = reader.group.read(cx).value().to_string();
+            let auto = *reader.auto_refresh.borrow();
+            if label.trim().is_empty() && url.trim().is_empty() {
+                return true;
+            }
+            commit_view.update(cx, |view, cx| {
+                view.commit_subscription_add(label, url, group, auto, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
             let view_for_rows = view.clone();
             let mut body = div().flex().flex_col().gap_2();
             if subs.is_empty() {
@@ -2421,24 +2523,19 @@ impl AppView {
                 ));
             }
             body = body.child(form.clone().element());
-            let view = view.clone();
-            let reader = reader.clone();
-            dialog.title("Subscriptions").child(body).button_props(
-                DialogButtonProps::default()
-                    .show_cancel(true)
-                    .on_ok(move |_, window, cx| {
-                        let label = reader.label.read(cx).value().to_string();
-                        let url = reader.url.read(cx).value().to_string();
-                        let group = reader.group.read(cx).value().to_string();
-                        let auto = *reader.auto_refresh.borrow();
-                        if label.trim().is_empty() && url.trim().is_empty() {
-                            return true;
-                        }
-                        view.update(cx, |view, cx| {
-                            view.commit_subscription_add(label, url, group, auto, window, cx)
-                        })
-                    }),
-            )
+            dialog
+                .title("Subscriptions")
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "subscriptions-dialog-ok",
+                    "subscriptions-dialog-cancel",
+                    commit_click,
+                ))
         });
     }
 
@@ -4946,5 +5043,191 @@ mod tests {
             ),
             Some("Files: a.conf, b.json".to_string())
         );
+    }
+
+    // -- Ticket 18: dialog footers (mouse OK/Cancel on every plain dialog) ---
+
+    /// Paint the freshly opened dialog to rest (same two-frame rhythm the
+    /// existing dialog tests use) so footer buttons are visible + clickable.
+    /// Callers set reduce-motion first (see below): without it the dialog's
+    /// 250ms slide-down entrance can still be in flight under parallel-test
+    /// load, moving the button between the click's down/up frames and
+    /// flaking the hit.
+    fn paint_dialog_open(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+    }
+
+    /// Scenario: import dialog with valid text → click OK → rows created,
+    /// dialog closes, one success toast. This is the previously-missing mouse
+    /// path end to end (plain `Dialog` paints no footer buttons on its own).
+    #[gpui_kit::test]
+    fn dialog_footer_ok_commits_import_end_to_end(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        // Settle the dialog entrance animation on its first frame so the
+        // click's down/up frames share one button position (framework's own
+        // dialog tests do the same).
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_import_dialog(
+                    "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one",
+                    "travel",
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("import-dialog-ok").is_some()));
+        cx.update(|window, cx| {
+            window.click("import-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "OK click closes the dialog"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "one click commits exactly one row (no double-commit)"
+        );
+        assert_eq!(notification_count(cx), 1, "one click fires one toast");
+        let group = view.read_with(cx, |view, _| {
+            view.store.list().expect("list works").remove(0).group
+        });
+        assert_eq!(group, "travel");
+    }
+
+    /// Scenario: add dialog → click Cancel → dialog closes, no row created.
+    #[gpui_kit::test]
+    fn dialog_footer_cancel_closes_add_without_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("add-dialog-cancel").is_some()));
+        cx.update(|window, cx| {
+            window.click("add-dialog-cancel", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Cancel closes the dialog"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "Cancel creates no row"
+        );
+        assert_eq!(notification_count(cx), 0, "Cancel fires no toast");
+    }
+
+    /// Scenario: every `open_dialog` call site renders a footer with stable
+    /// button ids — no dialog relies on the key-only commit path.
+    #[gpui_kit::test]
+    fn dialog_footers_audit_every_plain_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        for (open, ok, cancel) in [
+            ("add", "add-dialog-ok", "add-dialog-cancel"),
+            ("edit", "edit-dialog-ok", "edit-dialog-cancel"),
+            ("import", "import-dialog-ok", "import-dialog-cancel"),
+            (
+                "subscriptions",
+                "subscriptions-dialog-ok",
+                "subscriptions-dialog-cancel",
+            ),
+            ("logs", "logs-dialog-ok", "logs-dialog-cancel"),
+        ] {
+            let target = seeded.clone();
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| match open {
+                    "add" => view.open_add_dialog(window, cx),
+                    "edit" => view.open_edit_dialog(target, window, cx),
+                    "import" => view.open_import_dialog("vless://x", "travel", None, window, cx),
+                    "subscriptions" => view.open_subscriptions_dialog(window, cx),
+                    _ => view.open_logs_dialog(window, cx),
+                });
+            });
+            paint_dialog_open(cx);
+            assert!(
+                cx.update(|window, cx| window.has_active_dialog(cx)),
+                "{open} dialog opens"
+            );
+            assert!(
+                cx.update(|window, _| window.try_find(ok).is_some()),
+                "{open} dialog renders footer OK ({ok})"
+            );
+            assert!(
+                cx.update(|window, _| window.try_find(cancel).is_some()),
+                "{open} dialog renders footer Cancel ({cancel})"
+            );
+            cx.update(|window, cx| window.close_all_dialogs(cx));
+            cx.run_until_parked();
+        }
+    }
+
+    /// Scenario: footer OK with an invalid form behaves exactly like the
+    /// Enter path — stays open + error, never a silent close.
+    #[gpui_kit::test]
+    fn dialog_footer_ok_invalid_import_stays_open(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_import_dialog("bogus://x", "travel", None, window, cx);
+            });
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| {
+            window.click("import-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "invalid OK keeps the dialog open (same as Enter)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "nothing stored"
+        );
+        assert_eq!(notification_count(cx), 1, "one error notice, never silent");
     }
 }
