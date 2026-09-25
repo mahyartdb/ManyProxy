@@ -6,7 +6,7 @@
 
 **Owns:** api-and-interface-design
 
-**Status:** ready-for-agent
+**Status:** done (commit 49aaaea; `cargo test` 204 passed incl. RED-first TDD, verified)
 
 - [ ] Scenario: `ss://method:pw@host:8388/` → Action: import → Expected: parses (trailing slash tolerated). Verification: automated test. Priority: required.
 - [ ] Scenario: pasted `[interface]` lowercase conf → Action: import text → Expected: parsed as WireGuard conf. Verification: automated test. Priority: required.
