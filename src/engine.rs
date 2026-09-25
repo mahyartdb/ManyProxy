@@ -348,7 +348,7 @@ impl std::fmt::Display for EngineError {
                 };
                 write!(
                     f,
-                    "fork engine binary not found for {rows} (looked for {binary} in {searched}); install the AWG-capable fork — stock configs keep working, only AmneziaWG/Noise/XHTTP rows need it"
+                    "fork engine binary not found for {rows} (looked for {binary} in {searched}); install the AWG-capable fork — ManyProxy never downloads executables silently; stock configs keep working, only AmneziaWG/Noise/XHTTP rows need it"
                 )?;
                 if *xhttp {
                     write!(f, " ({XHTTP_KNOWN_BUGS})")?;
@@ -389,7 +389,7 @@ impl std::fmt::Display for EngineError {
                 };
                 write!(
                     f,
-                    "xray engine binary not found for {rows} (looked for {binary} in {searched}); install xray-core — stock configs keep working, only Xray-only rows need it"
+                    "xray engine binary not found for {rows} (looked for {binary} in {searched}); install xray-core — ManyProxy never downloads executables silently; stock configs keep working, only Xray-only rows need it"
                 )
             }
             EngineError::MissingExtraBinary {
@@ -3540,6 +3540,23 @@ impl EngineController {
             .map(|row| format!("\"{}\" serves on {} (LAN-visible)", row.name, row.bind_ip))
             .collect()
     }
+
+    /// Ticket 09: OS-mutation proof seam — fingerprint of the controlled
+    /// surface (active binds + generated-config hash). Equal before a
+    /// session and after stop-all; different while serving.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn session_fingerprint(&self) -> SessionFingerprint {
+        let mut binds: Vec<String> = self
+            .active
+            .iter()
+            .map(|row| format!("{}:{}", row.bind_ip.to_ascii_lowercase(), row.port))
+            .collect();
+        binds.sort();
+        SessionFingerprint {
+            binds,
+            config_hash: fnv1a_64(self.last_config_json.as_deref().unwrap_or("")),
+        }
+    }
 }
 
 /// True for loopback literals (spec: default bind; anything else is an
@@ -3561,6 +3578,102 @@ pub fn lan_exposure_warning(name: &str, bind: &str) -> Option<String> {
             "\"{name}\" binds {bind}: LAN-visible; anyone on the network can use this proxy"
         ))
     }
+}
+
+/// Ticket 09: confirm-dialog title shared by the single- and start-all LAN
+/// gates (spec boundary: LAN bind behind explicit warning + confirm).
+pub const LAN_CONFIRM_TITLE: &str = "Expose proxy on the local network?";
+
+/// Ticket 09: confirm-gate predicate — every non-loopback bind must pass an
+/// explicit user confirm before start. Unparseable binds fail closed
+/// (confirm required) instead of serving silently.
+pub fn requires_lan_confirm(bind: &str) -> bool {
+    !is_loopback_bind(bind)
+}
+
+/// Ticket 09: confirm-dialog copy for starting one LAN-bound config. Names
+/// the config and the bind only — never params, keys, or secrets.
+pub fn lan_confirm_text(name: &str, bind: &str) -> String {
+    format!(
+        "\"{name}\" will listen on {bind}, reachable by anyone on the local network. Start it anyway?"
+    )
+}
+
+/// Ticket 09: confirm-dialog copy for start-all with LAN-bound rows.
+/// `entries` are `(name, bind)` pairs; output names each pair, never
+/// secrets. Empty input yields the loopback-only sentence (no confirm
+/// needed upstream — callers check [`requires_lan_confirm`] first).
+pub fn lan_confirm_description(entries: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|(name, bind)| format!("\"{name}\" on {bind}"))
+        .collect();
+    lines.sort();
+    format!(
+        "These endpoints will be LAN-visible (anyone on the local network can use them): {}. Start them anyway?",
+        lines.join(", ")
+    )
+}
+
+/// Ticket 09: recursive forbidden-key scan over a generated engine JSON
+/// document (the OS-mutation structural proof). Rejects any `tun` / `dns`
+/// section and any `set_system_proxy` key at any depth. Errors name the
+/// offending key and its path only — never values.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn assert_no_system_mutation(config_json: &str) -> Result<(), String> {
+    let document: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|_| "generated config is not JSON".to_string())?;
+    fn walk(node: &serde_json::Value, path: &str) -> Result<(), String> {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    let lowered = key.to_ascii_lowercase();
+                    if lowered == "tun" || lowered == "dns" || lowered == "set_system_proxy" {
+                        return Err(format!("forbidden key \"{key}\" at {path}"));
+                    }
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(value, &child)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, &format!("{path}[{index}]"))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    walk(&document, "$")
+}
+
+/// Ticket 09: fingerprint of everything the app controls across a session
+/// (active `bind:port` set + hash of the last generated engine config).
+/// Snapshot before a session must equal the snapshot after stop-all; during
+/// a session it differs. OS-level proxy/DNS/route bytes still need a live
+/// run (see QUICKSTART-RUN.md) — this seam proves the app side neither
+/// retains residue nor mutates anything across the session. Carries binds
+/// and a hash only, never params or secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct SessionFingerprint {
+    pub binds: Vec<String>,
+    pub config_hash: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn fnv1a_64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -3877,6 +3990,156 @@ mod tests {
         let warnings = controller.lan_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("\"Alpha\""));
+    }
+
+    // -- Ticket 09: hardening + release proof --------------------------------
+
+    /// Confirm gate blocks every non-loopback bind (and fails closed on
+    /// garbage); loopback stays quiet.
+    #[test]
+    fn lan_confirm_gate_blocks_non_loopback_only() {
+        assert!(!requires_lan_confirm("127.0.0.1"));
+        assert!(!requires_lan_confirm("::1"));
+        assert!(!requires_lan_confirm(" 127.0.0.2 "));
+        assert!(requires_lan_confirm("0.0.0.0"));
+        assert!(requires_lan_confirm("::"));
+        assert!(requires_lan_confirm("192.168.1.20"));
+        assert!(requires_lan_confirm("not-an-ip"), "garbage fails closed");
+        assert!(requires_lan_confirm(""), "blank fails closed");
+    }
+
+    /// Confirm copy names the config + bind and carries no secrets, even
+    /// when the row's params are secret-laden.
+    #[test]
+    fn lan_confirm_text_names_config_without_secrets() {
+        let single = lan_confirm_text("Home", "0.0.0.0");
+        assert!(single.contains("\"Home\""), "names config: {single}");
+        assert!(single.contains("0.0.0.0"), "names bind: {single}");
+        for canary in ["hunter2", "LOCAL-PRIVATE", "SECRET-UUID"] {
+            assert!(!single.contains(canary), "no secrets: {single}");
+        }
+        let multi = lan_confirm_description(&[
+            ("Beta".to_string(), "192.168.1.20".to_string()),
+            ("Alpha".to_string(), "0.0.0.0".to_string()),
+        ]);
+        assert!(
+            multi.contains("\"Alpha\" on 0.0.0.0"),
+            "names pair: {multi}"
+        );
+        assert!(
+            multi.contains("\"Beta\" on 192.168.1.20"),
+            "names pair: {multi}"
+        );
+        for canary in ["hunter2", "LOCAL-PRIVATE", "SECRET-UUID"] {
+            assert!(!multi.contains(canary), "no secrets: {multi}");
+        }
+    }
+
+    /// OS-mutation proof: fingerprint before a session equals the fingerprint
+    /// after stop-all, differs while serving; the generated config carries
+    /// no tun/dns/set_system_proxy anywhere; the fingerprint itself leaks
+    /// no secret material.
+    #[test]
+    fn session_fingerprint_roundtrip_proves_no_residue() {
+        let (mut controller, _) = EngineController::fake();
+        let before = controller.session_fingerprint();
+        let rows = three_standard();
+        controller.start_all(&rows).expect("session starts");
+        let during = controller.session_fingerprint();
+        assert_ne!(before, during, "serving differs from idle");
+        assert_eq!(during.binds.len(), 3);
+        let generated = generate(&rows).expect("standard set generates");
+        assert_no_system_mutation(&generated.value().to_string())
+            .expect("generated config has no system-mutation keys");
+        controller.stop_all();
+        let after = controller.session_fingerprint();
+        assert_eq!(before, after, "stop-all leaves no residue");
+        let debug = format!("{after:?}");
+        for canary in ["pass1", "TOP-SECRET", "LOCAL-PRIVATE", "11111111-2222"] {
+            assert!(
+                !debug.contains(canary),
+                "fingerprint leaks no secrets: {debug}"
+            );
+        }
+    }
+
+    /// The mutation scan rejects each forbidden key at top level and nested,
+    /// naming the key (never values); clean documents pass.
+    #[test]
+    fn mutation_scan_rejects_forbidden_keys() {
+        for (label, doc) in [
+            (
+                "top tun",
+                r#"{"tun": {}, "inbounds": [], "outbounds": [], "endpoints": []}"#,
+            ),
+            (
+                "top dns",
+                r#"{"dns": {}, "inbounds": [], "outbounds": [], "endpoints": []}"#,
+            ),
+            (
+                "nested set_system_proxy",
+                r#"{"inbounds": [{"set_system_proxy": true}]}"#,
+            ),
+            ("deep dns", r#"{"route": {"rules": [{"dns": "x"}]}}"#),
+        ] {
+            let error = assert_no_system_mutation(doc).unwrap_err();
+            assert!(
+                error.contains("forbidden key"),
+                "{label}: names the key class, got {error}"
+            );
+        }
+        assert_no_system_mutation(r#"{"inbounds": [], "domain_strategy": "x"}"#)
+            .expect("lookalike keys pass");
+        assert!(assert_no_system_mutation("{not json}").is_err());
+    }
+
+    /// Release prohibitions, machine-checked half: every missing-binary error
+    /// states the never-downloads contract (no silent binary replacement).
+    #[test]
+    fn missing_binaries_state_never_downloads() {
+        let stock = EngineError::MissingBinary {
+            searched: "app-dir + PATH".to_string(),
+        }
+        .to_string();
+        assert!(stock.contains("never downloads"), "contract text: {stock}");
+        let fork = EngineError::MissingForkBinary {
+            rows: "\"AWG\"".to_string(),
+            binary: FORK_BINARY_BASE.to_string(),
+            searched: "app-dir + PATH".to_string(),
+            xhttp: false,
+        }
+        .to_string();
+        assert!(fork.contains("never downloads"), "fork contract: {fork}");
+        let xray = EngineError::MissingXrayBinary {
+            rows: "\"VX\"".to_string(),
+            binary: XRAY_BINARY_BASE.to_string(),
+            searched: "app-dir + PATH".to_string(),
+        }
+        .to_string();
+        assert!(xray.contains("never downloads"), "xray contract: {xray}");
+        let extra = EngineError::MissingExtraBinary {
+            rows: "\"EC\"".to_string(),
+            binary: "extra-core".to_string(),
+            searched: "app dir".to_string(),
+        }
+        .to_string();
+        assert!(extra.contains("never downloads"), "extra contract: {extra}");
+        assert!(
+            extra.contains("never runs it privileged"),
+            "no-admin text: {extra}"
+        );
+    }
+
+    /// Binary resolution searches explicit directories only: no download, no
+    /// elevation, and the searched list is reported (empty roots fail typed).
+    #[test]
+    fn binary_resolution_never_elevates_or_downloads() {
+        let error = resolve_engine_binary_in(None, "").expect_err("empty search roots fail");
+        assert!(
+            matches!(error, EngineError::MissingBinary { .. }),
+            "typed failure, got {error}"
+        );
+        assert!(!error.to_string().is_empty());
     }
 
     /// Empty activation set is a typed error, not an empty engine config.

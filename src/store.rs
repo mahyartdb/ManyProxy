@@ -146,6 +146,15 @@ pub fn delete_confirm_text(name: &str) -> String {
     format!("Remove \"{name}\"? The stored configuration is deleted. Nothing else changes.")
 }
 
+/// Ticket 09: explicit warning copy for any user-owned plaintext export.
+/// v1 ships no export UI (local SQLite only); when an export path lands it
+/// must surface this text verbatim so private keys/tokens/passwords never
+/// leave silently.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn export_warning_text() -> &'static str {
+    "Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe."
+}
+
 /// Map one result row to a ProxyConfig. All columns are bound by position
 /// with explicit types (STRICT table guarantees the shapes).
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
@@ -1291,6 +1300,16 @@ mod tests {
             text.contains("Work VPN"),
             "confirm names the config, got {text}"
         );
+    }
+
+    /// Ticket 09: the export warning names every secret class it protects
+    /// (keys, tokens, passwords) and states the plaintext consequence.
+    #[test]
+    fn export_warning_names_secret_classes() {
+        let text = export_warning_text();
+        for class in ["private keys", "tokens", "passwords", "plaintext"] {
+            assert!(text.contains(class), "warning names {class}: {text}");
+        }
     }
 
     /// File-backed stores persist across reopen (restart scenario).

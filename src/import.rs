@@ -1967,13 +1967,34 @@ fn import_clash_proxies(content: &str) -> BatchResult {
     out
 }
 
-/// Redact credentials (`scheme://…@`) and truncate, for notifications and
-/// logs (boundary: secrets never reach logs/clipboard).
+/// Redact credentials (`scheme://…@`) and query values, then truncate, for
+/// notifications and logs (boundary: secrets never reach logs/clipboard).
+/// Query keys stay (they diagnose failures); values go (some schemes carry
+/// key material like reality `pbk` in the query). Fragments (remarks) stay:
+/// remarks are display names by design.
 pub fn redact_link(line: &str) -> String {
     let mut text = line.trim().to_string();
     if let Some(scheme_end) = text.find("://") {
         if let Some(at) = text[scheme_end + 3..].find('@') {
             text.replace_range(scheme_end + 3..scheme_end + 3 + at, "…");
+        }
+    }
+    if let Some(query_start) = text.find('?') {
+        let frag_start = text.find('#').unwrap_or(text.len());
+        if query_start < frag_start {
+            let mut pairs = Vec::new();
+            for pair in text[query_start + 1..frag_start].split('&') {
+                match pair.find('=') {
+                    Some(eq) => pairs.push(format!("{}=…", &pair[..eq])),
+                    None => pairs.push(pair.to_string()),
+                }
+            }
+            text = format!(
+                "{}?{}{}",
+                &text[..query_start],
+                pairs.join("&"),
+                &text[frag_start..]
+            );
         }
     }
     const LIMIT: usize = 96;
@@ -2529,6 +2550,46 @@ mod tests {
         let redacted = redact_link("vless://my-secret-uuid@example.com:443#x");
         assert!(!redacted.contains("my-secret-uuid"), "got {redacted}");
         assert!(redacted.contains("example.com"), "got {redacted}");
+    }
+
+    /// Ticket 09: failure labels scrub query values (reality `pbk` and
+    /// friends) while keeping the keys; a broken link carrying key material
+    /// in the query exposes nothing via the import notification path.
+    #[test]
+    fn redact_link_scrubs_query_values_keeps_keys() {
+        let redacted = redact_link(
+            "vless://11111111-2222-4333-8444-555555555555@example.com:notaport?security=reality&pbk=SECRET-PBK&sid=1234#x",
+        );
+        assert!(!redacted.contains("SECRET-PBK"), "got {redacted}");
+        assert!(!redacted.contains("sid=1234"), "got {redacted}");
+        assert!(redacted.contains("pbk="), "key kept: {redacted}");
+        assert!(redacted.contains("example.com"), "host kept: {redacted}");
+    }
+
+    /// Ticket 09: end-to-end over the notification path — a batch whose
+    /// broken item carries secrets yields failure display strings
+    /// (`item {index} ({label}): {reason}`) with no plaintext secret.
+    #[test]
+    fn failure_display_strings_carry_no_plaintext_secrets() {
+        let body = [
+            &format!("vless://{UUID}@a.example.com:443#ok"),
+            "vless://not-a-uuid@b.example.com:notaport?security=reality&pbk=hunter2-public-key#bad",
+            "trojan://s3cret-pw@c.example.com:443#also-ok",
+        ]
+        .join("\n");
+        let out = import_text(&body);
+        assert_eq!(out.failures.len(), 1);
+        let failure = &out.failures[0];
+        let display = format!(
+            "item {} ({}): {}",
+            failure.index + 1,
+            failure.label,
+            failure.reason
+        );
+        for canary in ["hunter2-public-key", "not-a-uuid", "s3cret-pw"] {
+            assert!(!display.contains(canary), "leak in {display}");
+        }
+        assert!(display.contains("b.example.com"), "host kept: {display}");
     }
 
     // -- ticket 04: subscription bodies, identity, addsub --------------------

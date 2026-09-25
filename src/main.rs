@@ -21,7 +21,10 @@ use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
 
-use engine::{lan_exposure_warning, EngineController};
+use engine::{
+    lan_confirm_description, lan_confirm_text, lan_exposure_warning, requires_lan_confirm,
+    EngineController, LAN_CONFIRM_TITLE,
+};
 use health::{
     ping_all, test_all, HealthProber, HealthStore, LogStore, RealHealthProber, DEFAULT_TEST_URL,
 };
@@ -386,10 +389,12 @@ fn redact_subscription_url(url: &str) -> String {
 }
 
 /// Ticket 04: default subscription label derived from the URL host (never
-/// the query, which may carry a token).
+/// the userinfo, never the query — both may carry a token).
+/// Ticket 09: userinfo stripped too (a pasted URL can embed credentials).
 fn subscription_label_from_url(url: &str) -> String {
     let after = url.split("://").nth(1).unwrap_or(url);
     let host = after.split('/').next().unwrap_or(after);
+    let host = host.rsplit('@').next().unwrap_or(host);
     if host.trim().is_empty() {
         "Subscription".to_string()
     } else {
@@ -730,17 +735,58 @@ impl AppView {
     /// Ticket 05: start the selected config. The engine regenerates one
     /// combined config, runs the engine `check`, then restarts the sidecar;
     /// a port conflict names both configs and changes nothing.
+    /// Ticket 09: non-loopback binds stop at an explicit confirm dialog
+    /// first (LAN-exposure gate) — nothing starts until the user confirms.
     fn start_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             return;
         };
+        if requires_lan_confirm(&config.bind_ip) {
+            self.open_lan_confirm_single(config, window, cx);
+            return;
+        }
+        self.commit_start_selected(&config.id, window, cx);
+    }
+
+    /// Ticket 09: LAN confirm gate for one config. The dialog names the
+    /// config + bind only (see [`lan_confirm_text`]); confirming starts it,
+    /// dismissing changes nothing.
+    fn open_lan_confirm_single(
+        &mut self,
+        config: ProxyConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
         let id = config.id.clone();
+        let description = lan_confirm_text(&config.name, &config.bind_ip);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let id = id.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title(LAN_CONFIRM_TITLE)
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_start_selected(&id, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Ticket 09: the actual single start (post-gate). Looks the config up
+    /// fresh so a confirmed dialog never starts a stale row.
+    fn commit_start_selected(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(Some(config)) = self.store.get(id) else {
+            return;
+        };
         if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
             window.push_notification(Notification::warning(warning), cx);
         }
         match self.engine.start_one(&config) {
             Ok(()) => {
-                let _ = self.store.set_enabled(&id, true);
+                let _ = self.store.set_enabled(id, true);
                 self.reload(cx);
                 window.push_notification(
                     Notification::success(format!("Started \"{}\"", config.name)),
@@ -772,7 +818,38 @@ impl AppView {
 
     /// Ticket 05: start every stored config at once (each keeps its own
     /// endpoint; the enabled flag follows the engine state).
+    /// Ticket 09: any non-loopback bind routes through one confirm dialog
+    /// naming every LAN-bound row — nothing starts until the user confirms.
     fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.store.list().unwrap_or_default();
+        let lan: Vec<(String, String)> = rows
+            .iter()
+            .filter(|row| requires_lan_confirm(&row.bind_ip))
+            .map(|row| (row.name.clone(), row.bind_ip.clone()))
+            .collect();
+        if !lan.is_empty() {
+            let view = cx.entity();
+            let description = lan_confirm_description(&lan);
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let view = view.clone();
+                let description = description.clone();
+                alert
+                    .confirm()
+                    .title(LAN_CONFIRM_TITLE)
+                    .description(description)
+                    .on_ok(move |_, window, cx| {
+                        view.update(cx, |view, cx| view.commit_start_all(window, cx));
+                        true
+                    })
+            });
+            return;
+        }
+        self.commit_start_all(window, cx);
+    }
+
+    /// Ticket 09: the actual start-all (post-gate). Rows are re-listed so a
+    /// confirmed dialog never starts a stale set.
+    fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.store.list().unwrap_or_default();
         match self.engine.start_all(&rows) {
             Ok(()) => {
@@ -2280,5 +2357,159 @@ mod tests {
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-log-filter").is_some()));
         assert!(cx.update(|window, _| window.try_find("log-lines").is_some()));
+    }
+
+    // -- Ticket 09: hardening + release proof --------------------------------
+
+    /// Subscription labels never carry credentials: userinfo and query are
+    /// both stripped (the only network surface besides health probes is the
+    /// user-initiated subscription refresh, and its errors never echo URLs).
+    #[test]
+    fn subscription_label_strips_credentials_and_query() {
+        use crate::subscription_label_from_url;
+        assert_eq!(
+            subscription_label_from_url("https://example.com/sub?id=42"),
+            "example.com"
+        );
+        let labeled =
+            subscription_label_from_url("https://user:hunter2@example.com:8443/sub?token=abc");
+        assert!(!labeled.contains("hunter2"), "no password: {labeled}");
+        assert!(!labeled.contains("token=abc"), "no query: {labeled}");
+        assert!(labeled.contains("example.com"), "host kept: {labeled}");
+        assert_eq!(subscription_label_from_url(""), "Subscription");
+    }
+
+    /// Copy-URL clipboard content is bind + port only: no params, keys, or
+    /// tokens can reach the clipboard through this path by construction.
+    #[test]
+    fn copy_urls_carry_binds_not_secrets() {
+        use crate::store::proxy_urls;
+        let (socks, http) = proxy_urls("127.0.0.1", 10801);
+        assert_eq!(socks, "socks5://127.0.0.1:10801");
+        assert_eq!(http, "http://127.0.0.1:10801");
+        for canary in ["hunter2", "LOCAL-PRIVATE", "SECRET-UUID", "token=abc"] {
+            assert!(!socks.contains(canary));
+            assert!(!http.contains(canary));
+        }
+    }
+
+    fn seed_lan_input(name: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: String::new(),
+            group: String::new(),
+            bind_ip: "0.0.0.0".to_string(),
+            port: String::new(),
+        }
+    }
+
+    /// LAN single-start stops at the confirm gate: a dialog opens and the
+    /// engine stays stopped until the user confirms.
+    #[gpui_kit::test]
+    fn lan_single_start_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_lan_input("Lan")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+                view.start_selected_engine(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts before confirm"
+        );
+    }
+
+    /// LAN start-all stops at the confirm gate too: one dialog naming the
+    /// LAN rows, engine stopped until confirm.
+    #[gpui_kit::test]
+    fn lan_start_all_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Loop")).expect("seed works");
+        store.add(seed_lan_input("Lan")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts before confirm"
+        );
+    }
+
+    /// Loopback single-start skips the confirm gate (no dialog); the start
+    /// itself fails here only because no real sidecar binary ships in tests.
+    #[gpui_kit::test]
+    fn loopback_single_start_skips_confirm(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Loop")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+                view.start_selected_engine(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 }
