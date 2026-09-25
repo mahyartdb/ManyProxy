@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 mod engine;
+mod health;
 mod import;
 mod store;
 
@@ -21,6 +22,9 @@ use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
 
 use engine::{lan_exposure_warning, EngineController};
+use health::{
+    ping_all, test_all, HealthProber, HealthStore, LogStore, RealHealthProber, DEFAULT_TEST_URL,
+};
 use import::{commit_batch, import_file_content, import_text, parse_addsub_link, AddSubRequest};
 use store::{
     delete_confirm_text, due_for_refresh, now_unix, proxy_urls, ConfigPatch, NewConfig,
@@ -38,6 +42,9 @@ struct LibraryDelegate {
     visible: Vec<usize>,
     query: String,
     selected: Option<IndexPath>,
+    /// Ticket 06: per-row health summary (`config_id` → `87ms` / `dead`);
+    /// empty or missing means untested (no health child rendered).
+    health: HashMap<String, String>,
 }
 
 impl LibraryDelegate {
@@ -47,6 +54,7 @@ impl LibraryDelegate {
             visible: Vec::new(),
             query: String::new(),
             selected: None,
+            health: HashMap::new(),
         }
     }
 
@@ -99,6 +107,12 @@ impl LibraryDelegate {
         self.selected = None;
     }
 
+    /// Ticket 06: replace the per-row health summaries (keyed by config id
+    /// so row replacement never misattributes a latency).
+    fn set_health(&mut self, health: HashMap<String, String>) {
+        self.health = health;
+    }
+
     /// (total rows, enabled rows) for the status bar.
     fn counts(&self) -> (usize, usize) {
         (
@@ -148,15 +162,19 @@ impl ListDelegate for LibraryDelegate {
             .map(|current| current.section == index.section && current.row == index.row)
             .unwrap_or(false);
         let status = if row.enabled { "on" } else { "off" };
-        Some(
-            ListItem::new(format!("library-row-{}", row.id))
-                .selected(selected)
-                .child(format!("{} [{status}]", row.name))
-                .child(format!(
-                    "{} · {} · {}:{}",
-                    row.protocol, row.group, row.bind_ip, row.port
-                )),
-        )
+        let mut item = ListItem::new(format!("library-row-{}", row.id))
+            .selected(selected)
+            .child(format!("{} [{status}]", row.name))
+            .child(format!(
+                "{} · {} · {}:{}",
+                row.protocol, row.group, row.bind_ip, row.port
+            ));
+        if let Some(summary) = self.health.get(&row.id) {
+            if !summary.is_empty() {
+                item = item.child(summary.clone());
+            }
+        }
+        Some(item)
     }
 
     fn render_empty(
@@ -535,6 +553,14 @@ struct AppView {
     /// active set). Production uses the real `sing-box` driver; tests swap
     /// in the fake via direct field assignment.
     engine: EngineController,
+    /// Ticket 06: health samples + traffic counters, redacted sidecar logs
+    /// with a per-config UI filter, and the boxed measure driver
+    /// (production dials each config's own endpoint; tests swap in the
+    /// fake via direct field assignment like the engine).
+    health_store: HealthStore,
+    logs: LogStore,
+    log_filter: String,
+    prober: Box<dyn HealthProber>,
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
@@ -570,6 +596,10 @@ impl AppView {
             libraries: libraries.clone(),
             store,
             engine: EngineController::production(),
+            health_store: HealthStore::default(),
+            logs: LogStore::default(),
+            log_filter: String::new(),
+            prober: Box::new(RealHealthProber::default()),
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
@@ -599,8 +629,10 @@ impl AppView {
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.poll_engine();
         if let Ok(rows) = self.store.list() {
+            let health = self.health_map();
             self.libraries.update(cx, |state, _| {
                 state.delegate_mut().set_rows(rows);
+                state.delegate_mut().set_health(health);
             });
         }
         cx.notify();
@@ -769,6 +801,195 @@ impl AppView {
         }
         self.reload(cx);
         window.push_notification(Notification::success("Stopped all endpoints"), cx);
+    }
+
+    /// Ticket 06: stored rows backing the running endpoints (each probe
+    /// dials its own row's endpoint, so results are per-egress).
+    fn active_health_rows(&self) -> Vec<ProxyConfig> {
+        let running = self.engine.running_ids();
+        self.store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| running.contains(&row.id))
+            .collect()
+    }
+
+    /// Ticket 06: per-row summaries for the virtualized list.
+    fn health_map(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for id in self.engine.running_ids() {
+            let summary = self.health_store.row_summary(&id);
+            if !summary.is_empty() {
+                map.insert(id, summary);
+            }
+        }
+        map
+    }
+
+    /// Ticket 06: `(live, dead)` over the running endpoints for the
+    /// status bar.
+    fn health_counts(&self) -> (usize, usize) {
+        self.health_store.counts(&self.engine.running_ids())
+    }
+
+    fn health_status_text(&self) -> String {
+        let (live, dead) = self.health_counts();
+        if live == 0 && dead == 0 {
+            "health: not tested".to_string()
+        } else {
+            format!("health: {live} live · {dead} dead")
+        }
+    }
+
+    /// Ticket 06: run one URL test per active endpoint, record samples +
+    /// traffic, refresh the rows, and summarize. Synchronous in v1 with a
+    /// bounded per-test timeout (background scheduling deferred).
+    fn test_all_health(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        let rows = self.active_health_rows();
+        if rows.is_empty() {
+            window.push_notification(Notification::warning("No running endpoints to test"), cx);
+            return 0;
+        }
+        let outcomes = test_all(&rows, DEFAULT_TEST_URL, &mut *self.prober);
+        for outcome in &outcomes {
+            self.health_store.record_outcome(outcome);
+        }
+        let (live, dead) = self.health_counts();
+        self.reload(cx);
+        window.push_notification(
+            Notification::success(format!(
+                "Tested {} endpoint(s): {live} live · {dead} dead",
+                outcomes.len()
+            )),
+            cx,
+        );
+        outcomes.len()
+    }
+
+    /// Ticket 06: URL-test just the selected config's endpoint.
+    fn test_selected_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            return;
+        };
+        if !self.engine.running_ids().contains(&config.id) {
+            window.push_notification(
+                Notification::warning(format!("\"{}\" is not running", config.name)),
+                cx,
+            );
+            return;
+        }
+        let outcomes = test_all(
+            std::slice::from_ref(&config),
+            DEFAULT_TEST_URL,
+            &mut *self.prober,
+        );
+        for outcome in &outcomes {
+            self.health_store.record_outcome(outcome);
+        }
+        self.reload(cx);
+    }
+
+    /// Ticket 06: TCP-ping just the selected config's endpoint.
+    fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            return;
+        };
+        if !self.engine.running_ids().contains(&config.id) {
+            window.push_notification(
+                Notification::warning(format!("\"{}\" is not running", config.name)),
+                cx,
+            );
+            return;
+        }
+        let outcomes = ping_all(std::slice::from_ref(&config), &mut *self.prober);
+        for outcome in &outcomes {
+            self.health_store.record_outcome(outcome);
+        }
+        self.reload(cx);
+    }
+
+    /// Ticket 06: visible log lines for the dialog — the selected config's
+    /// lines when a row is selected, else engine-global + all — further
+    /// narrowed by the `log_filter` substring. Newest last, capped.
+    fn log_lines(&self, cx: &App) -> Vec<String> {
+        let selected = self.selected_config(cx).map(|config| config.id);
+        let filter = self.log_filter.trim().to_lowercase();
+        let mut lines: Vec<String> = match selected.as_deref() {
+            Some(id) => self
+                .logs
+                .for_config(id)
+                .iter()
+                .map(|record| format!("[{}] {}", record.level.as_str(), record.message))
+                .collect(),
+            None => self
+                .logs
+                .all()
+                .iter()
+                .map(|record| format!("[{}] {}", record.level.as_str(), record.message))
+                .collect(),
+        };
+        if !filter.is_empty() {
+            lines.retain(|line| line.to_lowercase().contains(&filter));
+        }
+        if lines.len() > 200 {
+            lines = lines.split_off(lines.len() - 200);
+        }
+        lines
+    }
+
+    /// Ticket 06: per-config log dialog with a filter field. OK applies the
+    /// filter and re-renders when still open.
+    fn open_logs_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.log_filter.clone();
+        let filter_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Filter logs")
+                .default_value(current)
+        });
+        let view = cx.entity();
+        let reader = filter_state.clone();
+        let lines = self.log_lines(cx);
+        let title = match self.selected_config(cx) {
+            Some(config) => format!("Logs — {}", config.name),
+            None => "Logs".to_string(),
+        };
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view = view.clone();
+            let reader = reader.clone();
+            let mut body = div().flex().flex_col().gap_2().child(dialog_field(
+                "field-log-filter",
+                "Filter",
+                filter_state.clone(),
+            ));
+            let mut list = div()
+                .id("log-lines")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_1();
+            if lines.is_empty() {
+                list = list.child("No log lines for this filter yet");
+            }
+            for line in &lines {
+                list = list.child(line.clone());
+            }
+            body = body.child(list);
+            let view = view.clone();
+            dialog.title(title.clone()).child(body).button_props(
+                DialogButtonProps::default()
+                    .show_cancel(true)
+                    .on_ok(move |_, window, cx| {
+                        let filter = reader.read(cx).value().to_string();
+                        view.update(cx, |view, cx| {
+                            view.log_filter = filter;
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                        true
+                    }),
+            )
+        });
     }
 
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1278,6 +1499,12 @@ impl AppView {
             )
             .child(
                 div()
+                    .id("config-health")
+                    .test_support()
+                    .child(self.health_store.detail_line(&config.id)),
+            )
+            .child(
+                div()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1341,7 +1568,26 @@ impl AppView {
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_selected_engine(window, cx);
                             })),
-                    ),
+                    )
+                    .child(
+                        Button::new("health-test")
+                            .label("Test")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.test_selected_health(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("health-ping")
+                            .label("Ping")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.ping_selected(window, cx);
+                            })),
+                    )
+                    .child(Button::new("logs-open").label("Logs").on_click(cx.listener(
+                        |view, _, window, cx| {
+                            view.open_logs_dialog(window, cx);
+                        },
+                    ))),
             )
             .into_any_element()
     }
@@ -1349,6 +1595,7 @@ impl AppView {
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let (total, enabled) = self.libraries.read(cx).delegate().counts();
         let engine_text = self.engine.status_text();
+        let health_text = self.health_status_text();
         StatusBar::new().left(
             div()
                 .flex()
@@ -1361,7 +1608,8 @@ impl AppView {
                         .test_support()
                         .child(format!("{total} configurations · {enabled} enabled")),
                 )
-                .child(div().id("engine-status").test_support().child(engine_text)),
+                .child(div().id("engine-status").test_support().child(engine_text))
+                .child(div().id("health-status").test_support().child(health_text)),
         )
     }
 }
@@ -1425,6 +1673,13 @@ impl Render for AppView {
                             .label("Stop all")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_all_engines(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("health-test-all")
+                            .label("Test health")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.test_all_health(window, cx);
                             })),
                     ),
             )
@@ -1875,5 +2130,155 @@ mod tests {
             error.contains("Alpha") && error.contains("Beta"),
             "conflict names both configs, got {error}"
         );
+    }
+
+    /// Ticket 06: health test-all over the mock driver records per-row
+    /// latency, flags the dead row with its named cause, and renders the
+    /// health line, status totals, and toolbar controls headless.
+    #[gpui_kit::test]
+    fn health_test_all_via_fake_flags_dead(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        fn health_seed(name: &str, port: &str) -> NewConfig {
+            NewConfig {
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                    \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: port.to_string(),
+            }
+        }
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(health_seed("Alpha", "10841"))
+            .expect("seed works");
+        let beta = store.add(health_seed("Beta", "10842")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, handle) = FakeHealthProber::shared();
+                handle.script_latency(&alpha.id, 33);
+                handle.script_failure(&beta.id, "upstream refused");
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        let tested =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
+        assert_eq!(tested, 2);
+
+        let (alpha_live, beta_dead) = view.read_with(cx, |view, _| {
+            (
+                view.health_store.status(&alpha.id),
+                view.health_store.status(&beta.id),
+            )
+        });
+        assert_eq!(alpha_live.latency_ms, Some(33));
+        assert!(
+            beta_dead
+                .cause
+                .as_deref()
+                .unwrap_or("")
+                .contains("upstream refused"),
+            "dead row names cause: {:?}",
+            beta_dead.cause
+        );
+        assert_eq!(view.read_with(cx, |view, _| view.health_counts()), (1, 1));
+
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, _| window.try_find("health-test-all").is_some()));
+        assert!(cx.update(|window, _| window.try_find("health-status").is_some()));
+    }
+
+    /// Ticket 06: the logs dialog opens with a per-config filter field and
+    /// shows only the selected config's redacted lines.
+    #[gpui_kit::test]
+    fn logs_dialog_filters_to_selected_and_redacts(cx: &mut TestAppContext) {
+        use crate::engine::inbound_tag;
+        use gpui_kit::component::IndexPath;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let config = store.add(seed_input("Work")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+                let rows = vec![config.clone()];
+                view.logs.push_raw(
+                    &format!(
+                        "warn {}: dial failed password=hunter2",
+                        inbound_tag(&config.id)
+                    ),
+                    &rows,
+                );
+                view.logs.push_raw("info engine started", &rows);
+            });
+        });
+
+        let lines = view.read_with(cx, |view, _cx| {
+            view.logs
+                .for_config(&config.id)
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(lines.len(), 1, "only its lines show");
+        assert!(!lines[0].contains("hunter2"), "redacted: {}", lines[0]);
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("field-log-filter").is_some()));
+        assert!(cx.update(|window, _| window.try_find("log-lines").is_some()));
     }
 }
