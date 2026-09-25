@@ -6,7 +6,7 @@
 
 **Owns:** security-and-hardening
 
-**Status:** ready-for-agent
+**Status:** done (commit 760bb14; `cargo test` 160 passed, verified; live halves need real remotes per QUICKSTART-RUN.md)
 
 - [ ] Scenario: quickstart A (3 egresses) → Action: run end-to-end → Expected: distinct egresses per endpoint, OS snapshot unchanged. Verification: operational check. Priority: required.
 - [ ] Scenario: quickstart B/C/D → Action: run conflict, subscription-preservation, exotic+custom paths → Expected: all expectations in quickstart.md hold. Verification: operational check. Priority: required.
