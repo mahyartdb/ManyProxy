@@ -3895,8 +3895,10 @@ dependencies = [
 name = "manyproxy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "gpui-kit",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

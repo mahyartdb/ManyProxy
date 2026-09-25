@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 gpui-kit = "0.6"
 rusqlite = { version = "0.40", features = ["bundled"] }
+base64 = "0.22"
+serde_json = "1"
 
 [dev-dependencies]
 gpui-kit = { version = "0.6", features = ["test-support"] }

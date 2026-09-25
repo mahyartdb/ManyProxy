@@ -1,10 +1,11 @@
 #![recursion_limit = "512"]
 
+mod import;
 mod store;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::notification::Notification;
@@ -14,6 +15,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::*;
 
+use import::{commit_batch, import_file_content, import_text};
 use store::{
     delete_confirm_text, proxy_urls, ConfigPatch, NewConfig, ProxyConfig, Store, StoreError,
     DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
@@ -287,6 +289,60 @@ impl ConfigForm {
     }
 }
 
+/// Handles to the import dialog inputs: a multi-line paste box plus the
+/// target group. `file_hint` carries the dropped file name (if exactly one)
+/// so `.conf` content keeps its stem for peer names and parses as conf even
+/// after edits; otherwise the commit path sniffs the text.
+#[derive(Clone)]
+struct ImportForm {
+    text: Entity<TextareaState>,
+    group: Entity<InputState>,
+    file_hint: Option<String>,
+}
+
+impl ImportForm {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        prefill_text: &str,
+        prefill_group: &str,
+        file_hint: Option<String>,
+    ) -> Self {
+        Self {
+            text: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("One share link per line, JSON, or a WireGuard conf")
+                    .default_value(prefill_text.to_string())
+            }),
+            group: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Group")
+                    .default_value(prefill_group.to_string())
+            }),
+            file_hint,
+        }
+    }
+
+    /// Consumes a clone; every built element owns its state entity.
+    fn element(self) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id("field-import-text")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(Label::new("Links, JSON, or conf"))
+                    .child(Textarea::new(&self.text).h(px(160.))),
+            )
+            .child(dialog_field("field-import-group", "Group", self.group))
+    }
+}
+
 /// Root view of the ManyProxy window: title bar, toolbar, virtualized
 /// configuration list, detail bar, status bar, plus overlay layers.
 struct AppView {
@@ -508,6 +564,132 @@ impl AppView {
         });
     }
 
+    /// Ticket 03: paste/clipboard entry point. The batch commits through the
+    /// existing add flow, so every record lands disabled in the chosen group.
+    fn open_import_dialog(
+        &mut self,
+        prefill_text: &str,
+        prefill_group: &str,
+        file_hint: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = ImportForm::new(window, cx, prefill_text, prefill_group, file_hint);
+        let view = cx.entity();
+        let reader = form.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view = view.clone();
+            let reader = reader.clone();
+            dialog
+                .title("Import proxy configurations")
+                .child(form.clone().element())
+                .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
+                    move |_, window, cx| {
+                        let text = reader.text.read(cx).value().to_string();
+                        let group = reader.group.read(cx).value().to_string();
+                        let hint = reader.file_hint.clone();
+                        view.update(cx, |view, cx| {
+                            view.commit_import(text, group, hint, window, cx)
+                        })
+                    },
+                ))
+        });
+    }
+
+    /// Ticket 03: clipboard entry point. Clipboard text prefills the same
+    /// dialog (same group choice, same commit path).
+    fn open_import_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            window.push_notification(Notification::warning("Clipboard has no text to import"), cx);
+            return;
+        }
+        self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx);
+    }
+
+    /// Ticket 03: drag-drop/file entry point. Readable files are concatenated
+    /// into the same import dialog; a single dropped file keeps its name so
+    /// `.conf` content parses as WireGuard with stem-based peer names.
+    fn import_dropped_files(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut merged = String::new();
+        let mut names: Vec<String> = Vec::new();
+        for path in paths.0.iter() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if !merged.is_empty() {
+                    merged.push('\n');
+                }
+                merged.push_str(&content);
+                names.push(path.to_string_lossy().into_owned());
+            }
+        }
+        if merged.trim().is_empty() {
+            window.push_notification(Notification::warning("No readable files dropped"), cx);
+            return;
+        }
+        let file_hint = if names.len() == 1 {
+            names.into_iter().next()
+        } else {
+            None
+        };
+        self.open_import_dialog(&merged, DEFAULT_GROUP, file_hint, window, cx);
+    }
+
+    /// Ticket 03: commit a paste box through the existing add flow. Valid
+    /// items become disabled records in `group`; failures are reported with
+    /// item index + reason (never partial silent import); identical
+    /// re-imports add nothing. Import never starts configs.
+    fn commit_import(
+        &mut self,
+        text: String,
+        group: String,
+        file_hint: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let batch = match file_hint {
+            Some(name) => import_file_content(&name, &text),
+            None => import_text(&text),
+        };
+        match commit_batch(&mut self.store, batch, &group) {
+            Ok(outcome) => {
+                self.reload(cx);
+                let mut summary = format!(
+                    "Imported {} · {} duplicates skipped · {} failed",
+                    outcome.imported,
+                    outcome.duplicates,
+                    outcome.failures.len()
+                );
+                if let Some(first) = outcome.failures.first() {
+                    summary.push_str(&format!(
+                        " — item {} ({}): {}",
+                        first.index + 1,
+                        first.label,
+                        first.reason
+                    ));
+                }
+                if outcome.failures.is_empty() {
+                    window.push_notification(Notification::success(summary), cx);
+                } else {
+                    window.push_notification(Notification::warning(summary), cx);
+                }
+                true
+            }
+            Err(error) => {
+                window
+                    .push_notification(Notification::error(format!("Import failed: {error}")), cx);
+                false
+            }
+        }
+    }
+
     fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
             return div()
@@ -609,6 +791,7 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let drop_view = cx.entity();
         div()
             .id("manyproxy-shell")
             .size_full()
@@ -616,6 +799,11 @@ impl Render for AppView {
             .flex_col()
             .track_focus(&self.focus)
             .key_context("manyproxy-library")
+            .on_drop(move |paths: &ExternalPaths, window, cx| {
+                drop_view.update(cx, |view, cx| {
+                    view.import_dropped_files(paths, window, cx);
+                });
+            })
             .child(TitleBar::new())
             .child(
                 div()
@@ -628,7 +816,21 @@ impl Render for AppView {
                         |view, _, window, cx| {
                             view.open_add_dialog(window, cx);
                         },
-                    ))),
+                    )))
+                    .child(
+                        Button::new("import-config")
+                            .label("Import")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("import-clipboard")
+                            .label("From clipboard")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_import_from_clipboard(window, cx);
+                            })),
+                    ),
             )
             .child(
                 div().flex_1().child(
@@ -860,5 +1062,73 @@ mod tests {
             window.render_frame(cx);
         });
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    /// Ticket 03: the import dialog opens with a paste box and a group field,
+    /// wiring paste/clipboard/drop entry points to the add flow.
+    #[gpui_kit::test]
+    fn import_dialog_opens_with_fields(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_import_dialog("vless://x", "travel", None, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("field-import-text").is_some()));
+        assert!(cx.update(|window, _| window.try_find("field-import-group").is_some()));
+    }
+
+    /// Ticket 03: committing pasted links stores disabled records in the
+    /// chosen group without starting anything.
+    #[gpui_kit::test]
+    fn import_commit_stores_disabled_records(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.commit_import(
+                    "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x"
+                        .to_string(),
+                    "travel".to_string(),
+                    None,
+                    window,
+                    cx,
+                ));
+            });
+        });
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
     }
 }
