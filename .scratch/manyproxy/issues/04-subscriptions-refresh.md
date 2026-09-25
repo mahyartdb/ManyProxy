@@ -6,7 +6,7 @@
 
 **Owns:** api-and-interface-design
 
-**Status:** ready-for-agent
+**Status:** done (commit ad00f9e; `cargo test` 81 passed, verified)
 
 - [ ] Scenario: new subscription URL → Action: add + fetch → Expected: group created, members appear disabled, fetch recorded. Verification: automated test. Priority: required.
 - [ ] Scenario: member renamed by hand → Action: refresh with unchanged upstream body → Expected: no duplicates, rename preserved (no-op effective). Verification: automated test. Priority: required.
