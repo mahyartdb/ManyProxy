@@ -257,6 +257,13 @@ fn invalid_json(message: impl Into<String>) -> ImportError {
     ImportError::new(ImportErrorKind::InvalidJson, message)
 }
 
+/// Strip a leading UTF-8 BOM, if present. `str::trim` leaves U+FEFF alone
+/// (it is not White_Space), so BOM-prefixed bodies must strip it before any
+/// `{`/`[`/section sniffing.
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{FEFF}').unwrap_or(text)
+}
+
 // ---------------------------------------------------------------------------
 // URI splitting (hand-rolled: full control over the error taxonomy)
 // ---------------------------------------------------------------------------
@@ -679,7 +686,10 @@ fn parse_ss_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
                     .ok_or_else(|| missing_credential("ss link is missing password"))?;
                 (text[..j].to_string(), text[j + 1..].to_string())
             };
-            let (host, port_text) = split_host_port(host_port)?;
+            // Real-world clients append a trailing slash to the authority
+            // (`ss://method:pw@host:8388/`); tolerate it like the legacy
+            // branch below (research 05: trailing-slash ss → trim/lenient).
+            let (host, port_text) = split_host_port(host_port.trim_end_matches('/'))?;
             (method, password, host, require_port(port_text.as_deref())?)
         }
         None => {
@@ -1340,15 +1350,47 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
     out
 }
 
+/// Ticket 15: case-insensitive, comment-aware conf detection. Section
+/// markers match in any case (`[Interface]`, `[interface]`, … — the parser
+/// itself already lowercases them); `://` only disqualifies when it appears
+/// on a non-comment line, so a `# see https://…` comment no longer defeats
+/// detection. Paste (`import_text`) and drop (`import_file_content`) share
+/// this detector, so the same bytes parse the same way on both paths.
 fn looks_like_wg_conf(trimmed: &str) -> bool {
-    trimmed.contains("[Interface]") && !trimmed.contains("://")
+    let mut has_section = false;
+    for raw_line in trimmed.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.contains("://") {
+            return false;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let name = line[1..line.len() - 1].trim();
+            if name.eq_ignore_ascii_case("interface") || name.eq_ignore_ascii_case("peer") {
+                has_section = true;
+            }
+        }
+    }
+    has_section
 }
 
 fn file_stem(file_name: &str) -> String {
     let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
-    match base.rfind('.') {
-        Some(i) if i > 0 => base[..i].to_string(),
-        _ => base.to_string(),
+    let unhidden = base.trim_start_matches('.');
+    if unhidden.is_empty() {
+        return String::new();
+    }
+    if base.starts_with('.') && !unhidden.contains('.') {
+        // Dotfile without a real stem (`.conf`): the leading dot marks a
+        // hidden file, not an extension separator, so there is no stem to
+        // derive and the caller falls back to "wireguard".
+        return String::new();
+    }
+    match unhidden.rfind('.') {
+        Some(i) => unhidden[..i].to_string(),
+        None => unhidden.to_string(),
     }
 }
 
@@ -1417,11 +1459,13 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
     }
 }
 
-/// Parse pasted/clipboard text: a WireGuard conf, a JSON body (outbounds
-/// array or full config), or one share link per line. Blank lines are
-/// skipped silently; every other failure is reported with its item index.
+/// Parse pasted/clipboard text: a WireGuard conf (any marker case), a JSON
+/// body (outbounds array or full config, BOM-prefixed or not), limited Clash
+/// YAML (`proxies:` — same support as subscription bodies), or one share
+/// link per line. Blank lines are skipped silently; every other failure is
+/// reported with its item index.
 pub fn import_text(body: &str) -> BatchResult {
-    let trimmed = body.trim();
+    let trimmed = strip_bom(body.trim()).trim();
     if trimmed.is_empty() {
         return BatchResult::fail(0, ImportErrorKind::Empty, "nothing to import");
     }
@@ -1437,6 +1481,9 @@ pub fn import_text(body: &str) -> BatchResult {
                 format!("invalid JSON: {error}"),
             ),
         };
+    }
+    if has_clash_proxies(trimmed) {
+        return import_clash_proxies(trimmed);
     }
     let mut out = BatchResult::default();
     let mut index = 0;
@@ -1456,17 +1503,23 @@ pub fn import_text(body: &str) -> BatchResult {
     out
 }
 
-/// Parse dropped/picked file content. `.conf` files (or conf-shaped bodies)
-/// go through the WireGuard parser; everything else follows [`import_text`].
+/// Parse dropped/picked file content. `.conf` files go through the
+/// WireGuard parser only when the content actually looks like a conf;
+/// JSON / link-line / Clash bodies inside a `.conf` file are content-sniffed
+/// down the [`import_text`] path instead (never forced through the wg parser
+/// with a wrong-taxonomy error). Everything else follows [`import_text`].
 pub fn import_file_content(file_name: &str, content: &str) -> BatchResult {
     if file_name.to_ascii_lowercase().ends_with(".conf") {
-        let stem = file_stem(file_name);
-        let stem = if stem.trim().is_empty() {
-            "wireguard".to_string()
-        } else {
-            stem
-        };
-        return import_wg_conf(content, &stem);
+        let trimmed = strip_bom(content.trim()).trim();
+        if looks_like_wg_conf(trimmed) {
+            let stem = file_stem(file_name);
+            let stem = if stem.trim().is_empty() {
+                "wireguard".to_string()
+            } else {
+                stem
+            };
+            return import_wg_conf(trimmed, &stem);
+        }
     }
     import_text(content)
 }
@@ -1695,7 +1748,7 @@ pub fn parse_addsub_link(line: &str) -> Result<AddSubRequest, ImportError> {
 /// (single-line, `data:…;base64,…`, or per-line v2rayN style), WireGuard conf,
 /// or plain share-link lines. Per-item failures skip + count, as everywhere.
 pub fn import_subscription_body(body: &str) -> BatchResult {
-    let trimmed = body.trim();
+    let trimmed = strip_bom(body.trim()).trim();
     if trimmed.is_empty() {
         return BatchResult::fail(0, ImportErrorKind::Empty, "nothing to import");
     }
@@ -2843,6 +2896,138 @@ mod tests {
         assert!(!is_addsub_attempt("vless://x@y.example.com:443"));
         assert!(!is_addsub_attempt("not a link"));
         assert!(!is_addsub_attempt(""));
+    }
+
+    /// Ticket 15: trailing-slash ss links tolerate the slash in every
+    /// userinfo branch (plain, base64-split, legacy blob).
+    #[test]
+    fn ss_trailing_slash_tolerated() {
+        let cases = [
+            "ss://aes-256-gcm:hunter2@example.com:8388/".to_string(),
+            "ss://aes-256-gcm:hunter2@example.com:8388/#with-remark".to_string(),
+            format!("ss://{}@example.com:8388/", b64("aes-256-gcm:hunter2")),
+            format!("ss://{}/", b64("aes-256-gcm:hunter2@example.com:8388")),
+        ];
+        for link in &cases {
+            let config = parse_link(link).unwrap_or_else(|_| panic!("{link} parses"));
+            assert_eq!(config.protocol, "shadowsocks", "link {link}");
+            assert_eq!(config.host, "example.com", "link {link}");
+            assert_eq!(config.port, 8388, "link {link}");
+            assert_eq!(params_of(&config)["method"], "aes-256-gcm", "link {link}");
+            assert_eq!(params_of(&config)["password"], "hunter2", "link {link}");
+        }
+    }
+
+    /// Ticket 15: pasted lowercase `[interface]`/`[peer]` markers parse as
+    /// WireGuard conf, agreeing with the drop path (stem aside).
+    #[test]
+    fn lowercase_interface_conf_parses_like_canonical() {
+        let conf = "[interface]\nPrivateKey = cHJpdmF0ZWtleQ\n\n[peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        let pasted = import_text(conf);
+        assert!(
+            pasted.failures.is_empty(),
+            "failures: {:?}",
+            pasted.failures
+        );
+        assert_eq!(pasted.configs.len(), 1);
+        assert_eq!(pasted.configs[0].protocol, "wireguard");
+        assert_eq!(pasted.configs[0].host, "203.0.113.1");
+        let dropped = import_file_content("tun.conf", conf);
+        assert_eq!(dropped.configs.len(), pasted.configs.len());
+        assert_eq!(dropped.configs[0].host, pasted.configs[0].host);
+        assert_eq!(dropped.configs[0].name, "tun-p1");
+    }
+
+    /// Ticket 15: a `://` inside a conf comment no longer defeats detection.
+    #[test]
+    fn wg_conf_comment_with_url_still_detected() {
+        let conf = "# see https://example.com/docs\n[Interface]\nPrivateKey = cHJpdmF0ZWtleQ\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        let out = import_text(conf);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].protocol, "wireguard");
+    }
+
+    /// Ticket 15: `.conf` files holding JSON or link lines are content-sniffed
+    /// (never forced through the wg parser with a wrong-taxonomy error),
+    /// while real conf content still parses as conf.
+    #[test]
+    fn conf_file_holding_json_or_links_is_sniffed() {
+        let array = serde_json::json!([
+            {"type": "vless", "tag": "json-one", "server": "a.example.com", "server_port": 443, "uuid": UUID}
+        ]);
+        let out = import_file_content("odd.conf", &array.to_string());
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "json-one");
+
+        let links =
+            format!("vless://{UUID}@a.example.com:443#one\ntrojan://pw@b.example.com:443#two");
+        let out = import_file_content("odd.conf", &links);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+
+        let conf = "[Interface]\nPrivateKey = cHJpdmF0ZWtleQ\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        let out = import_file_content("tun.conf", conf);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "tun-p1");
+    }
+
+    /// Ticket 15: pasted Clash YAML imports with the same limited support as
+    /// subscription bodies.
+    #[test]
+    fn pasted_clash_yaml_imports_like_subscription() {
+        let body = "proxies:\n  - name: clash-one\n    type: trojan\n    server: t.example.com\n    port: 443\n    password: pw\n";
+        let pasted = import_text(body);
+        assert!(
+            pasted.failures.is_empty(),
+            "failures: {:?}",
+            pasted.failures
+        );
+        assert_eq!(pasted.configs.len(), 1);
+        assert_eq!(pasted.configs[0].protocol, "trojan");
+        assert_eq!(pasted.configs[0].name, "clash-one");
+        let via_sub = import_subscription_body(body);
+        assert_eq!(via_sub.configs.len(), pasted.configs.len());
+    }
+
+    /// Ticket 15: BOM-prefixed JSON parses after the BOM is stripped.
+    #[test]
+    fn bom_prefixed_json_parses() {
+        let array = serde_json::json!([
+            {"type": "vless", "tag": "bom-one", "server": "a.example.com", "server_port": 443, "uuid": UUID}
+        ]);
+        let body = format!("\u{FEFF}{}", array);
+        let out = import_text(&body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "bom-one");
+        let via_sub = import_subscription_body(&body);
+        assert_eq!(via_sub.configs.len(), 1);
+    }
+
+    /// Ticket 15: dotfile `.conf` gets a sensible stem, never `.conf-p1`.
+    #[test]
+    fn dotfile_conf_gets_sensible_stem() {
+        let conf = "[Interface]\nPrivateKey = cHJpdmF0ZWtleQ\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        let out = import_file_content(".conf", conf);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "wireguard-p1");
+    }
+
+    /// Ticket 15: paste and drop agree on the same conf bytes (stem aside).
+    #[test]
+    fn paste_and_drop_agree_on_conf_bytes() {
+        let conf = "; lan endpoint\n[Interface]\nPrivateKey = cHJpdmF0ZWtleQ\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.9:51820\n";
+        let pasted = import_text(conf);
+        let dropped = import_file_content("office.conf", conf);
+        assert_eq!(pasted.configs.len(), 1);
+        assert_eq!(dropped.configs.len(), 1);
+        assert_eq!(dropped.configs[0].host, pasted.configs[0].host);
+        assert_eq!(dropped.configs[0].port, pasted.configs[0].port);
+        assert_eq!(dropped.configs[0].name, "office-p1");
     }
 
     /// Total failure renders every item with index/label/reason and no
