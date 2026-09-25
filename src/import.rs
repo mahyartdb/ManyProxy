@@ -3946,7 +3946,7 @@ mod tests {
 
     #[test]
     fn ticket24_data_base64_case_insensitive() {
-        let inner = format!("trojan://pw@b.example.com:443#two");
+        let inner = "trojan://pw@b.example.com:443#two".to_string();
         for marker in [";base64,", ";Base64,", ";BASE64,"] {
             let body = format!("data:text/plain{marker}{}", b64(&inner));
             let out = import_subscription_body(&body);
