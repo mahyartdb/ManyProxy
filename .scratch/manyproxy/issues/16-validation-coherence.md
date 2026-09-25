@@ -6,7 +6,7 @@
 
 **Owns:** sqlite
 
-**Status:** ready-for-agent
+**Status:** done (commit 421e8a0; `cargo test` 219 passed, verified)
 
 - [ ] Scenario: manual add with unknown protocol or non-JSON params → Action: save → Expected: field error naming the problem, row not created. Verification: automated test. Priority: required.
 - [ ] Scenario: edit with a field cleared → Action: save → Expected: current value preserved (blank = keep), except port where blank = auto is explicit in UI. Verification: automated test. Priority: required.
