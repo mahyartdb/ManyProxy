@@ -7,7 +7,7 @@
 //! through and render the returned field-level errors.
 
 use rusqlite::{params, Connection};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +37,10 @@ pub struct ProxyConfig {
     pub enabled: bool,
     pub bind_ip: String,
     pub port: u16,
+    /// Owning subscription id (ticket 04), if this row is subscription-managed.
+    pub subscription_id: Option<String>,
+    /// Normalized subscription identity (ticket 04), if owned.
+    pub identity_key: Option<String>,
 }
 
 /// Raw input for creating a config. All strings are unvalidated; empty
@@ -157,6 +161,8 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
         enabled: enabled != 0,
         bind_ip: row.get(6)?,
         port: port as u16,
+        subscription_id: row.get(8)?,
+        identity_key: row.get(9)?,
     })
 }
 
@@ -217,6 +223,78 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
         }
     }
 }
+/// Ticket 04: a subscription refresh source. Refresh upserts ProxyConfigs in
+/// `group` keyed by normalized identity (never the remark); it never deletes
+/// hand-created configs and never enables or starts anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscription {
+    /// Stable string id, never reused.
+    pub id: String,
+    pub label: String,
+    pub url: String,
+    pub group: String,
+    pub auto_refresh: bool,
+    /// Unix seconds of the last successful refresh, if any.
+    pub last_refresh_at: Option<i64>,
+    /// Last fetch/parse failure, cleared on the next success.
+    pub last_error: Option<String>,
+}
+
+/// Ticket 04: outcome of one refresh merge. `error` is `Some` when the body
+/// failed to parse, in which case prior members were kept untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub duplicates: usize,
+    /// Desired rows skipped because the user deleted them (tombstoned).
+    pub skipped: usize,
+    pub failures: Vec<crate::import::ImportFailure>,
+    pub error: Option<String>,
+}
+
+/// Default auto-refresh interval for subscriptions (ticket 04 scheduling
+/// hook): daily. The hook is [`due_for_refresh`]; the host decides when to
+/// evaluate it (v1: at startup for due subscriptions, plus manual refresh).
+pub const DEFAULT_AUTO_REFRESH_SECS: i64 = 86_400;
+
+/// Current Unix time in seconds (refresh bookkeeping).
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Auto-refresh scheduling hook: true when the subscription wants automatic
+/// refresh and has never succeeded or its last success is older than
+/// `interval_secs`.
+pub fn due_for_refresh(subscription: &Subscription, now: i64, interval_secs: i64) -> bool {
+    if !subscription.auto_refresh {
+        return false;
+    }
+    match subscription.last_refresh_at {
+        None => true,
+        Some(last) => interval_secs <= 0 || now.saturating_sub(last) >= interval_secs,
+    }
+}
+
+/// Map one subscription row to a Subscription.
+fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
+    let id: i64 = row.get(0)?;
+    let auto_refresh: i64 = row.get(4)?;
+    Ok(Subscription {
+        id: id.to_string(),
+        label: row.get(1)?,
+        url: row.get(2)?,
+        group: row.get(3)?,
+        auto_refresh: auto_refresh != 0,
+        last_refresh_at: row.get(5)?,
+        last_error: row.get(6)?,
+    })
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -287,11 +365,41 @@ impl Store {
                grp TEXT NOT NULL DEFAULT 'default',
                enabled INTEGER NOT NULL DEFAULT 0,
                bind_ip TEXT NOT NULL DEFAULT '127.0.0.1',
-               port INTEGER NOT NULL
+               port INTEGER NOT NULL,
+               subscription_id TEXT,
+               identity_key TEXT
              ) STRICT;
              CREATE INDEX IF NOT EXISTS idx_proxy_configs_enabled
-               ON proxy_configs(enabled);",
+               ON proxy_configs(enabled);
+             CREATE INDEX IF NOT EXISTS idx_proxy_configs_subscription
+               ON proxy_configs(subscription_id);
+             CREATE TABLE IF NOT EXISTS subscriptions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               label TEXT NOT NULL,
+               url TEXT NOT NULL,
+               grp TEXT NOT NULL DEFAULT 'default',
+               auto_refresh INTEGER NOT NULL DEFAULT 1,
+               last_refresh_at INTEGER,
+               last_error TEXT
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS subscription_tombstones (
+               subscription_id TEXT NOT NULL,
+               identity_key TEXT NOT NULL,
+               PRIMARY KEY (subscription_id, identity_key)
+             ) STRICT;",
         )?;
+        // Migrate pre-ticket-04 databases that lack the new columns.
+        for (column, ddl) in [("subscription_id", "TEXT"), ("identity_key", "TEXT")] {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('proxy_configs') WHERE name = ?1")?;
+            let exists: bool = stmt.exists(params![column])?;
+            if !exists {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE proxy_configs ADD COLUMN {column} {ddl};"
+                ))?;
+            }
+        }
         Ok(())
     }
 
@@ -319,7 +427,8 @@ impl Store {
     /// All configs in stable id order.
     pub fn list(&self) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, protocol, params, grp, enabled, bind_ip, port
+            "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
+              subscription_id, identity_key
              FROM proxy_configs ORDER BY id",
         )?;
         let rows = stmt
@@ -335,7 +444,8 @@ impl Store {
             Err(_) => return Ok(None),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, protocol, params, grp, enabled, bind_ip, port
+            "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
+              subscription_id, identity_key
              FROM proxy_configs WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_row)?;
@@ -371,14 +481,30 @@ impl Store {
     }
 
     /// Remove a config. Returns false when the id does not exist.
+    /// Ticket 04: removing a subscription-owned row records a tombstone so
+    /// the next refresh does not resurrect a row the user deleted on purpose.
     pub fn remove(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Ok(false),
         };
+        let current = self.get(id)?;
         let removed = self
             .conn
             .execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
+        if removed > 0 {
+            if let Some(row) = current {
+                if let (Some(subscription_id), Some(identity_key)) =
+                    (row.subscription_id, row.identity_key)
+                {
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO subscription_tombstones (subscription_id, identity_key)
+                         VALUES (?1, ?2)",
+                        params![subscription_id, identity_key],
+                    )?;
+                }
+            }
+        }
         Ok(removed > 0)
     }
 
@@ -397,6 +523,369 @@ impl Store {
         }
         self.get(id)?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    // -- Ticket 04: subscriptions -----------------------------------------
+
+    fn validated_subscription_label(raw: &str) -> Result<String, StoreError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "label",
+                "label must not be empty",
+            )]));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn validated_subscription_url(raw: &str) -> Result<String, StoreError> {
+        // Error text never echoes the URL: subscription URLs often carry
+        // tokens in the query string (boundary: no secrets in logs).
+        let trimmed = raw.trim();
+        let after_scheme = if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
+            &trimmed[7..]
+        } else if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://") {
+            &trimmed[8..]
+        } else {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "url",
+                "subscription url must use http(s)",
+            )]));
+        };
+        let host = after_scheme.split(['/', '?']).next().unwrap_or("");
+        if host.trim().is_empty() || trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "url",
+                "subscription url must use http(s)",
+            )]));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    /// Add a subscription record. The URL must be `http(s)`; blank groups
+    /// fall back to the default. Members appear on the next refresh, never
+    /// enabled or started.
+    pub fn add_subscription(
+        &mut self,
+        label: &str,
+        url: &str,
+        group: &str,
+        auto_refresh: bool,
+    ) -> Result<Subscription, StoreError> {
+        let label = Self::validated_subscription_label(label)?;
+        let url = Self::validated_subscription_url(url)?;
+        let group = defaulted(group, DEFAULT_GROUP);
+        self.conn.execute(
+            "INSERT INTO subscriptions (label, url, grp, auto_refresh)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![label, url, group, auto_refresh as i64],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_subscription(&id.to_string())?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// All subscriptions in stable id order.
+    pub fn list_subscriptions(&self) -> Result<Vec<Subscription>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error
+             FROM subscriptions ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], map_subscription_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch one subscription by id.
+    pub fn get_subscription(&self, id: &str) -> Result<Option<Subscription>, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Ok(None),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error
+             FROM subscriptions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![rowid], map_subscription_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Flip a subscription's auto-refresh flag.
+    pub fn set_subscription_auto_refresh(
+        &mut self,
+        id: &str,
+        auto_refresh: bool,
+    ) -> Result<Subscription, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let changed = self.conn.execute(
+            "UPDATE subscriptions SET auto_refresh = ?1 WHERE id = ?2",
+            params![auto_refresh as i64, rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_subscription(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Remove a subscription. Owned member rows are released (kept, unowned),
+    /// never deleted; tombstones for this subscription are dropped.
+    pub fn remove_subscription(&mut self, id: &str) -> Result<bool, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Ok(false),
+        };
+        if self.get_subscription(id)?.is_none() {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE proxy_configs SET subscription_id = NULL, identity_key = NULL
+             WHERE subscription_id = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM subscription_tombstones WHERE subscription_id = ?1",
+            params![id],
+        )?;
+        let removed = self
+            .conn
+            .execute("DELETE FROM subscriptions WHERE id = ?1", params![rowid])?;
+        Ok(removed > 0)
+    }
+
+    /// Record a fetch-level failure (e.g. network error from the intake
+    /// path): prior members are kept, only `last_error` changes.
+    pub fn record_subscription_error(
+        &mut self,
+        id: &str,
+        error: &str,
+    ) -> Result<Subscription, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let changed = self.conn.execute(
+            "UPDATE subscriptions SET last_error = ?1 WHERE id = ?2",
+            params![error, rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_subscription(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Refresh a subscription from an already-fetched body (the refresh-merge
+    /// seam: tests inject body strings, never real network). The body is
+    /// parsed with the ticket-03 parsers via
+    /// [`crate::import::import_subscription_body`]; the merge upserts owned
+    /// rows keyed by [`crate::import::normalized_identity`], preserves the
+    /// hand-edit overlay (name/enabled/bind/port), tombstones user-deleted
+    /// rows, removes only subscription-owned vanished rows, and applies
+    /// atomically per group. Unparseable bodies keep the last-good members
+    /// and record `last_error`. Refresh never enables or starts configs.
+    pub fn refresh_with_body(
+        &mut self,
+        sub_id: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<RefreshOutcome, StoreError> {
+        use crate::import::{import_subscription_body, normalized_identity, ImportedConfig};
+        let subscription = self
+            .get_subscription(sub_id)?
+            .ok_or_else(|| StoreError::NotFound(sub_id.to_string()))?;
+        let batch = import_subscription_body(body);
+        if batch.configs.is_empty() && (!batch.failures.is_empty() || body.trim().is_empty()) {
+            let reason = batch
+                .failures
+                .first()
+                .map(|failure| failure.reason.clone())
+                .unwrap_or_else(|| "empty subscription body".to_string());
+            self.record_subscription_error(sub_id, &reason)?;
+            return Ok(RefreshOutcome {
+                failures: batch.failures,
+                error: Some(reason),
+                ..Default::default()
+            });
+        }
+        // Desired set, first-wins; extras count as duplicates.
+        let mut desired: HashMap<String, ImportedConfig> = HashMap::new();
+        let mut duplicates = 0usize;
+        for config in batch.configs {
+            let key = normalized_identity(&config.protocol, &config.params);
+            if desired.insert(key, config).is_some() {
+                duplicates += 1;
+            }
+        }
+        let rows = self.list()?;
+        let mut tombstones: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT identity_key FROM subscription_tombstones WHERE subscription_id = ?1",
+            )?;
+            let keys = stmt.query_map(params![subscription.id], |row| row.get::<_, String>(0))?;
+            for key in keys {
+                tombstones.insert(key?);
+            }
+        }
+        let row_key = |row: &ProxyConfig| -> String {
+            row.identity_key
+                .clone()
+                .unwrap_or_else(|| normalized_identity(&row.protocol, &row.params))
+        };
+        let mut global_by_key: HashMap<String, &ProxyConfig> = HashMap::new();
+        for row in &rows {
+            global_by_key.entry(row_key(row)).or_insert(row);
+        }
+        let owned: Vec<&ProxyConfig> = rows
+            .iter()
+            .filter(|row| row.subscription_id.as_deref() == Some(subscription.id.as_str()))
+            .collect();
+        let mut owned_by_key: HashMap<String, &ProxyConfig> = HashMap::new();
+        for row in &owned {
+            owned_by_key.entry(row_key(row)).or_insert(row);
+        }
+        enum Op {
+            Insert {
+                key: String,
+                config: ImportedConfig,
+                port: u16,
+            },
+            Update {
+                id: String,
+                protocol: String,
+                params: String,
+            },
+            Delete {
+                id: String,
+            },
+        }
+        let mut ops: Vec<Op> = Vec::new();
+        let mut outcome = RefreshOutcome {
+            duplicates,
+            failures: batch.failures,
+            ..Default::default()
+        };
+        let mut taken: HashSet<i64> = rows.iter().map(|row| row.port as i64).collect();
+        let mut next_free_port = || -> Option<u16> {
+            for port in AUTO_PORT_START..=AUTO_PORT_END {
+                if !taken.contains(&(port as i64)) {
+                    taken.insert(port as i64);
+                    return Some(port);
+                }
+            }
+            None
+        };
+        for (key, config) in &desired {
+            if tombstones.contains(key) {
+                outcome.skipped += 1;
+                continue;
+            }
+            if let Some(current) = owned_by_key.get(key) {
+                if current.protocol != config.protocol
+                    || current.params != config.params
+                    || current.group != subscription.group
+                {
+                    ops.push(Op::Update {
+                        id: current.id.clone(),
+                        protocol: config.protocol.clone(),
+                        params: config.params.clone(),
+                    });
+                    outcome.updated += 1;
+                }
+                continue;
+            }
+            if global_by_key.contains_key(key) {
+                outcome.duplicates += 1;
+                continue;
+            }
+            match next_free_port() {
+                Some(port) => {
+                    ops.push(Op::Insert {
+                        key: key.clone(),
+                        config: config.clone(),
+                        port,
+                    });
+                    outcome.added += 1;
+                }
+                None => {
+                    outcome.failures.push(crate::import::ImportFailure {
+                        index: 0,
+                        label: crate::import::redact_link(&config.name),
+                        reason: "port-exhausted: no automatic port left in the auto range"
+                            .to_string(),
+                        code: crate::import::ImportErrorKind::BadPort,
+                    });
+                }
+            }
+        }
+        for row in &owned {
+            if !desired.contains_key(&row_key(row)) {
+                ops.push(Op::Delete { id: row.id.clone() });
+                outcome.removed += 1;
+            }
+        }
+        let tx = self.conn.transaction()?;
+        for op in ops {
+            match op {
+                Op::Insert { key, config, port } => {
+                    tx.execute(
+                        "INSERT INTO proxy_configs
+                           (name, protocol, params, grp, enabled, bind_ip, port,
+                            subscription_id, identity_key)
+                         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+                        params![
+                            config.name,
+                            config.protocol,
+                            config.params,
+                            subscription.group,
+                            DEFAULT_BIND,
+                            port as i64,
+                            subscription.id,
+                            key,
+                        ],
+                    )?;
+                }
+                Op::Update {
+                    id,
+                    protocol,
+                    params,
+                } => {
+                    let rowid: i64 = id.parse().map_err(|_| {
+                        StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
+                    })?;
+                    tx.execute(
+                        "UPDATE proxy_configs SET protocol = ?1, params = ?2, grp = ?3
+                         WHERE id = ?4",
+                        params![protocol, params, subscription.group, rowid],
+                    )?;
+                }
+                Op::Delete { id } => {
+                    let rowid: i64 = id.parse().map_err(|_| {
+                        StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
+                    })?;
+                    tx.execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
+                }
+            }
+        }
+        {
+            let rowid: i64 = subscription.id.parse().map_err(|_| {
+                StoreError::Invalid(vec![FieldError::new("id", "bad subscription id")])
+            })?;
+            tx.execute(
+                "UPDATE subscriptions SET last_refresh_at = ?1, last_error = NULL WHERE id = ?2",
+                params![now, rowid],
+            )?;
+        }
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// First free port in the auto range, given the set of taken ports.
@@ -825,5 +1314,440 @@ mod tests {
     fn localhost_parses_as_loopback() {
         let ip: IpAddr = DEFAULT_BIND.parse().expect("default bind parses");
         assert!(ip.is_loopback());
+    }
+
+    // -- Ticket 04: subscriptions + refresh (merge seam; injected bodies) --
+
+    const SUB_UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn sub_body_two() -> String {
+        format!("vless://{SUB_UUID}@a.example.com:443#one\ntrojan://pw@b.example.com:443#two")
+    }
+
+    fn add_sub(store: &mut Store, group: &str) -> Subscription {
+        store
+            .add_subscription("Nightly", "https://example.com/sub.txt", group, true)
+            .expect("add subscription works")
+    }
+
+    /// Subscription intake validates at the boundary: blank labels and
+    /// non-http(s) URLs are rejected per field, writing nothing.
+    #[test]
+    fn subscription_add_validates_label_and_url() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for (label, url) in [
+            ("", "https://example.com/sub.txt"),
+            ("   ", "https://example.com/sub.txt"),
+            ("Nightly", "not-a-url"),
+            ("Nightly", "ftp://example.com/sub.txt"),
+            ("Nightly", "https://"),
+        ] {
+            let error = store
+                .add_subscription(label, url, "travel", true)
+                .expect_err(&format!("{label:?} + {url:?} must fail"));
+            let StoreError::Invalid(fields) = error else {
+                panic!("expected Invalid, got {error}");
+            };
+            assert_eq!(fields.len(), 1, "one field, got {fields:?}");
+            assert!(
+                fields[0].field == "label" || fields[0].field == "url",
+                "field name, got {fields:?}"
+            );
+            assert!(
+                !fields[0].message.contains("token")
+                    && !fields[0].message.contains("example.com/sub"),
+                "error hides URL contents, got {}",
+                fields[0].message
+            );
+        }
+        assert!(
+            store.list_subscriptions().expect("list works").is_empty(),
+            "failed adds write nothing"
+        );
+        let created = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "  ", true)
+            .expect("blank group falls back");
+        assert_eq!(created.group, DEFAULT_GROUP);
+        assert!(created.auto_refresh);
+        assert_eq!(created.last_refresh_at, None);
+        assert_eq!(created.last_error, None);
+    }
+
+    /// Issue 04, scenario 1: new subscription + fetch → group created,
+    /// members appear disabled, fetch recorded.
+    #[test]
+    fn subscription_refresh_creates_disabled_members() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 1_700_000_000)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 2);
+        assert_eq!(outcome.updated, 0);
+        assert_eq!(outcome.removed, 0);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.error, None);
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(!row.enabled, "refresh never enables");
+            assert_eq!(row.group, "travel");
+            assert_eq!(row.subscription_id.as_deref(), Some(sub.id.as_str()));
+            assert!(row.identity_key.is_some());
+        }
+        let kept = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(kept.last_refresh_at, Some(1_700_000_000));
+        assert_eq!(kept.last_error, None);
+    }
+
+    /// Issue 04, scenario 2: hand-renamed member + unchanged upstream body →
+    /// no duplicates, rename preserved (effective no-op).
+    #[test]
+    fn subscription_refresh_preserves_hand_rename_no_duplicates() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let first = store.list().expect("list works").remove(0);
+        store
+            .update(
+                &first.id,
+                ConfigPatch {
+                    name: Some("My favourite".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("rename works");
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.updated, 0);
+        assert_eq!(outcome.removed, 0);
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 2, "no duplicates, got {rows:?}");
+        let renamed = store.get(&first.id).expect("get works").expect("kept");
+        assert_eq!(renamed.name, "My favourite", "hand edit wins");
+    }
+
+    /// Changed upstream params with the same identity update in place (name
+    /// still preserved); a remark-only change is a no-op.
+    #[test]
+    fn subscription_refresh_updates_params_in_place() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(
+                &sub.id,
+                &format!("vless://{SUB_UUID}@a.example.com:443#one"),
+                100,
+            )
+            .expect("refresh works");
+        let before = store.list().expect("list works").remove(0);
+        // `flow` rides in params but is outside the identity key.
+        let outcome = store
+            .refresh_with_body(
+                &sub.id,
+                &format!("vless://{SUB_UUID}@a.example.com:443?flow=xtls-rprx-vision#one"),
+                200,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.updated, 1);
+        assert_eq!(outcome.added, 0);
+        let after = store.get(&before.id).expect("get works").expect("kept");
+        assert_eq!(after.id, before.id, "updated in place, not re-added");
+        assert_ne!(after.params, before.params);
+        assert_eq!(after.name, before.name, "remark preserved");
+        // Remark-only change: identical params, identical key → no-op.
+        let noop = store
+            .refresh_with_body(
+                &sub.id,
+                &format!(
+                    "vless://{SUB_UUID}@a.example.com:443?flow=xtls-rprx-vision#renamed-upstream"
+                ),
+                300,
+            )
+            .expect("refresh works");
+        assert_eq!(noop.added, 0);
+        assert_eq!(noop.updated, 0);
+        assert_eq!(store.list().expect("list works").len(), 1);
+    }
+
+    /// Issue 04, scenario 3: upstream removes a member → only the
+    /// subscription-owned row is removed; hand-created configs are untouched.
+    #[test]
+    fn subscription_refresh_removes_only_owned() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let hand = store
+            .add(NewConfig {
+                name: "Hand made".to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "travel".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("hand add works");
+        let outcome = store
+            .refresh_with_body(
+                &sub.id,
+                &format!("vless://{SUB_UUID}@a.example.com:443#one"),
+                200,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.removed, 1);
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 2, "one owned row + hand row, got {rows:?}");
+        let kept = store
+            .get(&hand.id)
+            .expect("get works")
+            .expect("hand row kept");
+        assert_eq!(kept, hand, "hand-created config untouched");
+        assert_eq!(kept.subscription_id, None);
+    }
+
+    /// An upstream that empties cleanly (`[]`) removes owned members; that is
+    /// a valid refresh, not a failure.
+    #[test]
+    fn subscription_refresh_empty_array_clears_owned() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let outcome = store
+            .refresh_with_body(&sub.id, "[]", 200)
+            .expect("refresh works");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.removed, 2);
+        assert!(store.list().expect("list works").is_empty());
+    }
+
+    /// Issue 04, scenario 4: fetch/parse failure → prior members kept, error
+    /// recorded on the subscription.
+    #[test]
+    fn subscription_refresh_failure_keeps_last_good() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let before = store.list().expect("list works");
+        let outcome = store
+            .refresh_with_body(&sub.id, "bogus://x\nbogus://y", 200)
+            .expect("failure is an outcome, not an error");
+        assert!(outcome.error.is_some(), "failure recorded");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.removed, 0);
+        assert!(!outcome.failures.is_empty(), "per-item failures counted");
+        assert_eq!(store.list().expect("list works"), before, "members kept");
+        let kept = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(kept.last_refresh_at, Some(100), "success stamp untouched");
+        assert!(kept.last_error.is_some(), "error recorded");
+        // Next success clears the error.
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 300)
+            .expect("refresh works");
+        let cleared = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(cleared.last_error, None);
+        assert_eq!(cleared.last_refresh_at, Some(300));
+    }
+
+    /// Prohibited side effect: refresh never enables/starts configs and never
+    /// overwrites hand-edited overlay fields (name/enabled/bind/port).
+    #[test]
+    fn subscription_refresh_never_enables_or_clobbers_overlay() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let first = store.list().expect("list works").remove(0);
+        store
+            .set_enabled(&first.id, true)
+            .expect("user enables a member");
+        store
+            .update(
+                &first.id,
+                ConfigPatch {
+                    bind_ip: Some("127.0.0.2".to_string()),
+                    port: Some("10821".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("user edits bind");
+        // Upstream adds a third member; the refresh must not touch the
+        // user-enabled row's overlay and the newcomer stays disabled.
+        let grown = format!("{}\ntrojan://pw@c.example.com:443#three", sub_body_two());
+        let outcome = store
+            .refresh_with_body(&sub.id, &grown, 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 1);
+        let edited = store.get(&first.id).expect("get works").expect("kept");
+        assert!(
+            edited.enabled,
+            "refresh never disables user-enabled rows either"
+        );
+        assert_eq!(edited.bind_ip, "127.0.0.2");
+        assert_eq!(edited.port, 10821);
+        let newcomer = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "three")
+            .expect("new member added");
+        assert!(!newcomer.enabled, "new rows land disabled");
+    }
+
+    /// User-deleted owned rows are tombstoned: refresh does not resurrect.
+    #[test]
+    fn subscription_tombstone_prevents_resurrect() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let victim = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "two")
+            .expect("member present");
+        assert!(store.remove(&victim.id).expect("remove works"));
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.skipped, 1, "tombstoned row skipped");
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 1);
+        assert!(rows.iter().all(|row| row.name != "two"));
+    }
+
+    /// Upstream rows colliding with hand-created (or foreign) identity count
+    /// as duplicates instead of duplicating.
+    #[test]
+    fn subscription_refresh_counts_foreign_identity_as_duplicate() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(NewConfig {
+                name: "Mine".to_string(),
+                protocol: "trojan".to_string(),
+                params: "{\"password\":\"pw\",\"server\":\"b.example.com\",\"server_port\":443,\"type\":\"trojan\",\"sni\":\"b.example.com\"}"
+                    .to_string(),
+                group: "other".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("hand add works");
+        let sub = add_sub(&mut store, "travel");
+        let outcome = store
+            .refresh_with_body(&sub.id, "trojan://pw@b.example.com:443#two", 100)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.duplicates, 1);
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 1, "no duplicate created, got {rows:?}");
+    }
+
+    /// Per-item failures skip + count while valid siblings still merge.
+    #[test]
+    fn subscription_refresh_per_item_failures_skip_and_count() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        let outcome = store
+            .refresh_with_body(
+                &sub.id,
+                &format!("vless://{SUB_UUID}@a.example.com:443#one\nbogus://x"),
+                100,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.error, None, "partial success is not a failure");
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(store.list().expect("list works").len(), 1);
+    }
+
+    /// Removing a subscription releases (never deletes) its rows and drops
+    /// its tombstones; unknown ids report NotFound/false.
+    #[test]
+    fn remove_subscription_releases_rows() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        assert!(store.remove_subscription(&sub.id).expect("remove works"));
+        assert!(!store.remove_subscription(&sub.id).expect("repeat works"));
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 2, "released rows are kept");
+        for row in &rows {
+            assert_eq!(row.subscription_id, None);
+            assert_eq!(row.identity_key, None);
+        }
+        assert!(store.list_subscriptions().expect("list works").is_empty());
+        assert!(matches!(
+            store.refresh_with_body(&sub.id, &sub_body_two(), 200),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.set_subscription_auto_refresh("no-such-id", false),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// Auto-refresh scheduling hook: manual gate is `auto_refresh`; timing
+    /// compares `last_refresh_at` against the interval.
+    #[test]
+    fn due_for_refresh_hook() {
+        let scheduled = Subscription {
+            id: "1".to_string(),
+            label: "Nightly".to_string(),
+            url: "https://example.com/sub.txt".to_string(),
+            group: "travel".to_string(),
+            auto_refresh: true,
+            last_refresh_at: None,
+            last_error: None,
+        };
+        assert!(
+            due_for_refresh(&scheduled, 1_000, 86_400),
+            "never refreshed is due"
+        );
+        let fresh = Subscription {
+            last_refresh_at: Some(900),
+            ..scheduled.clone()
+        };
+        assert!(!due_for_refresh(&fresh, 1_000, 86_400));
+        assert!(
+            due_for_refresh(&fresh, 1_000 + 86_400, 86_400),
+            "due at interval"
+        );
+        let manual = Subscription {
+            auto_refresh: false,
+            ..scheduled.clone()
+        };
+        assert!(!due_for_refresh(&manual, 1_000_000, 1), "manual never due");
+        let toggled = {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let sub = add_sub(&mut store, "travel");
+            store
+                .set_subscription_auto_refresh(&sub.id, false)
+                .expect("toggle works")
+        };
+        assert!(!toggled.auto_refresh);
     }
 }

@@ -3,6 +3,9 @@
 mod import;
 mod store;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
@@ -13,11 +16,13 @@ use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
 
-use import::{commit_batch, import_file_content, import_text};
+use import::{commit_batch, import_file_content, import_text, parse_addsub_link, AddSubRequest};
 use store::{
-    delete_confirm_text, proxy_urls, ConfigPatch, NewConfig, ProxyConfig, Store, StoreError,
+    delete_confirm_text, due_for_refresh, now_unix, proxy_urls, ConfigPatch, NewConfig,
+    ProxyConfig, Store, StoreError, Subscription as ProxySubscription, DEFAULT_AUTO_REFRESH_SECS,
     DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
 };
 
@@ -343,6 +348,181 @@ impl ImportForm {
     }
 }
 
+/// Ticket 04: redacted subscription URL for display (query and fragment are
+/// dropped so tokens never reach the screen or logs).
+fn redact_subscription_url(url: &str) -> String {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    const LIMIT: usize = 96;
+    if without_query.chars().count() > LIMIT {
+        let kept: String = without_query.chars().take(LIMIT).collect();
+        format!("{kept}…")
+    } else {
+        without_query.to_string()
+    }
+}
+
+/// Ticket 04: default subscription label derived from the URL host (never
+/// the query, which may carry a token).
+fn subscription_label_from_url(url: &str) -> String {
+    let after = url.split("://").nth(1).unwrap_or(url);
+    let host = after.split('/').next().unwrap_or(after);
+    if host.trim().is_empty() {
+        "Subscription".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// Ticket 04: fetch a subscription body over the platform HTTP client.
+/// Errors are generic on purpose (never echo the URL: tokens hide in
+/// queries). Bodies are capped at 8 MiB and must be UTF-8; anything else is
+/// a refresh failure that keeps the last-good members.
+async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Result<String, String> {
+    use futures::AsyncReadExt as _;
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    const TIMEOUT_SECS: u64 = 20;
+    let request = http_client::http::Request::builder()
+        .uri(url)
+        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+        .body(AsyncBody::empty())
+        .map_err(|_| "subscription request failed".to_string())?;
+    let mut response = client
+        .send(request)
+        .await
+        .map_err(|_| "subscription fetch failed".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "subscription fetch failed (status {})",
+            response.status().as_u16()
+        ));
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 65_536];
+    loop {
+        let n = response
+            .body_mut()
+            .read(&mut chunk)
+            .await
+            .map_err(|_| "subscription fetch failed".to_string())?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_BYTES {
+            return Err("subscription body too large".to_string());
+        }
+    }
+    String::from_utf8(buf).map_err(|_| "subscription body is not UTF-8".to_string())
+}
+
+/// Handles to the subscription add form inside the subscriptions dialog.
+#[derive(Clone)]
+struct SubForm {
+    label: Entity<InputState>,
+    url: Entity<InputState>,
+    group: Entity<InputState>,
+}
+
+impl SubForm {
+    fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
+        Self {
+            label: cx.new(|cx| InputState::new(window, cx).placeholder("Label")),
+            url: cx.new(|cx| InputState::new(window, cx).placeholder("https://…")),
+            group: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Group")
+                    .default_value(DEFAULT_GROUP)
+            }),
+        }
+    }
+
+    /// Consumes a clone; every built element owns its state entity.
+    fn element(self) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(dialog_field("field-sub-label", "Label", self.label))
+            .child(dialog_field("field-sub-url", "Subscription URL", self.url))
+            .child(dialog_field("field-sub-group", "Group", self.group))
+    }
+}
+
+/// Ticket 04: one subscription row for the manager dialog (label, redacted
+/// URL, group, member count, auto flag, last error) with Refresh / Auto /
+/// Remove actions. Refresh re-reads the record so a stale snapshot cannot
+/// fetch a removed subscription.
+fn subscription_row(
+    view: Entity<AppView>,
+    sub: ProxySubscription,
+    count: usize,
+) -> impl IntoElement {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(Label::new(sub.label.clone()))
+        .child(format!(
+            "{} · {} · {count} configs · auto {}",
+            redact_subscription_url(&sub.url),
+            sub.group,
+            if sub.auto_refresh { "on" } else { "off" }
+        ));
+    if let Some(error) = sub.last_error.as_deref() {
+        row = row.child(format!("last error: {error}"));
+    }
+    let refresh_view = view.clone();
+    let refresh_id = sub.id.clone();
+    row = row.child(
+        Button::new(format!("sub-refresh-{}", sub.id))
+            .label("Refresh")
+            .on_click(move |_, window, cx| {
+                let sub_id = refresh_id.clone();
+                refresh_view.update(cx, |view, cx| {
+                    if let Some(sub) = view.store.get_subscription(&sub_id).unwrap_or(None) {
+                        view.start_subscription_refresh(sub, window, cx);
+                    }
+                });
+            }),
+    );
+    let auto_view = view.clone();
+    let auto_id = sub.id.clone();
+    let auto_now = sub.auto_refresh;
+    row = row.child(
+        Button::new(format!("sub-auto-{}", sub.id))
+            .label(if auto_now { "Auto on" } else { "Auto off" })
+            .on_click(move |_, window, cx| {
+                let sub_id = auto_id.clone();
+                auto_view.update(cx, |view, cx| {
+                    if view
+                        .store
+                        .set_subscription_auto_refresh(&sub_id, !auto_now)
+                        .is_ok()
+                    {
+                        view.reload(cx);
+                    }
+                    view.reopen_subscriptions_if_open(window, cx);
+                });
+            }),
+    );
+    let remove_view = view.clone();
+    row.child(
+        Button::new(format!("sub-remove-{}", sub.id))
+            .label("Remove")
+            .on_click(move |_, window, cx| {
+                let sub = sub.clone();
+                remove_view.update(cx, |view, cx| {
+                    view.open_subscription_remove_confirm(sub, window, cx);
+                });
+            }),
+    )
+}
+
 /// Root view of the ManyProxy window: title bar, toolbar, virtualized
 /// configuration list, detail bar, status bar, plus overlay layers.
 struct AppView {
@@ -646,6 +826,8 @@ impl AppView {
     /// items become disabled records in `group`; failures are reported with
     /// item index + reason (never partial silent import); identical
     /// re-imports add nothing. Import never starts configs.
+    /// Ticket 04: a lone `throne://addsub/...` line diverts to the
+    /// subscription intake instead (record + immediate first refresh).
     fn commit_import(
         &mut self,
         text: String,
@@ -654,6 +836,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() && !trimmed.contains('\n') && file_hint.is_none() {
+            if let Ok(request) = parse_addsub_link(trimmed) {
+                return self.commit_addsub_request(request, window, cx);
+            }
+        }
         let batch = match file_hint {
             Some(name) => import_file_content(&name, &text),
             None => import_text(&text),
@@ -687,6 +875,274 @@ impl AppView {
                     .push_notification(Notification::error(format!("Import failed: {error}")), cx);
                 false
             }
+        }
+    }
+
+    /// Ticket 04: `throne://addsub/...` intake — record the subscription
+    /// (label from the URL host, never the query) and fetch immediately so
+    /// members appear without waiting for the next startup pass.
+    fn commit_addsub_request(
+        &mut self,
+        request: AddSubRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let label = subscription_label_from_url(&request.url);
+        self.commit_subscription_add(label, request.url, request.group, window, cx)
+    }
+
+    /// Ticket 04: add a subscription record; on success the dialog closes and
+    /// a first refresh starts in the background. Invalid input keeps the
+    /// dialog open with an error notification.
+    fn commit_subscription_add(
+        &mut self,
+        label: String,
+        url: String,
+        group: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.add_subscription(&label, &url, &group, true) {
+            Ok(sub) => {
+                self.reload(cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Subscription \"{}\" added — refreshing",
+                        sub.label
+                    )),
+                    cx,
+                );
+                self.start_subscription_refresh(sub, window, cx);
+                true
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                false
+            }
+        }
+    }
+
+    /// Ticket 04: fetch one subscription without blocking the UI, then merge
+    /// through the tested [`Store::refresh_with_body`] seam.
+    fn start_subscription_refresh(
+        &mut self,
+        sub: ProxySubscription,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let client = cx.http_client();
+        let view = cx.entity();
+        let sub_id = sub.id.clone();
+        let label = sub.label.clone();
+        let url = sub.url.clone();
+        cx.spawn(async move |_entity, cx| {
+            let fetched = fetch_subscription_body(client, &url).await;
+            let now = now_unix();
+            cx.update(|cx| {
+                if let Some(handle) = cx.active_window() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.finish_subscription_refresh(
+                                &sub_id, &label, fetched, now, window, cx,
+                            );
+                        });
+                    });
+                } else {
+                    view.update(cx, |view, cx| {
+                        view.finish_subscription_refresh_no_window(&sub_id, fetched, now, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Ticket 04: apply a fetched body (or fetch error) with user feedback,
+    /// then refresh the dialog contents if it is still open.
+    fn finish_subscription_refresh(
+        &mut self,
+        sub_id: &str,
+        label: &str,
+        fetched: Result<String, String>,
+        now: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match fetched {
+            Ok(body) => match self.store.refresh_with_body(sub_id, &body, now) {
+                Ok(outcome) => {
+                    self.reload(cx);
+                    if let Some(error) = outcome.error {
+                        window.push_notification(
+                            Notification::error(format!("{label}: refresh failed ({error})")),
+                            cx,
+                        );
+                    } else {
+                        let mut summary = format!(
+                            "{}: +{} ~{} -{}",
+                            label, outcome.added, outcome.updated, outcome.removed
+                        );
+                        if outcome.skipped > 0 {
+                            summary.push_str(&format!(" · {} skipped", outcome.skipped));
+                        }
+                        if outcome.duplicates > 0 {
+                            summary.push_str(&format!(" · {} duplicates", outcome.duplicates));
+                        }
+                        if outcome.failures.is_empty() {
+                            window.push_notification(Notification::success(summary), cx);
+                        } else {
+                            summary.push_str(&format!(" · {} failed", outcome.failures.len()));
+                            window.push_notification(Notification::warning(summary), cx);
+                        }
+                    }
+                }
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(format!("{label}: refresh failed ({error})")),
+                        cx,
+                    );
+                }
+            },
+            Err(error) => {
+                let _ = self.store.record_subscription_error(sub_id, &error);
+                self.reload(cx);
+                window.push_notification(Notification::error(format!("{label}: {error}")), cx);
+            }
+        }
+        self.reopen_subscriptions_if_open(window, cx);
+    }
+
+    /// Ticket 04: headless completion path (no window for notifications).
+    fn finish_subscription_refresh_no_window(
+        &mut self,
+        sub_id: &str,
+        fetched: Result<String, String>,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) {
+        match fetched {
+            Ok(body) => {
+                let _ = self.store.refresh_with_body(sub_id, &body, now);
+            }
+            Err(error) => {
+                let _ = self.store.record_subscription_error(sub_id, &error);
+            }
+        }
+        self.reload(cx);
+    }
+
+    /// Ticket 04: re-render the subscriptions dialog after an action, but
+    /// only if the user still has it open.
+    fn reopen_subscriptions_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            window.close_all_dialogs(cx);
+            self.open_subscriptions_dialog(window, cx);
+        }
+    }
+
+    /// Ticket 04: subscription manager dialog — existing subscriptions with
+    /// per-row Refresh / Auto / Remove plus an add form committed by OK.
+    /// An empty add form just closes the dialog.
+    fn open_subscriptions_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let form = SubForm::blank(window, cx);
+        let view = cx.entity();
+        let reader = form.clone();
+        let subs = self.store.list_subscriptions().unwrap_or_default();
+        let rows = self.store.list().unwrap_or_default();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for row in &rows {
+            if let Some(owner) = row.subscription_id.as_deref() {
+                *counts.entry(owner.to_string()).or_insert(0) += 1;
+            }
+        }
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view_for_rows = view.clone();
+            let mut body = div().flex().flex_col().gap_2();
+            if subs.is_empty() {
+                body = body.child("No subscriptions yet — paste a subscription URL below");
+            }
+            for sub in &subs {
+                body = body.child(subscription_row(
+                    view_for_rows.clone(),
+                    sub.clone(),
+                    counts.get(&sub.id).copied().unwrap_or(0),
+                ));
+            }
+            body = body.child(form.clone().element());
+            let view = view.clone();
+            let reader = reader.clone();
+            dialog.title("Subscriptions").child(body).button_props(
+                DialogButtonProps::default()
+                    .show_cancel(true)
+                    .on_ok(move |_, window, cx| {
+                        let label = reader.label.read(cx).value().to_string();
+                        let url = reader.url.read(cx).value().to_string();
+                        let group = reader.group.read(cx).value().to_string();
+                        if label.trim().is_empty() && url.trim().is_empty() {
+                            return true;
+                        }
+                        view.update(cx, |view, cx| {
+                            view.commit_subscription_add(label, url, group, window, cx)
+                        })
+                    }),
+            )
+        });
+    }
+
+    /// Ticket 04: confirm removing a subscription. Members stay in the
+    /// library as hand-owned configs (release, never delete).
+    fn open_subscription_remove_confirm(
+        &mut self,
+        sub: ProxySubscription,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let id = sub.id.clone();
+        let label = sub.label.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let id = id.clone();
+            alert
+                .confirm()
+                .title("Remove subscription")
+                .description(format!(
+                    "Remove \"{label}\"? Its configs stay in the library."
+                ))
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        match view.store.remove_subscription(&id) {
+                            Ok(true) => {
+                                view.reload(cx);
+                            }
+                            _ => {
+                                window.push_notification(
+                                    Notification::warning("Already removed"),
+                                    cx,
+                                );
+                            }
+                        }
+                        view.reopen_subscriptions_if_open(window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Ticket 04: refresh due subscriptions once at startup (the auto-refresh
+    /// scheduling hook evaluation). Never called by tests, so no headless
+    /// test ever touches the network.
+    fn refresh_due_on_startup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = now_unix();
+        let due: Vec<ProxySubscription> = self
+            .store
+            .list_subscriptions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|sub| due_for_refresh(sub, now, DEFAULT_AUTO_REFRESH_SECS))
+            .collect();
+        for sub in due {
+            self.start_subscription_refresh(sub, window, cx);
         }
     }
 
@@ -830,6 +1286,13 @@ impl Render for AppView {
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_import_from_clipboard(window, cx);
                             })),
+                    )
+                    .child(
+                        Button::new("subscriptions")
+                            .label("Subscriptions")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_subscriptions_dialog(window, cx);
+                            })),
                     ),
             )
             .child(
@@ -853,6 +1316,7 @@ fn main() {
         cx.spawn(async move |cx| {
             cx.open_window(TitleBar::window_options(), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
+                view.update(cx, |view, cx| view.refresh_due_on_startup(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open window");
@@ -1130,5 +1594,41 @@ mod tests {
             });
         });
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
+    }
+
+    /// Ticket 04: the subscriptions dialog opens with a label/URL/group
+    /// form for the add flow.
+    #[gpui_kit::test]
+    fn subscriptions_dialog_opens_with_fields(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("field-sub-label").is_some()));
+        assert!(cx.update(|window, _| window.try_find("field-sub-url").is_some()));
+        assert!(cx.update(|window, _| window.try_find("field-sub-group").is_some()));
     }
 }

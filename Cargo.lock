@@ -3896,6 +3896,7 @@ name = "manyproxy"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "futures",
  "gpui-kit",
  "rusqlite",
  "serde_json",

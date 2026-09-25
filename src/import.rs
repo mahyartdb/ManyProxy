@@ -989,7 +989,7 @@ fn json_outbound(index: usize, value: &serde_json::Value) -> Result<ImportedConf
         return Err(bad_host("item has a bad \"server\""));
     }
     let port = json_port(obj)?;
-    let name = json_string(obj, &["tag", "remark", "ps", "email", "name"])
+    let name = json_string(obj, &["tag", "remark", "remarks", "ps", "email", "name"])
         .unwrap_or_else(|| format!("{protocol}-{host}:{port}"));
     let mut params = obj.clone();
     params.insert(
@@ -1006,6 +1006,48 @@ fn json_outbound(index: usize, value: &serde_json::Value) -> Result<ImportedConf
     })
 }
 
+/// Limited SIP008 server item: explicit `type`/`protocol` goes through the
+/// standard outbound path; a typeless item with `method` + `password` (+
+/// `server`/`server_port`) is treated as Shadowsocks. Anything else is a
+/// per-item failure so refresh skips + counts it.
+fn sip008_server(value: &serde_json::Value) -> Result<ImportedConfig, ImportError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_json("item is not a JSON object"))?;
+    if obj.contains_key("type") || obj.contains_key("protocol") {
+        return json_outbound(0, value);
+    }
+    let mut synthesized = obj.clone();
+    synthesized.insert(
+        "type".to_string(),
+        serde_json::Value::String("shadowsocks".to_string()),
+    );
+    if !synthesized.contains_key("server") && synthesized.contains_key("address") {
+        if let Some(server) = synthesized.get("address").cloned() {
+            synthesized.insert("server".to_string(), server);
+        }
+    }
+    if !synthesized.contains_key("server_port") && synthesized.contains_key("port") {
+        if let Some(port) = synthesized.get("port").cloned() {
+            synthesized.insert("server_port".to_string(), port);
+        }
+    }
+    let has_method = synthesized
+        .get("method")
+        .and_then(|value| value.as_str())
+        .is_some_and(|method| !method.trim().is_empty());
+    let has_password = synthesized
+        .get("password")
+        .and_then(|value| value.as_str())
+        .is_some_and(|password| !password.is_empty());
+    if !has_method || !has_password {
+        return Err(invalid_json(
+            "SIP008 item needs an outbound \"type\" or Shadowsocks \"method\"+\"password\"",
+        ));
+    }
+    json_outbound(0, &serde_json::Value::Object(synthesized))
+}
+
 /// Duplicate tags inside one JSON body are deduped with `-2`, `-3`, … suffixes.
 fn dedupe_names(configs: &mut [ImportedConfig]) {
     let mut seen: HashMap<String, usize> = HashMap::new();
@@ -1019,6 +1061,47 @@ fn dedupe_names(configs: &mut [ImportedConfig]) {
 }
 
 fn import_json_value(value: &serde_json::Value) -> BatchResult {
+    // SIP008-style `{"version": N, "servers": [...]}` (limited): items with
+    // an explicit type go through the standard outbound path; method+password
+    // items without a type are treated as Shadowsocks; anything else is a
+    // per-item failure (skip + count).
+    if let serde_json::Value::Object(map) = value {
+        let is_outbound_shape = map.contains_key("outbounds")
+            || map.contains_key("type")
+            || map.contains_key("protocol");
+        if !is_outbound_shape {
+            if let Some(servers) = map.get("servers") {
+                let mut out = BatchResult::default();
+                match servers {
+                    serde_json::Value::Array(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            let label = item
+                                .get("tag")
+                                .or_else(|| item.get("remark"))
+                                .or_else(|| item.get("remarks"))
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("sip008");
+                            match sip008_server(item) {
+                                Ok(config) => out.configs.push(config),
+                                Err(error) => {
+                                    out.failures.push(ImportFailure::new(index, label, error))
+                                }
+                            }
+                        }
+                        dedupe_names(&mut out.configs);
+                        return out;
+                    }
+                    _ => {
+                        return BatchResult::fail(
+                            0,
+                            ImportErrorKind::InvalidJson,
+                            "invalid JSON: \"servers\" is not an array",
+                        );
+                    }
+                }
+            }
+        }
+    }
     let mut out = BatchResult::default();
     let items: Vec<(usize, &serde_json::Value)> = match value {
         serde_json::Value::Array(items) => items.iter().enumerate().collect(),
@@ -1363,6 +1446,457 @@ pub fn commit_batch(
 
 fn identity(protocol: &str, params: &str) -> String {
     format!("{protocol}\0{params}")
+}
+
+// ---------------------------------------------------------------------------
+// Ticket 04: subscriptions — normalized identity, addsub intake, bodies
+// ---------------------------------------------------------------------------
+
+/// Normalized subscription identity for refresh upserts: protocol + server +
+/// port + credential + method + sni/path, NOT the remark. Server is
+/// lowercased (hostnames are case-insensitive); credential values stay
+/// verbatim. Non-JSON params fall back to the raw string so hand-made rows
+/// still get a stable key.
+pub fn normalized_identity(protocol: &str, params: &str) -> String {
+    fn get(obj: &Params, keys: &[&str]) -> Option<String> {
+        keys.iter().find_map(|wanted| {
+            obj.iter().find_map(|(key, value)| {
+                if key.eq_ignore_ascii_case(wanted) {
+                    match value {
+                        serde_json::Value::String(text) if !text.trim().is_empty() => {
+                            Some(text.clone())
+                        }
+                        serde_json::Value::Number(number) => Some(number.to_string()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+    }
+    let protocol = protocol.trim().to_ascii_lowercase();
+    match serde_json::from_str::<serde_json::Value>(params) {
+        Ok(serde_json::Value::Object(map)) => {
+            let server = get(&map, &["server", "address"])
+                .map(|server| server.to_ascii_lowercase())
+                .unwrap_or_default();
+            let port = get(&map, &["server_port", "port"]).unwrap_or_default();
+            let creds: Vec<String> = [
+                "uuid",
+                "password",
+                "auth",
+                "private_key",
+                "privatekey",
+                "public_key",
+                "publickey",
+                "method",
+                "username",
+                "token",
+            ]
+            .iter()
+            .filter_map(|key| get(&map, &[key]))
+            .collect();
+            let sni: Vec<String> = ["sni", "peer", "servername"]
+                .iter()
+                .filter_map(|key| get(&map, &[key]))
+                .collect();
+            let path: Vec<String> = ["path", "service_name", "servicename", "serviceName"]
+                .iter()
+                .filter_map(|key| get(&map, &[key]))
+                .collect();
+            format!(
+                "{protocol}\0{server}\0{port}\0{}\0{}\0{}",
+                creds.join(","),
+                sni.join(","),
+                path.join(",")
+            )
+        }
+        _ => format!("{protocol}\0{params}"),
+    }
+}
+
+/// Parsed `throne://addsub/...` intake: a subscription URL plus its group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddSubRequest {
+    pub url: String,
+    pub group: String,
+}
+
+/// Parse `throne://addsub/<standard-base64 of "<url>[#group]">`
+/// (case-insensitive command). Unlike `throne://add`, the payload alphabet is
+/// standard base64 ONLY: urlsafe bytes (`-`, `_`) are rejected as bad base64.
+/// The URL must be `http(s)`; a missing group falls back to the default.
+pub fn parse_addsub_link(line: &str) -> Result<AddSubRequest, ImportError> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    let text = line.trim();
+    let sep = text
+        .find("://")
+        .ok_or_else(|| unknown_scheme("not a share link (missing '://')"))?;
+    if !text[..sep].eq_ignore_ascii_case("throne") {
+        return Err(unknown_scheme(format!("unknown scheme '{}'", &text[..sep])));
+    }
+    let rest = &text[sep + 3..];
+    let (command, payload) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    if !command.eq_ignore_ascii_case("addsub") {
+        return Err(unknown_scheme(format!(
+            "unknown throne command '{command}'"
+        )));
+    }
+    if payload.trim().is_empty() {
+        return Err(ImportError::new(
+            ImportErrorKind::Empty,
+            "throne link is missing its payload",
+        ));
+    }
+    let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.chars().any(|c| c == '-' || c == '_') {
+        return Err(ImportError::new(
+            ImportErrorKind::BadBase64,
+            "addsub payload must be standard base64",
+        ));
+    }
+    let bytes = STANDARD
+        .decode(&compact)
+        .or_else(|_| STANDARD_NO_PAD.decode(&compact))
+        .map_err(|_| ImportError::new(ImportErrorKind::BadBase64, "bad base64 payload"))?;
+    let inner = String::from_utf8(bytes)
+        .map_err(|_| ImportError::new(ImportErrorKind::NonUtf8, "payload is not UTF-8"))?;
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Err(ImportError::new(
+            ImportErrorKind::Empty,
+            "addsub payload is empty",
+        ));
+    }
+    let (url, group) = match inner.find('#') {
+        Some(i) => (inner[..i].trim(), inner[i + 1..].trim().to_string()),
+        None => (inner, DEFAULT_GROUP.to_string()),
+    };
+    let after_scheme = if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
+        &url[7..]
+    } else if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
+        &url[8..]
+    } else {
+        return Err(bad_host("subscription url must use http(s)"));
+    };
+    let host = after_scheme.split(['/', '?']).next().unwrap_or("");
+    if host.trim().is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(bad_host("subscription url must use http(s)"));
+    }
+    Ok(AddSubRequest {
+        url: url.to_string(),
+        group: if group.is_empty() {
+            DEFAULT_GROUP.to_string()
+        } else {
+            group
+        },
+    })
+}
+
+/// Parse a subscription response body, reusing the ticket-03 parsers:
+/// JSON (arrays, full configs, limited SIP008 `servers[]`), limited Clash
+/// YAML (`proxies:` with `type`/`server`/`port`), base64 blobs of share links
+/// (single-line, `data:…;base64,…`, or per-line v2rayN style), WireGuard conf,
+/// or plain share-link lines. Per-item failures skip + count, as everywhere.
+pub fn import_subscription_body(body: &str) -> BatchResult {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return BatchResult::fail(0, ImportErrorKind::Empty, "nothing to import");
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(value) => import_json_value(&value),
+            Err(error) => BatchResult::fail(
+                0,
+                ImportErrorKind::InvalidJson,
+                format!("invalid JSON: {error}"),
+            ),
+        };
+    }
+    if looks_like_wg_conf(trimmed) {
+        return import_wg_conf(trimmed, "wireguard");
+    }
+    if has_clash_proxies(trimmed) {
+        return import_clash_proxies(trimmed);
+    }
+    let lines: Vec<&str> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() > 1 {
+        // v2rayN-style multi-line base64: decode the lines that decode,
+        // keep the rest verbatim, then parse the rebuilt body.
+        let mut rebuilt = Vec::with_capacity(lines.len());
+        let mut decoded_any = false;
+        for line in &lines {
+            if line.contains("://") {
+                rebuilt.push((*line).to_string());
+            } else if let Ok(text) = decode_b64_utf8(line) {
+                let text = text.trim().to_string();
+                if text.contains("://") {
+                    rebuilt.push(text);
+                    decoded_any = true;
+                } else {
+                    rebuilt.push((*line).to_string());
+                }
+            } else {
+                rebuilt.push((*line).to_string());
+            }
+        }
+        if decoded_any {
+            return import_text(&rebuilt.join("\n"));
+        }
+        return import_text(body);
+    }
+    let single = lines.first().copied().unwrap_or("");
+    if single.contains("://") && !single.to_ascii_lowercase().starts_with("data:") {
+        return import_text(body);
+    }
+    // `data:…;base64,…` single payloads (V2Fly DataURLSingle).
+    if let Some(comma) = single.find(";base64,").or_else(|| single.find(";BASE64,")) {
+        let payload = &single[comma + 8..];
+        return match decode_b64_utf8(payload) {
+            Ok(text) if text.contains("://") => import_text(&text),
+            Ok(_) => BatchResult::fail(
+                0,
+                ImportErrorKind::InvalidJson,
+                "subscription payload has no share links",
+            ),
+            Err(error) => BatchResult {
+                configs: Vec::new(),
+                failures: vec![ImportFailure::new(0, "body", error)],
+            },
+        };
+    }
+    // Single base64 blob of share links.
+    match decode_b64_utf8(single) {
+        Ok(text) if text.trim().contains("://") => import_text(&text),
+        Ok(_) => import_text(body),
+        Err(error) => match error.kind {
+            ImportErrorKind::Empty => import_text(body),
+            ImportErrorKind::NonUtf8 => BatchResult {
+                configs: Vec::new(),
+                failures: vec![ImportFailure::new(0, "body", error)],
+            },
+            // Not base64 at all: let the link parser report it per line.
+            _ => import_text(body),
+        },
+    }
+}
+
+/// A Clash body has a top-level `proxies:` mapping. Share-link bodies never
+/// start a line with `proxies:`.
+fn has_clash_proxies(trimmed: &str) -> bool {
+    trimmed.lines().any(|raw_line| {
+        let indent = raw_line.len() - raw_line.trim_start().len();
+        indent == 0 && {
+            let line = raw_line.trim();
+            line == "proxies:" || line.starts_with("proxies:")
+        }
+    })
+}
+
+/// Limited Clash `proxies:` parser (block style only): each `- ` entry needs
+/// `name` (default `{type}-{server}:{port}`), `type`, `server`, `port`.
+/// Entries are converted to sing-box-shaped params; unknown types and missing
+/// fields are per-item failures. Groups/rules are ignored.
+fn import_clash_proxies(content: &str) -> BatchResult {
+    fn clash_type(raw: &str) -> Result<String, ImportError> {
+        let lower = raw.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
+            | "wireguard" | "socks" | "anytls" | "http" | "https" | "naive" => Ok(lower),
+            "ss" => Ok("shadowsocks".to_string()),
+            "socks5" => Ok("socks".to_string()),
+            "" => Err(invalid_json("clash entry is missing \"type\"")),
+            other => Err(unknown_scheme(format!("unknown clash type '{other}'"))),
+        }
+    }
+    fn clash_value(raw: &str) -> String {
+        let mut value = raw.trim().to_string();
+        if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            value = value[1..value.len() - 1].to_string();
+        }
+        value
+    }
+    let mut out = BatchResult::default();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines
+        .iter()
+        .position(|raw_line| {
+            let line = raw_line.trim();
+            line == "proxies:" || line.starts_with("proxies:")
+        })
+        .unwrap_or(0);
+    // Entries: (fields, source index). Indents track the `- ` entry line
+    // separately from the first `key: value` line so nested mapping detail
+    // is ignored instead of ending the entry.
+    struct Pending {
+        fields: Vec<(String, String)>,
+        entry_indent: usize,
+        key_indent: Option<usize>,
+    }
+    let mut entries: Vec<(Vec<(String, String)>, usize)> = Vec::new();
+    let mut current: Option<Pending> = None;
+    let flush = |current: &mut Option<Pending>,
+                 entries: &mut Vec<(Vec<(String, String)>, usize)>| {
+        if let Some(pending) = current.take() {
+            let index = entries.len();
+            entries.push((pending.fields, index));
+        }
+    };
+    for raw_line in lines.iter().skip(start + 1) {
+        if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = raw_line.len() - raw_line.trim_start().len();
+        if indent == 0 {
+            break; // next top-level section ends `proxies:`.
+        }
+        let line = raw_line.trim();
+        if line.starts_with("- ") || line == "-" {
+            flush(&mut current, &mut entries);
+            let after = line.strip_prefix("- ").unwrap_or("").trim();
+            let mut fields = Vec::new();
+            if !after.is_empty() {
+                // `- {flow}` mappings are out of scope for the limited parser.
+                if after.starts_with('{') {
+                    let index = entries.len();
+                    entries.push((vec![("__flow__".to_string(), after.to_string())], index));
+                    continue;
+                }
+                if let Some(i) = after.find(':') {
+                    let (key, value) = (after[..i].trim(), after[i + 1..].trim());
+                    if !key.is_empty() {
+                        fields.push((key.to_ascii_lowercase(), clash_value(value)));
+                    }
+                }
+            }
+            current = Some(Pending {
+                fields,
+                entry_indent: indent,
+                key_indent: None,
+            });
+        } else if let Some(pending) = current.as_mut() {
+            if indent <= pending.entry_indent {
+                // Dedented non-entry line ends the entry; the line itself is
+                // not a field.
+                flush(&mut current, &mut entries);
+                continue;
+            }
+            match pending.key_indent {
+                None => {
+                    if let Some(i) = line.find(':') {
+                        let (key, value) = (line[..i].trim(), line[i + 1..].trim());
+                        if !key.is_empty() && !key.contains(' ') {
+                            pending.key_indent = Some(indent);
+                            pending
+                                .fields
+                                .push((key.to_ascii_lowercase(), clash_value(value)));
+                        }
+                    }
+                }
+                Some(key_indent) => {
+                    if indent != key_indent {
+                        continue; // nested mapping detail: ignored.
+                    }
+                    if let Some(i) = line.find(':') {
+                        let (key, value) = (line[..i].trim(), line[i + 1..].trim());
+                        if !key.is_empty() && !key.contains(' ') {
+                            pending
+                                .fields
+                                .push((key.to_ascii_lowercase(), clash_value(value)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    flush(&mut current, &mut entries);
+    if entries.is_empty() {
+        return BatchResult::fail(
+            0,
+            ImportErrorKind::InvalidJson,
+            "clash body has no proxy entries",
+        );
+    }
+    for (entry_index, (fields, _)) in entries.iter().enumerate() {
+        let parsed = (|| -> Result<ImportedConfig, ImportError> {
+            if fields.iter().any(|(key, _)| key == "__flow__") {
+                return Err(invalid_json("clash flow mappings are not supported"));
+            }
+            let raw_type = fields
+                .iter()
+                .find(|(key, _)| key == "type")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            let protocol = clash_type(&raw_type)?;
+            let host = fields
+                .iter()
+                .find(|(key, _)| key == "server")
+                .map(|(_, value)| value.clone())
+                .filter(|host| !host.trim().is_empty())
+                .ok_or_else(|| {
+                    ImportError::new(
+                        ImportErrorKind::BadHost,
+                        "clash entry is missing \"server\"",
+                    )
+                })?;
+            if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(bad_host("clash entry has a bad \"server\""));
+            }
+            let port_raw = fields
+                .iter()
+                .find(|(key, _)| key == "port")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            let port = parse_port(&port_raw)
+                .map_err(|_| bad_port(format!("clash entry has a bad \"port\" ({port_raw})")))?;
+            let name = fields
+                .iter()
+                .find(|(key, _)| key == "name")
+                .map(|(_, value)| value.clone())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("{protocol}-{host}:{port}"));
+            let mut params = base_params(&protocol, &host, port);
+            for (key, value) in fields {
+                if key == "name" || key == "type" || key == "server" || key == "port" {
+                    continue;
+                }
+                insert_str(&mut params, key, value.clone());
+            }
+            Ok(ImportedConfig {
+                name,
+                protocol,
+                params: finish(params),
+                host,
+                port,
+            })
+        })();
+        match parsed {
+            Ok(config) => out.configs.push(config),
+            Err(error) => {
+                let label = entries[entry_index]
+                    .0
+                    .iter()
+                    .find(|(key, _)| key == "name")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "clash".to_string());
+                out.failures
+                    .push(ImportFailure::new(entry_index, label, error));
+            }
+        }
+    }
+    dedupe_names(&mut out.configs);
+    out
 }
 
 /// Redact credentials (`scheme://…@`) and truncate, for notifications and
@@ -1860,5 +2394,138 @@ mod tests {
         let redacted = redact_link("vless://my-secret-uuid@example.com:443#x");
         assert!(!redacted.contains("my-secret-uuid"), "got {redacted}");
         assert!(redacted.contains("example.com"), "got {redacted}");
+    }
+
+    // -- ticket 04: subscription bodies, identity, addsub --------------------
+
+    fn b64_standard(text: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(text)
+    }
+
+    #[test]
+    fn normalized_identity_ignores_remark() {
+        let first =
+            parse_link(&format!("vless://{UUID}@a.example.com:443#one")).expect("link parses");
+        let second =
+            parse_link(&format!("vless://{UUID}@a.example.com:443#two")).expect("link parses");
+        assert_eq!(
+            normalized_identity(&first.protocol, &first.params),
+            normalized_identity(&second.protocol, &second.params),
+            "remark is not identity"
+        );
+        let other =
+            parse_link(&format!("vless://{UUID}@b.example.com:443#one")).expect("link parses");
+        assert_ne!(
+            normalized_identity(&first.protocol, &first.params),
+            normalized_identity(&other.protocol, &other.params),
+            "server is identity"
+        );
+    }
+
+    #[test]
+    fn subscription_body_base64_blob() {
+        let inner =
+            format!("vless://{UUID}@a.example.com:443#one\ntrojan://pw@b.example.com:443#two");
+        let out = import_subscription_body(&b64_standard(&inner));
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+    }
+
+    #[test]
+    fn subscription_body_json_array_and_sip008() {
+        let array = serde_json::json!([
+            {"type": "vless", "tag": "one", "server": "a.example.com", "server_port": 443, "uuid": UUID}
+        ]);
+        let out = import_subscription_body(&array.to_string());
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+
+        // Limited SIP008: typeless method+password items become Shadowsocks.
+        let sip008 = serde_json::json!({
+            "version": 2,
+            "servers": [
+                {"remarks": "ss-one", "server": "s.example.com", "server_port": 8388,
+                 "method": "aes-256-gcm", "password": "hunter2"},
+                {"remarks": "typed", "type": "trojan", "server": "t.example.com",
+                 "server_port": 443, "password": "pw"},
+                {"remarks": "broken", "server": "b.example.com"}
+            ]
+        });
+        let out = import_subscription_body(&sip008.to_string());
+        assert_eq!(out.configs.len(), 2, "failures: {:?}", out.failures);
+        assert_eq!(out.failures.len(), 1, "typeless item without creds skips");
+        assert_eq!(out.configs[0].protocol, "shadowsocks");
+        assert_eq!(out.configs[0].name, "ss-one");
+    }
+
+    #[test]
+    fn subscription_body_clash_limited() {
+        let body = "proxies:\n  - name: clash-one\n    type: trojan\n    server: t.example.com\n    port: 443\n    password: pw\n  - name: clash-two\n    type: ss\n    server: s.example.com\n    port: 8388\n    cipher: aes-256-gcm\n    password: hunter2\n  - name: broken\n    type: wireguard\n";
+        let out = import_subscription_body(body);
+        assert_eq!(out.configs.len(), 2, "failures: {:?}", out.failures);
+        assert_eq!(out.failures.len(), 1, "member without server skips");
+        assert_eq!(out.configs[0].protocol, "trojan");
+        assert_eq!(out.configs[1].protocol, "shadowsocks");
+    }
+
+    #[test]
+    fn subscription_body_garbage_is_failure() {
+        let out = import_subscription_body("bogus://x\nbogus://y");
+        assert!(out.configs.is_empty());
+        assert_eq!(out.failures.len(), 2);
+        let empty = import_subscription_body("   \n ");
+        assert!(empty.configs.is_empty());
+        assert_eq!(empty.failures.len(), 1);
+        assert_eq!(empty.failures[0].code, ImportErrorKind::Empty);
+    }
+
+    #[test]
+    fn addsub_valid_with_group() {
+        let link = format!(
+            "throne://addsub/{}",
+            b64_standard("https://example.com/sub.txt#travel")
+        );
+        let request = parse_addsub_link(&link).expect("addsub parses");
+        assert_eq!(request.url, "https://example.com/sub.txt");
+        assert_eq!(request.group, "travel");
+    }
+
+    #[test]
+    fn addsub_missing_group_falls_back_to_default() {
+        let link = format!(
+            "throne://addsub/{}",
+            b64_standard("https://example.com/sub.txt")
+        );
+        let request = parse_addsub_link(&link).expect("addsub parses");
+        assert_eq!(request.group, DEFAULT_GROUP);
+    }
+
+    #[test]
+    fn addsub_rejects_urlsafe_alphabet() {
+        // Bytes 0xFB 0xFF encode with `-`/`_` in urlsafe: standard-only must fail.
+        let urlsafe = base64::engine::general_purpose::URL_SAFE.encode([0xFBu8, 0xFF]);
+        assert!(
+            urlsafe.contains('-') || urlsafe.contains('_'),
+            "fixture uses the urlsafe alphabet, got {urlsafe}"
+        );
+        let error = parse_addsub_link(&format!("throne://addsub/{urlsafe}"))
+            .expect_err("urlsafe addsub fails");
+        assert_eq!(error.kind, ImportErrorKind::BadBase64);
+    }
+
+    #[test]
+    fn addsub_rejects_non_http_and_unknown_command() {
+        let error = parse_addsub_link(&format!(
+            "throne://addsub/{}",
+            b64_standard("ftp://example.com/sub.txt#travel")
+        ))
+        .expect_err("non-http url fails");
+        assert_eq!(error.kind, ImportErrorKind::BadHost);
+        assert!(
+            !error.message.contains("ftp://example.com"),
+            "error hides the URL, got {error}"
+        );
+        let error = parse_addsub_link("throne://route/aGk").expect_err("route cmd fails here");
+        assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
     }
 }
