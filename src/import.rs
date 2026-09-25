@@ -29,7 +29,8 @@ pub struct ImportedConfig {
     /// Remark/tag, or `{protocol}-{host}:{port}` when the link has none.
     pub name: String,
     /// Normalized outbound type (`vless`, `vmess`, `trojan`, `shadowsocks`,
-    /// `hysteria2`, `hysteria`, `tuic`, `wireguard`, `socks`, `anytls`,
+    /// `hysteria2`, `hysteria`, `tuic`, `wireguard`, `amneziawg` (ticket 07:
+    /// `awg`/`amnezia-wg` aliases fold here), `socks`, `anytls`,
     /// `http`, `https`, `naive`).
     pub protocol: String,
     /// Deterministic JSON object with sing-box outbound field names
@@ -808,6 +809,35 @@ fn parse_wg_uri(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     })
 }
 
+/// Ticket 07: AmneziaWG-variant URI (`awg://`, `amneziawg://`,
+/// `amnezia-wg://`): same authority shape as WireGuard (private key in
+/// userinfo, `publickey` required); every other query key — `awg_version`,
+/// `jc`/`jmin`/`jmax`, `s/h/i` ranges, 3.x additions — is preserved verbatim
+/// into params for the fork-core version-matrix validator (engine.rs).
+fn parse_awg_uri(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    let private_key = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
+    if private_key.trim().is_empty() {
+        return Err(missing_credential("amneziawg link is missing private key"));
+    }
+    let query = &parts.query;
+    let public_key = query.get("publickey").cloned().unwrap_or_default();
+    if public_key.trim().is_empty() {
+        return Err(missing_credential("amneziawg link is missing publickey"));
+    }
+    let port = require_port(parts.port_text.as_deref())?;
+    let mut params = base_params("amneziawg", &parts.host, port);
+    insert_str(&mut params, "private_key", private_key);
+    insert_str(&mut params, "public_key", public_key);
+    insert_extras(&mut params, query, &["publickey"]);
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "amneziawg", &parts.host, port),
+        protocol: "amneziawg".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
 fn parse_socks_like(
     protocol: &str,
     parts: &UriParts,
@@ -935,9 +965,11 @@ fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
         "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-        | "wireguard" | "socks" | "anytls" | "http" | "https" | "naive" => Ok(lower),
+        | "wireguard" | "amneziawg" | "socks" | "anytls" | "http" | "https" | "naive" => Ok(lower),
         "ss" => Ok("shadowsocks".to_string()),
         "socks5" => Ok("socks".to_string()),
+        // Ticket 07: AWG aliases fold to the canonical stored form.
+        "awg" | "amnezia-wg" => Ok("amneziawg".to_string()),
         "" => Err(invalid_json("item is missing outbound \"type\"")),
         other => Err(unknown_scheme(format!("unknown outbound type '{other}'"))),
     }
@@ -1336,6 +1368,7 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         "hysteria" => parse_hy1(&split_uri(&scheme, rest)?),
         "tuic" => parse_tuic(&split_uri(&scheme, rest)?),
         "wireguard" | "wg" => parse_wg_uri(&split_uri(&scheme, rest)?),
+        "awg" | "amneziawg" | "amnezia-wg" => parse_awg_uri(&split_uri(&scheme, rest)?),
         "socks" | "socks5" => parse_socks_like("socks", &split_uri(&scheme, rest)?, None),
         "anytls" => parse_anytls(&split_uri(&scheme, rest)?),
         "http" => parse_socks_like("http", &split_uri(&scheme, rest)?, Some(80)),
@@ -1710,9 +1743,13 @@ fn import_clash_proxies(content: &str) -> BatchResult {
         let lower = raw.trim().to_ascii_lowercase();
         match lower.as_str() {
             "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-            | "wireguard" | "socks" | "anytls" | "http" | "https" | "naive" => Ok(lower),
+            | "wireguard" | "amneziawg" | "socks" | "anytls" | "http" | "https" | "naive" => {
+                Ok(lower)
+            }
             "ss" => Ok("shadowsocks".to_string()),
             "socks5" => Ok("socks".to_string()),
+            // Ticket 07: AWG aliases fold to the canonical stored form.
+            "awg" | "amnezia-wg" => Ok("amneziawg".to_string()),
             "" => Err(invalid_json("clash entry is missing \"type\"")),
             other => Err(unknown_scheme(format!("unknown clash type '{other}'"))),
         }
@@ -2103,6 +2140,73 @@ mod tests {
         assert_eq!(out.configs[0].host, "203.0.113.1");
         assert_eq!(out.configs[1].host, "203.0.113.2");
         assert_eq!(params_of(&out.configs[0])["dns"], "1.1.1.1");
+    }
+
+    // -- ticket 07: AmneziaWG-variant links (params preserved verbatim) -----
+
+    #[test]
+    fn awg_link_preserves_version_matrix_params_verbatim() {
+        let link = "awg://cHJpdmF0ZWtleQ@example.com:51820?publickey=cHVia2V5&awg_version=2.0&jc=4&jmin=40&jmax=70&s1=20&h1=1-100&i1=%3Cb%200xd100%3E%3Cr%2050%3E#awg-one";
+        let config = parse_link(link).expect("awg parses");
+        assert_eq!(config.protocol, "amneziawg");
+        assert_eq!(config.host, "example.com");
+        assert_eq!(config.port, 51820);
+        assert_eq!(config.name, "awg-one");
+        let params = params_of(&config);
+        assert_eq!(params["private_key"], "cHJpdmF0ZWtleQ");
+        assert_eq!(params["public_key"], "cHVia2V5");
+        assert_eq!(params["awg_version"], "2.0");
+        assert_eq!(params["jc"], "4");
+        assert_eq!(params["jmin"], "40");
+        assert_eq!(params["jmax"], "70");
+        assert_eq!(params["s1"], "20");
+        assert_eq!(params["h1"], "1-100");
+        assert_eq!(params["i1"], "<b 0xd100><r 50>");
+    }
+
+    #[test]
+    fn awg_alias_schemes_fold_to_canonical() {
+        for scheme in ["awg", "amneziawg", "amnezia-wg", "AWG"] {
+            let link = format!(
+                "{scheme}://cHJpdmF0ZWtleQ@example.com:51820?publickey=cHVia2V5&awg_version=3.1&HeaderProtectionKey=K#x"
+            );
+            let config = parse_link(&link).unwrap_or_else(|_| panic!("{scheme} parses"));
+            assert_eq!(config.protocol, "amneziawg", "scheme {scheme}");
+            assert_eq!(params_of(&config)["HeaderProtectionKey"], "K");
+        }
+    }
+
+    #[test]
+    fn awg_missing_keys_fail_without_echoing() {
+        let no_priv = parse_link("awg://@example.com:51820?publickey=x")
+            .expect_err("missing private key fails");
+        assert_eq!(no_priv.kind, ImportErrorKind::MissingCredential);
+        assert!(no_priv.message.contains("private key"), "got {no_priv}");
+
+        let no_pub = parse_link("awg://cHJpdmF0ZWtleQ@example.com:51820")
+            .expect_err("missing publickey fails");
+        assert_eq!(no_pub.kind, ImportErrorKind::MissingCredential);
+        assert!(no_pub.message.contains("publickey"), "got {no_pub}");
+        assert!(
+            !no_pub.message.contains("cHJpdmF0ZWtleQ"),
+            "no key echo: {no_pub}"
+        );
+    }
+
+    #[test]
+    fn json_outbound_awg_types_fold_to_canonical() {
+        for raw in ["amneziawg", "awg", "amnezia-wg"] {
+            let body = serde_json::json!([{
+                "type": raw, "tag": "awg-json",
+                "server": "a.example.com", "server_port": 51820,
+                "private_key": "p", "public_key": "q", "awg_version": "2.0", "jc": 2
+            }]);
+            let out = import_text(&body.to_string());
+            assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+            assert_eq!(out.configs.len(), 1);
+            assert_eq!(out.configs[0].protocol, "amneziawg", "type {raw}");
+            assert_eq!(params_of(&out.configs[0])["awg_version"], "2.0");
+        }
     }
 
     #[test]

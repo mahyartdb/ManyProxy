@@ -10,7 +10,8 @@
 //! touches a real remote server. Extra-core rows do not exist until ticket
 //! 08: [`is_probeable_protocol`] denies them with a named error and the fake
 //! driver carries a deny-list hook so ticket 08 can flip them on for
-//! active-profile tests only.
+//! active-profile tests only. Ticket 07 flips AmneziaWG variants on: AWG rows
+//! are probeable through their own endpoints exactly like stock rows.
 //!
 //! Hard prohibitions: health checks never route through another config's
 //! egress (each probe dials its own `bind:port`); secrets never reach stored
@@ -113,9 +114,12 @@ pub trait HealthProber {
     ) -> Result<ProbeSuccess, String>;
 }
 
-/// Protocols measurable in this slice. Mirrors the ticket-05 standard set;
-/// anything else (anytls, ssh, custom-*, chained, extra-core, xray-only) is
-/// a named skip until its owning ticket. Ticket 08 flips `extra-core` on.
+/// Protocols measurable in this slice. Mirrors the ticket-05 standard set
+/// plus ticket-07 AmneziaWG variants (each probe still dials the row's own
+/// endpoint, so AWG rows are measured through their own egress like stock
+/// rows). Anything else (anytls, ssh, custom-*, chained, extra-core,
+/// xray-only) is a named skip until its owning ticket. Ticket 08 flips
+/// `extra-core` on.
 pub fn is_probeable_protocol(protocol: &str) -> bool {
     matches!(
         protocol.trim().to_ascii_lowercase().as_str(),
@@ -130,6 +134,9 @@ pub fn is_probeable_protocol(protocol: &str) -> bool {
             | "hy2"
             | "wireguard"
             | "wg"
+            | "amneziawg"
+            | "awg"
+            | "amnezia-wg"
     )
 }
 
@@ -1207,6 +1214,36 @@ mod tests {
         assert!(!real.supports(&configs[1]), "real driver denies extra-core");
         assert!(is_probeable_protocol("ss"));
         assert!(!is_probeable_protocol("custom-config"));
+    }
+
+    /// Ticket 07: AWG rows are probeable through their own endpoints (deny
+    /// list flipped); extra-core rows stay denied.
+    #[test]
+    fn amneziawg_rows_are_probeable_through_own_endpoints() {
+        for protocol in ["amneziawg", "awg", "amnezia-wg"] {
+            assert!(is_probeable_protocol(protocol), "{protocol} is probeable");
+        }
+        let configs = vec![
+            fixture("7", "AwgOne", "amneziawg", "127.0.0.1", 10807),
+            fixture("9", "Odd", "extra-core", "127.0.0.1", 10809),
+        ];
+        let (mut prober, handle) = FakeHealthProber::shared();
+        handle.deny_protocol("extra-core");
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].sample.error.is_none());
+        assert!(outcomes[1].sample.error.is_some());
+        let calls = handle.calls_for("7");
+        assert_eq!(calls.len(), 1, "AWG row is probed, not skipped");
+        assert_eq!(calls[0].bind, "127.0.0.1");
+        assert_eq!(calls[0].port, 10807, "own endpoint, not a sibling's");
+
+        let real = RealHealthProber::default();
+        assert!(real.supports(&configs[0]), "real driver probes AWG");
+        assert!(
+            !real.supports(&configs[1]),
+            "real driver still denies extra-core"
+        );
     }
 
     /// Traffic counters accumulate per config across probes.
