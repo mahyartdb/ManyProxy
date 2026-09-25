@@ -31,12 +31,13 @@ use health::{
     DEFAULT_TEST_URL,
 };
 use import::{
-    commit_batch, format_import_failures, import_file_content, import_text, is_addsub_attempt,
-    parse_addsub_link, AddSubRequest, ImportError,
+    commit_batch, effective_hint_for_text, format_import_failures, import_file_content,
+    import_multi_file_contents, import_text, is_addsub_attempt, parse_addsub_link, AddSubRequest,
+    ImportError,
 };
 use store::{
-    delete_confirm_text, due_for_refresh, export_confirm_description, now_unix, proxy_urls,
-    ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig, Store, StoreError,
+    count_importable, delete_confirm_text, due_for_refresh, export_confirm_description, now_unix,
+    proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig, Store, StoreError,
     Subscription as ProxySubscription, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND, DEFAULT_GROUP,
     DEFAULT_PROTOCOL,
 };
@@ -334,13 +335,17 @@ impl ConfigForm {
 
 /// Handles to the import dialog inputs: a multi-line paste box plus the
 /// target group. `file_hint` carries the dropped file name (if exactly one)
-/// so `.conf` content keeps its stem for peer names and parses as conf even
-/// after edits; otherwise the commit path sniffs the text.
+/// so `.conf` content keeps its stem for peer names; `original_text` is the
+/// prefill at open time (stale-hint guard: edited text parses as its own
+/// type); `multi_files` carries every dropped file for multi-drop so per-file
+/// stems/keys survive (merged text alone cannot recover file boundaries).
 #[derive(Clone)]
 struct ImportForm {
     text: Entity<TextareaState>,
     group: Entity<InputState>,
     file_hint: Option<String>,
+    original_text: String,
+    multi_files: Option<Vec<(String, String)>>,
 }
 
 impl ImportForm {
@@ -363,7 +368,21 @@ impl ImportForm {
                     .default_value(prefill_group.to_string())
             }),
             file_hint,
+            original_text: prefill_text.to_string(),
+            multi_files: None,
         }
+    }
+
+    fn new_multi(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        prefill_text: &str,
+        prefill_group: &str,
+        files: Vec<(String, String)>,
+    ) -> Self {
+        let mut form = Self::new(window, cx, prefill_text, prefill_group, None);
+        form.multi_files = Some(files);
+        form
     }
 
     /// Consumes a clone; every built element owns its state entity.
@@ -441,6 +460,32 @@ fn subscription_label_from_url(url: &str) -> String {
 /// is safe for notifications.
 fn addsub_error_message(error: &ImportError) -> String {
     format!("Invalid subscription link: {error}")
+}
+
+/// Ticket 16: dialog group wins for single-addsub intake. A blank dialog
+/// falls back to the payload group; an untouched `default` dialog keeps a
+/// custom payload group; any edited (non-default) dialog group lands the
+/// subscription in the edited group, not the payload group.
+fn effective_addsub_group(dialog_group: &str, payload_group: &str) -> String {
+    let dialog = dialog_group.trim();
+    if dialog.is_empty() {
+        return payload_group.to_string();
+    }
+    if dialog == DEFAULT_GROUP && payload_group != DEFAULT_GROUP {
+        return payload_group.to_string();
+    }
+    dialog.to_string()
+}
+
+/// Ticket 16: honest export toast. The payload only re-imports import-shaped
+/// rows, so when hand-made metadata-only rows exist the toast states both
+/// numbers instead of claiming every row re-imports.
+fn export_count_message(total: usize, importable: usize, path: &str) -> String {
+    if importable == total {
+        format!("Exported {total} config(s) to {path}")
+    } else {
+        format!("Exported {total} config(s) ({importable} importable) to {path}")
+    }
 }
 
 /// Ticket 04: fetch a subscription body over the platform HTTP client.
@@ -1246,6 +1291,8 @@ impl AppView {
 
     /// Ticket 11: the actual export write (post-confirm). The notification
     /// names only the destination path and the row count — never secrets.
+    /// Ticket 16: the count is honest — import-shaped (re-importable) vs
+    /// total, so hand-made metadata-only rows never inflate the claim.
     fn commit_export_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = Store::default_export_path();
         match self.store.commit_export(&path, true) {
@@ -1256,9 +1303,10 @@ impl AppView {
                 // fails (never claim "0 config(s)").
                 match self.store.list() {
                     Ok(rows) => window.push_notification(
-                        Notification::success(format!(
-                            "Exported {} config(s) to {rendered}",
-                            rows.len()
+                        Notification::success(export_count_message(
+                            rows.len(),
+                            count_importable(&rows),
+                            &rendered,
                         )),
                         cx,
                     ),
@@ -1357,7 +1405,32 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = ImportForm::new(window, cx, prefill_text, prefill_group, file_hint);
+        self.open_import_dialog_with_files(
+            prefill_text,
+            prefill_group,
+            file_hint,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// Ticket 16: multi-file opener — the dialog shows the merged text but
+    /// retains every `(file_name, content)` pair so an unedited commit keeps
+    /// per-file stems/keys; any edit falls back to single-text sniffing.
+    fn open_import_dialog_with_files(
+        &mut self,
+        prefill_text: &str,
+        prefill_group: &str,
+        file_hint: Option<String>,
+        multi_files: Option<Vec<(String, String)>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = match multi_files {
+            Some(files) => ImportForm::new_multi(window, cx, prefill_text, prefill_group, files),
+            None => ImportForm::new(window, cx, prefill_text, prefill_group, file_hint),
+        };
         let view = cx.entity();
         let reader = form.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
@@ -1371,8 +1444,18 @@ impl AppView {
                         let text = reader.text.read(cx).value().to_string();
                         let group = reader.group.read(cx).value().to_string();
                         let hint = reader.file_hint.clone();
+                        let original = reader.original_text.clone();
+                        let multi = reader.multi_files.clone();
                         view.update(cx, |view, cx| {
-                            view.commit_import(text, group, hint, window, cx)
+                            view.commit_import_with_context(
+                                text,
+                                group,
+                                hint,
+                                Some(original),
+                                multi,
+                                window,
+                                cx,
+                            )
                         })
                     },
                 ))
@@ -1396,6 +1479,8 @@ impl AppView {
     /// Ticket 03: drag-drop/file entry point. Readable files are concatenated
     /// into the same import dialog; a single dropped file keeps its name so
     /// `.conf` content parses as WireGuard with stem-based peer names.
+    /// Ticket 16: multi-file drops retain every file's bytes so per-file
+    /// `.conf` stems/keys survive; the dialog still shows the merged text.
     fn import_dropped_files(
         &mut self,
         paths: &ExternalPaths,
@@ -1404,25 +1489,35 @@ impl AppView {
     ) {
         let mut merged = String::new();
         let mut names: Vec<String> = Vec::new();
+        let mut files: Vec<(String, String)> = Vec::new();
         for path in paths.0.iter() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 if !merged.is_empty() {
                     merged.push('\n');
                 }
                 merged.push_str(&content);
-                names.push(path.to_string_lossy().into_owned());
+                let name = path.to_string_lossy().into_owned();
+                names.push(name.clone());
+                files.push((name, content));
             }
         }
         if merged.trim().is_empty() {
             window.push_notification(Notification::warning("No readable files dropped"), cx);
             return;
         }
-        let file_hint = if names.len() == 1 {
-            names.into_iter().next()
+        if names.len() == 1 {
+            let file_hint = names.into_iter().next();
+            self.open_import_dialog(&merged, DEFAULT_GROUP, file_hint, window, cx);
         } else {
-            None
-        };
-        self.open_import_dialog(&merged, DEFAULT_GROUP, file_hint, window, cx);
+            self.open_import_dialog_with_files(
+                &merged,
+                DEFAULT_GROUP,
+                None,
+                Some(files),
+                window,
+                cx,
+            );
+        }
     }
 
     /// Ticket 03: commit a paste box through the existing add flow. Valid
@@ -1431,6 +1526,10 @@ impl AppView {
     /// re-imports add nothing. Import never starts configs.
     /// Ticket 04: a lone `throne://addsub/...` line diverts to the
     /// subscription intake instead (record + immediate first refresh).
+    /// Ticket 16: stale `.conf` hints are cleared when the text no longer
+    /// looks like a conf, and single-addsub honors the dialog group.
+    /// Test-only callers (existing import_commit_* tests) go through here.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn commit_import(
         &mut self,
         text: String,
@@ -1439,6 +1538,45 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.commit_import_with_context(text, group, file_hint, None, None, window, cx)
+    }
+
+    /// Ticket 16: context-aware commit behind [`commit_import`]. `original`
+    /// is the dialog prefill (when `text` differs, the drop hint and the
+    /// multi-file bytes are stale and the edited text sniffs as its own
+    /// type); `multi` carries every dropped file for unedited multi-commits.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_import_with_context(
+        &mut self,
+        text: String,
+        group: String,
+        file_hint: Option<String>,
+        original: Option<String>,
+        multi: Option<Vec<(String, String)>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let edited = match original.as_deref() {
+            Some(prefill) => text.trim() != prefill.trim(),
+            None => false,
+        };
+        let multi = if edited { None } else { multi };
+        let file_hint = if edited {
+            None
+        } else {
+            effective_hint_for_text(file_hint.as_deref(), &text)
+        };
+        // Unedited multi-file drop: per-file parse keeps stems/keys.
+        if let Some(files) = multi {
+            if file_hint.is_none() {
+                let refs: Vec<(&str, &str)> = files
+                    .iter()
+                    .map(|(name, content)| (name.as_str(), content.as_str()))
+                    .collect();
+                let batch = import_multi_file_contents(&refs);
+                return self.finish_import_batch(batch, &group, window, cx);
+            }
+        }
         let trimmed = text.trim();
         if !trimmed.is_empty() && !trimmed.contains('\n') && file_hint.is_none() {
             // Ticket 14: only addsub lines divert; a malformed one reports
@@ -1446,7 +1584,10 @@ impl AppView {
             // keeps the dialog open.
             if is_addsub_attempt(trimmed) {
                 return match parse_addsub_link(trimmed) {
-                    Ok(request) => self.commit_addsub_request(request, window, cx),
+                    Ok(request) => {
+                        let effective = effective_addsub_group(&group, &request.group);
+                        self.commit_addsub_request_with_group(request, &effective, window, cx)
+                    }
                     Err(error) => {
                         window.push_notification(
                             Notification::error(addsub_error_message(&error)),
@@ -1461,7 +1602,18 @@ impl AppView {
             Some(name) => import_file_content(&name, &text),
             None => import_text(&text),
         };
-        match commit_batch(&mut self.store, batch, &group) {
+        self.finish_import_batch(batch, &group, window, cx)
+    }
+
+    /// Ticket 03/14: shared batch-commit tail (reload + truthful summary).
+    fn finish_import_batch(
+        &mut self,
+        batch: crate::import::BatchResult,
+        group: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match commit_batch(&mut self.store, batch, group) {
             Ok(outcome) => {
                 self.reload(window, cx);
                 // Ticket 14: total failure keeps the dialog open and lists
@@ -1503,14 +1655,17 @@ impl AppView {
     /// Ticket 04: `throne://addsub/...` intake — record the subscription
     /// (label from the URL host, never the query) and fetch immediately so
     /// members appear without waiting for the next startup pass.
-    fn commit_addsub_request(
+    /// Ticket 16: the dialog group wins over the payload group (see
+    /// [`effective_addsub_group`]).
+    fn commit_addsub_request_with_group(
         &mut self,
         request: AddSubRequest,
+        dialog_group: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let label = subscription_label_from_url(&request.url);
-        self.commit_subscription_add(label, request.url, request.group, window, cx)
+        self.commit_subscription_add(label, request.url, dialog_group.to_string(), window, cx)
     }
 
     /// Ticket 04: add a subscription record; on success the dialog closes and
@@ -3693,5 +3848,134 @@ mod tests {
             });
         });
         assert_eq!(notification_count(cx), 1, "live sub failure notifies");
+    }
+
+    // -- Ticket 16: validation coherence + dedupe/group consistency --------
+
+    /// Scenario 4 (pure): an edited dialog group beats the payload group.
+    #[test]
+    fn effective_addsub_group_dialog_wins() {
+        use crate::effective_addsub_group;
+        assert_eq!(effective_addsub_group("edited", "payload-group"), "edited");
+        assert_eq!(effective_addsub_group("", "payload-group"), "payload-group");
+        assert_eq!(
+            effective_addsub_group("default", "payload-group"),
+            "payload-group",
+            "untouched default keeps the payload group"
+        );
+        assert_eq!(effective_addsub_group("default", "default"), "default");
+        assert_eq!(
+            effective_addsub_group("  edited  ", "payload-group"),
+            "edited"
+        );
+    }
+
+    /// Scenario 7 (pure): the toast equals re-importable rows, or states
+    /// both numbers when hand-made rows exist.
+    #[test]
+    fn export_count_message_states_both_numbers() {
+        use crate::export_count_message;
+        assert_eq!(
+            export_count_message(3, 3, "/tmp/x.json"),
+            "Exported 3 config(s) to /tmp/x.json"
+        );
+        let both = export_count_message(4, 3, "/tmp/x.json");
+        assert!(both.contains('4'), "total in: {both}");
+        assert!(both.contains('3'), "importable in: {both}");
+        assert!(both.contains("/tmp/x.json"), "path in: {both}");
+    }
+
+    /// Scenario 5 (commit): dropping a `.conf` then editing the box to links
+    /// parses the edited text, not the old file type.
+    #[gpui_kit::test]
+    fn import_commit_stale_conf_hint_parses_edited_links(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let links = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one";
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import(
+                    links.to_string(),
+                    "travel".to_string(),
+                    Some("drop.conf".to_string()),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(closed, "edited links commit and close");
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].protocol, "vless");
+        assert_eq!(rows[0].group, "travel");
+    }
+
+    /// Scenario 6 (commit): an unedited multi-file drop keeps per-file stems.
+    #[gpui_kit::test]
+    fn import_commit_multi_files_keep_stems(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let a = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        let b = "[Interface]\nPrivateKey = WFl6\n\n[Peer]\nPublicKey = cHVia2V5Mg\nEndpoint = 203.0.113.2:51820\n";
+        let merged = format!("{a}\n{b}");
+        let files = vec![
+            ("a.conf".to_string(), a.to_string()),
+            ("b.conf".to_string(), b.to_string()),
+        ];
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import_with_context(
+                    merged,
+                    "travel".to_string(),
+                    None,
+                    None,
+                    Some(files),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(closed, "multi commit closes");
+        let mut names = view.read_with(cx, |view, _| {
+            view.store
+                .list()
+                .expect("list works")
+                .into_iter()
+                .map(|row| row.name)
+                .collect::<Vec<_>>()
+        });
+        names.sort();
+        assert_eq!(names, vec!["a-p1".to_string(), "b-p1".to_string()]);
+    }
+
+    /// Scenario 6 (edited multi): editing the merged text drops the per-file
+    /// bytes and sniffs the edited text instead.
+    #[gpui_kit::test]
+    fn import_commit_edited_multi_parses_edited_text(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let a = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        let files = vec![("a.conf".to_string(), a.to_string())];
+        let links = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one";
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import_with_context(
+                    links.to_string(),
+                    "travel".to_string(),
+                    Some("a.conf".to_string()),
+                    Some(a.to_string()),
+                    Some(files),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(closed, "edited text commits");
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].protocol, "vless");
     }
 }

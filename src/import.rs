@@ -1235,8 +1235,11 @@ fn conf_value(section: &HashMap<String, String>, key: &str) -> String {
 }
 
 fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
-    let mut iface: HashMap<String, String> = HashMap::new();
-    let mut peers: Vec<HashMap<String, String>> = Vec::new();
+    // Ticket 16: each peer keeps the Interface snapshot that precedes it, so
+    // concatenated multi-file bodies never bleed one file's PrivateKey (or
+    // address/dns/mtu fallback) into another file's peers.
+    let mut active_iface: HashMap<String, String> = HashMap::new();
+    let mut peers: Vec<(HashMap<String, String>, HashMap<String, String>)> = Vec::new();
     let mut current: Option<(bool, HashMap<String, String>)> = None;
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -1246,9 +1249,9 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
         if line.starts_with('[') && line.ends_with(']') {
             if let Some((is_peer, section)) = current.take() {
                 if is_peer {
-                    peers.push(section);
+                    peers.push((section, active_iface.clone()));
                 } else {
-                    iface = section;
+                    active_iface = section;
                 }
             }
             let name = line[1..line.len() - 1].trim().to_ascii_lowercase();
@@ -1270,10 +1273,10 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
     }
     if let Some((is_peer, section)) = current {
         if is_peer {
-            peers.push(section);
-        } else {
-            iface = section;
+            peers.push((section, active_iface.clone()));
         }
+        // A trailing [Interface] with no peers binds nothing: drop it instead
+        // of updating state no peer will ever read.
     }
     if peers.is_empty() {
         return BatchResult::fail(
@@ -1282,16 +1285,8 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
             "wireguard conf has no [Peer] sections",
         );
     }
-    let private_key = conf_value(&iface, "privatekey");
-    if private_key.trim().is_empty() {
-        return BatchResult::fail(
-            0,
-            ImportErrorKind::MissingCredential,
-            "wireguard conf is missing PrivateKey",
-        );
-    }
     let mut out = BatchResult::default();
-    for (peer_index, peer) in peers.iter().enumerate() {
+    for (peer_index, (peer, iface)) in peers.iter().enumerate() {
         let index = peer_index;
         let endpoint = conf_value(peer, "endpoint");
         let parsed = (|| -> Result<ImportedConfig, ImportError> {
@@ -1307,8 +1302,12 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
             if public_key.trim().is_empty() {
                 return Err(missing_credential("wireguard peer is missing PublicKey"));
             }
+            let private_key = conf_value(iface, "privatekey");
+            if private_key.trim().is_empty() {
+                return Err(missing_credential("wireguard conf is missing PrivateKey"));
+            }
             let mut params = base_params("wireguard", &host, port);
-            insert_str(&mut params, "private_key", private_key.clone());
+            insert_str(&mut params, "private_key", private_key);
             insert_str(&mut params, "public_key", public_key);
             for (conf_key, json_key) in [
                 ("presharedkey", "pre_shared_key"),
@@ -1324,7 +1323,7 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
                 }
             }
             for (conf_key, json_key) in [("address", "address"), ("dns", "dns"), ("mtu", "mtu")] {
-                let value = conf_value(&iface, conf_key);
+                let value = conf_value(iface, conf_key);
                 if !value.trim().is_empty() && !params.contains_key(json_key) {
                     insert_str(&mut params, json_key, value);
                 }
@@ -1525,11 +1524,12 @@ pub fn import_file_content(file_name: &str, content: &str) -> BatchResult {
 }
 
 /// Write a batch into the store as disabled records in `group` (blank falls
-/// back to the default group). Items whose normalized identity
-/// (protocol + params) already exists — including earlier items of this same
-/// batch — are skipped and counted as duplicates, so identical re-imports
-/// never duplicate. Import never enables or starts configs: it only calls
-/// [`Store::add`], which creates disabled records.
+/// back to the default group). Ticket 16: dedupe uses
+/// [`normalized_identity`] — the same key as subscription refresh — so the
+/// same server with different case/whitespace or a flow-only change commits
+/// a single row instead of duplicating. Identical re-imports never duplicate.
+/// Import never enables or starts configs: it only calls [`Store::add`],
+/// which creates disabled records.
 pub fn commit_batch(
     store: &mut Store,
     batch: BatchResult,
@@ -1544,7 +1544,7 @@ pub fn commit_batch(
     let mut seen: HashSet<String> = store
         .list()?
         .iter()
-        .map(|config| identity(&config.protocol, &config.params))
+        .map(|config| normalized_identity(&config.protocol, &config.params))
         .collect();
     let mut outcome = ImportOutcome {
         imported: 0,
@@ -1552,7 +1552,7 @@ pub fn commit_batch(
         failures: batch.failures,
     };
     for config in batch.configs {
-        if !seen.insert(identity(&config.protocol, &config.params)) {
+        if !seen.insert(normalized_identity(&config.protocol, &config.params)) {
             outcome.duplicates += 1;
             continue;
         }
@@ -1569,8 +1569,44 @@ pub fn commit_batch(
     Ok(outcome)
 }
 
-fn identity(protocol: &str, params: &str) -> String {
-    format!("{protocol}\0{params}")
+/// Ticket 16: parse several dropped files, each through [`import_file_content`]
+/// with its own name, so per-file `.conf` stems and PrivateKeys are preserved
+/// (no cross-file bleed from merged-text parsing). Failure indices are offset
+/// by the number of items already seen so every failure keeps a unique index.
+pub fn import_multi_file_contents(files: &[(&str, &str)]) -> BatchResult {
+    let mut out = BatchResult::default();
+    let mut offset = 0usize;
+    for (name, content) in files {
+        let mut batch = import_file_content(name, content);
+        for config in batch.configs.drain(..) {
+            out.configs.push(config);
+            offset += 1;
+        }
+        for mut failure in batch.failures.drain(..) {
+            failure.index += offset;
+            out.failures.push(failure);
+            offset += 1;
+        }
+    }
+    out
+}
+
+/// Ticket 16: stale-hint guard. A `.conf` hint with non-conf text means the
+/// dialog text was edited after the drop — the hint is cleared so the edited
+/// text sniffs as its own type instead of parsing as the old file type.
+pub fn effective_hint_for_text(hint: Option<&str>, text: &str) -> Option<String> {
+    match hint {
+        Some(name) if name.to_ascii_lowercase().ends_with(".conf") => {
+            let trimmed = strip_bom(text.trim()).trim();
+            if looks_like_wg_conf(trimmed) {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        }
+        Some(name) => Some(name.to_string()),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1578,10 +1614,12 @@ fn identity(protocol: &str, params: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Normalized subscription identity for refresh upserts: protocol + server +
-/// port + credential + method + sni/path, NOT the remark. Server is
-/// lowercased (hostnames are case-insensitive); credential values stay
-/// verbatim. Non-JSON params fall back to the raw string so hand-made rows
-/// still get a stable key.
+/// port + credential + method + sni/path, NOT the remark. Server is trimmed
+/// and lowercased (hostnames are case-insensitive, surrounding whitespace is
+/// not identity); credential values stay verbatim. Non-JSON params fall back
+/// to the raw string so hand-made rows still get a stable key.
+/// Ticket 16: [`commit_batch`] uses this same key so paste/import dedupes
+/// exactly like subscription refresh.
 pub fn normalized_identity(protocol: &str, params: &str) -> String {
     fn get(obj: &Params, keys: &[&str]) -> Option<String> {
         keys.iter().find_map(|wanted| {
@@ -1604,7 +1642,7 @@ pub fn normalized_identity(protocol: &str, params: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(params) {
         Ok(serde_json::Value::Object(map)) => {
             let server = get(&map, &["server", "address"])
-                .map(|server| server.to_ascii_lowercase())
+                .map(|server| server.trim().to_ascii_lowercase())
                 .unwrap_or_default();
             let port = get(&map, &["server_port", "port"]).unwrap_or_default();
             let creds: Vec<String> = [
@@ -1625,6 +1663,7 @@ pub fn normalized_identity(protocol: &str, params: &str) -> String {
             let sni: Vec<String> = ["sni", "peer", "servername"]
                 .iter()
                 .filter_map(|key| get(&map, &[key]))
+                .map(|value| value.trim().to_ascii_lowercase())
                 .collect();
             let path: Vec<String> = ["path", "service_name", "servicename", "serviceName"]
                 .iter()
@@ -3051,5 +3090,105 @@ mod tests {
             assert!(!text.contains(canary), "leak in {text}");
         }
         assert!(text.contains("b.example.com"), "host kept: {text}");
+    }
+
+    // -- ticket 16: validation coherence + dedupe/group consistency --------
+
+    /// Scenario 3: same server with different case/whitespace, or a flow-only
+    /// change, shares the normalized identity — commit dedupes like refresh.
+    #[test]
+    fn commit_dedupes_on_normalized_identity() {
+        let mut store = Store::open_in_memory().expect("store opens");
+        let first = import_text(&format!("vless://{UUID}@a.example.com:443#one"));
+        let outcome = commit_batch(&mut store, first, "g").expect("commit works");
+        assert_eq!(outcome.imported, 1);
+
+        // Different case + remark: same identity, counted as duplicate.
+        let upper = import_text(&format!("vless://{UUID}@A.EXAMPLE.COM:443#two"));
+        assert_eq!(
+            normalized_identity(&upper.configs[0].protocol, &upper.configs[0].params),
+            normalized_identity("vless", &store.list().expect("list").remove(0).params),
+            "case is not identity"
+        );
+        let outcome = commit_batch(&mut store, upper, "g").expect("recommit works");
+        assert_eq!(outcome.imported, 0, "case variant adds nothing");
+        assert_eq!(outcome.duplicates, 1);
+
+        // Flow-only change rides outside the identity key: still one row.
+        let flowed = import_text(&format!(
+            "vless://{UUID}@a.example.com:443?flow=xtls-rprx-vision#three"
+        ));
+        let outcome = commit_batch(&mut store, flowed, "g").expect("recommit works");
+        assert_eq!(outcome.imported, 0, "flow variant adds nothing");
+        assert_eq!(outcome.duplicates, 1);
+        assert_eq!(store.list().expect("list works").len(), 1);
+    }
+
+    /// Normalized identity trims surrounding whitespace before lowercasing.
+    #[test]
+    fn normalized_identity_trims_server_whitespace() {
+        let a = normalized_identity(
+            "vless",
+            "{\"type\":\"vless\",\"server\":\"  A.Example.COM  \",\"server_port\":443,\"uuid\":\"u\"}",
+        );
+        let b = normalized_identity(
+            "VLESS",
+            "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"u\"}",
+        );
+        assert_eq!(a, b, "whitespace/case are not identity");
+    }
+
+    /// Scenario 5: a `.conf` hint with edited link text is stale — cleared so
+    /// the edited text sniffs as its own type.
+    #[test]
+    fn stale_conf_hint_cleared_for_link_text() {
+        let links = format!("vless://{UUID}@a.example.com:443#one");
+        assert_eq!(effective_hint_for_text(Some("drop.conf"), &links), None);
+        let conf = "[Interface]\nPrivateKey = cHJpdmF0ZWtleQ\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        assert_eq!(
+            effective_hint_for_text(Some("drop.conf"), conf),
+            Some("drop.conf".to_string())
+        );
+        assert_eq!(
+            effective_hint_for_text(Some("notes.txt"), &links),
+            Some("notes.txt".to_string())
+        );
+        assert_eq!(effective_hint_for_text(None, &links), None);
+    }
+
+    /// Scenario 6: two `.conf` files keep their own stems and PrivateKeys.
+    #[test]
+    fn multi_file_confs_keep_per_file_stems_and_keys() {
+        let a = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        let b = "[Interface]\nPrivateKey = WFl6\n\n[Peer]\nPublicKey = cHVia2V5Mg\nEndpoint = 203.0.113.2:51820\n";
+        let out = import_multi_file_contents(&[("a.conf", a), ("b.conf", b)]);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+        assert_eq!(out.configs[0].name, "a-p1");
+        assert_eq!(out.configs[1].name, "b-p1");
+        let params_a: serde_json::Value =
+            serde_json::from_str(&out.configs[0].params).expect("params JSON");
+        let params_b: serde_json::Value =
+            serde_json::from_str(&out.configs[1].params).expect("params JSON");
+        assert_eq!(params_a["private_key"], "QUJD");
+        assert_eq!(params_b["private_key"], "WFl6");
+        assert_ne!(params_a["private_key"], params_b["private_key"]);
+    }
+
+    /// Scenario 6 (bleed guard): concatenated conf text without the multi
+    /// helper still binds each peer to its preceding Interface key.
+    #[test]
+    fn concatenated_conf_text_does_not_bleed_private_keys() {
+        let merged = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n[Interface]\nPrivateKey = WFl6\n\n[Peer]\nPublicKey = cHVia2V5Mg\nEndpoint = 203.0.113.2:51820\n";
+        let out = import_text(merged);
+        // Paste path uses the single "wireguard" stem, but keys stay bound.
+        assert_eq!(out.configs.len(), 2, "failures: {:?}", out.failures);
+        let params: Vec<serde_json::Value> = out
+            .configs
+            .iter()
+            .map(|config| serde_json::from_str(&config.params).expect("params JSON"))
+            .collect();
+        assert_eq!(params[0]["private_key"], "QUJD");
+        assert_eq!(params[1]["private_key"], "WFl6");
     }
 }

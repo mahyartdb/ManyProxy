@@ -141,10 +141,7 @@ pub fn export_payload(configs: &[ProxyConfig], subscriptions: &[Subscription]) -
         if let Ok(serde_json::Value::Object(map)) =
             serde_json::from_str::<serde_json::Value>(&config.params)
         {
-            let has_kind = map.contains_key("type") || map.contains_key("protocol");
-            let has_host = map.contains_key("server") || map.contains_key("address");
-            let has_port = map.contains_key("server_port") || map.contains_key("port");
-            if has_kind && has_host && has_port {
+            if value_is_import_shaped(&map) {
                 outbounds.push(serde_json::Value::Object(map.clone()));
             }
         }
@@ -330,6 +327,215 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
             None
         }
     }
+}
+
+/// Ticket 16: canonical protocol for manual add/edit. Trims, lowercases, and
+/// folds well-known aliases to the stored form (mirrors the import grammar's
+/// `normalize_outbound_type` + Clash folds). Unknown names yield `None` so
+/// the caller can raise a `protocol` field error.
+fn canonical_protocol(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "vless" => Some("vless".to_string()),
+        "vmess" => Some("vmess".to_string()),
+        "trojan" => Some("trojan".to_string()),
+        "shadowsocks" | "ss" => Some("shadowsocks".to_string()),
+        "hysteria2" => Some("hysteria2".to_string()),
+        "hysteria" => Some("hysteria".to_string()),
+        "tuic" => Some("tuic".to_string()),
+        "wireguard" | "wg" => Some("wireguard".to_string()),
+        "amneziawg" | "awg" | "amnezia-wg" => Some("amneziawg".to_string()),
+        "socks" | "socks5" => Some("socks".to_string()),
+        "anytls" => Some("anytls".to_string()),
+        "http" => Some("http".to_string()),
+        "https" => Some("https".to_string()),
+        "naive" => Some("naive".to_string()),
+        "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Some("xray".to_string()),
+        "custom"
+        | "custom-out"
+        | "custom-outbound"
+        | "custom_outbound"
+        | "custom-outbound-json" => Some("custom-outbound".to_string()),
+        "custom-config" | "custom_config" | "custom-full" | "custom_full"
+        | "custom-full-config" => Some("custom-config".to_string()),
+        "extra" | "extra-core" | "extra_core" | "extracore" => Some("extra-core".to_string()),
+        "chain" | "chained" | "chain-outbound" | "chain_outbound" => Some("chain".to_string()),
+        _ => None,
+    }
+}
+
+/// Ticket 16: true when a params JSON object carries the import shape
+/// (`type`/`protocol` + `server`/`address` + `server_port`/`port`). Same
+/// predicate as [`export_payload`]: only these rows round-trip through the
+/// import grammar; opaque rows (e.g. `"{}"`) stay metadata-only.
+fn value_is_import_shaped(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_kind = obj.contains_key("type") || obj.contains_key("protocol");
+    let has_host = obj.contains_key("server") || obj.contains_key("address");
+    let has_port = obj.contains_key("server_port") || obj.contains_key("port");
+    has_kind && has_host && has_port
+}
+
+/// Ticket 16: true when `params` parses as a JSON object with the import
+/// shape. Used by the export toast (re-importable count) and by manual
+/// validation (only import-shaped rows get per-protocol credential checks,
+/// so legacy opaque rows like `"{}"` keep working).
+pub fn is_import_shaped_params(params: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(params) {
+        Ok(serde_json::Value::Object(map)) => value_is_import_shaped(&map),
+        _ => false,
+    }
+}
+
+/// Ticket 16: number of rows whose params re-import through the grammar.
+pub fn count_importable(configs: &[ProxyConfig]) -> usize {
+    configs
+        .iter()
+        .filter(|config| is_import_shaped_params(&config.params))
+        .count()
+}
+
+fn lookup_case_insensitive(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    for wanted in keys {
+        for (key, value) in obj {
+            if key.eq_ignore_ascii_case(wanted) {
+                match value {
+                    serde_json::Value::String(text) if !text.trim().is_empty() => {
+                        return Some(text.clone());
+                    }
+                    serde_json::Value::Number(number) => return Some(number.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ticket 16: validate a manual protocol + params pair like the import path
+/// does. Unknown protocols and non-JSON params are `protocol`/`params` field
+/// errors (row not created). Import-shaped params additionally require the
+/// per-protocol credential from research 05 (uuid/password/keys/…) plus a
+/// sane server/port; opaque params (e.g. `"{}"`) pass through so legacy
+/// hand rows and the `subscription_refresh_removes_only_owned` seed keep
+/// working. Reality without `pbk` is rejected like the link parsers.
+fn validate_protocol_params(
+    protocol_raw: &str,
+    params_raw: &str,
+    errors: &mut Vec<FieldError>,
+) -> Option<(String, String)> {
+    let protocol_trimmed = protocol_raw.trim();
+    let canonical = if protocol_trimmed.is_empty() {
+        DEFAULT_PROTOCOL.to_string()
+    } else {
+        match canonical_protocol(protocol_trimmed) {
+            Some(protocol) => protocol,
+            None => {
+                errors.push(FieldError::new(
+                    "protocol",
+                    format!("unknown protocol '{protocol_trimmed}'"),
+                ));
+                return None;
+            }
+        }
+    };
+    let params_trimmed = params_raw.trim();
+    let params_text = if params_trimmed.is_empty() {
+        "{}".to_string()
+    } else {
+        params_trimmed.to_string()
+    };
+    let value: serde_json::Value = match serde_json::from_str(&params_text) {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(FieldError::new(
+                "params",
+                format!("params must be JSON object ({error})"),
+            ));
+            return None;
+        }
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => {
+            errors.push(FieldError::new(
+                "params",
+                "params must be JSON object".to_string(),
+            ));
+            return None;
+        }
+    };
+    if value_is_import_shaped(obj) {
+        let server = lookup_case_insensitive(obj, &["server", "address"]).unwrap_or_default();
+        if server.trim().is_empty() || server.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            errors.push(FieldError::new("params", "params need a valid server"));
+            return None;
+        }
+        let port_ok = match obj
+            .get("server_port")
+            .or_else(|| obj.get("port"))
+            .or_else(|| obj.get("serverPort"))
+        {
+            Some(serde_json::Value::Number(number)) => number
+                .as_u64()
+                .is_some_and(|port| (1..=65_535).contains(&port)),
+            Some(serde_json::Value::String(text)) => text
+                .trim()
+                .parse::<u32>()
+                .is_ok_and(|port| (1..=65_535).contains(&port)),
+            _ => false,
+        };
+        if !port_ok {
+            errors.push(FieldError::new(
+                "params",
+                "params need a valid server_port (1-65535)",
+            ));
+            return None;
+        }
+        let missing =
+            |what: &str| FieldError::new("params", format!("{canonical} params need {what}"));
+        let has = |keys: &[&str]| lookup_case_insensitive(obj, keys).is_some();
+        let credential_ok = match canonical.as_str() {
+            "vless" | "xray" | "vmess" => has(&["uuid", "id"]),
+            "trojan" => has(&["password"]),
+            "shadowsocks" => has(&["method", "cipher"]) && has(&["password"]),
+            "hysteria2" => has(&["password", "auth"]),
+            "hysteria" => has(&["auth", "password"]),
+            "tuic" => has(&["uuid", "id"]) && has(&["password"]),
+            "wireguard" | "amneziawg" => {
+                has(&["private_key", "privatekey"]) && has(&["public_key", "publickey"])
+            }
+            "anytls" => has(&["password"]),
+            "naive" => has(&["username", "user"]) && has(&["password"]),
+            _ => true,
+        };
+        if !credential_ok {
+            let what = match canonical.as_str() {
+                "vless" | "xray" | "vmess" => "uuid",
+                "trojan" => "password",
+                "shadowsocks" => "method and password",
+                "hysteria2" => "password",
+                "hysteria" => "auth",
+                "tuic" => "uuid and password",
+                "wireguard" | "amneziawg" => "private_key and public_key",
+                "anytls" => "password",
+                "naive" => "username and password",
+                _ => "credentials",
+            };
+            errors.push(missing(what));
+            return None;
+        }
+        if lookup_case_insensitive(obj, &["security"])
+            .is_some_and(|security| security.eq_ignore_ascii_case("reality"))
+            && !has(&["pbk"])
+        {
+            errors.push(missing("pbk (required for reality)"));
+            return None;
+        }
+    }
+    Some((canonical, params_text))
 }
 /// Ticket 04: a subscription refresh source. Refresh upserts ProxyConfigs in
 /// `group` keyed by normalized identity (never the remark); it never deletes
@@ -1145,11 +1351,12 @@ impl Store {
     }
 
     /// Validate fresh input, applying defaults and auto port assignment.
+    /// Ticket 16: protocol/params validate like the import grammar (unknown
+    /// protocol / non-JSON / missing per-protocol credential → field error).
     fn validate_new(&self, input: &NewConfig) -> Result<ValidatedConfig, StoreError> {
         let mut errors = Vec::new();
         let name = validated_name(&input.name, &mut errors);
-        let protocol = defaulted(&input.protocol, DEFAULT_PROTOCOL);
-        let params = defaulted(&input.params, "{}");
+        let proto_params = validate_protocol_params(&input.protocol, &input.params, &mut errors);
         let group = defaulted(&input.group, DEFAULT_GROUP);
         let bind_ip = validated_bind(&input.bind_ip, &mut errors);
         let port = match parse_port_field(&input.port) {
@@ -1170,6 +1377,8 @@ impl Store {
         if !errors.is_empty() {
             return Err(StoreError::Invalid(errors));
         }
+        let (protocol, params) =
+            proto_params.unwrap_or((DEFAULT_PROTOCOL.to_string(), "{}".to_string()));
         Ok(ValidatedConfig {
             name: name.unwrap_or_default(),
             protocol,
@@ -1181,6 +1390,9 @@ impl Store {
     }
 
     /// Validate a patch against the current record; pure until the write.
+    /// Ticket 16: blank protocol/params/group/bind means "keep current"
+    /// (never silent defaults); blank name still errors; blank port still
+    /// means auto-assign (explicit in the dialog placeholder).
     fn validate_patch(
         &self,
         current: &ProxyConfig,
@@ -1191,21 +1403,26 @@ impl Store {
             Some(raw) => validated_name(raw, &mut errors),
             None => Some(current.name.clone()),
         };
-        let protocol = match &patch.protocol {
-            Some(raw) => Some(defaulted(raw, DEFAULT_PROTOCOL)),
-            None => Some(current.protocol.clone()),
+        let protocol_raw = match &patch.protocol {
+            None => current.protocol.clone(),
+            Some(raw) if raw.trim().is_empty() => current.protocol.clone(),
+            Some(raw) => raw.clone(),
         };
-        let params = match &patch.params {
-            Some(raw) => Some(defaulted(raw, "{}")),
-            None => Some(current.params.clone()),
+        let params_raw = match &patch.params {
+            None => current.params.clone(),
+            Some(raw) if raw.trim().is_empty() => current.params.clone(),
+            Some(raw) => raw.clone(),
         };
+        let proto_params = validate_protocol_params(&protocol_raw, &params_raw, &mut errors);
         let group = match &patch.group {
-            Some(raw) => Some(defaulted(raw, DEFAULT_GROUP)),
             None => Some(current.group.clone()),
+            Some(raw) if raw.trim().is_empty() => Some(current.group.clone()),
+            Some(raw) => Some(raw.trim().to_string()),
         };
         let bind_ip = match &patch.bind_ip {
-            Some(raw) => validated_bind(raw, &mut errors),
             None => Some(current.bind_ip.clone()),
+            Some(raw) if raw.trim().is_empty() => Some(current.bind_ip.clone()),
+            Some(raw) => validated_bind(raw, &mut errors),
         };
         let port = match &patch.port {
             Some(raw) => match parse_port_field(raw) {
@@ -1228,10 +1445,12 @@ impl Store {
         if !errors.is_empty() {
             return Err(StoreError::Invalid(errors));
         }
+        let (protocol, params) =
+            proto_params.unwrap_or((current.protocol.clone(), current.params.clone()));
         Ok(ValidatedConfig {
             name: name.unwrap_or_else(|| current.name.clone()),
-            protocol: protocol.unwrap_or_else(|| current.protocol.clone()),
-            params: params.unwrap_or_else(|| current.params.clone()),
+            protocol,
+            params,
             group: group.unwrap_or_else(|| current.group.clone()),
             bind_ip: bind_ip.unwrap_or_else(|| current.bind_ip.clone()),
             port: port.unwrap_or(current.port),
@@ -2326,5 +2545,216 @@ mod tests {
         let snaps = reopened.load_health_snapshots().expect("load works");
         assert_eq!(snaps.len(), 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- Ticket 16: validation coherence + dedupe/group consistency ---------
+
+    fn invalid_fields(error: &StoreError) -> Vec<String> {
+        match error {
+            StoreError::Invalid(fields) => fields.iter().map(|e| e.field.to_string()).collect(),
+            other => panic!("expected Invalid, got {other}"),
+        }
+    }
+
+    /// Scenario 1: unknown protocol or non-JSON params → field error, nothing
+    /// written.
+    #[test]
+    fn manual_add_unknown_protocol_or_non_json_rejected() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let error = store
+            .add(NewConfig {
+                name: "Bad proto".to_string(),
+                protocol: "bogus".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("unknown protocol must fail");
+        assert!(
+            invalid_fields(&error).contains(&"protocol".to_string()),
+            "names protocol, got {error}"
+        );
+        let error = store
+            .add(NewConfig {
+                name: "Bad params".to_string(),
+                protocol: "vless".to_string(),
+                params: "not-json".to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("non-JSON params must fail");
+        assert!(
+            invalid_fields(&error).contains(&"params".to_string()),
+            "names params, got {error}"
+        );
+        assert!(
+            store.list().expect("list works").is_empty(),
+            "failed adds write nothing"
+        );
+    }
+
+    /// Scenario 1 (credential half): import-shaped vless without uuid lands
+    /// no row — the same rule the link grammar enforces.
+    #[test]
+    fn manual_add_import_shaped_without_credential_rejected() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let error = store
+            .add(NewConfig {
+                name: "No uuid".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("vless without uuid must fail");
+        let text = error.to_string();
+        assert!(
+            invalid_fields(&error).contains(&"params".to_string()),
+            "names params, got {text}"
+        );
+        assert!(
+            text.contains("uuid"),
+            "names the missing credential, got {text}"
+        );
+        assert!(
+            store.list().expect("list works").is_empty(),
+            "failed add writes nothing"
+        );
+        // Opaque legacy rows stay valid (metadata-only, never poison import).
+        let ok = store
+            .add(NewConfig {
+                name: "Opaque".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("opaque params still valid");
+        assert_eq!(ok.params, "{}");
+        assert!(!is_import_shaped_params(&ok.params));
+    }
+
+    /// Scenario 1 (edit half): bad protocol/params on edit fail pure (record
+    /// unchanged).
+    #[test]
+    fn manual_edit_bad_protocol_or_params_leaves_record_unchanged() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store.add(valid_input("Home")).expect("valid add works");
+        let error = store
+            .update(
+                &created.id,
+                ConfigPatch {
+                    protocol: Some("bogus".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect_err("bad protocol edit must fail");
+        assert!(invalid_fields(&error).contains(&"protocol".to_string()));
+        let error = store
+            .update(
+                &created.id,
+                ConfigPatch {
+                    params: Some("not-json".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect_err("bad params edit must fail");
+        assert!(invalid_fields(&error).contains(&"params".to_string()));
+        let kept = store.get(&created.id).expect("get works").expect("kept");
+        assert_eq!(kept, created, "record unchanged after failed edits");
+    }
+
+    /// Scenario 2: cleared protocol/params/group/bind keep current values;
+    /// blank port still means auto (explicit in the dialog placeholder).
+    #[test]
+    fn edit_blank_preserves_current_values() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store
+            .add(NewConfig {
+                name: "Keep".to_string(),
+                protocol: "trojan".to_string(),
+                params: "{\"type\":\"trojan\",\"server\":\"b.example.com\",\"server_port\":443,\"password\":\"pw\",\"sni\":\"b.example.com\"}".to_string(),
+                group: "travel".to_string(),
+                bind_ip: "127.0.0.2".to_string(),
+                port: "10821".to_string(),
+            })
+            .expect("seed works");
+        let kept = store
+            .update(
+                &created.id,
+                ConfigPatch {
+                    protocol: Some("   ".to_string()),
+                    params: Some(String::new()),
+                    group: Some("  ".to_string()),
+                    bind_ip: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .expect("blank edit preserves");
+        assert_eq!(kept.protocol, "trojan", "protocol preserved");
+        assert_eq!(kept.params, created.params, "params preserved");
+        assert_eq!(kept.group, "travel", "group preserved");
+        assert_eq!(kept.bind_ip, "127.0.0.2", "bind preserved");
+        assert_eq!(kept.port, 10821, "untouched port preserved");
+        // Blank port is the documented auto exception.
+        let reauto = store
+            .update(
+                &created.id,
+                ConfigPatch {
+                    port: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .expect("blank port re-autos");
+        assert!(
+            (AUTO_PORT_START..=AUTO_PORT_END).contains(&reauto.port),
+            "auto port in range, got {}",
+            reauto.port
+        );
+        assert_eq!(reauto.protocol, "trojan");
+        assert_eq!(reauto.group, "travel");
+    }
+
+    /// Scenario 7 (store half): import-shaped vs total counts for the honest
+    /// export toast.
+    #[test]
+    fn import_shaped_predicate_and_count() {
+        assert!(is_import_shaped_params(
+            "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"u\"}"
+        ));
+        assert!(!is_import_shaped_params("{}"));
+        assert!(!is_import_shaped_params("not-json"));
+        let rows = vec![
+            ProxyConfig {
+                id: "1".to_string(),
+                name: "A".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"u\"}".to_string(),
+                group: "g".to_string(),
+                enabled: false,
+                bind_ip: DEFAULT_BIND.to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+            },
+            ProxyConfig {
+                id: "2".to_string(),
+                name: "B".to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "g".to_string(),
+                enabled: false,
+                bind_ip: DEFAULT_BIND.to_string(),
+                port: 10802,
+                subscription_id: None,
+                identity_key: None,
+            },
+        ];
+        assert_eq!(count_importable(&rows), 1);
     }
 }
