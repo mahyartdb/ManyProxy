@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod engine;
 mod import;
 mod store;
 
@@ -19,6 +20,7 @@ use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
 
+use engine::{lan_exposure_warning, EngineController};
 use import::{commit_batch, import_file_content, import_text, parse_addsub_link, AddSubRequest};
 use store::{
     delete_confirm_text, due_for_refresh, now_unix, proxy_urls, ConfigPatch, NewConfig,
@@ -529,6 +531,10 @@ struct AppView {
     focus: FocusHandle,
     libraries: Entity<ListState<LibraryDelegate>>,
     store: Store,
+    /// Ticket 05: supervised sidecar owner (one combined config for the
+    /// active set). Production uses the real `sing-box` driver; tests swap
+    /// in the fake via direct field assignment.
+    engine: EngineController,
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
@@ -563,6 +569,7 @@ impl AppView {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
             store,
+            engine: EngineController::production(),
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
@@ -590,6 +597,7 @@ impl AppView {
 
     /// Reload rows from the store, keeping the selection by id.
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.poll_engine();
         if let Ok(rows) = self.store.list() {
             self.libraries.update(cx, |state, _| {
                 state.delegate_mut().set_rows(rows);
@@ -671,6 +679,96 @@ impl AppView {
             cx.write_to_clipboard(ClipboardItem::new_string(format!("{socks}\n{http}")));
             window.push_notification(Notification::success("Copied proxy URLs"), cx);
         }
+    }
+
+    /// Ticket 05: surface a detected sidecar crash on every reload so the
+    /// status bar reflects it without a background timer.
+    fn poll_engine(&mut self) {
+        let _ = self.engine.poll();
+    }
+
+    /// Ticket 05: warn once per non-loopback bind going live (LAN exposure
+    /// needs an explicit user action — the Start click — plus this warning).
+    fn warn_for_lan_binds(&self, window: &mut Window, cx: &mut App) {
+        for warning in self.engine.lan_warnings() {
+            window.push_notification(Notification::warning(warning), cx);
+        }
+    }
+
+    /// Ticket 05: start the selected config. The engine regenerates one
+    /// combined config, runs the engine `check`, then restarts the sidecar;
+    /// a port conflict names both configs and changes nothing.
+    fn start_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            return;
+        };
+        let id = config.id.clone();
+        if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
+            window.push_notification(Notification::warning(warning), cx);
+        }
+        match self.engine.start_one(&config) {
+            Ok(()) => {
+                let _ = self.store.set_enabled(&id, true);
+                self.reload(cx);
+                window.push_notification(
+                    Notification::success(format!("Started \"{}\"", config.name)),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(Notification::error(error.to_string()), cx);
+            }
+        }
+    }
+
+    /// Ticket 05: stop the selected config; its endpoint closes, the rest
+    /// keep serving on a regenerated config.
+    fn stop_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            return;
+        };
+        let id = config.id.clone();
+        if self.engine.stop_one(&id) {
+            let _ = self.store.set_enabled(&id, false);
+            self.reload(cx);
+            window.push_notification(
+                Notification::success(format!("Stopped \"{}\"", config.name)),
+                cx,
+            );
+        }
+    }
+
+    /// Ticket 05: start every stored config at once (each keeps its own
+    /// endpoint; the enabled flag follows the engine state).
+    fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.store.list().unwrap_or_default();
+        match self.engine.start_all(&rows) {
+            Ok(()) => {
+                for row in &rows {
+                    let _ = self.store.set_enabled(&row.id, true);
+                }
+                self.reload(cx);
+                self.warn_for_lan_binds(window, cx);
+                window.push_notification(
+                    Notification::success(format!("Started {} endpoint(s)", rows.len())),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(Notification::error(error.to_string()), cx);
+            }
+        }
+    }
+
+    /// Ticket 05: stop everything and take the sidecar down.
+    fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.engine.stop_all();
+        let rows = self.store.list().unwrap_or_default();
+        for row in &rows {
+            let _ = self.store.set_enabled(&row.id, false);
+        }
+        self.reload(cx);
+        window.push_notification(Notification::success("Stopped all endpoints"), cx);
     }
 
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1229,6 +1327,20 @@ impl AppView {
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.copy_selected_urls(window, cx);
                             })),
+                    )
+                    .child(
+                        Button::new("engine-start")
+                            .label("Start")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.start_selected_engine(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("engine-stop")
+                            .label("Stop")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.stop_selected_engine(window, cx);
+                            })),
                     ),
             )
             .into_any_element()
@@ -1236,11 +1348,20 @@ impl AppView {
 
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let (total, enabled) = self.libraries.read(cx).delegate().counts();
+        let engine_text = self.engine.status_text();
         StatusBar::new().left(
             div()
-                .id("status-count")
-                .test_support()
-                .child(format!("{total} configurations · {enabled} enabled")),
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id("status-count")
+                        .test_support()
+                        .child(format!("{total} configurations · {enabled} enabled")),
+                )
+                .child(div().id("engine-status").test_support().child(engine_text)),
         )
     }
 }
@@ -1292,6 +1413,18 @@ impl Render for AppView {
                             .label("Subscriptions")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_subscriptions_dialog(window, cx);
+                            })),
+                    )
+                    .child(Button::new("engine-start-all").label("Start all").on_click(
+                        cx.listener(|view, _, window, cx| {
+                            view.start_all_engines(window, cx);
+                        }),
+                    ))
+                    .child(
+                        Button::new("engine-stop-all")
+                            .label("Stop all")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.stop_all_engines(window, cx);
                             })),
                     ),
             )
@@ -1630,5 +1763,117 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("field-sub-label").is_some()));
         assert!(cx.update(|window, _| window.try_find("field-sub-url").is_some()));
         assert!(cx.update(|window, _| window.try_find("field-sub-group").is_some()));
+    }
+
+    /// Ticket 05: start-all over the mock driver brings up one endpoint per
+    /// config (generated JSON asserted structurally); stop-all takes them
+    /// down; a port collision blocks start naming both configs. The
+    /// engine-status element and start/stop controls render headless.
+    #[gpui_kit::test]
+    fn engine_start_all_and_stop_all_via_fake(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::store::ConfigPatch;
+
+        cx.update(gpui_kit::init);
+
+        fn engine_seed(name: &str, port: &str) -> NewConfig {
+            NewConfig {
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                    \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: port.to_string(),
+            }
+        }
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(engine_seed("Alpha", "10831"))
+            .expect("seed works");
+        let beta = store.add(engine_seed("Beta", "10832")).expect("seed works");
+        let _gamma = store
+            .add(engine_seed("Gamma", "10833"))
+            .expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        // Swap the real driver for the mock; production never starts here.
+        let handle = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, handle) = EngineController::fake();
+                view.engine = engine;
+                handle
+            })
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 3);
+        assert!(view.read_with(cx, |view, _| view.engine.is_running(&alpha.id)));
+        let recorded: serde_json::Value =
+            serde_json::from_str(&handle.last_config().expect("mock recorded the config"))
+                .expect("generated config is JSON");
+        assert_eq!(recorded["inbounds"].as_array().expect("inbounds").len(), 3);
+        assert_eq!(
+            recorded["route"]["rules"].as_array().expect("rules").len(),
+            3
+        );
+        assert_eq!(recorded["route"]["final"], serde_json::json!("direct"));
+
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, _| window.try_find("engine-status").is_some()));
+        assert!(cx.update(|window, _| window.try_find("engine-start-all").is_some()));
+        assert!(cx.update(|window, _| window.try_find("engine-stop-all").is_some()));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.stop_all_engines(window, cx));
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
+        assert!(!handle.is_running());
+
+        // Collision path: two rows on one port block start, naming both.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let _ = view.store.update(
+                    &alpha.id,
+                    ConfigPatch {
+                        port: Some("10901".to_string()),
+                        ..Default::default()
+                    },
+                );
+                let _ = view.store.update(
+                    &beta.id,
+                    ConfigPatch {
+                        port: Some("10901".to_string()),
+                        ..Default::default()
+                    },
+                );
+                view.start_all_engines(window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
+        let error = view.read_with(cx, |view, _| {
+            view.engine.last_error().unwrap_or("").to_string()
+        });
+        assert!(
+            error.contains("Alpha") && error.contains("Beta"),
+            "conflict names both configs, got {error}"
+        );
     }
 }
