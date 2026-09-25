@@ -6,7 +6,7 @@
 
 **Owns:** rust-networking
 
-**Status:** ready-for-agent
+**Status:** done (commit c4ebd9c; `cargo test` 127 passed, verified)
 
 - [ ] Scenario: AmneziaWG-variant link → Action: start → Expected: its endpoint routes traffic (not "unsupported type"). Verification: integration check. Priority: required.
 - [ ] Scenario: config mixing AWG params with Xray-noise semantics → Action: validate → Expected: blocked with a wrong-layer error before any connection. Verification: automated test. Priority: important.
