@@ -116,6 +116,61 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+/// Ticket 11: pure payload builder behind [`Store::export_library_json`]
+/// (tests build payloads without a store). `outbounds` holds each
+/// import-shaped row's params object verbatim (object with
+/// `type`/`protocol` + `server`/`address` + `server_port`/`port`); rows
+/// whose params are not import-shaped stay metadata-only so they never
+/// poison the import path with per-item failures. `library` keeps every
+/// row's display/endpoint metadata for backup; `subscriptions` keeps the
+/// subscription records. The import grammar reads only `outbounds`, so a
+/// re-import of this payload commits duplicates, never adds.
+pub fn export_payload(configs: &[ProxyConfig], subscriptions: &[Subscription]) -> String {
+    let mut outbounds: Vec<serde_json::Value> = Vec::with_capacity(configs.len());
+    for config in configs {
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(&config.params)
+        {
+            let has_kind = map.contains_key("type") || map.contains_key("protocol");
+            let has_host = map.contains_key("server") || map.contains_key("address");
+            let has_port = map.contains_key("server_port") || map.contains_key("port");
+            if has_kind && has_host && has_port {
+                outbounds.push(serde_json::Value::Object(map.clone()));
+            }
+        }
+    }
+    let library: Vec<serde_json::Value> = configs
+        .iter()
+        .map(|config| {
+            serde_json::json!({
+                "name": config.name,
+                "protocol": config.protocol,
+                "group": config.group,
+                "bind_ip": config.bind_ip,
+                "port": config.port,
+                "subscription_id": config.subscription_id,
+            })
+        })
+        .collect();
+    let subs: Vec<serde_json::Value> = subscriptions
+        .iter()
+        .map(|sub| {
+            serde_json::json!({
+                "label": sub.label,
+                "url": sub.url,
+                "group": sub.group,
+                "auto_refresh": sub.auto_refresh,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "outbounds": outbounds,
+        "library": library,
+        "subscriptions": subs,
+    })
+    .to_string()
+}
+
 /// Parse raw port text from a form field. Empty means auto-assign (`None`).
 /// `Some(0)` never validates: it is rejected as out of range.
 pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
@@ -147,12 +202,18 @@ pub fn delete_confirm_text(name: &str) -> String {
 }
 
 /// Ticket 09: explicit warning copy for any user-owned plaintext export.
-/// v1 ships no export UI (local SQLite only); when an export path lands it
-/// must surface this text verbatim so private keys/tokens/passwords never
+/// Ticket 11: the export confirm dialog shows this text verbatim (see
+/// [`export_confirm_description`]) so private keys/tokens/passwords never
 /// leave silently.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn export_warning_text() -> &'static str {
     "Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe."
+}
+
+/// Ticket 11: the export confirm dialog description. This indirection locks
+/// the verbatim binding: the dialog must show [`export_warning_text`]
+/// exactly (no paraphrase, no trimming).
+pub fn export_confirm_description() -> &'static str {
+    export_warning_text()
 }
 
 /// Map one result row to a ProxyConfig. All columns are bound by position
@@ -895,6 +956,65 @@ impl Store {
         }
         tx.commit()?;
         Ok(outcome)
+    }
+
+    // -- Ticket 11: user-owned JSON export ----------------------------------
+
+    /// Default export destination: `MANYPROXY_EXPORT` overrides; otherwise a
+    /// `manyproxy-export.json` sibling of the library file. The dialog writes
+    /// here only after explicit confirm; cancel writes nothing.
+    pub fn default_export_path() -> PathBuf {
+        if let Ok(path) = std::env::var("MANYPROXY_EXPORT") {
+            if !path.trim().is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+        let sibling = Self::default_path();
+        if let Some(parent) = sibling.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("manyproxy-export.json");
+            }
+        }
+        PathBuf::from("manyproxy-export.json")
+    }
+
+    /// Serialize the library (configs + subscriptions, no health samples)
+    /// for the user-owned export path. The payload round-trips through the
+    /// ticket-03 import grammar ([`crate::import::import_text`]): `outbounds`
+    /// carries each import-shaped row's params verbatim so an identical
+    /// re-import commits 0 added / N duplicates; `library`/`subscriptions`
+    /// metadata rides along for backup and is ignored by the import path.
+    /// Secrets stay plaintext by design (the confirm dialog shows
+    /// [`export_warning_text`] verbatim): redacting here would break
+    /// re-import, so redaction never applies to this payload.
+    pub fn export_library_json(&self) -> Result<String, StoreError> {
+        Ok(export_payload(&self.list()?, &self.list_subscriptions()?))
+    }
+
+    /// Write the export file only when `confirmed` is true. Cancel (`false`)
+    /// performs no I/O and returns `Ok(None)`; confirm writes the payload
+    /// and returns the path. Errors never echo file contents (no secrets in
+    /// logs); only the destination path is named.
+    pub fn commit_export(
+        &self,
+        path: &Path,
+        confirmed: bool,
+    ) -> Result<Option<PathBuf>, StoreError> {
+        if !confirmed {
+            return Ok(None);
+        }
+        let payload = self.export_library_json()?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                })?;
+            }
+        }
+        std::fs::write(path, payload).map_err(|error| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        Ok(Some(path.to_path_buf()))
     }
 
     /// First free port in the auto range, given the set of taken ports.
@@ -1768,5 +1888,169 @@ mod tests {
                 .expect("toggle works")
         };
         assert!(!toggled.auto_refresh);
+    }
+
+    // -- Ticket 11: user-owned JSON export -----------------------------------
+
+    const EXPORT_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    fn export_seed_body() -> String {
+        format!(
+            "vless://{EXPORT_UUID}@a.example.com:443#one\ntrojan://pw@b.example.com:443#two\nss://YWVzLTEyOC1nY206dGVzdA@c.example.com:8388#three"
+        )
+    }
+
+    fn export_seed(store: &mut Store) {
+        let batch = crate::import::import_text(&export_seed_body());
+        let outcome = crate::import::commit_batch(store, batch, "travel").expect("seed works");
+        assert_eq!(outcome.imported, 3);
+        store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "travel", true)
+            .expect("seed subscription works");
+    }
+
+    /// The confirm dialog description is the warning text verbatim (no
+    /// paraphrase, no trimming): secrets never leave silently.
+    #[test]
+    fn export_confirm_description_is_warning_verbatim() {
+        assert_eq!(export_confirm_description(), export_warning_text());
+    }
+
+    /// Scenario 1: library with 3 configs → export with confirm → file
+    /// parses as JSON, re-import yields 0 added / 3 duplicates, warning
+    /// shown verbatim before write.
+    #[test]
+    fn export_round_trips_through_import_grammar_as_duplicates() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        export_seed(&mut store);
+
+        let payload = store.export_library_json().expect("export works");
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("export parses as JSON");
+        assert_eq!(
+            value
+                .get("outbounds")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3),
+            "all three rows are import-shaped"
+        );
+        assert_eq!(
+            value
+                .get("subscriptions")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1),
+            "subscriptions ride along"
+        );
+        // Plaintext by design (redacting here would break re-import): the
+        // credential survives the round trip; the warning covers the risk.
+        assert!(
+            payload.contains("pw"),
+            "export keeps fields valid for re-import"
+        );
+
+        let batch = crate::import::import_text(&payload);
+        assert!(
+            batch.failures.is_empty(),
+            "no per-item failures, got {:?}",
+            batch.failures
+        );
+        let outcome =
+            crate::import::commit_batch(&mut store, batch, "travel").expect("re-import works");
+        assert_eq!(outcome.imported, 0, "re-import adds nothing");
+        assert_eq!(outcome.duplicates, 3, "re-import yields N duplicates");
+        assert_eq!(store.list().expect("list works").len(), 3);
+    }
+
+    /// Hand-made rows whose params are not import-shaped stay metadata-only:
+    /// they never poison the import path with per-item failures.
+    #[test]
+    fn export_keeps_non_import_rows_metadata_only() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        export_seed(&mut store);
+        store
+            .add(NewConfig {
+                name: "Hand made".to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "travel".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("hand add works");
+
+        let payload = store.export_library_json().expect("export works");
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("export parses as JSON");
+        assert_eq!(
+            value
+                .get("outbounds")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3),
+            "hand-made row stays out of the import path"
+        );
+        assert_eq!(
+            value
+                .get("library")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(4),
+            "hand-made row is still backed up"
+        );
+        let batch = crate::import::import_text(&payload);
+        assert!(
+            batch.failures.is_empty(),
+            "no failures, got {:?}",
+            batch.failures
+        );
+    }
+
+    /// Scenario: export with confirm → the file is written and parses.
+    #[test]
+    fn export_confirmed_writes_parseable_file() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        export_seed(&mut store);
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-export-confirm-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let written = store
+            .commit_export(&path, true)
+            .expect("confirmed export works");
+        assert_eq!(written, Some(path.clone()));
+        let on_disk = std::fs::read_to_string(&path).expect("export file was written");
+        let value: serde_json::Value =
+            serde_json::from_str(&on_disk).expect("export file parses as JSON");
+        assert_eq!(
+            value
+                .get("outbounds")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario: export cancelled → no file is created.
+    #[test]
+    fn export_cancelled_writes_no_file() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        export_seed(&mut store);
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-export-cancel-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let written = store
+            .commit_export(&path, false)
+            .expect("cancelled export works");
+        assert_eq!(written, None);
+        assert!(!path.exists(), "dismissing the warning creates no file");
+        let _ = std::fs::remove_file(&path);
     }
 }

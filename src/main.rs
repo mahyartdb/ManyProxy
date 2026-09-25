@@ -30,9 +30,9 @@ use health::{
 };
 use import::{commit_batch, import_file_content, import_text, parse_addsub_link, AddSubRequest};
 use store::{
-    delete_confirm_text, due_for_refresh, now_unix, proxy_urls, ConfigPatch, NewConfig,
-    ProxyConfig, Store, StoreError, Subscription as ProxySubscription, DEFAULT_AUTO_REFRESH_SECS,
-    DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    delete_confirm_text, due_for_refresh, export_confirm_description, now_unix, proxy_urls,
+    ConfigPatch, NewConfig, ProxyConfig, Store, StoreError, Subscription as ProxySubscription,
+    DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
 };
 
 /// Delegate for the configuration library list.
@@ -1069,6 +1069,51 @@ impl AppView {
         });
     }
 
+    /// Ticket 11: user-owned JSON export behind the plaintext-secret
+    /// warning. The confirm dialog shows [`export_confirm_description`]
+    /// (the [`store::export_warning_text`] verbatim); confirming writes the
+    /// file, dismissing writes nothing. The payload round-trips through the
+    /// import grammar (re-import yields duplicates, never adds).
+    fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let description = export_confirm_description().to_string();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Export library")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_export_write(window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Ticket 11: the actual export write (post-confirm). The notification
+    /// names only the destination path and the row count — never secrets.
+    fn commit_export_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = Store::default_export_path();
+        match self.store.commit_export(&path, true) {
+            Ok(Some(path)) => {
+                let count = self.store.list().map(|rows| rows.len()).unwrap_or(0);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Exported {count} config(s) to {}",
+                        path.display()
+                    )),
+                    cx,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                window
+                    .push_notification(Notification::error(format!("Export failed: {error}")), cx);
+            }
+        }
+    }
+
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let form = ConfigForm::blank(window, cx);
         let view = cx.entity();
@@ -1734,6 +1779,13 @@ impl Render for AppView {
                             })),
                     )
                     .child(
+                        Button::new("export-library")
+                            .label("Export")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_export_dialog(window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("subscriptions")
                             .label("Subscriptions")
                             .on_click(cx.listener(|view, _, window, cx| {
@@ -2059,6 +2111,47 @@ mod tests {
             });
         });
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
+    }
+
+    /// Ticket 11: the Export button opens a confirm dialog carrying the
+    /// plaintext-secret warning verbatim; nothing is written until confirm.
+    #[gpui_kit::test]
+    fn export_dialog_opens_with_verbatim_warning(cx: &mut TestAppContext) {
+        use crate::store::export_confirm_description;
+        use crate::store::export_warning_text;
+
+        cx.update(gpui_kit::init);
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        // The dialog description is the warning text verbatim by construction.
+        assert_eq!(export_confirm_description(), export_warning_text());
+
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, _| window.try_find("export-library").is_some()));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_export_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
     /// Ticket 04: the subscriptions dialog opens with a label/URL/group
