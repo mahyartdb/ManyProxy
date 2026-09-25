@@ -7,7 +7,7 @@
 //! through and render the returned field-level errors.
 
 use rusqlite::{params, Connection};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -135,7 +135,28 @@ impl From<rusqlite::Error> for StoreError {
 /// row's display/endpoint metadata for backup; `subscriptions` keeps the
 /// subscription records. The import grammar reads only `outbounds`, so a
 /// re-import of this payload commits duplicates, never adds.
+///
+/// Ticket 25: kept as the slim import-compat builder (the full-fidelity
+/// export lives in [`export_payload_full`]). No in-tree prod caller —
+/// like the ticket-16 test-only wrappers, this stays for API stability.
+#[allow(dead_code)]
 pub fn export_payload(configs: &[ProxyConfig], subscriptions: &[Subscription]) -> String {
+    export_payload_full(configs, subscriptions, &[])
+}
+
+/// Ticket 25: full-fidelity payload behind [`Store::export_library_json`].
+/// Beyond [`export_payload`], `library` carries every row's full params,
+/// enabled flag, identity, sync baseline, adoptable flag, and row id;
+/// `subscriptions` carries each record's id plus refresh metadata
+/// (`last_refresh_at`/`last_error`/`failures`); `tombstones` rides along so
+/// user-deleted rows stay deleted after a restore. This is the store half
+/// of restorable export: the import/UI side reads these sections (ticket 26
+/// territory) or [`Store::restore_library_json`] rebuilds them directly.
+pub fn export_payload_full(
+    configs: &[ProxyConfig],
+    subscriptions: &[Subscription],
+    tombstones: &[(String, String)],
+) -> String {
     let mut outbounds: Vec<serde_json::Value> = Vec::with_capacity(configs.len());
     for config in configs {
         if let Ok(serde_json::Value::Object(map)) =
@@ -150,23 +171,42 @@ pub fn export_payload(configs: &[ProxyConfig], subscriptions: &[Subscription]) -
         .iter()
         .map(|config| {
             serde_json::json!({
+                "id": config.id,
                 "name": config.name,
                 "protocol": config.protocol,
+                "params": config.params,
                 "group": config.group,
                 "bind_ip": config.bind_ip,
                 "port": config.port,
+                "enabled": config.enabled,
                 "subscription_id": config.subscription_id,
+                "identity_key": config.identity_key,
             })
         })
         .collect();
     let subs: Vec<serde_json::Value> = subscriptions
         .iter()
         .map(|sub| {
+            let failures: serde_json::Value = serde_json::from_str(&encode_failures(&sub.failures))
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
             serde_json::json!({
+                "id": sub.id,
                 "label": sub.label,
                 "url": sub.url,
                 "group": sub.group,
                 "auto_refresh": sub.auto_refresh,
+                "last_refresh_at": sub.last_refresh_at,
+                "last_error": sub.last_error,
+                "failures": failures,
+            })
+        })
+        .collect();
+    let tombs: Vec<serde_json::Value> = tombstones
+        .iter()
+        .map(|(subscription_id, identity_key)| {
+            serde_json::json!({
+                "subscription_id": subscription_id,
+                "identity_key": identity_key,
             })
         })
         .collect();
@@ -174,6 +214,7 @@ pub fn export_payload(configs: &[ProxyConfig], subscriptions: &[Subscription]) -
         "outbounds": outbounds,
         "library": library,
         "subscriptions": subs,
+        "tombstones": tombs,
     })
     .to_string()
 }
@@ -195,13 +236,14 @@ pub struct HealthSnapshot {
 }
 
 /// Map one health snapshot row to a HealthSnapshot.
+/// Ticket 25: negative stored latencies clamp to 0 (never wrap via `as u64`).
 fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot> {
     let latency_ms: Option<i64> = row.get(3)?;
     Ok(HealthSnapshot {
         config_id: row.get(0)?,
         at: row.get(1)?,
         kind: row.get(2)?,
-        latency_ms: latency_ms.map(|ms| ms as u64),
+        latency_ms: latency_ms.map(|ms| ms.max(0) as u64),
         error: row.get(4)?,
     })
 }
@@ -253,10 +295,23 @@ pub fn export_confirm_description() -> &'static str {
 
 /// Map one result row to a ProxyConfig. All columns are bound by position
 /// with explicit types (STRICT table guarantees the shapes).
+/// Ticket 25: out-of-range ports fail loudly (never silent truncation via
+/// `as u16`); a CHECK constraint guards new tables, this rejects drift in
+/// old ones.
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
     let id: i64 = row.get(0)?;
     let enabled: i64 = row.get(5)?;
     let port: i64 = row.get(7)?;
+    if !(1..=65_535).contains(&port) {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("stored port out of range: {port}"),
+            )),
+        ));
+    }
     Ok(ProxyConfig {
         id: id.to_string(),
         name: row.get(1)?,
@@ -568,6 +623,11 @@ pub struct RefreshOutcome {
     pub duplicates: usize,
     /// Desired rows skipped because the user deleted them (tombstoned).
     pub skipped: usize,
+    /// Ticket 25: owned rows where the user changed params/protocol AND
+    /// upstream changed them too (or rotated identity under a user edit).
+    /// The user's version is kept in place — never silently reverted — and
+    /// each such row counts here exactly once so the UI can surface it.
+    pub conflicts: usize,
     pub failures: Vec<crate::import::ImportFailure>,
     pub error: Option<String>,
 }
@@ -650,10 +710,13 @@ fn decode_failures(raw: Option<String>) -> Vec<crate::import::ImportFailure> {
     let mut out = Vec::new();
     if let Some(items) = value.as_array() {
         for item in items {
+            // Ticket 25: saturating conversion (never truncate a hostile u64
+            // on 32-bit targets); import.rs owns its own half.
             let index = item
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize;
+                .map(|index| usize::try_from(index).unwrap_or(usize::MAX))
+                .unwrap_or(0);
             let label = item
                 .get("label")
                 .and_then(|value| value.as_str())
@@ -678,6 +741,137 @@ fn decode_failures(raw: Option<String>) -> Vec<crate::import::ImportFailure> {
         }
     }
     out
+}
+
+/// Ticket 25: widened subscription identity. The import grammar's
+/// [`crate::import::normalized_identity`] deliberately excludes
+/// transport/security/flow/fingerprint fields (same server with a flow-only
+/// change is one row for paste dedupe). Refresh merging needs the opposite:
+/// two upstream nodes that share the narrow identity but differ in
+/// transport/security/flow/fp/pbk/alpn/plugin are two different nodes and
+/// must not over-merge into one row. This key is the narrow key plus those
+/// fields (case-insensitive lookup, enum-like values lowercased, secrets
+/// verbatim like the narrow key). Non-JSON params fall back exactly like the
+/// narrow key. The cutover of `commit_batch` to this key needs an import.rs
+/// change (ticket 26 territory); refresh uses it today.
+pub fn widened_identity(protocol: &str, params: &str) -> String {
+    fn get(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+        keys.iter().find_map(|wanted| {
+            obj.iter().find_map(|(key, value)| {
+                if key.eq_ignore_ascii_case(wanted) {
+                    match value {
+                        serde_json::Value::String(text) if !text.trim().is_empty() => {
+                            Some(text.clone())
+                        }
+                        serde_json::Value::Number(number) => Some(number.to_string()),
+                        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+    }
+    let narrow = crate::import::normalized_identity(protocol, params);
+    let extras: Vec<String> = match serde_json::from_str::<serde_json::Value>(params) {
+        Ok(serde_json::Value::Object(map)) => [
+            (["transport", "network", "net"].as_slice(), true),
+            (["security"].as_slice(), true),
+            (["flow"].as_slice(), true),
+            (["fp", "fingerprint"].as_slice(), true),
+            (["pbk"].as_slice(), false),
+            (["alpn"].as_slice(), false),
+            (["plugin"].as_slice(), false),
+        ]
+        .iter()
+        .map(|(keys, lower)| {
+            get(&map, keys)
+                .map(|value| {
+                    let trimmed = value.trim().to_string();
+                    if *lower {
+                        trimmed.to_ascii_lowercase()
+                    } else {
+                        trimmed
+                    }
+                })
+                .unwrap_or_default()
+        })
+        .collect(),
+        _ => Vec::new(),
+    };
+    format!("{narrow}\0{}", extras.join("\0"))
+}
+
+/// Ticket 25: rotation-link core for in-place identity rotation: normalized
+/// server + numeric port, WITHOUT protocol or credentials. When upstream
+/// rotates identity (flow/security/password/protocol change on the same
+/// server:port), the vanished owned row and the unmatched desired item share
+/// this core, so the merge updates in place (keeps id/port/enabled) instead
+/// of delete + re-add. `None` for non-JSON params (never rotation-matched).
+fn rotation_core(params: &str) -> Option<String> {
+    let map = serde_json::from_str::<serde_json::Value>(params)
+        .ok()?
+        .as_object()?
+        .clone();
+    let get = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|wanted| {
+            map.iter().find_map(|(key, value)| {
+                if key.eq_ignore_ascii_case(wanted) {
+                    match value {
+                        serde_json::Value::String(text) if !text.trim().is_empty() => {
+                            Some(text.clone())
+                        }
+                        serde_json::Value::Number(number) => Some(number.to_string()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+    };
+    let server = get(&["server", "address"]).map(|server| {
+        let trimmed = server.trim();
+        let unbracketed = trimmed
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(trimmed);
+        unbracketed.trim_end_matches('.').to_ascii_lowercase()
+    })?;
+    if server.is_empty() {
+        return None;
+    }
+    let port = get(&["server_port", "port"])?;
+    if port.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{server}\0{}", port.trim()))
+}
+
+/// Ticket 25: outcome of [`Store::restore_library_json`].
+/// (Test-driven API for ticket 26; see the callee's note.)
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub configs: usize,
+    pub subscriptions: usize,
+    pub tombstones: usize,
+}
+
+/// Ticket 25 (L4): same-directory tmp sibling for atomic export writes.
+fn tmp_export_path(path: &Path) -> PathBuf {
+    let tmp_name = format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("manyproxy-export.json"),
+        std::process::id()
+    );
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    }
 }
 
 pub struct Store {
@@ -756,10 +950,78 @@ impl Store {
         Ok(())
     }
 
+    /// Ticket 25: schema version behind `PRAGMA user_version`. Version 1 is
+    /// every table/column through ticket 17; version 2 adds the ticket-25
+    /// ownership columns (`adoptable`, `synced_params`). Fresh and legacy
+    /// (`user_version = 0`) databases migrate forward idempotently; a
+    /// database from a NEWER build fails loudly (never a silent empty).
+    const SCHEMA_VERSION: i64 = 2;
+    /// Minimum SQLite for this schema: STRICT tables need 3.37+.
+    const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
+
+    /// Ticket 25: loud schema failure (newer-than-supported version, too-old
+    /// SQLite, post-migration drift). Reuses `StoreError::Sql` so the public
+    /// API stays additive; the message names the versions and the fix.
+    fn schema_error(message: String) -> StoreError {
+        StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        )))
+    }
+
+    /// Ticket 25: assert the runtime SQLite meets [`Store::MIN_SQLITE`].
+    fn assert_sqlite_version(&self) -> Result<(), StoreError> {
+        let text: String = self
+            .conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
+        let mut parts = text.split('.').map(|part| part.parse::<i64>().unwrap_or(0));
+        let version = (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        );
+        if version < Self::MIN_SQLITE {
+            return Err(Self::schema_error(format!(
+                "SQLite {text} is too old: ManyProxy needs {}.{}.{}+ (delete or upgrade the runtime, not the database)",
+                Self::MIN_SQLITE.0,
+                Self::MIN_SQLITE.1,
+                Self::MIN_SQLITE.2,
+            )));
+        }
+        Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, StoreError> {
+        // Table names are hardcoded at the call sites (never user input).
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT name FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))?;
+        Ok(stmt.exists(params![column])?)
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, ddl: &str) -> Result<(), StoreError> {
+        if !self.column_exists(table, column)? {
+            self.conn
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};"))?;
+        }
+        Ok(())
+    }
+
     fn create_schema(&self) -> Result<(), StoreError> {
+        self.assert_sqlite_version()?;
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > Self::SCHEMA_VERSION {
+            return Err(Self::schema_error(format!(
+                "library database schema version {version} is newer than this build supports ({}): open it with a newer ManyProxy instead of wiping it",
+                Self::SCHEMA_VERSION,
+            )));
+        }
         // `grp` avoids the reserved word GROUP. Ports are intentionally NOT
         // unique: two stored configs may share a port; the conflict error
         // naming both parties is raised at activation time (ticket 03).
+        // Ticket 25: CHECK pins the valid range on new tables (old tables
+        // are covered by the read-time reject in `map_row`).
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS proxy_configs (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -769,14 +1031,18 @@ impl Store {
                grp TEXT NOT NULL DEFAULT 'default',
                enabled INTEGER NOT NULL DEFAULT 0,
                bind_ip TEXT NOT NULL DEFAULT '127.0.0.1',
-               port INTEGER NOT NULL,
+               port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
                subscription_id TEXT,
-               identity_key TEXT
+               identity_key TEXT,
+               adoptable INTEGER NOT NULL DEFAULT 0,
+               synced_params TEXT
              ) STRICT;
              CREATE INDEX IF NOT EXISTS idx_proxy_configs_enabled
                ON proxy_configs(enabled);
              CREATE INDEX IF NOT EXISTS idx_proxy_configs_subscription
                ON proxy_configs(subscription_id);
+             CREATE INDEX IF NOT EXISTS idx_proxy_configs_identity
+               ON proxy_configs(subscription_id, identity_key);
              CREATE TABLE IF NOT EXISTS subscriptions (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                label TEXT NOT NULL,
@@ -802,50 +1068,159 @@ impl Store {
         )?;
         // Migrate pre-ticket-04 databases that lack the new columns.
         for (column, ddl) in [("subscription_id", "TEXT"), ("identity_key", "TEXT")] {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT name FROM pragma_table_info('proxy_configs') WHERE name = ?1")?;
-            let exists: bool = stmt.exists(params![column])?;
-            if !exists {
-                self.conn.execute_batch(&format!(
-                    "ALTER TABLE proxy_configs ADD COLUMN {column} {ddl};"
-                ))?;
-            }
+            self.ensure_column("proxy_configs", column, ddl)?;
         }
         // Ticket 17: migrate pre-ticket-17 databases that lack the per-item
         // refresh failures column.
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT name FROM pragma_table_info('subscriptions') WHERE name = 'failures'",
-            )?;
-            if !stmt.exists(params![])? {
-                self.conn.execute_batch(
-                    "ALTER TABLE subscriptions ADD COLUMN failures TEXT NOT NULL DEFAULT '[]';",
-                )?;
+        self.ensure_column("subscriptions", "failures", "TEXT NOT NULL DEFAULT '[]'")?;
+        // Ticket 25 (version 2): ownership columns for the refresh merge —
+        // `adoptable` marks rows released by `remove_subscription` so a
+        // second subscription can adopt them; `synced_params` is the
+        // last-synced upstream baseline behind the user-vs-upstream compare.
+        self.ensure_column("proxy_configs", "adoptable", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("proxy_configs", "synced_params", "TEXT")?;
+        // Unknown drift fails loudly: every column the merge relies on must
+        // exist after migration, never a silent empty read.
+        for (table, column) in [
+            ("proxy_configs", "subscription_id"),
+            ("proxy_configs", "identity_key"),
+            ("proxy_configs", "adoptable"),
+            ("proxy_configs", "synced_params"),
+            ("subscriptions", "failures"),
+        ] {
+            if !self.column_exists(table, column)? {
+                return Err(Self::schema_error(format!(
+                    "library database is missing {table}.{column} after migration: restore from an export instead of running on a half-migrated file"
+                )));
             }
         }
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {};", Self::SCHEMA_VERSION))?;
         Ok(())
     }
 
     /// Create a disabled config; invalid input is rejected with field errors.
+    /// Ticket 25: implemented on [`Store::add_batch`] (single-row batch —
+    /// one transaction, identical validation).
     pub fn add(&mut self, input: NewConfig) -> Result<ProxyConfig, StoreError> {
-        let validated = self.validate_new(&input)?;
-        self.conn.execute(
-            "INSERT INTO proxy_configs
-               (name, protocol, params, grp, enabled, bind_ip, port)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
-            params![
-                validated.name,
-                validated.protocol,
-                validated.params,
-                validated.group,
-                validated.bind_ip,
-                validated.port as i64,
-            ],
-        )?;
-        let id = self.conn.last_insert_rowid();
-        self.get(&id.to_string())?
-            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+        let mut created = self.add_batch(vec![input])?;
+        created
+            .pop()
+            .ok_or_else(|| StoreError::NotFound("batch was empty".to_string()))
+    }
+
+    /// Ticket 25: create many disabled configs in ONE transaction (the store
+    /// half of "batch inserts off the UI thread": one tx instead of ~1000
+    /// statements; rewiring `commit_batch` and the `spawn_blocking` move is
+    /// import.rs/main.rs territory, ticket 26). Validation runs fully before
+    /// any write, so one bad item rejects the whole batch and writes nothing.
+    /// Auto ports assign sequentially from a single taken-set snapshot.
+    pub fn add_batch(&mut self, inputs: Vec<NewConfig>) -> Result<Vec<ProxyConfig>, StoreError> {
+        struct Fields {
+            name: String,
+            protocol: String,
+            params: String,
+            group: String,
+            bind_ip: String,
+            port: Option<u16>,
+        }
+        let mut fields: Vec<Fields> = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            let mut errors = Vec::new();
+            let name = validated_name(&input.name, &mut errors);
+            let proto_params =
+                validate_protocol_params(&input.protocol, &input.params, &mut errors);
+            let group = defaulted(&input.group, DEFAULT_GROUP);
+            let bind_ip = validated_bind(&input.bind_ip, &mut errors);
+            let port = match parse_port_field(&input.port) {
+                Ok(port) => Some(port),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            };
+            if !errors.is_empty() {
+                return Err(StoreError::Invalid(errors));
+            }
+            let (protocol, params) =
+                proto_params.unwrap_or((DEFAULT_PROTOCOL.to_string(), "{}".to_string()));
+            fields.push(Fields {
+                name: name.unwrap_or_default(),
+                protocol,
+                params,
+                group,
+                bind_ip: bind_ip.unwrap_or_default(),
+                port: port.unwrap_or(None),
+            });
+        }
+        let mut taken: HashSet<i64> = HashSet::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT port FROM proxy_configs")?;
+            let mapped = stmt.query_map([], |row| row.get(0))?;
+            for port in mapped {
+                taken.insert(port?);
+            }
+        }
+        let mut assigned: Vec<ValidatedConfig> = Vec::with_capacity(fields.len());
+        for item in fields {
+            let port = match item.port {
+                Some(port) => port,
+                None => {
+                    let mut free = None;
+                    for candidate in AUTO_PORT_START..=AUTO_PORT_END {
+                        if !taken.contains(&(candidate as i64)) {
+                            free = Some(candidate);
+                            break;
+                        }
+                    }
+                    match free {
+                        Some(port) => port,
+                        None => {
+                            return Err(StoreError::Invalid(vec![FieldError::new(
+                                "port",
+                                "no automatic port left in the auto range",
+                            )]));
+                        }
+                    }
+                }
+            };
+            taken.insert(port as i64);
+            assigned.push(ValidatedConfig {
+                name: item.name,
+                protocol: item.protocol,
+                params: item.params,
+                group: item.group,
+                bind_ip: item.bind_ip,
+                port,
+            });
+        }
+        let tx = self.conn.transaction()?;
+        let mut ids: Vec<i64> = Vec::with_capacity(assigned.len());
+        for item in &assigned {
+            tx.execute(
+                "INSERT INTO proxy_configs
+                   (name, protocol, params, grp, enabled, bind_ip, port)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                params![
+                    item.name,
+                    item.protocol,
+                    item.params,
+                    item.group,
+                    item.bind_ip,
+                    item.port as i64,
+                ],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        tx.commit()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(
+                self.get(&id.to_string())?
+                    .ok_or_else(|| StoreError::NotFound(id.to_string()))?,
+            );
+        }
+        Ok(out)
     }
 
     /// All configs in stable id order.
@@ -881,15 +1256,29 @@ impl Store {
 
     /// Edit a stopped-config record. Validation runs before any write, so
     /// invalid input leaves the record unchanged.
+    /// Ticket 25: editing a subscription-owned row's protocol/params
+    /// refreshes its `identity_key` to the widened identity of the new
+    /// values (never a stale key that a later refresh would silently
+    /// revert), and any edit claims an adoptable (released) row so a later
+    /// subscription refresh cannot adopt it away. The last-synced upstream
+    /// baseline (`synced_params`) is deliberately left alone: the merge
+    /// compares current params against it to tell user-changed from
+    /// upstream-changed.
     pub fn update(&mut self, id: &str, patch: ConfigPatch) -> Result<ProxyConfig, StoreError> {
         let current = self
             .get(id)?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         let merged = self.validate_patch(&current, &patch)?;
+        let identity_key = if current.subscription_id.is_some() {
+            Some(widened_identity(&merged.protocol, &merged.params))
+        } else {
+            current.identity_key.clone()
+        };
         self.conn.execute(
             "UPDATE proxy_configs
-             SET name = ?1, protocol = ?2, params = ?3, grp = ?4, bind_ip = ?5, port = ?6
-             WHERE id = ?7",
+             SET name = ?1, protocol = ?2, params = ?3, grp = ?4, bind_ip = ?5, port = ?6,
+                 identity_key = ?7, adoptable = 0
+             WHERE id = ?8",
             params![
                 merged.name,
                 merged.protocol,
@@ -897,6 +1286,7 @@ impl Store {
                 merged.group,
                 merged.bind_ip,
                 merged.port as i64,
+                identity_key,
                 current.rowid(),
             ],
         )?;
@@ -909,32 +1299,35 @@ impl Store {
     /// the next refresh does not resurrect a row the user deleted on purpose.
     /// Ticket 12: the row's health snapshot goes with it (bounded table, no
     /// stale resurrection after restart).
+    /// Ticket 25: the delete + tombstone + snapshot prune apply in a single
+    /// transaction (never a half-removed row).
     pub fn remove(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Ok(false),
         };
         let current = self.get(id)?;
-        let removed = self
-            .conn
-            .execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
         if removed > 0 {
             if let Some(row) = current {
-                if let (Some(subscription_id), Some(identity_key)) =
-                    (row.subscription_id, row.identity_key)
-                {
-                    self.conn.execute(
+                let key = row
+                    .identity_key
+                    .unwrap_or_else(|| widened_identity(&row.protocol, &row.params));
+                if let Some(subscription_id) = row.subscription_id {
+                    tx.execute(
                         "INSERT OR IGNORE INTO subscription_tombstones (subscription_id, identity_key)
                          VALUES (?1, ?2)",
-                        params![subscription_id, identity_key],
+                        params![subscription_id, key],
                     )?;
                 }
             }
-            self.conn.execute(
+            tx.execute(
                 "DELETE FROM health_snapshots WHERE config_id = ?1",
                 params![id],
             )?;
         }
+        tx.commit()?;
         Ok(removed > 0)
     }
 
@@ -971,10 +1364,18 @@ impl Store {
     fn validated_subscription_url(raw: &str) -> Result<String, StoreError> {
         // Error text never echoes the URL: subscription URLs often carry
         // tokens in the query string (boundary: no secrets in logs).
+        // Ticket 25: byte-safe scheme prefix (never slice at a non-char
+        // boundary on non-ASCII input — the import-side half is ticket 24).
         let trimmed = raw.trim();
-        let after_scheme = if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
+        let after_scheme = if trimmed
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        {
             &trimmed[7..]
-        } else if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://") {
+        } else if trimmed
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        {
             &trimmed[8..]
         } else {
             return Err(StoreError::Invalid(vec![FieldError::new(
@@ -1067,6 +1468,11 @@ impl Store {
 
     /// Remove a subscription. Owned member rows are released (kept, unowned),
     /// never deleted; tombstones for this subscription are dropped.
+    /// Ticket 25: the release + tombstone drop + subscription delete apply
+    /// in a single transaction. Released rows keep their params but lose
+    /// their identity, baseline, and ownership — and are marked adoptable so
+    /// a second subscription carrying the same node adopts them in place
+    /// instead of double-counting a cross-subscription shadow.
     pub fn remove_subscription(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -1075,18 +1481,20 @@ impl Store {
         if self.get_subscription(id)?.is_none() {
             return Ok(false);
         }
-        self.conn.execute(
-            "UPDATE proxy_configs SET subscription_id = NULL, identity_key = NULL
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE proxy_configs
+             SET subscription_id = NULL, identity_key = NULL,
+                 synced_params = NULL, adoptable = 1
              WHERE subscription_id = ?1",
             params![id],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM subscription_tombstones WHERE subscription_id = ?1",
             params![id],
         )?;
-        let removed = self
-            .conn
-            .execute("DELETE FROM subscriptions WHERE id = ?1", params![rowid])?;
+        let removed = tx.execute("DELETE FROM subscriptions WHERE id = ?1", params![rowid])?;
+        tx.commit()?;
         Ok(removed > 0)
     }
 
@@ -1116,18 +1524,22 @@ impl Store {
     /// seam: tests inject body strings, never real network). The body is
     /// parsed with the ticket-03 parsers via
     /// [`crate::import::import_subscription_body`]; the merge upserts owned
-    /// rows keyed by [`crate::import::normalized_identity`], preserves the
-    /// hand-edit overlay (name/enabled/bind/port), tombstones user-deleted
-    /// rows, removes only subscription-owned vanished rows, and applies
-    /// atomically per group. Unparseable bodies keep the last-good members
-    /// and record `last_error`. Refresh never enables or starts configs.
+    /// rows keyed by [`widened_identity`], preserves the hand-edit overlay
+    /// (name/enabled/bind/port), pins user-edited params/protocol against
+    /// silent upstream reverts (versioned against `synced_params`, conflicts
+    /// counted), rotates identity in place (id/port/enabled kept), adopts
+    /// released rows, tombstones user-deleted rows, removes only
+    /// subscription-owned vanished rows (pruning their health snapshots),
+    /// and applies atomically per group. Unparseable bodies keep the
+    /// last-good members and record `last_error`. Refresh never enables or
+    /// starts configs.
     pub fn refresh_with_body(
         &mut self,
         sub_id: &str,
         body: &str,
         now: i64,
     ) -> Result<RefreshOutcome, StoreError> {
-        use crate::import::{import_subscription_body, normalized_identity, ImportedConfig};
+        use crate::import::{import_subscription_body, ImportedConfig};
         let subscription = self
             .get_subscription(sub_id)?
             .ok_or_else(|| StoreError::NotFound(sub_id.to_string()))?;
@@ -1146,13 +1558,23 @@ impl Store {
                 ..Default::default()
             });
         }
-        // Desired set, first-wins; extras count as duplicates.
-        let mut desired: HashMap<String, ImportedConfig> = HashMap::new();
+        // Desired set, FIRST-wins (ticket 25 L1: the code matches the
+        // comment); extras count as duplicates. A BTreeMap keeps the
+        // allocation order deterministic (ticket 25 L2). Keys are the
+        // widened identity (ticket 25: no transport/security/flow over-merge).
+        // Values carry the batch position so port-exhaustion failures report
+        // real per-item indices (ticket 25 L3).
+        let mut desired: BTreeMap<String, (usize, ImportedConfig)> = BTreeMap::new();
         let mut duplicates = 0usize;
-        for config in batch.configs {
-            let key = normalized_identity(&config.protocol, &config.params);
-            if desired.insert(key, config).is_some() {
-                duplicates += 1;
+        for (index, config) in batch.configs.into_iter().enumerate() {
+            let key = widened_identity(&config.protocol, &config.params);
+            match desired.entry(key) {
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    duplicates += 1;
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((index, config));
+                }
             }
         }
         let rows = self.list()?;
@@ -1166,22 +1588,78 @@ impl Store {
                 tombstones.insert(key?);
             }
         }
-        let row_key = |row: &ProxyConfig| -> String {
-            row.identity_key
-                .clone()
-                .unwrap_or_else(|| normalized_identity(&row.protocol, &row.params))
-        };
-        let mut global_by_key: HashMap<String, &ProxyConfig> = HashMap::new();
-        for row in &rows {
-            global_by_key.entry(row_key(row)).or_insert(row);
+        // Ticket 25: ownership side-channels live in side queries, never in
+        // `ProxyConfig` (its shape is frozen: main.rs builds it literally).
+        // `adoptable` marks rows released by `remove_subscription` so a
+        // second subscription adopts them; `synced_params` is the last-synced
+        // upstream baseline behind the user-vs-upstream compare.
+        let mut adoptable: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM proxy_configs WHERE adoptable = 1")?;
+            let ids = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            for id in ids {
+                adoptable.insert(id?.to_string());
+            }
         }
-        let owned: Vec<&ProxyConfig> = rows
+        let mut synced: HashMap<String, Option<String>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, synced_params FROM proxy_configs WHERE subscription_id = ?1",
+            )?;
+            let pairs = stmt.query_map(params![subscription.id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for pair in pairs {
+                let (id, baseline) = pair?;
+                synced.insert(id.to_string(), baseline);
+            }
+        }
+        struct RowView<'a> {
+            row: &'a ProxyConfig,
+            stored: Option<String>,
+            fresh: String,
+            owned: bool,
+        }
+        let views: Vec<RowView<'_>> = rows
             .iter()
-            .filter(|row| row.subscription_id.as_deref() == Some(subscription.id.as_str()))
+            .map(|row| RowView {
+                stored: row.identity_key.clone(),
+                fresh: widened_identity(&row.protocol, &row.params),
+                owned: row.subscription_id.as_deref() == Some(subscription.id.as_str()),
+                row,
+            })
             .collect();
-        let mut owned_by_key: HashMap<String, &ProxyConfig> = HashMap::new();
-        for row in &owned {
-            owned_by_key.entry(row_key(row)).or_insert(row);
+        // Primary match key: the stored (last-synced or user-refreshed)
+        // identity, falling back to the fresh key for legacy rows.
+        let mut owned_by_key: HashMap<String, &RowView<'_>> = HashMap::new();
+        for view in &views {
+            if view.owned {
+                owned_by_key
+                    .entry(view.stored.clone().unwrap_or_else(|| view.fresh.clone()))
+                    .or_insert(view);
+            }
+        }
+        let mut global_by_key: HashMap<String, &RowView<'_>> = HashMap::new();
+        for view in &views {
+            global_by_key.entry(view.fresh.clone()).or_insert(view);
+        }
+        // Ticket 25: narrow fallback behind the widened shadow. Hand-made
+        // rows (dialog JSON, legacy seeds) omit the transport/security
+        // defaults the link parsers emit, so the same node serializes to
+        // different widened keys. A narrow hit on an UNOWNED row still
+        // dedupes exactly like before (adopt when released, duplicate when
+        // hand-made); owned rows never shadow (vanished/rotation resolves
+        // them) so widened precision survives where it matters.
+        let mut narrow_by_key: HashMap<String, &RowView<'_>> = HashMap::new();
+        for view in &views {
+            narrow_by_key
+                .entry(crate::import::normalized_identity(
+                    &view.row.protocol,
+                    &view.row.params,
+                ))
+                .or_insert(view);
         }
         enum Op {
             Insert {
@@ -1189,9 +1667,18 @@ impl Store {
                 config: ImportedConfig,
                 port: u16,
             },
-            Update {
+            UpstreamUpdate {
                 id: String,
                 protocol: String,
+                params: String,
+                key: String,
+            },
+            GroupFollow {
+                id: String,
+            },
+            Adopt {
+                id: String,
+                key: String,
                 params: String,
             },
             Delete {
@@ -1204,7 +1691,184 @@ impl Store {
             failures: batch.failures,
             ..Default::default()
         };
-        let mut taken: HashSet<i64> = rows.iter().map(|row| row.port as i64).collect();
+        // Rotation cores of tombstoned desired items: a vanished owned row
+        // sharing one is user-owned now (the user edited identity away from
+        // the upstream key) and is pinned, never deleted, never reverted.
+        let mut tomb_cores: HashSet<String> = HashSet::new();
+        for (key, (_, config)) in &desired {
+            if tombstones.contains(key) {
+                if let Some(core) = rotation_core(&config.params) {
+                    tomb_cores.insert(core);
+                }
+            }
+        }
+        let mut matched_owned: HashSet<String> = HashSet::new();
+        let mut candidates: Vec<(String, usize, ImportedConfig)> = Vec::new();
+        for (key, (index, config)) in &desired {
+            if tombstones.contains(key) {
+                outcome.skipped += 1;
+                continue;
+            }
+            if let Some(view) = owned_by_key.get(key) {
+                matched_owned.insert(view.row.id.clone());
+                // Ticket 25 versioned compare: the baseline is the
+                // last-synced upstream params. User-changed rows keep their
+                // params/protocol (pinned); upstream-only changes apply in
+                // place; both changing surfaces an explicit conflict.
+                match synced.get(&view.row.id).and_then(|base| base.clone()) {
+                    None => {
+                        // Legacy row (pre-ticket-25, no baseline): upstream
+                        // wins, exactly the old behavior.
+                        if view.row.protocol != config.protocol
+                            || view.row.params != config.params
+                            || view.row.group != subscription.group
+                        {
+                            ops.push(Op::UpstreamUpdate {
+                                id: view.row.id.clone(),
+                                protocol: config.protocol.clone(),
+                                params: config.params.clone(),
+                                key: key.clone(),
+                            });
+                            outcome.updated += 1;
+                        }
+                    }
+                    Some(base) => {
+                        let upstream_changed = config.params != base;
+                        let user_changed = view.row.params != base;
+                        let follow_group = view.row.group != subscription.group;
+                        if view.row.protocol != config.protocol
+                            || (upstream_changed && !user_changed)
+                        {
+                            ops.push(Op::UpstreamUpdate {
+                                id: view.row.id.clone(),
+                                protocol: config.protocol.clone(),
+                                params: config.params.clone(),
+                                key: key.clone(),
+                            });
+                            outcome.updated += 1;
+                        } else {
+                            // Pinned: user fix kept (params/protocol never
+                            // overwritten); only the group still follows.
+                            if follow_group {
+                                ops.push(Op::GroupFollow {
+                                    id: view.row.id.clone(),
+                                });
+                                outcome.updated += 1;
+                            }
+                            if upstream_changed && user_changed {
+                                outcome.conflicts += 1;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(view) = global_by_key.get(key) {
+                // Ticket 25 cross-subscription fix: an unowned ADOPTABLE
+                // (released) row with the same node is adopted in place;
+                // hand-made collisions stay duplicates, never duplicated.
+                // Owned rows never shadow here (a stale-key twin falls
+                // through to candidate duty; vanished/rotation resolves it).
+                if view.owned {
+                    candidates.push((key.clone(), *index, config.clone()));
+                } else if adoptable.contains(&view.row.id) {
+                    ops.push(Op::Adopt {
+                        id: view.row.id.clone(),
+                        key: key.clone(),
+                        params: config.params.clone(),
+                    });
+                    outcome.added += 1;
+                } else {
+                    outcome.duplicates += 1;
+                }
+                continue;
+            }
+            if let Some(view) = narrow_by_key.get(&crate::import::normalized_identity(
+                &config.protocol,
+                &config.params,
+            )) {
+                if view.owned {
+                    candidates.push((key.clone(), *index, config.clone()));
+                } else if adoptable.contains(&view.row.id) {
+                    // Released row, upstream tweaked an extra since release:
+                    // adopt in place onto the new key + params.
+                    ops.push(Op::Adopt {
+                        id: view.row.id.clone(),
+                        key: key.clone(),
+                        params: config.params.clone(),
+                    });
+                    outcome.added += 1;
+                } else {
+                    outcome.duplicates += 1;
+                }
+                continue;
+            }
+            candidates.push((key.clone(), *index, config.clone()));
+        }
+        // Vanished owned rows, paired deterministically by numeric id.
+        let mut vanished: Vec<&RowView<'_>> = views
+            .iter()
+            .filter(|view| view.owned && !matched_owned.contains(&view.row.id))
+            .collect();
+        vanished.sort_by_key(|view| view.row.id.parse::<i64>().unwrap_or(i64::MAX));
+        let mut consumed: HashSet<String> = HashSet::new();
+        let mut deleted_ids: Vec<String> = Vec::new();
+        for view in vanished {
+            let user_changed = synced
+                .get(&view.row.id)
+                .and_then(|base| base.as_ref())
+                .map(|base| view.row.params != *base)
+                .unwrap_or(false);
+            let core = rotation_core(&view.row.params);
+            if let Some(core) = core.as_deref() {
+                if tomb_cores.contains(core) {
+                    continue;
+                }
+            }
+            let mut paired = false;
+            if let Some(core) = core.as_deref() {
+                for (candidate_key, _, candidate) in &candidates {
+                    if consumed.contains(candidate_key) {
+                        continue;
+                    }
+                    if rotation_core(&candidate.params).as_deref() == Some(core) {
+                        consumed.insert(candidate_key.clone());
+                        if user_changed {
+                            // Upstream rotated identity under a user edit:
+                            // keep the user's version, swallow the twin.
+                            outcome.conflicts += 1;
+                        } else {
+                            // Ticket 25 rotation in place: same id, same
+                            // port, same enabled — never delete + re-add.
+                            ops.push(Op::UpstreamUpdate {
+                                id: view.row.id.clone(),
+                                protocol: candidate.protocol.clone(),
+                                params: candidate.params.clone(),
+                                key: candidate_key.clone(),
+                            });
+                            outcome.updated += 1;
+                        }
+                        paired = true;
+                        break;
+                    }
+                }
+            }
+            if !paired {
+                ops.push(Op::Delete {
+                    id: view.row.id.clone(),
+                });
+                deleted_ids.push(view.row.id.clone());
+                outcome.removed += 1;
+            }
+        }
+        // Ticket 25 L2: same-pass deletions free their ports first; BTreeMap
+        // order makes multi-insert allocation deterministic.
+        let deleted_set: HashSet<&str> = deleted_ids.iter().map(String::as_str).collect();
+        let mut taken: HashSet<i64> = rows
+            .iter()
+            .filter(|row| !deleted_set.contains(row.id.as_str()))
+            .map(|row| row.port as i64)
+            .collect();
         let mut next_free_port = || -> Option<u16> {
             for port in AUTO_PORT_START..=AUTO_PORT_END {
                 if !taken.contains(&(port as i64)) {
@@ -1214,27 +1878,8 @@ impl Store {
             }
             None
         };
-        for (key, config) in &desired {
-            if tombstones.contains(key) {
-                outcome.skipped += 1;
-                continue;
-            }
-            if let Some(current) = owned_by_key.get(key) {
-                if current.protocol != config.protocol
-                    || current.params != config.params
-                    || current.group != subscription.group
-                {
-                    ops.push(Op::Update {
-                        id: current.id.clone(),
-                        protocol: config.protocol.clone(),
-                        params: config.params.clone(),
-                    });
-                    outcome.updated += 1;
-                }
-                continue;
-            }
-            if global_by_key.contains_key(key) {
-                outcome.duplicates += 1;
+        for (key, index, config) in &candidates {
+            if consumed.contains(key) {
                 continue;
             }
             match next_free_port() {
@@ -1248,19 +1893,13 @@ impl Store {
                 }
                 None => {
                     outcome.failures.push(crate::import::ImportFailure {
-                        index: 0,
+                        index: *index,
                         label: crate::import::redact_link(&config.name),
                         reason: "port-exhausted: no automatic port left in the auto range"
                             .to_string(),
                         code: crate::import::ImportErrorKind::BadPort,
                     });
                 }
-            }
-        }
-        for row in &owned {
-            if !desired.contains_key(&row_key(row)) {
-                ops.push(Op::Delete { id: row.id.clone() });
-                outcome.removed += 1;
             }
         }
         let tx = self.conn.transaction()?;
@@ -1270,8 +1909,8 @@ impl Store {
                     tx.execute(
                         "INSERT INTO proxy_configs
                            (name, protocol, params, grp, enabled, bind_ip, port,
-                            subscription_id, identity_key)
-                         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+                            subscription_id, identity_key, synced_params, adoptable)
+                         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 0)",
                         params![
                             config.name,
                             config.protocol,
@@ -1281,21 +1920,59 @@ impl Store {
                             port as i64,
                             subscription.id,
                             key,
+                            config.params,
                         ],
                     )?;
                 }
-                Op::Update {
+                Op::UpstreamUpdate {
                     id,
                     protocol,
                     params,
+                    key,
                 } => {
                     let rowid: i64 = id.parse().map_err(|_| {
                         StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
                     })?;
+                    // Ticket 25: refreshes the identity key and the upstream
+                    // baseline together; id/port/enabled/name/bind survive.
                     tx.execute(
-                        "UPDATE proxy_configs SET protocol = ?1, params = ?2, grp = ?3
-                         WHERE id = ?4",
-                        params![protocol, params, subscription.group, rowid],
+                        "UPDATE proxy_configs
+                         SET protocol = ?1, params = ?2, grp = ?3,
+                             identity_key = ?4, synced_params = ?5
+                         WHERE id = ?6",
+                        params![protocol, params, subscription.group, key, params, rowid],
+                    )?;
+                }
+                Op::GroupFollow { id } => {
+                    let rowid: i64 = id.parse().map_err(|_| {
+                        StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
+                    })?;
+                    tx.execute(
+                        "UPDATE proxy_configs SET grp = ?1 WHERE id = ?2",
+                        params![subscription.group, rowid],
+                    )?;
+                }
+                Op::Adopt { id, key, params } => {
+                    let rowid: i64 = id.parse().map_err(|_| {
+                        StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
+                    })?;
+                    // Ticket 25 adoption: a released row joins the
+                    // subscription in place (id/port/enabled/name kept); the
+                    // row was untouched since release, so upstream params win.
+                    tx.execute(
+                        "UPDATE proxy_configs
+                         SET subscription_id = ?1, identity_key = ?2,
+                             synced_params = ?3, params = ?4, grp = ?5,
+                             adoptable = 0
+                         WHERE id = ?6",
+                        params![
+                            subscription.id,
+                            key,
+                            params,
+                            params,
+                            subscription.group,
+                            rowid
+                        ],
                     )?;
                 }
                 Op::Delete { id } => {
@@ -1303,6 +1980,11 @@ impl Store {
                         StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
                     })?;
                     tx.execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
+                    // Ticket 25: refresh-deletes prune like remove() does.
+                    tx.execute(
+                        "DELETE FROM health_snapshots WHERE config_id = ?1",
+                        params![id],
+                    )?;
                 }
             }
         }
@@ -1369,14 +2051,64 @@ impl Store {
     /// Secrets stay plaintext by design (the confirm dialog shows
     /// [`export_warning_text`] verbatim): redacting here would break
     /// re-import, so redaction never applies to this payload.
+    /// Ticket 25: the `library`/`subscriptions`/`tombstones` sections are
+    /// full-fidelity (params, enabled, identity, sync baseline, adoptable
+    /// flag, refresh metadata) so [`Store::restore_library_json`] rebuilds
+    /// identical rows/groups/enabled with deletes staying deleted.
     pub fn export_library_json(&self) -> Result<String, StoreError> {
-        Ok(export_payload(&self.list()?, &self.list_subscriptions()?))
+        let mut stmt = self.conn.prepare(
+            "SELECT subscription_id, identity_key FROM subscription_tombstones
+             ORDER BY subscription_id, identity_key",
+        )?;
+        let tombstones = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload = export_payload_full(&self.list()?, &self.list_subscriptions()?, &tombstones);
+        // Ticket 25: ownership side-channels (`adoptable`, `synced_params`)
+        // live outside `ProxyConfig`; patch them into the library section
+        // here so restores preserve them.
+        let mut side: HashMap<String, (bool, Option<String>)> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, adoptable, synced_params FROM proxy_configs")?;
+            let entries = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for entry in entries {
+                let (id, adoptable, synced) = entry?;
+                side.insert(id.to_string(), (adoptable != 0, synced));
+            }
+        }
+        let mut value: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|error| Self::schema_error(format!("export serialization broke ({error})")))?;
+        if let Some(entries) = value.get_mut("library").and_then(|v| v.as_array_mut()) {
+            for entry in entries {
+                if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                    let (adoptable, synced) = side.get(id).cloned().unwrap_or((false, None));
+                    entry["adoptable"] = serde_json::Value::Bool(adoptable);
+                    entry["synced_params"] = match synced {
+                        Some(text) => serde_json::Value::String(text),
+                        None => serde_json::Value::Null,
+                    };
+                }
+            }
+        }
+        Ok(value.to_string())
     }
 
     /// Write the export file only when `confirmed` is true. Cancel (`false`)
     /// performs no I/O and returns `Ok(None)`; confirm writes the payload
     /// and returns the path. Errors never echo file contents (no secrets in
     /// logs); only the destination path is named.
+    /// Ticket 25 (L4): the payload lands via tmp-file + rename in the same
+    /// directory, so a crash never leaves a half-written export behind.
     pub fn commit_export(
         &self,
         path: &Path,
@@ -1394,11 +2126,222 @@ impl Store {
                 })?;
             }
         }
-        std::fs::write(path, payload).map_err(|error| StoreError::Io {
+        let tmp = tmp_export_path(path);
+        let io_error = |error: std::io::Error| StoreError::Io {
             path: path.to_path_buf(),
             message: error.to_string(),
-        })?;
+        };
+        if let Err(error) = std::fs::write(&tmp, payload).map_err(io_error) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&tmp, path).map_err(io_error) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
         Ok(Some(path.to_path_buf()))
+    }
+
+    /// Ticket 25: rebuild a [`Store::export_library_json`] payload verbatim —
+    /// same row ids, same groups, same enabled flags, same subscription
+    /// records with refresh metadata, same tombstones (deletes stay
+    /// deleted). Rows land exactly as exported (no re-validation, no port
+    /// reassignment); anything malformed fails loudly with an `export`
+    /// field error before anything is written (single transaction). The
+    /// import grammar keeps reading only `outbounds` (ticket 24 territory);
+    /// this is the store half that consumes the `library`/`subscriptions`/
+    /// `tombstones` sections ticket 25 exposes. No in-tree prod caller yet
+    /// (UI/import wiring is ticket 26); kept live by tests.
+    #[allow(dead_code)]
+    pub fn restore_library_json(&mut self, payload: &str) -> Result<RestoreOutcome, StoreError> {
+        fn invalid(message: String) -> StoreError {
+            StoreError::Invalid(vec![FieldError::new("export", message)])
+        }
+        let value: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|error| invalid(format!("not JSON ({error})")))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| invalid("top level must be an object".to_string()))?;
+        let library = obj
+            .get("library")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| invalid("missing library section".to_string()))?;
+        let subs = obj
+            .get("subscriptions")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| invalid("missing subscriptions section".to_string()))?;
+        let empty_section: Vec<serde_json::Value> = Vec::new();
+        let tombs = obj
+            .get("tombstones")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty_section);
+        let get_str = |entry: &serde_json::Value, key: &str| -> Option<String> {
+            entry.get(key).and_then(|v| v.as_str()).map(str::to_string)
+        };
+        struct LibraryRow {
+            id: i64,
+            name: String,
+            protocol: String,
+            params: String,
+            group: String,
+            enabled: bool,
+            bind_ip: String,
+            port: i64,
+            subscription_id: Option<String>,
+            identity_key: Option<String>,
+            synced_params: Option<String>,
+            adoptable: bool,
+        }
+        let mut rows: Vec<LibraryRow> = Vec::with_capacity(library.len());
+        for (index, entry) in library.iter().enumerate() {
+            let what = format!("library[{index}]");
+            let id: i64 = entry
+                .get("id")
+                .and_then(|v| v.as_str().and_then(|s| s.parse().ok()))
+                .ok_or_else(|| invalid(format!("{what} needs a string id")))?;
+            if id <= 0 {
+                return Err(invalid(format!("{what} has a bad id")));
+            }
+            let port: i64 = entry
+                .get("port")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|port| (1..=65_535).contains(port))
+                .ok_or_else(|| invalid(format!("{what} needs port 1-65535")))?;
+            rows.push(LibraryRow {
+                id,
+                name: get_str(entry, "name").unwrap_or_default(),
+                protocol: get_str(entry, "protocol").unwrap_or_else(|| "vless".to_string()),
+                params: get_str(entry, "params").unwrap_or_else(|| "{}".to_string()),
+                group: get_str(entry, "group").unwrap_or_else(|| "default".to_string()),
+                enabled: entry
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                bind_ip: get_str(entry, "bind_ip").unwrap_or_else(|| "127.0.0.1".to_string()),
+                port,
+                subscription_id: get_str(entry, "subscription_id"),
+                identity_key: get_str(entry, "identity_key"),
+                synced_params: get_str(entry, "synced_params"),
+                adoptable: entry
+                    .get("adoptable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+        struct SubRow {
+            id: i64,
+            label: String,
+            url: String,
+            group: String,
+            auto_refresh: bool,
+            last_refresh_at: Option<i64>,
+            last_error: Option<String>,
+            failures: String,
+        }
+        let mut sub_rows: Vec<SubRow> = Vec::with_capacity(subs.len());
+        for (index, entry) in subs.iter().enumerate() {
+            let what = format!("subscriptions[{index}]");
+            let id: i64 = entry
+                .get("id")
+                .and_then(|v| v.as_str().and_then(|s| s.parse().ok()))
+                .ok_or_else(|| invalid(format!("{what} needs a string id")))?;
+            if id <= 0 {
+                return Err(invalid(format!("{what} has a bad id")));
+            }
+            let failures = entry
+                .get("failures")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            // Loud on corrupt per-item metadata: never silently drop it.
+            if serde_json::from_str::<serde_json::Value>(&failures).is_err() {
+                return Err(invalid(format!("{what} has corrupt failures")));
+            }
+            sub_rows.push(SubRow {
+                id,
+                label: get_str(entry, "label").unwrap_or_default(),
+                url: get_str(entry, "url").unwrap_or_default(),
+                group: get_str(entry, "group").unwrap_or_else(|| "default".to_string()),
+                auto_refresh: entry
+                    .get("auto_refresh")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                last_refresh_at: entry
+                    .get("last_refresh_at")
+                    .and_then(serde_json::Value::as_i64),
+                last_error: get_str(entry, "last_error"),
+                failures,
+            });
+        }
+        let mut tomb_rows: Vec<(String, String)> = Vec::new();
+        for (index, entry) in tombs.iter().enumerate() {
+            let what = format!("tombstones[{index}]");
+            match (
+                get_str(entry, "subscription_id"),
+                get_str(entry, "identity_key"),
+            ) {
+                (Some(subscription_id), Some(identity_key)) => {
+                    tomb_rows.push((subscription_id, identity_key));
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "{what} needs subscription_id + identity_key"
+                    )))
+                }
+            }
+        }
+        let tx = self.conn.transaction()?;
+        for sub in &sub_rows {
+            tx.execute(
+                "INSERT INTO subscriptions
+                   (id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    sub.id,
+                    sub.label,
+                    sub.url,
+                    sub.group,
+                    sub.auto_refresh as i64,
+                    sub.last_refresh_at,
+                    sub.last_error,
+                    sub.failures,
+                ],
+            )?;
+        }
+        for row in &rows {
+            tx.execute(
+                "INSERT INTO proxy_configs
+                   (id, name, protocol, params, grp, enabled, bind_ip, port,
+                    subscription_id, identity_key, synced_params, adoptable)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    row.id,
+                    row.name,
+                    row.protocol,
+                    row.params,
+                    row.group,
+                    row.enabled as i64,
+                    row.bind_ip,
+                    row.port,
+                    row.subscription_id,
+                    row.identity_key,
+                    row.synced_params,
+                    row.adoptable as i64,
+                ],
+            )?;
+        }
+        for (subscription_id, identity_key) in &tomb_rows {
+            tx.execute(
+                "INSERT INTO subscription_tombstones (subscription_id, identity_key)
+                 VALUES (?1, ?2)",
+                params![subscription_id, identity_key],
+            )?;
+        }
+        tx.commit()?;
+        Ok(RestoreOutcome {
+            configs: rows.len(),
+            subscriptions: sub_rows.len(),
+            tombstones: tomb_rows.len(),
+        })
     }
 
     // -- Ticket 12: health snapshot persistence ------------------------------
@@ -1407,22 +2350,40 @@ impl Store {
     /// Called after every recorded probe outcome; restart rehydrates from
     /// [`Store::load_health_snapshots`]. Error text here is a probe cause
     /// (already redacted at the health seam), never raw secrets.
+    /// Ticket 25: absurd latencies saturate at `i64::MAX` (never wrap);
+    /// implemented on [`Store::save_health_snapshots`].
     pub fn save_health_snapshot(&mut self, snapshot: &HealthSnapshot) -> Result<(), StoreError> {
-        let latency_ms: Option<i64> = snapshot.latency_ms.map(|ms| ms as i64);
-        self.conn.execute(
-            "INSERT INTO health_snapshots (config_id, at, kind, latency_ms, error)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(config_id) DO UPDATE SET
-               at = excluded.at, kind = excluded.kind,
-               latency_ms = excluded.latency_ms, error = excluded.error",
-            params![
-                snapshot.config_id,
-                snapshot.at,
-                snapshot.kind,
-                latency_ms,
-                snapshot.error,
-            ],
-        )?;
+        self.save_health_snapshots(std::slice::from_ref(snapshot))
+    }
+
+    /// Ticket 25: persist a whole probe round in ONE transaction (the
+    /// store half of "health saves off the UI thread": one tx instead of N
+    /// statements; the `spawn_blocking` move is main.rs territory, ticket 26).
+    pub fn save_health_snapshots(
+        &mut self,
+        snapshots: &[HealthSnapshot],
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        for snapshot in snapshots {
+            let latency_ms: Option<i64> = snapshot
+                .latency_ms
+                .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
+            tx.execute(
+                "INSERT INTO health_snapshots (config_id, at, kind, latency_ms, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(config_id) DO UPDATE SET
+                   at = excluded.at, kind = excluded.kind,
+                   latency_ms = excluded.latency_ms, error = excluded.error",
+                params![
+                    snapshot.config_id,
+                    snapshot.at,
+                    snapshot.kind,
+                    latency_ms,
+                    snapshot.error,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1454,45 +2415,6 @@ impl Store {
             "port",
             "no automatic port left in the auto range",
         )]))
-    }
-
-    /// Validate fresh input, applying defaults and auto port assignment.
-    /// Ticket 16: protocol/params validate like the import grammar (unknown
-    /// protocol / non-JSON / missing per-protocol credential → field error).
-    fn validate_new(&self, input: &NewConfig) -> Result<ValidatedConfig, StoreError> {
-        let mut errors = Vec::new();
-        let name = validated_name(&input.name, &mut errors);
-        let proto_params = validate_protocol_params(&input.protocol, &input.params, &mut errors);
-        let group = defaulted(&input.group, DEFAULT_GROUP);
-        let bind_ip = validated_bind(&input.bind_ip, &mut errors);
-        let port = match parse_port_field(&input.port) {
-            Ok(None) => match self.auto_port() {
-                Ok(port) => Some(port),
-                Err(StoreError::Invalid(mut auto_errors)) => {
-                    errors.append(&mut auto_errors);
-                    None
-                }
-                Err(error) => return Err(error),
-            },
-            Ok(port) => port,
-            Err(error) => {
-                errors.push(error);
-                None
-            }
-        };
-        if !errors.is_empty() {
-            return Err(StoreError::Invalid(errors));
-        }
-        let (protocol, params) =
-            proto_params.unwrap_or((DEFAULT_PROTOCOL.to_string(), "{}".to_string()));
-        Ok(ValidatedConfig {
-            name: name.unwrap_or_default(),
-            protocol,
-            params,
-            group,
-            bind_ip: bind_ip.unwrap_or_default(),
-            port: port.unwrap_or(AUTO_PORT_START),
-        })
     }
 
     /// Validate a patch against the current record; pure until the write.
@@ -2939,5 +3861,668 @@ mod tests {
             },
         ];
         assert_eq!(count_importable(&rows), 1);
+    }
+
+    // -- Ticket 25: store races, transactions, identity, off-thread halves --
+
+    fn vless_params_with(server: &str, extra: &[(&str, &str)]) -> String {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "type".to_string(),
+            serde_json::Value::String("vless".to_string()),
+        );
+        map.insert(
+            "server".to_string(),
+            serde_json::Value::String(server.to_string()),
+        );
+        map.insert(
+            "server_port".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(443)),
+        );
+        map.insert(
+            "uuid".to_string(),
+            serde_json::Value::String(SUB_UUID.to_string()),
+        );
+        for (key, value) in extra {
+            map.insert(
+                (*key).to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+        serde_json::Value::Object(map).to_string()
+    }
+
+    /// update() on an owned row refreshes identity_key to the widened
+    /// identity of the new values (never stale for the next refresh).
+    #[test]
+    fn t25_update_refreshes_identity_key() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let row = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "one")
+            .expect("member one");
+        let before = row.identity_key.clone().expect("owned rows carry identity");
+        let fixed = vless_params_with("a.example.com", &[("flow", "xtls-rprx-vision")]);
+        let updated = store
+            .update(
+                &row.id,
+                ConfigPatch {
+                    params: Some(fixed.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect("edit works");
+        let after = updated.identity_key.clone().expect("identity kept");
+        assert_eq!(after, widened_identity(&updated.protocol, &fixed));
+        assert_ne!(before, after, "flow is part of the widened identity");
+    }
+
+    /// Required scenario: a user param fix on an owned row survives refresh
+    /// (kept, never silently reverted).
+    #[test]
+    fn t25_user_param_fix_survives_refresh() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let row = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "one")
+            .expect("member one");
+        let fixed = vless_params_with("a.example.com", &[("flow", "xtls-rprx-vision")]);
+        store
+            .update(
+                &row.id,
+                ConfigPatch {
+                    params: Some(fixed.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect("user fix works");
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.updated, 0);
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.conflicts, 1, "divergence is explicit");
+        let kept = store.get(&row.id).expect("get works").expect("kept");
+        assert_eq!(kept.params, fixed, "user fix kept, never reverted");
+        assert_eq!(store.list().expect("list works").len(), 2);
+    }
+
+    /// A non-identity user fix (extra params outside the key) pins the row:
+    /// refresh keeps it with zero churn.
+    #[test]
+    fn t25_user_nonidentity_fix_pinned_no_churn() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let row = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "one")
+            .expect("member one");
+        // A true non-identity fix: the row's own params plus an extra the
+        // identity ignores (every key field byte-identical).
+        let mut value: serde_json::Value = serde_json::from_str(&row.params).expect("params parse");
+        value["mux"] = serde_json::Value::String("on".to_string());
+        let fixed = value.to_string();
+        store
+            .update(
+                &row.id,
+                ConfigPatch {
+                    params: Some(fixed.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect("user fix works");
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.updated, 0);
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.conflicts, 0, "upstream did not move");
+        let kept = store.get(&row.id).expect("get works").expect("kept");
+        assert_eq!(kept.params, fixed);
+    }
+
+    /// Upstream identity rotation (password change, same server) updates in
+    /// place: same id, same port, same enabled — never delete + re-add.
+    #[test]
+    fn t25_upstream_rotation_updates_in_place() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, "trojan://pw1@s.example.com:443#n", 100)
+            .expect("refresh works");
+        let before = store.list().expect("list works").remove(0);
+        store
+            .set_enabled(&before.id, true)
+            .expect("user enables the row");
+        let outcome = store
+            .refresh_with_body(&sub.id, "trojan://pw2@s.example.com:443#n", 200)
+            .expect("refresh works");
+        assert_eq!(outcome.updated, 1);
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.removed, 0);
+        let after = store.get(&before.id).expect("get works").expect("kept");
+        assert_eq!(after.id, before.id, "same row");
+        assert_eq!(after.port, before.port, "same port");
+        assert!(after.enabled, "enabled survives rotation");
+        assert_ne!(after.params, before.params, "new credentials applied");
+    }
+
+    /// In-body duplicates are first-wins (the code matches the comment).
+    #[test]
+    fn t25_first_wins_in_body_dupes() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        let body = format!(
+            "vless://{SUB_UUID}@a.example.com:443#one\nvless://{SUB_UUID}@a.example.com:443#two"
+        );
+        let outcome = store
+            .refresh_with_body(&sub.id, &body, 100)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.duplicates, 1);
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "one", "first wins");
+    }
+
+    /// Same-pass deletions free their ports, and multi-insert allocation is
+    /// deterministic (key-sorted).
+    #[test]
+    fn t25_ports_reused_and_deterministic() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let before = store.list().expect("list works");
+        let freed = before
+            .iter()
+            .find(|row| row.name == "one")
+            .expect("member one")
+            .port;
+        let kept_port = before
+            .iter()
+            .find(|row| row.name == "two")
+            .expect("member two")
+            .port;
+        let grown = "trojan://pw@b.example.com:443#two\ntrojan://pw@c.example.com:443#three\ntrojan://pw@d.example.com:443#four".to_string();
+        let outcome = store
+            .refresh_with_body(&sub.id, &grown, 200)
+            .expect("refresh works");
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.added, 2);
+        let rows = store.list().expect("list works");
+        let three = rows.iter().find(|row| row.name == "three").expect("three");
+        let four = rows.iter().find(|row| row.name == "four").expect("four");
+        assert_eq!(three.port, freed, "freed port is reused");
+        assert_ne!(four.port, kept_port);
+        assert_ne!(three.port, four.port);
+        // Deterministic: the lower-sorted key takes the lower free port.
+        let key_three = widened_identity(&three.protocol, &three.params);
+        let key_four = widened_identity(&four.protocol, &four.params);
+        assert_eq!(
+            three.port < four.port,
+            key_three < key_four,
+            "allocation follows key order"
+        );
+    }
+
+    /// Port exhaustion reports real per-item indices (never a blanket 0).
+    #[test]
+    fn t25_exhaustion_reports_real_indices() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut inputs = Vec::new();
+        for index in 0..=(AUTO_PORT_END - AUTO_PORT_START) {
+            inputs.push(NewConfig {
+                name: format!("fill-{index}"),
+                protocol: "vless".to_string(),
+                params: vless_params_with(&format!("s{index}.example.com"), &[]),
+                group: "fill".to_string(),
+                bind_ip: String::new(),
+                port: (AUTO_PORT_START + index).to_string(),
+            });
+        }
+        let created = store.add_batch(inputs).expect("fill works");
+        assert_eq!(
+            created.len(),
+            (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
+        );
+        let sub = add_sub(&mut store, "travel");
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.failures.len(), 2);
+        let mut indices: Vec<usize> = outcome
+            .failures
+            .iter()
+            .map(|failure| failure.index)
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1], "real batch positions, got {indices:?}");
+    }
+
+    /// Released rows are adoptable: a second subscription adopts them in
+    /// place (same id/port) instead of shadowing them as duplicates.
+    #[test]
+    fn t25_released_rows_adopted_by_second_subscription() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&first.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let before = store.list().expect("list works");
+        assert!(store.remove_subscription(&first.id).expect("release works"));
+        let second = store
+            .add_subscription("Other", "https://example.com/other.txt", "travel", true)
+            .expect("second sub works");
+        let outcome = store
+            .refresh_with_body(&second.id, &sub_body_two(), 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 2, "adoptions count as gained members");
+        assert_eq!(outcome.duplicates, 0, "no cross-sub shadowing");
+        let after = store.list().expect("list works");
+        assert_eq!(after.len(), 2);
+        for row in &after {
+            assert_eq!(row.subscription_id.as_deref(), Some(second.id.as_str()));
+            assert!(row.identity_key.is_some());
+        }
+        let before_ids: Vec<&str> = before.iter().map(|row| row.id.as_str()).collect();
+        let after_ids: Vec<&str> = after.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(before_ids, after_ids, "adopted in place, same ids");
+    }
+
+    /// Editing a released row claims it: a later subscription cannot adopt
+    /// it away (the collision stays a duplicate).
+    #[test]
+    fn t25_update_claims_released_row_against_adoption() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&first.id, "trojan://pw@b.example.com:443#two", 100)
+            .expect("refresh works");
+        let row = store.list().expect("list works").remove(0);
+        assert!(store.remove_subscription(&first.id).expect("release works"));
+        store
+            .update(
+                &row.id,
+                ConfigPatch {
+                    name: Some("Mine now".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("user claims the row");
+        let second = store
+            .add_subscription("Other", "https://example.com/other.txt", "travel", true)
+            .expect("second sub works");
+        let outcome = store
+            .refresh_with_body(&second.id, "trojan://pw@b.example.com:443#two", 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.duplicates, 1);
+        let kept = store.get(&row.id).expect("get works").expect("kept");
+        assert_eq!(kept.subscription_id, None, "still unowned");
+        assert_eq!(kept.name, "Mine now");
+    }
+
+    /// Refresh-deletes prune health snapshots (no stale resurrection).
+    #[test]
+    fn t25_refresh_delete_prunes_snapshot() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let row = store.list().expect("list works").remove(0);
+        store
+            .save_health_snapshot(&HealthSnapshot {
+                config_id: row.id.clone(),
+                at: 1_700_000_000,
+                kind: "url-test".to_string(),
+                latency_ms: Some(12),
+                error: None,
+            })
+            .expect("save works");
+        assert_eq!(store.load_health_snapshots().expect("load works").len(), 1);
+        let outcome = store
+            .refresh_with_body(
+                &sub.id,
+                &format!("vless://{SUB_UUID}@a.example.com:443#one"),
+                200,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.removed, 1);
+        assert!(store
+            .load_health_snapshots()
+            .expect("load works")
+            .is_empty());
+    }
+
+    /// Required scenario: export → wipe → restore is identical (rows, groups,
+    /// enabled, subscriptions, tombstones); deletes stay deleted.
+    #[test]
+    fn t25_export_restore_round_trip() {
+        let mut first = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut first, "travel");
+        first
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let rows = first.list().expect("list works");
+        let victim = rows
+            .iter()
+            .find(|row| row.name == "two")
+            .expect("member two");
+        let keeper = rows
+            .iter()
+            .find(|row| row.name == "one")
+            .expect("member one");
+        first
+            .set_enabled(&keeper.id, true)
+            .expect("user enables a member");
+        assert!(first.remove(&victim.id).expect("user deletes a member"));
+        let payload = first.export_library_json().expect("export works");
+
+        let mut second = Store::open_in_memory().expect("fresh store opens");
+        let outcome = second
+            .restore_library_json(&payload)
+            .expect("restore works");
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                configs: 1,
+                subscriptions: 1,
+                tombstones: 1,
+            }
+        );
+        assert_eq!(
+            second.export_library_json().expect("re-export works"),
+            payload,
+            "restore is byte-identical"
+        );
+        let kept = second.get(&keeper.id).expect("get works").expect("kept");
+        assert!(kept.enabled, "enabled survives");
+        assert_eq!(kept.group, "travel");
+        assert_eq!(kept.subscription_id.as_deref(), Some(sub.id.as_str()));
+        let subs = second.list_subscriptions().expect("subs work");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            subs[0].last_refresh_at,
+            Some(100),
+            "refresh metadata survives"
+        );
+        // No resurrection: the tombstoned member stays skipped.
+        let refresh = second
+            .refresh_with_body(&sub.id, &sub_body_two(), 200)
+            .expect("refresh works");
+        assert_eq!(refresh.added, 0);
+        assert_eq!(refresh.skipped, 1);
+        assert_eq!(second.list().expect("list works").len(), 1);
+    }
+
+    /// Restore fails loudly on garbage (never a silent empty library).
+    #[test]
+    fn t25_restore_rejects_garbage_loudly() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for payload in [
+            "not-json",
+            "{}",
+            "{\"library\": [{\"id\": \"1\", \"port\": 99999}], \"subscriptions\": []}",
+        ] {
+            let error = store
+                .restore_library_json(payload)
+                .expect_err(&format!("must fail: {payload}"));
+            assert!(
+                matches!(error, StoreError::Invalid(_)),
+                "Invalid, got {error}"
+            );
+            assert!(store.list().expect("list works").is_empty());
+        }
+        // An honest empty export restores to an honest empty library.
+        let outcome = store
+            .restore_library_json("{\"library\": [], \"subscriptions\": []}")
+            .expect("empty restore works");
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                configs: 0,
+                subscriptions: 0,
+                tombstones: 0,
+            }
+        );
+    }
+
+    /// Atomic export: tmp + rename leaves a parseable file and no tmp litter.
+    #[test]
+    fn t25_export_is_atomic_no_tmp_litter() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        export_seed(&mut store);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("manyproxy-t25-atomic-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        store.commit_export(&path, true).expect("export works");
+        let on_disk = std::fs::read_to_string(&path).expect("file written");
+        serde_json::from_str::<serde_json::Value>(&on_disk).expect("parses");
+        let litter: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(litter.is_empty(), "no tmp litter, got {litter:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Batch insert: 500 rows in one transaction; one bad item writes nothing.
+    #[test]
+    fn t25_add_batch_is_atomic() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let inputs: Vec<NewConfig> = (0..500)
+            .map(|index| NewConfig {
+                name: format!("bulk-{index}"),
+                protocol: "vless".to_string(),
+                params: vless_params_with(&format!("h{index}.example.com"), &[]),
+                group: "bulk".to_string(),
+                bind_ip: String::new(),
+                // Explicit unique ports: the auto range holds 199, and
+                // duplicates stay legal at rest, so pin distinct ones.
+                port: (20_000 + index).to_string(),
+            })
+            .collect();
+        let created = store.add_batch(inputs).expect("500-row batch works");
+        assert_eq!(created.len(), 500);
+        let mut ports: Vec<u16> = created.iter().map(|row| row.port).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 500, "auto ports unique in one batch");
+
+        let mut bad: Vec<NewConfig> = (0..10)
+            .map(|index| NewConfig {
+                name: format!("ok-{index}"),
+                protocol: "vless".to_string(),
+                params: vless_params_with(&format!("k{index}.example.com"), &[]),
+                group: "bulk".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .collect();
+        bad.push(NewConfig {
+            name: "   ".to_string(),
+            protocol: "vless".to_string(),
+            params: String::new(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: String::new(),
+        });
+        let before = store.list().expect("list works").len();
+        assert!(matches!(store.add_batch(bad), Err(StoreError::Invalid(_))));
+        assert_eq!(
+            store.list().expect("list works").len(),
+            before,
+            "failed batch writes nothing"
+        );
+    }
+
+    /// Health batch: one call persists a whole probe round; absurd latencies
+    /// saturate instead of wrapping.
+    #[test]
+    fn t25_health_batch_saves_round() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .save_health_snapshots(&[
+                live_snapshot("1", 10),
+                dead_snapshot("2"),
+                HealthSnapshot {
+                    config_id: "3".to_string(),
+                    at: 1_700_000_002,
+                    kind: "url-test".to_string(),
+                    latency_ms: Some(u64::MAX),
+                    error: None,
+                },
+            ])
+            .expect("batch save works");
+        let snaps = store.load_health_snapshots().expect("load works");
+        assert_eq!(snaps.len(), 3);
+        let huge = snaps
+            .iter()
+            .find(|snap| snap.config_id == "3")
+            .expect("row 3");
+        assert_eq!(
+            huge.latency_ms,
+            Some(i64::MAX as u64),
+            "saturates, never wraps"
+        );
+    }
+
+    /// Legacy databases (user_version 0, no ticket-25 columns) migrate
+    /// forward on open: ownership columns reappear and refresh works.
+    #[test]
+    fn t25_legacy_database_migrates_forward() {
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t25-legacy-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = Store::open_file(&path).expect("file store opens");
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE proxy_configs DROP COLUMN adoptable;
+                     ALTER TABLE proxy_configs DROP COLUMN synced_params;
+                     PRAGMA user_version = 0;",
+                )
+                .expect("legacy shape simulated");
+        }
+        let mut store = Store::open_file(&path).expect("legacy file reopens");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version reads");
+        assert_eq!(version, Store::SCHEMA_VERSION);
+        // Ownership merge works on the migrated file (release + adopt).
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, "trojan://pw@b.example.com:443#two", 100)
+            .expect("refresh works");
+        assert!(store.remove_subscription(&sub.id).expect("release works"));
+        let second = store
+            .add_subscription("Other", "https://example.com/other.txt", "travel", true)
+            .expect("second sub works");
+        let outcome = store
+            .refresh_with_body(&second.id, "trojan://pw@b.example.com:443#two", 200)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 1, "adopted after migration");
+        assert_eq!(outcome.duplicates, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A database from a NEWER build fails loudly on open (never silent).
+    #[test]
+    fn t25_newer_schema_fails_loudly() {
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t25-newer-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = Store::open_file(&path).expect("file store opens");
+            store
+                .conn
+                .execute_batch("PRAGMA user_version = 999;")
+                .expect("newer stamp simulated");
+        }
+        let error = match Store::open_file(&path) {
+            Ok(_) => panic!("newer schema must fail"),
+            Err(error) => error,
+        };
+        let text = error.to_string();
+        assert!(text.contains("999"), "names the version, got {text}");
+        assert!(
+            matches!(error, StoreError::Sql(_)),
+            "loud database error, never a silent empty: {text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Non-ASCII subscription URLs never panic (valid ones still accepted).
+    #[test]
+    fn t25_non_ascii_subscription_urls_never_panic() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let ok = store
+            .add_subscription("Intl", "https://éxample.com/sub.txt", "g", true)
+            .expect("non-ascii host accepted");
+        assert_eq!(ok.group, "g");
+        for url in [
+            "http:/é",
+            "https://",
+            "https://exa mple.com/sub",
+            "ftp://éxample.com/sub",
+        ] {
+            assert!(
+                matches!(
+                    store.add_subscription("L", url, "g", true),
+                    Err(StoreError::Invalid(_))
+                ),
+                "rejected without panic: {url}"
+            );
+        }
+    }
+
+    /// The widened identity splits transport/security variants that the
+    /// narrow identity merges (no over-merge); remark never matters.
+    #[test]
+    fn t25_widened_identity_splits_variants() {
+        let base = vless_params_with("a.example.com", &[]);
+        let flow = vless_params_with("a.example.com", &[("flow", "xtls-rprx-vision")]);
+        assert_eq!(
+            crate::import::normalized_identity("vless", &base),
+            crate::import::normalized_identity("vless", &flow),
+            "narrow merges flow variants"
+        );
+        assert_ne!(
+            widened_identity("vless", &base),
+            widened_identity("vless", &flow),
+            "widened splits them"
+        );
+        let upper = vless_params_with("A.EXAMPLE.COM", &[("flow", "XTLS-RPRX-VISION")]);
+        assert_eq!(
+            widened_identity("vless", &flow),
+            widened_identity("vless", &upper),
+            "enum-like fields compare case-insensitively"
+        );
     }
 }
