@@ -171,6 +171,34 @@ pub fn export_payload(configs: &[ProxyConfig], subscriptions: &[Subscription]) -
     .to_string()
 }
 
+/// Ticket 12: durable latest-per-config health sample. The status view
+/// (`HealthStore`) stays in memory for the session, but the latest sample
+/// per row — latency plus the dead flag (an `error` present means dead) —
+/// survives restart via the `health_snapshots` table (one row per config).
+/// Logs stay session-only by ruling (never persisted here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    pub config_id: String,
+    pub at: i64,
+    /// `"url-test"` or `"tcp-ping"` (see `health::HealthKind::as_str`).
+    pub kind: String,
+    pub latency_ms: Option<u64>,
+    /// `Some` names the dead cause; `None` means the last sample was live.
+    pub error: Option<String>,
+}
+
+/// Map one health snapshot row to a HealthSnapshot.
+fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot> {
+    let latency_ms: Option<i64> = row.get(3)?;
+    Ok(HealthSnapshot {
+        config_id: row.get(0)?,
+        at: row.get(1)?,
+        kind: row.get(2)?,
+        latency_ms: latency_ms.map(|ms| ms as u64),
+        error: row.get(4)?,
+    })
+}
+
 /// Parse raw port text from a form field. Empty means auto-assign (`None`).
 /// `Some(0)` never validates: it is rejected as out of range.
 pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
@@ -456,6 +484,13 @@ impl Store {
                subscription_id TEXT NOT NULL,
                identity_key TEXT NOT NULL,
                PRIMARY KEY (subscription_id, identity_key)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS health_snapshots (
+               config_id TEXT PRIMARY KEY,
+               at INTEGER NOT NULL,
+               kind TEXT NOT NULL DEFAULT 'url-test',
+               latency_ms INTEGER,
+               error TEXT
              ) STRICT;",
         )?;
         // Migrate pre-ticket-04 databases that lack the new columns.
@@ -553,6 +588,8 @@ impl Store {
     /// Remove a config. Returns false when the id does not exist.
     /// Ticket 04: removing a subscription-owned row records a tombstone so
     /// the next refresh does not resurrect a row the user deleted on purpose.
+    /// Ticket 12: the row's health snapshot goes with it (bounded table, no
+    /// stale resurrection after restart).
     pub fn remove(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -574,6 +611,10 @@ impl Store {
                     )?;
                 }
             }
+            self.conn.execute(
+                "DELETE FROM health_snapshots WHERE config_id = ?1",
+                params![id],
+            )?;
         }
         Ok(removed > 0)
     }
@@ -1015,6 +1056,44 @@ impl Store {
             StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?;
         Ok(Some(path.to_path_buf()))
+    }
+
+    // -- Ticket 12: health snapshot persistence ------------------------------
+
+    /// Persist one config's latest sample (upsert keyed by `config_id`).
+    /// Called after every recorded probe outcome; restart rehydrates from
+    /// [`Store::load_health_snapshots`]. Error text here is a probe cause
+    /// (already redacted at the health seam), never raw secrets.
+    pub fn save_health_snapshot(&mut self, snapshot: &HealthSnapshot) -> Result<(), StoreError> {
+        let latency_ms: Option<i64> = snapshot.latency_ms.map(|ms| ms as i64);
+        self.conn.execute(
+            "INSERT INTO health_snapshots (config_id, at, kind, latency_ms, error)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(config_id) DO UPDATE SET
+               at = excluded.at, kind = excluded.kind,
+               latency_ms = excluded.latency_ms, error = excluded.error",
+            params![
+                snapshot.config_id,
+                snapshot.at,
+                snapshot.kind,
+                latency_ms,
+                snapshot.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted latest-per-config samples (callers filter to known ids
+    /// so snapshots of removed configs never resurrect rows).
+    pub fn load_health_snapshots(&self) -> Result<Vec<HealthSnapshot>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT config_id, at, kind, latency_ms, error
+             FROM health_snapshots ORDER BY config_id",
+        )?;
+        let rows = stmt
+            .query_map([], map_snapshot_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// First free port in the auto range, given the set of taken ports.
@@ -2051,6 +2130,108 @@ mod tests {
             .expect("cancelled export works");
         assert_eq!(written, None);
         assert!(!path.exists(), "dismissing the warning creates no file");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- Ticket 12: health snapshot persistence ------------------------------
+
+    fn live_snapshot(id: &str, latency_ms: u64) -> HealthSnapshot {
+        HealthSnapshot {
+            config_id: id.to_string(),
+            at: 1_700_000_000,
+            kind: "url-test".to_string(),
+            latency_ms: Some(latency_ms),
+            error: None,
+        }
+    }
+
+    fn dead_snapshot(id: &str) -> HealthSnapshot {
+        HealthSnapshot {
+            config_id: id.to_string(),
+            at: 1_700_000_001,
+            kind: "tcp-ping".to_string(),
+            latency_ms: None,
+            error: Some("tcp ping failed for \"Beta\": dial refused".to_string()),
+        }
+    }
+
+    /// Latest-per-config samples upsert by config id (live latency + dead
+    /// flag survive as stored).
+    #[test]
+    fn health_snapshots_save_load_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(store
+            .load_health_snapshots()
+            .expect("load works")
+            .is_empty());
+        store
+            .save_health_snapshot(&live_snapshot("1", 33))
+            .expect("save works");
+        store
+            .save_health_snapshot(&dead_snapshot("2"))
+            .expect("save works");
+        // A newer sample for the same row replaces, never appends.
+        store
+            .save_health_snapshot(&live_snapshot("1", 44))
+            .expect("resave works");
+
+        let snaps = store.load_health_snapshots().expect("load works");
+        assert_eq!(snaps.len(), 2);
+        let first = snaps
+            .iter()
+            .find(|snap| snap.config_id == "1")
+            .expect("row 1");
+        assert_eq!(first.latency_ms, Some(44));
+        assert_eq!(first.error, None);
+        assert_eq!(first.kind, "url-test");
+        let second = snaps
+            .iter()
+            .find(|snap| snap.config_id == "2")
+            .expect("row 2");
+        assert_eq!(second.latency_ms, None);
+        assert!(second
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("dial refused"));
+    }
+
+    /// Removing a config prunes its snapshot (bounded table, no stale
+    /// resurrection after restart).
+    #[test]
+    fn health_snapshot_pruned_with_config() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store.add(valid_input("Gone")).expect("add works");
+        store
+            .save_health_snapshot(&live_snapshot(&created.id, 10))
+            .expect("save works");
+        assert_eq!(store.load_health_snapshots().expect("load works").len(), 1);
+        assert!(store.remove(&created.id).expect("remove works"));
+        assert!(store
+            .load_health_snapshots()
+            .expect("load works")
+            .is_empty());
+    }
+
+    /// File-backed stores keep snapshots across reopen (restart scenario at
+    /// the persistence seam).
+    #[test]
+    fn health_snapshots_persist_across_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-ticket12-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            store
+                .save_health_snapshot(&live_snapshot("7", 87))
+                .expect("save works");
+            store
+                .save_health_snapshot(&dead_snapshot("9"))
+                .expect("save works");
+        }
+        let reopened = Store::open_file(&path).expect("reopen works");
+        let snaps = reopened.load_health_snapshots().expect("load works");
+        assert_eq!(snaps.len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 }

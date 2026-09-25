@@ -30,7 +30,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::engine::{inbound_tag, outbound_tag};
-use crate::store::{now_unix, ProxyConfig};
+use crate::store::{now_unix, HealthSnapshot, ProxyConfig};
 
 /// Default URL-test target: plain `http` (the local mixed inbound serves an
 /// HTTP-proxy GET directly; `https` would need a CONNECT+TLS stack v1 does
@@ -51,7 +51,6 @@ pub enum HealthKind {
 }
 
 impl HealthKind {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn as_str(self) -> &'static str {
         match self {
             HealthKind::UrlTest => "url-test",
@@ -496,6 +495,30 @@ impl HealthStore {
             entry.rx_bytes = entry.rx_bytes.saturating_add(success.bytes_rx);
             entry.tx_bytes = entry.tx_bytes.saturating_add(success.bytes_tx);
             entry.probes += 1;
+        }
+    }
+
+    /// Ticket 12: restore persisted latest-per-config samples after restart.
+    /// Samples only — traffic counters stay session-only (a fresh session
+    /// has moved no bytes yet). Unknown kinds default to URL tests; callers
+    /// pass only snapshots of known rows so removed configs never resurrect.
+    pub fn hydrate(&mut self, snapshots: &[HealthSnapshot]) {
+        for snapshot in snapshots {
+            if self.samples.len() >= MAX_SAMPLES {
+                self.samples.remove(0);
+            }
+            let kind = if snapshot.kind == HealthKind::TcpPing.as_str() {
+                HealthKind::TcpPing
+            } else {
+                HealthKind::UrlTest
+            };
+            self.samples.push(HealthSample {
+                config_id: snapshot.config_id.clone(),
+                at: snapshot.at,
+                kind,
+                latency_ms: snapshot.latency_ms,
+                error: snapshot.error.clone(),
+            });
         }
     }
 
@@ -1191,6 +1214,66 @@ mod tests {
             "named cause: {:?}",
             beta.cause
         );
+    }
+
+    /// Ticket 12: hydrated snapshots restore latencies and dead flags;
+    /// traffic stays zeroed (session-only) and unknown kinds default.
+    #[test]
+    fn hydrate_restores_latency_and_dead_flags_without_traffic() {
+        use crate::store::HealthSnapshot;
+
+        let snapshots = vec![
+            HealthSnapshot {
+                config_id: "1".to_string(),
+                at: 1_700_000_000,
+                kind: "url-test".to_string(),
+                latency_ms: Some(87),
+                error: None,
+            },
+            HealthSnapshot {
+                config_id: "2".to_string(),
+                at: 1_700_000_001,
+                kind: "tcp-ping".to_string(),
+                latency_ms: None,
+                error: Some("tcp ping failed for \"Beta\": dial refused".to_string()),
+            },
+            HealthSnapshot {
+                config_id: "3".to_string(),
+                at: 1_700_000_002,
+                kind: "mystery-kind".to_string(),
+                latency_ms: Some(5),
+                error: None,
+            },
+        ];
+        let mut store = HealthStore::default();
+        store.hydrate(&snapshots);
+
+        let live = store.status("1");
+        assert!(matches!(live.state, RowState::Live));
+        assert_eq!(live.latency_ms, Some(87));
+        assert_eq!(store.row_summary("1"), "87ms");
+        let dead = store.status("2");
+        assert!(matches!(dead.state, RowState::Dead));
+        assert!(
+            dead.cause.as_deref().unwrap_or("").contains("dial refused"),
+            "dead flag keeps its named cause: {:?}",
+            dead.cause
+        );
+        assert_eq!(store.row_summary("2"), "dead");
+        // Unknown kinds default to URL tests, never panic.
+        assert_eq!(
+            store.latest("3").map(|sample| sample.kind),
+            Some(HealthKind::UrlTest)
+        );
+        assert_eq!(
+            store
+                .latest_of("2", HealthKind::TcpPing)
+                .map(|s| &s.config_id),
+            Some(&"2".to_string())
+        );
+        // Traffic is session-only: hydration moves no bytes.
+        assert_eq!(store.traffic("1"), TrafficStats::default());
+        assert_eq!(store.status("missing").state, RowState::Unknown);
     }
 
     /// TCP pings record dial timing under their own kind.

@@ -5,8 +5,9 @@ mod health;
 mod import;
 mod store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
@@ -26,14 +27,25 @@ use engine::{
     EngineController, LAN_CONFIRM_TITLE,
 };
 use health::{
-    ping_all, test_all, HealthProber, HealthStore, LogStore, RealHealthProber, DEFAULT_TEST_URL,
+    ping_all, test_all, HealthProber, HealthStore, LogStore, RealHealthProber, TestOutcome,
+    DEFAULT_TEST_URL,
 };
 use import::{commit_batch, import_file_content, import_text, parse_addsub_link, AddSubRequest};
 use store::{
     delete_confirm_text, due_for_refresh, export_confirm_description, now_unix, proxy_urls,
-    ConfigPatch, NewConfig, ProxyConfig, Store, StoreError, Subscription as ProxySubscription,
-    DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig, Store, StoreError,
+    Subscription as ProxySubscription, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND, DEFAULT_GROUP,
+    DEFAULT_PROTOCOL,
 };
+
+/// Ticket 12: background tick intervals. Each tick is bounded (engine poll
+/// is O(1); the subscription pass only starts already-due subs; the
+/// re-probe only covers running rows with the existing 5s per-test bound)
+/// and stoppable (see [`AppView::stop_background_ticks`]; the loop also
+/// exits when the view is released).
+pub const ENGINE_POLL_TICK_SECS: u64 = 5;
+pub const DUE_SUBSCRIPTION_TICK_SECS: u64 = 300;
+pub const REPROBE_TICK_SECS: u64 = 60;
 
 /// Delegate for the configuration library list.
 ///
@@ -506,11 +518,11 @@ fn subscription_row(
     row = row.child(
         Button::new(format!("sub-refresh-{}", sub.id))
             .label("Refresh")
-            .on_click(move |_, window, cx| {
+            .on_click(move |_, _window, cx| {
                 let sub_id = refresh_id.clone();
                 refresh_view.update(cx, |view, cx| {
                     if let Some(sub) = view.store.get_subscription(&sub_id).unwrap_or(None) {
-                        view.start_subscription_refresh(sub, window, cx);
+                        view.start_subscription_refresh(sub, cx);
                     }
                 });
             }),
@@ -548,6 +560,36 @@ fn subscription_row(
     )
 }
 
+/// Ticket 12: run one background tick loop: sleep `secs`, run one bounded
+/// pass, then exit when ticks are stopped or the view is released (fail
+/// closed: a released view ends its loops instead of updating dead state).
+fn spawn_tick(
+    cx: &mut Context<AppView>,
+    secs: u64,
+    tick: impl Fn(&mut AppView, &mut Context<AppView>) + 'static,
+) {
+    let weak = cx.entity().downgrade();
+    cx.spawn(async move |_entity, cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_secs(secs))
+            .await;
+        let keep_going = cx.update(|cx| {
+            weak.update(cx, |view, cx| {
+                if !view.ticks_enabled {
+                    return false;
+                }
+                tick(view, cx);
+                true
+            })
+            .unwrap_or(false)
+        });
+        if !keep_going {
+            break;
+        }
+    })
+    .detach();
+}
+
 /// Root view of the ManyProxy window: title bar, toolbar, virtualized
 /// configuration list, detail bar, status bar, plus overlay layers.
 struct AppView {
@@ -562,10 +604,14 @@ struct AppView {
     /// with a per-config UI filter, and the boxed measure driver
     /// (production dials each config's own endpoint; tests swap in the
     /// fake via direct field assignment like the engine).
+    /// Ticket 12: `ticks_enabled` gates the three background ticks
+    /// ([`AppView::stop_background_ticks`]); the latest sample per row is
+    /// also persisted so restart restores latencies + dead flags.
     health_store: HealthStore,
     logs: LogStore,
     log_filter: String,
     prober: Box<dyn HealthProber>,
+    ticks_enabled: bool,
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
@@ -605,6 +651,7 @@ impl AppView {
             logs: LogStore::default(),
             log_filter: String::new(),
             prober: Box::new(RealHealthProber::default()),
+            ticks_enabled: true,
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
@@ -612,6 +659,24 @@ impl AppView {
                 },
             ),
         };
+        let mut view = view;
+        // Ticket 12: restore last latencies + dead flags across restart.
+        // Only snapshots of still-known rows hydrate (removed configs never
+        // resurrect); traffic stays session-only; logs are never persisted.
+        if let Ok(snapshots) = view.store.load_health_snapshots() {
+            let known: HashSet<String> = view
+                .store
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            let kept: Vec<HealthSnapshot> = snapshots
+                .into_iter()
+                .filter(|snapshot| known.contains(&snapshot.config_id))
+                .collect();
+            view.health_store.hydrate(&kept);
+        }
         let rows = view.store.list().unwrap_or_default();
         libraries.update(cx, |state, _| {
             state.delegate_mut().set_rows(rows);
@@ -720,8 +785,10 @@ impl AppView {
 
     /// Ticket 05: surface a detected sidecar crash on every reload so the
     /// status bar reflects it without a background timer.
-    fn poll_engine(&mut self) {
-        let _ = self.engine.poll();
+    /// Ticket 12: returns the named cause once (the engine-crash tick uses
+    /// it; reload ignores it).
+    fn poll_engine(&mut self) -> Option<String> {
+        self.engine.poll()
     }
 
     /// Ticket 05: warn once per non-loopback bind going live (LAN exposure
@@ -919,9 +986,29 @@ impl AppView {
         }
     }
 
+    /// Ticket 12: record probe outcomes into the session store and persist
+    /// each row's latest sample (+ dead flag) for restart. Traffic stays
+    /// session-only; logs are never persisted. Persistence failures are
+    /// ignored (a full disk must not break the health view).
+    fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
+        for outcome in outcomes {
+            self.health_store.record_outcome(outcome);
+            let snapshot = HealthSnapshot {
+                config_id: outcome.sample.config_id.clone(),
+                at: outcome.sample.at,
+                kind: outcome.sample.kind.as_str().to_string(),
+                latency_ms: outcome.sample.latency_ms,
+                error: outcome.sample.error.clone(),
+            };
+            let _ = self.store.save_health_snapshot(&snapshot);
+        }
+    }
+
     /// Ticket 06: run one URL test per active endpoint, record samples +
     /// traffic, refresh the rows, and summarize. Synchronous in v1 with a
     /// bounded per-test timeout (background scheduling deferred).
+    /// Ticket 12: outcomes persist (latest sample + dead flag survive
+    /// restart) via [`AppView::record_and_persist`].
     fn test_all_health(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let rows = self.active_health_rows();
         if rows.is_empty() {
@@ -929,9 +1016,7 @@ impl AppView {
             return 0;
         }
         let outcomes = test_all(&rows, DEFAULT_TEST_URL, &mut *self.prober);
-        for outcome in &outcomes {
-            self.health_store.record_outcome(outcome);
-        }
+        self.record_and_persist(&outcomes);
         let (live, dead) = self.health_counts();
         self.reload(cx);
         window.push_notification(
@@ -961,9 +1046,7 @@ impl AppView {
             DEFAULT_TEST_URL,
             &mut *self.prober,
         );
-        for outcome in &outcomes {
-            self.health_store.record_outcome(outcome);
-        }
+        self.record_and_persist(&outcomes);
         self.reload(cx);
     }
 
@@ -980,9 +1063,7 @@ impl AppView {
             return;
         }
         let outcomes = ping_all(std::slice::from_ref(&config), &mut *self.prober);
-        for outcome in &outcomes {
-            self.health_store.record_outcome(outcome);
-        }
+        self.record_and_persist(&outcomes);
         self.reload(cx);
     }
 
@@ -1353,7 +1434,7 @@ impl AppView {
                     )),
                     cx,
                 );
-                self.start_subscription_refresh(sub, window, cx);
+                self.start_subscription_refresh(sub, cx);
                 true
             }
             Err(error) => {
@@ -1365,12 +1446,9 @@ impl AppView {
 
     /// Ticket 04: fetch one subscription without blocking the UI, then merge
     /// through the tested [`Store::refresh_with_body`] seam.
-    fn start_subscription_refresh(
-        &mut self,
-        sub: ProxySubscription,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Ticket 12: window-free (the completion path branches on the active
+    /// window itself) so the due-subscription background tick can call it.
+    fn start_subscription_refresh(&mut self, sub: ProxySubscription, cx: &mut Context<Self>) {
         let client = cx.http_client();
         let view = cx.entity();
         let sub_id = sub.id.clone();
@@ -1573,18 +1651,96 @@ impl AppView {
     /// Ticket 04: refresh due subscriptions once at startup (the auto-refresh
     /// scheduling hook evaluation). Never called by tests, so no headless
     /// test ever touches the network.
-    fn refresh_due_on_startup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ticket 12: delegates to [`AppView::due_subscriptions`].
+    fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
+        for sub in self.due_subscriptions() {
+            self.start_subscription_refresh(sub, cx);
+        }
+    }
+
+    // -- Ticket 12: background ticks (bounded, stoppable) --------------------
+
+    /// Subscriptions due for auto-refresh right now (pure query behind the
+    /// due-subscription pass and the startup pass). Never enables anything;
+    /// the pass only fetches already-due subscription URLs.
+    fn due_subscriptions(&self) -> Vec<ProxySubscription> {
         let now = now_unix();
-        let due: Vec<ProxySubscription> = self
-            .store
+        self.store
             .list_subscriptions()
             .unwrap_or_default()
             .into_iter()
             .filter(|sub| due_for_refresh(sub, now, DEFAULT_AUTO_REFRESH_SECS))
-            .collect();
-        for sub in due {
-            self.start_subscription_refresh(sub, window, cx);
+            .collect()
+    }
+
+    /// Stop the background ticks (each tick also no-ops once stopped, so a
+    /// stopped view never touches the network or the engine).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn stop_background_ticks(&mut self) {
+        self.ticks_enabled = false;
+    }
+
+    /// One engine-crash poll without user clicks: surfaces the named cause
+    /// via the status bar on the next render. Bounded (one `poll`, no I/O
+    /// beyond reaping an exited sidecar) and stoppable.
+    fn tick_engine_poll(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if !self.ticks_enabled {
+            return None;
         }
+        let cause = self.poll_engine();
+        self.reload(cx);
+        cause
+    }
+
+    /// One due-subscription pass without user clicks: starts a refresh only
+    /// for already-due subscriptions (never beyond them, never enabling or
+    /// starting configs). Returns the number of refreshes started. Stopped
+    /// views start nothing.
+    fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
+        if !self.ticks_enabled {
+            return 0;
+        }
+        let due = self.due_subscriptions();
+        let count = due.len();
+        for sub in due {
+            self.start_subscription_refresh(sub, cx);
+        }
+        count
+    }
+
+    /// One re-probe of running rows only, without user clicks: silent (no
+    /// notification), recorded + persisted like a manual test. Idle views
+    /// (nothing running) do nothing: no network traffic, no errors.
+    /// Stopped views probe nothing.
+    fn tick_reprobe_running(&mut self, cx: &mut Context<Self>) -> usize {
+        if !self.ticks_enabled {
+            return 0;
+        }
+        let rows = self.active_health_rows();
+        if rows.is_empty() {
+            return 0;
+        }
+        let outcomes = test_all(&rows, DEFAULT_TEST_URL, &mut *self.prober);
+        let count = outcomes.len();
+        self.record_and_persist(&outcomes);
+        self.reload(cx);
+        count
+    }
+
+    /// Spawn the three background tick loops. Each loop sleeps its interval,
+    /// runs one bounded pass, and exits when ticks are stopped or the view
+    /// is released. Never called by tests (headless tests call the tick
+    /// methods directly with mock seams, never touching the network).
+    fn start_background_ticks(&mut self, cx: &mut Context<Self>) {
+        spawn_tick(cx, ENGINE_POLL_TICK_SECS, |view, cx| {
+            view.tick_engine_poll(cx);
+        });
+        spawn_tick(cx, DUE_SUBSCRIPTION_TICK_SECS, |view, cx| {
+            view.tick_due_subscriptions(cx);
+        });
+        spawn_tick(cx, REPROBE_TICK_SECS, |view, cx| {
+            view.tick_reprobe_running(cx);
+        });
     }
 
     fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1833,7 +1989,10 @@ fn main() {
         cx.spawn(async move |cx| {
             cx.open_window(TitleBar::window_options(), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
-                view.update(cx, |view, cx| view.refresh_due_on_startup(window, cx));
+                view.update(cx, |view, cx| {
+                    view.refresh_due_on_startup(cx);
+                    view.start_background_ticks(cx);
+                });
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open window");
@@ -2152,6 +2311,266 @@ mod tests {
         });
 
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    // -- Ticket 12: health persistence + background ticks --------------------
+
+    fn tick12_seed(name: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    /// Ticks idle with nothing running: no network traffic, no errors, no
+    /// crash reports.
+    #[gpui_kit::test]
+    fn ticks_idle_with_nothing_running_touch_no_network(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+            });
+        });
+
+        let poll = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_engine_poll(cx)));
+        assert_eq!(poll, None, "no crash without a sidecar");
+        let subs = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_due_subscriptions(cx)));
+        assert_eq!(subs, 0, "no subs, no fetches");
+        let reprobed = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_reprobe_running(cx)));
+        assert_eq!(reprobed, 0, "nothing running, nothing probed");
+        assert!(
+            handle.calls_for("1").is_empty() && handle.calls_for("2").is_empty(),
+            "idle ticks never touch the network"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.engine.last_error().is_none()),
+            "no errors recorded"
+        );
+    }
+
+    /// The re-probe tick covers running rows only: records + persists, and
+    /// never probes stopped rows.
+    #[gpui_kit::test]
+    fn tick_reprobe_running_records_and_persists(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10851"))
+            .expect("seed works");
+        let beta = store.add(tick12_seed("Beta", "10852")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+            });
+        });
+        handle.script_latency(&alpha.id, 21);
+        handle.script_failure(&beta.id, "upstream refused");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+
+        let reprobed = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_reprobe_running(cx)));
+        assert_eq!(reprobed, 2, "both running rows re-probed");
+        assert_eq!(handle.calls_for(&alpha.id).len(), 1);
+        assert_eq!(handle.calls_for(&beta.id).len(), 1);
+
+        let (alpha_live, beta_dead) = view.read_with(cx, |view, _| {
+            (
+                view.health_store.status(&alpha.id),
+                view.health_store.status(&beta.id),
+            )
+        });
+        assert_eq!(alpha_live.latency_ms, Some(21));
+        assert!(beta_dead
+            .cause
+            .as_deref()
+            .unwrap_or("")
+            .contains("upstream refused"));
+        let snaps = view.read_with(cx, |view, _| {
+            view.store.load_health_snapshots().expect("snapshots load")
+        });
+        assert_eq!(snaps.len(), 2, "latest samples persisted");
+    }
+
+    /// Restart restores last latencies + dead flags (file-backed store,
+    /// second view hydrates with no new probing).
+    #[gpui_kit::test]
+    fn restart_restores_last_latency_and_dead_flags(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-tick12-restart-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (alpha_id, beta_id) = {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            let alpha = store
+                .add(tick12_seed("Alpha", "10853"))
+                .expect("seed works");
+            let beta = store.add(tick12_seed("Beta", "10854")).expect("seed works");
+            (alpha.id.clone(), beta.id.clone())
+        };
+        let store = Store::open_file(&path).expect("reopen works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+            });
+        });
+        handle.script_latency(&alpha_id, 33);
+        handle.script_failure(&beta_id, "upstream refused");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        let tested =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
+        assert_eq!(tested, 2);
+        drop(view);
+
+        // "Restart": a fresh view over the same file, no probing at all.
+        let store = Store::open_file(&path).expect("restart reopen works");
+        let stash2: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash2_for_window = stash2.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let restarted = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash2_for_window.borrow_mut() = Some(restarted.clone());
+            Root::new(restarted, window, cx)
+        });
+        let restarted = stash2.borrow().clone().expect("AppView stashed");
+
+        let (live, dead) = restarted.read_with(cx, |view, _| {
+            (
+                view.health_store.status(&alpha_id),
+                view.health_store.status(&beta_id),
+            )
+        });
+        assert_eq!(live.latency_ms, Some(33), "latency survives restart");
+        assert!(
+            dead.cause
+                .as_deref()
+                .unwrap_or("")
+                .contains("upstream refused"),
+            "dead flag + cause survive restart: {:?}",
+            dead.cause
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Stopped ticks start nothing even with due subs and running rows (no
+    /// telemetry, no auto-start, no fetch beyond due subs — here, no fetch
+    /// at all).
+    #[gpui_kit::test]
+    fn stopped_ticks_start_nothing(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10855"))
+            .expect("seed works");
+        store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "travel", true)
+            .expect("due sub (never refreshed)");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        // The due-sub selection itself is pure (one due sub found).
+        assert_eq!(
+            view.read_with(cx, |view, _| view.due_subscriptions().len()),
+            1
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.stop_background_ticks());
+        });
+        let poll = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_engine_poll(cx)));
+        assert_eq!(poll, None);
+        let subs = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_due_subscriptions(cx)));
+        assert_eq!(subs, 0, "stopped pass starts no fetch");
+        let reprobed = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_reprobe_running(cx)));
+        assert_eq!(reprobed, 0, "stopped pass probes nothing");
+        assert!(
+            handle.calls_for(&alpha.id).is_empty(),
+            "stopped ticks never touch the network"
+        );
     }
 
     /// Ticket 04: the subscriptions dialog opens with a label/URL/group
