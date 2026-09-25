@@ -6,7 +6,7 @@
 
 **Owns:** rust-networking
 
-**Status:** ready-for-agent
+**Status:** done (commit 6cb4db4; `cargo test` 146 passed, verified)
 
 - [ ] Scenario: Xray-only VLESS + custom-JSON + stock configs → Action: start all → Expected: each endpoint serves its own egress in isolation. Verification: integration check. Priority: required.
 - [ ] Scenario: broken custom JSON → Action: save + start → Expected: start blocked naming the offending field; other endpoints unaffected. Verification: automated test. Priority: required.
