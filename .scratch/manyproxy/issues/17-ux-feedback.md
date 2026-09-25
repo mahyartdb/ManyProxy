@@ -6,7 +6,7 @@
 
 **Owns:** gpui-kit
 
-**Status:** ready-for-agent
+**Status:** done (commit df07e09; `cargo test` 239 passed, verified)
 
 - [ ] Scenario: add/edit/remove config → Action: complete → Expected: success toast naming the row. Verification: manual UX review. Priority: important.
 - [ ] Scenario: import dialog with pasted text → Action: type/paste → Expected: live `X valid · Y invalid` preview before commit. Verification: automated test. Priority: important.
