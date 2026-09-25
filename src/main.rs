@@ -179,18 +179,18 @@ impl ListDelegate for LibraryDelegate {
             .selected
             .map(|current| current.section == index.section && current.row == index.row)
             .unwrap_or(false);
-        let status = if row.enabled { "on" } else { "off" };
-        let mut item = ListItem::new(format!("library-row-{}", row.id))
-            .selected(selected)
-            .child(format!("{} [{status}]", row.name))
-            .child(format!(
-                "{} · {} · {}:{}",
-                row.protocol, row.group, row.bind_ip, row.port
-            ));
-        if let Some(summary) = self.health.get(&row.id) {
-            if !summary.is_empty() {
-                item = item.child(summary.clone());
-            }
+        // Ticket 19: complete row content (name, protocol, upstream
+        // host:port, bind endpoint, enabled state, health) via the tested
+        // [`library_row_lines`] seam — one child per line, stable domain id,
+        // no entity per row.
+        let health = self
+            .health
+            .get(&row.id)
+            .map(String::as_str)
+            .filter(|summary| !summary.is_empty());
+        let mut item = ListItem::new(format!("library-row-{}", row.id)).selected(selected);
+        for line in library_row_lines(&row, health) {
+            item = item.child(line);
         }
         Some(item)
     }
@@ -201,6 +201,8 @@ impl ListDelegate for LibraryDelegate {
         _cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
         div()
+            .id("library-empty")
+            .test_support()
             .size_full()
             .flex()
             .items_center()
@@ -684,6 +686,67 @@ fn already_stopped_message(name: &str) -> String {
     format!("\"{name}\" is already stopped")
 }
 
+/// Ticket 19: upstream `host:port` for a library row, read from the params
+/// JSON only (`server`/`address` + `server_port`/`port` — the same keys the
+/// store validation and import grammar use). Credential keys are never read,
+/// so the display string cannot leak secrets by construction. `None` for
+/// metadata-only rows with no upstream host.
+fn upstream_host_port(row: &ProxyConfig) -> Option<String> {
+    let map = serde_json::from_str::<serde_json::Value>(&row.params)
+        .ok()?
+        .as_object()?
+        .clone();
+    let host = ["server", "address"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .find(|host| !host.is_empty())?;
+    let port = ["server_port", "port"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .find_map(|value| {
+            if let Some(port) = value.as_u64() {
+                (port > 0 && port <= 65535).then(|| port.to_string())
+            } else {
+                value.as_str().and_then(|text| {
+                    text.trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|port| *port > 0 && *port <= 65535)
+                        .map(|port| port.to_string())
+                })
+            }
+        });
+    Some(match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+/// Ticket 19: every text line of a library row — name, protocol + upstream
+/// host:port, group + bind endpoint + enabled state, plus the health summary
+/// when one exists. Pure so tests pin the complete content;
+/// [`LibraryDelegate::render_item`] maps each line to a child.
+fn library_row_lines(row: &ProxyConfig, health: Option<&str>) -> Vec<String> {
+    let upstream = upstream_host_port(row).unwrap_or_else(|| "no upstream".to_string());
+    let state = if row.enabled { "enabled" } else { "disabled" };
+    let mut lines = vec![
+        row.name.clone(),
+        format!("{} · {upstream}", row.protocol),
+        format!(
+            "{} · bind {}:{} · {state}",
+            row.group, row.bind_ip, row.port
+        ),
+    ];
+    if let Some(summary) = health {
+        if !summary.is_empty() {
+            lines.push(summary.to_string());
+        }
+    }
+    lines
+}
+
 /// Ticket 17: a library row matches the search query by name, protocol,
 /// group, bind address, port, or upstream host (the `server`/`address` inside
 /// params — never credential fields).
@@ -1038,8 +1101,13 @@ impl AppView {
                 Vec::new()
             }
         };
-        libraries.update(cx, |state, _| {
+        libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
+            // Ticket 19: the rows cache refreshes inside `ListState::render`
+            // (the `List` element embeds the state entity as a child view),
+            // which only runs when the list entity itself is notified — the
+            // parent notify below never reaches it.
+            list_cx.notify();
         });
         cx.notify();
         view
@@ -1080,9 +1148,11 @@ impl AppView {
         self.poll_engine();
         let rows = self.store.list()?;
         let health = self.health_map();
-        self.libraries.update(cx, |state, _| {
+        self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
             state.delegate_mut().set_health(health);
+            // Ticket 19: notify the list entity itself (see `with_store`).
+            list_cx.notify();
         });
         Ok(())
     }
@@ -1145,9 +1215,17 @@ impl AppView {
             .unwrap_or_else(|| id.to_string());
         match self.store.remove(id) {
             Ok(true) => {
-                self.libraries.update(cx, |state, _| {
-                    state.delegate_mut().clear_selection();
-                });
+                // Ticket 19: only drop the selection when the removed row was
+                // selected — any other row keeps the selection, which
+                // `set_rows` then preserves by id across the reload.
+                if self.selected_config(cx).map(|row| row.id).as_deref() == Some(id) {
+                    self.libraries.update(cx, |state, list_cx| {
+                        state.delegate_mut().clear_selection();
+                        // Ticket 19: notify the list entity itself (see
+                        // `with_store`); the reload below refreshes rows too.
+                        list_cx.notify();
+                    });
+                }
                 self.reload(window, cx);
                 window.push_notification(Notification::success(config_removed_message(&name)), cx);
             }
@@ -2706,6 +2784,10 @@ impl AppView {
         let switch_id = format!("enabled-{}", config.id);
         let switch_view = cx.entity();
         let switch_id_for_handler = config.id.clone();
+        // Ticket 19: complete detail pane — endpoint URLs (bind + port only,
+        // never params or secrets) plus the upstream host:port when known.
+        let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
+        let upstream = upstream_host_port(&config).unwrap_or_else(|| "no upstream".to_string());
         div()
             .id("config-detail")
             .test_support()
@@ -2724,6 +2806,16 @@ impl AppView {
                         "{} · {} · {}:{}",
                         config.protocol, config.group, config.bind_ip, config.port
                     )),
+            )
+            .child(
+                div()
+                    .id("config-endpoints")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(format!("upstream {upstream}"))
+                    .child(format!("{socks_url} · {http_url}")),
             )
             .child(
                 div()
@@ -2939,8 +3031,8 @@ impl Render for AppView {
                     .child("Drop .conf / .json / .txt files here to import"),
             )
             .child(
-                div().flex_1().child(
-                    div().id("config-list").test_support().child(
+                div().flex().flex_col().flex_1().child(
+                    div().id("config-list").test_support().flex_1().child(
                         List::new(&self.libraries).search_placeholder("Search configurations"),
                     ),
                 ),
@@ -5229,5 +5321,386 @@ mod tests {
             "nothing stored"
         );
         assert_eq!(notification_count(cx), 1, "one error notice, never silent");
+    }
+
+    // -- Ticket 19: library list paints stored rows --------------------------
+
+    /// One completed frame at desktop size after external changes.
+    fn paint_frame(cx: &mut VisualTestContext) {
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+    }
+
+    /// Paint means painted: present in the completed frame, visible, with
+    /// non-zero bounds. Element presence alone never proves paint.
+    fn assert_painted(cx: &mut VisualTestContext, id: &str) {
+        let snapshot = cx.update(|window, _| window.try_find(id.to_owned()));
+        let snapshot =
+            snapshot.unwrap_or_else(|| panic!("{id} renders: missing element in completed frame"));
+        assert!(snapshot.visible(), "{id} is visible");
+        let bounds = snapshot.bounds();
+        assert!(
+            bounds.size.width > px(0.) && bounds.size.height > px(0.),
+            "{id} paints with non-zero bounds: {bounds:?}"
+        );
+    }
+
+    fn assert_absent(cx: &mut VisualTestContext, id: String) {
+        assert!(
+            cx.update(|window, _| window.try_find(id.clone()).is_none()),
+            "{id} is not in the completed frame"
+        );
+    }
+
+    fn row19_seed(name: &str, host: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: format!(
+                "{{\"type\":\"vless\",\"server\":\"{host}\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\"}}"
+            ),
+            group: "travel".to_string(),
+            bind_ip: "127.0.0.1".to_string(),
+            port: port.to_string(),
+        }
+    }
+
+    /// Scenario: store with 2 configs, fresh window → 2 painted rows with
+    /// stable ids, findable in a completed frame.
+    #[gpui_kit::test]
+    fn library_paints_two_stored_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
+        assert_painted(cx, &format!("library-row-{}", first.id));
+        assert_painted(cx, &format!("library-row-{}", second.id));
+    }
+
+    /// Scenario: empty store → the empty state actually paints (asserted via
+    /// bounds/visibility, not just element presence).
+    #[gpui_kit::test]
+    fn library_paints_empty_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_painted(cx, "library-empty");
+    }
+
+    /// Scenario: add/remove/search each repaint to match the store with no
+    /// restart and no stale rows; selection survives by id; the detail pane
+    /// paints endpoint URLs for the selected row.
+    #[gpui_kit::test]
+    fn library_mutations_repaint_and_keep_selection(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        // Select the first row, then add a third: the list repaints with all
+        // three and the selection stays on the first row's id.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let third_id = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.commit_add(seed_input("Cabin"), window, cx));
+                view.store
+                    .list()
+                    .expect("list works")
+                    .into_iter()
+                    .find(|row| row.name == "Cabin")
+                    .expect("added row stored")
+                    .id
+            })
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 3);
+        assert_painted(cx, &format!("library-row-{}", first.id));
+        assert_painted(cx, &format!("library-row-{}", second.id));
+        assert_painted(cx, &format!("library-row-{third_id}"));
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id)),
+            Some(first.id.clone()),
+            "selection preserved by id across add"
+        );
+        assert_painted(cx, "config-endpoints");
+
+        // Remove the third: it leaves the painted frame (no stale row) and
+        // the selection still follows the first row's id.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_remove(&third_id, window, cx));
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
+        assert_painted(cx, &format!("library-row-{}", first.id));
+        assert_painted(cx, &format!("library-row-{}", second.id));
+        assert_absent(cx, format!("library-row-{third_id}"));
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id)),
+            Some(first.id.clone()),
+            "selection preserved by id across remove"
+        );
+
+        // Search narrows the painted rows (incremental filter, no rebuild);
+        // clearing it repaints everything.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "home".to_string();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, &format!("library-row-{}", second.id));
+        assert_absent(cx, format!("library-row-{}", first.id));
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = String::new();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, &format!("library-row-{}", first.id));
+        assert_painted(cx, &format!("library-row-{}", second.id));
+
+        // Removing everything paints the empty state (never a blank list
+        // with no rows and no empty text).
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_remove(&first.id, window, cx);
+                view.commit_remove(&second.id, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 0);
+        assert_painted(cx, "library-empty");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.selected_config(cx)),
+            None,
+            "removing the selected row clears the selection"
+        );
+    }
+
+    /// Scenario: a health tick (fake engine + scripted prober) refreshes the
+    /// rows in place — painted rows match the store and carry the new health
+    /// summaries with no restart.
+    #[gpui_kit::test]
+    fn library_health_tick_repaints_rows(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10811"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10812"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+            });
+        });
+        handle.script_latency(&first.id, 33);
+        handle.script_failure(&second.id, "upstream refused");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        let tested =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
+        assert_eq!(tested, 2);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_painted(cx, &format!("library-row-{}", first.id));
+        assert_painted(cx, &format!("library-row-{}", second.id));
+        let health = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().health.clone()
+        });
+        assert_eq!(
+            health.get(&first.id).map(String::as_str),
+            Some("33ms"),
+            "live row summary refreshed: {health:?}"
+        );
+        assert_eq!(
+            health.get(&second.id).map(String::as_str),
+            Some("dead"),
+            "dead row summary refreshed: {health:?}"
+        );
+    }
+
+    /// Row content (pure seam): name, protocol, upstream host:port, bind
+    /// endpoint, enabled state, and the health summary are all present; the
+    /// health line appears only when a summary exists.
+    #[test]
+    fn library_row_lines_show_complete_content() {
+        use crate::library_row_lines;
+        use crate::store::ProxyConfig;
+        fn row(enabled: bool, params: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: "7".to_string(),
+                name: "Work".to_string(),
+                protocol: "vless".to_string(),
+                params: params.to_string(),
+                group: "travel".to_string(),
+                enabled,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+            }
+        }
+        let full = library_row_lines(
+            &row(true, "{\"server\":\"a.example.com\",\"server_port\":443}"),
+            Some("87ms"),
+        )
+        .join("\n");
+        for want in [
+            "Work",
+            "vless",
+            "a.example.com:443",
+            "travel",
+            "127.0.0.1:10801",
+            "enabled",
+            "87ms",
+        ] {
+            assert!(full.contains(want), "{want} visible in:\n{full}");
+        }
+        let plain = library_row_lines(&row(false, "{}"), None).join("\n");
+        assert!(
+            plain.contains("disabled"),
+            "enabled state visible:\n{plain}"
+        );
+        assert!(
+            plain.contains("no upstream"),
+            "metadata-only rows say so honestly:\n{plain}"
+        );
+        assert_eq!(
+            library_row_lines(&row(false, "{}"), None).len(),
+            3,
+            "no health child without a summary"
+        );
+    }
+
+    /// Upstream extraction reads host/port keys only — credentials in params
+    /// can never reach the row text through this seam.
+    #[test]
+    fn upstream_host_port_reads_only_host_keys() {
+        use crate::store::ProxyConfig;
+        use crate::upstream_host_port;
+        fn row(params: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: "7".to_string(),
+                name: "Work".to_string(),
+                protocol: "vless".to_string(),
+                params: params.to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+            }
+        }
+        assert_eq!(
+            upstream_host_port(&row("{\"server\":\"a.example.com\",\"server_port\":443,\
+                    \"uuid\":\"SECRET-UUID\",\"password\":\"hunter2\"}"))
+            .as_deref(),
+            Some("a.example.com:443")
+        );
+        assert_eq!(
+            upstream_host_port(&row("{\"address\":\"10.0.0.5\",\"port\":\"51820\"}")).as_deref(),
+            Some("10.0.0.5:51820"),
+            "address/port aliases work"
+        );
+        assert_eq!(
+            upstream_host_port(&row("{\"server\":\"a.example.com\"}")).as_deref(),
+            Some("a.example.com"),
+            "host alone still shows"
+        );
+        assert_eq!(upstream_host_port(&row("{}")), None);
+        assert_eq!(upstream_host_port(&row("not json")), None);
+        for (params, canary) in [
+            (
+                "{\"server\":\"a.example.com\",\"server_port\":443,\"password\":\"hunter2\"}",
+                "hunter2",
+            ),
+            (
+                "{\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"SECRET-UUID\"}",
+                "SECRET-UUID",
+            ),
+            (
+                "{\"server\":\"a.example.com\",\"server_port\":443,\"token\":\"abc123\"}",
+                "abc123",
+            ),
+        ] {
+            let shown = upstream_host_port(&row(params)).unwrap_or_default();
+            assert!(!shown.contains(canary), "no credentials in {shown}");
+        }
     }
 }
