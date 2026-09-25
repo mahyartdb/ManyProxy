@@ -31,7 +31,10 @@ pub struct ImportedConfig {
     /// Normalized outbound type (`vless`, `vmess`, `trojan`, `shadowsocks`,
     /// `hysteria2`, `hysteria`, `tuic`, `wireguard`, `amneziawg` (ticket 07:
     /// `awg`/`amnezia-wg` aliases fold here), `socks`, `anytls`,
-    /// `http`, `https`, `naive`).
+    /// `http`, `https`, `naive`, `xray` (ticket 08: Xray-only VLESS),
+    /// `custom-outbound` / `custom-config` (ticket 08: custom JSON rows),
+    /// `extra-core` (ticket 08: user executable slot),
+    /// `chain` (ticket 08: chained outbounds)).
     pub protocol: String,
     /// Deterministic JSON object with sing-box outbound field names
     /// (`type`, `server`, `server_port`, …).
@@ -480,7 +483,7 @@ fn parse_vless_like(
 
     let mut params = base_params(protocol, &parts.host, port);
     match protocol {
-        "vless" => {
+        "vless" | "xray" => {
             insert_str(&mut params, "uuid", credential);
             insert_str(
                 &mut params,
@@ -970,6 +973,19 @@ fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
         "socks5" => Ok("socks".to_string()),
         // Ticket 07: AWG aliases fold to the canonical stored form.
         "awg" | "amnezia-wg" => Ok("amneziawg".to_string()),
+        // Ticket 08: Xray/custom/extra/chain rows keep their kind so the
+        // engine can route them to the sidecar bridge, the owning core,
+        // the user slot, or the chain builder.
+        "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Ok("xray".to_string()),
+        "custom"
+        | "custom-out"
+        | "custom-outbound"
+        | "custom_outbound"
+        | "custom-outbound-json" => Ok("custom-outbound".to_string()),
+        "custom-config" | "custom_config" | "custom-full" | "custom_full"
+        | "custom-full-config" => Ok("custom-config".to_string()),
+        "extra" | "extra-core" | "extra_core" | "extracore" => Ok("extra-core".to_string()),
+        "chain" | "chained" | "chain-outbound" | "chain_outbound" => Ok("chain".to_string()),
         "" => Err(invalid_json("item is missing outbound \"type\"")),
         other => Err(unknown_scheme(format!("unknown outbound type '{other}'"))),
     }
@@ -1364,6 +1380,10 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         "throne" => parse_throne_rest(rest),
         "vless" => parse_vless_like("vless", &split_uri(&scheme, rest)?, "uuid"),
         "trojan" => parse_vless_like("trojan", &split_uri(&scheme, rest)?, "password"),
+        // Ticket 08: Xray-only VLESS links share the vless userinfo shape;
+        // the row keeps the `xray` kind so the engine bridges it to the
+        // Xray sidecar (Xray-only fields pass through verbatim).
+        "xray" => parse_vless_like("xray", &split_uri(&scheme, rest)?, "uuid"),
         "hysteria2" | "hy2" | "hysteria2+realm" => parse_hy2(&scheme, &split_uri(&scheme, rest)?),
         "hysteria" => parse_hy1(&split_uri(&scheme, rest)?),
         "tuic" => parse_tuic(&split_uri(&scheme, rest)?),
@@ -1750,6 +1770,17 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             "socks5" => Ok("socks".to_string()),
             // Ticket 07: AWG aliases fold to the canonical stored form.
             "awg" | "amnezia-wg" => Ok("amneziawg".to_string()),
+            // Ticket 08: same kind-preserving fold as the JSON path.
+            "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Ok("xray".to_string()),
+            "custom"
+            | "custom-out"
+            | "custom-outbound"
+            | "custom_outbound"
+            | "custom-outbound-json" => Ok("custom-outbound".to_string()),
+            "custom-config" | "custom_config" | "custom-full" | "custom_full"
+            | "custom-full-config" => Ok("custom-config".to_string()),
+            "extra" | "extra-core" | "extra_core" | "extracore" => Ok("extra-core".to_string()),
+            "chain" | "chained" | "chain-outbound" | "chain_outbound" => Ok("chain".to_string()),
             "" => Err(invalid_json("clash entry is missing \"type\"")),
             other => Err(unknown_scheme(format!("unknown clash type '{other}'"))),
         }
@@ -2631,5 +2662,70 @@ mod tests {
         );
         let error = parse_addsub_link("throne://route/aGk").expect_err("route cmd fails here");
         assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+    }
+
+    // -- ticket 08: Xray/custom/extra/chain intake --------------------------
+
+    #[test]
+    fn xray_link_keeps_xray_kind() {
+        let link = format!(
+            "xray://{UUID}@example.com:443?encryption=none&security=tls&sni=example.com&flow=xtls-rprx-vision#xray-one"
+        );
+        let config = parse_link(&link).expect("xray parses");
+        assert_eq!(config.protocol, "xray");
+        assert_eq!(config.host, "example.com");
+        assert_eq!(config.port, 443);
+        assert_eq!(config.name, "xray-one");
+        let params = params_of(&config);
+        assert_eq!(params["uuid"], UUID);
+        assert_eq!(params["flow"], "xtls-rprx-vision");
+    }
+
+    #[test]
+    fn json_outbound_ticket08_types_keep_kind() {
+        for (raw, canonical) in [
+            ("xray", "xray"),
+            ("xray-vless", "xray"),
+            ("custom-outbound", "custom-outbound"),
+            ("custom", "custom-outbound"),
+            ("custom-config", "custom-config"),
+            ("custom-full", "custom-config"),
+            ("extra-core", "extra-core"),
+            ("extracore", "extra-core"),
+            ("chain", "chain"),
+        ] {
+            let body = serde_json::json!([{
+                "type": raw, "tag": "k",
+                "server": "a.example.com", "server_port": 443, "uuid": UUID
+            }]);
+            let out = import_text(&body.to_string());
+            assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+            assert_eq!(out.configs.len(), 1);
+            assert_eq!(out.configs[0].protocol, canonical, "type {raw}");
+        }
+    }
+
+    #[test]
+    fn throne_add_custom_json_imports_as_custom_row() {
+        let outbound = serde_json::json!({
+            "type": "custom-outbound", "tag": "custom-one",
+            "server": "c.example.com", "server_port": 443,
+            "fancy": "kept", "uuid": UUID
+        });
+        let link = format!("throne://add/{}", b64(&outbound.to_string()));
+        let config = parse_link(&link).expect("throne custom add parses");
+        assert_eq!(config.protocol, "custom-outbound");
+        assert_eq!(config.name, "custom-one");
+        assert_eq!(params_of(&config)["fancy"], "kept");
+    }
+
+    #[test]
+    fn clash_ticket08_types_fold_to_kind() {
+        let body = "proxies:\n  - name: x-one\n    type: xray\n    server: x.example.com\n    port: 443\n    uuid: u\n  - name: e-one\n    type: extra-core\n    server: e.example.com\n    port: 443\n    exe: core.exe\n";
+        let out = import_subscription_body(body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+        assert_eq!(out.configs[0].protocol, "xray");
+        assert_eq!(out.configs[1].protocol, "extra-core");
     }
 }

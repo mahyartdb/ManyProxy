@@ -7,10 +7,11 @@
 //! The measure seam is [`HealthProber`]: the real driver dials each config's
 //! own local endpoint (so a URL test can only ever exit via that config's
 //! egress), the fake driver scripts latencies/failures for tests. No test
-//! touches a real remote server. Extra-core rows do not exist until ticket
-//! 08: [`is_probeable_protocol`] denies them with a named error and the fake
-//! driver carries a deny-list hook so ticket 08 can flip them on for
-//! active-profile tests only. Ticket 07 flips AmneziaWG variants on: AWG rows
+//! touches a real remote server. Ticket 08 flips Xray/custom/extra-core/
+//! chained rows on: they are probeable through their own endpoints exactly
+//! like stock rows (extra-core slot: active-profile tests only — the runner
+//! only ever probes running endpoints, never group bulk sets; there is no
+//! group-test path in v1). Ticket 07 flips AmneziaWG variants on: AWG rows
 //! are probeable through their own endpoints exactly like stock rows.
 //!
 //! Hard prohibitions: health checks never route through another config's
@@ -115,11 +116,10 @@ pub trait HealthProber {
 }
 
 /// Protocols measurable in this slice. Mirrors the ticket-05 standard set
-/// plus ticket-07 AmneziaWG variants (each probe still dials the row's own
-/// endpoint, so AWG rows are measured through their own egress like stock
-/// rows). Anything else (anytls, ssh, custom-*, chained, extra-core,
-/// xray-only) is a named skip until its owning ticket. Ticket 08 flips
-/// `extra-core` on.
+/// plus ticket-07 AmneziaWG variants plus ticket-08 Xray/custom/extra-core/
+/// chained rows (each probe still dials the row's own endpoint, so every
+/// row is measured through its own egress). Anything else (anytls, ssh,
+/// socks, naive, …) is a named skip until its owning ticket.
 pub fn is_probeable_protocol(protocol: &str) -> bool {
     matches!(
         protocol.trim().to_ascii_lowercase().as_str(),
@@ -137,6 +137,28 @@ pub fn is_probeable_protocol(protocol: &str) -> bool {
             | "amneziawg"
             | "awg"
             | "amnezia-wg"
+            | "xray"
+            | "xray-vless"
+            | "xray_vless"
+            | "vless-xray"
+            | "custom"
+            | "custom-out"
+            | "custom-outbound"
+            | "custom_outbound"
+            | "custom-outbound-json"
+            | "custom-config"
+            | "custom_config"
+            | "custom-full"
+            | "custom_full"
+            | "custom-full-config"
+            | "extra"
+            | "extra-core"
+            | "extra_core"
+            | "extracore"
+            | "chain"
+            | "chained"
+            | "chain-outbound"
+            | "chain_outbound"
     )
 }
 
@@ -314,7 +336,7 @@ pub fn test_all(
                         kind: HealthKind::UrlTest,
                         latency_ms: None,
                         error: Some(format!(
-                            "unsupported protocol \"{}\" for \"{}\" (extra-core/custom rows gain health checks in ticket 08)",
+                            "unsupported protocol \"{}\" for \"{}\" (no health probe for this protocol yet)",
                             config.protocol, config.name
                         )),
                     },
@@ -365,7 +387,7 @@ pub fn ping_all(configs: &[ProxyConfig], prober: &mut dyn HealthProber) -> Vec<T
                         kind: HealthKind::TcpPing,
                         latency_ms: None,
                         error: Some(format!(
-                            "unsupported protocol \"{}\" for \"{}\" (extra-core/custom rows gain health checks in ticket 08)",
+                            "unsupported protocol \"{}\" for \"{}\" (no health probe for this protocol yet)",
                             config.protocol, config.name
                         )),
                     },
@@ -950,8 +972,8 @@ impl FakeHealthHandle {
             .insert(config_id.to_string(), cause.to_string());
     }
 
-    /// Deny a protocol (ticket-08 hook: `extra-core` flips here for
-    /// active-profile tests without touching the runner).
+    /// Deny a protocol (test hook: simulates an unprobeable row without
+    /// touching the runner; the runner records a named skip).
     pub fn deny_protocol(&self, protocol: &str) {
         self.state
             .borrow_mut()
@@ -1186,23 +1208,22 @@ mod tests {
         assert_eq!(handle.calls_for("1")[0].port, 10801);
     }
 
-    /// Extra-core hook: denied protocols get a named skip without probing;
-    /// standard rows still run. Ticket 08 flips the deny list.
+    /// Denied protocols get a named skip without probing; standard rows
+    /// still run. The deny hook simulates unprobeable rows in tests.
     #[test]
     fn unsupported_protocol_skipped_without_probing() {
         let configs = vec![
             fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
-            fixture("9", "Odd", "extra-core", "127.0.0.1", 10809),
+            fixture("9", "Odd", "anytls", "127.0.0.1", 10809),
         ];
         let (mut prober, handle) = FakeHealthProber::shared();
-        handle.deny_protocol("extra-core");
+        handle.deny_protocol("anytls");
         let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes[0].sample.error.is_none());
         let skip = outcomes[1].sample.error.as_deref().expect("named skip");
-        assert!(skip.contains("extra-core"), "names protocol: {skip}");
+        assert!(skip.contains("anytls"), "names protocol: {skip}");
         assert!(skip.contains("\"Odd\""), "names config: {skip}");
-        assert!(skip.contains("ticket 08"), "names owner: {skip}");
         assert!(
             handle.calls_for("9").is_empty(),
             "denied rows are never probed"
@@ -1211,13 +1232,13 @@ mod tests {
 
         let real = RealHealthProber::default();
         assert!(real.supports(&configs[0]));
-        assert!(!real.supports(&configs[1]), "real driver denies extra-core");
+        assert!(!real.supports(&configs[1]), "real driver denies anytls");
         assert!(is_probeable_protocol("ss"));
-        assert!(!is_probeable_protocol("custom-config"));
+        assert!(!is_probeable_protocol("naive"));
     }
 
     /// Ticket 07: AWG rows are probeable through their own endpoints (deny
-    /// list flipped); extra-core rows stay denied.
+    /// list flipped); rows with no probe stay denied.
     #[test]
     fn amneziawg_rows_are_probeable_through_own_endpoints() {
         for protocol in ["amneziawg", "awg", "amnezia-wg"] {
@@ -1225,10 +1246,10 @@ mod tests {
         }
         let configs = vec![
             fixture("7", "AwgOne", "amneziawg", "127.0.0.1", 10807),
-            fixture("9", "Odd", "extra-core", "127.0.0.1", 10809),
+            fixture("9", "Odd", "anytls", "127.0.0.1", 10809),
         ];
         let (mut prober, handle) = FakeHealthProber::shared();
-        handle.deny_protocol("extra-core");
+        handle.deny_protocol("anytls");
         let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes[0].sample.error.is_none());
@@ -1242,8 +1263,52 @@ mod tests {
         assert!(real.supports(&configs[0]), "real driver probes AWG");
         assert!(
             !real.supports(&configs[1]),
-            "real driver still denies extra-core"
+            "real driver still denies anytls"
         );
+    }
+
+    /// Ticket 08: Xray/custom/extra-core/chained rows are probeable through
+    /// their own endpoints (deny-list hook flipped); each probe dials its
+    /// own endpoint so results stay per-egress.
+    #[test]
+    fn ticket08_rows_are_probeable_through_own_endpoints() {
+        for protocol in [
+            "xray",
+            "xray-vless",
+            "custom",
+            "custom-outbound",
+            "custom-config",
+            "extra-core",
+            "extracore",
+            "chain",
+        ] {
+            assert!(is_probeable_protocol(protocol), "{protocol} is probeable");
+        }
+        let configs = vec![
+            fixture("2", "XrayOne", "xray", "127.0.0.1", 10802),
+            fixture("9", "CustomOne", "custom-outbound", "127.0.0.1", 10809),
+            fixture("5", "Slot", "extra-core", "127.0.0.1", 10805),
+            fixture("8", "ChainAB", "chain", "127.0.0.1", 10808),
+        ];
+        let (mut prober, handle) = FakeHealthProber::shared();
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        assert_eq!(outcomes.len(), 4);
+        for (config, outcome) in configs.iter().zip(outcomes.iter()) {
+            assert!(
+                outcome.sample.error.is_none(),
+                "{} probed: {:?}",
+                config.name,
+                outcome.sample.error
+            );
+            let calls = handle.calls_for(&config.id);
+            assert_eq!(calls.len(), 1, "one probe for {}", config.name);
+            assert_eq!(calls[0].bind, config.bind_ip);
+            assert_eq!(calls[0].port, config.port, "own endpoint, not a sibling's");
+        }
+        let real = RealHealthProber::default();
+        for config in &configs {
+            assert!(real.supports(config), "real driver probes {}", config.name);
+        }
     }
 
     /// Traffic counters accumulate per config across probes.
