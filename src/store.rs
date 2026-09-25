@@ -91,6 +91,13 @@ pub enum StoreError {
     Invalid(Vec<FieldError>),
     /// No config with this id.
     NotFound(String),
+    /// Ticket 14: filesystem failure (export writes — never the database).
+    /// Carries the destination path so the UI names it instead of
+    /// mislabeling the failure "database error".
+    Io {
+        path: PathBuf,
+        message: String,
+    },
     Sql(rusqlite::Error),
 }
 
@@ -105,6 +112,9 @@ impl std::fmt::Display for StoreError {
                 write!(f, "invalid config ({})", parts.join("; "))
             }
             StoreError::NotFound(id) => write!(f, "config not found: {id}"),
+            StoreError::Io { path, message } => {
+                write!(f, "cannot write {}: {}", path.display(), message)
+            }
             StoreError::Sql(error) => write!(f, "database error: {error}"),
         }
     }
@@ -401,6 +411,25 @@ impl Store {
     /// Open a throwaway store for unit tests.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         Self::open(Connection::open_in_memory()?)
+    }
+
+    /// Ticket 14 test seam: drop the main tables so reads fail with
+    /// `StoreError::Sql` (lets UI tests trigger the DB-error paths with a
+    /// failing store instead of a silent empty list).
+    #[cfg(test)]
+    pub fn break_schema_for_test(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute_batch("DROP TABLE proxy_configs; DROP TABLE subscriptions;")?;
+        Ok(())
+    }
+
+    /// Ticket 14 test seam: read-only mode so writes fail with
+    /// `StoreError::Sql` while reads keep working (lets UI tests select a
+    /// row first, then fail the toggle write).
+    #[cfg(test)]
+    pub fn set_query_only_for_test(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch("PRAGMA query_only = ON;")?;
+        Ok(())
     }
 
     /// Open (creating parents as needed) a file-backed store.
@@ -1047,13 +1076,15 @@ impl Store {
         let payload = self.export_library_json()?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                std::fs::create_dir_all(parent).map_err(|error| StoreError::Io {
+                    path: path.to_path_buf(),
+                    message: error.to_string(),
                 })?;
             }
         }
-        std::fs::write(path, payload).map_err(|error| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        std::fs::write(path, payload).map_err(|error| StoreError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
         })?;
         Ok(Some(path.to_path_buf()))
     }
@@ -1925,6 +1956,68 @@ mod tests {
         assert!(matches!(
             store.set_subscription_auto_refresh("no-such-id", false),
             Err(StoreError::NotFound(_))
+        ));
+    }
+
+    /// Ticket 14, scenario 5: export I/O failures name the destination path
+    /// and never mislabel as a database error.
+    #[test]
+    fn export_io_error_names_path_never_database() {
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        // A regular file where a directory is needed: dir creation must fail.
+        let blocker =
+            std::env::temp_dir().join(format!("manyproxy-t14-blocker-{}.tmp", std::process::id()));
+        std::fs::write(&blocker, b"blocker").expect("blocker writes");
+        let bad = blocker.join("manyproxy-export.json");
+        let error = store
+            .commit_export(&bad, true)
+            .expect_err("export must fail");
+        let _ = std::fs::remove_file(&blocker);
+        let text = error.to_string();
+        assert!(
+            matches!(error, StoreError::Io { .. }),
+            "Io variant, got {text}"
+        );
+        assert!(
+            text.contains(&bad.display().to_string()),
+            "names the path: {text}"
+        );
+        assert!(
+            !text.contains("database error"),
+            "never database-labeled: {text}"
+        );
+    }
+
+    /// Ticket 14, scenario 6 (store seam): a broken database reports `Err`,
+    /// never `Ok(false)`, so the UI can tell "already removed" from a real
+    /// failure.
+    #[test]
+    fn remove_subscription_db_error_is_err_never_already_removed() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        store.break_schema_for_test().expect("break works");
+        assert!(
+            matches!(store.remove_subscription(&sub.id), Err(StoreError::Sql(_))),
+            "broken store reports Err, never Ok(false)"
+        );
+    }
+
+    /// Ticket 14, scenario 2 (store seam): reads on a broken database report
+    /// `Err` so the UI notifies instead of rendering a silent empty list.
+    #[test]
+    fn list_db_error_is_err_after_schema_break() {
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        store.break_schema_for_test().expect("break works");
+        assert!(matches!(store.list(), Err(StoreError::Sql(_))));
+        assert!(matches!(
+            store.get_subscription("1"),
+            Err(StoreError::Sql(_))
+        ));
+        assert!(matches!(
+            store.list_subscriptions(),
+            Err(StoreError::Sql(_))
         ));
     }
 

@@ -30,7 +30,10 @@ use health::{
     ping_all, test_all, HealthProber, HealthStore, LogStore, RealHealthProber, TestOutcome,
     DEFAULT_TEST_URL,
 };
-use import::{commit_batch, import_file_content, import_text, parse_addsub_link, AddSubRequest};
+use import::{
+    commit_batch, format_import_failures, import_file_content, import_text, is_addsub_attempt,
+    parse_addsub_link, AddSubRequest, ImportError,
+};
 use store::{
     delete_confirm_text, due_for_refresh, export_confirm_description, now_unix, proxy_urls,
     ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig, Store, StoreError,
@@ -385,18 +388,36 @@ impl ImportForm {
 
 /// Ticket 04: redacted subscription URL for display (query and fragment are
 /// dropped so tokens never reach the screen or logs).
+/// Ticket 14: userinfo is stripped too — same rule as
+/// [`subscription_label_from_url`]: a pasted URL can embed `user:password`,
+/// which must never appear in a row, notification, or log.
 fn redact_subscription_url(url: &str) -> String {
     let without_fragment = url.split('#').next().unwrap_or(url);
     let without_query = without_fragment
         .split('?')
         .next()
         .unwrap_or(without_fragment);
+    // Strip `userinfo@` from the authority, keeping scheme + host + path.
+    let stripped = match without_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let path_at = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at(path_at);
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            format!("{scheme}://{host}{path}")
+        }
+        None => {
+            let path_at = without_query.find('/').unwrap_or(without_query.len());
+            let (authority, path) = without_query.split_at(path_at);
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            format!("{host}{path}")
+        }
+    };
     const LIMIT: usize = 96;
-    if without_query.chars().count() > LIMIT {
-        let kept: String = without_query.chars().take(LIMIT).collect();
+    if stripped.chars().count() > LIMIT {
+        let kept: String = stripped.chars().take(LIMIT).collect();
         format!("{kept}…")
     } else {
-        without_query.to_string()
+        stripped
     }
 }
 
@@ -412,6 +433,14 @@ fn subscription_label_from_url(url: &str) -> String {
     } else {
         host.to_string()
     }
+}
+
+/// Ticket 14: single-line `throne://addsub/...` failure text. Surfaces the
+/// intake's own reason (`bad-base64`, `bad-host`, …) — the parse errors never
+/// echo the URL (see `addsub_rejects_non_http_and_unknown_command`), so this
+/// is safe for notifications.
+fn addsub_error_message(error: &ImportError) -> String {
+    format!("Invalid subscription link: {error}")
 }
 
 /// Ticket 04: fetch a subscription body over the platform HTTP client.
@@ -518,12 +547,10 @@ fn subscription_row(
     row = row.child(
         Button::new(format!("sub-refresh-{}", sub.id))
             .label("Refresh")
-            .on_click(move |_, _window, cx| {
+            .on_click(move |_, window, cx| {
                 let sub_id = refresh_id.clone();
                 refresh_view.update(cx, |view, cx| {
-                    if let Some(sub) = view.store.get_subscription(&sub_id).unwrap_or(None) {
-                        view.start_subscription_refresh(sub, cx);
-                    }
+                    view.refresh_subscription_by_id(&sub_id, window, cx);
                 });
             }),
     );
@@ -536,14 +563,7 @@ fn subscription_row(
             .on_click(move |_, window, cx| {
                 let sub_id = auto_id.clone();
                 auto_view.update(cx, |view, cx| {
-                    if view
-                        .store
-                        .set_subscription_auto_refresh(&sub_id, !auto_now)
-                        .is_ok()
-                    {
-                        view.reload(cx);
-                    }
-                    view.reopen_subscriptions_if_open(window, cx);
+                    view.commit_subscription_auto(&sub_id, auto_now, window, cx);
                 });
             }),
     );
@@ -677,7 +697,18 @@ impl AppView {
                 .collect();
             view.health_store.hydrate(&kept);
         }
-        let rows = view.store.list().unwrap_or_default();
+        let rows = match view.store.list() {
+            Ok(rows) => rows,
+            // Ticket 14: a broken database must not render as a silent empty
+            // library.
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load library: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
         libraries.update(cx, |state, _| {
             state.delegate_mut().set_rows(rows);
         });
@@ -695,18 +726,36 @@ impl AppView {
         self.libraries.read(cx).delegate().selected_row()
     }
 
-    /// Reload rows from the store, keeping the selection by id.
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        self.drain_engine_logs();
-        self.poll_engine();
-        if let Ok(rows) = self.store.list() {
-            let health = self.health_map();
-            self.libraries.update(cx, |state, _| {
-                state.delegate_mut().set_rows(rows);
-                state.delegate_mut().set_health(health);
-            });
+    /// Reload rows from the store, keeping the selection by id. A list
+    /// failure notifies (never a silent empty list); callers without a
+    /// window (background ticks, headless refresh) use [`AppView::reload_quiet`].
+    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.reload_inner(cx) {
+            window.push_notification(
+                Notification::error(format!("Cannot load library: {error}")),
+                cx,
+            );
         }
         cx.notify();
+    }
+
+    /// Window-less reload for background ticks and headless paths: keeps the
+    /// last-good rows when the store fails (no window exists to notify).
+    fn reload_quiet(&mut self, cx: &mut Context<Self>) {
+        let _ = self.reload_inner(cx);
+        cx.notify();
+    }
+
+    fn reload_inner(&mut self, cx: &mut Context<Self>) -> Result<(), StoreError> {
+        self.drain_engine_logs();
+        self.poll_engine();
+        let rows = self.store.list()?;
+        let health = self.health_map();
+        self.libraries.update(cx, |state, _| {
+            state.delegate_mut().set_rows(rows);
+            state.delegate_mut().set_health(health);
+        });
+        Ok(())
     }
 
     fn report_save_error(&self, error: StoreError, window: &mut Window, cx: &mut App) {
@@ -721,7 +770,7 @@ impl AppView {
     ) -> bool {
         match self.store.add(input) {
             Ok(_) => {
-                self.reload(cx);
+                self.reload(window, cx);
                 true
             }
             Err(error) => {
@@ -740,7 +789,7 @@ impl AppView {
     ) -> bool {
         match self.store.update(id, patch) {
             Ok(_) => {
-                self.reload(cx);
+                self.reload(window, cx);
                 true
             }
             Err(error) => {
@@ -756,7 +805,7 @@ impl AppView {
                 self.libraries.update(cx, |state, _| {
                     state.delegate_mut().clear_selection();
                 });
-                self.reload(cx);
+                self.reload(window, cx);
             }
             Ok(false) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
@@ -768,10 +817,16 @@ impl AppView {
         }
     }
 
-    fn toggle_selected_enabled(&mut self, cx: &mut Context<Self>) {
-        if let Some(config) = self.selected_config(cx) {
-            if self.store.set_enabled(&config.id, !config.enabled).is_ok() {
-                self.reload(cx);
+    fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            return;
+        };
+        // Ticket 14: a failed write notifies (never a dead click).
+        match self.store.set_enabled(&config.id, !config.enabled) {
+            Ok(_) => self.reload(window, cx),
+            Err(error) => {
+                window
+                    .push_notification(Notification::error(format!("Cannot toggle: {error}")), cx);
             }
         }
     }
@@ -855,7 +910,7 @@ impl AppView {
         match self.engine.start_one(&config) {
             Ok(()) => {
                 let _ = self.store.set_enabled(id, true);
-                self.reload(cx);
+                self.reload(window, cx);
                 window.push_notification(
                     Notification::success(format!("Started \"{}\"", config.name)),
                     cx,
@@ -876,7 +931,7 @@ impl AppView {
         let id = config.id.clone();
         if self.engine.stop_one(&id) {
             let _ = self.store.set_enabled(&id, false);
-            self.reload(cx);
+            self.reload(window, cx);
             window.push_notification(
                 Notification::success(format!("Stopped \"{}\"", config.name)),
                 cx,
@@ -924,7 +979,7 @@ impl AppView {
                 for row in &rows {
                     let _ = self.store.set_enabled(&row.id, true);
                 }
-                self.reload(cx);
+                self.reload(window, cx);
                 self.warn_for_lan_binds(window, cx);
                 window.push_notification(
                     Notification::success(format!("Started {} endpoint(s)", rows.len())),
@@ -944,7 +999,7 @@ impl AppView {
         for row in &rows {
             let _ = self.store.set_enabled(&row.id, false);
         }
-        self.reload(cx);
+        self.reload(window, cx);
         window.push_notification(Notification::success("Stopped all endpoints"), cx);
     }
 
@@ -1019,7 +1074,7 @@ impl AppView {
         let outcomes = test_all(&rows, DEFAULT_TEST_URL, &mut *self.prober);
         self.record_and_persist(&outcomes);
         let (live, dead) = self.health_counts();
-        self.reload(cx);
+        self.reload(window, cx);
         window.push_notification(
             Notification::success(format!(
                 "Tested {} endpoint(s): {live} live · {dead} dead",
@@ -1048,7 +1103,7 @@ impl AppView {
             &mut *self.prober,
         );
         self.record_and_persist(&outcomes);
-        self.reload(cx);
+        self.reload(window, cx);
     }
 
     /// Ticket 06: TCP-ping just the selected config's endpoint.
@@ -1065,7 +1120,7 @@ impl AppView {
         }
         let outcomes = ping_all(std::slice::from_ref(&config), &mut *self.prober);
         self.record_and_persist(&outcomes);
-        self.reload(cx);
+        self.reload(window, cx);
     }
 
     /// Ticket 13: ingest buffered sidecar stderr into the session LogStore
@@ -1195,14 +1250,23 @@ impl AppView {
         let path = Store::default_export_path();
         match self.store.commit_export(&path, true) {
             Ok(Some(path)) => {
-                let count = self.store.list().map(|rows| rows.len()).unwrap_or(0);
-                window.push_notification(
-                    Notification::success(format!(
-                        "Exported {count} config(s) to {}",
-                        path.display()
-                    )),
-                    cx,
-                );
+                let rendered = path.display().to_string();
+                // Ticket 14: the export itself succeeded — name the path with
+                // the real count, or without a count when the count query
+                // fails (never claim "0 config(s)").
+                match self.store.list() {
+                    Ok(rows) => window.push_notification(
+                        Notification::success(format!(
+                            "Exported {} config(s) to {rendered}",
+                            rows.len()
+                        )),
+                        cx,
+                    ),
+                    Err(_) => window.push_notification(
+                        Notification::success(format!("Exported to {rendered}")),
+                        cx,
+                    ),
+                }
             }
             Ok(None) => {}
             Err(error) => {
@@ -1377,8 +1441,20 @@ impl AppView {
     ) -> bool {
         let trimmed = text.trim();
         if !trimmed.is_empty() && !trimmed.contains('\n') && file_hint.is_none() {
-            if let Ok(request) = parse_addsub_link(trimmed) {
-                return self.commit_addsub_request(request, window, cx);
+            // Ticket 14: only addsub lines divert; a malformed one reports
+            // its own parse reason (never the generic unknown-command) and
+            // keeps the dialog open.
+            if is_addsub_attempt(trimmed) {
+                return match parse_addsub_link(trimmed) {
+                    Ok(request) => self.commit_addsub_request(request, window, cx),
+                    Err(error) => {
+                        window.push_notification(
+                            Notification::error(addsub_error_message(&error)),
+                            cx,
+                        );
+                        false
+                    }
+                };
             }
         }
         let batch = match file_hint {
@@ -1387,20 +1463,27 @@ impl AppView {
         };
         match commit_batch(&mut self.store, batch, &group) {
             Ok(outcome) => {
-                self.reload(cx);
+                self.reload(window, cx);
+                // Ticket 14: total failure keeps the dialog open and lists
+                // every failure (index/label/reason), not just the first.
+                if outcome.imported == 0 && !outcome.failures.is_empty() {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Import failed: {}",
+                            format_import_failures(&outcome.failures)
+                        )),
+                        cx,
+                    );
+                    return false;
+                }
                 let mut summary = format!(
                     "Imported {} · {} duplicates skipped · {} failed",
                     outcome.imported,
                     outcome.duplicates,
                     outcome.failures.len()
                 );
-                if let Some(first) = outcome.failures.first() {
-                    summary.push_str(&format!(
-                        " — item {} ({}): {}",
-                        first.index + 1,
-                        first.label,
-                        first.reason
-                    ));
+                if !outcome.failures.is_empty() {
+                    summary.push_str(&format!(" — {}", format_import_failures(&outcome.failures)));
                 }
                 if outcome.failures.is_empty() {
                     window.push_notification(Notification::success(summary), cx);
@@ -1443,7 +1526,7 @@ impl AppView {
     ) -> bool {
         match self.store.add_subscription(&label, &url, &group, true) {
             Ok(sub) => {
-                self.reload(cx);
+                self.reload(window, cx);
                 window.push_notification(
                     Notification::success(format!(
                         "Subscription \"{}\" added — refreshing",
@@ -1459,6 +1542,50 @@ impl AppView {
                 false
             }
         }
+    }
+
+    /// Ticket 14: manual per-row refresh with truthful outcomes — a missing
+    /// subscription warns (it was already removed), a store failure names
+    /// the error (never a dead click).
+    fn refresh_subscription_by_id(
+        &mut self,
+        sub_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.get_subscription(sub_id) {
+            Ok(Some(sub)) => self.start_subscription_refresh(sub, cx),
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot refresh subscription: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ticket 14: auto-refresh toggle with truthful outcomes (never a dead
+    /// click on store failure).
+    fn commit_subscription_auto(
+        &mut self,
+        sub_id: &str,
+        auto_now: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.set_subscription_auto_refresh(sub_id, !auto_now) {
+            Ok(_) => self.reload(window, cx),
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot change auto-refresh: {error}")),
+                    cx,
+                );
+            }
+        }
+        self.reopen_subscriptions_if_open(window, cx);
     }
 
     /// Ticket 04: fetch one subscription without blocking the UI, then merge
@@ -1504,10 +1631,29 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ticket 14: the subscription may have been deleted while the fetch
+        // was in flight — drop the result silently (no failure toast for a
+        // sub the user removed on purpose). A store failure here still
+        // surfaces instead of silently swallowing the completion.
+        match self.store.get_subscription(sub_id) {
+            Ok(None) => {
+                self.reload(window, cx);
+                self.reopen_subscriptions_if_open(window, cx);
+                return;
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot refresh subscription: {error}")),
+                    cx,
+                );
+                return;
+            }
+            Ok(Some(_)) => {}
+        }
         match fetched {
             Ok(body) => match self.store.refresh_with_body(sub_id, &body, now) {
                 Ok(outcome) => {
-                    self.reload(cx);
+                    self.reload(window, cx);
                     if let Some(error) = outcome.error {
                         window.push_notification(
                             Notification::error(format!("{label}: refresh failed ({error})")),
@@ -1533,17 +1679,33 @@ impl AppView {
                     }
                 }
                 Err(error) => {
+                    if matches!(error, StoreError::NotFound(_)) {
+                        // Deleted between the check above and the merge.
+                        self.reload(window, cx);
+                    } else {
+                        window.push_notification(
+                            Notification::error(format!("{label}: refresh failed ({error})")),
+                            cx,
+                        );
+                    }
+                }
+            },
+            Err(error) => match self.store.record_subscription_error(sub_id, &error) {
+                Ok(_) => {
+                    self.reload(window, cx);
+                    window.push_notification(Notification::error(format!("{label}: {error}")), cx);
+                }
+                Err(StoreError::NotFound(_)) => {
+                    // Deleted mid-flight: silent, like the pre-check arm.
+                    self.reload(window, cx);
+                }
+                Err(db_error) => {
                     window.push_notification(
-                        Notification::error(format!("{label}: refresh failed ({error})")),
+                        Notification::error(format!("Cannot refresh subscription: {db_error}")),
                         cx,
                     );
                 }
             },
-            Err(error) => {
-                let _ = self.store.record_subscription_error(sub_id, &error);
-                self.reload(cx);
-                window.push_notification(Notification::error(format!("{label}: {error}")), cx);
-            }
         }
         self.reopen_subscriptions_if_open(window, cx);
     }
@@ -1564,7 +1726,7 @@ impl AppView {
                 let _ = self.store.record_subscription_error(sub_id, &error);
             }
         }
-        self.reload(cx);
+        self.reload_quiet(cx);
     }
 
     /// Ticket 04: re-render the subscriptions dialog after an action, but
@@ -1583,8 +1745,28 @@ impl AppView {
         let form = SubForm::blank(window, cx);
         let view = cx.entity();
         let reader = form.clone();
-        let subs = self.store.list_subscriptions().unwrap_or_default();
-        let rows = self.store.list().unwrap_or_default();
+        let subs = match self.store.list_subscriptions() {
+            Ok(subs) => subs,
+            // Ticket 14: a broken database must not render as a lying empty
+            // state — the dialog still opens (form usable) plus a notice.
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load subscriptions: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
+        let rows = match self.store.list() {
+            Ok(rows) => rows,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load library: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
         let mut counts: HashMap<String, usize> = HashMap::new();
         for row in &rows {
             if let Some(owner) = row.subscription_id.as_deref() {
@@ -1625,6 +1807,32 @@ impl AppView {
         });
     }
 
+    /// Ticket 14: truthful remove-subscription outcome — success reloads, an
+    /// already-gone row warns "Already removed", and any store failure names
+    /// the error (never "Already removed", which would lie about an `Err`).
+    fn commit_subscription_remove(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.remove_subscription(id) {
+            Ok(true) => {
+                self.reload(window, cx);
+            }
+            Ok(false) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot remove subscription: {error}")),
+                    cx,
+                );
+            }
+        }
+        self.reopen_subscriptions_if_open(window, cx);
+    }
+
     /// Ticket 04: confirm removing a subscription. Members stay in the
     /// library as hand-owned configs (release, never delete).
     fn open_subscription_remove_confirm(
@@ -1647,18 +1855,7 @@ impl AppView {
                 ))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
-                        match view.store.remove_subscription(&id) {
-                            Ok(true) => {
-                                view.reload(cx);
-                            }
-                            _ => {
-                                window.push_notification(
-                                    Notification::warning("Already removed"),
-                                    cx,
-                                );
-                            }
-                        }
-                        view.reopen_subscriptions_if_open(window, cx);
+                        view.commit_subscription_remove(&id, window, cx);
                     });
                     true
                 })
@@ -1705,7 +1902,7 @@ impl AppView {
             return None;
         }
         let cause = self.poll_engine();
-        self.reload(cx);
+        self.reload_quiet(cx);
         cause
     }
 
@@ -1740,7 +1937,7 @@ impl AppView {
         let outcomes = test_all(&rows, DEFAULT_TEST_URL, &mut *self.prober);
         let count = outcomes.len();
         self.record_and_persist(&outcomes);
-        self.reload(cx);
+        self.reload_quiet(cx);
         count
     }
 
@@ -1808,12 +2005,22 @@ impl AppView {
                         Switch::new(switch_id)
                             .checked(config.enabled)
                             .label("Enabled")
-                            .on_change(move |enabled: &bool, _window, cx| {
+                            .on_change(move |enabled: &bool, window, cx| {
                                 let enabled = *enabled;
                                 let id = switch_id_for_handler.clone();
                                 switch_view.update(cx, |view, cx| {
-                                    if view.store.set_enabled(&id, enabled).is_ok() {
-                                        view.reload(cx);
+                                    // Ticket 14: a failed write notifies
+                                    // (never a dead switch).
+                                    match view.store.set_enabled(&id, enabled) {
+                                        Ok(_) => view.reload(window, cx),
+                                        Err(error) => {
+                                            window.push_notification(
+                                                Notification::error(format!(
+                                                    "Cannot toggle: {error}"
+                                                )),
+                                                cx,
+                                            );
+                                        }
                                     }
                                 });
                             }),
@@ -1821,8 +2028,8 @@ impl AppView {
                     .child(
                         Button::new("toggle-enabled")
                             .label(toggle_label)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.toggle_selected_enabled(cx);
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.toggle_selected_enabled(window, cx);
                             })),
                     )
                     .child(
@@ -2656,12 +2863,12 @@ mod tests {
         assert_eq!(beta_lines, 0, "no cross-config attribution");
 
         // The dialog renders the live lines for the selected row.
-        cx.update(|_, cx| {
+        cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, _| {
                     state.delegate_mut().selected = Some(IndexPath::new(0));
                 });
-                view.reload(cx);
+                view.reload(window, cx);
             });
         });
         cx.update(|window, cx| {
@@ -3131,5 +3338,360 @@ mod tests {
         cx.run_until_parked();
 
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    // -- Ticket 14: import-safety ------------------------------------------
+
+    use gpui_kit::VisualTestContext;
+
+    fn mount_view(
+        store: Store,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppView>, &mut VisualTestContext) {
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+        (view, cx)
+    }
+
+    fn notification_count(cx: &mut VisualTestContext) -> usize {
+        cx.update(|window, cx| window.notifications(cx).len())
+    }
+
+    /// Scenario: subscription URL with userinfo → userinfo never displayed.
+    #[test]
+    fn redact_subscription_url_strips_userinfo() {
+        use crate::redact_subscription_url;
+        let shown =
+            redact_subscription_url("https://user:hunter2@example.com:8443/sub?token=abc#frag");
+        assert!(!shown.contains("hunter2"), "no password: {shown}");
+        assert!(!shown.contains("user:"), "no userinfo: {shown}");
+        assert!(!shown.contains("token=abc"), "no query: {shown}");
+        assert!(!shown.contains("#frag"), "no fragment: {shown}");
+        assert_eq!(shown, "https://example.com:8443/sub");
+        assert_eq!(
+            redact_subscription_url("https://example.com/sub"),
+            "https://example.com/sub"
+        );
+        let long = format!("https://user:pw@example.com/{}", "x".repeat(200));
+        let shown = redact_subscription_url(&long);
+        assert!(
+            !shown.contains("user:pw"),
+            "stripped before truncate: {shown}"
+        );
+        assert!(shown.ends_with('…'), "still truncated: {shown}");
+    }
+
+    /// Scenario: bad addsub link → original reason, never generic
+    /// unknown-command.
+    #[test]
+    fn addsub_error_message_surfaces_original_reason() {
+        use crate::addsub_error_message;
+        use crate::import::parse_addsub_link;
+        let bad_b64 = parse_addsub_link("throne://addsub/!!!").expect_err("bad base64 fails");
+        let text = addsub_error_message(&bad_b64);
+        assert!(
+            text.contains("bad-base64"),
+            "original kind kept, got {text}"
+        );
+        assert!(
+            !text.contains("unknown throne command"),
+            "not generic: {text}"
+        );
+        let bad_host = parse_addsub_link("throne://addsub/aGk").expect_err("non-http fails");
+        let text = addsub_error_message(&bad_host);
+        assert!(text.contains("bad-host"), "original kind kept, got {text}");
+    }
+
+    /// Scenario: paste with all-invalid items → dialog stays open (false),
+    /// one notification, nothing stored.
+    #[gpui_kit::test]
+    fn import_commit_all_invalid_stays_open(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let body = "vless://not-a-uuid@b.example.com:notaport#bad\nbogus://x\ntrojan://pw@c.example.com:99999";
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import(body.to_string(), "g".to_string(), None, window, cx)
+            })
+        });
+        assert!(!closed, "total failure keeps the dialog open");
+        assert_eq!(notification_count(cx), 1, "all failures in one notice");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "nothing stored"
+        );
+    }
+
+    /// Scenario: bad addsub link → dialog stays open with the original
+    /// reason instead of the generic unknown-command.
+    #[gpui_kit::test]
+    fn import_commit_bad_addsub_stays_open(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import(
+                    "throne://addsub/!!!".to_string(),
+                    "g".to_string(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!closed, "bad addsub keeps the dialog open");
+        assert_eq!(notification_count(cx), 1);
+    }
+
+    /// A non-addsub all-invalid single line still takes the generic import
+    /// path — and stays open too.
+    #[gpui_kit::test]
+    fn import_commit_generic_single_invalid_stays_open(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import("bogus://x".to_string(), "g".to_string(), None, window, cx)
+            })
+        });
+        assert!(!closed, "all-invalid single line stays open too");
+        assert_eq!(notification_count(cx), 1);
+    }
+
+    /// Scenario: DB error on toggle → error notification, flag unchanged
+    /// (never a dead click).
+    #[gpui_kit::test]
+    fn db_error_on_toggle_notifies(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+                view.store
+                    .set_query_only_for_test()
+                    .expect("readonly works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.toggle_selected_enabled(window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "toggle failure notifies");
+        let enabled = view.read_with(cx, |view, cx| {
+            view.selected_config(cx).map(|row| row.enabled)
+        });
+        assert_eq!(enabled, Some(false), "failed toggle changes nothing");
+    }
+
+    /// Scenario: DB error on list → error notification, never a silent
+    /// empty list.
+    #[gpui_kit::test]
+    fn db_error_on_reload_notifies(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.break_schema_for_test().expect("break works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reload(window, cx));
+        });
+        assert!(notification_count(cx) >= 1, "list failure notifies");
+    }
+
+    /// Scenario: DB error on manual refresh → error notification, never a
+    /// dead click.
+    #[gpui_kit::test]
+    fn db_error_on_subscription_refresh_notifies(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.break_schema_for_test().expect("break works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.refresh_subscription_by_id(&sub_id, window, cx)
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "refresh failure notifies");
+    }
+
+    /// A refresh for an unknown id warns without touching the network.
+    #[gpui_kit::test]
+    fn refresh_unknown_subscription_warns_without_fetch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.refresh_subscription_by_id("999", window, cx)
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "gone sub warns, no fetch");
+    }
+
+    /// Scenario: DB error on the auto-refresh toggle → error notification.
+    #[gpui_kit::test]
+    fn db_error_on_subscription_auto_toggle_notifies(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.break_schema_for_test().expect("break works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_subscription_auto(&sub_id, true, window, cx)
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "auto-toggle failure notifies");
+    }
+
+    /// Scenario: remove subscription with a broken store → error
+    /// notification, never "Already removed".
+    #[gpui_kit::test]
+    fn remove_subscription_db_error_is_truthful(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.break_schema_for_test().expect("break works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_subscription_remove(&sub_id, window, cx)
+            });
+        });
+        // Exactly one notice: the store truthfully reports Err (never
+        // Ok(false)), so the error arm fires — pinned at the store seam too.
+        assert_eq!(notification_count(cx), 1);
+    }
+
+    /// Scenario: subscriptions dialog with a broken store → dialog still
+    /// opens (form usable) plus an error notification, never a lying empty
+    /// state.
+    #[gpui_kit::test]
+    fn subscriptions_dialog_db_error_notifies(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.break_schema_for_test().expect("break works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(notification_count(cx) >= 1, "listing failure notifies");
+    }
+
+    /// Scenario: background refresh for a deleted sub → silently ignored,
+    /// no failure toast, for both body and fetch-error completions.
+    #[gpui_kit::test]
+    fn background_refresh_deleted_sub_is_silent(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let label = sub.label.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store
+                    .remove_subscription(&sub_id)
+                    .expect("remove works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    &label,
+                    Ok("bogus://x".to_string()),
+                    999,
+                    window,
+                    cx,
+                );
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    &label,
+                    Err("subscription fetch failed".to_string()),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 0, "deleted sub: no failure toast");
+    }
+
+    /// Guard: a live subscription's refresh failure still notifies.
+    #[gpui_kit::test]
+    fn background_refresh_live_sub_failure_still_notifies(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let label = sub.label.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    &label,
+                    Ok("bogus://x\nbogus://y".to_string()),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "live sub failure notifies");
     }
 }

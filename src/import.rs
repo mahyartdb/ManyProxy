@@ -146,6 +146,25 @@ pub struct ImportOutcome {
     pub failures: Vec<ImportFailure>,
 }
 
+/// Ticket 14: render every batch failure as
+/// `item {1-based index} ({label}): {reason}`, joined for notifications.
+/// Labels arrive redacted from the import path (see [`redact_link`]); reasons
+/// never echo credentials by construction of the error taxonomy.
+pub fn format_import_failures(failures: &[ImportFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "item {} ({}): {}",
+                failure.index + 1,
+                failure.label,
+                failure.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 // ---------------------------------------------------------------------------
 // Small codecs
 // ---------------------------------------------------------------------------
@@ -1576,6 +1595,26 @@ pub struct AddSubRequest {
     pub group: String,
 }
 
+/// Ticket 14: single-line `throne://addsub/...` routing check (scheme and
+/// command both case-insensitive). Only these lines divert to the
+/// subscription intake; a malformed one reports its own
+/// [`parse_addsub_link`] reason instead of falling through to the generic
+/// unknown-command failure.
+pub fn is_addsub_attempt(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(sep) = trimmed.find("://") else {
+        return false;
+    };
+    if !trimmed[..sep].eq_ignore_ascii_case("throne") {
+        return false;
+    }
+    trimmed[sep + 3..]
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("addsub")
+}
+
 /// Parse `throne://addsub/<standard-base64 of "<url>[#group]">`
 /// (case-insensitive command). Unlike `throne://add`, the payload alphabet is
 /// standard base64 ONLY: urlsafe bytes (`-`, `_`) are rejected as bad base64.
@@ -2788,5 +2827,44 @@ mod tests {
         assert_eq!(out.configs.len(), 2);
         assert_eq!(out.configs[0].protocol, "xray");
         assert_eq!(out.configs[1].protocol, "extra-core");
+    }
+
+    // -- ticket 14: import-safety ------------------------------------------
+
+    /// Only single-line `throne://addsub/...` routes to the subscription
+    /// intake; every other single line keeps the generic import path.
+    #[test]
+    fn is_addsub_attempt_routes_only_addsub_lines() {
+        assert!(is_addsub_attempt("throne://addsub/aGk"));
+        assert!(is_addsub_attempt("  THRONE://ADDSUB/aGk  "));
+        assert!(is_addsub_attempt("throne://addsub"));
+        assert!(!is_addsub_attempt("throne://add/aGk"));
+        assert!(!is_addsub_attempt("throne://route/aGk"));
+        assert!(!is_addsub_attempt("vless://x@y.example.com:443"));
+        assert!(!is_addsub_attempt("not a link"));
+        assert!(!is_addsub_attempt(""));
+    }
+
+    /// Total failure renders every item with index/label/reason and no
+    /// credentials (labels arrive redacted from the import path).
+    #[test]
+    fn format_import_failures_lists_every_item_credential_free() {
+        let body = "vless://not-a-uuid@b.example.com:notaport?security=reality&pbk=hunter2-public-key#bad\nbogus://x\ntrojan://s3cret-pw@c.example.com:99999";
+        let out = import_text(body);
+        assert_eq!(out.configs.len(), 0);
+        assert_eq!(out.failures.len(), 3);
+        let text = format_import_failures(&out.failures);
+        for (n, failure) in out.failures.iter().enumerate() {
+            assert!(
+                text.contains(&format!("item {}", n + 1)),
+                "index in: {text}"
+            );
+            assert!(text.contains(&failure.label), "label in: {text}");
+            assert!(text.contains(&failure.reason), "reason in: {text}");
+        }
+        for canary in ["not-a-uuid", "hunter2-public-key", "s3cret-pw"] {
+            assert!(!text.contains(canary), "leak in {text}");
+        }
+        assert!(text.contains("b.example.com"), "host kept: {text}");
     }
 }
