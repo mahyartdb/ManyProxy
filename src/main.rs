@@ -5,7 +5,9 @@ mod health;
 mod import;
 mod store;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,8 +29,8 @@ use engine::{
     EngineController, LAN_CONFIRM_TITLE,
 };
 use health::{
-    ping_all, test_all, HealthProber, HealthStore, LogStore, RealHealthProber, TestOutcome,
-    DEFAULT_TEST_URL,
+    ping_all, test_all, truncate, HealthProber, HealthStore, LogStore, RealHealthProber,
+    TestOutcome, DEFAULT_TEST_URL,
 };
 use import::{
     commit_batch, effective_hint_for_text, format_import_failures, import_file_content,
@@ -91,17 +93,14 @@ impl LibraryDelegate {
     }
 
     fn apply_filter(&mut self) {
-        let query = self.query.trim().to_lowercase();
+        let query = self.query.clone();
         self.visible = self
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| {
-                query.is_empty()
-                    || row.name.to_lowercase().contains(&query)
-                    || row.protocol.to_lowercase().contains(&query)
-                    || row.group.to_lowercase().contains(&query)
-            })
+            // Ticket 17: search covers host/bind/port, not just
+            // name/protocol/group (see [`library_row_matches`]).
+            .filter(|(_, row)| library_row_matches(row, &query))
             .map(|(index, _)| index)
             .collect();
         if let Some(selected) = self.selected {
@@ -297,8 +296,11 @@ impl ConfigForm {
     }
 
     /// Consumes a clone; every built element owns its state entity.
-    fn element(self) -> impl IntoElement {
-        div()
+    /// Ticket 17: appends the inline LAN-confirm hint when the current bind
+    /// is non-loopback (rebuilt on every render, so it tracks typing).
+    fn element(self, cx: &App) -> impl IntoElement {
+        let bind = self.bind.read(cx).value().to_string();
+        let mut col = div()
             .flex()
             .flex_col()
             .gap_2()
@@ -307,7 +309,11 @@ impl ConfigForm {
             .child(dialog_field("field-params", "Params", self.params))
             .child(dialog_field("field-group", "Group", self.group))
             .child(dialog_field("field-bind", "Bind address", self.bind))
-            .child(dialog_field("field-port", "Port", self.port))
+            .child(dialog_field("field-port", "Port", self.port));
+        if let Some(hint) = lan_hint_for_bind(&bind) {
+            col = col.child(div().id("lan-hint").test_support().child(hint));
+        }
+        col
     }
 
     fn as_new(&self, cx: &App) -> NewConfig {
@@ -386,8 +392,14 @@ impl ImportForm {
     }
 
     /// Consumes a clone; every built element owns its state entity.
-    fn element(self) -> impl IntoElement {
-        div()
+    /// Ticket 17: shows the live `X valid · Y invalid` preview (rebuilt on
+    /// every render from the current box contents, so it tracks typing and
+    /// pasting) plus the dropped file names when present. The preview is
+    /// inline text, never a toast.
+    fn element(self, cx: &App) -> impl IntoElement {
+        let text = self.text.read(cx).value().to_string();
+        let (valid, invalid) = import_preview_counts(&text, self.file_hint.as_deref());
+        let mut col = div()
             .flex()
             .flex_col()
             .gap_2()
@@ -402,6 +414,18 @@ impl ImportForm {
                     .child(Textarea::new(&self.text).h(px(160.))),
             )
             .child(dialog_field("field-import-group", "Group", self.group))
+            .child(
+                div()
+                    .id("import-preview")
+                    .test_support()
+                    .child(import_preview_message(valid, invalid)),
+            );
+        if let Some(files) =
+            import_files_label(self.file_hint.as_deref(), self.multi_files.as_deref())
+        {
+            col = col.child(div().id("import-files").test_support().child(files));
+        }
+        col
     }
 }
 
@@ -488,6 +512,182 @@ fn export_count_message(total: usize, importable: usize, path: &str) -> String {
     }
 }
 
+/// Ticket 17: success toast copy naming the affected row (add/edit/remove
+/// each name their row; no toast fires on keystrokes or dialog opens).
+fn config_added_message(name: &str) -> String {
+    format!("Added \"{name}\"")
+}
+
+/// Ticket 17: see [`config_added_message`].
+fn config_updated_message(name: &str) -> String {
+    format!("Updated \"{name}\"")
+}
+
+/// Ticket 17: see [`config_added_message`].
+fn config_removed_message(name: &str) -> String {
+    format!("Removed \"{name}\"")
+}
+
+/// Ticket 17: live import preview counts, reusing the parser read-only (no
+/// store writes, no toasts — the dialog renders these as inline text).
+fn import_preview_counts(text: &str, file_hint: Option<&str>) -> (usize, usize) {
+    let batch = match effective_hint_for_text(file_hint, text) {
+        Some(name) => import_file_content(&name, text),
+        None => import_text(text),
+    };
+    (batch.configs.len(), batch.failures.len())
+}
+
+/// Ticket 17: the inline preview line (`X valid · Y invalid`).
+fn import_preview_message(valid: usize, invalid: usize) -> String {
+    format!("{valid} valid · {invalid} invalid")
+}
+
+/// Ticket 17: basename of a dropped path (dialogs show file names, never
+/// full paths — paths can carry OS usernames).
+fn file_basename(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+/// Ticket 17: file-names line for the import dialog after a drop (`None`
+/// when nothing was dropped).
+fn import_files_label(
+    file_hint: Option<&str>,
+    multi_files: Option<&[(String, String)]>,
+) -> Option<String> {
+    if let Some(files) = multi_files {
+        let names: Vec<String> = files.iter().map(|(name, _)| file_basename(name)).collect();
+        if names.is_empty() {
+            None
+        } else {
+            Some(format!("Files: {}", names.join(", ")))
+        }
+    } else {
+        file_hint.map(|name| format!("File: {}", file_basename(name)))
+    }
+}
+
+/// Ticket 17: export dialog preview — row counts plus the destination path,
+/// with an overwrite warning when the file already exists. The plaintext
+/// warning itself stays verbatim ([`export_confirm_description`]); this line
+/// is appended after it.
+fn export_preview_description(total: usize, importable: usize, path: &str, exists: bool) -> String {
+    let mut out = if importable == total {
+        format!("{total} config(s) → {path}")
+    } else {
+        format!("{total} config(s) ({importable} importable) → {path}")
+    };
+    if exists {
+        out.push_str(&format!(" — {path} already exists and will be overwritten"));
+    }
+    out
+}
+
+/// Ticket 17: per-subscription item failures line (renders the stored
+/// failures vec, not just a count). Empty when there is nothing to show.
+fn subscription_failures_text(failures: &[crate::import::ImportFailure]) -> String {
+    if failures.is_empty() {
+        String::new()
+    } else {
+        truncate(
+            &format!(
+                "item failures ({}): {}",
+                failures.len(),
+                format_import_failures(failures)
+            ),
+            400,
+        )
+    }
+}
+
+/// Ticket 17: one coalesced background-tick summary for N refreshes.
+/// `None` when there is nothing to report (never an empty toast).
+/// The bool is the warning flag (any failed member warns).
+fn coalesced_refresh_message(
+    subs: usize,
+    added: usize,
+    updated: usize,
+    removed: usize,
+    failed: usize,
+) -> Option<(bool, String)> {
+    if subs == 0 {
+        return None;
+    }
+    let text =
+        format!("Background refresh: {subs} subscription(s): +{added} ~{updated} -{removed}");
+    if failed == 0 {
+        Some((false, text))
+    } else {
+        Some((true, format!("{text} · {failed} failed")))
+    }
+}
+
+/// Ticket 17: honest start-all copy — never "Started 0".
+fn start_all_message(count: usize) -> String {
+    if count == 0 {
+        "Nothing to start — the library is empty".to_string()
+    } else {
+        format!("Started {count} endpoint(s)")
+    }
+}
+
+/// Ticket 17: honest stop-all copy — never a success claim over silence.
+fn stop_all_message(running: usize) -> String {
+    if running == 0 {
+        "Nothing to stop — no endpoints are running".to_string()
+    } else {
+        "Stopped all endpoints".to_string()
+    }
+}
+
+/// Ticket 17: honest stop-on-stopped copy naming the row.
+fn already_stopped_message(name: &str) -> String {
+    format!("\"{name}\" is already stopped")
+}
+
+/// Ticket 17: a library row matches the search query by name, protocol,
+/// group, bind address, port, or upstream host (the `server`/`address` inside
+/// params — never credential fields).
+fn library_row_matches(row: &ProxyConfig, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    if row.name.to_lowercase().contains(&q)
+        || row.protocol.to_lowercase().contains(&q)
+        || row.group.to_lowercase().contains(&q)
+        || row.bind_ip.to_lowercase().contains(&q)
+        || row.port.to_string().contains(&q)
+    {
+        return true;
+    }
+    if let Ok(serde_json::Value::Object(map)) =
+        serde_json::from_str::<serde_json::Value>(&row.params)
+    {
+        for key in ["server", "address"] {
+            if let Some(serde_json::Value::String(host)) = map.get(key) {
+                if host.to_lowercase().contains(&q) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Ticket 17: inline LAN-confirm hint for add/edit dialogs. `Some` when
+/// starting this bind will stop at the LAN confirm gate; `None` for
+/// loopback and for blank (blank means the loopback default).
+fn lan_hint_for_bind(bind: &str) -> Option<String> {
+    if bind.trim().is_empty() || !requires_lan_confirm(bind) {
+        return None;
+    }
+    Some(format!(
+        "Starting on {} needs a LAN confirm — anyone on the network could use it",
+        bind.trim()
+    ))
+}
+
 /// Ticket 04: fetch a subscription body over the platform HTTP client.
 /// Errors are generic on purpose (never echo the URL: tokens hide in
 /// queries). Bodies are capped at 8 MiB and must be UTF-8; anything else is
@@ -531,11 +731,16 @@ async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Resu
 }
 
 /// Handles to the subscription add form inside the subscriptions dialog.
+/// Ticket 17: `auto_refresh` is the add-form checkbox state (default on —
+/// no more create-then-toggle). A shared cell (not an entity): the dialog
+/// builder reads it on every render and the toggle writes it on click; the
+/// OK handler commits whatever it holds.
 #[derive(Clone)]
 struct SubForm {
     label: Entity<InputState>,
     url: Entity<InputState>,
     group: Entity<InputState>,
+    auto_refresh: Rc<RefCell<bool>>,
 }
 
 impl SubForm {
@@ -548,11 +753,14 @@ impl SubForm {
                     .placeholder("Group")
                     .default_value(DEFAULT_GROUP)
             }),
+            auto_refresh: Rc::new(RefCell::new(true)),
         }
     }
 
     /// Consumes a clone; every built element owns its state entity.
     fn element(self) -> impl IntoElement {
+        let auto = self.auto_refresh.clone();
+        let checked = *auto.borrow();
         div()
             .flex()
             .flex_col()
@@ -560,6 +768,16 @@ impl SubForm {
             .child(dialog_field("field-sub-label", "Label", self.label))
             .child(dialog_field("field-sub-url", "Subscription URL", self.url))
             .child(dialog_field("field-sub-group", "Group", self.group))
+            .child(
+                div().id("field-sub-auto").test_support().child(
+                    Switch::new("sub-auto-add")
+                        .checked(checked)
+                        .label("Auto-refresh")
+                        .on_change(move |next: &bool, _, _| {
+                            *auto.borrow_mut() = *next;
+                        }),
+                ),
+            )
     }
 }
 
@@ -586,6 +804,17 @@ fn subscription_row(
         ));
     if let Some(error) = sub.last_error.as_deref() {
         row = row.child(format!("last error: {error}"));
+    }
+    // Ticket 17: item failures viewable per subscription (the stored vec,
+    // not just the aggregated count).
+    let failures = subscription_failures_text(&sub.failures);
+    if !failures.is_empty() {
+        row = row.child(
+            div()
+                .id(format!("sub-failures-{}", sub.id))
+                .test_support()
+                .child(failures),
+        );
     }
     let refresh_view = view.clone();
     let refresh_id = sub.id.clone();
@@ -677,6 +906,16 @@ struct AppView {
     log_filter: String,
     prober: Box<dyn HealthProber>,
     ticks_enabled: bool,
+    /// Ticket 17: background-refresh toast coalescing. `refresh_batch_members`
+    /// holds the in-flight background member ids; completions for members
+    /// accumulate counts instead of notifying, and the last member flushes at
+    /// most one toast. Manual refreshes notify immediately as before.
+    refresh_batch_total: usize,
+    refresh_batch_members: HashSet<String>,
+    refresh_batch_added: usize,
+    refresh_batch_updated: usize,
+    refresh_batch_removed: usize,
+    refresh_batch_failed: usize,
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
@@ -717,6 +956,12 @@ impl AppView {
             log_filter: String::new(),
             prober: Box::new(RealHealthProber::default()),
             ticks_enabled: true,
+            refresh_batch_total: 0,
+            refresh_batch_members: HashSet::new(),
+            refresh_batch_added: 0,
+            refresh_batch_updated: 0,
+            refresh_batch_removed: 0,
+            refresh_batch_failed: 0,
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
@@ -807,6 +1052,8 @@ impl AppView {
         window.push_notification(Notification::error(format!("Cannot save: {error}")), cx);
     }
 
+    /// Ticket 17: success names the row (informational toast, never a
+    /// blocking modal; nothing fires on keystrokes).
     fn commit_add(
         &mut self,
         input: NewConfig,
@@ -814,8 +1061,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> bool {
         match self.store.add(input) {
-            Ok(_) => {
+            Ok(created) => {
+                let message = config_added_message(&created.name);
                 self.reload(window, cx);
+                window.push_notification(Notification::success(message), cx);
                 true
             }
             Err(error) => {
@@ -833,8 +1082,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> bool {
         match self.store.update(id, patch) {
-            Ok(_) => {
+            Ok(updated) => {
+                let message = config_updated_message(&updated.name);
                 self.reload(window, cx);
+                window.push_notification(Notification::success(message), cx);
                 true
             }
             Err(error) => {
@@ -845,12 +1096,21 @@ impl AppView {
     }
 
     fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Ticket 17: the toast names the row (looked up before the delete).
+        let name = self
+            .store
+            .get(id)
+            .ok()
+            .flatten()
+            .map(|row| row.name)
+            .unwrap_or_else(|| id.to_string());
         match self.store.remove(id) {
             Ok(true) => {
                 self.libraries.update(cx, |state, _| {
                     state.delegate_mut().clear_selection();
                 });
                 self.reload(window, cx);
+                window.push_notification(Notification::success(config_removed_message(&name)), cx);
             }
             Ok(false) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
@@ -981,6 +1241,13 @@ impl AppView {
                 Notification::success(format!("Stopped \"{}\"", config.name)),
                 cx,
             );
+        } else {
+            // Ticket 17: honest stop-on-stopped (never silence, never a
+            // success claim over nothing).
+            window.push_notification(
+                Notification::warning(already_stopped_message(&config.name)),
+                cx,
+            );
         }
     }
 
@@ -1017,8 +1284,13 @@ impl AppView {
 
     /// Ticket 09: the actual start-all (post-gate). Rows are re-listed so a
     /// confirmed dialog never starts a stale set.
+    /// Ticket 17: an empty library warns honestly (never "Started 0").
     fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.store.list().unwrap_or_default();
+        if rows.is_empty() {
+            window.push_notification(Notification::warning(start_all_message(0)), cx);
+            return;
+        }
         match self.engine.start_all(&rows) {
             Ok(()) => {
                 for row in &rows {
@@ -1026,10 +1298,7 @@ impl AppView {
                 }
                 self.reload(window, cx);
                 self.warn_for_lan_binds(window, cx);
-                window.push_notification(
-                    Notification::success(format!("Started {} endpoint(s)", rows.len())),
-                    cx,
-                );
+                window.push_notification(Notification::success(start_all_message(rows.len())), cx);
             }
             Err(error) => {
                 window.push_notification(Notification::error(error.to_string()), cx);
@@ -1038,14 +1307,22 @@ impl AppView {
     }
 
     /// Ticket 05: stop everything and take the sidecar down.
+    /// Ticket 17: honest when nothing runs (never a success claim over
+    /// silence).
     fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let running = self.engine.running_count();
         self.engine.stop_all();
         let rows = self.store.list().unwrap_or_default();
         for row in &rows {
             let _ = self.store.set_enabled(&row.id, false);
         }
         self.reload(window, cx);
-        window.push_notification(Notification::success("Stopped all endpoints"), cx);
+        let message = stop_all_message(running);
+        if running == 0 {
+            window.push_notification(Notification::warning(message), cx);
+        } else {
+            window.push_notification(Notification::success(message), cx);
+        }
     }
 
     /// Ticket 06: stored rows backing the running endpoints (each probe
@@ -1272,9 +1549,19 @@ impl AppView {
     /// (the [`store::export_warning_text`] verbatim); confirming writes the
     /// file, dismissing writes nothing. The payload round-trips through the
     /// import grammar (re-import yields duplicates, never adds).
+    /// Ticket 17: the dialog previews row counts, the destination path, and
+    /// an overwrite warning when the file already exists.
     fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
-        let description = export_confirm_description().to_string();
+        let rows = self.store.list().unwrap_or_default();
+        let path = Store::default_export_path();
+        let preview = export_preview_description(
+            rows.len(),
+            count_importable(&rows),
+            &path.display().to_string(),
+            path.exists(),
+        );
+        let description = format!("{}\n\n{preview}", export_confirm_description());
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let description = description.clone();
@@ -1328,12 +1615,12 @@ impl AppView {
         let form = ConfigForm::blank(window, cx);
         let view = cx.entity();
         let reader = form.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let view = view.clone();
             let reader = reader.clone();
             dialog
                 .title("Add proxy configuration")
-                .child(form.clone().element())
+                .child(form.clone().element(cx))
                 .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
                     move |_, window, cx| {
                         view.update(cx, |view, cx| {
@@ -1355,13 +1642,13 @@ impl AppView {
         let reader = form.clone();
         let id = config.id.clone();
         let title = format!("Edit {}", config.name);
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let view = view.clone();
             let reader = reader.clone();
             let id = id.clone();
             dialog
                 .title(title.clone())
-                .child(form.clone().element())
+                .child(form.clone().element(cx))
                 .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
                     move |_, window, cx| {
                         view.update(cx, |view, cx| {
@@ -1433,12 +1720,12 @@ impl AppView {
         };
         let view = cx.entity();
         let reader = form.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let view = view.clone();
             let reader = reader.clone();
             dialog
                 .title("Import proxy configurations")
-                .child(form.clone().element())
+                .child(form.clone().element(cx))
                 .button_props(DialogButtonProps::default().show_cancel(true).on_ok(
                     move |_, window, cx| {
                         let text = reader.text.read(cx).value().to_string();
@@ -1665,21 +1952,34 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> bool {
         let label = subscription_label_from_url(&request.url);
-        self.commit_subscription_add(label, request.url, dialog_group.to_string(), window, cx)
+        self.commit_subscription_add(
+            label,
+            request.url,
+            dialog_group.to_string(),
+            true,
+            window,
+            cx,
+        )
     }
 
     /// Ticket 04: add a subscription record; on success the dialog closes and
     /// a first refresh starts in the background. Invalid input keeps the
     /// dialog open with an error notification.
+    /// Ticket 17: the add-form auto-refresh checkbox lands here (no more
+    /// create-then-toggle).
     fn commit_subscription_add(
         &mut self,
         label: String,
         url: String,
         group: String,
+        auto_refresh: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        match self.store.add_subscription(&label, &url, &group, true) {
+        match self
+            .store
+            .add_subscription(&label, &url, &group, auto_refresh)
+        {
             Ok(sub) => {
                 self.reload(window, cx);
                 window.push_notification(
@@ -1699,15 +1999,123 @@ impl AppView {
         }
     }
 
+    /// Ticket 17: open a coalescing batch for background refreshes. Member
+    /// completions accumulate instead of notifying; the last member flushes
+    /// at most one toast (see [`AppView::accumulate_batch_member`]). Empty
+    /// input is a no-op (never an empty toast).
+    fn begin_refresh_batch(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.refresh_batch_total = ids.len();
+        self.refresh_batch_members = ids.iter().cloned().collect();
+        self.refresh_batch_added = 0;
+        self.refresh_batch_updated = 0;
+        self.refresh_batch_removed = 0;
+        self.refresh_batch_failed = 0;
+    }
+
+    /// Ticket 17: accumulate one batch member completion. Returns true when
+    /// this completion finished the batch (the caller then flushes once).
+    /// Callers check [`AppView::is_batch_member`] first: non-members notify
+    /// immediately instead of accumulating.
+    fn accumulate_batch_member(
+        &mut self,
+        sub_id: &str,
+        added: usize,
+        updated: usize,
+        removed: usize,
+        failed: usize,
+    ) -> bool {
+        if !self.refresh_batch_members.remove(sub_id) {
+            return false;
+        }
+        self.refresh_batch_added += added;
+        self.refresh_batch_updated += updated;
+        self.refresh_batch_removed += removed;
+        self.refresh_batch_failed += failed;
+        self.refresh_batch_members.is_empty()
+    }
+
+    /// Ticket 17: true while `sub_id` belongs to the open background batch.
+    fn is_batch_member(&self, sub_id: &str) -> bool {
+        self.refresh_batch_members.contains(sub_id)
+    }
+
+    /// Ticket 17: close one batch slot, flushing the single coalesced toast
+    /// when the last member lands. No-op for non-members.
+    fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
+        if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0) {
+            self.flush_refresh_batch(window, cx);
+        }
+    }
+
+    /// Ticket 17: route one refresh completion. Batch members accumulate
+    /// (the last member flushes at most one toast); everyone else notifies
+    /// immediately with `notice`.
+    #[allow(clippy::too_many_arguments)]
+    fn route_refresh_completion(
+        &mut self,
+        sub_id: &str,
+        notice: Notification,
+        added: usize,
+        updated: usize,
+        removed: usize,
+        failed: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.is_batch_member(sub_id) {
+            if self.accumulate_batch_member(sub_id, added, updated, removed, failed) {
+                self.flush_refresh_batch(window, cx);
+            }
+        } else {
+            window.push_notification(notice, cx);
+        }
+    }
+
+    /// Ticket 17: flush a completed batch as at most one toast, then reset.
+    /// `total` is always ≥ 1 here (batches never open empty), so the message
+    /// helper always returns `Some`.
+    fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
+        let (warn, text) = coalesced_refresh_message(
+            self.refresh_batch_total,
+            self.refresh_batch_added,
+            self.refresh_batch_updated,
+            self.refresh_batch_removed,
+            self.refresh_batch_failed,
+        )
+        .unwrap_or((false, String::new()));
+        self.refresh_batch_total = 0;
+        self.refresh_batch_added = 0;
+        self.refresh_batch_updated = 0;
+        self.refresh_batch_removed = 0;
+        self.refresh_batch_failed = 0;
+        if text.is_empty() {
+            return;
+        }
+        window.push_notification(
+            if warn {
+                Notification::warning(text)
+            } else {
+                Notification::success(text)
+            },
+            cx,
+        );
+    }
+
     /// Ticket 14: manual per-row refresh with truthful outcomes — a missing
     /// subscription warns (it was already removed), a store failure names
     /// the error (never a dead click).
+    /// Ticket 17: manual refreshes leave any background batch (their
+    /// completion notifies immediately instead of merging into it).
     fn refresh_subscription_by_id(
         &mut self,
         sub_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_batch_members.remove(sub_id);
         match self.store.get_subscription(sub_id) {
             Ok(Some(sub)) => self.start_subscription_refresh(sub, cx),
             Ok(None) => {
@@ -1777,6 +2185,8 @@ impl AppView {
 
     /// Ticket 04: apply a fetched body (or fetch error) with user feedback,
     /// then refresh the dialog contents if it is still open.
+    /// Ticket 17: completions for background-batch members accumulate and
+    /// flush at most one toast; every other completion notifies immediately.
     fn finish_subscription_refresh(
         &mut self,
         sub_id: &str,
@@ -1793,12 +2203,20 @@ impl AppView {
         match self.store.get_subscription(sub_id) {
             Ok(None) => {
                 self.reload(window, cx);
+                // Ticket 17: a deleted batch member still closes its slot.
+                self.close_batch_slot(sub_id, window, cx);
                 self.reopen_subscriptions_if_open(window, cx);
                 return;
             }
             Err(error) => {
-                window.push_notification(
+                self.route_refresh_completion(
+                    sub_id,
                     Notification::error(format!("Cannot refresh subscription: {error}")),
+                    0,
+                    0,
+                    0,
+                    1,
+                    window,
                     cx,
                 );
                 return;
@@ -1810,8 +2228,14 @@ impl AppView {
                 Ok(outcome) => {
                     self.reload(window, cx);
                     if let Some(error) = outcome.error {
-                        window.push_notification(
+                        self.route_refresh_completion(
+                            sub_id,
                             Notification::error(format!("{label}: refresh failed ({error})")),
+                            0,
+                            0,
+                            0,
+                            1,
+                            window,
                             cx,
                         );
                     } else {
@@ -1825,21 +2249,39 @@ impl AppView {
                         if outcome.duplicates > 0 {
                             summary.push_str(&format!(" · {} duplicates", outcome.duplicates));
                         }
-                        if outcome.failures.is_empty() {
-                            window.push_notification(Notification::success(summary), cx);
+                        let failed = outcome.failures.len();
+                        let notice = if failed == 0 {
+                            Notification::success(summary)
                         } else {
-                            summary.push_str(&format!(" · {} failed", outcome.failures.len()));
-                            window.push_notification(Notification::warning(summary), cx);
-                        }
+                            summary.push_str(&format!(" · {failed} failed"));
+                            Notification::warning(summary)
+                        };
+                        self.route_refresh_completion(
+                            sub_id,
+                            notice,
+                            outcome.added,
+                            outcome.updated,
+                            outcome.removed,
+                            failed,
+                            window,
+                            cx,
+                        );
                     }
                 }
                 Err(error) => {
                     if matches!(error, StoreError::NotFound(_)) {
                         // Deleted between the check above and the merge.
                         self.reload(window, cx);
+                        self.close_batch_slot(sub_id, window, cx);
                     } else {
-                        window.push_notification(
+                        self.route_refresh_completion(
+                            sub_id,
                             Notification::error(format!("{label}: refresh failed ({error})")),
+                            0,
+                            0,
+                            0,
+                            1,
+                            window,
                             cx,
                         );
                     }
@@ -1848,15 +2290,31 @@ impl AppView {
             Err(error) => match self.store.record_subscription_error(sub_id, &error) {
                 Ok(_) => {
                     self.reload(window, cx);
-                    window.push_notification(Notification::error(format!("{label}: {error}")), cx);
+                    self.route_refresh_completion(
+                        sub_id,
+                        Notification::error(format!("{label}: {error}")),
+                        0,
+                        0,
+                        0,
+                        1,
+                        window,
+                        cx,
+                    );
                 }
                 Err(StoreError::NotFound(_)) => {
                     // Deleted mid-flight: silent, like the pre-check arm.
                     self.reload(window, cx);
+                    self.close_batch_slot(sub_id, window, cx);
                 }
                 Err(db_error) => {
-                    window.push_notification(
+                    self.route_refresh_completion(
+                        sub_id,
                         Notification::error(format!("Cannot refresh subscription: {db_error}")),
+                        0,
+                        0,
+                        0,
+                        1,
+                        window,
                         cx,
                     );
                 }
@@ -1866,6 +2324,8 @@ impl AppView {
     }
 
     /// Ticket 04: headless completion path (no window for notifications).
+    /// Ticket 17: batch members accumulate silently (no window exists to
+    /// flush a toast to); the counters reset when the batch completes.
     fn finish_subscription_refresh_no_window(
         &mut self,
         sub_id: &str,
@@ -1874,12 +2334,31 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         match fetched {
-            Ok(body) => {
-                let _ = self.store.refresh_with_body(sub_id, &body, now);
-            }
+            Ok(body) => match self.store.refresh_with_body(sub_id, &body, now) {
+                Ok(outcome) => {
+                    self.accumulate_batch_member(
+                        sub_id,
+                        outcome.added,
+                        outcome.updated,
+                        outcome.removed,
+                        outcome.failures.len(),
+                    );
+                }
+                Err(_) => {
+                    self.accumulate_batch_member(sub_id, 0, 0, 0, 1);
+                }
+            },
             Err(error) => {
                 let _ = self.store.record_subscription_error(sub_id, &error);
+                self.accumulate_batch_member(sub_id, 0, 0, 0, 1);
             }
+        }
+        if self.refresh_batch_members.is_empty() {
+            self.refresh_batch_total = 0;
+            self.refresh_batch_added = 0;
+            self.refresh_batch_updated = 0;
+            self.refresh_batch_removed = 0;
+            self.refresh_batch_failed = 0;
         }
         self.reload_quiet(cx);
     }
@@ -1951,11 +2430,12 @@ impl AppView {
                         let label = reader.label.read(cx).value().to_string();
                         let url = reader.url.read(cx).value().to_string();
                         let group = reader.group.read(cx).value().to_string();
+                        let auto = *reader.auto_refresh.borrow();
                         if label.trim().is_empty() && url.trim().is_empty() {
                             return true;
                         }
                         view.update(cx, |view, cx| {
-                            view.commit_subscription_add(label, url, group, window, cx)
+                            view.commit_subscription_add(label, url, group, auto, window, cx)
                         })
                     }),
             )
@@ -2065,11 +2545,15 @@ impl AppView {
     /// for already-due subscriptions (never beyond them, never enabling or
     /// starting configs). Returns the number of refreshes started. Stopped
     /// views start nothing.
+    /// Ticket 17: the pass opens one coalescing batch, so N completions
+    /// flush at most one toast instead of N.
     fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
         }
         let due = self.due_subscriptions();
+        let ids: Vec<String> = due.iter().map(|sub| sub.id.clone()).collect();
+        self.begin_refresh_batch(&ids);
         let count = due.len();
         for sub in due {
             self.start_subscription_refresh(sub, cx);
@@ -2346,6 +2830,16 @@ impl Render for AppView {
                                 view.test_all_health(window, cx);
                             })),
                     ),
+            )
+            // Ticket 17: visible drop affordance (the shell has no
+            // hover-during-drag event, so the hint stays visible instead of
+            // appearing only on hover).
+            .child(
+                div()
+                    .id("drop-hint")
+                    .test_support()
+                    .px_2()
+                    .child("Drop .conf / .json / .txt files here to import"),
             )
             .child(
                 div().flex_1().child(
@@ -3977,5 +4471,480 @@ mod tests {
         let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].protocol, "vless");
+    }
+
+    // -- Ticket 17: UX feedback across library flows -------------------------
+
+    /// Scenario: add/edit/remove → success toast naming the row (content at
+    /// the pure seam — notification text is framework-private, so delivery
+    /// is asserted by count in `crud_commits_toast_once_naming_row`).
+    #[test]
+    fn crud_toast_messages_name_the_row() {
+        use crate::{config_added_message, config_removed_message, config_updated_message};
+        assert_eq!(config_added_message("Work"), "Added \"Work\"");
+        assert_eq!(config_updated_message("Work"), "Updated \"Work\"");
+        assert_eq!(config_removed_message("Work"), "Removed \"Work\"");
+    }
+
+    /// Scenario: add/edit/remove commits each fire exactly one toast.
+    #[gpui_kit::test]
+    fn crud_commits_toast_once_naming_row(cx: &mut TestAppContext) {
+        use crate::store::ConfigPatch;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let id = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.commit_add(seed_input("Work"), window, cx));
+                view.store.list().expect("list works").remove(0).id
+            })
+        });
+        assert_eq!(notification_count(cx), 1, "add toasts once");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.commit_edit(
+                    &id,
+                    ConfigPatch {
+                        name: Some("Cabin".to_string()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                ));
+            });
+        });
+        assert_eq!(notification_count(cx), 2, "edit toasts once");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_remove(&id, window, cx));
+        });
+        assert_eq!(notification_count(cx), 3, "remove toasts once");
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 0);
+    }
+
+    /// Scenario: import dialog with pasted text → live `X valid · Y invalid`
+    /// preview before commit (pure counts + message).
+    #[test]
+    fn import_preview_counts_and_message() {
+        use crate::{import_preview_counts, import_preview_message};
+        let body = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x";
+        assert_eq!(import_preview_counts(body, None), (1, 1));
+        assert_eq!(import_preview_message(1, 1), "1 valid · 1 invalid");
+        assert_eq!(import_preview_message(0, 0), "0 valid · 0 invalid");
+        // A dropped conf keeps its hint for the preview too.
+        let conf = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        assert_eq!(import_preview_counts(conf, Some("home.conf")), (1, 0));
+    }
+
+    /// Scenario: import dialog shows the preview line and the dropped file
+    /// names after a drop.
+    #[gpui_kit::test]
+    fn import_dialog_shows_preview_and_files(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let a = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_import_dialog_with_files(
+                    a,
+                    "default",
+                    None,
+                    Some(vec![("a.conf".to_string(), a.to_string())]),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("import-preview").is_some()));
+        assert!(cx.update(|window, _| window.try_find("import-files").is_some()));
+    }
+
+    /// Scenario: drag files over shell → visible drop hint.
+    #[gpui_kit::test]
+    fn shell_renders_drop_hint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = mount_view(store, cx);
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, _| window.try_find("drop-hint").is_some()));
+    }
+
+    /// Scenario: export dialog → row counts + destination path + overwrite
+    /// warning when the file exists (pure description).
+    #[test]
+    fn export_preview_shows_counts_path_and_overwrite() {
+        use crate::export_preview_description;
+        let fresh = export_preview_description(3, 3, "/tmp/x.json", false);
+        assert!(fresh.contains('3'), "count in: {fresh}");
+        assert!(fresh.contains("/tmp/x.json"), "path in: {fresh}");
+        assert!(!fresh.contains("overwrit"), "no warning for fresh: {fresh}");
+        let both = export_preview_description(4, 3, "/tmp/x.json", false);
+        assert!(
+            both.contains('4') && both.contains('3'),
+            "both numbers: {both}"
+        );
+        let exists = export_preview_description(3, 3, "/tmp/x.json", true);
+        assert!(
+            exists.contains("/tmp/x.json") && exists.contains("overwrit"),
+            "overwrite warning names the path: {exists}"
+        );
+    }
+
+    /// Scenario: subscription refresh with item failures → failures viewable
+    /// per subscription (stored vec rendering, empty when clean).
+    #[test]
+    fn subscription_failures_text_renders_items() {
+        use crate::import::{ImportErrorKind, ImportFailure};
+        use crate::subscription_failures_text;
+        assert_eq!(
+            subscription_failures_text(&[]),
+            "",
+            "clean subs show no failures line"
+        );
+        let failures = vec![ImportFailure {
+            index: 1,
+            label: "bogus://x".to_string(),
+            reason: "unknown-scheme: unknown scheme 'bogus'".to_string(),
+            code: ImportErrorKind::UnknownScheme,
+        }];
+        let text = subscription_failures_text(&failures);
+        assert!(text.contains("bogus://x"), "label in: {text}");
+        assert!(text.contains("unknown-scheme"), "reason in: {text}");
+    }
+
+    /// Scenario: subscriptions dialog shows the auto-refresh checkbox and
+    /// the per-subscription failures after a partial refresh.
+    #[gpui_kit::test]
+    fn subscriptions_dialog_shows_auto_and_failures(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "travel", true)
+            .expect("seed works");
+        store
+            .refresh_with_body(
+                &sub.id,
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x",
+                100,
+            )
+            .expect("refresh works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("field-sub-auto").is_some()));
+        assert!(
+            cx.update(move |window, _| window.try_find(format!("sub-failures-{sub_id}")).is_some()),
+            "stored failures render per subscription"
+        );
+    }
+
+    /// Scenario: subscription add form → auto-refresh checkbox present and
+    /// default on.
+    #[gpui_kit::test]
+    fn sub_add_form_auto_defaults_on(cx: &mut TestAppContext) {
+        use crate::SubForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let auto = cx.update(|window, cx| {
+            view.update(cx, |_, cx| SubForm::blank(window, cx).auto_refresh.clone())
+        });
+        assert!(*auto.borrow(), "auto-refresh defaults on");
+    }
+
+    /// Scenario: background tick refreshes 3 subs → at most one coalesced
+    /// toast, not three (pure message + headless batch).
+    #[test]
+    fn coalesced_refresh_message_single_toast() {
+        use crate::coalesced_refresh_message;
+        assert_eq!(coalesced_refresh_message(0, 0, 0, 0, 0), None);
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0).expect("batch reports");
+        assert!(!warn);
+        assert!(
+            text.contains('3') && text.contains("+5"),
+            "one line: {text}"
+        );
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 2).expect("batch reports");
+        assert!(warn, "failures warn: {text}");
+        assert!(text.contains('2'), "failed count in: {text}");
+    }
+
+    /// Scenario: 3 background completions flush exactly one toast.
+    #[gpui_kit::test]
+    fn background_batch_coalesces_to_one_toast(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut ids = Vec::new();
+        for (label, group) in [("One", "g1"), ("Two", "g2"), ("Three", "g3")] {
+            let sub = store
+                .add_subscription(label, "https://example.com/sub.txt", group, true)
+                .expect("seed works");
+            ids.push((sub.id.clone(), sub.label.clone()));
+        }
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let keys: Vec<String> = ids.iter().map(|(id, _)| id.clone()).collect();
+                view.begin_refresh_batch(&keys);
+            });
+        });
+        for (id, label) in &ids {
+            let id = id.clone();
+            let label = label.clone();
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.finish_subscription_refresh(
+                        &id,
+                        &label,
+                        Ok(
+                            "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                                .to_string(),
+                        ),
+                        999,
+                        window,
+                        cx,
+                    );
+                });
+            });
+        }
+        assert_eq!(notification_count(cx), 1, "three refreshes, one toast");
+    }
+
+    /// Scenario: Start all on empty library / Stop on stopped row → honest
+    /// messages, never "Started 0" (pure copy).
+    #[test]
+    fn honest_start_stop_messages() {
+        use crate::{already_stopped_message, start_all_message, stop_all_message};
+        let empty = start_all_message(0);
+        assert!(empty.contains("Nothing to start"), "honest: {empty}");
+        assert!(!empty.contains("Started 0"), "never Started 0: {empty}");
+        assert!(start_all_message(3).contains('3'));
+        let idle = stop_all_message(0);
+        assert!(idle.contains("Nothing to stop"), "honest: {idle}");
+        assert_eq!(stop_all_message(2), "Stopped all endpoints");
+        assert!(already_stopped_message("Work").contains("Work"));
+        assert!(already_stopped_message("Work").contains("already stopped"));
+    }
+
+    /// Scenario: honest empty start-all and stop-on-stopped toasts headless.
+    #[gpui_kit::test]
+    fn empty_start_and_stopped_stop_warn_honestly(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Empty-library arm first: remove the seed so start-all is honest.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let rows = view.store.list().expect("list works");
+                for row in &rows {
+                    view.store.remove(&row.id).expect("remove works");
+                }
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "empty start warns once");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.add(seed_input("Work")).expect("seed works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reload(window, cx));
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.stop_selected_engine(window, cx));
+        });
+        assert_eq!(notification_count(cx), 2, "stop-on-stopped warns once");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.stop_all_engines(window, cx));
+        });
+        assert_eq!(notification_count(cx), 3, "idle stop-all warns once");
+    }
+
+    /// Scenario: search matches host/bind/port as well as
+    /// name/protocol/group (pure matcher + delegate filter).
+    #[test]
+    fn library_search_matches_host_bind_port() {
+        use crate::store::ProxyConfig;
+        use crate::{library_row_matches, LibraryDelegate};
+        fn row(name: &str, server: &str, bind: &str, port: u16) -> ProxyConfig {
+            ProxyConfig {
+                id: format!("id-{name}"),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: format!(
+                    "{{\"type\":\"vless\",\"server\":\"{server}\",\"server_port\":443}}"
+                ),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: bind.to_string(),
+                port,
+                subscription_id: None,
+                identity_key: None,
+            }
+        }
+        let alpha = row("Alpha", "a.example.com", "127.0.0.1", 10801);
+        let beta = row("Beta", "10.0.0.5", "10.0.0.5", 10802);
+        assert!(library_row_matches(&beta, "10.0.0.5"), "bind/host match");
+        assert!(library_row_matches(&alpha, "10801"), "port match");
+        assert!(!library_row_matches(&beta, "a.example.com"));
+        assert!(library_row_matches(&alpha, "a.example.com"), "host match");
+        assert!(library_row_matches(&alpha, "alpha"), "name still matches");
+        assert!(
+            library_row_matches(&alpha, "vless"),
+            "protocol still matches"
+        );
+        assert!(!library_row_matches(&alpha, "nope"), "no false positive");
+
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![alpha, beta]);
+        delegate.query = "10.0.0.5".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            delegate.visible.len(),
+            1,
+            "filter narrows to the bind/host row"
+        );
+        delegate.query = "10801".to_string();
+        delegate.apply_filter();
+        assert_eq!(delegate.visible.len(), 1, "filter narrows by port");
+        delegate.query = String::new();
+        delegate.apply_filter();
+        assert_eq!(delegate.visible.len(), 2, "empty query shows all");
+    }
+
+    /// Scenario: add/edit with a non-loopback bind → inline hint that
+    /// starting will need the LAN confirm.
+    #[test]
+    fn lan_hint_for_bind() {
+        use crate::lan_hint_for_bind;
+        assert_eq!(lan_hint_for_bind("127.0.0.1"), None);
+        assert_eq!(lan_hint_for_bind(""), None, "blank means loopback default");
+        assert_eq!(lan_hint_for_bind("  "), None);
+        let hint = lan_hint_for_bind("0.0.0.0").expect("LAN binds hint");
+        assert!(hint.contains("0.0.0.0"), "names the bind: {hint}");
+        assert!(hint.contains("LAN confirm"), "names the gate: {hint}");
+    }
+
+    /// Scenario: add dialog with a LAN bind shows the inline hint; the
+    /// loopback add dialog shows none.
+    #[gpui_kit::test]
+    fn add_dialog_shows_lan_hint_only_for_lan_bind(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let lan = store
+            .add(NewConfig {
+                name: "Lan".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: "0.0.0.0".to_string(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let loopback = store.add(seed_input("Loop")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(lan, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("lan-hint").is_some()));
+
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(loopback, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(
+            cx.update(|window, _| window.try_find("lan-hint").is_none()),
+            "loopback binds show no LAN hint"
+        );
+    }
+
+    /// Scenario: dropped file names render as basenames (never full paths).
+    #[test]
+    fn import_files_label_basenames() {
+        use crate::import_files_label;
+        assert_eq!(import_files_label(None, None), None);
+        assert_eq!(
+            import_files_label(Some("C:\\drops\\home.conf"), None),
+            Some("File: home.conf".to_string())
+        );
+        assert_eq!(
+            import_files_label(
+                None,
+                Some(&[
+                    ("/tmp/a.conf".to_string(), "x".to_string()),
+                    ("b.json".to_string(), "y".to_string())
+                ])
+            ),
+            Some("Files: a.conf, b.json".to_string())
+        );
     }
 }

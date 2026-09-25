@@ -552,6 +552,10 @@ pub struct Subscription {
     pub last_refresh_at: Option<i64>,
     /// Last fetch/parse failure, cleared on the next success.
     pub last_error: Option<String>,
+    /// Ticket 17: latest per-item refresh failures (stored vec behind the
+    /// per-subscription failures view; cleared on a clean refresh, kept on a
+    /// fetch error which parsed nothing new).
+    pub failures: Vec<crate::import::ImportFailure>,
 }
 
 /// Ticket 04: outcome of one refresh merge. `error` is `Some` when the body
@@ -598,6 +602,7 @@ pub fn due_for_refresh(subscription: &Subscription, now: i64, interval_secs: i64
 fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
     let id: i64 = row.get(0)?;
     let auto_refresh: i64 = row.get(4)?;
+    let failures_raw: Option<String> = row.get(7)?;
     Ok(Subscription {
         id: id.to_string(),
         label: row.get(1)?,
@@ -606,7 +611,73 @@ fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscriptio
         auto_refresh: auto_refresh != 0,
         last_refresh_at: row.get(5)?,
         last_error: row.get(6)?,
+        failures: decode_failures(failures_raw),
     })
+}
+
+/// Ticket 17: encode per-item refresh failures for the
+/// `subscriptions.failures` column (JSON array of
+/// `{index, label, reason, code}`; labels/reasons arrive redacted from the
+/// import path, so no secrets reach the database).
+fn encode_failures(failures: &[crate::import::ImportFailure]) -> String {
+    let items: Vec<serde_json::Value> = failures
+        .iter()
+        .map(|failure| {
+            serde_json::json!({
+                "index": failure.index,
+                "label": failure.label,
+                "reason": failure.reason,
+                "code": failure.code.as_str(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(items).to_string()
+}
+
+/// Ticket 17: decode the `subscriptions.failures` column. Any corruption
+/// (foreign rows, hand edits, older databases) yields no failures — never a
+/// crash, never an error.
+fn decode_failures(raw: Option<String>) -> Vec<crate::import::ImportFailure> {
+    use crate::import::{ImportErrorKind, ImportFailure};
+    let text = raw.unwrap_or_default();
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(items) = value.as_array() {
+        for item in items {
+            let index = item
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let label = item
+                .get("label")
+                .and_then(|value| value.as_str())
+                .unwrap_or("item")
+                .to_string();
+            let reason = item
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("refresh failed")
+                .to_string();
+            let code = item
+                .get("code")
+                .and_then(|value| value.as_str())
+                .and_then(ImportErrorKind::from_str)
+                .unwrap_or(ImportErrorKind::InvalidJson);
+            out.push(ImportFailure {
+                index,
+                label,
+                reason,
+                code,
+            });
+        }
+    }
+    out
 }
 
 pub struct Store {
@@ -713,7 +784,8 @@ impl Store {
                grp TEXT NOT NULL DEFAULT 'default',
                auto_refresh INTEGER NOT NULL DEFAULT 1,
                last_refresh_at INTEGER,
-               last_error TEXT
+               last_error TEXT,
+               failures TEXT NOT NULL DEFAULT '[]'
              ) STRICT;
              CREATE TABLE IF NOT EXISTS subscription_tombstones (
                subscription_id TEXT NOT NULL,
@@ -738,6 +810,18 @@ impl Store {
                 self.conn.execute_batch(&format!(
                     "ALTER TABLE proxy_configs ADD COLUMN {column} {ddl};"
                 ))?;
+            }
+        }
+        // Ticket 17: migrate pre-ticket-17 databases that lack the per-item
+        // refresh failures column.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT name FROM pragma_table_info('subscriptions') WHERE name = 'failures'",
+            )?;
+            if !stmt.exists(params![])? {
+                self.conn.execute_batch(
+                    "ALTER TABLE subscriptions ADD COLUMN failures TEXT NOT NULL DEFAULT '[]';",
+                )?;
             }
         }
         Ok(())
@@ -934,7 +1018,7 @@ impl Store {
     /// All subscriptions in stable id order.
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures
              FROM subscriptions ORDER BY id",
         )?;
         let rows = stmt
@@ -950,7 +1034,7 @@ impl Store {
             Err(_) => return Ok(None),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures
              FROM subscriptions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_subscription_row)?;
@@ -1055,6 +1139,7 @@ impl Store {
                 .map(|failure| failure.reason.clone())
                 .unwrap_or_else(|| "empty subscription body".to_string());
             self.record_subscription_error(sub_id, &reason)?;
+            self.save_subscription_failures(sub_id, &batch.failures)?;
             return Ok(RefreshOutcome {
                 failures: batch.failures,
                 error: Some(reason),
@@ -1226,12 +1311,33 @@ impl Store {
                 StoreError::Invalid(vec![FieldError::new("id", "bad subscription id")])
             })?;
             tx.execute(
-                "UPDATE subscriptions SET last_refresh_at = ?1, last_error = NULL WHERE id = ?2",
-                params![now, rowid],
+                "UPDATE subscriptions SET last_refresh_at = ?1, last_error = NULL, failures = ?2
+                 WHERE id = ?3",
+                params![now, encode_failures(&outcome.failures), rowid],
             )?;
         }
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// Ticket 17: persist the latest per-item failures for one subscription
+    /// (the per-subscription failures view reads them back via
+    /// [`Store::get_subscription`]). A fetch-level failure parses nothing new,
+    /// so [`Store::record_subscription_error`] intentionally leaves this
+    /// column untouched.
+    pub fn save_subscription_failures(
+        &mut self,
+        id: &str,
+        failures: &[crate::import::ImportFailure],
+    ) -> Result<(), StoreError> {
+        let rowid: i64 = id
+            .parse()
+            .map_err(|_| StoreError::Invalid(vec![FieldError::new("id", "bad subscription id")]))?;
+        self.conn.execute(
+            "UPDATE subscriptions SET failures = ?1 WHERE id = ?2",
+            params![encode_failures(failures), rowid],
+        )?;
+        Ok(())
     }
 
     // -- Ticket 11: user-owned JSON export ----------------------------------
@@ -2150,6 +2256,82 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 1);
     }
 
+    /// Ticket 17: per-item failures persist on the subscription (the stored
+    /// vec behind the per-subscription failures view): partial refreshes
+    /// store their failures, a clean refresh clears them, and a total
+    /// failure stores its failures alongside `last_error`.
+    #[test]
+    fn subscription_failures_persist_and_clear() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        let kept = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert!(
+            kept.failures.is_empty(),
+            "new subscriptions store no failures"
+        );
+
+        store
+            .refresh_with_body(
+                &sub.id,
+                &format!("vless://{SUB_UUID}@a.example.com:443#one\nbogus://x"),
+                100,
+            )
+            .expect("refresh works");
+        let partial = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(partial.failures.len(), 1, "partial failures stored");
+        assert!(
+            partial.failures[0].reason.contains("unknown-scheme"),
+            "reason kept, got {}",
+            partial.failures[0].reason
+        );
+        assert_eq!(
+            partial.failures[0].label, "bogus://x",
+            "label kept without secrets"
+        );
+
+        // A clean refresh clears the stored vec.
+        store
+            .refresh_with_body(
+                &sub.id,
+                &format!("vless://{SUB_UUID}@a.example.com:443#one"),
+                200,
+            )
+            .expect("refresh works");
+        let clean = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert!(clean.failures.is_empty(), "clean refresh clears failures");
+
+        // A total failure stores its failures with the error.
+        let outcome = store
+            .refresh_with_body(&sub.id, "bogus://x\nbogus://y", 300)
+            .expect("failure is an outcome");
+        assert!(outcome.error.is_some());
+        let failed = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(failed.failures.len(), 2, "total failures stored");
+        assert!(failed.last_error.is_some(), "error still recorded");
+    }
+
+    /// Ticket 17: corrupted failures JSON decodes to no failures (never a
+    /// crash, never an error).
+    #[test]
+    fn subscription_failures_decode_is_forgiving() {
+        assert!(decode_failures(None).is_empty());
+        assert!(decode_failures(Some(String::new())).is_empty());
+        assert!(decode_failures(Some("not-json".to_string())).is_empty());
+        assert!(decode_failures(Some("[{\"index\": 2}]".to_string())).len() == 1);
+    }
+
     /// Removing a subscription releases (never deletes) its rows and drops
     /// its tombstones; unknown ids report NotFound/false.
     #[test]
@@ -2252,6 +2434,7 @@ mod tests {
             auto_refresh: true,
             last_refresh_at: None,
             last_error: None,
+            failures: Vec::new(),
         };
         assert!(
             due_for_refresh(&scheduled, 1_000, 86_400),

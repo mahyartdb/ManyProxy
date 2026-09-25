@@ -73,6 +73,25 @@ impl ImportErrorKind {
             ImportErrorKind::SsPlugin => "ss-plugin",
         }
     }
+
+    /// Ticket 17: parse the [`ImportErrorKind::as_str`] form back (the store
+    /// persists per-subscription item failures as JSON and decodes them for
+    /// the failures view). Unknown input yields `None` (callers fall back,
+    /// never crash).
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "empty" => Some(ImportErrorKind::Empty),
+            "unknown-scheme" => Some(ImportErrorKind::UnknownScheme),
+            "bad-base64" => Some(ImportErrorKind::BadBase64),
+            "non-utf8" => Some(ImportErrorKind::NonUtf8),
+            "bad-host" => Some(ImportErrorKind::BadHost),
+            "bad-port" => Some(ImportErrorKind::BadPort),
+            "missing-credential" => Some(ImportErrorKind::MissingCredential),
+            "invalid-json" => Some(ImportErrorKind::InvalidJson),
+            "ss-plugin" => Some(ImportErrorKind::SsPlugin),
+            _ => None,
+        }
+    }
 }
 
 /// One rejected item. `message` never contains credentials.
@@ -2590,6 +2609,27 @@ mod tests {
     }
 
     // -- batch + commit semantics --------------------------------------------
+
+    /// Ticket 17: failure codes round-trip through their stored form (the
+    /// subscription failures column persists codes as text).
+    #[test]
+    fn error_kind_from_str_round_trips() {
+        for kind in [
+            ImportErrorKind::Empty,
+            ImportErrorKind::UnknownScheme,
+            ImportErrorKind::BadBase64,
+            ImportErrorKind::NonUtf8,
+            ImportErrorKind::BadHost,
+            ImportErrorKind::BadPort,
+            ImportErrorKind::MissingCredential,
+            ImportErrorKind::InvalidJson,
+            ImportErrorKind::SsPlugin,
+        ] {
+            assert_eq!(ImportErrorKind::from_str(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ImportErrorKind::from_str("bogus"), None);
+        assert_eq!(ImportErrorKind::from_str(""), None);
+    }
 
     #[test]
     fn batch_five_mixed_links() {
