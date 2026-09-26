@@ -1619,6 +1619,41 @@ fn import_json_value(value: &serde_json::Value) -> BatchResult {
 // WireGuard `.conf` files (one config per `[Peer]`)
 // ---------------------------------------------------------------------------
 
+/// AmneziaWG obfuscation keys a `.conf` may carry (official docs: junk-train
+/// Jc/Jmin/Jmax, length prefixes S1-S4, header ranges H1-H4, CPS chains
+/// I1-I5). Conf keys arrive lowercased by the parser below; values pass
+/// through verbatim. Mirrors the engine version matrix (`engine.rs`
+/// `AWG_V2_KEYS`); the fork's own `check` stays authoritative for shapes.
+const CONF_AWG_V2_KEYS: &[&str] = &[
+    "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4",
+    "i5",
+];
+
+/// AmneziaWG 3.x-only `.conf` keys (mirrors `engine.rs` `AWG_V3_ONLY_KEYS`).
+const CONF_AWG_V3_KEYS: &[&str] = &[
+    "headerprotectionkey",
+    "contentpaddingaddition",
+    "rekeyaftertime",
+    "rekeytimeout",
+    "rejectaftertime",
+    "keepalivetimeout",
+    "maxhandshakeattempts",
+    "randomtrailers",
+    "disablecookies",
+];
+
+/// Classify one peer (+ its Interface snapshot) as AmneziaWG when either
+/// section carries an AWG marker key (`awg_version`, a v2 junk/length/header
+/// key, or a v3-only key). A bare `version` key alone never reclassifies a
+/// plain WireGuard row.
+fn conf_peer_is_awg(peer: &HashMap<String, String>, iface: &HashMap<String, String>) -> bool {
+    peer.keys().chain(iface.keys()).any(|key| {
+        key == "awg_version"
+            || CONF_AWG_V2_KEYS.contains(&key.as_str())
+            || CONF_AWG_V3_KEYS.contains(&key.as_str())
+    })
+}
+
 fn conf_value(section: &HashMap<String, String>, key: &str) -> String {
     section.get(key).cloned().unwrap_or_default()
 }
@@ -1696,7 +1731,14 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
             if private_key.trim().is_empty() {
                 return Err(missing_credential("wireguard conf is missing PrivateKey"));
             }
-            let mut params = base_params("wireguard", &host, port);
+            // A conf carrying AmneziaWG obfuscation fields is an AmneziaWG
+            // row (fork-core `wireguard` endpoint), not plain WireGuard.
+            let protocol = if conf_peer_is_awg(peer, iface) {
+                "amneziawg"
+            } else {
+                "wireguard"
+            };
+            let mut params = base_params(protocol, &host, port);
             insert_str(&mut params, "private_key", private_key);
             insert_str(&mut params, "public_key", public_key);
             for (conf_key, json_key) in [
@@ -1718,10 +1760,49 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
                     insert_str(&mut params, json_key, value);
                 }
             }
+            if protocol == "amneziawg" {
+                // AmneziaWG obfuscation params ride verbatim (peer wins, the
+                // Interface snapshot is the fallback — stock AmneziaWG confs
+                // keep Jc/Jmin/Jmax in [Interface]). An explicit version is
+                // kept as-is; without one the fork matrix needs a declared
+                // version, so v3-only keys default to "3.x" and the v2 junk
+                // train to "2.0" (the engine's `awg_version_of` also accepts
+                // a `version` fallback, which is preserved below when set).
+                for key in CONF_AWG_V2_KEYS.iter().chain(CONF_AWG_V3_KEYS.iter()) {
+                    let value = conf_value(peer, key);
+                    let value = if value.trim().is_empty() {
+                        conf_value(iface, key)
+                    } else {
+                        value
+                    };
+                    if !value.trim().is_empty() {
+                        insert_str(&mut params, key, value);
+                    }
+                }
+                for key in ["awg_version", "version"] {
+                    let value = conf_value(peer, key);
+                    let value = if value.trim().is_empty() {
+                        conf_value(iface, key)
+                    } else {
+                        value
+                    };
+                    if !value.trim().is_empty() {
+                        insert_str(&mut params, key, value);
+                    }
+                }
+                if !params.contains_key("awg_version") && !params.contains_key("version") {
+                    let v3 = CONF_AWG_V3_KEYS.iter().any(|key| params.contains_key(*key));
+                    insert_str(
+                        &mut params,
+                        "awg_version",
+                        if v3 { "3.x" } else { "2.0" }.to_string(),
+                    );
+                }
+            }
             let name = format!("{stem}-p{}", peer_index + 1);
             Ok(ImportedConfig {
                 name,
-                protocol: "wireguard".to_string(),
+                protocol: protocol.to_string(),
                 params: finish(params),
                 host,
                 port,
@@ -2870,6 +2951,83 @@ mod tests {
         assert_eq!(out.configs[0].host, "203.0.113.1");
         assert_eq!(out.configs[1].host, "203.0.113.2");
         assert_eq!(params_of(&out.configs[0])["dns"], "1.1.1.1");
+    }
+
+    // -- live review (2026-09-26): user-supplied AmneziaWG conf -------------
+    // These exact bytes are the user's live config (already pasted in chat);
+    // they are the single regression test allowed to carry real values.
+    // A conf carrying AmneziaWG junk-train fields (Jc/Jmin/Jmax, …) is an
+    // AmneziaWG row — not plain WireGuard — with the obfuscation params
+    // preserved verbatim and a defaulted `awg_version` so the fork-core
+    // version matrix (engine.rs) accepts it.
+
+    #[test]
+    fn live_amneziawg_conf_imports_single_awg_row_with_junk_params() {
+        let conf = "[Interface]\nPrivateKey = +KjXeqsx9goY9hfPNQ0fS31xUtjYrVJ2KVuJnbHkZEM=\nAddress = 100.64.134.1/32\nDNS = 198.18.0.1,198.18.0.2\nJc = 5\nJmin = 30\nJmax = 1000\n\n[Peer]\nPublicKey = KgTUh3KLijVluDvNpzDCJJfrJ7EyLzYLmdHCksG4sRg=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 91.148.248.176:51820\n";
+        let out = import_file_content("live-awg.conf", conf);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1, "single peer yields one row");
+        let config = &out.configs[0];
+        assert_eq!(config.protocol, "amneziawg");
+        assert_eq!(config.host, "91.148.248.176");
+        assert_eq!(config.port, 51820);
+        let params = params_of(config);
+        assert_eq!(params["jc"], "5");
+        assert_eq!(params["jmin"], "30");
+        assert_eq!(params["jmax"], "1000");
+        assert_eq!(params["awg_version"], "2.0");
+        for key in ["private_key", "public_key"] {
+            assert!(
+                params
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "key {key} flows into params"
+            );
+        }
+        // Paste path agrees with the drop path (ticket 15 parity).
+        let pasted = import_text(conf);
+        assert!(
+            pasted.failures.is_empty(),
+            "failures: {:?}",
+            pasted.failures
+        );
+        assert_eq!(pasted.configs.len(), 1);
+        assert_eq!(pasted.configs[0].protocol, "amneziawg");
+        assert_eq!(params_of(&pasted.configs[0])["jmax"], "1000");
+        // Engine seam (public API only): the live row routes to the fork
+        // core and generates a fork `wireguard` endpoint with its junk
+        // params verbatim. Loopback bind + synthetic local port: no live
+        // network, no binary touched — the only missing runtime piece is
+        // the `sing-box-awg` binary itself.
+        let row = crate::store::ProxyConfig {
+            id: "live-awg-1".to_string(),
+            name: config.name.clone(),
+            protocol: config.protocol.clone(),
+            params: config.params.clone(),
+            group: "live-review".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+        };
+        assert!(
+            crate::engine::needs_fork(&row),
+            "AWG rows route to the fork core"
+        );
+        let generated = crate::engine::generate(std::slice::from_ref(&row))
+            .expect("live AWG row passes the version matrix");
+        assert!(generated.requires_fork);
+        let endpoints = generated.value()["endpoints"]
+            .as_array()
+            .expect("endpoints array")
+            .clone();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0]["type"], serde_json::json!("wireguard"));
+        assert_eq!(endpoints[0]["jc"], serde_json::json!("5"));
+        assert_eq!(endpoints[0]["jmin"], serde_json::json!("30"));
+        assert_eq!(endpoints[0]["jmax"], serde_json::json!("1000"));
     }
 
     // -- ticket 07: AmneziaWG-variant links (params preserved verbatim) -----
