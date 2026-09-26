@@ -95,6 +95,8 @@ pub trait HealthProber {
     /// False for rows this driver cannot measure (extra-core/custom until
     /// ticket 08). The runner records a named skip without calling the
     /// probe methods.
+    /// Ticket 28: the permissive default stays — both in-tree drivers
+    /// override it, and it keeps future test doubles total.
     fn supports(&self, config: &ProxyConfig) -> bool {
         let _ = config;
         true
@@ -122,6 +124,8 @@ pub trait HealthProber {
 /// dials the row's own endpoint, so every row is measured through its own
 /// egress). Anything else (socks, naive, …) is a named skip until its owning
 /// ticket.
+/// Ticket 28: kept parallel to the engine/store/import tables — probeability
+/// is a measurement capability list, not a parse or routing taxonomy.
 pub fn is_probeable_protocol(protocol: &str) -> bool {
     matches!(
         protocol.trim().to_ascii_lowercase().as_str(),
@@ -322,12 +326,18 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
         .map(|pos| pos + 4)
 }
 
-/// Run one URL test per config through each config's own endpoint. Order of
-/// the returned outcomes matches `configs`.
-pub fn test_all(
+/// Ticket 28: shared runner behind [`test_all`] and [`ping_all`] (one
+/// skip/probe/failure shape; only the kind, verb, and probe call differ).
+type ProbeFn =
+    fn(&mut dyn HealthProber, &ProxyConfig, &str, u16, &str) -> Result<ProbeSuccess, String>;
+
+fn run_all(
     configs: &[ProxyConfig],
-    url: &str,
     prober: &mut dyn HealthProber,
+    kind: HealthKind,
+    verb: &str,
+    probe: ProbeFn,
+    url: &str,
 ) -> Vec<TestOutcome> {
     configs
         .iter()
@@ -338,7 +348,7 @@ pub fn test_all(
                     sample: HealthSample {
                         config_id: config.id.clone(),
                         at,
-                        kind: HealthKind::UrlTest,
+                        kind,
                         latency_ms: None,
                         error: Some(format!(
                             "unsupported protocol \"{}\" for \"{}\" (no health probe for this protocol yet)",
@@ -348,12 +358,12 @@ pub fn test_all(
                     success: None,
                 };
             }
-            match prober.url_test(config, &config.bind_ip, config.port, url) {
+            match probe(prober, config, &config.bind_ip, config.port, url) {
                 Ok(success) => TestOutcome {
                     sample: HealthSample {
                         config_id: config.id.clone(),
                         at,
-                        kind: HealthKind::UrlTest,
+                        kind,
                         latency_ms: Some(success.latency_ms),
                         error: None,
                     },
@@ -363,10 +373,10 @@ pub fn test_all(
                     sample: HealthSample {
                         config_id: config.id.clone(),
                         at,
-                        kind: HealthKind::UrlTest,
+                        kind,
                         latency_ms: None,
                         error: Some(format!(
-                            "url test failed for \"{}\": {}",
+                            "{verb} failed for \"{}\": {}",
                             config.name,
                             redact_secrets(&cause)
                         )),
@@ -378,55 +388,53 @@ pub fn test_all(
         .collect()
 }
 
+fn url_probe(
+    prober: &mut dyn HealthProber,
+    config: &ProxyConfig,
+    bind: &str,
+    port: u16,
+    url: &str,
+) -> Result<ProbeSuccess, String> {
+    prober.url_test(config, bind, port, url)
+}
+
+fn ping_probe(
+    prober: &mut dyn HealthProber,
+    config: &ProxyConfig,
+    bind: &str,
+    port: u16,
+    _url: &str,
+) -> Result<ProbeSuccess, String> {
+    prober.tcp_ping(config, bind, port)
+}
+
+/// Run one URL test per config through each config's own endpoint. Order of
+/// the returned outcomes matches `configs`.
+pub fn test_all(
+    configs: &[ProxyConfig],
+    url: &str,
+    prober: &mut dyn HealthProber,
+) -> Vec<TestOutcome> {
+    run_all(
+        configs,
+        prober,
+        HealthKind::UrlTest,
+        "url test",
+        url_probe,
+        url,
+    )
+}
+
 /// Time one TCP dial per config to its own endpoint.
 pub fn ping_all(configs: &[ProxyConfig], prober: &mut dyn HealthProber) -> Vec<TestOutcome> {
-    configs
-        .iter()
-        .map(|config| {
-            let at = now_unix();
-            if !prober.supports(config) {
-                return TestOutcome {
-                    sample: HealthSample {
-                        config_id: config.id.clone(),
-                        at,
-                        kind: HealthKind::TcpPing,
-                        latency_ms: None,
-                        error: Some(format!(
-                            "unsupported protocol \"{}\" for \"{}\" (no health probe for this protocol yet)",
-                            config.protocol, config.name
-                        )),
-                    },
-                    success: None,
-                };
-            }
-            match prober.tcp_ping(config, &config.bind_ip, config.port) {
-                Ok(success) => TestOutcome {
-                    sample: HealthSample {
-                        config_id: config.id.clone(),
-                        at,
-                        kind: HealthKind::TcpPing,
-                        latency_ms: Some(success.latency_ms),
-                        error: None,
-                    },
-                    success: Some(success),
-                },
-                Err(cause) => TestOutcome {
-                    sample: HealthSample {
-                        config_id: config.id.clone(),
-                        at,
-                        kind: HealthKind::TcpPing,
-                        latency_ms: None,
-                        error: Some(format!(
-                            "tcp ping failed for \"{}\": {}",
-                            config.name,
-                            redact_secrets(&cause)
-                        )),
-                    },
-                    success: None,
-                },
-            }
-        })
-        .collect()
+    run_all(
+        configs,
+        prober,
+        HealthKind::TcpPing,
+        "tcp ping",
+        ping_probe,
+        "",
+    )
 }
 
 /// Liveness derived from the latest sample.
@@ -487,12 +495,18 @@ pub struct HealthStore {
 }
 
 impl HealthStore {
-    /// Append one outcome: sample always, traffic only on success.
-    pub fn record_outcome(&mut self, outcome: &TestOutcome) {
+    /// Ticket 28: one bounded push for [`record_outcome`] and [`hydrate`]
+    /// (the ring cap is not per-caller policy).
+    fn push_sample(&mut self, sample: HealthSample) {
         if self.samples.len() >= MAX_SAMPLES {
             self.samples.remove(0);
         }
-        self.samples.push(outcome.sample.clone());
+        self.samples.push(sample);
+    }
+
+    /// Append one outcome: sample always, traffic only on success.
+    pub fn record_outcome(&mut self, outcome: &TestOutcome) {
+        self.push_sample(outcome.sample.clone());
         if let Some(success) = &outcome.success {
             let entry = self
                 .traffic
@@ -510,15 +524,12 @@ impl HealthStore {
     /// pass only snapshots of known rows so removed configs never resurrect.
     pub fn hydrate(&mut self, snapshots: &[HealthSnapshot]) {
         for snapshot in snapshots {
-            if self.samples.len() >= MAX_SAMPLES {
-                self.samples.remove(0);
-            }
             let kind = if snapshot.kind == HealthKind::TcpPing.as_str() {
                 HealthKind::TcpPing
             } else {
                 HealthKind::UrlTest
             };
-            self.samples.push(HealthSample {
+            self.push_sample(HealthSample {
                 config_id: snapshot.config_id.clone(),
                 at: snapshot.at,
                 kind,
@@ -529,19 +540,20 @@ impl HealthStore {
     }
 
     /// Latest sample of any kind for one config.
+    /// Ticket 28: shares the reverse scan with [`latest_of`].
     pub fn latest(&self, config_id: &str) -> Option<&HealthSample> {
-        self.samples
-            .iter()
-            .rev()
-            .find(|sample| sample.config_id == config_id)
+        self.latest_filtered(config_id, None)
     }
 
     /// Latest sample of one kind for one config.
     pub fn latest_of(&self, config_id: &str, kind: HealthKind) -> Option<&HealthSample> {
-        self.samples
-            .iter()
-            .rev()
-            .find(|sample| sample.config_id == config_id && sample.kind == kind)
+        self.latest_filtered(config_id, Some(kind))
+    }
+
+    fn latest_filtered(&self, config_id: &str, kind: Option<HealthKind>) -> Option<&HealthSample> {
+        self.samples.iter().rev().find(|sample| {
+            sample.config_id == config_id && kind.is_none_or(|kind| sample.kind == kind)
+        })
     }
 
     /// Liveness from the latest sample: failure flags the row dead with the
@@ -1025,6 +1037,9 @@ impl FakeHealthHandle {
 
 /// In-memory mock driver: records calls, never dials, never resolves.
 /// All health tests run against this.
+/// Ticket 28: kept mirrored with the engine fake on purpose — this one is
+/// `Arc<Mutex>` (shared across probe threads), the engine fake is
+/// `Rc<RefCell>` (single-threaded UI harness).
 #[cfg(test)]
 pub struct FakeHealthProber {
     state: Arc<Mutex<FakeProbeState>>,

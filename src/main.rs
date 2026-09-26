@@ -337,62 +337,53 @@ struct ConfigForm {
 }
 
 impl ConfigForm {
+    /// Ticket 28: one input builder behind `blank` and `prefilled` (same
+    /// placeholder + default wiring per field; `None` skips `default_value`
+    /// exactly like the old blank fields did).
+    fn field(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        placeholder: &str,
+        default: Option<&str>,
+    ) -> Entity<InputState> {
+        cx.new(|cx| {
+            let state = InputState::new(window, cx).placeholder(placeholder);
+            match default {
+                Some(value) => state.default_value(value.to_string()),
+                None => state,
+            }
+        })
+    }
+
     fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
         Self {
-            name: cx.new(|cx| InputState::new(window, cx).placeholder("Name")),
-            protocol: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Protocol")
-                    .default_value(DEFAULT_PROTOCOL)
-            }),
-            params: cx
-                .new(|cx| InputState::new(window, cx).placeholder("Protocol params (optional)")),
-            group: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Group")
-                    .default_value(DEFAULT_GROUP)
-            }),
-            bind: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Bind address")
-                    .default_value(DEFAULT_BIND)
-            }),
-            port: cx.new(|cx| InputState::new(window, cx).placeholder("Port (blank = auto)")),
+            name: Self::field(window, cx, "Name", None),
+            protocol: Self::field(window, cx, "Protocol", Some(DEFAULT_PROTOCOL)),
+            params: Self::field(window, cx, "Protocol params (optional)", None),
+            group: Self::field(window, cx, "Group", Some(DEFAULT_GROUP)),
+            bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
+            port: Self::field(window, cx, "Port (blank = auto)", None),
         }
     }
 
     fn prefilled(window: &mut Window, cx: &mut Context<AppView>, config: &ProxyConfig) -> Self {
         Self {
-            name: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Name")
-                    .default_value(config.name.clone())
-            }),
-            protocol: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Protocol")
-                    .default_value(config.protocol.clone())
-            }),
-            params: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Protocol params (optional)")
-                    .default_value(config.params.clone())
-            }),
-            group: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Group")
-                    .default_value(config.group.clone())
-            }),
-            bind: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Bind address")
-                    .default_value(config.bind_ip.clone())
-            }),
-            port: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Port (blank = auto)")
-                    .default_value(config.port.to_string())
-            }),
+            name: Self::field(window, cx, "Name", Some(config.name.as_str())),
+            protocol: Self::field(window, cx, "Protocol", Some(config.protocol.as_str())),
+            params: Self::field(
+                window,
+                cx,
+                "Protocol params (optional)",
+                Some(config.params.as_str()),
+            ),
+            group: Self::field(window, cx, "Group", Some(config.group.as_str())),
+            bind: Self::field(window, cx, "Bind address", Some(config.bind_ip.as_str())),
+            port: Self::field(
+                window,
+                cx,
+                "Port (blank = auto)",
+                Some(&config.port.to_string()),
+            ),
         }
     }
 
@@ -434,23 +425,24 @@ impl ConfigForm {
     /// field. Only genuinely edited fields are written. Blank-vs-snapshot
     /// keeps the store's blank-equals-keep semantics (`Some("")` on genuinely
     /// edited fields behaves exactly like the old full patch).
+    /// Ticket 28: reads the six fields once via [`ConfigForm::as_new`] (one
+    /// read path for add and edit); only the baseline compare is edit-only.
     fn as_patch_vs(&self, cx: &App, baseline: &ProxyConfig) -> ConfigPatch {
-        fn changed(current: &str, baseline: &str) -> bool {
-            current != baseline
+        fn changed(current: String, baseline: &str) -> Option<String> {
+            if current == baseline {
+                None
+            } else {
+                Some(current)
+            }
         }
-        let name = self.name.read(cx).value().to_string();
-        let protocol = self.protocol.read(cx).value().to_string();
-        let params = self.params.read(cx).value().to_string();
-        let group = self.group.read(cx).value().to_string();
-        let bind = self.bind.read(cx).value().to_string();
-        let port = self.port.read(cx).value().to_string();
+        let current = self.as_new(cx);
         ConfigPatch {
-            name: changed(&name, &baseline.name).then_some(name),
-            protocol: changed(&protocol, &baseline.protocol).then_some(protocol),
-            params: changed(&params, &baseline.params).then_some(params),
-            group: changed(&group, &baseline.group).then_some(group),
-            bind_ip: changed(&bind, &baseline.bind_ip).then_some(bind),
-            port: changed(&port, &baseline.port.to_string()).then_some(port),
+            name: changed(current.name, &baseline.name),
+            protocol: changed(current.protocol, &baseline.protocol),
+            params: changed(current.params, &baseline.params),
+            group: changed(current.group, &baseline.group),
+            bind_ip: changed(current.bind_ip, &baseline.bind_ip),
+            port: changed(current.port, &baseline.port.to_string()),
         }
     }
 }
@@ -471,12 +463,15 @@ struct ImportForm {
 }
 
 impl ImportForm {
+    /// Ticket 28: one constructor (the old `new`/`new_multi` pair shared the
+    /// whole body; `multi` is `Some` only for an unedited multi-file drop).
     fn new(
         window: &mut Window,
         cx: &mut Context<AppView>,
         prefill_text: &str,
         prefill_group: &str,
         file_hint: Option<String>,
+        multi: Option<Vec<(String, String)>>,
     ) -> Self {
         Self {
             text: cx.new(|cx| {
@@ -491,20 +486,8 @@ impl ImportForm {
             }),
             file_hint,
             original_text: prefill_text.to_string(),
-            multi_files: None,
+            multi_files: multi,
         }
-    }
-
-    fn new_multi(
-        window: &mut Window,
-        cx: &mut Context<AppView>,
-        prefill_text: &str,
-        prefill_group: &str,
-        files: Vec<(String, String)>,
-    ) -> Self {
-        let mut form = Self::new(window, cx, prefill_text, prefill_group, None);
-        form.multi_files = Some(files);
-        form
     }
 
     /// Consumes a clone; every built element owns its state entity.
@@ -550,6 +533,11 @@ impl ImportForm {
 /// Ticket 14: userinfo is stripped too — same rule as
 /// [`subscription_label_from_url`]: a pasted URL can embed `user:password`,
 /// which must never appear in a row, notification, or log.
+/// Ticket 28: kept separate from the import `redact_link` and health
+/// `redact_secrets` on purpose — this drops query/fragment for http(s)
+/// endpoint URLs, `redact_link` masks opaque link payloads but keeps
+/// fragments (remarks are display names), and `redact_secrets` scrubs
+/// token forms inside free text; one scrubber would leak on some path.
 fn redact_subscription_url(url: &str) -> String {
     let without_fragment = url.split('#').next().unwrap_or(url);
     let without_query = without_fragment
@@ -571,13 +559,9 @@ fn redact_subscription_url(url: &str) -> String {
             format!("{host}{path}")
         }
     };
-    const LIMIT: usize = 96;
-    if stripped.chars().count() > LIMIT {
-        let kept: String = stripped.chars().take(LIMIT).collect();
-        format!("{kept}…")
-    } else {
-        stripped
-    }
+    // Ticket 28: length cap is health::truncate (same 96-char rule as the
+    // link scrubber; one truncator for every display path).
+    truncate(&stripped, 96)
 }
 
 /// Ticket 04: default subscription label derived from the URL host (never
@@ -620,28 +604,28 @@ fn effective_addsub_group(dialog_group: &str, payload_group: &str) -> String {
 /// Ticket 16: honest export toast. The payload only re-imports import-shaped
 /// rows, so when hand-made metadata-only rows exist the toast states both
 /// numbers instead of claiming every row re-imports.
-fn export_count_message(total: usize, importable: usize, path: &str) -> String {
+/// Ticket 28: the count fragment is shared with
+/// [`export_preview_description`] (one branch, two sentence frames).
+fn export_count_fragment(total: usize, importable: usize) -> String {
     if importable == total {
-        format!("Exported {total} config(s) to {path}")
+        format!("{total} config(s)")
     } else {
-        format!("Exported {total} config(s) ({importable} importable) to {path}")
+        format!("{total} config(s) ({importable} importable)")
     }
+}
+
+fn export_count_message(total: usize, importable: usize, path: &str) -> String {
+    format!(
+        "Exported {} to {path}",
+        export_count_fragment(total, importable)
+    )
 }
 
 /// Ticket 17: success toast copy naming the affected row (add/edit/remove
 /// each name their row; no toast fires on keystrokes or dialog opens).
-fn config_added_message(name: &str) -> String {
-    format!("Added \"{name}\"")
-}
-
-/// Ticket 17: see [`config_added_message`].
-fn config_updated_message(name: &str) -> String {
-    format!("Updated \"{name}\"")
-}
-
-/// Ticket 17: see [`config_added_message`].
-fn config_removed_message(name: &str) -> String {
-    format!("Removed \"{name}\"")
+/// Ticket 28: one verb slot instead of three parallel one-line wrappers.
+fn row_action_message(verb: &str, name: &str) -> String {
+    format!("{verb} \"{name}\"")
 }
 
 /// Ticket 17: live import preview counts, reusing the parser read-only (no
@@ -723,19 +707,24 @@ fn file_basename(path: &str) -> String {
 
 /// Ticket 17: file-names line for the import dialog after a drop (`None`
 /// when nothing was dropped).
+/// Ticket 28: one basename-join for the single- and multi-file arms (the
+/// `File:`/`Files:` prefixes stay distinct; an empty multi-drop still shows
+/// nothing even when a stale hint lingers).
 fn import_files_label(
     file_hint: Option<&str>,
     multi_files: Option<&[(String, String)]>,
 ) -> Option<String> {
-    if let Some(files) = multi_files {
-        let names: Vec<String> = files.iter().map(|(name, _)| file_basename(name)).collect();
-        if names.is_empty() {
-            None
-        } else {
-            Some(format!("Files: {}", names.join(", ")))
-        }
+    let (prefix, names): (&str, Vec<String>) = match multi_files {
+        Some(files) => (
+            "Files",
+            files.iter().map(|(name, _)| file_basename(name)).collect(),
+        ),
+        None => ("File", file_hint.map(file_basename).into_iter().collect()),
+    };
+    if names.is_empty() {
+        None
     } else {
-        file_hint.map(|name| format!("File: {}", file_basename(name)))
+        Some(format!("{prefix}: {}", names.join(", ")))
     }
 }
 
@@ -744,11 +733,7 @@ fn import_files_label(
 /// warning itself stays verbatim ([`export_confirm_description`]); this line
 /// is appended after it.
 fn export_preview_description(total: usize, importable: usize, path: &str, exists: bool) -> String {
-    let mut out = if importable == total {
-        format!("{total} config(s) → {path}")
-    } else {
-        format!("{total} config(s) ({importable} importable) → {path}")
-    };
+    let mut out = format!("{} → {path}", export_count_fragment(total, importable));
     if exists {
         out.push_str(&format!(" — {path} already exists and will be overwritten"));
     }
@@ -1390,6 +1375,9 @@ impl AppView {
     /// Reload rows from the store, keeping the selection by id. A list
     /// failure notifies (never a silent empty list); callers without a
     /// window (background ticks, headless refresh) use [`AppView::reload_quiet`].
+    /// Ticket 28: the three reload variants stay — the notify/ignore split
+    /// is load-bearing (ticket-14 ruling: headless paths stay silent by
+    /// necessity, every user action notifies).
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.reload_inner(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
@@ -1438,23 +1426,18 @@ impl AppView {
 
     /// Ticket 26: running rows for a probe, or notify once on a database
     /// error (never "no running endpoints" over a corrupt database).
+    /// Ticket 28: filters over [`list_or_notify`] (one list/notify seam).
     fn running_rows_or_notify(
         &self,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Vec<ProxyConfig>> {
         let running = self.engine.running_ids();
-        match self.store.list() {
-            Ok(rows) => Some(
-                rows.into_iter()
-                    .filter(|row| running.contains(&row.id))
-                    .collect(),
-            ),
-            Err(error) => {
-                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
-                None
-            }
-        }
+        self.list_or_notify(window, cx).map(|rows| {
+            rows.into_iter()
+                .filter(|row| running.contains(&row.id))
+                .collect()
+        })
     }
 
     /// Ticket 17: success names the row (informational toast, never a
@@ -1471,7 +1454,7 @@ impl AppView {
     ) -> bool {
         match self.store.add(input) {
             Ok(created) => {
-                let message = config_added_message(&created.name);
+                let message = row_action_message("Added", &created.name);
                 self.reload(window, cx);
                 window.push_notification(Notification::success(message), cx);
                 true
@@ -1507,7 +1490,7 @@ impl AppView {
             }
             Ok(Some(_)) => match self.store.update(id, patch) {
                 Ok(updated) => {
-                    let message = config_updated_message(&updated.name);
+                    let message = row_action_message("Updated", &updated.name);
                     self.reload(window, cx);
                     window.push_notification(Notification::success(message), cx);
                     true
@@ -1543,7 +1526,10 @@ impl AppView {
                     });
                 }
                 self.reload(window, cx);
-                window.push_notification(Notification::success(config_removed_message(&name)), cx);
+                window.push_notification(
+                    Notification::success(row_action_message("Removed", &name)),
+                    cx,
+                );
             }
             Ok(false) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
@@ -2501,8 +2487,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let form = match multi_files {
-            Some(files) => ImportForm::new_multi(window, cx, prefill_text, prefill_group, files),
-            None => ImportForm::new(window, cx, prefill_text, prefill_group, file_hint),
+            Some(files) => {
+                ImportForm::new(window, cx, prefill_text, prefill_group, None, Some(files))
+            }
+            None => ImportForm::new(window, cx, prefill_text, prefill_group, file_hint, None),
         };
         let view = cx.entity();
         let reader = form.clone();
@@ -5619,10 +5607,10 @@ mod tests {
     /// is asserted by count in `crud_commits_toast_once_naming_row`).
     #[test]
     fn crud_toast_messages_name_the_row() {
-        use crate::{config_added_message, config_removed_message, config_updated_message};
-        assert_eq!(config_added_message("Work"), "Added \"Work\"");
-        assert_eq!(config_updated_message("Work"), "Updated \"Work\"");
-        assert_eq!(config_removed_message("Work"), "Removed \"Work\"");
+        use crate::row_action_message;
+        assert_eq!(row_action_message("Added", "Work"), "Added \"Work\"");
+        assert_eq!(row_action_message("Updated", "Work"), "Updated \"Work\"");
+        assert_eq!(row_action_message("Removed", "Work"), "Removed \"Work\"");
     }
 
     /// Scenario: add/edit/remove commits each fire exactly one toast.

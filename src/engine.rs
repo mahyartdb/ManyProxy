@@ -85,49 +85,65 @@ pub const XRAY_BRIDGE_PORT_END: u16 = 11999;
 pub const CHAIN_EGRESS_RULE: &str = "Cannot use Extracore or Custom or Xray configs in a chain";
 pub const XRAY_BRIDGE_COUNT_SIGNATURE: &str = "xray ingress tags size does not match bridge count!";
 
-/// Ticket 08: Xray-only VLESS rows (research 02: VLESS PQ `encryption`,
-/// finalmask/noise, XHTTP and other Xray-only semantics live here, never in
-/// the stock schema).
+/// Ticket 28: the five kind predicates share one alias-table lookup.
+fn matches_protocol_aliases(protocol: &str, aliases: &[&str]) -> bool {
+    aliases.contains(&protocol.trim().to_ascii_lowercase().as_str())
+}
+
+/// Ticket 08: Xray-only VLESS rows (research 02 semantics live here, never
+/// in the stock schema).
 pub fn is_xray_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "xray" | "xray-vless" | "xray_vless" | "vless-xray"
+    matches_protocol_aliases(
+        protocol,
+        &["xray", "xray-vless", "xray_vless", "vless-xray"],
     )
 }
 
 /// Ticket 08: single-outbound custom JSON rows (merged into the owning
 /// core's generated config; `core` picks stock/fork/xray).
 pub fn is_custom_outbound_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "custom" | "custom-out" | "custom-outbound" | "custom_outbound" | "custom-outbound-json"
+    matches_protocol_aliases(
+        protocol,
+        &[
+            "custom",
+            "custom-out",
+            "custom-outbound",
+            "custom_outbound",
+            "custom-outbound-json",
+        ],
     )
 }
 
 /// Ticket 08: full-config custom rows (replace the owning core's generated
 /// config wholesale; the user owns its inbounds).
 pub fn is_custom_config_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "custom-config" | "custom_config" | "custom-full" | "custom_full" | "custom-full-config"
+    matches_protocol_aliases(
+        protocol,
+        &[
+            "custom-config",
+            "custom_config",
+            "custom-full",
+            "custom_full",
+            "custom-full-config",
+        ],
     )
 }
 
 /// Ticket 08: user extra-core executable slot (ticket 27: N named slots —
 /// one sidecar per active row, each serving its own endpoint).
 pub fn is_extra_core_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "extra" | "extra-core" | "extra_core" | "extracore"
+    matches_protocol_aliases(
+        protocol,
+        &["extra", "extra-core", "extra_core", "extracore"],
     )
 }
 
 /// Ticket 08: chained-outbound rows (inline hops, or id references within
 /// the same sidecar config).
 pub fn is_chain_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "chain" | "chained" | "chain-outbound" | "chain_outbound"
+    matches_protocol_aliases(
+        protocol,
+        &["chain", "chained", "chain-outbound", "chain_outbound"],
     )
 }
 
@@ -190,6 +206,9 @@ fn owning_core_of(
 /// plus ticket-27 natives (AnyTLS, SSH).
 /// Anything else (naive, socks, http, unknown) is an
 /// [`EngineError::UnsupportedProtocol`] owned by a later ticket.
+/// Ticket 28: kept parallel to the import/store/health tables — this maps
+/// to sing-box outbound types for codegen, the others to stored names,
+/// grammar acceptance, and probe capability.
 fn canonical_type(protocol: &str) -> Option<&'static str> {
     match protocol.trim().to_ascii_lowercase().as_str() {
         "shadowsocks" | "ss" => Some("shadowsocks"),
@@ -208,26 +227,34 @@ fn canonical_type(protocol: &str) -> Option<&'static str> {
 }
 
 /// Ticket 27: native SSH rows (sing-box `ssh` outbound, stock sidecar).
+/// Ticket 28: same alias table as the other kind predicates (ASCII case
+/// folding matches the old `eq_ignore_ascii_case` exactly).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_ssh_protocol(protocol: &str) -> bool {
-    protocol.trim().eq_ignore_ascii_case("ssh")
+    matches_protocol_aliases(protocol, &["ssh"])
 }
 
 /// Ticket 27: standalone Noise rows (fork sidecar via [`needs_fork`]).
 /// Amnezia Noise ≠ Xray Noise (research 02): Noise rows carry their own
 /// `password`/`key` and must never mix AWG obfuscation fields.
 pub fn is_noise_protocol(protocol: &str) -> bool {
-    protocol.trim().eq_ignore_ascii_case("noise")
+    matches_protocol_aliases(protocol, &["noise"])
 }
 
 /// Inbound tag for a library row (unique: ids are never reused).
+/// Ticket 28: shares the prefix join with [`outbound_tag`] (one sanitize
+/// pass; the `in-`/`out-` prefixes themselves are load-bearing routing).
 pub fn inbound_tag(id: &str) -> String {
-    format!("in-{}", sanitize_tag(id))
+    tagged("in", id)
 }
 
 /// Outbound/endpoint tag for a library row.
 pub fn outbound_tag(id: &str) -> String {
-    format!("out-{}", sanitize_tag(id))
+    tagged("out", id)
+}
+
+fn tagged(prefix: &str, id: &str) -> String {
+    format!("{prefix}-{}", sanitize_tag(id))
 }
 
 fn sanitize_tag(raw: &str) -> String {
@@ -662,11 +689,7 @@ fn validate_awg_row(
 ) -> Result<AwgVersion, EngineError> {
     let version = awg_version_of(name, params)?;
     for field in ["private_key", "public_key"] {
-        let present = params
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty());
-        if !present {
+        if str_field(params, field).is_none() {
             return Err(EngineError::BadParams {
                 name: name.to_string(),
                 field,
@@ -712,24 +735,13 @@ fn validate_noise_row(
     params: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
     check_wrong_layer(name, "noise", params)?;
-    let server = params
-        .get("server")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|server| !server.is_empty());
-    if server.is_none() {
+    if str_field(params, "server").is_none() {
         return Err(EngineError::BadParams {
             name: name.to_string(),
             field: "server",
         });
     }
-    let secret = ["password", "key"].iter().any(|key| {
-        params
-            .get(*key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    if !secret {
+    if !any_field(params, &["password", "key"]) {
         return Err(EngineError::BadParams {
             name: name.to_string(),
             field: "password",
@@ -744,13 +756,7 @@ fn validate_ssh_row(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
-    let user = ["user", "username"].iter().any(|key| {
-        params
-            .get(*key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    if !user {
+    if !any_field(params, &["user", "username"]) {
         return Err(EngineError::BadParams {
             name: name.to_string(),
             field: "user",
@@ -874,6 +880,39 @@ fn params_object(
         })
 }
 
+/// Ticket 28: one JSON port-shape check for the custom/xray validators
+/// (numbers and digit strings in 1..=65535; presence rules stay per-shape).
+fn json_port_valid(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .is_some_and(|port| (1..=65_535).contains(&port)),
+        serde_json::Value::String(text) => {
+            text.trim().parse::<u16>().ok().is_some_and(|port| port > 0)
+        }
+        _ => false,
+    }
+}
+
+/// Ticket 28: trimmed non-empty string field — one read shape for every
+/// params validator (presence errors stay per-caller, so taxonomies never
+/// change).
+fn str_field<'a>(
+    params: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Ticket 28: true when any of `keys` holds a non-blank string.
+fn any_field(params: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| str_field(params, key).is_some())
+}
+
 /// Ticket 08: validate one Xray-only VLESS row (server/uuid shape checked
 /// here; every other Xray-only field passes through verbatim into the
 /// sidecar config).
@@ -881,38 +920,19 @@ fn validate_xray_row(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
-    let server = params
-        .get("server")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|server| !server.is_empty());
-    if server.is_none() {
-        return Err(EngineError::BadParams {
-            name: name.to_string(),
-            field: "server",
-        });
-    }
+    str_field(params, "server").ok_or(EngineError::BadParams {
+        name: name.to_string(),
+        field: "server",
+    })?;
     match params.get("server_port") {
-        Some(serde_json::Value::Number(number)) => number
-            .as_u64()
-            .filter(|port| (1..=65_535).contains(port))
-            .ok_or(EngineError::BadCustom {
+        Some(value) if json_port_valid(value) => {}
+        Some(_) => {
+            return Err(EngineError::BadCustom {
                 name: name.to_string(),
                 field: "server_port".to_string(),
                 detail: "xray server_port must be 1-65535".to_string(),
-            })
-            .map(|_| ())?,
-        Some(serde_json::Value::String(text)) => text
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port > 0)
-            .ok_or(EngineError::BadCustom {
-                name: name.to_string(),
-                field: "server_port".to_string(),
-                detail: "xray server_port must be 1-65535".to_string(),
-            })
-            .map(|_| ())?,
+            });
+        }
         _ => {
             return Err(EngineError::BadParams {
                 name: name.to_string(),
@@ -920,17 +940,10 @@ fn validate_xray_row(
             });
         }
     }
-    let uuid = params
-        .get("uuid")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|uuid| !uuid.is_empty());
-    if uuid.is_none() {
-        return Err(EngineError::BadParams {
-            name: name.to_string(),
-            field: "uuid",
-        });
-    }
+    str_field(params, "uuid").ok_or(EngineError::BadParams {
+        name: name.to_string(),
+        field: "uuid",
+    })?;
     Ok(())
 }
 
@@ -947,12 +960,7 @@ fn validate_custom_outbound(
     let mut map = params.clone();
     map.remove("core");
     if core == OwningCore::Xray {
-        let protocol = map
-            .get("protocol")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|protocol| !protocol.is_empty());
-        if protocol.is_none() {
+        if str_field(&map, "protocol").is_none() {
             return Err(EngineError::BadCustom {
                 name: name.to_string(),
                 field: "protocol".to_string(),
@@ -961,12 +969,7 @@ fn validate_custom_outbound(
             });
         }
     } else {
-        let outbound_type = map
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|outbound_type| !outbound_type.is_empty());
-        if outbound_type.is_none() {
+        if str_field(&map, "type").is_none() {
             return Err(EngineError::BadCustom {
                 name: name.to_string(),
                 field: "type".to_string(),
@@ -974,16 +977,7 @@ fn validate_custom_outbound(
             });
         }
         if let Some(port) = map.get("server_port") {
-            let valid = match port {
-                serde_json::Value::Number(number) => number
-                    .as_u64()
-                    .is_some_and(|port| (1..=65_535).contains(&port)),
-                serde_json::Value::String(text) => {
-                    text.trim().parse::<u16>().ok().is_some_and(|port| port > 0)
-                }
-                _ => false,
-            };
-            if !valid {
+            if !json_port_valid(port) {
                 return Err(EngineError::BadCustom {
                     name: name.to_string(),
                     field: "server_port".to_string(),
@@ -1419,13 +1413,8 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
             );
             serde_json::Value::Object(map)
         } else {
-            let server = egress
-                .params
-                .get("server")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|server| !server.is_empty())
-                .ok_or_else(|| EngineError::BadParams {
+            let server =
+                str_field(&egress.params, "server").ok_or_else(|| EngineError::BadParams {
                     name: egress.owner.clone(),
                     field: "server",
                 })?;
@@ -1881,24 +1870,14 @@ fn validate_xray_hop(
     label: &str,
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
-    let server = map
-        .get("server")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|server| !server.is_empty());
-    if server.is_none() {
+    if str_field(map, "server").is_none() {
         return Err(EngineError::BadCustom {
             name: name.to_string(),
             field: "nodes".to_string(),
             detail: format!("{label} xray hop is missing \"server\""),
         });
     }
-    let uuid = map
-        .get("uuid")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|uuid| !uuid.is_empty());
-    if uuid.is_none() {
+    if str_field(map, "uuid").is_none() {
         return Err(EngineError::BadCustom {
             name: name.to_string(),
             field: "nodes".to_string(),
@@ -2022,16 +2001,10 @@ fn build_standard_node(
     params: &mut serde_json::Map<String, serde_json::Value>,
     out_tag: &str,
 ) -> Result<(serde_json::Value, bool, bool), EngineError> {
-    let server = params
-        .get("server")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|server| !server.is_empty())
-        .ok_or(EngineError::BadParams {
-            name: config.name.clone(),
-            field: "server",
-        })?;
-    let _ = server;
+    str_field(params, "server").ok_or(EngineError::BadParams {
+        name: config.name.clone(),
+        field: "server",
+    })?;
     // Ticket 07: wrong-layer guards run before dispatch so obfuscation
     // mixes fail explicitly instead of connecting nowhere.
     check_wrong_layer(&config.name, &config.protocol, params)?;
@@ -2574,6 +2547,9 @@ pub trait EngineBackend {
     /// The real backend pipes stderr and pumps it on a reader thread; the
     /// fake backend replays scripted lines. UI ingests the lines through
     /// `LogStore::push_raw` (tag match + redact + bounded ring).
+    /// Ticket 28: the no-op trait defaults below stay — the fake relies on
+    /// them (no files, no binaries), so dropping any default only moves
+    /// code into the fake for zero behavior gain.
     fn drain_log_lines(&mut self) -> Vec<String> {
         Vec::new()
     }
@@ -2601,13 +2577,35 @@ pub fn engine_binary_file_name() -> String {
     }
 }
 
+/// Ticket 28: the real app directory behind every bundled-core lookup.
+fn current_app_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// Ticket 28: shared app-dir join for bundled cores (executable-gated).
+/// `Err` is the searched directory; each `resolve_*` keeps its own error
+/// type because the controller names different rows/binaries.
+fn resolve_bundled_in(app_dir: Option<&Path>, file: &str) -> Result<PathBuf, String> {
+    match app_dir {
+        Some(dir) => {
+            let candidate = dir.join(file);
+            if is_executable(&candidate) {
+                Ok(candidate)
+            } else {
+                Err(dir.display().to_string())
+            }
+        }
+        None => Err("no app directory".to_string()),
+    }
+}
+
 /// Resolve the sidecar binary in the app directory (never `PATH`, never
 /// downloads anything); the [`EngineError::MissingBinary`] names the
 /// directory searched. Candidates must be executable.
 pub fn resolve_engine_binary() -> Result<PathBuf, EngineError> {
-    let app_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let app_dir = current_app_dir();
     let path_env = std::env::var("PATH").unwrap_or_default();
     resolve_engine_binary_in(app_dir.as_deref(), &path_env)
 }
@@ -2621,19 +2619,8 @@ pub fn resolve_engine_binary_in(
     app_dir: Option<&Path>,
     _path_env: &str,
 ) -> Result<PathBuf, EngineError> {
-    let file = engine_binary_file_name();
-    if let Some(dir) = app_dir {
-        let candidate = dir.join(&file);
-        if is_executable(&candidate) {
-            return Ok(candidate);
-        }
-        return Err(EngineError::MissingBinary {
-            searched: dir.display().to_string(),
-        });
-    }
-    Err(EngineError::MissingBinary {
-        searched: "no app directory".to_string(),
-    })
+    resolve_bundled_in(app_dir, &engine_binary_file_name())
+        .map_err(|searched| EngineError::MissingBinary { searched })
 }
 
 /// Ticket 07: binary file name for the fork core on this platform.
@@ -2650,24 +2637,14 @@ pub fn fork_binary_file_name() -> String {
 /// executable). Never downloads; `Err` is the searched directory.
 /// Stock paths never call this: only exotic rows do.
 pub fn resolve_fork_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
-    let file = fork_binary_file_name();
-    if let Some(dir) = app_dir {
-        let candidate = dir.join(&file);
-        if is_executable(&candidate) {
-            return Ok(candidate);
-        }
-        return Err(dir.display().to_string());
-    }
-    Err("no app directory".to_string())
+    resolve_bundled_in(app_dir, &fork_binary_file_name())
 }
 
 /// Ticket 07: resolve the fork-core binary, naming the expected binary on
 /// failure. Row names are filled in by the controller ([`EngineController`]
 /// knows the exotic set); direct callers get the unnamed form.
 pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
-    let app_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let app_dir = current_app_dir();
     let path_env = std::env::var("PATH").unwrap_or_default();
     resolve_fork_binary_in(app_dir.as_deref(), &path_env).map_err(|searched| {
         EngineError::MissingForkBinary {
@@ -2728,24 +2705,14 @@ pub fn xray_binary_file_name() -> String {
 /// executable). Never downloads; `Err` is the searched directory.
 /// Stock/fork paths never call this: only Xray rows do.
 pub fn resolve_xray_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
-    let file = xray_binary_file_name();
-    if let Some(dir) = app_dir {
-        let candidate = dir.join(&file);
-        if is_executable(&candidate) {
-            return Ok(candidate);
-        }
-        return Err(dir.display().to_string());
-    }
-    Err("no app directory".to_string())
+    resolve_bundled_in(app_dir, &xray_binary_file_name())
 }
 
 /// Ticket 08: resolve the Xray-core binary, naming the expected binary on
 /// failure. Row names are filled in by the controller ([`EngineController`]
 /// knows the Xray set); direct callers get the unnamed form.
 pub fn resolve_xray_binary() -> Result<PathBuf, EngineError> {
-    let app_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let app_dir = current_app_dir();
     let path_env = std::env::var("PATH").unwrap_or_default();
     resolve_xray_binary_in(app_dir.as_deref(), &path_env).map_err(|searched| {
         EngineError::MissingXrayBinary {
@@ -2789,9 +2756,7 @@ pub fn resolve_extra_binary_in(app_dir: Option<&Path>, exe: &str) -> Result<Path
 /// dir. Row names are filled in by the controller; direct callers get the
 /// unnamed form.
 pub fn resolve_extra_binary(exe: &str) -> Result<PathBuf, EngineError> {
-    let app_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let app_dir = current_app_dir();
     resolve_extra_binary_in(app_dir.as_deref(), exe).map_err(|searched| {
         EngineError::MissingExtraBinary {
             rows: String::new(),
@@ -2802,12 +2767,7 @@ pub fn resolve_extra_binary(exe: &str) -> Result<PathBuf, EngineError> {
 }
 
 fn truncate_detail(detail: &str) -> String {
-    const LIMIT: usize = 1000;
-    let mut text: String = detail.chars().take(LIMIT).collect();
-    if detail.chars().count() > LIMIT {
-        text.push('…');
-    }
-    text
+    crate::health::truncate(detail, 1000)
 }
 
 // -- Ticket 23: lifecycle hardening -----------------------------------------
@@ -3482,6 +3442,9 @@ impl FakeHandle {
 
 /// In-memory mock driver: records configs, never spawns processes, never
 /// touches the network. All unit and headless UI tests run against this.
+/// Ticket 28: kept mirrored with the health fake on purpose — this one is
+/// `Rc<RefCell>` (single-threaded UI harness), the health fake is
+/// `Arc<Mutex>` (shared across probe threads).
 #[cfg(test)]
 pub struct FakeEngineBackend {
     state: Rc<RefCell<FakeState>>,

@@ -78,19 +78,22 @@ impl ImportErrorKind {
     /// persists per-subscription item failures as JSON and decodes them for
     /// the failures view). Unknown input yields `None` (callers fall back,
     /// never crash).
+    /// Ticket 28: single source of truth is [`ImportErrorKind::as_str`]
+    /// (one variant list instead of two parallel match tables).
     pub fn from_str(raw: &str) -> Option<Self> {
-        match raw {
-            "empty" => Some(ImportErrorKind::Empty),
-            "unknown-scheme" => Some(ImportErrorKind::UnknownScheme),
-            "bad-base64" => Some(ImportErrorKind::BadBase64),
-            "non-utf8" => Some(ImportErrorKind::NonUtf8),
-            "bad-host" => Some(ImportErrorKind::BadHost),
-            "bad-port" => Some(ImportErrorKind::BadPort),
-            "missing-credential" => Some(ImportErrorKind::MissingCredential),
-            "invalid-json" => Some(ImportErrorKind::InvalidJson),
-            "ss-plugin" => Some(ImportErrorKind::SsPlugin),
-            _ => None,
-        }
+        use ImportErrorKind::*;
+        const ALL: &[ImportErrorKind] = &[
+            Empty,
+            UnknownScheme,
+            BadBase64,
+            NonUtf8,
+            BadHost,
+            BadPort,
+            MissingCredential,
+            InvalidJson,
+            SsPlugin,
+        ];
+        ALL.iter().copied().find(|kind| kind.as_str() == raw)
     }
 }
 
@@ -405,7 +408,7 @@ struct UriParts {
     path: String,
 }
 
-fn split_uri(scheme: &str, rest: &str) -> Result<UriParts, ImportError> {
+fn split_uri(_scheme: &str, rest: &str) -> Result<UriParts, ImportError> {
     let (before_frag, fragment) = match rest.find('#') {
         Some(i) => (&rest[..i], rest[i + 1..].to_string()),
         None => (rest, String::new()),
@@ -422,13 +425,11 @@ fn split_uri(scheme: &str, rest: &str) -> Result<UriParts, ImportError> {
         Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
         None => (None, authority),
     };
-    let (raw_host, port_text) = split_host_port(host_port).map_err(|mut error| {
-        if scheme == "hysteria2" || scheme == "hy2" {
-            // Port omission is legal for hy2 (→ 443); other host errors stand.
-            let _ = &mut error;
-        }
-        error
-    })?;
+    let (raw_host, port_text) = split_host_port(host_port)?;
+    // Ticket 28: the old `.map_err` here returned its error unchanged on
+    // every path (the hy2 branch was a `let _ =` no-op) — deleted, behavior
+    // identical. Port omission stays legal for hy2 via `parse_hy2`'s 443
+    // default downstream.
     let host = percent_decode(raw_host.trim(), false);
     if host.trim().is_empty() {
         return Err(bad_host("missing host"));
@@ -479,10 +480,18 @@ fn display_name(fragment: &str, protocol: &str, host: &str, port: u16) -> String
     let remark = remark.trim();
     if remark.is_empty() {
         format!("{protocol}-{host}:{port}")
-    } else if remark.chars().count() > MAX_NAME_CHARS {
-        remark.chars().take(MAX_NAME_CHARS).collect()
     } else {
-        remark.to_string()
+        cap_name(remark.to_string())
+    }
+}
+
+/// Ticket 28: one display-name length cap (link remarks and JSON tags share
+/// `MAX_NAME_CHARS`; the truncation itself never carries secrets).
+fn cap_name(name: String) -> String {
+    if name.chars().count() > MAX_NAME_CHARS {
+        name.chars().take(MAX_NAME_CHARS).collect()
+    } else {
+        name
     }
 }
 
@@ -983,19 +992,28 @@ fn parse_tuic(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     })
 }
 
-/// WireGuard URI: private key in userinfo, `publickey` required.
-fn parse_wg_uri(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+/// WireGuard-family URI: private key in userinfo, `publickey` required.
+/// Ticket 28: one parser for `wireguard`/`wg` and the AmneziaWG variants
+/// (`awg://`, `amneziawg://`, `amnezia-wg://`) — same authority shape; every
+/// other query key is preserved verbatim into params for the fork-core
+/// version-matrix validator (engine.rs). Only the protocol name (params,
+/// display name, and credential errors) varies.
+fn parse_wg_like(protocol: &str, parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     let private_key = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     if private_key.trim().is_empty() {
-        return Err(missing_credential("wireguard link is missing private key"));
+        return Err(missing_credential(format!(
+            "{protocol} link is missing private key"
+        )));
     }
     let query = &parts.query;
     let public_key = query.get("publickey").cloned().unwrap_or_default();
     if public_key.trim().is_empty() {
-        return Err(missing_credential("wireguard link is missing publickey"));
+        return Err(missing_credential(format!(
+            "{protocol} link is missing publickey"
+        )));
     }
     let port = require_port(parts.port_text.as_deref())?;
-    let mut params = base_params("wireguard", &parts.host, port);
+    let mut params = base_params(protocol, &parts.host, port);
     insert_str(&mut params, "private_key", private_key);
     insert_str(&mut params, "public_key", public_key);
     insert_extras(
@@ -1012,12 +1030,17 @@ fn parse_wg_uri(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
         ],
     );
     Ok(ImportedConfig {
-        name: display_name(&parts.fragment, "wireguard", &parts.host, port),
-        protocol: "wireguard".to_string(),
+        name: display_name(&parts.fragment, protocol, &parts.host, port),
+        protocol: protocol.to_string(),
         params: finish(params),
         host: parts.host.clone(),
         port,
     })
+}
+
+/// WireGuard URI: private key in userinfo, `publickey` required.
+fn parse_wg_uri(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    parse_wg_like("wireguard", parts)
 }
 
 /// Ticket 07: AmneziaWG-variant URI (`awg://`, `amneziawg://`,
@@ -1026,39 +1049,7 @@ fn parse_wg_uri(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// `jc`/`jmin`/`jmax`, `s/h/i` ranges, 3.x additions — is preserved verbatim
 /// into params for the fork-core version-matrix validator (engine.rs).
 fn parse_awg_uri(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
-    let private_key = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
-    if private_key.trim().is_empty() {
-        return Err(missing_credential("amneziawg link is missing private key"));
-    }
-    let query = &parts.query;
-    let public_key = query.get("publickey").cloned().unwrap_or_default();
-    if public_key.trim().is_empty() {
-        return Err(missing_credential("amneziawg link is missing publickey"));
-    }
-    let port = require_port(parts.port_text.as_deref())?;
-    let mut params = base_params("amneziawg", &parts.host, port);
-    insert_str(&mut params, "private_key", private_key);
-    insert_str(&mut params, "public_key", public_key);
-    insert_extras(
-        &mut params,
-        query,
-        &[
-            "publickey",
-            "private_key",
-            "privatekey",
-            "public_key",
-            "server",
-            "server_port",
-            "port",
-        ],
-    );
-    Ok(ImportedConfig {
-        name: display_name(&parts.fragment, "amneziawg", &parts.host, port),
-        protocol: "amneziawg".to_string(),
-        params: finish(params),
-        host: parts.host.clone(),
-        port,
-    })
+    parse_wg_like("amneziawg", parts)
 }
 
 fn parse_socks_like(
@@ -1307,6 +1298,8 @@ fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
 /// Normalize an outbound `type`/`protocol` value to a library protocol name.
 /// Ticket 24 (M8): link-scheme aliases (`hy2`, `wg`, `hysteria2+realm`,
 /// `naive+https`) fold here too, so JSON/Clash agree with links.
+/// Ticket 28: kept parallel to the store `canonical_protocol` on purpose
+/// (see its note) — the alias sets and error taxonomy differ by path.
 fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
@@ -1375,7 +1368,7 @@ fn json_port(obj: &Params) -> Result<u16, ImportError> {
 /// Convert one outbound object (sing-box `type` or Xray `protocol`).
 /// Ticket 24 (M4): credential-needing types must carry credentials, exactly
 /// like links do — only the Custom/extra/chain kinds pass through unchecked.
-fn json_outbound(index: usize, value: &serde_json::Value) -> Result<ImportedConfig, ImportError> {
+fn json_outbound(_index: usize, value: &serde_json::Value) -> Result<ImportedConfig, ImportError> {
     let obj = value
         .as_object()
         .ok_or_else(|| invalid_json("item is not a JSON object"))?;
@@ -1402,11 +1395,7 @@ fn json_outbound(index: usize, value: &serde_json::Value) -> Result<ImportedConf
     // Ticket 24 (M7): `email` is an account identifier, never a display name.
     let name = json_string(obj, &["tag", "remark", "remarks", "ps", "name"])
         .unwrap_or_else(|| format!("{protocol}-{host}:{port}"));
-    let name = if name.chars().count() > MAX_NAME_CHARS {
-        name.chars().take(MAX_NAME_CHARS).collect()
-    } else {
-        name
-    };
+    let name = cap_name(name);
     require_json_credentials(&protocol, obj)?;
     let mut params = obj.clone();
     // Ticket 24 (M6): one canonical value under both keys — the engine reads
@@ -1419,7 +1408,6 @@ fn json_outbound(index: usize, value: &serde_json::Value) -> Result<ImportedConf
         "protocol".to_string(),
         serde_json::Value::String(protocol.clone()),
     );
-    let _ = index;
     Ok(ImportedConfig {
         name,
         protocol,
@@ -2660,13 +2648,9 @@ pub fn redact_link(line: &str) -> String {
             );
         }
     }
-    const LIMIT: usize = 96;
-    if text.chars().count() > LIMIT {
-        let kept: String = text.chars().take(LIMIT).collect();
-        format!("{kept}…")
-    } else {
-        text
-    }
+    // Ticket 28: length cap is health::truncate (same 96-char rule as the
+    // subscription-URL scrubber; one truncator for every display path).
+    crate::health::truncate(&text, 96)
 }
 
 #[cfg(test)]

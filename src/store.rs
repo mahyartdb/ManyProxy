@@ -297,32 +297,18 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-/// Ticket 11: pure payload builder behind [`Store::export_library_json`]
-/// (tests build payloads without a store). `outbounds` holds each
-/// import-shaped row's params object verbatim (object with
-/// `type`/`protocol` + `server`/`address` + `server_port`/`port`); rows
-/// whose params are not import-shaped stay metadata-only so they never
-/// poison the import path with per-item failures. `library` keeps every
-/// row's display/endpoint metadata for backup; `subscriptions` keeps the
-/// subscription records. The import grammar reads only `outbounds`, so a
-/// re-import of this payload commits duplicates, never adds.
-///
-/// Ticket 25: kept as the slim import-compat builder (the full-fidelity
-/// export lives in [`export_payload_full`]). No in-tree prod caller —
-/// like the ticket-16 test-only wrappers, this stays for API stability.
-#[allow(dead_code)]
-pub fn export_payload(configs: &[ProxyConfig], subscriptions: &[Subscription]) -> String {
-    export_payload_full(configs, subscriptions, &[])
-}
-
 /// Ticket 25: full-fidelity payload behind [`Store::export_library_json`].
-/// Beyond [`export_payload`], `library` carries every row's full params,
+/// `outbounds` holds each import-shaped row's params object verbatim (the
+/// import grammar reads only `outbounds`, so a re-import commits duplicates,
+/// never adds); `library` carries every row's full params,
 /// enabled flag, identity, sync baseline, adoptable flag, and row id;
 /// `subscriptions` carries each record's id plus refresh metadata
 /// (`last_refresh_at`/`last_error`/`failures`); `tombstones` rides along so
 /// user-deleted rows stay deleted after a restore. This is the store half
 /// of restorable export: the import/UI side reads these sections (ticket 26
 /// territory) or [`Store::restore_library_json`] rebuilds them directly.
+/// Ticket 28: the old slim `export_payload` wrapper is gone (zero callers;
+/// every consumer takes the full payload).
 pub fn export_payload_full(
     configs: &[ProxyConfig],
     subscriptions: &[Subscription],
@@ -421,6 +407,10 @@ fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot>
 
 /// Parse raw port text from a form field. Empty means auto-assign (`None`).
 /// `Some(0)` never validates: it is rejected as out of range.
+/// Ticket 28: kept separate from the import grammar's `parse_port` — form
+/// input allows blank-means-auto and plain digits, while link/JSON ports
+/// enforce the strict grammar (no leading zeros/signs, multi-port
+/// first-wins); one parser would change rejections on one path.
 pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -559,6 +549,10 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
 /// folds well-known aliases to the stored form (mirrors the import grammar's
 /// `normalize_outbound_type` + Clash folds). Unknown names yield `None` so
 /// the caller can raise a `protocol` field error.
+/// Ticket 28: kept parallel to the grammar table on purpose — the grammar
+/// folds link-only aliases (`hy2`, `wg`, `naive+https`) and raises taxonomy
+/// errors, while this folds dialog input to stored form; sharing one table
+/// would newly accept (or reject) protocols on one path.
 fn canonical_protocol(raw: &str) -> Option<String> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
@@ -624,6 +618,10 @@ pub fn count_importable(configs: &[ProxyConfig]) -> usize {
         .count()
 }
 
+/// Ticket 28: kept case-insensitive on purpose — manual dialog params have
+/// no canonical key casing, while the import side (`json_string`) matches
+/// exact format keys; folding both to one lookup would newly accept or miss
+/// keys on one path.
 fn lookup_case_insensitive(
     obj: &serde_json::Map<String, serde_json::Value>,
     keys: &[&str],
