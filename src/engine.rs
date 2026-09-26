@@ -2222,6 +2222,9 @@ fn build_standard_node(
         "server_port".to_string(),
         serde_json::Value::Number(server_port.into()),
     );
+    if canonical == "wireguard" {
+        reshape_wireguard_endpoint(&config.name, params, server_port)?;
+    }
     params.insert(
         "type".to_string(),
         serde_json::Value::String(canonical.to_string()),
@@ -2232,6 +2235,111 @@ fn build_standard_node(
     );
     let node = serde_json::Value::Object(params.clone());
     Ok((node, canonical == "wireguard", fork_row))
+}
+
+/// sing-box ≥1.11 WireGuard clients are `endpoints[]`, not outbounds: the
+/// remote peer lives in `peers[]` while local material (private key,
+/// interface addresses, MTU, and AmneziaWG obfuscation fields) stays
+/// top-level. Stored rows keep outbound-style keys (`server`, `public_key`);
+/// this translates them, erroring on missing credentials instead of emitting
+/// a config the engine rejects with `unknown field "server"`.
+fn reshape_wireguard_endpoint(
+    name: &str,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    server_port: u16,
+) -> Result<(), EngineError> {
+    let missing = |field: &'static str| EngineError::BadParams {
+        name: name.to_string(),
+        field,
+    };
+    let take_key = |params: &mut serde_json::Map<String, serde_json::Value>,
+                    keys: &[&str]|
+     -> Option<serde_json::Value> {
+        keys.iter()
+            .find_map(|key| params.remove(*key))
+            .filter(|value| value.as_str().is_none_or(|text| !text.trim().is_empty()))
+    };
+    let server = params
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+        .ok_or_else(|| missing("server"))?
+        .to_string();
+    let public_key = take_key(params, &["public_key", "publickey"])
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| missing("public_key"))?;
+    if let Some(private_key) = take_key(params, &["private_key", "privatekey"]) {
+        params.insert("private_key".to_string(), private_key);
+    } else {
+        return Err(missing("private_key"));
+    }
+    let as_list = |value: serde_json::Value| -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(_) => value,
+            serde_json::Value::String(text) => serde_json::Value::Array(
+                text.split([',', ' '])
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| serde_json::Value::String(entry.to_string()))
+                    .collect(),
+            ),
+            other => serde_json::Value::Array(vec![other]),
+        }
+    };
+    // Endpoint list fields stay lists: interface addresses arrive as a
+    // single CIDR string from conf/URI intake.
+    if let Some(address) = params.remove("address") {
+        params.insert("address".to_string(), as_list(address));
+    }
+    let mut peer = serde_json::Map::with_capacity(6);
+    peer.insert("address".to_string(), serde_json::Value::String(server));
+    peer.insert(
+        "port".to_string(),
+        serde_json::Value::Number(server_port.into()),
+    );
+    peer.insert(
+        "public_key".to_string(),
+        serde_json::Value::String(public_key),
+    );
+    if let Some(pre_shared) = take_key(params, &["pre_shared_key", "presharedkey"]) {
+        peer.insert("pre_shared_key".to_string(), pre_shared);
+    }
+    if let Some(allowed) = take_key(params, &["allowed_ips", "allowedips"]) {
+        peer.insert("allowed_ips".to_string(), as_list(allowed));
+    }
+    if let Some(keepalive) = take_key(params, &["persistent_keepalive"]) {
+        peer.insert("persistent_keepalive".to_string(), keepalive);
+    }
+    params.remove("server");
+    params.remove("server_port");
+    // Internal classification markers never reach the engine.
+    params.remove("awg_version");
+    // Client-side resolver setting from conf files: not an endpoint field.
+    params.remove("dns");
+    // The fork's AmneziaWG options are typed numerics (jc/jmin/jmax are
+    // uint32); conf/URI intake keeps everything as strings, so coerce the
+    // numeric fields and leave the rest verbatim for the fork to judge.
+    for key in ["jc", "jmin", "jmax"] {
+        let number = params
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.trim().parse::<u64>().ok());
+        if let Some(number) = number {
+            params.insert(key.to_string(), serde_json::Value::Number(number.into()));
+        }
+    }
+    params.insert(
+        "peers".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(peer)]),
+    );
+    Ok(())
 }
 
 /// Ticket 08: one row's main-config emission: its outbound/endpoint nodes
@@ -5040,6 +5148,53 @@ mod tests {
         assert!(generated.outbound_tags.contains(&outbound_tag("1")));
     }
 
+    /// Live-proven mapping (2026-09-26, real fork handshake + HTTP 301
+    /// through the tunnel): outbound-style stored keys become endpoint
+    /// schema — peer in `peers[]`, list fields as lists, numerics as
+    /// numbers, internal markers and client settings dropped. The fork
+    /// rejects `server`/`dns`/`awg_version` and string `jmin` outright.
+    #[test]
+    fn wireguard_endpoint_schema_matches_fork() {
+        let row = fixture(
+            "7",
+            "AwgLive",
+            "amneziawg",
+            json!({"type": "wireguard", "server": "192.0.2.44", "server_port": 51820,
+                   "private_key": "LOCAL", "public_key": "REMOTE",
+                   "address": "100.64.134.1/32", "dns": "198.18.0.1",
+                   "allowed_ips": "0.0.0.0/0", "awg_version": "2.0",
+                   "jc": "5", "jmin": "30", "jmax": "1000"}),
+            "127.0.0.1",
+            10807,
+        );
+        let generated = generate(std::slice::from_ref(&row)).expect("wg generates");
+        let value = generated.value();
+        let endpoint = value["endpoints"]
+            .as_array()
+            .expect("endpoints array")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("7")))
+            .expect("wg endpoint present");
+        assert!(endpoint.get("server").is_none(), "no outbound key");
+        assert!(endpoint.get("server_port").is_none(), "no outbound key");
+        assert!(endpoint.get("awg_version").is_none(), "no internal marker");
+        assert!(endpoint.get("dns").is_none(), "no client setting");
+        assert_eq!(endpoint["private_key"], json!("LOCAL"));
+        assert_eq!(endpoint["address"], json!(["100.64.134.1/32"]));
+        assert_eq!(endpoint["jc"], json!(5));
+        assert_eq!(endpoint["jmin"], json!(30));
+        assert_eq!(endpoint["jmax"], json!(1000));
+        let peer = endpoint["peers"]
+            .as_array()
+            .expect("peers array")
+            .first()
+            .expect("one peer");
+        assert_eq!(peer["address"], json!("192.0.2.44"));
+        assert_eq!(peer["port"], json!(51820));
+        assert_eq!(peer["public_key"], json!("REMOTE"));
+        assert_eq!(peer["allowed_ips"], json!(["0.0.0.0/0"]));
+    }
+
     /// Exotic protocols stay out of this slice with a named error.
     /// Ticket 27: AnyTLS/SSH/Noise are native now — the residual
     /// UnsupportedProtocol case is a genuinely unknown protocol.
@@ -5528,7 +5683,12 @@ mod tests {
         assert_eq!(endpoints[0]["tag"], json!(outbound_tag("7")));
         assert_eq!(endpoints[0]["jc"], json!(4));
         assert_eq!(endpoints[0]["jmin"], json!(40));
-        assert_eq!(endpoints[0]["awg_version"], json!("2.0"));
+        // The endpoint reshape drops internal markers (`awg_version` never
+        // reaches the engine; the fork judges the matrix fields as given).
+        assert!(
+            endpoints[0].get("awg_version").is_none(),
+            "no internal marker"
+        );
         assert_eq!(generated.isolation.len(), 1);
     }
 

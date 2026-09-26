@@ -3025,9 +3025,11 @@ mod tests {
             .clone();
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0]["type"], serde_json::json!("wireguard"));
-        assert_eq!(endpoints[0]["jc"], serde_json::json!("5"));
-        assert_eq!(endpoints[0]["jmin"], serde_json::json!("30"));
-        assert_eq!(endpoints[0]["jmax"], serde_json::json!("1000"));
+        // Live-proven: the fork types jc/jmin/jmax as uint32 — strings are
+        // rejected at check time, so generation coerces them.
+        assert_eq!(endpoints[0]["jc"], serde_json::json!(5));
+        assert_eq!(endpoints[0]["jmin"], serde_json::json!(30));
+        assert_eq!(endpoints[0]["jmax"], serde_json::json!(1000));
     }
 
     // -- ticket 07: AmneziaWG-variant links (params preserved verbatim) -----

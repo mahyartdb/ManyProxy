@@ -6,7 +6,7 @@
 
 **Owns:** rust-networking
 
-**Status:** ready-for-agent
+**Status:** done (commit ff794ed + reshape follow-up; `cargo test` 366 passed, clippy/fmt clean, verified)
 
 Findings (live-proven 2026-09-26):
 - Stock sing-box 1.14.2 strict-decodes and rejects the `encryption` key on vless outbounds — even `"none"`. A real user row (`encryption` + `packetEncoding` camelCase + ws opts) fails Start-all with `outbounds[0].encryption: json: unknown field "encryption"`.
