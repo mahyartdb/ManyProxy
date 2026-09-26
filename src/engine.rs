@@ -389,7 +389,14 @@ impl std::fmt::Display for EngineError {
                 write!(f, "invalid generated engine config ({detail})")
             }
             EngineError::CheckFailed { detail } => {
-                write!(f, "engine config check failed ({detail})")
+                // Ticket 29: `check` stderr arrives with ANSI color escapes
+                // (the raw `[31mFATAL[0m` toast); the surfaced error keeps the
+                // text and drops the codes.
+                write!(
+                    f,
+                    "engine config check failed ({})",
+                    strip_ansi_codes(detail)
+                )
             }
             EngineError::MissingBinary { searched } => write!(
                 f,
@@ -848,12 +855,80 @@ pub fn needs_fork(config: &ProxyConfig) -> bool {
     false
 }
 
+/// Ticket 29: VLESS `encryption` routing (live-proven 2026-09-26 against
+/// stock sing-box 1.14.2 and xray-core 26.3.27):
+/// - stock strict-decodes and rejects ANY `encryption` key on vless
+///   outbounds — even `"none"` (`unknown field "encryption"`);
+/// - xray accepts `"none"` in `users[].encryption` but validates real values
+///   (`unsupported "encryption"` for anything it cannot parse; genuine client
+///   values are full key strings minted by `xray vlessenc`).
+///
+/// Absent/blank/`"none"` drops the key and stays stock, while a real value
+/// routes the row through the xray sidecar bridge with fields passthrough
+/// (xray `streamSettings.packetEncoding` is camelCase, matching intake).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VlessEncryption {
+    /// No key, null, blank, or `"none"` (ASCII case-insensitive): stock.
+    Stock,
+    /// A real value: xray bridge leg.
+    Xray,
+    /// Present but not a string: typed error.
+    BadType,
+}
+
+/// Ticket 29: classify one standard VLESS row's `encryption` param.
+fn vless_encryption_of(params: &serde_json::Map<String, serde_json::Value>) -> VlessEncryption {
+    match params.get("encryption") {
+        None | Some(serde_json::Value::Null) => VlessEncryption::Stock,
+        Some(serde_json::Value::String(value)) => {
+            if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("none") {
+                VlessEncryption::Stock
+            } else {
+                VlessEncryption::Xray
+            }
+        }
+        Some(_) => VlessEncryption::BadType,
+    }
+}
+
+/// Ticket 29: true for standard `vless` rows carrying a real `encryption`
+/// value (served through the xray sidecar bridge, never stock).
+fn vless_needs_xray(protocol: &str, params: &serde_json::Map<String, serde_json::Value>) -> bool {
+    canonical_type(protocol) == Some("vless")
+        && vless_encryption_of(params) == VlessEncryption::Xray
+}
+
+/// Ticket 29: row-level form of [`vless_needs_xray`] (malformed params are
+/// not xray-routed: they fail with their own named error, like every other
+/// routing predicate here).
+fn config_vless_needs_xray(config: &ProxyConfig) -> bool {
+    serde_json::from_str::<serde_json::Value>(&config.params)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|map| vless_needs_xray(&config.protocol, &map))
+}
+
+/// Ticket 29: malformed `encryption` on a VLESS row (names the field and the
+/// xray sidecar; never echoes the value).
+fn bad_vless_encryption(name: &str) -> EngineError {
+    EngineError::BadCustom {
+        name: name.to_string(),
+        field: "encryption".to_string(),
+        detail: "vless \"encryption\" must be \"none\" (stock, key dropped) or a string value served via the xray sidecar".to_string(),
+    }
+}
+
 /// Ticket 08: true for rows served through the Xray sidecar bridge: Xray
 /// rows plus xray-core custom outbounds. Malformed params are not
 /// xray-routed: they fail at [`generate`]/[`validate_activation`] with
 /// their own named error.
+/// Ticket 29: standard VLESS rows carrying a real `encryption` value ride
+/// the same bridge (stock sing-box rejects the `encryption` key outright).
 pub fn needs_xray(config: &ProxyConfig) -> bool {
     if is_xray_protocol(&config.protocol) {
+        return true;
+    }
+    if config_vless_needs_xray(config) {
         return true;
     }
     if is_custom_outbound_protocol(&config.protocol) {
@@ -1153,6 +1228,24 @@ fn inline_hop_kind(
             field: "nodes".to_string(),
             detail: format!("{label} nests a chain (v1 chains are flat)"),
         });
+    }
+    // Ticket 29: inline vless hops carrying a real `encryption` value are
+    // xray-bridged (stock rejects the key outright); a non-string value
+    // fails typed here instead of at `check` time.
+    if canonical_type(&marker) == Some("vless") {
+        match vless_encryption_of(map) {
+            VlessEncryption::Xray => return Ok(ChainHopKind::Xray),
+            VlessEncryption::BadType => {
+                return Err(EngineError::BadCustom {
+                    name: name.to_string(),
+                    field: "nodes".to_string(),
+                    detail: format!(
+                        "{label} carries a non-string \"encryption\" (want \"none\" or an xray-served string value)"
+                    ),
+                });
+            }
+            VlessEncryption::Stock => {}
+        }
     }
     if is_extra_core_protocol(&marker) || truthy(map, "extra") || truthy(map, "extracore") {
         return Ok(ChainHopKind::Extra);
@@ -1455,8 +1548,20 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                 serde_json::Value::Array(vec![serde_json::Value::Object(vnext)]),
             );
             let mut stream = serde_json::Map::new();
+            // Ticket 29: `packetEncoding` stays camelCase per the xray schema
+            // (`streamSettings.packetEncoding`, accepted by `xray run -test`).
             for key in [
-                "network", "security", "sni", "pbk", "sid", "path", "host", "mode", "fp", "alpn",
+                "network",
+                "security",
+                "sni",
+                "pbk",
+                "sid",
+                "path",
+                "host",
+                "mode",
+                "fp",
+                "alpn",
+                "packetEncoding",
             ] {
                 if let Some(value) = egress.params.get(key) {
                     stream.insert(key.to_string(), value.clone());
@@ -1678,7 +1783,11 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                 });
             }
             replacements.push((core, document.to_string()));
-        } else if is_xray_protocol(&config.protocol) {
+        } else if is_xray_protocol(&config.protocol) || vless_needs_xray(&config.protocol, &params)
+        {
+            // Ticket 29: standard VLESS rows carrying a real `encryption`
+            // value validate like xray rows and ride the same bridge (stock
+            // sing-box rejects the `encryption` key outright).
             check_wrong_layer(&config.name, &config.protocol, &params)?;
             validate_xray_row(&config.name, &params)?;
             bridge_keys.push(config.id.clone());
@@ -1764,6 +1873,22 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                         ),
                     });
                 }
+                // Ticket 29: VLESS-`encryption` rows are bridge legs
+                // (egress-only like xray rows, but classified Standard by
+                // protocol alone), so a mid-chain reference fails here.
+                if index + 1 < hops.len()
+                    && by_id
+                        .get(id)
+                        .is_some_and(|row| config_vless_needs_xray(row))
+                {
+                    return Err(EngineError::ChainViolation {
+                        name: config.name.clone(),
+                        detail: format!(
+                            "{} references a VLESS-`encryption` row mid-chain; xray-bridged nodes must be last",
+                            hop.label
+                        ),
+                    });
+                }
             }
             if hop.kind == ChainHopKind::Xray && hop.ref_id.is_none() {
                 bridge_keys.push(format!("{}#hop{}", config.id, index));
@@ -1778,7 +1903,8 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         .collect();
     let ports = assign_bridge_ports(&bridge_keys, &taken_ports)?;
     for config in configs {
-        if is_xray_protocol(&config.protocol) {
+        // Ticket 29: VLESS `encryption` rows ride the xray bridge too.
+        if is_xray_protocol(&config.protocol) || config_vless_needs_xray(config) {
             let params = params_object(config)?;
             egresses.push(XrayEgress {
                 owner: config.name.clone(),
@@ -1884,6 +2010,18 @@ fn validate_xray_hop(
             detail: format!("{label} xray hop is missing \"uuid\""),
         });
     }
+    // Ticket 29: xray itself rejects unparsable values at load (`unsupported
+    // "encryption""); a non-string never reaches it — typed here instead.
+    if map
+        .get("encryption")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(EngineError::BadCustom {
+            name: name.to_string(),
+            field: "nodes".to_string(),
+            detail: format!("{label} xray hop carries a non-string \"encryption\""),
+        });
+    }
     Ok(())
 }
 
@@ -1963,7 +2101,8 @@ pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError>
 fn bridge_keys_for(configs: &[ProxyConfig]) -> Result<Vec<String>, EngineError> {
     let mut keys = Vec::new();
     for config in configs {
-        if is_xray_protocol(&config.protocol) {
+        // Ticket 29: VLESS `encryption` rows take bridge ports too.
+        if is_xray_protocol(&config.protocol) || config_vless_needs_xray(config) {
             keys.push(config.id.clone());
             continue;
         }
@@ -2046,6 +2185,25 @@ fn build_standard_node(
             protocol: config.protocol.clone(),
         });
     };
+    // Ticket 29: stock sing-box rejects ANY `encryption` key on vless
+    // outbounds, so absent/blank/`"none"` drops the key here (stays stock).
+    // A real value never reaches stock emission (routing sends it xray-ward)
+    // and fails typed if it does; a non-string fails typed naming the field.
+    if canonical == "vless" {
+        match vless_encryption_of(params) {
+            VlessEncryption::Stock => {
+                params.remove("encryption");
+            }
+            VlessEncryption::BadType => return Err(bad_vless_encryption(&config.name)),
+            VlessEncryption::Xray => {
+                return Err(EngineError::BadCustom {
+                    name: config.name.clone(),
+                    field: "encryption".to_string(),
+                    detail: "vless rows carrying a real \"encryption\" value run in the xray sidecar, not the stock config".to_string(),
+                });
+            }
+        }
+    }
     let server_port = match params.get("server_port") {
         Some(serde_json::Value::Number(number)) => number
             .as_u64()
@@ -2112,7 +2270,9 @@ fn build_ticket08_row(
             detail: "custom full-config rows replace their core's config instead of joining the main config".to_string(),
         });
     }
-    if is_xray_protocol(&config.protocol) {
+    // Ticket 29: standard VLESS rows with a real `encryption` value emit the
+    // same loopback bridge pointer (stock rejects the key outright).
+    if is_xray_protocol(&config.protocol) || vless_needs_xray(&config.protocol, params) {
         check_wrong_layer(&config.name, &config.protocol, params)?;
         validate_xray_row(&config.name, params)?;
         let port = *bridges
@@ -2200,7 +2360,14 @@ fn build_ticket08_row(
                             ),
                         });
                     }
-                    if needs_fork(target) {
+                    // Ticket 29: xray rows and VLESS-`encryption` rows are
+                    // bridge legs served through the main config, so they
+                    // resolve before the fork-sidecar rejection below.
+                    let target_bridged = is_xray_protocol(&target.protocol)
+                        || params_object(target)
+                            .ok()
+                            .is_some_and(|map| vless_needs_xray(&target.protocol, &map));
+                    if needs_fork(target) && !target_bridged {
                         return Err(EngineError::BadCustom {
                             name: config.name.clone(),
                             field: "nodes".to_string(),
@@ -2210,7 +2377,7 @@ fn build_ticket08_row(
                             ),
                         });
                     }
-                    if is_xray_protocol(&target.protocol) {
+                    if target_bridged {
                         let port = *bridges.get(&target.id).ok_or_else(|| {
                             EngineError::InvalidGenerated {
                                 detail: format!("no bridge port assigned for \"{}\"", target.name),
@@ -2770,6 +2937,37 @@ fn truncate_detail(detail: &str) -> String {
     crate::health::truncate(detail, 1000)
 }
 
+/// Ticket 29: strip ANSI CSI escape sequences (`ESC [ params final-byte`,
+/// the SGR colors/bold that `sing-box check` paints its `FATAL` line with)
+/// so engine errors stay human-readable in toasts. Keeps the text, drops
+/// only the codes. Hand-rolled (no new deps); a trailing bare ESC is dropped.
+pub fn strip_ansi_codes(text: &str) -> String {
+    const CSI_FINAL: std::ops::RangeInclusive<char> = '@'..='~';
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(next) = chars.next() {
+        if next != 27 as char {
+            out.push(next);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for code in chars.by_ref() {
+                    if CSI_FINAL.contains(&code) {
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 // -- Ticket 23: lifecycle hardening -----------------------------------------
 // Sidecar lifecycle that cannot orphan processes, leak secret files, or
 // split-brain on partial failure. Pure helpers first (tested directly);
@@ -3236,7 +3434,11 @@ impl EngineBackend for RealEngineBackend {
         if output.status.success() {
             Ok(())
         } else {
-            Err(truncate_detail(&String::from_utf8_lossy(&output.stderr)))
+            // Ticket 29: strip ANSI color escapes before truncating so the
+            // cap counts visible text and the toast keeps `FATAL` clean.
+            Err(truncate_detail(&strip_ansi_codes(
+                &String::from_utf8_lossy(&output.stderr),
+            )))
         }
     }
 
@@ -4211,6 +4413,9 @@ impl EngineController {
                     if label == "fork" && plan.fork_xhttp {
                         detail = format!("{detail} ({XHTTP_KNOWN_BUGS})");
                     }
+                    // Ticket 29: ANSI-clean on every backend path (stock /
+                    // fork / xray check output all surface as toasts).
+                    detail = strip_ansi_codes(&detail);
                     let error = EngineError::CheckFailed { detail };
                     self.last_error = Some(error.to_string());
                     return Err(error);
@@ -4221,7 +4426,10 @@ impl EngineController {
         for (slot, gen) in self.extra_backends.iter_mut().zip(extra_gens.iter()) {
             if let Some(json) = gen {
                 if let Err(detail) = slot.check_config(json) {
-                    let error = EngineError::CheckFailed { detail };
+                    // Ticket 29: ANSI-clean on the extra-slot path too.
+                    let error = EngineError::CheckFailed {
+                        detail: strip_ansi_codes(&detail),
+                    };
                     self.last_error = Some(error.to_string());
                     return Err(error);
                 }
@@ -6787,5 +6995,310 @@ mod tests {
                 row.name
             );
         }
+    }
+
+    // -- Ticket 29: VLESS `encryption` routing + ANSI-clean engine errors --
+
+    fn t29_vless_row(
+        id: &str,
+        name: &str,
+        encryption: serde_json::Value,
+        port: u16,
+    ) -> ProxyConfig {
+        let mut params = serde_json::Map::new();
+        params.insert("type".to_string(), json!("vless"));
+        params.insert("server".to_string(), json!("198.51.100.9"));
+        params.insert("server_port".to_string(), json!(443));
+        params.insert(
+            "uuid".to_string(),
+            json!("11111111-2222-4333-8444-555555555555"),
+        );
+        params.insert("encryption".to_string(), encryption);
+        fixture(
+            id,
+            name,
+            "vless",
+            serde_json::Value::Object(params),
+            "127.0.0.1",
+            port,
+        )
+    }
+
+    fn t29_generated_node(value: &serde_json::Value, tag: &str) -> serde_json::Value {
+        value["outbounds"]
+            .as_array()
+            .expect("outbounds array")
+            .iter()
+            .find(|node| node["tag"] == json!(tag))
+            .expect("outbound present")
+            .clone()
+    }
+
+    /// Scenario 1: `encryption: "none"` stays stock with the key dropped.
+    /// Stock sing-box 1.14.2 strict-decodes and rejects ANY `encryption` key
+    /// on vless outbounds (`unknown field "encryption"`, live-proven), so the
+    /// key must never reach the stock config.
+    #[test]
+    fn t29_vless_encryption_none_drops_key_stays_stock() {
+        let row = t29_vless_row("t29a", "VlessNone", json!("none"), 18921);
+        assert!(!needs_xray(&row), "none stays stock");
+        assert!(!needs_fork(&row), "none needs no fork");
+        let plan = validate_activation(std::slice::from_ref(&row)).expect("none plans");
+        assert!(
+            plan.egresses.is_empty(),
+            "no xray legs: {:?}",
+            plan.egresses
+        );
+        assert_eq!(plan.main_rows.len(), 1);
+        let generated = generate(&plan.main_rows).expect("stock generates");
+        assert!(!generated.requires_xray, "stock sidecar serves it");
+        let node = t29_generated_node(&generated.value(), &outbound_tag("t29a"));
+        assert_eq!(node["type"], json!("vless"));
+        assert!(
+            !node.as_object().expect("object").contains_key("encryption"),
+            "key dropped for stock: {node}"
+        );
+    }
+
+    /// Rows without `encryption` are untouched (prohibited side effect).
+    #[test]
+    fn t29_vless_without_encryption_unchanged() {
+        let row = fixture(
+            "t29b",
+            "VlessPlain",
+            "vless",
+            json!({"type": "vless", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555"}),
+            "127.0.0.1",
+            18922,
+        );
+        assert!(!needs_xray(&row), "plain vless stays stock");
+        let generated = generate(std::slice::from_ref(&row)).expect("plain generates");
+        assert!(!generated.requires_xray, "stock serves it");
+        let node = t29_generated_node(&generated.value(), &outbound_tag("t29b"));
+        assert_eq!(node["type"], json!("vless"));
+        assert!(
+            !node.as_object().expect("object").contains_key("encryption"),
+            "no key invented: {node}"
+        );
+    }
+
+    /// Blank and case-folded `"none"` also stay stock with no key emitted.
+    #[test]
+    fn t29_vless_encryption_blank_and_case_fold_stay_stock() {
+        for (id, value) in [
+            ("t29c", json!("None")),
+            ("t29d", json!(" NONE ")),
+            ("t29e", json!("")),
+        ] {
+            let row = t29_vless_row(id, "VlessFold", value, 18923);
+            assert!(!needs_xray(&row), "{id} stays stock");
+            let generated = generate(std::slice::from_ref(&row)).expect("stock generates");
+            assert!(!generated.requires_xray, "{id} served by stock");
+            let node = t29_generated_node(&generated.value(), &outbound_tag(id));
+            assert!(
+                !node.as_object().expect("object").contains_key("encryption"),
+                "{id} key dropped: {node}"
+            );
+        }
+    }
+
+    /// Scenario 2: a real `encryption` value routes through the xray sidecar
+    /// bridge (bridge pointer in the main config, verbatim `encryption` in
+    /// the xray `users[]` entry). Synthetic value only — never key material.
+    #[test]
+    fn t29_vless_real_encryption_routes_xray_bridge() {
+        let row = t29_vless_row("t29x", "VlessEnc", json!("synthetic-t29-encryption"), 18924);
+        assert!(needs_xray(&row), "real value needs xray");
+        assert!(!needs_fork(&row), "xray, not fork");
+        let plan = validate_activation(std::slice::from_ref(&row)).expect("xray plans");
+        assert_eq!(plan.main_rows.len(), 1, "pointer served by main");
+        assert_eq!(plan.egresses.len(), 1, "one bridge leg");
+        let egress = &plan.egresses[0];
+        assert_eq!(egress.bridge_key, "t29x");
+        assert!(!egress.xray_shaped, "vless-shaped leg");
+        let xray = generate_xray_config(&plan.egresses).expect("xray config builds");
+        let outbounds = xray.value()["outbounds"].clone();
+        let node = outbounds
+            .as_array()
+            .expect("xray outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(xray_egress_tag("t29x")))
+            .expect("xray vless egress present");
+        assert_eq!(node["protocol"], json!("vless"));
+        assert_eq!(
+            node["settings"]["vnext"][0]["users"][0]["encryption"],
+            json!("synthetic-t29-encryption"),
+            "verbatim passthrough"
+        );
+        let generated = generate(std::slice::from_ref(&row)).expect("main generates");
+        assert!(generated.requires_xray, "main knows the bridge");
+        let pointer = t29_generated_node(&generated.value(), &outbound_tag("t29x"));
+        assert_eq!(pointer["type"], json!("socks"), "bridge pointer: {pointer}");
+        assert_eq!(pointer["server"], json!("127.0.0.1"));
+        assert_eq!(
+            pointer["server_port"].as_u64().expect("bridge port"),
+            egress.bridge_port as u64,
+            "pointer meets ingress"
+        );
+    }
+
+    /// Scenario 2 detail: `flow` plus camelCase `packetEncoding` ride the
+    /// xray leg per the xray schema (`streamSettings.packetEncoding`,
+    /// accepted by xray 26.3.27 `run -test`).
+    #[test]
+    fn t29_vless_real_encryption_carries_flow_and_packet_encoding() {
+        let row = fixture(
+            "t29y",
+            "VlessWs",
+            "vless",
+            json!({"type": "vless", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555",
+                   "encryption": "synthetic-t29-encryption",
+                   "flow": "xtls-rprx-vision",
+                   "network": "ws", "packetEncoding": "packet",
+                   "path": "/ws", "host": "example.com"}),
+            "127.0.0.1",
+            18925,
+        );
+        let plan = validate_activation(std::slice::from_ref(&row)).expect("plans");
+        assert_eq!(plan.egresses.len(), 1, "one bridge leg");
+        let xray = generate_xray_config(&plan.egresses).expect("builds");
+        let outbounds = xray.value()["outbounds"].clone();
+        let node = outbounds
+            .as_array()
+            .expect("xray outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(xray_egress_tag("t29y")))
+            .expect("xray vless egress present");
+        assert_eq!(
+            node["settings"]["vnext"][0]["users"][0]["flow"],
+            json!("xtls-rprx-vision"),
+            "flow passthrough"
+        );
+        assert_eq!(
+            node["streamSettings"]["packetEncoding"],
+            json!("packet"),
+            "xray-schema naming"
+        );
+    }
+
+    /// A non-string `encryption` fails typed, naming the field and the xray
+    /// sidecar — never a stock `unknown field` at check time, never values.
+    #[test]
+    fn t29_vless_encryption_nonstring_is_typed_error() {
+        let row = t29_vless_row("t29z", "VlessBad", json!(42), 18926);
+        let error = validate_activation(std::slice::from_ref(&row)).expect_err("typed");
+        assert!(
+            matches!(error, EngineError::BadCustom { .. }),
+            "typed, got {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("\"encryption\""), "names the field: {text}");
+        assert!(text.contains("xray"), "names the sidecar: {text}");
+    }
+
+    /// Scenario 2 end to end: the row is served via the xray sidecar on its
+    /// own endpoint; the value never lands in the stock config.
+    #[test]
+    fn t29_vless_real_encryption_served_by_xray_sidecar() {
+        let row = t29_vless_row(
+            "t29w",
+            "VlessSidecar",
+            json!("synthetic-t29-encryption"),
+            18927,
+        );
+        let (mut controller, stock, _fork, xray, _extra) = EngineController::fake_quartet();
+        controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
+        controller
+            .start_all(std::slice::from_ref(&row))
+            .expect("starts via bridge");
+        assert!(xray.is_running(), "xray sidecar serves the leg");
+        assert!(stock.is_running(), "stock serves the bridge pointer");
+        assert!(controller.is_running("t29w"), "row reports running");
+        let served_xray = xray.last_config().expect("xray config");
+        assert!(
+            served_xray.contains("synthetic-t29-encryption"),
+            "value reaches xray"
+        );
+        let served_stock = stock.last_config().expect("stock config");
+        assert!(
+            !served_stock.contains("synthetic-t29-encryption"),
+            "never in stock: {served_stock}"
+        );
+    }
+
+    /// Ticket 29: build an ANSI-colored `check` stderr line without invisible
+    /// bytes in source (`char::from(27u8)` keeps the ESC byte visible).
+    fn t29_ansi(detail: &str) -> String {
+        detail.replace("[ESC]", &char::from(27u8).to_string())
+    }
+
+    /// Ticket 29: the ANSI stripper drops CSI sequences and keeps text
+    /// (SGR colors, bold, multi-param, non-CSI escapes, trailing bare ESC).
+    #[test]
+    fn t29_strip_ansi_codes_drops_csi_keeps_text() {
+        assert_eq!(strip_ansi_codes("plain"), "plain");
+        assert_eq!(
+            strip_ansi_codes(&t29_ansi("[ESC][31mFATAL[ESC][0m")),
+            "FATAL"
+        );
+        assert_eq!(
+            strip_ansi_codes(&t29_ansi("[ESC][31;1mboom[ESC][0m")),
+            "boom"
+        );
+        assert_eq!(
+            strip_ansi_codes(&t29_ansi("a[ESC]b")),
+            "a",
+            "non-CSI escape eats one char"
+        );
+        assert_eq!(
+            strip_ansi_codes(&t29_ansi("trailing[ESC]")),
+            "trailing",
+            "bare tail dropped"
+        );
+    }
+
+    /// Scenario 3: engine `check` stderr arrives with ANSI color escapes; the
+    /// surfaced error keeps the text and drops the codes.
+    #[test]
+    fn t29_check_failed_strips_ansi_escape_codes() {
+        let error = EngineError::CheckFailed {
+            detail: t29_ansi("[ESC][31mFATAL[ESC][0m decode failed: boom"),
+        };
+        let text = error.to_string();
+        assert!(text.contains("FATAL"), "text kept: {text}");
+        assert!(text.contains("boom"), "text kept: {text}");
+        assert!(
+            !text.contains(char::from(27u8)),
+            "no escape codes: {text:?}"
+        );
+        assert!(!text.contains("[31m"), "no SGR residue: {text}");
+    }
+
+    /// Scenario 3 end to end: an ANSI-colored `check` failure from any
+    /// backend surfaces without escape codes (toast-safe).
+    #[test]
+    fn t29_controller_check_failure_has_no_ansi() {
+        let row = fixture(
+            "t29s",
+            "AnsiRow",
+            "shadowsocks",
+            json!({"type": "shadowsocks", "server": "203.0.113.7",
+                   "server_port": 8388, "method": "aes-128-gcm", "password": "pass1"}),
+            "127.0.0.1",
+            18928,
+        );
+        let (mut controller, stock) = EngineController::fake();
+        stock.fail_check(&t29_ansi("[ESC][31;1mFATAL[ESC][0m outbounds[0]: boom"));
+        let error = controller
+            .start_all(std::slice::from_ref(&row))
+            .expect_err("blocked");
+        assert!(matches!(error, EngineError::CheckFailed { .. }));
+        let text = error.to_string();
+        assert!(text.contains("FATAL"), "kept: {text}");
+        assert!(!text.contains(char::from(27u8)), "stripped: {text:?}");
+        let last = controller.last_error().expect("recorded");
+        assert!(!last.contains(char::from(27u8)), "stored clean: {last:?}");
     }
 }
