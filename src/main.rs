@@ -27,7 +27,8 @@ use gpui_kit::*;
 use engine::{
     engine_binary_file_name, fork_binary_file_name, lan_confirm_description, lan_confirm_text,
     lan_exposure_warning, requires_lan_confirm, resolve_engine_binary, resolve_fork_binary,
-    resolve_xray_binary, xray_binary_file_name, EngineController, EngineError, LAN_CONFIRM_TITLE,
+    resolve_xray_binary, strip_ansi_codes, xray_binary_file_name, EngineController, EngineError,
+    LAN_CONFIRM_TITLE,
 };
 use health::{
     ping_all, redact_secrets, test_all, truncate, HealthProber, HealthStore, LogStore,
@@ -2734,21 +2735,27 @@ impl AppView {
     /// Ticket 06: visible log lines for the dialog — the selected config's
     /// lines when a row is selected, else engine-global + all — further
     /// narrowed by the `log_filter` substring. Newest last, capped.
+    /// Ticket 34: sidecar stderr carries ANSI color escapes (sing-box
+    /// `[31m`/`[38;5;…`); the Logs dialog renders them stripped via the
+    /// shared `strip_ansi_codes` helper. Stored records stay verbatim so
+    /// filtering and any future export see the original bytes.
     fn log_lines(&self, cx: &App) -> Vec<String> {
         let selected = self.selected_config(cx).map(|config| config.id);
         let filter = self.log_filter.trim().to_lowercase();
+        let render =
+            |level: &str, message: &str| format!("[{}] {}", level, strip_ansi_codes(message));
         let mut lines: Vec<String> = match selected.as_deref() {
             Some(id) => self
                 .logs
                 .for_config(id)
                 .iter()
-                .map(|record| format!("[{}] {}", record.level.as_str(), record.message))
+                .map(|record| render(record.level.as_str(), &record.message))
                 .collect(),
             None => self
                 .logs
                 .all()
                 .iter()
-                .map(|record| format!("[{}] {}", record.level.as_str(), record.message))
+                .map(|record| render(record.level.as_str(), &record.message))
                 .collect(),
         };
         if !filter.is_empty() {
@@ -5022,6 +5029,52 @@ mod tests {
         assert_eq!(
             crate::sidecar_presence_line("x.exe", false),
             "x.exe: missing (place it next to the app exe)"
+        );
+    }
+
+    /// Ticket 34: the Logs dialog strips sidecar ANSI colors at render
+    /// (live-proven: sing-box `[31m`/`[38;5;…` escapes reached the dialog);
+    /// stored records stay verbatim.
+    #[gpui_kit::test]
+    fn logs_dialog_strips_sidecar_ansi(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.logs.push_raw(
+                    "\u{1b}[31mERROR\u{1b}[0m[0033] dial tcp 127.0.0.1:8388: refused",
+                    &[],
+                );
+            });
+        });
+        let stored = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.logs
+                    .all()
+                    .iter()
+                    .map(|r| r.message.clone())
+                    .collect::<Vec<_>>()
+            })
+        });
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0].contains('\u{1b}'),
+            "stored record stays verbatim, got {:?}",
+            stored[0]
+        );
+        let lines = cx.update(|_, cx| view.update(cx, |view, cx| view.log_lines(cx)));
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !lines[0].contains('\u{1b}'),
+            "rendered line has no escapes, got {:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("ERROR"), "keeps text, got {:?}", lines[0]);
+        assert!(
+            lines[0].contains("refused"),
+            "keeps text, got {:?}",
+            lines[0]
         );
     }
 

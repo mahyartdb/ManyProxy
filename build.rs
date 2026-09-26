@@ -9,6 +9,14 @@ fn main() {
     // Best-effort only: no git binary / no repo / any failure falls back to
     // "unknown" and never fails the build.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    // Ticket 34: `.git/HEAD` only names the ref (its bytes never change on
+    // commit), so follow it to the ref file — otherwise the About hash goes
+    // stale after the first build. Best-effort; never fails the build.
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(target) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=.git/{target}");
+        }
+    }
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
