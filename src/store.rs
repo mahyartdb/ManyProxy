@@ -18,6 +18,34 @@ pub const DEFAULT_BIND: &str = "127.0.0.1";
 pub const DEFAULT_GROUP: &str = "default";
 /// Default protocol when the add form leaves it blank.
 pub const DEFAULT_PROTOCOL: &str = "vless";
+/// Ticket 31: canonical stored protocol names (the
+/// [`canonical_protocol`] output form). Typo errors name this list so a
+/// mistyped protocol points at what exists; the import side has its own
+/// lists (JSON types vs link schemes differ, so one shared list would lie on
+/// some path).
+pub const VALID_PROTOCOLS: &[&str] = &[
+    "vless",
+    "vmess",
+    "trojan",
+    "shadowsocks",
+    "hysteria2",
+    "hysteria",
+    "tuic",
+    "wireguard",
+    "amneziawg",
+    "socks",
+    "anytls",
+    "ssh",
+    "noise",
+    "http",
+    "https",
+    "naive",
+    "xray",
+    "custom-outbound",
+    "custom-config",
+    "extra-core",
+    "chain",
+];
 /// Inclusive auto-port range for configs created without an explicit port.
 pub const AUTO_PORT_START: u16 = 10801;
 pub const AUTO_PORT_END: u16 = 10999;
@@ -427,10 +455,18 @@ pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
 
 /// Both proxy URL forms for a local endpoint (contract: copy action copies
 /// both the `socks5://` and `http://` forms).
+/// Ticket 32: IPv6 literals bracket (`socks5://[::1]:port`); IPv4 and
+/// hostnames pass through untouched.
 pub fn proxy_urls(bind_ip: &str, port: u16) -> (String, String) {
+    let trimmed = bind_ip.trim();
+    let host = if trimmed.contains(':') && !trimmed.starts_with('[') {
+        format!("[{trimmed}]")
+    } else {
+        trimmed.to_string()
+    };
     (
-        format!("socks5://{bind_ip}:{port}"),
-        format!("http://{bind_ip}:{port}"),
+        format!("socks5://{host}:{port}"),
+        format!("http://{host}:{port}"),
     )
 }
 
@@ -588,6 +624,62 @@ fn canonical_protocol(raw: &str) -> Option<String> {
     }
 }
 
+/// Ticket 31: per-protocol starter params for the guided add dialog (never
+/// raw JSON first). Every template is a JSON object with the upstream
+/// `server`/`server_port` slots plus the protocol's credential slot(s) left
+/// blank — submitting it untouched fails in [`validate_protocol_params`]
+/// naming the missing field, never silently. Unknown input falls back to a
+/// bare server/port object (the commit then names the valid protocols).
+pub fn protocol_params_template(protocol: &str) -> String {
+    fn blank(params: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
+        params.insert(key.to_string(), serde_json::Value::String(String::new()));
+    }
+    let canonical = canonical_protocol(protocol).unwrap_or_else(|| protocol.trim().to_string());
+    let port: u16 = match canonical.as_str() {
+        "wireguard" | "amneziawg" => 51820,
+        "ssh" => 22,
+        "socks" => 1080,
+        _ => 443,
+    };
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "type".to_string(),
+        serde_json::Value::String(canonical.clone()),
+    );
+    params.insert(
+        "server".to_string(),
+        serde_json::Value::String(String::new()),
+    );
+    params.insert(
+        "server_port".to_string(),
+        serde_json::Value::Number(port.into()),
+    );
+    match canonical.as_str() {
+        "vless" | "vmess" | "xray" => blank(&mut params, "uuid"),
+        "trojan" | "hysteria2" | "anytls" => blank(&mut params, "password"),
+        "hysteria" => blank(&mut params, "auth"),
+        "shadowsocks" => {
+            blank(&mut params, "method");
+            blank(&mut params, "password");
+        }
+        "tuic" => {
+            blank(&mut params, "uuid");
+            blank(&mut params, "password");
+        }
+        "wireguard" | "amneziawg" => {
+            blank(&mut params, "private_key");
+            blank(&mut params, "public_key");
+        }
+        "naive" | "ssh" => {
+            blank(&mut params, "username");
+            blank(&mut params, "password");
+        }
+        "noise" => blank(&mut params, "key"),
+        _ => {}
+    }
+    serde_json::Value::Object(params).to_string()
+}
+
 /// Ticket 16: true when a params JSON object carries the import shape
 /// (`type`/`protocol` + `server`/`address` + `server_port`/`port`). Same
 /// predicate as [`export_payload`]: only these rows round-trip through the
@@ -663,7 +755,10 @@ fn validate_protocol_params(
             None => {
                 errors.push(FieldError::new(
                     "protocol",
-                    format!("unknown protocol '{protocol_trimmed}'"),
+                    format!(
+                        "unknown protocol '{protocol_trimmed}' (valid: {})",
+                        VALID_PROTOCOLS.join(", ")
+                    ),
                 ));
                 return None;
             }
@@ -954,8 +1049,12 @@ pub fn widened_identity(protocol: &str, params: &str) -> String {
         })
     }
     let narrow = crate::import::normalized_identity(protocol, params);
-    let extras: Vec<String> = match serde_json::from_str::<serde_json::Value>(params) {
-        Ok(serde_json::Value::Object(map)) => [
+    let parsed: Option<serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_str::<serde_json::Value>(params)
+            .ok()
+            .and_then(|value| value.as_object().cloned());
+    let mut extras: Vec<String> = match &parsed {
+        Some(map) => [
             (["transport", "network", "net"].as_slice(), true),
             (["security"].as_slice(), true),
             (["flow"].as_slice(), true),
@@ -966,7 +1065,7 @@ pub fn widened_identity(protocol: &str, params: &str) -> String {
         ]
         .iter()
         .map(|(keys, lower)| {
-            get(&map, keys)
+            get(map, keys)
                 .map(|value| {
                     let trimmed = value.trim().to_string();
                     if *lower {
@@ -978,9 +1077,78 @@ pub fn widened_identity(protocol: &str, params: &str) -> String {
                 .unwrap_or_default()
         })
         .collect(),
-        _ => Vec::new(),
+        None => Vec::new(),
     };
+    // Ticket 32: AmneziaWG obfuscation keys join the identity — two rows
+    // sharing server+creds but a different `jc` (or s/h/i junk tune) are
+    // two nodes, never over-merged into one. Appended only for AWG-like
+    // rows (protocol alias or any AWG-layer key present), so every other
+    // protocol's key is byte-identical to before (no re-key churn for
+    // stored identities). Values stay verbatim like the narrow key.
+    if let Some(map) = &parsed {
+        if is_awg_like(protocol, map) {
+            // Declared version first (`awg_version`, else legacy `version`),
+            // then every obfuscation slot in matrix order.
+            extras.push(
+                get(map, &["awg_version", "version"])
+                    .map(|value| value.trim().to_string())
+                    .unwrap_or_default(),
+            );
+            for key in AWG_IDENTITY_KEYS {
+                extras.push(
+                    get(map, &[key])
+                        .map(|value| value.trim().to_string())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
     format!("{narrow}\0{}", extras.join("\0"))
+}
+
+/// Ticket 32: AWG obfuscation slots behind [`widened_identity`] — the v2
+/// junk/length/header/CPS matrix plus the 3.x additions (same key sets the
+/// engine's version matrix validates).
+const AWG_IDENTITY_KEYS: &[&str] = &[
+    "jc",
+    "jmin",
+    "jmax",
+    "s1",
+    "s2",
+    "s3",
+    "s4",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "i1",
+    "i2",
+    "i3",
+    "i4",
+    "i5",
+    "headerprotectionkey",
+    "contentpaddingaddition",
+    "rekeyaftertime",
+    "rekeytimeout",
+    "rejectaftertime",
+    "keepalivetimeout",
+    "maxhandshakeattempts",
+    "randomtrailers",
+    "disablecookies",
+];
+
+/// Ticket 32: true for AmneziaWG-like rows — the protocol alias, or any
+/// AWG-layer key carried in the params (case-insensitive; links and conf
+/// files spell them `Jc`, `S1`, …).
+fn is_awg_like(protocol: &str, params: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match protocol.trim().to_ascii_lowercase().as_str() {
+        "amneziawg" | "awg" | "amnezia-wg" => return true,
+        _ => {}
+    }
+    params.keys().any(|key| {
+        let lower = key.to_ascii_lowercase();
+        lower == "awg_version" || AWG_IDENTITY_KEYS.contains(&lower.as_str())
+    })
 }
 
 /// Ticket 25: rotation-link core for in-place identity rotation: normalized
@@ -1625,6 +1793,51 @@ impl Store {
         let id = self.conn.last_insert_rowid();
         self.get_subscription(&id.to_string())?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Ticket 31: edit a subscription's label/url/group in place. Blank
+    /// groups fall back to the default (like add); the auto-refresh flag is
+    /// untouched. Invalid input fails typed with nothing written (the same
+    /// validators as add, so errors never echo the URL); unknown ids are
+    /// `NotFound`.
+    pub fn update_subscription(
+        &mut self,
+        id: &str,
+        label: &str,
+        url: &str,
+        group: &str,
+    ) -> Result<Subscription, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        if self.get_subscription(id)?.is_none() {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        let label = Self::validated_subscription_label(label)?;
+        let url = Self::validated_subscription_url(url)?;
+        let group = defaulted(group, DEFAULT_GROUP);
+        self.conn.execute(
+            "UPDATE subscriptions SET label = ?1, url = ?2, grp = ?3 WHERE id = ?4",
+            params![label, url, group, rowid],
+        )?;
+        self.get_subscription(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Ticket 31: find a subscription by exact (trimmed) URL — the friendly
+    /// `already subscribed` path. A missing row is `None`, never an error.
+    pub fn find_subscription_by_url(&self, url: &str) -> Result<Option<Subscription>, StoreError> {
+        let trimmed = url.trim();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures
+             FROM subscriptions WHERE url = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![trimmed], map_subscription_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     /// All subscriptions in stable id order.
@@ -2320,6 +2533,9 @@ impl Store {
     /// logs); only the destination path is named.
     /// Ticket 25 (L4): the payload lands via tmp-file + rename in the same
     /// directory, so a crash never leaves a half-written export behind.
+    /// Ticket 32: the payload holds secrets at rest, so both the tmp
+    /// sibling and the final file land user-only hardened
+    /// ([`harden_file_permissions`], like the library DB).
     pub fn commit_export(
         &self,
         path: &Path,
@@ -2346,10 +2562,12 @@ impl Store {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
+        harden_file_permissions(&tmp);
         if let Err(error) = std::fs::rename(&tmp, path).map_err(io_error) {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
+        harden_file_permissions(path);
         Ok(Some(path.to_path_buf()))
     }
 
@@ -4737,6 +4955,110 @@ mod tests {
         );
     }
 
+    // -- Ticket 32: store correctness (IPv6 URLs, AWG identity, hardened
+    // export) ------------------------------------------------------------
+
+    /// Ticket 32: IPv6 binds bracket in copied URLs (`[::1]:port`).
+    #[test]
+    fn t32_proxy_urls_bracket_ipv6() {
+        let (socks, http) = proxy_urls("::1", 10801);
+        assert_eq!(socks, "socks5://[::1]:10801");
+        assert_eq!(http, "http://[::1]:10801");
+        let (socks, http) = proxy_urls("127.0.0.1", 10801);
+        assert_eq!(socks, "socks5://127.0.0.1:10801");
+        assert_eq!(http, "http://127.0.0.1:10801");
+        let (socks, _) = proxy_urls("2001:db8::1", 10802);
+        assert_eq!(socks, "socks5://[2001:db8::1]:10802");
+    }
+
+    /// Ticket 32: two AWG rows sharing server+creds but a different `jc`
+    /// are two rows (identity includes AWG keys); identical rows dedupe.
+    #[test]
+    fn t32_awg_identity_includes_obfuscation_keys() {
+        fn awg_params_with(jc: &str) -> String {
+            serde_json::json!({
+                "type": "amneziawg", "server": "192.0.2.90", "server_port": 51820,
+                "private_key": "LOCAL-PRIVATE", "public_key": "REMOTE-PUBLIC",
+                "awg_version": "2.0", "jc": jc, "jmin": "30", "jmax": "1000",
+            })
+            .to_string()
+        }
+        let first = awg_params_with("5");
+        let second = awg_params_with("9");
+        assert_eq!(
+            crate::import::normalized_identity("amneziawg", &first),
+            crate::import::normalized_identity("amneziawg", &second),
+            "narrow identity ignores obfuscation"
+        );
+        assert_ne!(
+            widened_identity("amneziawg", &first),
+            widened_identity("amneziawg", &second),
+            "widened identity splits jc variants"
+        );
+        assert_eq!(
+            widened_identity("amneziawg", &first),
+            widened_identity("amneziawg", &first.clone()),
+            "identical rows share identity"
+        );
+        // End to end: refresh/import keeps both rows.
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let batch = crate::import::BatchResult {
+            configs: vec![
+                crate::import::ImportedConfig {
+                    name: "AwgFive".to_string(),
+                    protocol: "amneziawg".to_string(),
+                    params: first,
+                    host: "192.0.2.90".to_string(),
+                    port: 51820,
+                },
+                crate::import::ImportedConfig {
+                    name: "AwgNine".to_string(),
+                    protocol: "amneziawg".to_string(),
+                    params: second,
+                    host: "192.0.2.90".to_string(),
+                    port: 51820,
+                },
+            ],
+            failures: Vec::new(),
+        };
+        let outcome = crate::import::commit_batch(&mut store, batch, "awg").expect("import works");
+        assert_eq!(outcome.imported, 2, "two rows, got {outcome:?}");
+        assert_eq!(outcome.duplicates, 0);
+        assert_eq!(store.list().expect("list works").len(), 2);
+    }
+
+    /// Ticket 32: the export file lands 0600/ACL-hardened like the DB (user
+    /// only; the payload holds secrets at rest).
+    #[test]
+    fn t32_export_file_hardened_like_db() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(valid_input("ExportMe")).expect("add works");
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t32-export-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let written = store
+            .commit_export(&path, true)
+            .expect("export writes")
+            .expect("confirm returns the path");
+        assert_eq!(written, path);
+        assert!(path.is_file(), "export file exists");
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("export reads"))
+                .expect("export is JSON");
+        assert!(payload.get("library").is_some(), "full-fidelity payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata reads")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "user-only export, got {mode:o}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     // -- Ticket 27: caps lift + secrets hardening + fetch policy -----------
 
     /// 250 auto-port configs all assign (primary then spillover); exhaustion
@@ -4940,5 +5262,203 @@ mod tests {
                 "typed, got {error}"
             );
         }
+    }
+
+    // -- Ticket 31: dialogs + import + subscriptions ---------------------
+
+    /// Ticket 31: a typo protocol error names the valid protocol list (never
+    /// just "unknown").
+    #[test]
+    fn ticket31_unknown_protocol_names_valid_protocols() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let error = store
+            .add(NewConfig {
+                name: "Typo".to_string(),
+                protocol: "vles".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("typo protocol must fail");
+        let text = error.to_string();
+        assert!(text.contains("vles"), "echoes the typo, got {text}");
+        for valid in ["vless", "vmess", "trojan", "wireguard", "shadowsocks"] {
+            assert!(text.contains(valid), "names {valid}, got {text}");
+        }
+        assert!(
+            store.list().expect("list works").is_empty(),
+            "failed add writes nothing"
+        );
+    }
+
+    /// Ticket 31: per-protocol templates carry the credential slot; a
+    /// template with the server filled but the credential blank fails naming
+    /// the credential (guided add, never raw JSON first).
+    #[test]
+    fn ticket31_protocol_templates_guide_and_reject_blank_credentials() {
+        for (protocol, credential) in [
+            ("vless", "uuid"),
+            ("trojan", "password"),
+            ("shadowsocks", "password"),
+            ("wireguard", "private_key"),
+            ("hysteria2", "password"),
+            ("tuic", "uuid"),
+            ("naive", "username"),
+            ("ssh", "username"),
+            ("noise", "key"),
+        ] {
+            let template = protocol_params_template(protocol);
+            let value: serde_json::Value =
+                serde_json::from_str(&template).expect("template is JSON");
+            assert!(value.is_object(), "{protocol} template is an object");
+            assert!(
+                is_import_shaped_params(&template),
+                "{protocol} template is import-shaped: {template}"
+            );
+            assert!(
+                template.contains(credential),
+                "{protocol} template names {credential}: {template}"
+            );
+        }
+        // Server filled, credential blank → the named credential error.
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let params = protocol_params_template("vless")
+            .replace("\"server\":\"\"", "\"server\":\"a.example.com\"");
+        let error = store
+            .add(NewConfig {
+                name: "Half".to_string(),
+                protocol: "vless".to_string(),
+                params,
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("blank credential must fail");
+        let text = error.to_string();
+        assert!(text.contains("uuid"), "names the credential, got {text}");
+        // Unknown protocol falls back to a bare server/port object.
+        let fallback = protocol_params_template("bogus");
+        assert!(
+            fallback.contains("server"),
+            "fallback still guides, got {fallback}"
+        );
+    }
+
+    /// Ticket 31: edit a subscription's label/url/group — persists in place,
+    /// no double row, auto flag untouched.
+    #[test]
+    fn ticket31_update_subscription_persists_label_url_group() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/a.txt", "g1", true)
+            .expect("seed works");
+        let updated = store
+            .update_subscription(&sub.id, "Daily", "https://example.com/b.txt", "g2")
+            .expect("edit works");
+        assert_eq!(updated.label, "Daily");
+        assert_eq!(updated.url, "https://example.com/b.txt");
+        assert_eq!(updated.group, "g2");
+        assert!(updated.auto_refresh, "edit keeps the auto flag");
+        let rows = store.list_subscriptions().expect("list works");
+        assert_eq!(rows.len(), 1, "edit refreshes in place, no double row");
+        assert_eq!(rows[0].label, "Daily");
+        assert_eq!(rows[0].url, "https://example.com/b.txt");
+        assert_eq!(rows[0].group, "g2");
+    }
+
+    /// Ticket 31: bad subscription edits fail typed with the record
+    /// unchanged; unknown ids are NotFound. Errors never echo the URL.
+    #[test]
+    fn ticket31_update_subscription_rejects_bad_input_and_ghosts() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/a.txt", "g", true)
+            .expect("seed works");
+        for (label, url) in [
+            ("", "https://example.com/b.txt"),
+            ("   ", "https://example.com/b.txt"),
+            ("Daily", "ftp://example.com/b.txt"),
+            ("Daily", "http://127.0.0.1/b.txt"),
+        ] {
+            let error = store
+                .update_subscription(&sub.id, label, url, "g2")
+                .expect_err("bad edit must fail");
+            assert!(
+                matches!(error, StoreError::Invalid(_)),
+                "typed, got {error}"
+            );
+            assert!(
+                !error.to_string().contains("ftp://") && !error.to_string().contains("127.0.0.1"),
+                "no URL in error, got {error}"
+            );
+        }
+        let kept = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("kept");
+        assert_eq!(kept.label, "Nightly", "record unchanged");
+        assert_eq!(kept.url, "https://example.com/a.txt");
+        assert_eq!(kept.group, "g");
+        assert!(
+            matches!(
+                store.update_subscription("9999", "x", "https://example.com/x.txt", "g"),
+                Err(StoreError::NotFound(_))
+            ),
+            "ghost edit is NotFound"
+        );
+    }
+
+    /// Ticket 31: duplicate-URL lookup finds the existing row (the friendly
+    /// `already subscribed` path); other URLs find nothing.
+    #[test]
+    fn ticket31_find_subscription_by_url_matches_trimmed() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/a.txt", "g", true)
+            .expect("seed works");
+        let found = store
+            .find_subscription_by_url("  https://example.com/a.txt  ")
+            .expect("lookup works")
+            .expect("dup found");
+        assert_eq!(found.id, sub.id);
+        assert_eq!(found.label, "Nightly");
+        assert!(
+            store
+                .find_subscription_by_url("https://example.com/other.txt")
+                .expect("lookup works")
+                .is_none(),
+            "other URL finds nothing"
+        );
+    }
+
+    /// Ticket 31: no silent dedup on bind/port — two rows may share an
+    /// endpoint at rest (the conflict error naming both parties stays an
+    /// activation-time concern); saves are never blocked here.
+    #[test]
+    fn ticket31_shared_bind_port_saves_without_silent_dedup() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(NewConfig {
+                name: "One".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: "127.0.0.1".to_string(),
+                port: "12001".to_string(),
+            })
+            .expect("first saves");
+        let second = store
+            .add(NewConfig {
+                name: "Two".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: "127.0.0.1".to_string(),
+                port: "12001".to_string(),
+            })
+            .expect("second saves too — warning, never a block");
+        assert_ne!(first.id, second.id, "two rows, no silent dedup");
+        assert_eq!(store.list().expect("list works").len(), 2);
     }
 }

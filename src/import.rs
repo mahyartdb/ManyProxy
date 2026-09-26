@@ -1263,6 +1263,8 @@ fn parse_noise(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// `throne://add/<base64-outbound-json>` (case-insensitive command, single
 /// outbound, no confirm). Query/fragment bytes corrupt the payload and fail
 /// as bad base64; unknown commands are skipped+counted.
+/// Ticket 33: `throne://route/...` (routing presets) gets a named error, not
+/// the generic unknown-command text — v1 has no routing-rule editor.
 fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
     if rest.trim().is_empty() {
         return Err(ImportError::new(
@@ -1274,6 +1276,11 @@ fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
         Some(i) => (&rest[..i], &rest[i + 1..]),
         None => (rest, ""),
     };
+    if command.eq_ignore_ascii_case("route") {
+        return Err(unknown_scheme(
+            "routing presets not supported in v1 (throne://route links carry no importable endpoint)",
+        ));
+    }
     if !command.eq_ignore_ascii_case("add") {
         return Err(unknown_scheme(format!(
             "unknown throne command '{command}'"
@@ -1300,6 +1307,62 @@ fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
 /// `naive+https`) fold here too, so JSON/Clash agree with links.
 /// Ticket 28: kept parallel to the store `canonical_protocol` on purpose
 /// (see its note) — the alias sets and error taxonomy differ by path.
+/// Ticket 31: typo errors name [`VALID_OUTBOUND_TYPES`].
+pub const VALID_OUTBOUND_TYPES: &[&str] = &[
+    "vless",
+    "vmess",
+    "trojan",
+    "shadowsocks",
+    "hysteria2",
+    "hysteria",
+    "tuic",
+    "wireguard",
+    "amneziawg",
+    "socks",
+    "anytls",
+    "ssh",
+    "noise",
+    "http",
+    "https",
+    "naive",
+    "xray",
+    "custom-outbound",
+    "custom-config",
+    "extra-core",
+    "chain",
+];
+
+/// Ticket 31: accepted link schemes (lowercase, as matched in
+/// [`parse_link`]). Typo scheme errors name this list; stored/JSON types
+/// have their own [`VALID_OUTBOUND_TYPES`] (different namespace: `hy2` is a
+/// scheme, never a stored type).
+pub const VALID_LINK_SCHEMES: &[&str] = &[
+    "vless",
+    "vmess",
+    "trojan",
+    "ss",
+    "shadowsocks",
+    "throne",
+    "xray",
+    "hysteria2",
+    "hy2",
+    "hysteria2+realm",
+    "hysteria",
+    "tuic",
+    "wireguard",
+    "wg",
+    "awg",
+    "amneziawg",
+    "amnezia-wg",
+    "socks",
+    "socks5",
+    "anytls",
+    "ssh",
+    "noise",
+    "http",
+    "https",
+    "naive+https",
+];
 fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
@@ -1329,9 +1392,11 @@ fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
         "" => Err(invalid_json("item is missing outbound \"type\"")),
         // Ticket 24 (LOW scheme casing): echo the input's case, not the
         // lowered form, and cap the echo (no unbounded input in errors).
+        // Ticket 31: the typo names the valid types.
         _ => Err(unknown_scheme(format!(
-            "unknown outbound type '{}'",
-            raw.trim().chars().take(64).collect::<String>()
+            "unknown outbound type '{}' (valid: {})",
+            raw.trim().chars().take(64).collect::<String>(),
+            VALID_OUTBOUND_TYPES.join(", ")
         ))),
     }
 }
@@ -1938,7 +2003,11 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         "http" => parse_socks_like("http", &split_uri(&scheme, rest)?, Some(80)),
         "https" => parse_socks_like("https", &split_uri(&scheme, rest)?, Some(443)),
         "naive+https" => parse_naive(&split_uri(&scheme, rest)?),
-        _ => Err(unknown_scheme(format!("unknown scheme '{scheme}'"))),
+        // Ticket 31: a typo scheme names the valid schemes.
+        _ => Err(unknown_scheme(format!(
+            "unknown scheme '{scheme}' (valid: {})",
+            VALID_LINK_SCHEMES.join(", ")
+        ))),
     }
 }
 
@@ -3189,6 +3258,22 @@ mod tests {
         );
     }
 
+    /// Ticket 31: typo scheme / typo JSON type errors name the valid lists
+    /// (never just "unknown").
+    #[test]
+    fn failure_typos_name_valid_protocols() {
+        let error = parse_link("vles://example.com:443").expect_err("typo scheme fails");
+        assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+        for valid in ["vless", "vmess", "trojan", "wireguard"] {
+            assert!(error.message.contains(valid), "names {valid}, got {error}");
+        }
+        let error = super::normalize_outbound_type("vles").expect_err("typo type fails");
+        assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+        for valid in ["vless", "shadowsocks", "hysteria2", "xray"] {
+            assert!(error.message.contains(valid), "names {valid}, got {error}");
+        }
+    }
+
     #[test]
     fn failure_throne_unknown_command() {
         let error = parse_link("throne://addsub/aGk").expect_err("unknown throne cmd fails");
@@ -3197,6 +3282,22 @@ mod tests {
             error.message.contains("addsub"),
             "names command, got {error}"
         );
+    }
+
+    /// Ticket 33: `throne://route` links fail with the named v1 error, not
+    /// the generic unknown-command text.
+    #[test]
+    fn failure_throne_route_names_routing_unsupported() {
+        for link in ["throne://route/abc", "throne://ROUTE/abc"] {
+            let error = parse_link(link).expect_err("route command fails");
+            assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+            assert!(
+                error
+                    .message
+                    .contains("routing presets not supported in v1"),
+                "named v1 error, got {error}"
+            );
+        }
     }
 
     #[test]

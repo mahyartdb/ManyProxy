@@ -2071,6 +2071,12 @@ pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError>
     }
     let mut taken: HashMap<(String, u16), &str> = HashMap::new();
     for config in configs {
+        // Ticket 32: custom full-config rows are user-managed (their bind
+        // is documentation, not an endpoint we serve), so they never
+        // conflict — exactly like `validate_activation`.
+        if is_custom_config_protocol(&config.protocol) {
+            continue;
+        }
         // Ticket 23: loopback aliases compare equal (localhost ≡ 127.0.0.1).
         let key = (normalize_bind_key(&config.bind_ip), config.port);
         if let Some(first) = taken.get(&key) {
@@ -2204,6 +2210,15 @@ fn build_standard_node(
             }
         }
     }
+    // Ticket 32: v2ray-flat stored params → stock sing-box 1.14.2 schema
+    // (live-probed: strict decode rejects top-level `security`/`sni`/
+    // `path`/… on outbounds). TLS intent folds into a `tls` object,
+    // stream settings into a `transport` object; keys meaningless for the
+    // protocol are dropped (other clients ignore them too); keys
+    // meaningful but unmappable fail named (never a silently wrong
+    // connection). Anything unrecognized passes through for the engine's
+    // own `check` to judge loudly.
+    translate_outbound(canonical, &config.name, params)?;
     let server_port = match params.get("server_port") {
         Some(serde_json::Value::Number(number)) => number
             .as_u64()
@@ -2235,6 +2250,502 @@ fn build_standard_node(
     );
     let node = serde_json::Value::Object(params.clone());
     Ok((node, canonical == "wireguard", fork_row))
+}
+
+/// Ticket 32: first non-blank string among `keys` (exact-case, matching
+/// every other params reader here); removes ALL listed keys whether or
+/// not one matched, so alias spellings never leak into the emission.
+fn take_flat(
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    let mut found = None;
+    for key in keys {
+        if let Some(serde_json::Value::String(text)) = params.remove(*key) {
+            if found.is_none() && !text.trim().is_empty() {
+                found = Some(text.trim().to_string());
+            }
+        } else {
+            params.remove(*key);
+        }
+    }
+    found
+}
+
+/// Ticket 32: `{"field": ...}` error naming the offending stored field
+/// (never values, keys, or tokens).
+fn bad_option(name: &str, field: &str, detail: &str) -> EngineError {
+    EngineError::BadCustom {
+        name: name.to_string(),
+        field: field.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+/// Ticket 32: split a flat `alpn` value (`"h2"`, `"h2,http/1.1"`) into the
+/// string array the sing-box `tls` object wants. Empty means omit.
+fn split_alpn(raw: Option<String>) -> Vec<serde_json::Value> {
+    raw.map(|text| {
+        text.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| serde_json::Value::String(entry.to_string()))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Ticket 32: one sing-box `tls` outbound object. `server_name` falls back
+/// to the row's server; `reality` carries the public key (short id only
+/// when the row sets one). The uTLS fingerprint lives in the `utls`
+/// object — live-probed: 1.14.2 strict-decodes and rejects a top-level
+/// `fingerprint` on the tls object.
+fn tls_object(
+    server: &str,
+    server_name: Option<String>,
+    fingerprint: Option<String>,
+    alpn: Vec<serde_json::Value>,
+    reality: Option<(String, Option<String>)>,
+) -> serde_json::Value {
+    let mut tls = serde_json::Map::with_capacity(5);
+    tls.insert("enabled".to_string(), serde_json::Value::Bool(true));
+    tls.insert(
+        "server_name".to_string(),
+        serde_json::Value::String(server_name.unwrap_or_else(|| server.to_string())),
+    );
+    if let Some(fingerprint) = fingerprint {
+        tls.insert(
+            "utls".to_string(),
+            serde_json::json!({"enabled": true, "fingerprint": fingerprint}),
+        );
+    }
+    if !alpn.is_empty() {
+        tls.insert("alpn".to_string(), serde_json::Value::Array(alpn));
+    }
+    if let Some((public_key, short_id)) = reality {
+        let mut real = serde_json::Map::with_capacity(3);
+        real.insert("enabled".to_string(), serde_json::Value::Bool(true));
+        real.insert(
+            "public_key".to_string(),
+            serde_json::Value::String(public_key),
+        );
+        if let Some(short_id) = short_id {
+            real.insert("short_id".to_string(), serde_json::Value::String(short_id));
+        }
+        tls.insert("reality".to_string(), serde_json::Value::Object(real));
+    }
+    serde_json::Value::Object(tls)
+}
+
+/// Ticket 32: TLS intent behind one row's flat `security` marker.
+enum TlsIntent {
+    Off,
+    On { reality: bool },
+}
+
+/// Ticket 32: fold one row's flat TLS keys (`security`/`sni`/`fp`/`alpn`/
+/// `pbk`/`sid`/`peer`) into a sing-box `tls` object, or drop them when the
+/// intent is off. `default_on` serves the protocols that are definitionally
+/// TLS (trojan, tuic, hysteria, hysteria2, anytls); `mandatory` rejects an
+/// explicit `security=none` on protocols where plaintext cannot work.
+fn apply_tls(
+    name: &str,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    server: &str,
+    default_on: bool,
+    mandatory: bool,
+) -> Result<(), EngineError> {
+    let security = take_flat(params, &["security"]);
+    let intent = match security.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        None if default_on => TlsIntent::On { reality: false },
+        None => TlsIntent::Off,
+        Some("tls" | "xtls") => TlsIntent::On { reality: false },
+        Some("reality") => TlsIntent::On { reality: true },
+        Some("none" | "") => {
+            if mandatory {
+                return Err(bad_option(
+                    name,
+                    "security",
+                    "this protocol requires TLS (security=none cannot work here)",
+                ));
+            }
+            TlsIntent::Off
+        }
+        Some(other) => {
+            return Err(bad_option(
+                name,
+                "security",
+                &format!("unknown security \"{other}\" (want \"tls\", \"reality\", or \"none\")"),
+            ));
+        }
+    };
+    let server_name = take_flat(params, &["sni"]).or_else(|| take_flat(params, &["peer"]));
+    let fingerprint = take_flat(params, &["fp", "fingerprint"]);
+    let alpn = split_alpn(take_flat(params, &["alpn"]));
+    let public_key = take_flat(params, &["pbk"]);
+    let short_id = take_flat(params, &["sid"]);
+    match intent {
+        TlsIntent::Off => {
+            // No TLS: key material for it is meaningless here.
+            Ok(())
+        }
+        TlsIntent::On { reality: false } => {
+            params.insert(
+                "tls".to_string(),
+                tls_object(server, server_name, fingerprint, alpn, None),
+            );
+            Ok(())
+        }
+        TlsIntent::On { reality: true } => {
+            let public_key = public_key.ok_or_else(|| EngineError::BadParams {
+                name: name.to_string(),
+                field: "pbk",
+            })?;
+            params.insert(
+                "tls".to_string(),
+                tls_object(
+                    server,
+                    server_name,
+                    fingerprint,
+                    alpn,
+                    Some((public_key, short_id)),
+                ),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Ticket 32: fold one row's flat stream keys (`network`/`path`/`host`/…)
+/// into a sing-box `transport` object (`None` for plain TCP). Only shapes
+/// the live probe proved 1.14.2 accepts are emitted; anything else names
+/// `network` instead of emitting a guess.
+fn apply_transport(
+    name: &str,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    // A native `transport` object wins outright; the flats beside it are
+    // redundant intake spellings, not a second transport.
+    if let Some(native) = params.remove("transport") {
+        take_flat(
+            params,
+            &[
+                "network",
+                "path",
+                "host",
+                "headers",
+                "serviceName",
+                "service_name",
+            ],
+        );
+        take_flat(params, &["method"]);
+        if native.is_object() {
+            params.insert("transport".to_string(), native);
+        } else {
+            return Err(bad_option(
+                name,
+                "transport",
+                "transport must be a JSON object",
+            ));
+        }
+        return Ok(());
+    }
+    let network = take_flat(params, &["network"]).unwrap_or_default();
+    let path = take_flat(params, &["path"]);
+    let host = take_flat(params, &["host"]);
+    take_flat(params, &["headers"]);
+    let service_name = take_flat(params, &["serviceName", "service_name"]).or(path.clone());
+    let method = take_flat(params, &["method"]);
+    let transport = match network.to_ascii_lowercase().as_str() {
+        "" | "tcp" | "raw" | "none" => None,
+        "ws" | "websocket" => {
+            let mut ws = serde_json::Map::with_capacity(3);
+            if let Some(path) = path {
+                ws.insert("path".to_string(), serde_json::Value::String(path));
+            }
+            if let Some(host) = host {
+                ws.insert("headers".to_string(), serde_json::json!({"Host": host}));
+            }
+            Some((serde_json::Value::String("ws".to_string()), ws))
+        }
+        "grpc" | "gun" => {
+            let mut grpc = serde_json::Map::with_capacity(1);
+            // v2ray grpc names the service `serviceName`; some links use
+            // `path` (or `host`) for the same slot.
+            let service = service_name.or(path).or(host);
+            if let Some(service) = service {
+                grpc.insert(
+                    "service_name".to_string(),
+                    serde_json::Value::String(service),
+                );
+            }
+            Some((serde_json::Value::String("grpc".to_string()), grpc))
+        }
+        "http" => {
+            let mut http = serde_json::Map::with_capacity(3);
+            if let Some(host) = host {
+                http.insert("host".to_string(), serde_json::Value::String(host));
+            }
+            if let Some(path) = path {
+                http.insert("path".to_string(), serde_json::Value::String(path));
+            }
+            if let Some(method) = method {
+                http.insert("method".to_string(), serde_json::Value::String(method));
+            }
+            Some((serde_json::Value::String("http".to_string()), http))
+        }
+        "httpupgrade" => {
+            let mut upgrade = serde_json::Map::with_capacity(2);
+            if let Some(host) = host {
+                upgrade.insert("host".to_string(), serde_json::Value::String(host));
+            }
+            if let Some(path) = path {
+                upgrade.insert("path".to_string(), serde_json::Value::String(path));
+            }
+            Some((
+                serde_json::Value::String("httpupgrade".to_string()),
+                upgrade,
+            ))
+        }
+        "xhttp" => {
+            // Fork-routed (stock has no xhttp): the fork judges the shape;
+            // the pointer carries the intake slots plus any mode pin.
+            let mut xhttp = serde_json::Map::with_capacity(3);
+            if let Some(host) = host {
+                xhttp.insert("host".to_string(), serde_json::Value::String(host));
+            }
+            if let Some(path) = path {
+                xhttp.insert("path".to_string(), serde_json::Value::String(path));
+            }
+            if let Some(mode) = take_flat(params, &["mode"]) {
+                xhttp.insert("mode".to_string(), serde_json::Value::String(mode));
+            }
+            Some((serde_json::Value::String("xhttp".to_string()), xhttp))
+        }
+        other => {
+            return Err(bad_option(
+                name,
+                "network",
+                &format!("transport \"{other}\" has no stock sing-box mapping (want tcp, ws, grpc, http, httpupgrade, or xhttp)"),
+            ));
+        }
+    };
+    if let Some((kind, mut body)) = transport {
+        body.insert("type".to_string(), kind);
+        params.insert("transport".to_string(), serde_json::Value::Object(body));
+    }
+    Ok(())
+}
+
+/// Ticket 32: keys that carry no meaning for protocols without TLS or
+/// stream transports (intake spellings from other protocols' links).
+/// Dropped so provider junk never fails `check`; anything meaningful but
+/// unmappable errors at its own site instead of here. `keep` spares a key
+/// that is native to the caller (the shadowsocks cipher `method`).
+fn drop_foreign_flats(params: &mut serde_json::Map<String, serde_json::Value>, keep: &[&str]) {
+    for key in [
+        "security",
+        "sni",
+        "peer",
+        "fp",
+        "fingerprint",
+        "alpn",
+        "pbk",
+        "sid",
+        "network",
+        "path",
+        "host",
+        "headers",
+        "serviceName",
+        "service_name",
+        "flow",
+        "tls",
+        "encryption",
+        "alter_id",
+        "header_type",
+        "mode",
+        "method",
+        "transport",
+        "variant",
+    ] {
+        if !keep.contains(&key) {
+            params.remove(key);
+        }
+    }
+}
+
+/// Ticket 32: v2ray-flat stored params → stock sing-box 1.14.2 outbound
+/// schema (see [`apply_tls`] / [`apply_transport`] for the contract).
+fn translate_outbound(
+    canonical: &str,
+    name: &str,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    let server = params
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    match canonical {
+        "vless" | "trojan" => {
+            apply_tls(name, params, &server, canonical == "trojan", false)?;
+            apply_transport(name, params)?;
+        }
+        "vmess" => {
+            // Legacy links carry a `tls` bool plus a cipher `security`;
+            // new-style links carry tls-ness in `security` and the cipher
+            // in `encryption`. The bool decides which grammar owns the row.
+            if params.get("tls").is_some_and(|tls| tls.is_boolean()) {
+                let on = params
+                    .remove("tls")
+                    .and_then(|tls| tls.as_bool())
+                    .unwrap_or(false);
+                if on {
+                    let server_name = take_flat(params, &["sni"]);
+                    let fingerprint = take_flat(params, &["fp", "fingerprint"]);
+                    let alpn = split_alpn(take_flat(params, &["alpn"]));
+                    params.insert(
+                        "tls".to_string(),
+                        tls_object(&server, server_name, fingerprint, alpn, None),
+                    );
+                }
+                // `security` stays: it is the sing-box packet cipher here.
+                take_flat(params, &["pbk", "sid", "peer"]);
+            } else {
+                let cipher =
+                    take_flat(params, &["encryption"]).unwrap_or_else(|| "auto".to_string());
+                apply_tls(name, params, &server, false, false)?;
+                params.insert("security".to_string(), serde_json::Value::String(cipher));
+            }
+            // `alter_id` is numeric in sing-box; intake keeps strings.
+            match params.remove("alter_id") {
+                None => {}
+                Some(serde_json::Value::Number(number)) => {
+                    params.insert("alter_id".to_string(), serde_json::Value::Number(number));
+                }
+                Some(serde_json::Value::String(text)) => {
+                    let number: u64 = text.trim().parse().map_err(|_| {
+                        bad_option(name, "alter_id", "vmess \"alter_id\" must be a number")
+                    })?;
+                    params.insert(
+                        "alter_id".to_string(),
+                        serde_json::Value::Number(number.into()),
+                    );
+                }
+                Some(_) => {
+                    return Err(bad_option(
+                        name,
+                        "alter_id",
+                        "vmess \"alter_id\" must be a number",
+                    ));
+                }
+            }
+            let header = take_flat(params, &["header_type"]);
+            if header.is_some_and(|header| !header.eq_ignore_ascii_case("none")) {
+                return Err(bad_option(
+                    name,
+                    "header_type",
+                    "vmess TCP header obfuscation has no stock sing-box mapping (use a stream transport)",
+                ));
+            }
+            apply_transport(name, params)?;
+        }
+        "tuic" | "hysteria" | "hysteria2" | "anytls" => {
+            apply_tls(name, params, &server, true, true)?;
+            // Stream transports don't exist on these protocols; the flats
+            // beside them are other protocols' intake spellings.
+            take_flat(
+                params,
+                &[
+                    "network",
+                    "path",
+                    "host",
+                    "headers",
+                    "serviceName",
+                    "service_name",
+                    "method",
+                ],
+            );
+            if canonical == "hysteria" {
+                // sing-box holds the plaintext credential in `auth_str`;
+                // `auth` is base64 bytes there, never the link secret.
+                let auth = take_flat(params, &["auth"]);
+                if params.get("auth_str").is_none() {
+                    if let Some(auth) = auth {
+                        params.insert("auth_str".to_string(), serde_json::Value::String(auth));
+                    }
+                }
+                // Live-probed: 1.14.2 fails initialize without upload and
+                // download speeds. Name them instead of inventing
+                // bandwidth that would silently throttle the row.
+                for field in ["up", "down"] {
+                    let present = params
+                        .get(field)
+                        .and_then(|value| match value {
+                            serde_json::Value::String(text) => Some(!text.trim().is_empty()),
+                            serde_json::Value::Number(_) => Some(true),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                    if !present {
+                        return Err(EngineError::BadParams {
+                            name: name.to_string(),
+                            field: if field == "up" { "up" } else { "down" },
+                        });
+                    }
+                }
+            }
+            if canonical == "hysteria2" {
+                if let Some(variant) = take_flat(params, &["variant"]) {
+                    return Err(bad_option(
+                        name,
+                        "variant",
+                        &format!("hysteria2 variant \"{variant}\" has no stock sing-box mapping"),
+                    ));
+                }
+            }
+        }
+        "ssh" => {
+            // Live-probed: the stock `ssh` outbound names the login `user`;
+            // intake also accepts `username`, so fold it (explicit `user`
+            // wins). No TLS or stream transports on this shape.
+            if params.get("user").is_none() {
+                if let Some(user) = take_flat(params, &["username"]) {
+                    params.insert("user".to_string(), serde_json::Value::String(user));
+                }
+            } else {
+                params.remove("username");
+            }
+            drop_foreign_flats(params, &["user"]);
+        }
+        "wireguard" => {
+            // No TLS or stream transports on these shapes; the flats
+            // beside them are other protocols' intake spellings.
+            drop_foreign_flats(params, &[]);
+        }
+        "shadowsocks" => {
+            // Same, except `method` is the native cipher name here. A
+            // SIP002 `plugin` names an external executable sing-box would
+            // try to run at initialize: fail named instead of emitting a
+            // config `check` rejects with "plugin not found".
+            if take_flat(params, &["plugin"]).is_some() {
+                return Err(bad_option(
+                    name,
+                    "plugin",
+                    "shadowsocks plugins need their executable beside the engine (stock check fails without it)",
+                ));
+            }
+            drop_foreign_flats(params, &["method"]);
+        }
+        _ => {}
+    }
+    // `flow` survives only on vless (xtls-vision); elsewhere it is junk.
+    if canonical != "vless" {
+        params.remove("flow");
+    }
+    Ok(())
 }
 
 /// sing-box ≥1.11 WireGuard clients are `endpoints[]`, not outbounds: the
@@ -2313,9 +2824,33 @@ fn reshape_wireguard_endpoint(
     }
     if let Some(allowed) = take_key(params, &["allowed_ips", "allowedips"]) {
         peer.insert("allowed_ips".to_string(), as_list(allowed));
+    } else {
+        // Live-probed: 1.14.2 fails initialize with "missing allowed ips
+        // for peer 0". Link intake never carries AllowedIPs, and an egress
+        // that routes nothing is useless, so default to the v4 full
+        // tunnel (documented; a row that wants split tunnel sets it).
+        peer.insert(
+            "allowed_ips".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("0.0.0.0/0".to_string())]),
+        );
     }
-    if let Some(keepalive) = take_key(params, &["persistent_keepalive"]) {
-        peer.insert("persistent_keepalive".to_string(), keepalive);
+    // Per the schema (and live-probed against 1.14.2): the dial
+    // keepalive is `peers[].persistent_keepalive_interval`, numeric
+    // seconds. Intake keeps strings, so coerce; a failed parse stays
+    // verbatim for `check` to name loudly.
+    if let Some(keepalive) = take_key(
+        params,
+        &["persistent_keepalive", "persistent_keepalive_interval"],
+    ) {
+        let coerced = match keepalive {
+            serde_json::Value::String(text) => text
+                .trim()
+                .parse::<u64>()
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|_| serde_json::Value::String(text)),
+            other => other,
+        };
+        peer.insert("persistent_keepalive_interval".to_string(), coerced);
     }
     params.remove("server");
     params.remove("server_port");
@@ -2323,10 +2858,25 @@ fn reshape_wireguard_endpoint(
     params.remove("awg_version");
     // Client-side resolver setting from conf files: not an endpoint field.
     params.remove("dns");
-    // The fork's AmneziaWG options are typed numerics (jc/jmin/jmax are
-    // uint32); conf/URI intake keeps everything as strings, so coerce the
-    // numeric fields and leave the rest verbatim for the fork to judge.
-    for key in ["jc", "jmin", "jmax"] {
+    // Ticket 32: stock endpoint numerics arrive as strings from conf/URI
+    // intake (`mtu`); coerce, leaving failures verbatim for `check`.
+    // (Peer keepalive is renamed + coerced at build time above; AWG
+    // junk-train numerics get the same treatment below for the fork.)
+    if let Some(number) = params
+        .get("mtu")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    {
+        params.insert("mtu".to_string(), serde_json::Value::Number(number.into()));
+    }
+    // The fork's AmneziaWG numeric options (jc/jmin/jmax/s1-s4/h1-h4) are
+    // typed numerics; conf/URI intake keeps everything as strings, so
+    // coerce the plain-numeric fields. H-ranges ("1-100") and i-chains
+    // ("<b …><r …>") are truly opaque and pass through verbatim for the
+    // fork to judge (a failed parse keeps the original string).
+    for key in [
+        "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4",
+    ] {
         let number = params
             .get(key)
             .and_then(serde_json::Value::as_str)
@@ -2626,7 +3176,7 @@ fn build_main_config(
                 "listen_port": config.port,
             }));
             rules.push(serde_json::json!({
-                "inbound": in_tag,
+                "inbound": [in_tag],
                 "action": "route",
                 "outbound": built.serving_tag,
             }));
@@ -2656,7 +3206,7 @@ fn build_main_config(
             "listen_port": config.port,
         }));
         rules.push(serde_json::json!({
-            "inbound": in_tag,
+            "inbound": [in_tag],
             "action": "route",
             "outbound": out_tag,
         }));
@@ -2775,10 +3325,22 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
         .ok_or_else(|| invalid("missing \"route.rules\""))?;
     for rule in rules {
         let obj = rule.as_object().ok_or_else(|| invalid("bad route rule"))?;
-        let inbound = obj
-            .get("inbound")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| invalid("rule without inbound"))?;
+        // Ticket 32: `inbound` is an array (what stock sing-box 1.14.2
+        // accepts); every entry must name a generated inbound. A missing,
+        // empty, or non-string entry fails instead of routing nowhere.
+        let inbound_names_list: Vec<&str> = match obj.get("inbound") {
+            Some(serde_json::Value::Array(items)) if !items.is_empty() => {
+                let mut names = Vec::with_capacity(items.len());
+                for item in items {
+                    names.push(
+                        item.as_str()
+                            .ok_or_else(|| invalid("rule inbound must be strings"))?,
+                    );
+                }
+                names
+            }
+            _ => return Err(invalid("rule without inbound array")),
+        };
         let outbound = obj
             .get("outbound")
             .and_then(serde_json::Value::as_str)
@@ -2786,8 +3348,10 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
         if obj.get("action").and_then(serde_json::Value::as_str) != Some("route") {
             return Err(invalid("rule without route action"));
         }
-        if !inbound_names.contains(inbound) {
-            return Err(invalid(&format!("rule references unknown \"{inbound}\"")));
+        for inbound in inbound_names_list {
+            if !inbound_names.contains(inbound) {
+                return Err(invalid(&format!("rule references unknown \"{inbound}\"")));
+            }
         }
         if !exits.contains(outbound) {
             return Err(invalid(&format!("rule references unknown \"{outbound}\"")));
@@ -4192,13 +4756,23 @@ impl EngineController {
 
     /// Stop one config; returns true when it was active. Stops the sidecar
     /// when the set becomes empty.
+    /// Ticket 32: a failing re-gen restores the membership snapshot (active
+    /// and the running sidecar agree) and records the error in
+    /// [`EngineController::last_error`] — never a silent half-state. The
+    /// bool answers membership (the row was active); the apply outcome is
+    /// on the `last_error` seam, like the start paths.
     pub fn stop_one(&mut self, id: &str) -> bool {
         let before = self.active.len();
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
         self.active.retain(|row| row.id != id);
         if self.active.len() == before {
             return false;
         }
-        let _ = self.apply();
+        if self.apply().is_err() {
+            self.active = prev;
+            self.status = prev_status;
+        }
         self.prune_lan_confirmed();
         true
     }
@@ -4254,9 +4828,18 @@ impl EngineController {
     }
 
     /// Stop everything and take the sidecar down.
+    /// Ticket 32: like [`EngineController::stop_one`], a failing apply
+    /// restores the membership snapshot instead of leaving a silent
+    /// half-state (the empty-set apply cannot fail today; this is
+    /// defense in depth for future fallible teardown).
     pub fn stop_all(&mut self) {
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
         self.active.clear();
-        let _ = self.apply();
+        if self.apply().is_err() {
+            self.active = prev;
+            self.status = prev_status;
+        }
         self.prune_lan_confirmed();
     }
 
@@ -4764,6 +5347,19 @@ impl EngineController {
         crashes
     }
 
+    /// Ticket 30: joined per-shard crash detail — always one `shard: cause`
+    /// fragment per crashed shard, joined with `; ` (single crashes keep
+    /// their shard prefix here, unlike [`EngineController::poll`]'s bare
+    /// cause). Pure: the UI builds the error notification from this without
+    /// touching generation or schemas. Causes are already redacted upstream.
+    pub fn crash_detail(crashes: &[(String, String)]) -> String {
+        crashes
+            .iter()
+            .map(|(shard, cause)| format!("{shard}: {cause}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// Crash detection: call on UI actions; reports the named cause(s) once.
     /// Ticket 07: watches both sidecars, stock first.
     /// Ticket 08: watches all four sidecars, stock first.
@@ -5097,7 +5693,7 @@ mod tests {
         let rules = value["route"]["rules"].as_array().expect("rules array");
         assert_eq!(rules.len(), 3);
         for (entry, rule) in generated.isolation.iter().zip(rules.iter()) {
-            assert_eq!(rule["inbound"], json!(entry.inbound_tag));
+            assert_eq!(rule["inbound"], json!([entry.inbound_tag.clone()]));
             assert_eq!(rule["outbound"], json!(entry.outbound_tag));
             assert_eq!(rule["action"], json!("route"));
         }
@@ -5633,6 +6229,414 @@ mod tests {
         assert!(matches!(generate(&[]), Err(EngineError::NoActiveConfigs)));
     }
 
+    // -- Ticket 32: engine correctness (route arrays, custom agreement,
+    // AWG coercion, stop snapshot; TDD at the generation seam) --------------
+
+    /// Ticket 32: route rules carry `inbound` as an array (what stock
+    /// sing-box 1.14.2 `check` accepts); one entry per endpoint, each
+    /// resolving to its own outbound.
+    #[test]
+    fn t32_route_rules_use_inbound_array() {
+        let generated = generate(&three_standard()).expect("standard set generates");
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 3);
+        for (entry, rule) in generated.isolation.iter().zip(rules.iter()) {
+            assert_eq!(rule["inbound"], json!([entry.inbound_tag]), "array form");
+            assert_eq!(rule["outbound"], json!(entry.outbound_tag));
+            assert_eq!(rule["action"], json!("route"));
+        }
+    }
+
+    /// Ticket 32: custom full-config rows never conflict — `generate` and
+    /// `validate_activation` agree (their bind is documentation, not an
+    /// endpoint we serve).
+    #[test]
+    fn t32_custom_full_config_never_conflicts() {
+        fn custom_full(id: &str, name: &str, core: &str) -> ProxyConfig {
+            fixture(
+                id,
+                name,
+                "custom-config",
+                json!({"core": core,
+                       "config": {"outbounds": [{"type": "direct", "tag": "direct"}]}}),
+                "127.0.0.1",
+                10801,
+            )
+        }
+        // Same bind+port, different cores: the pre-check plans cleanly.
+        let rows = vec![
+            custom_full("c1", "CustomA", "stock"),
+            custom_full("c2", "CustomB", "fork"),
+        ];
+        validate_activation(&rows).expect("customs never conflict in validate");
+        // `generate` serves no custom full-config, but it must agree on the
+        // conflict verdict: never a PortConflict.
+        let error = generate(&rows).expect_err("customs join no bare config");
+        assert!(
+            !matches!(error, EngineError::PortConflict { .. }),
+            "generate agrees (no conflict), got {error}"
+        );
+        // A custom full-config sharing a standard row's endpoint agrees too.
+        let mixed = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            custom_full("c1", "CustomA", "stock"),
+        ];
+        let error = generate(&mixed).expect_err("custom joins no bare config");
+        assert!(
+            !matches!(error, EngineError::PortConflict { .. }),
+            "mixed set agrees (no conflict), got {error}"
+        );
+    }
+
+    /// Ticket 32: stop with a failing re-gen restores the snapshot (active
+    /// membership and the running sidecar agree) and records the error —
+    /// never a silent half-state.
+    #[test]
+    fn t32_stop_with_failing_regen_restores_snapshot() {
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10802),
+        ];
+        let (mut controller, stock, _) = EngineController::fake_pair();
+        controller.start_all(&rows).expect("both start");
+        assert!(stock.is_running());
+        stock.fail_check("t32 boom");
+        assert!(controller.stop_one("1"), "row was active");
+        assert_eq!(
+            controller.running_ids(),
+            vec!["1".to_string(), "2".to_string()],
+            "membership snapshot restored"
+        );
+        assert!(stock.is_running(), "sidecar still serves the snapshot");
+        assert!(controller.is_running("1"), "row still served");
+        let error = controller.last_error().unwrap_or("").to_string();
+        assert!(error.contains("t32 boom"), "error recorded, got {error}");
+        stock.clear_failures();
+        assert!(controller.stop_one("1"), "stop succeeds once healthy");
+        assert_eq!(controller.running_ids(), vec!["2".to_string()]);
+    }
+
+    /// Ticket 32: AWG string numerics (jc/jmin/jmax/s1-s4/h1-h4) coerce to
+    /// numbers; h-ranges and i-chains pass through verbatim.
+    #[test]
+    fn t32_awg_string_numerics_coerce_ranges_verbatim() {
+        let params = awg_params(
+            "2.0",
+            json!({"jc": "5", "jmin": "30", "jmax": "1000",
+            "s1": "20", "s2": "21", "s3": "22", "s4": "23",
+            "h1": "7", "h2": "8", "h3": "9", "h4": "1-100",
+            "i1": "<b 0xd100><r 50>", "i2": "5"}),
+        );
+        let configs = vec![awg_fixture("7", "AwgNum", params, 10807)];
+        let generated = generate(&configs).expect("AWG numerics generate");
+        let endpoint = generated.value()["endpoints"][0].clone();
+        for (key, number) in [
+            ("jc", 5),
+            ("jmin", 30),
+            ("jmax", 1000),
+            ("s1", 20),
+            ("s2", 21),
+            ("s3", 22),
+            ("s4", 23),
+            ("h1", 7),
+            ("h2", 8),
+            ("h3", 9),
+        ] {
+            assert_eq!(endpoint[key], json!(number), "{key} coerced");
+        }
+        assert_eq!(endpoint["h4"], json!("1-100"), "h-range verbatim");
+        assert_eq!(
+            endpoint["i1"],
+            json!("<b 0xd100><r 50>"),
+            "i-chain verbatim"
+        );
+        assert_eq!(endpoint["i2"], json!("5"), "i-chain never coerced");
+    }
+
+    /// Ticket 32 (live): every standard row shape the app emits passes the
+    /// real stock sing-box 1.14.2 `check` (EXIT 0) — route arrays, `tls` /
+    /// `transport` translation, endpoint reshape. Hermetic by default —
+    /// runs only with `MANYPROXY_LIVE_CHECK=1` (TEMP files only, removed
+    /// afterwards). The binary resolves via `MANYPROXY_SINGBOX_BIN` (else
+    /// the debug build beside the crate). Rows come from the real link
+    /// grammar so intake shapes are covered end to end.
+    #[test]
+    fn t32_live_singbox_check_accepts_standard_rows() {
+        if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
+            return;
+        }
+        use crate::import::parse_link;
+        let binary = std::env::var("MANYPROXY_SINGBOX_BIN").map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    PathBuf::from("target/debug/sing-box.exe")
+                } else {
+                    PathBuf::from("target/debug/sing-box")
+                }
+            },
+            PathBuf::from,
+        );
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let vmess_json = serde_json::json!({
+            "v": "2", "ps": "vmess-probe", "add": "192.0.2.11", "port": "443",
+            "id": uuid, "aid": "0", "scy": "auto", "net": "ws",
+            "type": "none", "host": "example.com", "path": "/ws", "tls": "tls", "sni": "example.com",
+        })
+        .to_string();
+        use base64::Engine as _;
+        let vmess_link = format!(
+            "vmess://{}#vmess-probe",
+            base64::engine::general_purpose::STANDARD.encode(vmess_json)
+        );
+        let links = [
+            ("ss", "ss://YWVzLTEyOC1nY206cGFzczE@192.0.2.7:8388#ss-one"),
+            ("vless-plain", &format!("vless://{uuid}@192.0.2.9:443?encryption=none#vless-plain")),
+            ("vless-tls-ws", &format!("vless://{uuid}@192.0.2.9:443?encryption=none&security=tls&sni=example.com&fp=chrome&type=ws&path=%2Fws&host=example.com#vless-tls")),
+            ("vless-grpc", &format!("vless://{uuid}@192.0.2.9:443?encryption=none&security=tls&sni=example.com&type=grpc&serviceName=exampleSvc#vless-grpc")),
+            ("vless-http", &format!("vless://{uuid}@192.0.2.9:443?encryption=none&security=tls&sni=example.com&type=http&host=example.com&path=%2Fh2path#vless-http")),
+            ("vless-reality", &format!("vless://{uuid}@192.0.2.9:443?encryption=none&security=reality&pbk=A3oRvoNAnsCtWItpFcR4nQ0VyJjEJhRq8yx6shbXSVo&sid=abcd&sni=example.com&fp=chrome&flow=xtls-rprx-vision#vless-reality")),
+            ("vmess", &vmess_link),
+            ("trojan", "trojan://cGFzczE@192.0.2.10:443?sni=example.com#trojan-one"),
+            ("tuic", &format!("tuic://{uuid}:cGFzczE@192.0.2.12:443?congestion_control=bbr&alpn=h3#tuic-one")),
+            ("hysteria2", "hysteria2://cGFzczE@192.0.2.13:443?sni=example.com#hy2-one"),
+            ("hysteria", "hysteria://cGFzczE@192.0.2.14:443?peer=example.com&alpn=h3&up=100%20Mbps&down=100%20Mbps#hy-one"),
+            ("anytls", "anytls://c2VjcmV0@192.0.2.15:8443?sni=example.com#anytls-one"),
+            ("ssh", "ssh://testuser:testpass@192.0.2.16:22#ssh-one"),
+            ("wg-uri", "wg://+OXqmRTv+Pv771vT7BlefIxQkBgLNEbmb+tqNcSR5FA=@192.0.2.44:51820?publickey=ovSNn7m3TBtLeRWIaGYAhpqTn3o1sF75Ot7LV0qULD0=#wg-uri"),
+            ("wg-full", "wgfull"),
+            ("wg-minimal", "wgminimal"),
+        ];
+        for (label, link) in links {
+            if link == "wgfull" {
+                // Valid base64 key material plus numeric-ish endpoint opts.
+                let row = fixture(
+                    "9",
+                    "WgFull",
+                    "wireguard",
+                    serde_json::json!({"type": "wireguard", "server": "192.0.2.44",
+                        "server_port": 51820,
+                        "private_key": "+OXqmRTv+Pv771vT7BlefIxQkBgLNEbmb+tqNcSR5FA=",
+                        "public_key": "ovSNn7m3TBtLeRWIaGYAhpqTn3o1sF75Ot7LV0qULD0=",
+                        "address": "100.64.0.2/32", "mtu": "1280",
+                        "persistent_keepalive": "25", "allowed_ips": "0.0.0.0/0"}),
+                    "127.0.0.1",
+                    10901,
+                );
+                check_one(&binary, label, &[row]);
+                continue;
+            }
+            if link == "wgminimal" {
+                // Real keys but no address/allowed_ips: the allowed-ips
+                // default carries it (address is optional to `check`).
+                let row = fixture(
+                    "9",
+                    "WgMinimal",
+                    "wireguard",
+                    serde_json::json!({"type": "wireguard", "server": "192.0.2.44",
+                        "server_port": 51820,
+                        "private_key": "+OXqmRTv+Pv771vT7BlefIxQkBgLNEbmb+tqNcSR5FA=",
+                        "public_key": "ovSNn7m3TBtLeRWIaGYAhpqTn3o1sF75Ot7LV0qULD0="}),
+                    "127.0.0.1",
+                    10901,
+                );
+                check_one(&binary, label, &[row]);
+                continue;
+            }
+            match parse_link(link) {
+                Ok(imported) => {
+                    let row = ProxyConfig {
+                        id: format!("live-{label}"),
+                        name: imported.name.clone(),
+                        protocol: imported.protocol.clone(),
+                        params: imported.params.clone(),
+                        group: "live".to_string(),
+                        enabled: true,
+                        bind_ip: "127.0.0.1".to_string(),
+                        port: 10901,
+                        subscription_id: None,
+                        identity_key: None,
+                    };
+                    check_one(&binary, label, std::slice::from_ref(&row));
+                }
+                Err(error) => panic!("PROBE {label}: link parses: {error}"),
+            }
+        }
+        fn check_one(binary: &Path, label: &str, rows: &[ProxyConfig]) {
+            let generated =
+                generate(rows).unwrap_or_else(|error| panic!("PROBE {label}: generates: {error}"));
+            let path = std::env::temp_dir().join(format!(
+                "manyproxy-t32-live-{label}-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::write(&path, &generated.json).expect("temp config writes");
+            let output = std::process::Command::new(binary)
+                .arg("check")
+                .arg("-c")
+                .arg(&path)
+                .output()
+                .expect("check runs");
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                output.status.success(),
+                "PROBE {label}: sing-box check EXIT 0, stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    /// Ticket 32: meaningful-but-unmappable intake fails named (field +
+    /// reason, never values) instead of emitting a config `check` rejects
+    /// — or worse, a silently wrong connection.
+    #[test]
+    fn t32_translation_errors_name_field() {
+        // Shadowsocks plugin: names an external executable.
+        let plugin = fixture(
+            "1",
+            "SsPlugin",
+            "shadowsocks",
+            json!({"type": "shadowsocks", "server": "192.0.2.7", "server_port": 8388,
+                   "method": "aes-128-gcm", "password": "pass1", "plugin": "obfs-local"}),
+            "127.0.0.1",
+            10801,
+        );
+        let error = generate(std::slice::from_ref(&plugin)).expect_err("plugin names its field");
+        assert!(
+            matches!(error, EngineError::BadCustom { .. }),
+            "typed, got {error}"
+        );
+        assert!(
+            error.to_string().contains("\"plugin\""),
+            "names field: {error}"
+        );
+        assert!(
+            !error.to_string().contains("obfs-local"),
+            "no value echo: {error}"
+        );
+        // Hysteria without speeds: sing-box requires up/down.
+        let slow = fixture(
+            "2",
+            "HyBare",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443, "auth": "pass1"}),
+            "127.0.0.1",
+            10802,
+        );
+        let error = generate(std::slice::from_ref(&slow)).expect_err("speeds required");
+        assert!(
+            matches!(error, EngineError::BadParams { field: "up", .. }),
+            "typed, got {error}"
+        );
+        // Hysteria2 realm variant: no sing-box mapping.
+        let realm = fixture(
+            "3",
+            "Hy2Realm",
+            "hysteria2",
+            json!({"type": "hysteria2", "server": "192.0.2.13", "server_port": 443,
+                   "password": "pass1", "variant": "realm"}),
+            "127.0.0.1",
+            10803,
+        );
+        let error = generate(std::slice::from_ref(&realm)).expect_err("realm names its field");
+        assert!(
+            error.to_string().contains("\"variant\""),
+            "names field: {error}"
+        );
+        // mKCP transport: no sing-box mapping.
+        let kcp = fixture(
+            "4",
+            "VlessKcp",
+            "vless",
+            json!({"type": "vless", "server": "192.0.2.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "network": "kcp"}),
+            "127.0.0.1",
+            10804,
+        );
+        let error = generate(std::slice::from_ref(&kcp)).expect_err("kcp names its field");
+        assert!(
+            error.to_string().contains("\"network\""),
+            "names field: {error}"
+        );
+        // Plaintext on a TLS-mandatory protocol.
+        let plain = fixture(
+            "5",
+            "TuicPlain",
+            "tuic",
+            json!({"type": "tuic", "server": "192.0.2.12", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "password": "pass1",
+                   "security": "none"}),
+            "127.0.0.1",
+            10805,
+        );
+        let error = generate(std::slice::from_ref(&plain)).expect_err("tls mandatory");
+        assert!(
+            error.to_string().contains("\"security\""),
+            "names field: {error}"
+        );
+    }
+
+    /// Ticket 32: intake spellings fold to sing-box names — `username` to
+    /// `user` on ssh, string `alter_id` to a number on vmess.
+    #[test]
+    fn t32_intake_spellings_fold_to_singbox_names() {
+        let ssh = fixture(
+            "1",
+            "SshOne",
+            "ssh",
+            json!({"type": "ssh", "server": "192.0.2.16", "server_port": 22,
+                   "username": "testuser", "password": "testpass"}),
+            "127.0.0.1",
+            10801,
+        );
+        let node = generate(std::slice::from_ref(&ssh))
+            .expect("ssh generates")
+            .value()["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("1")))
+            .expect("ssh outbound")
+            .clone();
+        assert_eq!(node["user"], json!("testuser"));
+        assert!(node.get("username").is_none(), "folded, not duplicated");
+        let vmess = fixture(
+            "2",
+            "VmessOne",
+            "vmess",
+            json!({"type": "vmess", "server": "192.0.2.11", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "alter_id": "3"}),
+            "127.0.0.1",
+            10802,
+        );
+        let value = generate(std::slice::from_ref(&vmess))
+            .expect("vmess generates")
+            .value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("2")))
+            .expect("vmess outbound");
+        assert_eq!(node["alter_id"], json!(3), "coerced to number");
+    }
+
     // -- Ticket 07: fork-core exotic (AWG version matrix, wrong-layer
     // guards, XHTTP path, fork gating; TDD at the validation seam) --------
 
@@ -5836,9 +6840,14 @@ mod tests {
         assert!(generated.requires_fork);
         let value = generated.value();
         let outbounds = value["outbounds"].as_array().expect("outbounds");
-        assert!(outbounds
+        // Ticket 32: the xhttp marker folds into the `transport` object
+        // the fork sidecar validates (no v2ray-flat top-level keys).
+        let node = outbounds
             .iter()
-            .any(|node| node["network"] == json!("xhttp")));
+            .find(|node| node["tag"] == json!(outbound_tag("2")))
+            .expect("xhttp outbound present");
+        assert_eq!(node["transport"]["type"], json!("xhttp"));
+        assert!(node.get("network").is_none(), "flat consumed");
 
         let mut wg = wg_params();
         wg.as_object_mut()
@@ -6112,7 +7121,7 @@ mod tests {
                 .as_array()
                 .expect("rules")
                 .iter()
-                .find(|rule| rule["inbound"] == json!(entry.inbound_tag))
+                .find(|rule| rule["inbound"] == json!([entry.inbound_tag.clone()]))
                 .expect("rule per endpoint");
             assert_eq!(rule["outbound"], json!(entry.outbound_tag));
         }
@@ -6446,7 +7455,7 @@ mod tests {
             .as_array()
             .expect("rules")
             .iter()
-            .find(|rule| rule["inbound"] == json!(inbound_tag("8")))
+            .find(|rule| rule["inbound"] == json!([inbound_tag("8")]))
             .expect("chain rule present");
         assert_eq!(rule["outbound"], json!(hop0));
     }
@@ -7009,7 +8018,7 @@ mod tests {
             .as_array()
             .expect("rules")
             .iter()
-            .find(|rule| rule["inbound"] == json!(inbound_tag("1")))
+            .find(|rule| rule["inbound"] == json!([inbound_tag("1")]))
             .expect("ssh rule present");
         assert_eq!(rule["outbound"], json!(outbound_tag("1")));
 

@@ -541,6 +541,9 @@ impl HealthStore {
 
     /// Latest sample of any kind for one config.
     /// Ticket 28: shares the reverse scan with [`latest_of`].
+    /// Ticket 32: no longer behind [`HealthStore::status`] (worst-kind-wins
+    /// reads per-kind); kept as the public latest-sample accessor.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn latest(&self, config_id: &str) -> Option<&HealthSample> {
         self.latest_filtered(config_id, None)
     }
@@ -556,28 +559,48 @@ impl HealthStore {
         })
     }
 
-    /// Liveness from the latest sample: failure flags the row dead with the
-    /// named cause, success is live, nothing recorded is unknown.
+    /// Liveness across kinds (ticket 32: worst-kind-wins): the latest sample
+    /// of EACH kind is considered — any dead kind means dead, so a later
+    /// ping success never masks a live URL failure (and vice versa). The
+    /// URL leg names the cause when it is dead (end-to-end signal beats
+    /// dial timing); latency prefers the URL leg. Nothing recorded of any
+    /// kind is unknown.
     pub fn status(&self, config_id: &str) -> RowHealth {
-        match self.latest(config_id) {
-            None => RowHealth {
+        let url = self.latest_of(config_id, HealthKind::UrlTest);
+        let ping = self.latest_of(config_id, HealthKind::TcpPing);
+        if url.is_none() && ping.is_none() {
+            return RowHealth {
                 state: RowState::Unknown,
                 latency_ms: None,
                 cause: None,
+            };
+        }
+        let dead_cause = url
+            .and_then(|sample| sample.error.as_deref())
+            .or_else(|| ping.and_then(|sample| sample.error.as_deref()));
+        match dead_cause {
+            Some(cause) => RowHealth {
+                state: RowState::Dead,
+                latency_ms: None,
+                cause: Some(cause.to_string()),
             },
-            Some(sample) => match &sample.error {
-                Some(cause) => RowHealth {
-                    state: RowState::Dead,
-                    latency_ms: None,
-                    cause: Some(cause.clone()),
-                },
-                None => RowHealth {
-                    state: RowState::Live,
-                    latency_ms: sample.latency_ms,
-                    cause: None,
-                },
+            None => RowHealth {
+                state: RowState::Live,
+                latency_ms: url
+                    .and_then(|sample| sample.latency_ms)
+                    .or_else(|| ping.and_then(|sample| sample.latency_ms)),
+                cause: None,
             },
         }
+    }
+
+    /// Ticket 32: drop samples older than `max_age_secs` relative to `now`
+    /// (stale samples expire instead of haunting a row forever).
+    /// Future-dated samples (clock skew) are kept, never pruned.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn prune_stale(&mut self, now: i64, max_age_secs: i64) {
+        self.samples
+            .retain(|sample| now.saturating_sub(sample.at) <= max_age_secs);
     }
 
     /// Accumulated traffic (zeroed when nothing succeeded yet).
@@ -585,15 +608,19 @@ impl HealthStore {
         self.traffic.get(config_id).copied().unwrap_or_default()
     }
 
+    /// Ticket 33: probe-byte counts are labeled `probe:` — they measure
+    /// health-probe request/response bytes through the row's own endpoint,
+    /// never data-plane traffic (there is no data-plane meter in v1).
     fn traffic_text(&self, config_id: &str) -> String {
         let stats = self.traffic(config_id);
         if stats.probes == 0 {
-            "no traffic".to_string()
+            "probe: no traffic yet".to_string()
         } else {
             format!(
-                "↑{} ↓{}",
+                "probe: ↑{} ↓{} · {} probe(s)",
                 format_bytes(stats.tx_bytes),
-                format_bytes(stats.rx_bytes)
+                format_bytes(stats.rx_bytes),
+                stats.probes
             )
         }
     }
@@ -1240,6 +1267,114 @@ mod tests {
         );
     }
 
+    // -- Ticket 32: truthful status (worst-kind-wins, stale expiry) --------
+
+    /// Ticket 32: a URL failure after a ping success is dead — and a later
+    /// ping success never masks a live URL failure (worst-kind-wins).
+    #[test]
+    fn t32_url_failure_after_ping_success_is_dead() {
+        fn outcome(
+            id: &str,
+            kind: HealthKind,
+            latency_ms: Option<u64>,
+            error: Option<&str>,
+        ) -> TestOutcome {
+            TestOutcome {
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at: now_unix(),
+                    kind,
+                    latency_ms,
+                    error: error.map(str::to_string),
+                },
+                success: latency_ms.map(|latency| ProbeSuccess {
+                    latency_ms: latency,
+                    bytes_rx: 1200,
+                    bytes_tx: 300,
+                }),
+            }
+        }
+        // Ping success, then URL failure: dead.
+        let mut store = HealthStore::default();
+        store.record_outcome(&outcome("1", HealthKind::TcpPing, Some(7), None));
+        store.record_outcome(&outcome(
+            "1",
+            HealthKind::UrlTest,
+            None,
+            Some("url test failed for \"A\": refused"),
+        ));
+        let status = store.status("1");
+        assert!(
+            matches!(status.state, RowState::Dead),
+            "url failure is dead: {status:?}"
+        );
+        // URL failure, then ping success: still dead (no ping masking).
+        let mut masked = HealthStore::default();
+        masked.record_outcome(&outcome(
+            "1",
+            HealthKind::UrlTest,
+            None,
+            Some("url test failed for \"A\": refused"),
+        ));
+        masked.record_outcome(&outcome("1", HealthKind::TcpPing, Some(7), None));
+        let status = masked.status("1");
+        assert!(
+            matches!(status.state, RowState::Dead),
+            "ping must not mask url failure: {status:?}"
+        );
+        assert!(masked.row_summary("1") == "dead", "list shows dead");
+        // Both kinds live: live with a latency.
+        let mut live = HealthStore::default();
+        live.record_outcome(&outcome("1", HealthKind::TcpPing, Some(7), None));
+        live.record_outcome(&outcome("1", HealthKind::UrlTest, Some(42), None));
+        let status = live.status("1");
+        assert!(matches!(status.state, RowState::Live));
+        assert_eq!(status.latency_ms, Some(42));
+    }
+
+    /// Ticket 32: stale samples expire — pruning drops samples older than
+    /// the TTL so dead history cannot haunt a row forever (and fresh
+    /// samples survive).
+    #[test]
+    fn t32_stale_samples_expire() {
+        let now = now_unix();
+        let mut store = HealthStore::default();
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "old".to_string(),
+                at: now - 10_000,
+                kind: HealthKind::UrlTest,
+                latency_ms: None,
+                error: Some("url test failed for \"Old\": refused".to_string()),
+            },
+            success: None,
+        });
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "fresh".to_string(),
+                at: now,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(42),
+                error: None,
+            },
+            success: Some(ProbeSuccess {
+                latency_ms: 42,
+                bytes_rx: 1200,
+                bytes_tx: 300,
+            }),
+        });
+        store.prune_stale(now, 300);
+        assert!(
+            matches!(store.status("old").state, RowState::Unknown),
+            "stale expires"
+        );
+        assert!(
+            matches!(store.status("fresh").state, RowState::Live),
+            "fresh survives"
+        );
+        assert_eq!(store.row_summary("fresh"), "42ms");
+    }
+
     /// Ticket 12: hydrated snapshots restore latencies and dead flags;
     /// traffic stays zeroed (session-only) and unknown kinds default.
     #[test]
@@ -1488,6 +1623,25 @@ mod tests {
         assert_eq!(store.traffic("missing"), TrafficStats::default());
         assert!(store.detail_line("1").contains("↑"), "traffic shown");
         assert_eq!(store.detail_line("missing"), "health: not tested");
+    }
+
+    /// Ticket 33: probe-byte counters are labeled `probe:` (never bare
+    /// `traffic` — v1 has no data-plane meter).
+    #[test]
+    fn traffic_text_is_labeled_probe() {
+        let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
+        let (mut prober, _) = FakeHealthProber::shared();
+        let mut store = HealthStore::default();
+        assert!(
+            store.detail_line("1") == "health: not tested",
+            "untested row names the state"
+        );
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+            store.record_outcome(&outcome);
+        }
+        let line = store.detail_line("1");
+        assert!(line.contains("probe:"), "probe bytes labeled, got {line}");
+        assert!(line.contains("1 probe(s)"), "probe count shown, got {line}");
     }
 
     /// Scenario 2: per-config log filter shows only its lines, secrets

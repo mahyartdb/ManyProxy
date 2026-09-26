@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::notification::Notification;
@@ -25,8 +25,9 @@ use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
 
 use engine::{
-    lan_confirm_description, lan_confirm_text, lan_exposure_warning, requires_lan_confirm,
-    EngineController, LAN_CONFIRM_TITLE,
+    engine_binary_file_name, fork_binary_file_name, lan_confirm_description, lan_confirm_text,
+    lan_exposure_warning, requires_lan_confirm, resolve_engine_binary, resolve_fork_binary,
+    resolve_xray_binary, xray_binary_file_name, EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
     ping_all, redact_secrets, test_all, truncate, HealthProber, HealthStore, LogStore,
@@ -39,9 +40,9 @@ use import::{
 };
 use store::{
     count_importable, delete_confirm_text, due_for_refresh, export_confirm_description, now_unix,
-    proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig, RestoreOutcome, Store,
-    StoreError, Subscription as ProxySubscription, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND,
-    DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    protocol_params_template, proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig,
+    RestoreOutcome, Store, StoreError, Subscription as ProxySubscription,
+    DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -102,6 +103,80 @@ fn app_window_options() -> WindowOptions {
     options
 }
 
+/// Ticket 33: crate version stamped into About (from `Cargo.toml`).
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Ticket 33: git hash stamped by `build.rs` (`MANYPROXY_GIT_HASH`); plain
+/// dev builds without git metadata show the fallback, never a build failure.
+pub const GIT_HASH: &str = match option_env!("MANYPROXY_GIT_HASH") {
+    Some(hash) => hash,
+    None => "unknown (dev build)",
+};
+
+/// Ticket 33: the five app shortcuts in one place — the About dialog and the
+/// toolbar hint labels both read this, so the visible hints can never drift
+/// from the [`bind_app_keys`] bindings.
+pub const SHORTCUT_LINES: &[(&str, &str)] = &[
+    ("Add configuration", "Ctrl-N"),
+    ("Import configurations", "Ctrl-O"),
+    ("Start selected", "F5"),
+    ("Stop selected", "Shift-F5"),
+    ("Test selected", "Ctrl-T"),
+];
+
+/// Ticket 33: close-confirm text for a window close with running endpoints.
+/// `None` when nothing runs (close proceeds silently — nothing to kill).
+/// `Some` names every running row so the confirm can never be a blind kill.
+fn close_confirm_description(running_names: &[String]) -> Option<String> {
+    if running_names.is_empty() {
+        return None;
+    }
+    let named = running_names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Closing now stops {} running endpoint(s): {named}. Stop all and close?",
+        running_names.len()
+    ))
+}
+
+/// Ticket 33: one sidecar-presence line for About: the expected file name
+/// plus whether it resolved in the app directory (never a download — a
+/// missing binary stays a missing binary).
+fn sidecar_presence_line(file_name: &str, found: bool) -> String {
+    if found {
+        format!("{file_name}: found (app dir)")
+    } else {
+        format!("{file_name}: missing (place it next to the app exe)")
+    }
+}
+
+/// Ticket 33: About dialog body — version + git hash + sidecar presence +
+/// data paths + shortcuts list. Pure so tests pin the complete content.
+fn about_body(
+    version: &str,
+    git_hash: &str,
+    sidecars: &[String],
+    db_path: &str,
+    export_path: &str,
+) -> String {
+    let mut out = format!("ManyProxy v{version} (git {git_hash})\n\nSidecars (app dir only):\n");
+    for line in sidecars {
+        out.push_str(&format!("  {line}\n"));
+    }
+    out.push_str(&format!(
+        "\nData:\n  library: {db_path}\n  export default: {export_path}\n"
+    ));
+    out.push_str("\nNo autostart, no registry writes, no auto-update in v1.\n");
+    out.push_str("\nShortcuts:\n");
+    for (action, keys) in SHORTCUT_LINES {
+        out.push_str(&format!("  {action}: {keys}\n"));
+    }
+    out
+}
+
 /// Delegate for the configuration library list.
 ///
 /// Ticket 02: renders stored rows with stable domain ids
@@ -115,6 +190,9 @@ struct LibraryDelegate {
     /// Ticket 06: per-row health summary (`config_id` → `87ms` / `dead`);
     /// empty or missing means untested (no health child rendered).
     health: HashMap<String, String>,
+    /// Ticket 30: serving truth per row (`config_id` set while running).
+    /// The badge renders from this — never from the enabled flag.
+    running: HashSet<String>,
 }
 
 impl LibraryDelegate {
@@ -125,6 +203,7 @@ impl LibraryDelegate {
             query: String::new(),
             selected: None,
             health: HashMap::new(),
+            running: HashSet::new(),
         }
     }
 
@@ -185,12 +264,30 @@ impl LibraryDelegate {
         self.health = health;
     }
 
+    /// Ticket 30: replace the serving set (`config_id`s currently running).
+    /// Badges render from this — never from the enabled flag.
+    fn set_running(&mut self, ids: Vec<String>) {
+        self.running = ids.into_iter().collect();
+    }
+
     /// (total rows, enabled rows) for the status bar.
     fn counts(&self) -> (usize, usize) {
         (
             self.rows.len(),
             self.rows.iter().filter(|row| row.enabled).count(),
         )
+    }
+
+    /// Ticket 30: (visible rows, total rows) for the `N of M` search count.
+    /// Test-only seam (production reads `delegate_counts_for_search`).
+    #[cfg(test)]
+    fn visible_counts(&self) -> (usize, usize) {
+        (self.visible.len(), self.rows.len())
+    }
+
+    /// Ticket 30: (visible, total, query) for the search-count row.
+    fn delegate_counts_for_search(&self) -> (usize, usize, String) {
+        (self.visible.len(), self.rows.len(), self.query.clone())
     }
 }
 
@@ -234,16 +331,18 @@ impl ListDelegate for LibraryDelegate {
             .map(|current| current.section == index.section && current.row == index.row)
             .unwrap_or(false);
         // Ticket 19: complete row content (name, protocol, upstream
-        // host:port, bind endpoint, enabled state, health) via the tested
-        // [`library_row_lines`] seam — one child per line, stable domain id,
-        // no entity per row.
+        // host:port, bind endpoint, enabled state, serving badge) via the
+        // tested [`library_row_lines`] seam — one child per line, stable
+        // domain id, no entity per row.
+        // Ticket 30: the badge reads the serving set, never the enabled flag.
         let health = self
             .health
             .get(&row.id)
             .map(String::as_str)
             .filter(|summary| !summary.is_empty());
+        let is_running = self.running.contains(&row.id);
         let mut item = ListItem::new(format!("library-row-{}", row.id)).selected(selected);
-        for line in library_row_lines(&row, health) {
+        for line in library_row_lines(&row, health, is_running) {
             item = item.child(line);
         }
         Some(item)
@@ -254,14 +353,45 @@ impl ListDelegate for LibraryDelegate {
         _window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
+        // Ticket 30: a query with no hits is not an empty library. No-hits
+        // shows `No matches — Clear search` + `N of M` (the user clears via
+        // the search box); a truly empty library shows the Add/Import CTAs.
+        if !self.query.trim().is_empty() && !self.rows.is_empty() {
+            let (visible, total) = (self.visible.len(), self.rows.len());
+            return div()
+                .id("library-empty")
+                .test_support()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(no_matches_text())
+                .child(search_count_text(visible, total))
+                .child(
+                    div()
+                        .id("clear-search-hint")
+                        .test_support()
+                        .child("Clear search"),
+                );
+        }
         div()
             .id("library-empty")
             .test_support()
             .size_full()
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
-            .child("No proxy configurations yet")
+            .gap_1()
+            .child(empty_library_text())
+            .child(
+                div()
+                    .id("empty-library-ctas")
+                    .test_support()
+                    .child("Add or Import"),
+            )
     }
 }
 
@@ -356,10 +486,14 @@ impl ConfigForm {
     }
 
     fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
+        // Ticket 31: the params box opens with the per-protocol field
+        // template (guided add, not raw JSON first). Submitting it untouched
+        // fails naming the missing field — never silently.
+        let template = protocol_params_template(DEFAULT_PROTOCOL);
         Self {
             name: Self::field(window, cx, "Name", None),
             protocol: Self::field(window, cx, "Protocol", Some(DEFAULT_PROTOCOL)),
-            params: Self::field(window, cx, "Protocol params (optional)", None),
+            params: Self::field(window, cx, "Protocol params (optional)", Some(&template)),
             group: Self::field(window, cx, "Group", Some(DEFAULT_GROUP)),
             bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
             port: Self::field(window, cx, "Port (blank = auto)", None),
@@ -390,7 +524,17 @@ impl ConfigForm {
     /// Consumes a clone; every built element owns its state entity.
     /// Ticket 17: appends the inline LAN-confirm hint when the current bind
     /// is non-loopback (rebuilt on every render, so it tracks typing).
-    fn element(self, cx: &App) -> impl IntoElement {
+    /// Ticket 31: `collision` is the precomputed bind/port warning for the
+    /// live field values (computed per render by the caller, which owns the
+    /// rows snapshot); `form_error` is the shared first-error slot shown
+    /// inline under the fields. All owned strings — the built element keeps
+    /// no borrows.
+    fn element(
+        self,
+        cx: &App,
+        collision: Option<String>,
+        form_error: Option<(String, String)>,
+    ) -> impl IntoElement {
         let bind = self.bind.read(cx).value().to_string();
         let mut col = div()
             .flex()
@@ -405,7 +549,42 @@ impl ConfigForm {
         if let Some(hint) = lan_hint_for_bind(&bind) {
             col = col.child(div().id("lan-hint").test_support().child(hint));
         }
+        if let Some(warning) = collision {
+            col = col.child(
+                div()
+                    .id("bind-collision-warning")
+                    .test_support()
+                    .child(warning),
+            );
+        }
+        if let Some((field, message)) = form_error {
+            col = col.child(
+                div()
+                    .id("form-field-error")
+                    .test_support()
+                    .child(format!("{field}: {message}")),
+            );
+        }
         col
+    }
+
+    /// Ticket 31: move keyboard focus to the named field's input
+    /// (`name`/`protocol`/`params`/`group`/`bind_ip`/`port`). Unknown names
+    /// focus nothing (never a wrong field).
+    fn focus_field(&self, field: &str, window: &mut Window, cx: &mut App) {
+        let target = match field {
+            "name" => Some(&self.name),
+            "protocol" => Some(&self.protocol),
+            "params" => Some(&self.params),
+            "group" => Some(&self.group),
+            "bind_ip" => Some(&self.bind),
+            "port" => Some(&self.port),
+            _ => None,
+        };
+        if let Some(state) = target {
+            let handle = AnyInputState::from(state.clone()).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
     }
 
     fn as_new(&self, cx: &App) -> NewConfig {
@@ -808,6 +987,91 @@ fn already_stopped_message(name: &str) -> String {
     format!("\"{name}\" is already stopped")
 }
 
+/// Ticket 30: serving badge for one row — running rows show
+/// `● Running :port` plus ` · health` when a summary exists; stopped rows
+/// show `○ Stopped`. The enabled flag never appears here (it stays secondary
+/// in the row's third line). Port + health are display-safe (no secrets).
+fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
+    if !is_running {
+        return "○ Stopped".to_string();
+    }
+    match health.map(str::trim).filter(|summary| !summary.is_empty()) {
+        Some(summary) => format!("● Running :{port} · {summary}"),
+        None => format!("● Running :{port}"),
+    }
+}
+
+/// Ticket 30: honest start-on-running copy — a restart, never a bare
+/// `Started`.
+fn already_running_message(name: &str) -> String {
+    format!("\"{name}\" already running (restarted)")
+}
+
+/// Ticket 30: no-selection copy for Start/Stop/Test/Ping with nothing
+/// selected (F5 path included).
+fn no_selection_message() -> String {
+    "Select a configuration first".to_string()
+}
+
+/// Ticket 30: busy-guard copy — a second Start while one is in flight is
+/// ignored, never double-applied.
+fn start_busy_message() -> String {
+    "Starting… already in progress".to_string()
+}
+
+/// Ticket 30: partial start-all copy — names the failed rows plus both
+/// counts so the toast never claims a clean sweep over failures.
+fn start_all_partial_message(started: usize, failed_names: &[String]) -> String {
+    let failed = failed_names.len();
+    if failed == 0 {
+        return start_all_message(started);
+    }
+    format!(
+        "Started {started} endpoint(s), {failed} failed: {}",
+        failed_names.join(", ")
+    )
+}
+
+/// Ticket 30: search count `N of M` (visible of total).
+fn search_count_text(visible: usize, total: usize) -> String {
+    format!("{visible} of {total}")
+}
+
+/// Ticket 30: no-hits copy for a query that matches nothing (total > 0).
+fn no_matches_text() -> String {
+    "No matches — Clear search".to_string()
+}
+
+/// Ticket 30: empty-library copy with Add/Import affordances.
+fn empty_library_text() -> String {
+    "No proxy configurations yet — Add or Import to start".to_string()
+}
+
+/// Ticket 30: sidecar-crash notification copy — names the joined per-shard
+/// detail (`shard: cause[; …]`) and points at the log viewer. `detail` comes
+/// from [`engine::EngineController::crash_detail`] (already redacted).
+fn crash_notification_text(detail: &str) -> String {
+    format!("Engine crashed ({detail}) — View logs")
+}
+
+/// Ticket 30: true for start-all failures that isolate to one broken row
+/// (bad params, unsupported protocol, wrong-layer/custom/chain schema
+/// failures — each names its row). Union-level failures (port conflicts,
+/// missing binaries, check/spawn failures, bridge skew, LAN gate) stay
+/// atomic: nothing starts, exactly like before.
+fn is_row_local_start_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::InvalidParamsJson { .. }
+            | EngineError::BadParams { .. }
+            | EngineError::UnsupportedProtocol { .. }
+            | EngineError::BadAwg { .. }
+            | EngineError::WrongLayer { .. }
+            | EngineError::BadCustom { .. }
+            | EngineError::ChainViolation { .. }
+    )
+}
+
 /// Ticket 26: the enabled flag is NOT the engine. The switch and the Enable
 /// button write the stored flag only — they never start or stop an endpoint
 /// (see [`AppView::commit_enabled_flag`]). This copy says so on every
@@ -912,26 +1176,24 @@ fn upstream_host_port(row: &ProxyConfig) -> Option<String> {
 }
 
 /// Ticket 19: every text line of a library row — name, protocol + upstream
-/// host:port, group + bind endpoint + enabled state, plus the health summary
-/// when one exists. Pure so tests pin the complete content;
+/// host:port, group + bind endpoint + enabled state, plus the serving badge.
+/// Ticket 30: the badge (`● Running :port · health` / `○ Stopped`) is always
+/// present from the serving truth; the enabled flag stays secondary in the
+/// third line. Health folds into the badge when running (no separate health
+/// child). Pure so tests pin the complete content;
 /// [`LibraryDelegate::render_item`] maps each line to a child.
-fn library_row_lines(row: &ProxyConfig, health: Option<&str>) -> Vec<String> {
+fn library_row_lines(row: &ProxyConfig, health: Option<&str>, is_running: bool) -> Vec<String> {
     let upstream = upstream_host_port(row).unwrap_or_else(|| "no upstream".to_string());
     let state = if row.enabled { "enabled" } else { "disabled" };
-    let mut lines = vec![
+    vec![
         row.name.clone(),
         format!("{} · {upstream}", row.protocol),
         format!(
             "{} · bind {}:{} · {state}",
             row.group, row.bind_ip, row.port
         ),
-    ];
-    if let Some(summary) = health {
-        if !summary.is_empty() {
-            lines.push(summary.to_string());
-        }
-    }
-    lines
+        serving_badge(is_running, row.port, health),
+    ]
 }
 
 /// Ticket 17: a library row matches the search query by name, protocol,
@@ -975,6 +1237,65 @@ fn lan_hint_for_bind(bind: &str) -> Option<String> {
         "Starting on {} needs a LAN confirm — anyone on the network could use it",
         bind.trim()
     ))
+}
+
+/// Ticket 31: owning dialog field for a save error — the first invalid
+/// field's name plus its message, so the dialog can show it inline and move
+/// focus to it. `None` for non-field errors (`NotFound`/database). Carries
+/// field names only, never values (no secrets by construction).
+fn field_error_target(error: &StoreError) -> Option<(&'static str, String)> {
+    match error {
+        StoreError::Invalid(errors) => errors
+            .first()
+            .map(|first| (first.field, first.message.clone())),
+        _ => None,
+    }
+}
+
+/// Ticket 31: non-blocking bind/port collision warning naming the colliding
+/// row. `None` when the pair is free, when it is the edited row itself
+/// (`exclude_id`), when the port is blank (auto-assign never collides), or
+/// when the port is unparseable (validation owns that error — the warning
+/// must never double-report it). Saving is always still allowed: at rest two
+/// rows may share an endpoint; the conflict error naming both parties stays
+/// an activation-time concern.
+fn bind_port_collision_warning(
+    rows: &[ProxyConfig],
+    exclude_id: Option<&str>,
+    bind_raw: &str,
+    port_raw: &str,
+) -> Option<String> {
+    let port: u16 = port_raw.trim().parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    let bind = bind_raw.trim();
+    let bind = if bind.is_empty() { DEFAULT_BIND } else { bind };
+    rows.iter()
+        .filter(|row| Some(row.id.as_str()) != exclude_id)
+        .find(|row| row.bind_ip == bind && row.port == port)
+        .map(|row| {
+            format!(
+                "bind {bind}:{port} is already used by \"{}\" — saving is still allowed",
+                row.name
+            )
+        })
+}
+
+/// Ticket 31: visible plaintext-fetch warning for subscription URLs (the
+/// Warn policy surfaced, never the URL). `None` for https and for anything
+/// the validators reject (those are errors, not warnings).
+fn http_subscription_warning(url: &str) -> Option<String> {
+    match store::subscription_fetch_policy(url) {
+        store::SubscriptionFetchPolicy::Warn { reason } => Some(reason.to_string()),
+        _ => None,
+    }
+}
+
+/// Ticket 31: friendly duplicate-subscription copy — names the existing
+/// label (never the URL: tokens hide in queries).
+fn already_subscribed_message(label: &str) -> String {
+    format!("Already subscribed as \"{label}\" — no duplicate added")
 }
 
 /// Ticket 04: fetch a subscription body over the platform HTTP client.
@@ -1073,10 +1394,14 @@ impl SubForm {
     }
 
     /// Consumes a clone; every built element owns its state entity.
-    fn element(self) -> impl IntoElement {
+    /// Ticket 31: appends the inline plaintext-fetch warning when the live
+    /// URL input is http (rebuilt on every render, so it tracks typing —
+    /// same pattern as the LAN hint on [`ConfigForm::element`]).
+    fn element(self, cx: &App) -> impl IntoElement {
         let auto = self.auto_refresh.clone();
         let checked = *auto.borrow();
-        div()
+        let url = self.url.read(cx).value().to_string();
+        let mut col = div()
             .flex()
             .flex_col()
             .gap_2()
@@ -1092,7 +1417,16 @@ impl SubForm {
                             *auto.borrow_mut() = *next;
                         }),
                 ),
-            )
+            );
+        if let Some(warning) = http_subscription_warning(&url) {
+            col = col.child(
+                div()
+                    .id("sub-add-http-warning")
+                    .test_support()
+                    .child(warning),
+            );
+        }
+        col
     }
 }
 
@@ -1100,6 +1434,7 @@ impl SubForm {
 /// URL, group, member count, auto flag, last error) with Refresh / Auto /
 /// Remove actions. Refresh re-reads the record so a stale snapshot cannot
 /// fetch a removed subscription.
+/// Ticket 31: plus an Edit action opening the label/url/group editor.
 fn subscription_row(
     view: Entity<AppView>,
     sub: ProxySubscription,
@@ -1159,6 +1494,18 @@ fn subscription_row(
             }),
     );
     let remove_view = view.clone();
+    let edit_view = view.clone();
+    let edit_sub = sub.clone();
+    row = row.child(
+        Button::new(format!("sub-edit-{}", sub.id))
+            .label("Edit")
+            .on_click(move |_, window, cx| {
+                let sub = edit_sub.clone();
+                edit_view.update(cx, |view, cx| {
+                    view.open_subscription_edit_dialog(sub, window, cx);
+                });
+            }),
+    );
     row.child(
         Button::new(format!("sub-remove-{}", sub.id))
             .label("Remove")
@@ -1268,6 +1615,13 @@ struct AppView {
     /// executor. A second OK while it runs is ignored (the first completion
     /// closes or keeps the dialog exactly once — no double commit).
     import_parse_in_flight: bool,
+    /// Ticket 33: set once the user confirms the close-with-running-endpoints
+    /// dialog, so the confirmed second close is never vetoed again.
+    close_confirmed: bool,
+    /// Ticket 30: an engine start (single or start-all) is in flight. A
+    /// second Start while set is ignored with an info toast (no second
+    /// apply); the detail Start button reads `Starting…` while set.
+    start_in_flight: bool,
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
@@ -1320,6 +1674,8 @@ impl AppView {
             probe_in_flight: false,
             subs_form: None,
             import_parse_in_flight: false,
+            close_confirmed: false,
+            start_in_flight: false,
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
@@ -1379,6 +1735,10 @@ impl AppView {
     /// is load-bearing (ticket-14 ruling: headless paths stay silent by
     /// necessity, every user action notifies).
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Ticket 30: a pending sidecar crash notifies here (windowed) with
+        // shard/cause + View-logs — never status-bar-only. `reload_inner`
+        // would otherwise consume the one-shot poll for the status bar alone.
+        self.notify_engine_crash(window, cx);
         if let Err(error) = self.reload_inner(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
@@ -1397,9 +1757,12 @@ impl AppView {
         self.poll_engine();
         let rows = self.store.list()?;
         let health = self.health_map();
+        let running = self.engine.running_ids();
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
             state.delegate_mut().set_health(health);
+            // Ticket 30: serving truth follows the engine on every reload.
+            state.delegate_mut().set_running(running);
             // Ticket 19: notify the list entity itself (see `with_store`).
             list_cx.notify();
         });
@@ -1446,6 +1809,9 @@ impl AppView {
     /// the add — a new row hidden by the active filter is confirmed by the
     /// toast plus the status count, and appears when the filter clears.
     /// Clearing the user's query behind their back would be worse.
+    /// Ticket 31: dialogs commit through [`AppView::commit_add_with_focus`];
+    /// this stays as the headless/test seam.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn commit_add(
         &mut self,
         input: NewConfig,
@@ -1466,12 +1832,47 @@ impl AppView {
         }
     }
 
+    /// Ticket 31: dialog commit behind [`AppView::commit_add`]. Reads the
+    /// input from the form, and on failure records the first field error in
+    /// the shared inline slot (rendered under the fields on the next frame)
+    /// and moves keyboard focus to the owning field. The dialog stays open
+    /// (false); the toast still fires so headless callers see the error too.
+    fn commit_add_with_focus(
+        &mut self,
+        form: &ConfigForm,
+        form_error: &Rc<RefCell<Option<(String, String)>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.add(form.as_new(cx)) {
+            Ok(created) => {
+                *form_error.borrow_mut() = None;
+                let message = row_action_message("Added", &created.name);
+                self.reload(window, cx);
+                window.push_notification(Notification::success(message), cx);
+                true
+            }
+            Err(error) => {
+                if let Some((field, message)) = field_error_target(&error) {
+                    *form_error.borrow_mut() = Some((field.to_string(), message));
+                    form.focus_field(field, window, cx);
+                }
+                self.report_save_error(error, window, cx);
+                cx.notify();
+                false
+            }
+        }
+    }
+
     /// Ticket 26: re-read the row at commit. A row deleted while the dialog
     /// was open warns "Already removed" and closes (nothing left to edit);
     /// a store failure keeps the dialog open with the error (retryable).
     /// Staleness inside the row is handled by the caller, which builds the
     /// patch relative to the dialog-open snapshot (only user-touched fields
     /// are `Some` — see [`ConfigForm::as_patch_vs`]).
+    /// Ticket 31: dialogs commit through [`AppView::commit_edit_with_focus`];
+    /// this stays as the headless/test seam.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn commit_edit(
         &mut self,
         id: &str,
@@ -1497,6 +1898,49 @@ impl AppView {
                 }
                 Err(error) => {
                     self.report_save_error(error, window, cx);
+                    false
+                }
+            },
+        }
+    }
+
+    /// Ticket 31: dialog commit behind [`AppView::commit_edit`]. Same
+    /// ghost/store-failure arms, plus the inline first-error slot and focus
+    /// move on validation failure (the dialog stays open, retryable).
+    fn commit_edit_with_focus(
+        &mut self,
+        id: &str,
+        patch: ConfigPatch,
+        form: &ConfigForm,
+        form_error: &Rc<RefCell<Option<(String, String)>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.get(id) {
+            Ok(None) => {
+                *form_error.borrow_mut() = None;
+                window.push_notification(Notification::warning("Already removed"), cx);
+                true
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                false
+            }
+            Ok(Some(_)) => match self.store.update(id, patch) {
+                Ok(updated) => {
+                    *form_error.borrow_mut() = None;
+                    let message = row_action_message("Updated", &updated.name);
+                    self.reload(window, cx);
+                    window.push_notification(Notification::success(message), cx);
+                    true
+                }
+                Err(error) => {
+                    if let Some((field, message)) = field_error_target(&error) {
+                        *form_error.borrow_mut() = Some((field.to_string(), message));
+                        form.focus_field(field, window, cx);
+                    }
+                    self.report_save_error(error, window, cx);
+                    cx.notify();
                     false
                 }
             },
@@ -1576,6 +2020,9 @@ impl AppView {
         }
     }
 
+    /// Ticket 30: the removed duplicate Enable/Disable button's commit path.
+    /// Test-only seam — production uses the `Enabled` Switch.
+    #[cfg(test)]
     fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             return;
@@ -1597,8 +2044,37 @@ impl AppView {
     /// status bar reflects it without a background timer.
     /// Ticket 12: returns the named cause once (the engine-crash tick uses
     /// it; reload ignores it).
+    /// Ticket 30: the joined per-shard detail (`shard: cause[; …]`) is
+    /// available via [`AppView::poll_engine_detail`] for notifications —
+    /// a crash is never status-bar-only.
     fn poll_engine(&mut self) -> Option<String> {
         self.engine.poll()
+    }
+
+    /// Ticket 30: poll for crashes with the joined per-shard detail (always
+    /// `shard: cause` per shard, via `EngineController::crash_detail`).
+    /// Single-shard crashes keep their shard prefix here (unlike `poll()`'s
+    /// bare cause) so the notification can name the shard.
+    fn poll_engine_detail(&mut self) -> Option<String> {
+        let crashes = self.engine.poll_shards();
+        if crashes.is_empty() {
+            return None;
+        }
+        // Matches `poll()`'s active-empty silence: with nothing served there
+        // is no serving truth to report (the one-shot poll is consumed).
+        if self.engine.running_count() == 0 {
+            return None;
+        }
+        Some(EngineController::crash_detail(&crashes))
+    }
+
+    /// Ticket 30: notify one crash as an error naming shard/cause with the
+    /// View-logs path. No-op when there is no crash. Returns the detail when
+    /// notified (tests pin delivery by count + the pure copy).
+    fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut App) -> Option<String> {
+        let detail = self.poll_engine_detail()?;
+        window.push_notification(Notification::error(crash_notification_text(&detail)), cx);
+        Some(detail)
     }
 
     /// Ticket 05: warn once per non-loopback bind going live (LAN exposure
@@ -1615,9 +2091,18 @@ impl AppView {
     /// Ticket 09: non-loopback binds stop at an explicit confirm dialog
     /// first (LAN-exposure gate) — nothing starts until the user confirms.
     fn start_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Ticket 30: no selection + Start (F5 included) explains itself —
+        // never a dead click.
         let Some(config) = self.selected_config(cx) else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         };
+        // Ticket 30: a second Start while one is in flight is ignored (no
+        // second apply).
+        if self.start_in_flight {
+            window.push_notification(Notification::info(start_busy_message()), cx);
+            return;
+        }
         if requires_lan_confirm(&config.bind_ip) {
             self.open_lan_confirm_single(config, window, cx);
             return;
@@ -1656,10 +2141,20 @@ impl AppView {
     /// fresh so a confirmed dialog never starts a stale row.
     /// Ticket 23: post-gate starts use the confirmed variant (the controller
     /// enforces LAN confirms itself); check output is redacted for display.
+    /// Ticket 30: re-entrant starts are ignored (busy guard); starting an
+    /// already-running row reports `already running (restarted)`, never a
+    /// bare `Started`.
     fn commit_start_selected(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.start_in_flight {
+            window.push_notification(Notification::info(start_busy_message()), cx);
+            return;
+        }
+        self.start_in_flight = true;
         let Ok(Some(config)) = self.store.get(id) else {
+            self.start_in_flight = false;
             return;
         };
+        let was_running = self.engine.is_running(id);
         if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
             window.push_notification(Notification::warning(warning), cx);
         }
@@ -1671,10 +2166,12 @@ impl AppView {
                 match self.store.set_enabled(id, true) {
                     Ok(_) => {
                         self.reload(window, cx);
-                        window.push_notification(
-                            Notification::success(format!("Started \"{}\"", config.name)),
-                            cx,
-                        );
+                        let message = if was_running {
+                            already_running_message(&config.name)
+                        } else {
+                            format!("Started \"{}\"", config.name)
+                        };
+                        window.push_notification(Notification::success(message), cx);
                     }
                     Err(error) => {
                         self.reload(window, cx);
@@ -1693,6 +2190,7 @@ impl AppView {
                     .push_notification(Notification::error(redact_secrets(&error.to_string())), cx);
             }
         }
+        self.start_in_flight = false;
     }
 
     /// Ticket 05: stop the selected config; its endpoint closes, the rest
@@ -1744,6 +2242,11 @@ impl AppView {
     /// LAN gate re-evaluates on the fresh rows — a row added or removed
     /// between open and confirm can neither sneak past nor dodge the gate.
     fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Ticket 30: a second Start-all while one is in flight is ignored.
+        if self.start_in_flight {
+            window.push_notification(Notification::info(start_busy_message()), cx);
+            return;
+        }
         // Ticket 26: a broken database errors here (never "the library is
         // empty" over rows we simply failed to read).
         let Some(rows) = self.list_or_notify(window, cx) else {
@@ -1779,14 +2282,25 @@ impl AppView {
     /// Ticket 17: an empty library warns honestly (never "Started 0").
     /// Ticket 23: post-gate starts use the confirmed variant; check output
     /// is redacted for display.
+    /// Ticket 30: best-effort — one broken row never blocks the rest. The
+    /// fast path starts the whole set at once; on failure each row starts
+    /// alone so valid rows keep serving while the toast names the failed
+    /// rows plus both counts. Re-entrant calls are ignored (busy guard).
     fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.start_in_flight {
+            window.push_notification(Notification::info(start_busy_message()), cx);
+            return;
+        }
+        self.start_in_flight = true;
         // Ticket 26: same honesty as the pre-gate read — a corrupt database
         // names its error instead of claiming an empty library.
         let Some(rows) = self.list_or_notify(window, cx) else {
+            self.start_in_flight = false;
             return;
         };
         if rows.is_empty() {
             window.push_notification(Notification::warning(start_all_message(0)), cx);
+            self.start_in_flight = false;
             return;
         }
         match self.engine.start_all_confirmed(&rows) {
@@ -1805,6 +2319,7 @@ impl AppView {
                 }
                 self.reload(window, cx);
                 self.warn_for_lan_binds(window, cx);
+                self.start_in_flight = false;
                 if flag_errors == 0 {
                     window.push_notification(
                         Notification::success(start_all_message(rows.len())),
@@ -1820,9 +2335,73 @@ impl AppView {
                     );
                 }
             }
-            Err(error) => {
-                window
-                    .push_notification(Notification::error(redact_secrets(&error.to_string())), cx);
+            Err(fast_error) => {
+                // Ticket 30: union-level failures (port conflicts, missing
+                // binaries, check/spawn, bridge, LAN gate) stay atomic —
+                // nothing starts, exactly like before. Only row-local schema
+                // failures isolate per-row so one broken row never blocks the
+                // rest (best-effort fallback below).
+                if !is_row_local_start_error(&fast_error) {
+                    self.reload(window, cx);
+                    self.start_in_flight = false;
+                    window.push_notification(
+                        Notification::error(redact_secrets(&fast_error.to_string())),
+                        cx,
+                    );
+                    return;
+                }
+                // Best-effort fallback: isolate the broken rows per-row.
+                // Start from a clean slate so a half-validated fast path
+                // leaves no residue, then serve each row alone.
+                self.engine.stop_all();
+                let mut started: Vec<ProxyConfig> = Vec::new();
+                let mut failed_names: Vec<String> = Vec::new();
+                for row in &rows {
+                    match self.engine.start_one_confirmed(row) {
+                        Ok(()) => started.push(row.clone()),
+                        Err(_) => {
+                            failed_names.push(format!("\"{}\"", row.name));
+                        }
+                    }
+                }
+                if started.is_empty() {
+                    self.reload(window, cx);
+                    self.start_in_flight = false;
+                    window.push_notification(
+                        Notification::error(redact_secrets(&fast_error.to_string())),
+                        cx,
+                    );
+                    return;
+                }
+                // Flag only the rows that actually serve (never claim a
+                // failed row started).
+                let mut flag_errors = 0;
+                let mut first_error = String::new();
+                for row in &started {
+                    if let Err(error) = self.store.set_enabled(&row.id, true) {
+                        if flag_errors == 0 {
+                            first_error = error.to_string();
+                        }
+                        flag_errors += 1;
+                    }
+                }
+                self.reload(window, cx);
+                self.warn_for_lan_binds(window, cx);
+                self.start_in_flight = false;
+                if flag_errors > 0 {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Started {} endpoint(s) but {flag_errors} flag(s) failed to save: {first_error}",
+                            started.len()
+                        )),
+                        cx,
+                    );
+                    return;
+                }
+                window.push_notification(
+                    Notification::warning(start_all_partial_message(started.len(), &failed_names)),
+                    cx,
+                );
             }
         }
     }
@@ -1870,6 +2449,75 @@ impl AppView {
         } else {
             window.push_notification(Notification::success(message), cx);
         }
+    }
+
+    /// Ticket 33: names of the currently running endpoints (for the
+    /// close-confirm). A broken database yields no names — the close then
+    /// proceeds, since there is nothing nameable to protect.
+    fn running_names_for_close(&self) -> Vec<String> {
+        let running = self.engine.running_ids();
+        if running.is_empty() {
+            return Vec::new();
+        }
+        match self.store.list() {
+            Ok(rows) => rows
+                .iter()
+                .filter(|row| running.contains(&row.id))
+                .map(|row| row.name.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Ticket 33: close-confirm verdict for the `on_window_should_close`
+    /// hook. Returns the confirm text when the close must be vetoed (the
+    /// caller opens the dialog and returns false); `None` lets the close
+    /// proceed (nothing running, or already confirmed).
+    fn close_veto_text(&self) -> Option<String> {
+        if self.close_confirmed {
+            return None;
+        }
+        close_confirm_description(&self.running_names_for_close())
+    }
+
+    /// Ticket 33: the confirmed close path (runs from the confirm dialog's
+    /// OK): stops every endpoint, best-effort clears the enabled flags so a
+    /// relaunch does not show running rows that died with the window, and
+    /// marks the close confirmed so the hook lets the second close through.
+    fn confirm_close_stop(&mut self) {
+        self.engine.stop_all();
+        if let Ok(rows) = self.store.list() {
+            for row in &rows {
+                let _ = self.store.set_enabled(&row.id, false);
+            }
+        }
+        self.close_confirmed = true;
+    }
+
+    /// Ticket 33: About dialog — version + git hash + sidecar presence +
+    /// data paths + shortcuts list. Informational only; OK just closes.
+    fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sidecars = [
+            (engine_binary_file_name(), resolve_engine_binary().is_ok()),
+            (fork_binary_file_name(), resolve_fork_binary().is_ok()),
+            (xray_binary_file_name(), resolve_xray_binary().is_ok()),
+        ]
+        .into_iter()
+        .map(|(file, found)| sidecar_presence_line(&file, found))
+        .collect::<Vec<_>>();
+        let body = about_body(
+            APP_VERSION,
+            GIT_HASH,
+            &sidecars,
+            &Store::default_path().display().to_string(),
+            &Store::default_export_path().display().to_string(),
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .title(format!("About {APP_TITLE}"))
+                .description(body.clone())
+                .on_ok(|_, _, _| true)
+        });
     }
 
     /// Ticket 06: per-row summaries for the virtualized list.
@@ -2363,20 +3011,34 @@ impl AppView {
         let form = ConfigForm::blank(window, cx);
         let view = cx.entity();
         let reader = form.clone();
+        // Ticket 31: the shared first-error slot — the commit records it and
+        // the builder renders it inline under the fields on the next frame.
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let error_for_commit = form_error.clone();
+        // Ticket 31: rows snapshot for the live bind/port collision warning
+        // (a broken database warns nothing — the commit still reports it).
+        let rows = self.store.list().unwrap_or_default();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
         let commit: DialogCommit = Rc::new(move |window, cx| {
             view.update(cx, |view, cx| {
-                view.commit_add(reader.as_new(cx), window, cx)
+                view.commit_add_with_focus(&reader, &error_for_commit, window, cx)
             })
         });
         let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
+            // Ticket 31: live warning inputs — the builder re-runs every
+            // render, so the collision line tracks typing.
+            let live = form.clone();
+            let bind = live.bind.read(cx).value().to_string();
+            let port = live.port.read(cx).value().to_string();
+            let collision = bind_port_collision_warning(&rows, None, &bind, &port);
+            let inline = form_error.borrow().clone();
             dialog
                 .title("Add proxy configuration")
-                .child(form.clone().element(cx))
+                .child(form.clone().element(cx, collision, inline))
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -2401,6 +3063,13 @@ impl AppView {
         let reader = form.clone();
         let id = config.id.clone();
         let title = format!("Edit {}", config.name);
+        // Ticket 31: the shared first-error slot (see `open_add_dialog`).
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let error_for_commit = form_error.clone();
+        // Ticket 31: rows snapshot for the live collision warning; the edited
+        // row itself is excluded.
+        let rows = self.store.list().unwrap_or_default();
+        let exclude = id.clone();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
         // Ticket 26: the patch is relative to this dialog-open snapshot —
@@ -2409,15 +3078,22 @@ impl AppView {
         let snapshot = config.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let patch = reader.as_patch_vs(cx, &snapshot);
-            view.update(cx, |view, cx| view.commit_edit(&id, patch, window, cx))
+            view.update(cx, |view, cx| {
+                view.commit_edit_with_focus(&id, patch, &reader, &error_for_commit, window, cx)
+            })
         });
         let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
+            let live = form.clone();
+            let bind = live.bind.read(cx).value().to_string();
+            let port = live.port.read(cx).value().to_string();
+            let collision = bind_port_collision_warning(&rows, Some(&exclude), &bind, &port);
+            let inline = form_error.borrow().clone();
             dialog
                 .title(title.clone())
-                .child(form.clone().element(cx))
+                .child(form.clone().element(cx, collision, inline))
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -2861,6 +3537,8 @@ impl AppView {
     /// dialog open with an error notification.
     /// Ticket 17: the add-form auto-refresh checkbox lands here (no more
     /// create-then-toggle).
+    /// Ticket 31: an already-subscribed URL takes the friendly path — a
+    /// warning naming the existing label, no double row, dialog stays open.
     fn commit_subscription_add(
         &mut self,
         label: String,
@@ -2870,6 +3548,15 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A broken-database lookup must not block the add: fall through and
+        // let the insert report the real error.
+        if let Ok(Some(existing)) = self.store.find_subscription_by_url(&url) {
+            window.push_notification(
+                Notification::warning(already_subscribed_message(&existing.label)),
+                cx,
+            );
+            return false;
+        }
         match self
             .store
             .add_subscription(&label, &url, &group, auto_refresh)
@@ -2884,6 +3571,43 @@ impl AppView {
                     cx,
                 );
                 self.start_subscription_refresh(sub, cx);
+                true
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                false
+            }
+        }
+    }
+
+    /// Ticket 31: edit a subscription's label/url/group in place. Persists
+    /// via [`Store::update_subscription`], refreshes the list, and closes on
+    /// success (the manager dialog reopens with the new values through
+    /// [`AppView::reopen_subscriptions_if_open`]). A row removed mid-edit
+    /// warns and closes; validation failures keep the dialog open with the
+    /// error (retryable).
+    fn commit_subscription_edit(
+        &mut self,
+        id: &str,
+        label: String,
+        url: String,
+        group: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.update_subscription(id, &label, &url, &group) {
+            Ok(updated) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!("Updated \"{}\"", updated.label)),
+                    cx,
+                );
+                self.reopen_subscriptions_if_open(window, cx);
+                true
+            }
+            Err(StoreError::NotFound(_)) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+                self.reopen_subscriptions_if_open(window, cx);
                 true
             }
             Err(error) => {
@@ -3447,7 +4171,7 @@ impl AppView {
         // backdrop/X) clears the stashed form through `.on_close`, so a
         // later foreign dialog can never be mistaken for this one.
         let close_view = view.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let view_for_rows = view.clone();
@@ -3463,7 +4187,7 @@ impl AppView {
                     counts.get(&sub.id).copied().unwrap_or(0),
                 ));
             }
-            body = body.child(form.clone().element());
+            body = body.child(form.clone().element(cx));
             dialog
                 .title("Subscriptions")
                 .child(body)
@@ -3509,6 +4233,99 @@ impl AppView {
             }
         }
         self.reopen_subscriptions_if_open(window, cx);
+    }
+
+    /// Ticket 31: edit a subscription's label/url/group. The fields open
+    /// prefilled (no auto-refresh toggle here — the commit writes only
+    /// label/url/group, so no control may imply otherwise). The plaintext
+    /// warning tracks the live URL input. Commits through
+    /// [`AppView::commit_subscription_edit`], which reopens the manager on
+    /// success. Cancel closes this dialog (stacked above the manager, which
+    /// stays intact underneath).
+    fn open_subscription_edit_dialog(
+        &mut self,
+        sub: ProxySubscription,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Label")
+                .default_value(sub.label.clone())
+        });
+        let url_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://…")
+                .default_value(sub.url.clone())
+        });
+        let group_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Group")
+                .default_value(sub.group.clone())
+        });
+        let view = cx.entity();
+        let id = sub.id.clone();
+        let title = format!("Edit {}", sub.label);
+        let read_label = label_state.clone();
+        let read_url = url_state.clone();
+        let read_group = group_state.clone();
+        // Ticket 18: Rc-shared with the footer OK button (mouse commits
+        // identically to the Confirm key path, including stay-open-on-error).
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let label = read_label.read(cx).value().to_string();
+            let url = read_url.read(cx).value().to_string();
+            let group = read_group.read(cx).value().to_string();
+            view.update(cx, |view, cx| {
+                view.commit_subscription_edit(&id, label, url, group, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let mut col = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(dialog_field(
+                    "field-sub-edit-label",
+                    "Label",
+                    label_state.clone(),
+                ))
+                .child(dialog_field(
+                    "field-sub-edit-url",
+                    "Subscription URL",
+                    url_state.clone(),
+                ))
+                .child(dialog_field(
+                    "field-sub-edit-group",
+                    "Group",
+                    group_state.clone(),
+                ));
+            // Ticket 31: live plaintext warning for the URL being typed.
+            let url_now = url_state.read(cx).value().to_string();
+            if let Some(warning) = http_subscription_warning(&url_now) {
+                col = col.child(
+                    div()
+                        .id("sub-edit-http-warning")
+                        .test_support()
+                        .child(warning),
+                );
+            }
+            dialog
+                .title(title.clone())
+                .child(col)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "subscription-edit-dialog-ok",
+                    "subscription-edit-dialog-cancel",
+                    commit_click,
+                ))
+        });
     }
 
     /// Ticket 04: confirm removing a subscription. Members stay in the
@@ -3578,6 +4395,9 @@ impl AppView {
     /// One engine-crash poll without user clicks: surfaces the named cause
     /// via the status bar on the next render. Bounded (one `poll`, no I/O
     /// beyond reaping an exited sidecar) and stoppable.
+    /// Ticket 30: windowless ticks stay status-only by necessity (no window
+    /// exists to notify through — ticket-14 precedent); windowed callers use
+    /// [`AppView::tick_engine_poll_notify`] for the error notification.
     fn tick_engine_poll(&mut self, cx: &mut Context<Self>) -> Option<String> {
         if !self.ticks_enabled {
             return None;
@@ -3585,6 +4405,29 @@ impl AppView {
         let cause = self.poll_engine();
         self.reload_quiet(cx);
         cause
+    }
+
+    /// Ticket 30: windowed engine-crash tick — polls the joined per-shard
+    /// detail, reloads, and pushes the error notification naming shard/cause
+    /// with the View-logs path. Returns the detail when a crash was reported.
+    /// Test-only seam: the live tick (`tick_engine_poll`) is windowless by
+    /// necessity, so production notifies via `reload` → `notify_engine_crash`.
+    #[cfg(test)]
+    fn tick_engine_poll_notify(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if !self.ticks_enabled {
+            return None;
+        }
+        let detail = self.poll_engine_detail();
+        self.reload_quiet(cx);
+        if let Some(detail) = detail {
+            window.push_notification(Notification::error(crash_notification_text(&detail)), cx);
+            return Some(detail);
+        }
+        None
     }
 
     /// One due-subscription pass without user clicks: starts a refresh only
@@ -3660,14 +4503,39 @@ impl AppView {
                 .child("Select a configuration")
                 .into_any_element();
         };
-        let toggle_label = if config.enabled { "Disable" } else { "Enable" };
         let switch_id = format!("enabled-{}", config.id);
         let switch_view = cx.entity();
         let switch_id_for_handler = config.id.clone();
         // Ticket 19: complete detail pane — endpoint URLs (bind + port only,
         // never params or secrets) plus the upstream host:port when known.
+        // Ticket 30: the header carries the same serving badge as the list
+        // row (`● Running :port · health` / `○ Stopped`); the enabled flag
+        // stays secondary (Switch only — the duplicate Enable button is
+        // gone). The Start button reads `Starting…` while a start is in
+        // flight (second clicks are ignored, never double-applied).
         let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
         let upstream = upstream_host_port(&config).unwrap_or_else(|| "no upstream".to_string());
+        let is_running = self.engine.is_running(&config.id);
+        let badge = if is_running {
+            let summary = self.health_store.row_summary(&config.id);
+            let summary = summary.trim();
+            serving_badge(
+                true,
+                config.port,
+                if summary.is_empty() {
+                    None
+                } else {
+                    Some(summary)
+                },
+            )
+        } else {
+            serving_badge(false, config.port, None)
+        };
+        let start_label = if self.start_in_flight {
+            "Starting…"
+        } else {
+            "Start"
+        };
         div()
             .id("config-detail")
             .test_support()
@@ -3685,7 +4553,8 @@ impl AppView {
                     .child(format!(
                         "{} · {} · {}:{}",
                         config.protocol, config.group, config.bind_ip, config.port
-                    )),
+                    ))
+                    .child(div().id("detail-serving").test_support().child(badge)),
             )
             .child(
                 div()
@@ -3721,16 +4590,11 @@ impl AppView {
                                     // switch writes the stored flag only (see
                                     // [`AppView::commit_enabled_flag`]);
                                     // starting/stopping stays on Start/Stop.
+                                    // Ticket 30: the Switch is the only
+                                    // enabled control (no duplicate button).
                                     view.commit_enabled_flag(&id, enabled, window, cx);
                                 });
                             }),
-                    )
-                    .child(
-                        Button::new("toggle-enabled")
-                            .label(toggle_label)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.toggle_selected_enabled(window, cx);
-                            })),
                     )
                     .child(
                         Button::new("edit-config")
@@ -3759,21 +4623,21 @@ impl AppView {
                     )
                     .child(
                         Button::new("engine-start")
-                            .label("Start")
+                            .label(start_label)
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.start_selected_engine(window, cx);
                             })),
                     )
                     .child(
                         Button::new("engine-stop")
-                            .label("Stop")
+                            .label("Stop (Shift-F5)")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_selected_engine(window, cx);
                             })),
                     )
                     .child(
                         Button::new("health-test")
-                            .label("Test")
+                            .label("Test (Ctrl-T)")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_selected_health(window, cx);
                             })),
@@ -3813,6 +4677,51 @@ impl AppView {
                 .child(div().id("engine-status").test_support().child(engine_text))
                 .child(div().id("health-status").test_support().child(health_text)),
         )
+    }
+
+    /// Ticket 30: `N of M` search count above the list (visible while a
+    /// query is active). Includes a Clear-search button that resets the
+    /// filter in place. Empty when no query is active.
+    /// Ticket 31 deviation (mechanical repair — the helper lives on the
+    /// delegate, not on `ListState`): route through `.delegate()`.
+    fn render_search_count(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (visible, total, query) = self
+            .libraries
+            .read(cx)
+            .delegate()
+            .delegate_counts_for_search();
+        if query.trim().is_empty() {
+            return div().id("search-count").test_support().into_any_element();
+        }
+        let clear_view = cx.entity();
+        div()
+            .id("search-count")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(search_count_text(visible, total))
+            .child(Button::new("clear-search").label("Clear search").on_click(
+                move |_, window, cx| {
+                    clear_view.update(cx, |view, cx| {
+                        view.clear_library_search(window, cx);
+                    });
+                },
+            ))
+            .into_any_element()
+    }
+
+    /// Ticket 30: clear the library search filter in place (selection
+    /// re-derives by id via `apply_filter`).
+    fn clear_library_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.libraries.update(cx, |state, list_cx| {
+            let delegate = state.delegate_mut();
+            delegate.query = String::new();
+            delegate.apply_filter();
+            list_cx.notify();
+        });
+        cx.notify();
     }
 }
 
@@ -3872,14 +4781,20 @@ impl Render for AppView {
                     .flex_row()
                     .gap_2()
                     .p_2()
-                    .child(Button::new("add-config").label("Add").on_click(cx.listener(
-                        |view, _, window, cx| {
-                            view.open_add_dialog(window, cx);
-                        },
-                    )))
+                    // Ticket 33: shortcut hints ride in the labels (F5/Shift-F5/
+                    // Ctrl-T/Ctrl-N/Ctrl-O) so the bindings in [`bind_app_keys`]
+                    // are visible without opening About. Button ids are
+                    // unchanged.
+                    .child(
+                        Button::new("add-config")
+                            .label("Add (Ctrl-N)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_add_dialog(window, cx);
+                            })),
+                    )
                     .child(
                         Button::new("import-config")
-                            .label("Import")
+                            .label("Import (Ctrl-O)")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
                             })),
@@ -3905,23 +4820,32 @@ impl Render for AppView {
                                 view.open_subscriptions_dialog(window, cx);
                             })),
                     )
-                    .child(Button::new("engine-start-all").label("Start all").on_click(
-                        cx.listener(|view, _, window, cx| {
-                            view.start_all_engines(window, cx);
-                        }),
-                    ))
+                    .child(
+                        Button::new("engine-start-all")
+                            .label("Start all (F5)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.start_all_engines(window, cx);
+                            })),
+                    )
                     .child(
                         Button::new("engine-stop-all")
-                            .label("Stop all")
+                            .label("Stop all (Shift-F5)")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_all_engines(window, cx);
                             })),
                     )
                     .child(
                         Button::new("health-test-all")
-                            .label("Test health")
+                            .label("Test health (Ctrl-T)")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_all_health(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("about-dialog")
+                            .label("About")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_about_dialog(window, cx);
                             })),
                     ),
             )
@@ -3937,9 +4861,14 @@ impl Render for AppView {
             )
             .child(
                 div().flex().flex_col().flex_1().child(
-                    div().id("config-list").test_support().flex_1().child(
-                        List::new(&self.libraries).search_placeholder("Search configurations"),
-                    ),
+                    div()
+                        .id("config-list")
+                        .test_support()
+                        .flex_1()
+                        .child(self.render_search_count(cx))
+                        .child(
+                            List::new(&self.libraries).search_placeholder("Search configurations"),
+                        ),
                 ),
             )
             .child(self.render_detail(cx))
@@ -3961,6 +4890,40 @@ fn main() {
                 view.update(cx, |view, cx| {
                     view.refresh_due_on_startup(cx);
                     view.start_background_ticks(cx);
+                });
+                // Ticket 33: never silently kill running endpoints on window
+                // close. The hook vetoes the close while endpoints run and
+                // opens a confirm naming them; OK stops everything and closes
+                // via `remove_window` (the confirmed flag lets that second
+                // close through). No tray/minimize in v1 (kit-only, no new
+                // deps) — see PACKAGING-NOTES.md.
+                let weak = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    let Some(view) = weak.upgrade() else {
+                        return true;
+                    };
+                    match view.read_with(cx, |view, _| view.close_veto_text()) {
+                        None => true,
+                        Some(description) => {
+                            let confirm_view = view.clone();
+                            window.open_alert_dialog(cx, move |alert, _, _| {
+                                let confirm_view = confirm_view.clone();
+                                let description = description.clone();
+                                alert
+                                    .confirm()
+                                    .title("Close ManyProxy?")
+                                    .description(description)
+                                    .on_ok(move |_, window, cx| {
+                                        confirm_view.update(cx, |view, _| {
+                                            view.confirm_close_stop();
+                                        });
+                                        window.remove_window();
+                                        true
+                                    })
+                            });
+                            false
+                        }
+                    }
                 });
                 cx.new(|cx| Root::new(view, window, cx))
             })
@@ -4016,6 +4979,75 @@ mod tests {
         assert_eq!(&bytes[0..4], &[0, 0, 1, 0], "ICO magic");
         let count = u16::from_le_bytes([bytes[4], bytes[5]]);
         assert!(count >= 1, "at least one icon image");
+    }
+
+    /// Ticket 33: close-confirm names every running row (never a blind
+    /// kill); nothing running means no veto text.
+    #[test]
+    fn close_confirm_names_running_rows() {
+        assert_eq!(crate::close_confirm_description(&[]), None);
+        let text = crate::close_confirm_description(&["alpha".to_string(), "beta".to_string()])
+            .expect("veto text while running");
+        assert!(text.contains("\"alpha\""), "names rows, got {text}");
+        assert!(text.contains("\"beta\""), "names rows, got {text}");
+        assert!(text.contains('2'), "counts rows, got {text}");
+    }
+
+    /// Ticket 33: About carries version + git hash + sidecar presence +
+    /// data paths + the shortcut list (and the no-autostart contract).
+    #[test]
+    fn about_body_carries_version_sidecars_paths_shortcuts() {
+        let body = crate::about_body(
+            "0.1.0",
+            "abc123",
+            &["sing-box.exe: found (app dir)".to_string()],
+            "C:\\data\\library.db",
+            "C:\\data\\manyproxy-export.json",
+        );
+        for needle in [
+            "0.1.0",
+            "abc123",
+            "sing-box.exe",
+            "library.db",
+            "manyproxy-export.json",
+            "F5",
+            "Shift-F5",
+            "Ctrl-T",
+            "Ctrl-N",
+            "Ctrl-O",
+            "No autostart",
+        ] {
+            assert!(body.contains(needle), "about names {needle}");
+        }
+        assert_eq!(
+            crate::sidecar_presence_line("x.exe", false),
+            "x.exe: missing (place it next to the app exe)"
+        );
+    }
+
+    /// Ticket 33: the close veto passes with nothing running, and the
+    /// confirmed path marks the close confirmed (headless: in-memory store,
+    /// no sidecars — `stop_all` on an idle engine is a no-op).
+    #[gpui_kit::test]
+    fn close_veto_passes_when_nothing_running(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        assert_eq!(view.read_with(cx, |view, _| view.close_veto_text()), None);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.confirm_close_stop());
+        });
+        assert!(view.read_with(cx, |view, _| view.close_confirmed));
+        assert_eq!(view.read_with(cx, |view, _| view.close_veto_text()), None);
     }
 
     /// Ticket 01, scenario 1: cold start shows an empty library.
@@ -6550,6 +7582,9 @@ mod tests {
     /// Row content (pure seam): name, protocol, upstream host:port, bind
     /// endpoint, enabled state, and the health summary are all present; the
     /// health line appears only when a summary exists.
+    /// Ticket 31 deviation (mechanical repair — ticket 30 changed the
+    /// signature mid-flight without updating this caller): passes the serving
+    /// flag through; the badge line is always present, so the count is 4.
     #[test]
     fn library_row_lines_show_complete_content() {
         use crate::library_row_lines;
@@ -6571,6 +7606,7 @@ mod tests {
         let full = library_row_lines(
             &row(true, "{\"server\":\"a.example.com\",\"server_port\":443}"),
             Some("87ms"),
+            true,
         )
         .join("\n");
         for want in [
@@ -6584,7 +7620,7 @@ mod tests {
         ] {
             assert!(full.contains(want), "{want} visible in:\n{full}");
         }
-        let plain = library_row_lines(&row(false, "{}"), None).join("\n");
+        let plain = library_row_lines(&row(false, "{}"), None, false).join("\n");
         assert!(
             plain.contains("disabled"),
             "enabled state visible:\n{plain}"
@@ -6594,9 +7630,9 @@ mod tests {
             "metadata-only rows say so honestly:\n{plain}"
         );
         assert_eq!(
-            library_row_lines(&row(false, "{}"), None).len(),
-            3,
-            "no health child without a summary"
+            library_row_lines(&row(false, "{}"), None, false).len(),
+            4,
+            "badge line always present (stopped here)"
         );
     }
 
@@ -7384,5 +8420,739 @@ mod tests {
             !view.read_with(cx, |view, _| view.probe_in_flight),
             "flag clears on completion"
         );
+    }
+
+    // -- Ticket 30: list + engine feedback -----------------------------------
+
+    /// Scenario: serving badge copy — running rows show
+    /// `● Running :port · health`, stopped rows show `○ Stopped`; the
+    /// enabled flag never leaks into the badge (synthetic ports only).
+    #[test]
+    fn serving_badge_copy() {
+        use crate::serving_badge;
+        assert_eq!(
+            serving_badge(true, 10801, Some("87ms")),
+            "● Running :10801 · 87ms"
+        );
+        assert_eq!(serving_badge(true, 10801, None), "● Running :10801");
+        assert_eq!(serving_badge(true, 10801, Some("  ")), "● Running :10801");
+        assert_eq!(serving_badge(false, 10801, Some("87ms")), "○ Stopped");
+        assert_eq!(serving_badge(false, 10801, None), "○ Stopped");
+        for canary in ["hunter2", "SECRET-UUID", "token=abc"] {
+            assert!(!serving_badge(true, 10801, Some("87ms")).contains(canary));
+        }
+    }
+
+    /// Scenario: running vs stopped rows render the badge in the row lines;
+    /// the enabled flag stays secondary in its own line.
+    #[test]
+    fn row_lines_badge_follows_serving_not_flag() {
+        use crate::store::ProxyConfig;
+        use crate::{library_row_lines, serving_badge};
+        fn row() -> ProxyConfig {
+            ProxyConfig {
+                id: "7".to_string(),
+                name: "Work".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"server\":\"a.example.com\",\"server_port\":443}".to_string(),
+                group: "travel".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+            }
+        }
+        let running = library_row_lines(&row(), Some("87ms"), true).join("\n");
+        assert!(
+            running.contains(&serving_badge(true, 10801, Some("87ms"))),
+            "running badge in row:\n{running}"
+        );
+        assert!(
+            running.contains("disabled"),
+            "flag stays secondary:\n{running}"
+        );
+        let stopped = library_row_lines(&row(), Some("87ms"), false).join("\n");
+        assert!(
+            stopped.contains("○ Stopped"),
+            "stopped badge in row:\n{stopped}"
+        );
+        assert!(
+            !stopped.contains("87ms"),
+            "stopped rows show no latency:\n{stopped}"
+        );
+    }
+
+    /// Scenario: honest start-on-running / no-selection / busy / partial /
+    /// crash / search-count copies (pure).
+    #[test]
+    fn honest_engine_feedback_copies() {
+        use crate::engine::EngineController;
+        use crate::{
+            already_running_message, crash_notification_text, empty_library_text, no_matches_text,
+            no_selection_message, search_count_text, start_all_partial_message, start_busy_message,
+        };
+        let restarted = already_running_message("Work");
+        assert!(restarted.contains("Work"), "{restarted}");
+        assert!(restarted.contains("already running"), "{restarted}");
+        assert!(restarted.contains("restarted"), "{restarted}");
+        assert!(
+            !restarted.starts_with("Started \""),
+            "never bare Started: {restarted}"
+        );
+        assert_eq!(no_selection_message(), "Select a configuration first");
+        assert!(
+            start_busy_message().contains("Starting"),
+            "{}",
+            start_busy_message()
+        );
+        let partial = start_all_partial_message(4, &["\"Broken\"".to_string()]);
+        assert!(partial.contains('4'), "{partial}");
+        assert!(partial.contains('1'), "{partial}");
+        assert!(partial.contains("Broken"), "{partial}");
+        // Row-local schema failures isolate; union failures stay atomic.
+        assert!(crate::is_row_local_start_error(
+            &crate::engine::EngineError::BadParams {
+                name: "Broken".to_string(),
+                field: "server",
+            }
+        ));
+        assert!(!crate::is_row_local_start_error(
+            &crate::engine::EngineError::PortConflict {
+                bind: "127.0.0.1".to_string(),
+                port: 10901,
+                first: "Alpha".to_string(),
+                second: "Beta".to_string(),
+            }
+        ));
+        assert_eq!(search_count_text(0, 5), "0 of 5");
+        assert_eq!(search_count_text(4, 5), "4 of 5");
+        assert!(
+            no_matches_text().contains("No matches"),
+            "{}",
+            no_matches_text()
+        );
+        assert!(
+            no_matches_text().contains("Clear search"),
+            "{}",
+            no_matches_text()
+        );
+        let empty = empty_library_text();
+        assert!(empty.contains("Add"), "{empty}");
+        assert!(empty.contains("Import"), "{empty}");
+        let detail = EngineController::crash_detail(&[
+            ("stock".to_string(), "signal: killed".to_string()),
+            ("xray".to_string(), "signal: segmentation fault".to_string()),
+        ]);
+        assert!(detail.contains("stock"), "{detail}");
+        assert!(detail.contains("xray"), "{detail}");
+        assert!(detail.contains("killed"), "{detail}");
+        let single =
+            EngineController::crash_detail(&[("stock".to_string(), "signal: killed".to_string())]);
+        assert!(
+            single.contains("stock"),
+            "single crash keeps its shard: {single}"
+        );
+        let notice = crash_notification_text(&single);
+        assert!(notice.contains("stock"), "{notice}");
+        assert!(notice.contains("killed"), "{notice}");
+        assert!(notice.contains("View logs"), "{notice}");
+        for text in [restarted, partial, notice, empty] {
+            for canary in ["hunter2", "SECRET-UUID", "token=abc"] {
+                assert!(!text.contains(canary), "no secrets in {text}");
+            }
+        }
+    }
+
+    fn t30_engine_seed(name: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    /// Scenario: Start-all with 1 broken of 5 → valid rows keep serving,
+    /// one toast naming the failed row plus both counts.
+    #[gpui_kit::test]
+    fn start_all_partial_names_failed_row_and_serves_rest(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for (name, port) in [
+            ("A", "10921"),
+            ("B", "10922"),
+            ("C", "10923"),
+            ("D", "10924"),
+        ] {
+            store.add(t30_engine_seed(name, port)).expect("seed works");
+        }
+        // Broken: stored params are not valid for the engine (never echoes).
+        store
+            .add(NewConfig {
+                name: "Broken".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: "10925".to_string(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            4,
+            "valid rows keep serving"
+        );
+        assert_eq!(notification_count(cx), 1, "one partial toast");
+        // The copy itself (names + counts) is pinned at the pure seam.
+        let copy = crate::start_all_partial_message(4, &["\"Broken\"".to_string()]);
+        assert!(copy.contains('4') && copy.contains('1') && copy.contains("Broken"));
+    }
+
+    /// Scenario: double Start while busy → ignored with an info toast, no
+    /// second apply.
+    #[gpui_kit::test]
+    fn double_start_while_busy_is_ignored(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Work", "10931"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let handle = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, handle) = EngineController::fake();
+                view.engine = engine;
+                view.start_in_flight = true;
+                handle
+            })
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        let checks_before = handle.check_calls();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_selected_engine(window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "busy explains itself once");
+        assert_eq!(handle.check_calls(), checks_before, "no second apply");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts while busy"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.start_in_flight = false;
+            });
+        });
+    }
+
+    /// Scenario: Start on already-running → honest `already running
+    /// (restarted)` path, still serving exactly once.
+    #[gpui_kit::test]
+    fn start_on_running_restarts_honestly(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Work", "10932"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        let id = view.read_with(cx, |view, cx| {
+            view.selected_config(cx).expect("selected").id
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_selected(&id, window, cx));
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 1);
+        assert_eq!(notification_count(cx), 1);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_selected(&id, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "restart serves exactly once"
+        );
+        assert_eq!(notification_count(cx), 2, "restart toasts honestly");
+    }
+
+    /// Scenario: no selection + Start (F5 path) → info toast, never a dead
+    /// click.
+    #[gpui_kit::test]
+    fn start_with_no_selection_explains_itself(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // No selection by default.
+        assert!(view.read_with(cx, |view, cx| view.selected_config(cx).is_none()));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_selected_engine(window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "no-selection explains itself");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts"
+        );
+    }
+
+    /// Scenario: sidecar crash → poll tick pushes an error notification
+    /// naming shard/cause with the View-logs path (not status-bar-only).
+    #[gpui_kit::test]
+    fn crash_tick_notifies_with_shard_and_logs_path(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Work", "10933"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let stock = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, stock) = EngineController::fake();
+                view.engine = engine;
+                stock
+            })
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 1);
+        let before = notification_count(cx);
+        stock.inject_crash("signal: killed");
+        let detail = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.tick_engine_poll_notify(window, cx))
+        });
+        let detail = detail.expect("crash reported");
+        assert!(detail.contains("stock"), "names the shard: {detail}");
+        assert!(detail.contains("killed"), "names the cause: {detail}");
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "crash notifies (not status-bar-only)"
+        );
+    }
+
+    /// Scenario: search no-hits vs empty library at the delegate seam —
+    /// no-hits keeps the total (`0 of M`), empty stays `0 of 0`.
+    #[test]
+    fn search_no_hits_vs_empty_counts() {
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        fn row(id: &str, name: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+            }
+        }
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta")]);
+        delegate.query = "zzz-no-hit".to_string();
+        delegate.apply_filter();
+        assert_eq!(delegate.visible_counts(), (0, 2));
+        assert_eq!(crate::search_count_text(0, 2), "0 of 2");
+        assert!(crate::no_matches_text().contains("Clear search"));
+        let mut empty = LibraryDelegate::new();
+        empty.set_rows(Vec::new());
+        assert_eq!(empty.visible_counts(), (0, 0));
+        assert!(crate::empty_library_text().contains("Add"));
+    }
+
+    /// Scenario: no-hits paints `No matches — Clear search` + `N of M`
+    /// with a clear affordance; the detail pane carries the serving badge
+    /// and no duplicate enable button.
+    #[gpui_kit::test]
+    fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "zzz-no-hit".to_string();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        // Selection cleared by the narrowing filter (filtered-out rows never
+        // keep the selection); reselect is impossible with zero visible, so
+        // restore the query for the detail half of this scenario.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = String::new();
+                    delegate.apply_filter();
+                    delegate.selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("library-row-{}", seeded.id))
+                .is_some()),
+            "row paints once the filter clears"
+        );
+        assert_painted(cx, "detail-serving");
+        assert!(
+            cx.update(|window, _| window.try_find("toggle-enabled".to_string()).is_none()),
+            "no duplicate enable button — Switch only"
+        );
+        // No-hits half: narrow again and check the empty-state affordances.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "zzz-no-hit".to_string();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "library-empty");
+        assert!(
+            cx.update(|window, _| window.try_find("clear-search-hint".to_string()).is_some()),
+            "no-hits names the Clear search affordance"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("search-count".to_string()).is_some()),
+            "N of M row renders"
+        );
+    }
+
+    /// Scenario: empty library paints Add/Import CTAs (never a bare blank).
+    #[gpui_kit::test]
+    fn empty_library_paints_ctas(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "library-empty");
+        assert!(
+            cx.update(|window, _| window.try_find("empty-library-ctas".to_string()).is_some()),
+            "empty library offers Add/Import"
+        );
+    }
+
+    // -- Ticket 31: dialogs + import + subscriptions ---------------------
+
+    /// Ticket 31: field errors map to their owning dialog field (first error
+    /// wins); non-field errors map nowhere. Credentials never appear: the
+    /// mapping carries field names only.
+    #[test]
+    fn field_error_targets_name_the_owning_field() {
+        use crate::field_error_target;
+        use crate::store::NewConfig;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let error = store
+            .add(NewConfig {
+                name: "   ".to_string(),
+                protocol: "bogus".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("bad add fails");
+        assert_eq!(
+            field_error_target(&error).map(|(field, _)| field),
+            Some("name"),
+            "first error wins, got {error}"
+        );
+        let error = store
+            .add(NewConfig {
+                name: "Work".to_string(),
+                protocol: "bogus".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("bad protocol fails");
+        let (field, message) = field_error_target(&error).expect("protocol maps");
+        assert_eq!(field, "protocol");
+        assert!(message.contains("valid"), "message guides, got {message}");
+        let error = store
+            .add(NewConfig {
+                name: "Work".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: "99999".to_string(),
+            })
+            .expect_err("bad port fails");
+        assert_eq!(
+            field_error_target(&error).map(|(field, _)| field),
+            Some("port"),
+            "got {error}"
+        );
+        assert_eq!(
+            field_error_target(&crate::store::StoreError::NotFound("7".to_string())),
+            None,
+            "non-field errors map nowhere"
+        );
+    }
+
+    /// Ticket 31: bind/port collision warns naming the colliding row (save
+    /// still allowed); free, self, auto, and invalid pairs stay quiet.
+    #[test]
+    fn bind_port_collision_warning_names_colliding_row() {
+        use crate::bind_port_collision_warning;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(NewConfig {
+                name: "One".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: "127.0.0.1".to_string(),
+                port: "12001".to_string(),
+            })
+            .expect("seed works");
+        let rows = store.list().expect("list works");
+        let warning =
+            bind_port_collision_warning(&rows, None, "127.0.0.1", "12001").expect("collides");
+        assert!(warning.contains("One"), "names the row, got {warning}");
+        assert!(warning.contains("12001"), "names the port, got {warning}");
+        assert!(
+            warning.contains("still allowed"),
+            "non-blocking, got {warning}"
+        );
+        assert!(
+            bind_port_collision_warning(&rows, None, "127.0.0.1", "12002").is_none(),
+            "free pair stays quiet"
+        );
+        assert!(
+            bind_port_collision_warning(&rows, None, "127.0.0.1", "").is_none(),
+            "blank port means auto — never collides"
+        );
+        assert!(
+            bind_port_collision_warning(&rows, None, "127.0.0.1", "bogus").is_none(),
+            "invalid port is validation's job, not the warning's"
+        );
+        let self_id = rows[0].id.clone();
+        assert!(
+            bind_port_collision_warning(&rows, Some(&self_id), "127.0.0.1", "12001").is_none(),
+            "edit excludes its own row"
+        );
+        assert!(
+            bind_port_collision_warning(&rows, None, "", "12001").is_some(),
+            "blank bind means the loopback default"
+        );
+    }
+
+    /// Ticket 31: plaintext http subscription URLs surface the fetch warning;
+    /// https (and unparseable input) stays quiet.
+    #[test]
+    fn http_subscription_warning_only_for_plaintext() {
+        use crate::http_subscription_warning;
+        let warning = http_subscription_warning("http://example.com/sub.txt").expect("http warns");
+        assert!(
+            warning.contains("plaintext"),
+            "Warn policy surfaced, got {warning}"
+        );
+        assert!(
+            http_subscription_warning("https://example.com/sub.txt").is_none(),
+            "https stays quiet"
+        );
+        assert!(
+            http_subscription_warning("").is_none(),
+            "blank is a validation error, not a warning"
+        );
+        assert!(
+            http_subscription_warning("not-a-url").is_none(),
+            "unparseable is a validation error, not a warning"
+        );
+    }
+
+    /// Ticket 31: the friendly duplicate message names the existing label.
+    #[test]
+    fn already_subscribed_message_names_existing_label() {
+        use crate::already_subscribed_message;
+        let text = already_subscribed_message("Nightly");
+        assert!(
+            text.contains("Already subscribed"),
+            "friendly path, got {text}"
+        );
+        assert!(text.contains("Nightly"), "names the row, got {text}");
+    }
+
+    /// Ticket 31: invalid add commit stays open with the error, focuses the
+    /// owning field, and stores nothing.
+    #[gpui_kit::test]
+    fn add_commit_invalid_stays_open_and_focuses_field(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        use gpui_kit::component::input::AnyInputState;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let form_error: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("   ", window, cx);
+                });
+                let expected = AnyInputState::from(form.name.clone()).focus_handle(cx);
+                let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
+                assert_eq!(
+                    window.focused(cx),
+                    Some(expected),
+                    "focus moves to the error field"
+                );
+                closed
+            })
+        });
+        assert!(!closed, "invalid commit keeps the dialog open");
+        let (field, _) = form_error.borrow().clone().expect("inline error recorded");
+        assert_eq!(field, "name", "inline error names the field");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "nothing stored"
+        );
+    }
+
+    /// Ticket 31: duplicate subscription URL takes the friendly path — the
+    /// dialog stays open with a warning and no double row appears.
+    #[gpui_kit::test]
+    fn duplicate_subscription_url_warns_without_double_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add_subscription("Nightly", "https://example.com/a.txt", "g", true)
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_subscription_add(
+                    "Copy".to_string(),
+                    "  https://example.com/a.txt  ".to_string(),
+                    "g".to_string(),
+                    true,
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!closed, "dup keeps the dialog open");
+        assert_eq!(notification_count(cx), 1, "one friendly warning");
+        let subs = view.read_with(cx, |view, _| {
+            view.store.list_subscriptions().expect("list works")
+        });
+        assert_eq!(subs.len(), 1, "no double row");
+        assert_eq!(subs[0].label, "Nightly", "original kept");
+    }
+
+    /// Ticket 31: edit subscription persists label/url/group via
+    /// `Store::update_subscription` and refreshes the list; a ghost edit
+    /// warns and closes.
+    #[gpui_kit::test]
+    fn edit_subscription_persists_and_refreshes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/a.txt", "g1", true)
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_subscription_edit(
+                    &sub.id,
+                    "Daily".to_string(),
+                    "https://example.com/b.txt".to_string(),
+                    "g2".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(closed, "valid edit closes");
+        assert_eq!(notification_count(cx), 1, "one success notice");
+        let subs = view.read_with(cx, |view, _| {
+            view.store.list_subscriptions().expect("list works")
+        });
+        assert_eq!(subs.len(), 1, "edit refreshes in place");
+        assert_eq!(subs[0].label, "Daily");
+        assert_eq!(subs[0].url, "https://example.com/b.txt");
+        assert_eq!(subs[0].group, "g2");
+        let ghost = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_subscription_edit(
+                    "9999",
+                    "x".to_string(),
+                    "https://example.com/x.txt".to_string(),
+                    "g".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(ghost, "ghost edit closes with a warning");
+        assert_eq!(notification_count(cx), 2, "ghost warns once more");
     }
 }

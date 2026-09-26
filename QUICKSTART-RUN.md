@@ -49,6 +49,42 @@ egresses, loopback networking allowed, ports from 10801 free.
 - Live: one AmneziaWG-variant + one Xray-only VLESS + one custom-JSON config
   with real remotes, start all → each endpoint serves its own egress.
 
+## Scenario E — Export → wipe → restore
+
+- Automated: export round-trip store tests (payload re-imports 0 added /
+  N duplicates; `commit_export` writes only after confirm, cancel writes
+  nothing) plus the restore dry-run-then-wipe path
+  (`commit_library_restore`: malformed payloads never wipe a good library).
+- Live: Export the library, note the `Exported N config(s) [(M importable)]
+  to <path>` toast; delete every config; paste the export file content into
+  Import → the restore confirm (`Restore library`) replaces the library
+  verbatim (row ids, groups, enabled flags, subscriptions, deletions);
+  confirm counts match. The export file carries secrets in plaintext by
+  design (the confirm shows `export_warning_text()` verbatim) — store it
+  somewhere safe.
+
+## Scenario F — Close confirm + About + shortcuts (ticket 33)
+
+- Automated: `close_confirm_names_running_rows` (veto text names every
+  running row; `None` when idle), `close_veto_passes_when_nothing_running`,
+  `about_body_carries_version_sidecars_paths_shortcuts`,
+  `traffic_text_is_labeled_probe` (`probe:` prefix + probe count),
+  `failure_throne_route_names_routing_unsupported`.
+- Live (manual screenshot): start 2+ endpoints, close the window → `Close
+  ManyProxy?` confirm names both rows; Cancel keeps them running, OK stops
+  all and closes. Toolbar **About** shows version + git hash + sidecar
+  presence + data paths + shortcuts; toolbar labels read `Add (Ctrl-N)`,
+  `Import (Ctrl-O)`, `Start all (F5)`, `Stop all (Shift-F5)`,
+  `Test health (Ctrl-T)`.
+
+## Ports: primary + spillover
+
+Auto ports assign primary `10801–10999` first, then spillover `18081–18380`
+(`auto_port_candidates`, `AUTO_PORT_SPILL_START/END`); exhaustion past both
+ranges is an honest error, never a silent reuse
+(`ticket27_auto_ports_assign_250_with_spillover_and_honest_exhaustion`).
+Live: blank-port adds past 199 rows keep assigning (spillover), all unique.
+
 ## Secrets audit (grep-level proof)
 
 - `redact_secrets_covers_credential_forms` (health log ingest: key=value,
@@ -61,11 +97,12 @@ egresses, loopback networking allowed, ports from 10801 free.
     `copy_urls_carry_binds_not_secrets` + `proxy_url_pair_format` (clipboard),
     `lan_confirm_text_names_config_without_secrets` (new ticket-09 output),
     `session_fingerprint_roundtrip_proves_no_residue` (new fingerprint output),
-    `export_warning_names_secret_classes` (future export copy).
+    `export_warning_names_secret_classes` (export confirm copy).
 - Manual grep to re-run at release: search `src/` for `push_notification`,
   `write_to_clipboard`, `push_raw`, `format!` in error paths and confirm no
   `params`, `password`, `token`, `private_key`, `uuid`, `url` values flow in.
-  v1 ships no export UI (local SQLite only).
+  Export is a user-owned JSON file only (local SQLite + one explicit-confirmed
+  export path; cancel writes nothing).
 
 ## Prohibitions (asserted as tests where possible)
 

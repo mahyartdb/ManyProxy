@@ -8,8 +8,10 @@
   AmneziaWG/Noise/XHTTP rows only), `xray` (Xray-only VLESS bridge only),
   plus at most one user-supplied extra-core executable (single slot, app dir
   only, unprivileged).
-- **Resolution order**: app directory first, then `PATH`
-  (`resolve_engine_binary*` in `src/engine.rs`). A missing binary is a typed
+- **Resolution order**: app directory ONLY, never `PATH` (ticket 23: the
+  bundled cores must be the placed binaries, not whatever the environment
+  resolves; `resolve_*_binary_in` ignores `PATH` — the extra slot was
+  already app-dir-only). A missing binary is a typed
   error naming the rows + the expected file + every directory searched — the
   app never fetches an executable silently (asserted by
   `missing_binaries_state_never_downloads`).
@@ -22,9 +24,22 @@
   Windows for high ports, but they pass an explicit confirm gate
   (`requires_lan_confirm` + `LAN_CONFIRM_TITLE` dialog) plus a post-start
   warning. Firewall prompts for LAN binds are the OS's own and are expected.
-- **Data**: local SQLite (user-owned file). v1 ships **no export UI**; when
-  an export path lands it must surface `export_warning_text()` verbatim
+- **Data**: local SQLite (user-owned file). The Export dialog writes
+  user-owned JSON only after an explicit confirm, and only to
+  `Store::default_export_path()` (`MANYPROXY_EXPORT` override, else
+  `manyproxy-export.json` next to the library file); cancel writes nothing.
+  The confirm surfaces `export_warning_text()` verbatim
   (asserted by `export_warning_names_secret_classes`).
+- **Window close with running endpoints**: closing the window opens a
+  confirm naming every running row (`close_confirm_description`) — OK stops
+  all endpoints and closes, Cancel keeps them running. Never a silent kill.
+  There is no minimize-to-tray in v1 (no new deps for it); closing really
+  stops the sidecars, so Stop-all before close is equivalent.
+- **No autostart, no registry writes**: v1 registers nothing at startup or
+  shutdown (no Run keys, services, protocol handlers, or single-instance
+  lock) — asserted by construction: the only file writes are the library
+  DB, the export path on explicit confirm, and per-launch sidecar configs
+  in the temp dir (removed on stop/crash).
 
 ## AV / heuristic expectations
 
