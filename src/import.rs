@@ -1172,6 +1172,103 @@ fn parse_naive(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     })
 }
 
+/// Ticket 27: SSH link (`ssh://user[:password]@host[:port]?…`).
+/// Native sing-box `ssh` outbound (user + password or private key). Port
+/// omitted → 22. A `private_key`/`privatekey` query value also satisfies the
+/// secret half (never echoed in errors).
+fn parse_ssh(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    let raw = parts.userinfo.as_deref().unwrap_or("");
+    let (user, password) = match raw.find(':') {
+        Some(i) => (
+            percent_decode(&raw[..i], false),
+            percent_decode(&raw[i + 1..], false),
+        ),
+        None => (percent_decode(raw, false), String::new()),
+    };
+    if user.trim().is_empty() {
+        return Err(missing_credential("ssh link is missing user"));
+    }
+    let query_key = parts
+        .query
+        .get("private_key")
+        .or_else(|| parts.query.get("privatekey"))
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false);
+    if password.is_empty() && !query_key {
+        return Err(missing_credential(
+            "ssh link is missing password (or ?private_key=)",
+        ));
+    }
+    let port = match parts.port_text.as_deref() {
+        Some(text) => parse_port(text)?,
+        None => 22,
+    };
+    let mut params = base_params("ssh", &parts.host, port);
+    insert_str(&mut params, "user", user.clone());
+    insert_str(&mut params, "username", user);
+    if !password.is_empty() {
+        insert_str(&mut params, "password", password);
+    }
+    // Ticket 24 (HIGH extras-overwrite): `private_key` is a CORE_KEY, so
+    // extras never carry it — read it explicitly like WireGuard's publickey.
+    for key in ["private_key", "privatekey"] {
+        if let Some(value) = parts.query.get(key) {
+            if !value.trim().is_empty() {
+                insert_str(&mut params, "private_key", value.clone());
+                break;
+            }
+        }
+    }
+    insert_extras(
+        &mut params,
+        &parts.query,
+        &[
+            "user",
+            "username",
+            "password",
+            "private_key",
+            "privatekey",
+            "server",
+            "server_port",
+            "port",
+        ],
+    );
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "ssh", &parts.host, port),
+        protocol: "ssh".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
+/// Ticket 27: standalone Noise link (`noise://key@host:port?…`).
+/// Fork-sidecar `noise` rows (never stock): the key rides as `password`
+/// with a `key` alias so JSON rows and links agree. Port required.
+/// AWG-vs-Noise confusion is rejected in the engine (wrong-layer), not here.
+fn parse_noise(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    let key = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
+    if key.trim().is_empty() {
+        return Err(missing_credential("noise link is missing key"));
+    }
+    let port = require_port(parts.port_text.as_deref())?;
+    let mut params = base_params("noise", &parts.host, port);
+    insert_str(&mut params, "password", key.clone());
+    insert_str(&mut params, "key", key);
+    insert_extras(
+        &mut params,
+        &parts.query,
+        &["password", "key", "server", "server_port", "port"],
+    );
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "noise", &parts.host, port),
+        protocol: "noise".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
 /// `throne://add/<base64-outbound-json>` (case-insensitive command, single
 /// outbound, no confirm). Query/fragment bytes corrupt the payload and fail
 /// as bad base64; unknown commands are skipped+counted.
@@ -1214,7 +1311,8 @@ fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
         "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-        | "wireguard" | "amneziawg" | "socks" | "anytls" | "http" | "https" | "naive" => Ok(lower),
+        | "wireguard" | "amneziawg" | "socks" | "anytls" | "ssh" | "noise" | "http" | "https"
+        | "naive" => Ok(lower),
         "ss" => Ok("shadowsocks".to_string()),
         "socks5" => Ok("socks".to_string()),
         // Ticket 07: AWG aliases fold to the canonical stored form.
@@ -1350,6 +1448,12 @@ fn require_json_credentials(protocol: &str, obj: &Params) -> Result<(), ImportEr
     let ok = match protocol {
         "vless" | "vmess" | "xray" => present(obj, &["uuid"], true),
         "trojan" | "anytls" => present(obj, &["password"], false),
+        // Ticket 27: ssh (user + password/private_key), noise (password/key).
+        "ssh" => {
+            present(obj, &["username", "user"], true)
+                && present(obj, &["password", "private_key", "privatekey"], false)
+        }
+        "noise" => present(obj, &["password", "key"], false),
         "shadowsocks" => present(obj, &["method"], true) && present(obj, &["password"], false),
         "hysteria2" => present(obj, &["password", "auth"], true),
         "hysteria" => present(obj, &["auth"], true),
@@ -1759,6 +1863,9 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         "awg" | "amneziawg" | "amnezia-wg" => parse_awg_uri(&split_uri(&scheme, rest)?),
         "socks" | "socks5" => parse_socks_like("socks", &split_uri(&scheme, rest)?, None),
         "anytls" => parse_anytls(&split_uri(&scheme, rest)?),
+        // Ticket 27: native SSH + standalone Noise (fork sidecar) links.
+        "ssh" => parse_ssh(&split_uri(&scheme, rest)?),
+        "noise" => parse_noise(&split_uri(&scheme, rest)?),
         "http" => parse_socks_like("http", &split_uri(&scheme, rest)?, Some(80)),
         "https" => parse_socks_like("https", &split_uri(&scheme, rest)?, Some(443)),
         "naive+https" => parse_naive(&split_uri(&scheme, rest)?),
@@ -2145,6 +2252,15 @@ pub fn parse_addsub_link(line: &str) -> Result<AddSubRequest, ImportError> {
     if host.trim().is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(bad_host("subscription url must use http(s)"));
     }
+    // Ticket 27: same internal-host block as the store intake (SSRF guard;
+    // see `crate::store::subscription_fetch_policy`). Plain http stays
+    // allowed (Warn at fetch, not a parse reject).
+    if matches!(
+        crate::store::subscription_fetch_policy(url),
+        crate::store::SubscriptionFetchPolicy::Block { .. }
+    ) {
+        return Err(bad_host("subscription url must not target internal hosts"));
+    }
     Ok(AddSubRequest {
         url: url.to_string(),
         group: if group.is_empty() {
@@ -2278,9 +2394,8 @@ fn import_clash_proxies(content: &str) -> BatchResult {
         let lower = raw.trim().to_ascii_lowercase();
         match lower.as_str() {
             "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-            | "wireguard" | "amneziawg" | "socks" | "anytls" | "http" | "https" | "naive" => {
-                Ok(lower)
-            }
+            | "wireguard" | "amneziawg" | "socks" | "anytls" | "ssh" | "noise" | "http"
+            | "https" | "naive" => Ok(lower),
             "ss" => Ok("shadowsocks".to_string()),
             "socks5" => Ok("socks".to_string()),
             // Ticket 07: AWG aliases fold to the canonical stored form.
@@ -4113,5 +4228,105 @@ mod tests {
         let big = format!("vmess://{}", "A".repeat(3_000_000));
         let error = parse_link(&big).expect_err("huge payload fails");
         assert_eq!(error.kind, ImportErrorKind::BadBase64);
+    }
+
+    // -- Ticket 27: SSH + Noise links -------------------------------------
+
+    #[test]
+    fn ticket27_ssh_link_parses_user_password_default_port() {
+        let config = parse_link("ssh://alice:hunter2@example.com:2222#office").expect("ssh parses");
+        assert_eq!(config.protocol, "ssh");
+        assert_eq!(config.host, "example.com");
+        assert_eq!(config.port, 2222);
+        assert_eq!(config.name, "office");
+        let params = params_of(&config);
+        assert_eq!(params["user"], "alice");
+        assert_eq!(params["username"], "alice");
+        assert_eq!(params["password"], "hunter2");
+
+        let defaulted = parse_link("ssh://bob:secret@example.com#d").expect("port defaults");
+        assert_eq!(defaulted.port, 22, "ssh omits port like hy2 omits to 443");
+    }
+
+    #[test]
+    fn ticket27_ssh_link_rejects_missing_credentials() {
+        let error = parse_link("ssh://:pw@example.com:22#x").expect_err("user required");
+        assert_eq!(error.kind, ImportErrorKind::MissingCredential);
+        assert!(!error.message.contains("pw"), "no secrets: {error}");
+        let error = parse_link("ssh://alice@example.com:22#x")
+            .expect_err("password or private_key required");
+        assert_eq!(error.kind, ImportErrorKind::MissingCredential);
+        // ?private_key= satisfies the secret half.
+        let keyed = parse_link("ssh://alice@example.com:22?private_key=KEYMAT#x")
+            .expect("private_key satisfies secret");
+        assert_eq!(params_of(&keyed)["private_key"], "KEYMAT");
+    }
+
+    #[test]
+    fn ticket27_noise_link_parses_key_requires_port() {
+        let config = parse_link("noise://NOISE-KEY@example.com:51820#n").expect("noise parses");
+        assert_eq!(config.protocol, "noise");
+        assert_eq!(config.host, "example.com");
+        assert_eq!(config.port, 51820);
+        let params = params_of(&config);
+        assert_eq!(params["password"], "NOISE-KEY");
+        assert_eq!(params["key"], "NOISE-KEY");
+
+        let error = parse_link("noise://@example.com:51820#x").expect_err("key required");
+        assert_eq!(error.kind, ImportErrorKind::MissingCredential);
+        let error = parse_link("noise://k@example.com#x").expect_err("noise port required");
+        assert_eq!(error.kind, ImportErrorKind::BadPort);
+    }
+
+    #[test]
+    fn ticket27_ssh_noise_json_rows_validate_credentials() {
+        for (body, ok) in [
+            (
+                serde_json::json!([{"type": "ssh", "server": "a.example.com",
+                    "server_port": 22, "username": "u", "password": "p"}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"type": "ssh", "server": "a.example.com",
+                    "server_port": 22, "username": "u"}]),
+                false,
+            ),
+            (
+                serde_json::json!([{"type": "noise", "server": "a.example.com",
+                    "server_port": 51820, "key": "k"}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"type": "noise", "server": "a.example.com",
+                    "server_port": 51820}]),
+                false,
+            ),
+        ] {
+            let out = import_text(&body.to_string());
+            if ok {
+                assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+            } else {
+                assert_eq!(out.failures.len(), 1, "one credential failure");
+                assert!(
+                    out.failures[0].reason.contains("missing"),
+                    "got {}",
+                    out.failures[0].reason
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ticket27_internal_addsub_blocked_without_url_echo() {
+        use base64::Engine as _;
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode("http://127.0.0.1/sub.txt#g");
+        let error = parse_addsub_link(&format!("throne://addsub/{payload}"))
+            .expect_err("internal addsub blocked");
+        assert_eq!(error.kind, ImportErrorKind::BadHost);
+        assert!(
+            !error.message.contains("127.0.0.1"),
+            "no host echo: {error}"
+        );
     }
 }

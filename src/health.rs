@@ -118,9 +118,10 @@ pub trait HealthProber {
 
 /// Protocols measurable in this slice. Mirrors the ticket-05 standard set
 /// plus ticket-07 AmneziaWG variants plus ticket-08 Xray/custom/extra-core/
-/// chained rows (each probe still dials the row's own endpoint, so every
-/// row is measured through its own egress). Anything else (anytls, ssh,
-/// socks, naive, …) is a named skip until its owning ticket.
+/// chained rows plus ticket-27 SSH/AnyTLS/Noise natives (each probe still
+/// dials the row's own endpoint, so every row is measured through its own
+/// egress). Anything else (socks, naive, …) is a named skip until its owning
+/// ticket.
 pub fn is_probeable_protocol(protocol: &str) -> bool {
     matches!(
         protocol.trim().to_ascii_lowercase().as_str(),
@@ -138,6 +139,9 @@ pub fn is_probeable_protocol(protocol: &str) -> bool {
             | "amneziawg"
             | "awg"
             | "amnezia-wg"
+            | "anytls"
+            | "ssh"
+            | "noise"
             | "xray"
             | "xray-vless"
             | "xray_vless"
@@ -1298,19 +1302,21 @@ mod tests {
 
     /// Denied protocols get a named skip without probing; standard rows
     /// still run. The deny hook simulates unprobeable rows in tests.
+    /// Ticket 27: AnyTLS/SSH/Noise are probeable now — the residual skip
+    /// case is a genuinely unprobeable protocol (`naive`).
     #[test]
     fn unsupported_protocol_skipped_without_probing() {
         let configs = vec![
             fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
-            fixture("9", "Odd", "anytls", "127.0.0.1", 10809),
+            fixture("9", "Odd", "naive", "127.0.0.1", 10809),
         ];
         let (mut prober, handle) = FakeHealthProber::shared();
-        handle.deny_protocol("anytls");
+        handle.deny_protocol("naive");
         let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes[0].sample.error.is_none());
         let skip = outcomes[1].sample.error.as_deref().expect("named skip");
-        assert!(skip.contains("anytls"), "names protocol: {skip}");
+        assert!(skip.contains("naive"), "names protocol: {skip}");
         assert!(skip.contains("\"Odd\""), "names config: {skip}");
         assert!(
             handle.calls_for("9").is_empty(),
@@ -1320,13 +1326,14 @@ mod tests {
 
         let real = RealHealthProber::default();
         assert!(real.supports(&configs[0]));
-        assert!(!real.supports(&configs[1]), "real driver denies anytls");
+        assert!(!real.supports(&configs[1]), "real driver denies naive");
         assert!(is_probeable_protocol("ss"));
         assert!(!is_probeable_protocol("naive"));
     }
 
     /// Ticket 07: AWG rows are probeable through their own endpoints (deny
     /// list flipped); rows with no probe stay denied.
+    /// Ticket 27: the still-denied example is `naive` (AnyTLS probes now).
     #[test]
     fn amneziawg_rows_are_probeable_through_own_endpoints() {
         for protocol in ["amneziawg", "awg", "amnezia-wg"] {
@@ -1334,10 +1341,10 @@ mod tests {
         }
         let configs = vec![
             fixture("7", "AwgOne", "amneziawg", "127.0.0.1", 10807),
-            fixture("9", "Odd", "anytls", "127.0.0.1", 10809),
+            fixture("9", "Odd", "naive", "127.0.0.1", 10809),
         ];
         let (mut prober, handle) = FakeHealthProber::shared();
-        handle.deny_protocol("anytls");
+        handle.deny_protocol("naive");
         let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes[0].sample.error.is_none());
@@ -1351,7 +1358,7 @@ mod tests {
         assert!(real.supports(&configs[0]), "real driver probes AWG");
         assert!(
             !real.supports(&configs[1]),
-            "real driver still denies anytls"
+            "real driver still denies naive"
         );
     }
 
@@ -1392,6 +1399,54 @@ mod tests {
             assert_eq!(calls.len(), 1, "one probe for {}", config.name);
             assert_eq!(calls[0].bind, config.bind_ip);
             assert_eq!(calls[0].port, config.port, "own endpoint, not a sibling's");
+        }
+        let real = RealHealthProber::default();
+        for config in &configs {
+            assert!(real.supports(config), "real driver probes {}", config.name);
+        }
+    }
+
+    /// Ticket 27: SSH/AnyTLS/Noise rows are probeable through their own
+    /// endpoints (native engine support landed); each probe dials its own
+    /// endpoint so results stay per-egress. Traffic counters stay
+    /// probe-bytes per the spec note (data-plane deferred).
+    #[test]
+    fn ticket27_ssh_anytls_noise_probeable_through_own_endpoints() {
+        for protocol in ["ssh", "anytls", "noise"] {
+            assert!(is_probeable_protocol(protocol), "{protocol} is probeable");
+        }
+        let configs = vec![
+            fixture("1", "SshOne", "ssh", "127.0.0.1", 10801),
+            fixture("9", "AnyOne", "anytls", "127.0.0.1", 10809),
+            fixture("3", "NoiseOne", "noise", "127.0.0.1", 10803),
+        ];
+        let (mut prober, handle) = FakeHealthProber::shared();
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        assert_eq!(outcomes.len(), 3);
+        let mut store = HealthStore::default();
+        for (config, outcome) in configs.iter().zip(outcomes.iter()) {
+            assert!(
+                outcome.sample.error.is_none(),
+                "{} probed: {:?}",
+                config.name,
+                outcome.sample.error
+            );
+            assert!(
+                outcome.success.is_some(),
+                "{} carries probe bytes",
+                config.name
+            );
+            let calls = handle.calls_for(&config.id);
+            assert_eq!(calls.len(), 1, "one probe for {}", config.name);
+            assert_eq!(calls[0].bind, config.bind_ip);
+            assert_eq!(calls[0].port, config.port, "own endpoint, not a sibling's");
+            store.record_outcome(outcome);
+        }
+        // Probe-bytes only: no data-plane traffic is invented here.
+        for config in &configs {
+            let stats = store.traffic(&config.id);
+            assert_eq!(stats.probes, 1);
+            assert!(stats.rx_bytes > 0 && stats.tx_bytes > 0);
         }
         let real = RealHealthProber::default();
         for config in &configs {

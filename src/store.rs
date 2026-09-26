@@ -21,6 +21,177 @@ pub const DEFAULT_PROTOCOL: &str = "vless";
 /// Inclusive auto-port range for configs created without an explicit port.
 pub const AUTO_PORT_START: u16 = 10801;
 pub const AUTO_PORT_END: u16 = 10999;
+/// Ticket 27: spillover auto-port range (spec: auto ports from the
+/// 10801/18081 ranges). Primary fills first; spillover serves overflow so
+/// 250 auto-port configs assign cleanly. Exhaustion is honest only past both
+/// ranges. Disjoint from the Xray bridge range (11801-11999) by construction.
+pub const AUTO_PORT_SPILL_START: u16 = 18081;
+pub const AUTO_PORT_SPILL_END: u16 = 18380;
+
+/// Ticket 27: total auto-port capacity across both ranges.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const AUTO_PORT_CAPACITY: usize = (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
+    + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize;
+
+/// Ticket 27: auto-port candidates in assignment order (primary, then
+/// spillover). Every auto assignment in this file funnels through here so
+/// the two ranges never drift apart.
+pub fn auto_port_candidates() -> impl Iterator<Item = u16> {
+    (AUTO_PORT_START..=AUTO_PORT_END).chain(AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END)
+}
+
+/// Ticket 27: true when a port was auto-assigned from either range
+/// (explicit user ports elsewhere stay legal at rest).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_auto_port(port: u16) -> bool {
+    (AUTO_PORT_START..=AUTO_PORT_END).contains(&port)
+        || (AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END).contains(&port)
+}
+
+/// Ticket 27: secrets-at-rest note. v1 encrypts nothing: the library DB and
+/// sidecar config files hold private keys/tokens/passwords and are protected
+/// by user-only file permissions ([`harden_file_permissions`], applied to the
+/// DB file on open and to every sidecar config on write). OS-keychain/DPAPI
+/// credential encryption is an explicit BACKLOG non-goal (spec R6): no
+/// keychain/DPAPI code ships in v1; when it lands, this note and the export
+/// warning are its entry points.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SECRETS_AT_REST_NOTE: &str = "secrets at rest: user-only file permissions (0600/ACL); OS-keychain/DPAPI encryption is backlog, not v1";
+
+/// Ticket 27: best-effort user-only permissions for a secrets-bearing file
+/// (library DB, sidecar configs). Unix sets 0600; Windows strips inherited
+/// ACLs to the current user via `icacls` (best-effort: failures are ignored
+/// so hardening never breaks open/write — the file stays usable in its
+/// per-user dir). Never echoes file contents.
+pub fn harden_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        // Best-effort: `<user>:(R,W)` only, no inherited entries. The temp
+        // dir and %APPDATA% are per-user by construction; this tightens the
+        // file itself when icacls is available.
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg("*S-1-5-32-544:(R)")
+            .output();
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/grant:r")
+            .arg(format!(
+                "{}:(R,W)",
+                std::env::var("USERNAME").unwrap_or_else(|_| "OWNER RIGHTS".to_string())
+            ))
+            .output();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+    }
+}
+
+/// Ticket 27: subscription-fetch policy for one URL (pure, no DNS, no fetch).
+/// Decision (documented rationale):
+/// - `https` to a public host: Allow (tokens ride TLS; the existing 8 MiB /
+///   20 s / UTF-8 caps still apply at fetch).
+/// - `http` (plaintext) to a public host: Warn — allowed for LAN-provider
+///   compat, but query tokens leak in plaintext, so the UI surfaces the
+///   reason (never the URL).
+/// - Any `http(s)` URL whose host is loopback/private/link-local/unspecified
+///   (`localhost`, `127.x`, `10/8`, `172.16/12`, `192.168/16`, `::1`, `::`,
+///   `fe80::/10`, `fc00::/7`): Block — a pasted subscription URL must never
+///   make the app probe local services (SSRF); local files enter via manual
+///   import instead. Non-IP hostnames (e.g. `example.com`) are never blocked
+///   here (no DNS at policy time).
+///
+/// Errors and reasons never echo the URL (tokens hide in queries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscriptionFetchPolicy {
+    Allow,
+    Warn { reason: &'static str },
+    Block { reason: &'static str },
+}
+
+/// Ticket 27: classify one subscription URL without fetching (see
+/// [`SubscriptionFetchPolicy`] for the warn/block/allow rationale).
+pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
+    const HTTP_WARN: &str =
+        "subscription uses plaintext http (tokens in the URL leak in plaintext; prefer https)";
+    const INTERNAL_BLOCK: &str =
+        "subscription targets an internal host (loopback/private/link-local are never fetched; import local files manually)";
+    let trimmed = url.trim();
+    let (scheme, after) = match trimmed.get(..7) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("http://") => ("http", &trimmed[7..]),
+        _ => match trimmed.get(..8) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("https://") => ("https", &trimmed[8..]),
+            _ => {
+                return SubscriptionFetchPolicy::Block {
+                    reason: "subscription url must use http(s)",
+                };
+            }
+        },
+    };
+    let authority = after.split('/').next().unwrap_or(after);
+    let host_part = authority.rsplit('@').next().unwrap_or(authority);
+    // Bracketed IPv6 (`[::1]`, `[::1]:8080`) unwraps first — a naive `:`
+    // split would shred the literal (see ticket-27 RED run).
+    let host = if let Some(rest) = host_part.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_part.split(':').next().unwrap_or(host_part)
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        return SubscriptionFetchPolicy::Block {
+            reason: "subscription url must use http(s)",
+        };
+    }
+    if is_internal_host(host) {
+        return SubscriptionFetchPolicy::Block {
+            reason: INTERNAL_BLOCK,
+        };
+    }
+    if scheme == "http" {
+        return SubscriptionFetchPolicy::Warn { reason: HTTP_WARN };
+    }
+    SubscriptionFetchPolicy::Allow
+}
+
+/// Ticket 27: true for loopback/private/link-local/unspecified hosts (IP
+/// literals only; hostnames are never internal without DNS).
+fn is_internal_host(host: &str) -> bool {
+    let lower = host.trim().to_ascii_lowercase();
+    if lower == "localhost" {
+        return true;
+    }
+    if let Ok(ip) = lower.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                v4.is_loopback()
+                    || v4.is_unspecified()
+                    || v4.is_link_local()
+                    || octets[0] == 10
+                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                    || (octets[0] == 192 && octets[1] == 168)
+                    || octets[0] == 127
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
+                // fe80::/10 link-local, fc00::/7 unique-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+            }
+        }
+    } else {
+        false
+    }
+}
 
 /// A stored proxy configuration (ticket 02 owns identity, naming, grouping,
 /// enable flag, and local bind; protocol params are opaque until the
@@ -402,6 +573,10 @@ fn canonical_protocol(raw: &str) -> Option<String> {
         "amneziawg" | "awg" | "amnezia-wg" => Some("amneziawg".to_string()),
         "socks" | "socks5" => Some("socks".to_string()),
         "anytls" => Some("anytls".to_string()),
+        // Ticket 27: native SSH outbound (sing-box `ssh`) + standalone Noise
+        // (fork sidecar; AWG-vs-Noise mismatch rejected in the engine).
+        "ssh" => Some("ssh".to_string()),
+        "noise" => Some("noise".to_string()),
         "http" => Some("http".to_string()),
         "https" => Some("https".to_string()),
         "naive" => Some("naive".to_string()),
@@ -564,6 +739,11 @@ fn validate_protocol_params(
             }
             "anytls" => has(&["password"]),
             "naive" => has(&["username", "user"]) && has(&["password"]),
+            // Ticket 27: SSH needs a user plus one secret (password or
+            // private key); standalone Noise needs one noise secret
+            // (password or key) so rows never connect nowhere silently.
+            "ssh" => has(&["username", "user"]) && has(&["password", "private_key", "privatekey"]),
+            "noise" => has(&["password", "key"]),
             _ => true,
         };
         if !credential_ok {
@@ -577,6 +757,8 @@ fn validate_protocol_params(
                 "wireguard" | "amneziawg" => "private_key and public_key",
                 "anytls" => "password",
                 "naive" => "username and password",
+                "ssh" => "username and a password or private_key",
+                "noise" => "password or key",
                 _ => "credentials",
             };
             errors.push(missing(what));
@@ -904,6 +1086,8 @@ impl Store {
     }
 
     /// Open (creating parents as needed) a file-backed store.
+    /// Ticket 27: the DB file holds secrets at rest — user-only permissions
+    /// apply on open (best-effort, never fails the open).
     pub fn open_file(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -912,7 +1096,19 @@ impl Store {
                 })?;
             }
         }
-        Self::open(Connection::open(path)?)
+        let store = Self::open(Connection::open(path)?)?;
+        harden_file_permissions(path);
+        // WAL sidecars (`<db>-wal`, `<db>-shm`) hold the same secrets;
+        // tighten them too when present.
+        for sibling in [
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            if sibling.exists() {
+                harden_file_permissions(&sibling);
+            }
+        }
+        Ok(store)
     }
 
     /// Default file location: `%APPDATA%/ManyProxy/library.db` on Windows,
@@ -1166,8 +1362,10 @@ impl Store {
             let port = match item.port {
                 Some(port) => port,
                 None => {
+                    // Ticket 27: primary then spillover; honest exhaustion
+                    // only past both ranges (message unchanged).
                     let mut free = None;
-                    for candidate in AUTO_PORT_START..=AUTO_PORT_END {
+                    for candidate in auto_port_candidates() {
                         if !taken.contains(&(candidate as i64)) {
                             free = Some(candidate);
                             break;
@@ -1388,6 +1586,21 @@ impl Store {
             return Err(StoreError::Invalid(vec![FieldError::new(
                 "url",
                 "subscription url must use http(s)",
+            )]));
+        }
+        // Ticket 27: internal hosts never fetch (SSRF guard). Plain http
+        // stays allowed here — the Warn surfaces at fetch/policy time, not
+        // as an add-time reject (LAN providers use http). Reasons never
+        // echo the URL.
+        if matches!(
+            subscription_fetch_policy(trimmed),
+            SubscriptionFetchPolicy::Block { .. }
+        ) {
+            // Distinguish scheme failures (above) from the internal-host
+            // block: only hosts that parsed as http(s) reach here.
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "url",
+                "subscription url must not target internal hosts",
             )]));
         }
         Ok(trimmed.to_string())
@@ -1870,7 +2083,7 @@ impl Store {
             .map(|row| row.port as i64)
             .collect();
         let mut next_free_port = || -> Option<u16> {
-            for port in AUTO_PORT_START..=AUTO_PORT_END {
+            for port in auto_port_candidates() {
                 if !taken.contains(&(port as i64)) {
                     taken.insert(port as i64);
                     return Some(port);
@@ -2401,12 +2614,13 @@ impl Store {
     }
 
     /// First free port in the auto range, given the set of taken ports.
+    /// Ticket 27: primary then spillover (see [`auto_port_candidates`]).
     fn auto_port(&self) -> Result<u16, StoreError> {
         let mut stmt = self.conn.prepare("SELECT port FROM proxy_configs")?;
         let taken: HashSet<i64> = stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<HashSet<_>, _>>()?;
-        for port in AUTO_PORT_START..=AUTO_PORT_END {
+        for port in auto_port_candidates() {
             if !taken.contains(&(port as i64)) {
                 return Ok(port);
             }
@@ -4087,25 +4301,24 @@ mod tests {
     }
 
     /// Port exhaustion reports real per-item indices (never a blanket 0).
+    /// Ticket 27: the range under test is the widened capacity (primary +
+    /// spillover); exhaustion is honest only past both.
     #[test]
     fn t25_exhaustion_reports_real_indices() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let mut inputs = Vec::new();
-        for index in 0..=(AUTO_PORT_END - AUTO_PORT_START) {
+        for (index, port) in auto_port_candidates().enumerate() {
             inputs.push(NewConfig {
                 name: format!("fill-{index}"),
                 protocol: "vless".to_string(),
                 params: vless_params_with(&format!("s{index}.example.com"), &[]),
                 group: "fill".to_string(),
                 bind_ip: String::new(),
-                port: (AUTO_PORT_START + index).to_string(),
+                port: port.to_string(),
             });
         }
         let created = store.add_batch(inputs).expect("fill works");
-        assert_eq!(
-            created.len(),
-            (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
-        );
+        assert_eq!(created.len(), AUTO_PORT_CAPACITY);
         let sub = add_sub(&mut store, "travel");
         let outcome = store
             .refresh_with_body(&sub.id, &sub_body_two(), 100)
@@ -4341,8 +4554,8 @@ mod tests {
                 params: vless_params_with(&format!("h{index}.example.com"), &[]),
                 group: "bulk".to_string(),
                 bind_ip: String::new(),
-                // Explicit unique ports: the auto range holds 199, and
-                // duplicates stay legal at rest, so pin distinct ones.
+                // Explicit unique ports: duplicates stay legal at rest, so
+                // pin distinct ones outside the auto ranges.
                 port: (20_000 + index).to_string(),
             })
             .collect();
@@ -4524,5 +4737,210 @@ mod tests {
             widened_identity("vless", &upper),
             "enum-like fields compare case-insensitively"
         );
+    }
+
+    // -- Ticket 27: caps lift + secrets hardening + fetch policy -----------
+
+    /// 250 auto-port configs all assign (primary then spillover); exhaustion
+    /// stays honest only past the widened capacity.
+    #[test]
+    fn ticket27_auto_ports_assign_250_with_spillover_and_honest_exhaustion() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let inputs: Vec<NewConfig> = (0..250)
+            .map(|index| NewConfig {
+                name: format!("auto-{index}"),
+                protocol: "vless".to_string(),
+                params: vless_params_with(&format!("h{index}.example.com"), &[]),
+                group: "bulk".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .collect();
+        let created = store.add_batch(inputs).expect("250 auto ports assign");
+        assert_eq!(created.len(), 250);
+        let mut ports: Vec<u16> = created.iter().map(|row| row.port).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 250, "all unique");
+        assert!(
+            ports.iter().all(|port| is_auto_port(*port)),
+            "every port from an auto range"
+        );
+        assert!(
+            ports.iter().any(|port| *port >= AUTO_PORT_SPILL_START),
+            "spillover serves overflow past the 199-port primary"
+        );
+        // Fill to capacity, then prove honest exhaustion (message unchanged).
+        let mut fill: Vec<NewConfig> = Vec::new();
+        for port in auto_port_candidates() {
+            if ports.contains(&port) {
+                continue;
+            }
+            fill.push(NewConfig {
+                name: format!("fill-{port}"),
+                protocol: "vless".to_string(),
+                params: vless_params_with(&format!("f{port}.example.com"), &[]),
+                group: "bulk".to_string(),
+                bind_ip: String::new(),
+                port: port.to_string(),
+            });
+        }
+        let filled = store.add_batch(fill).expect("fill to capacity works");
+        assert_eq!(filled.len(), AUTO_PORT_CAPACITY - 250);
+        let error = store
+            .add(NewConfig {
+                name: "one-too-many".to_string(),
+                protocol: "vless".to_string(),
+                params: vless_params_with("last.example.com", &[]),
+                group: "bulk".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("past capacity exhausts honestly");
+        let text = error.to_string();
+        assert!(
+            text.contains("no automatic port left"),
+            "honest exhaustion, got {text}"
+        );
+    }
+
+    /// Fresh file DBs carry user-only permissions; the backlog note records
+    /// keychain/DPAPI as a non-goal (never shipped silently).
+    #[test]
+    fn ticket27_db_file_has_user_only_permissions_and_backlog_note() {
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t27-perms-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let _store = Store::open_file(&path).expect("file store opens");
+            assert!(path.exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "owner-only, got {mode:o}");
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+        assert!(
+            SECRETS_AT_REST_NOTE.contains("keychain") && SECRETS_AT_REST_NOTE.contains("DPAPI"),
+            "backlog recorded, got {SECRETS_AT_REST_NOTE}"
+        );
+        // Spot permissions are best-effort on hardened files.
+        let probe =
+            std::env::temp_dir().join(format!("manyproxy-t27-harden-{}.tmp", std::process::id()));
+        std::fs::write(&probe, "secrets").expect("probe writes");
+        harden_file_permissions(&probe);
+        assert!(probe.exists());
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    /// Subscription-fetch policy: https/public allows, http warns, internal
+    /// blocks (reasons never echo the URL); add rejects internal only.
+    #[test]
+    fn ticket27_subscription_fetch_policy_warn_block_allow() {
+        use SubscriptionFetchPolicy::{Allow, Block, Warn};
+        assert!(matches!(
+            subscription_fetch_policy("https://example.com/sub.txt"),
+            Allow
+        ));
+        assert!(matches!(
+            subscription_fetch_policy("http://example.com/sub.txt"),
+            Warn { .. }
+        ));
+        for url in [
+            "http://127.0.0.1/sub.txt",
+            "https://127.0.0.1/sub.txt",
+            "https://10.0.0.5/sub",
+            "https://192.168.1.20/sub",
+            "https://172.16.0.9/sub",
+            "https://localhost/sub",
+            "https://[::1]/sub",
+            "http://[::]/sub",
+        ] {
+            assert!(
+                matches!(subscription_fetch_policy(url), Block { .. }),
+                "blocked: {url}"
+            );
+        }
+        // Reasons never echo hosts/tokens.
+        let blocked = subscription_fetch_policy("http://127.0.0.1/sub?token=hunter2");
+        let reason = match blocked {
+            Block { reason } => reason,
+            other => panic!("expected Block, got {other:?}"),
+        };
+        assert!(!reason.contains("127.0.0.1"), "no host echo: {reason}");
+        assert!(!reason.contains("hunter2"), "no token echo: {reason}");
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let error = store
+            .add_subscription("Local", "http://127.0.0.1/sub.txt", "g", true)
+            .expect_err("internal add blocked");
+        assert!(
+            error.to_string().contains("internal"),
+            "names block, got {error}"
+        );
+        // Plain http stays addable (Warn at fetch, LAN-provider compat).
+        store
+            .add_subscription("Plain", "http://example.com/sub.txt", "g", true)
+            .expect("http add allowed");
+    }
+
+    /// Manual ssh/noise rows validate like the import path (credentials
+    /// required; opaque rows still pass through).
+    #[test]
+    fn ticket27_manual_ssh_noise_rows_validate() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(NewConfig {
+                name: "Ssh".to_string(),
+                protocol: "ssh".to_string(),
+                params: "{\"type\":\"ssh\",\"server\":\"a.example.com\",\"server_port\":22,\"username\":\"u\",\"password\":\"p\"}".to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("ssh with creds works");
+        store
+            .add(NewConfig {
+                name: "Noise".to_string(),
+                protocol: "noise".to_string(),
+                params: "{\"type\":\"noise\",\"server\":\"a.example.com\",\"server_port\":51820,\"key\":\"k\"}".to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("noise with key works");
+        for (protocol, params) in [
+            (
+                "ssh",
+                "{\"type\":\"ssh\",\"server\":\"a.example.com\",\"server_port\":22,\"username\":\"u\"}",
+            ),
+            (
+                "noise",
+                "{\"type\":\"noise\",\"server\":\"a.example.com\",\"server_port\":51820}",
+            ),
+        ] {
+            let error = store
+                .add(NewConfig {
+                    name: "Bad".to_string(),
+                    protocol: protocol.to_string(),
+                    params: params.to_string(),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .expect_err(&format!("{protocol} without creds fails"));
+            assert!(
+                matches!(error, StoreError::Invalid(_)),
+                "typed, got {error}"
+            );
+        }
     }
 }

@@ -113,7 +113,8 @@ pub fn is_custom_config_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Ticket 08: user extra-core executable slot (single slot: one active row).
+/// Ticket 08: user extra-core executable slot (ticket 27: N named slots —
+/// one sidecar per active row, each serving its own endpoint).
 pub fn is_extra_core_protocol(protocol: &str) -> bool {
     matches!(
         protocol.trim().to_ascii_lowercase().as_str(),
@@ -185,8 +186,9 @@ fn owning_core_of(
     }
 }
 
-/// Canonical sing-box outbound/endpoint type for the ticket-05 standard set.
-/// Anything else (anytls, naive, socks, http, unknown) is an
+/// Canonical sing-box outbound/endpoint type for the ticket-05 standard set
+/// plus ticket-27 natives (AnyTLS, SSH).
+/// Anything else (naive, socks, http, unknown) is an
 /// [`EngineError::UnsupportedProtocol`] owned by a later ticket.
 fn canonical_type(protocol: &str) -> Option<&'static str> {
     match protocol.trim().to_ascii_lowercase().as_str() {
@@ -198,8 +200,24 @@ fn canonical_type(protocol: &str) -> Option<&'static str> {
         "hysteria2" | "hy2" => Some("hysteria2"),
         "tuic" => Some("tuic"),
         "wireguard" | "wg" => Some("wireguard"),
+        // Ticket 27: native sing-box outbounds (stock sidecar, own endpoint).
+        "anytls" => Some("anytls"),
+        "ssh" => Some("ssh"),
         _ => None,
     }
+}
+
+/// Ticket 27: native SSH rows (sing-box `ssh` outbound, stock sidecar).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_ssh_protocol(protocol: &str) -> bool {
+    protocol.trim().eq_ignore_ascii_case("ssh")
+}
+
+/// Ticket 27: standalone Noise rows (fork sidecar via [`needs_fork`]).
+/// Amnezia Noise ≠ Xray Noise (research 02): Noise rows carry their own
+/// `password`/`key` and must never mix AWG obfuscation fields.
+pub fn is_noise_protocol(protocol: &str) -> bool {
+    protocol.trim().eq_ignore_ascii_case("noise")
 }
 
 /// Inbound tag for a library row (unique: ids are never reused).
@@ -567,23 +585,37 @@ fn awg_version_of(
 }
 
 /// Wrong-layer mismatch guards (research 02 silent-mismatch class): AWG
-/// fields on non-AWG rows, and Xray noise/finalmask semantics on AWG rows,
-/// fail here with explicit errors — never silently.
+/// fields on non-AWG rows, Xray noise/finalmask semantics on AWG rows, and
+/// ticket-27 Noise guards — AWG obfuscation on Noise rows plus Xray-noise
+/// semantics on Noise or stock rows — fail here with explicit errors — never
+/// silently.
 fn check_wrong_layer(
     name: &str,
     protocol: &str,
     params: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
     let awg = is_awg_protocol(protocol);
+    let noise = is_noise_protocol(protocol);
+    let xray = is_xray_protocol(protocol);
     for key in params.keys() {
         let lower = key.to_ascii_lowercase();
-        if !awg && is_awg_layer_key(&lower) {
+        if !awg && !noise && is_awg_layer_key(&lower) {
             return Err(EngineError::WrongLayer {
                 name: name.to_string(),
                 field: key.clone(),
                 detail: format!(
                     "\"{key}\" is an AmneziaWG field but protocol is \"{protocol}\" \
                      (Amnezia Noise ≠ Xray Noise: match obfuscation to its server; research 02)"
+                ),
+            });
+        }
+        if noise && is_awg_layer_key(&lower) {
+            return Err(EngineError::WrongLayer {
+                name: name.to_string(),
+                field: key.clone(),
+                detail: format!(
+                    "\"{key}\" is an AmneziaWG field on a standalone Noise row \
+                     (AWG-vs-Noise confusion: AWG obfuscation must match the AWG server, Noise rows carry their own key; research 02)"
                 ),
             });
         }
@@ -594,6 +626,26 @@ fn check_wrong_layer(
                 detail: format!(
                     "\"{key}\" is Xray-noise semantics on an AmneziaWG row \
                      (Amnezia Noise ≠ Xray Noise: AWG obfuscation must match the AWG server; research 02)"
+                ),
+            });
+        }
+        if noise && XRAY_NOISE_KEYS.contains(&lower.as_str()) {
+            return Err(EngineError::WrongLayer {
+                name: name.to_string(),
+                field: key.clone(),
+                detail: format!(
+                    "\"{key}\" is Xray-noise semantics on a standalone Noise row \
+                     (AWG-vs-Noise confusion: Noise rows carry their own key, Xray noise belongs on Xray rows; research 02)"
+                ),
+            });
+        }
+        if !awg && !noise && !xray && XRAY_NOISE_KEYS.contains(&lower.as_str()) {
+            return Err(EngineError::WrongLayer {
+                name: name.to_string(),
+                field: key.clone(),
+                detail: format!(
+                    "\"{key}\" is Xray-noise semantics on a \"{protocol}\" row \
+                     (Amnezia Noise ≠ Xray Noise: match obfuscation to its server; research 02)"
                 ),
             });
         }
@@ -651,6 +703,93 @@ fn validate_awg_row(
     Ok(version)
 }
 
+/// Ticket 27: validate one standalone Noise row (fork sidecar): server +
+/// port shape plus one noise secret (`password`/`key`), verbatim
+/// passthrough otherwise. AWG-vs-Noise confusion (AWG obfuscation fields on
+/// a Noise row) fails here explicitly — never silently.
+fn validate_noise_row(
+    name: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    check_wrong_layer(name, "noise", params)?;
+    let server = params
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|server| !server.is_empty());
+    if server.is_none() {
+        return Err(EngineError::BadParams {
+            name: name.to_string(),
+            field: "server",
+        });
+    }
+    let secret = ["password", "key"].iter().any(|key| {
+        params
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    if !secret {
+        return Err(EngineError::BadParams {
+            name: name.to_string(),
+            field: "password",
+        });
+    }
+    Ok(())
+}
+
+/// Ticket 27: validate one native SSH row (stock sidecar): server shape plus
+/// user + one secret (password or private key). Errors name the field only.
+fn validate_ssh_row(
+    name: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    let user = ["user", "username"].iter().any(|key| {
+        params
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    if !user {
+        return Err(EngineError::BadParams {
+            name: name.to_string(),
+            field: "user",
+        });
+    }
+    let secret = ["password", "private_key", "privatekey"].iter().any(|key| {
+        params
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    });
+    if !secret {
+        return Err(EngineError::BadParams {
+            name: name.to_string(),
+            field: "password",
+        });
+    }
+    Ok(())
+}
+
+/// Ticket 27: validate one native AnyTLS row (stock sidecar): password
+/// required (sing-box `anytls` authenticates by password).
+fn validate_anytls_row(
+    name: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    let password = params
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .filter(|password| !password.is_empty());
+    if password.is_none() {
+        return Err(EngineError::BadParams {
+            name: name.to_string(),
+            field: "password",
+        });
+    }
+    Ok(())
+}
+
 /// Transport marker: flat v2ray-style `network` (what import writes),
 /// sing-box `transport.type`, or Xray `streamSettings.network` (what JSON
 /// import preserves verbatim).
@@ -686,12 +825,12 @@ pub fn config_is_xhttp(config: &ProxyConfig) -> bool {
     transport_of(&map).is_some_and(|transport| transport.eq_ignore_ascii_case("xhttp"))
 }
 
-/// True for rows the stock binary cannot serve: AWG variants, plus XHTTP
-/// transports on the VLESS family. Anything else (including malformed
-/// params) is not fork-routed: malformed rows fail at [`generate`] with
-/// their own named error.
+/// True for rows the stock binary cannot serve: AWG variants, standalone
+/// Noise, plus XHTTP transports on the VLESS family. Anything else (including
+/// malformed params) is not fork-routed: malformed rows fail at [`generate`]
+/// with their own named error.
 pub fn needs_fork(config: &ProxyConfig) -> bool {
-    if is_awg_protocol(&config.protocol) {
+    if is_awg_protocol(&config.protocol) || is_noise_protocol(&config.protocol) {
         return true;
     }
     if config_is_xhttp(config) {
@@ -1465,12 +1604,13 @@ pub struct ActivationPlan {
     /// Rows served by the main (stock) sidecar: standard, Xray pointers,
     /// stock-core customs, and chains.
     pub main_rows: Vec<ProxyConfig>,
-    /// Rows served by the fork sidecar: AWG/XHTTP plus fork-core customs.
+    /// Rows served by the fork sidecar: AWG/Noise/XHTTP plus fork-core customs.
     pub fork_rows: Vec<ProxyConfig>,
     /// Xray sidecar legs (row VLESS, xray-core customs, xray-last chain hops).
     pub egresses: Vec<XrayEgress>,
-    /// The single extra-core slot row, if any.
-    pub extra: Option<ProxyConfig>,
+    /// Ticket 27: N named extra-core slot rows (each serves its own endpoint
+    /// in its own sidecar; replaces the ticket-08 singleton).
+    pub extras: Vec<ProxyConfig>,
     /// Custom full-config replacements (`(core, config json)`; at most one
     /// per core).
     pub replacements: Vec<(OwningCore, String)>,
@@ -1523,24 +1663,15 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     let mut main_rows = Vec::new();
     let mut fork_rows = Vec::new();
     let mut egresses: Vec<XrayEgress> = Vec::new();
-    let mut extra: Option<ProxyConfig> = None;
+    // Ticket 27: N named extra-core slots (no singleton cap).
+    let mut extras: Vec<ProxyConfig> = Vec::new();
     let mut replacements: Vec<(OwningCore, String)> = Vec::new();
     let mut bridge_keys: Vec<String> = Vec::new();
     for config in configs {
         let params = params_object(config)?;
         if is_extra_core_protocol(&config.protocol) {
             validate_extra_row(config)?;
-            if let Some(previous) = &extra {
-                return Err(EngineError::BadExtra {
-                    name: config.name.clone(),
-                    field: "exe".to_string(),
-                    detail: format!(
-                        "only one extra-core row can be active at a time (single user slot; \"{}\" already holds it)",
-                        previous.name
-                    ),
-                });
-            }
-            extra = Some(config.clone());
+            extras.push(config.clone());
         } else if is_custom_config_protocol(&config.protocol) {
             let (core, document) = custom_full_config(&config.name, &params)?;
             if replacements.iter().any(|(owned, _)| *owned == core) {
@@ -1587,8 +1718,12 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             check_wrong_layer(&config.name, &config.protocol, &params)?;
             // Same schema gate `generate` applies (server shape, known
             // protocol): unknown protocols and bad params fail here, not
-            // after `active` moves.
-            if canonical_type(&config.protocol).is_none() && !is_awg_protocol(&config.protocol) {
+            // after `active` moves. Ticket 27: Noise is fork-routed (never
+            // UnsupportedProtocol); SSH/AnyTLS are canonical natives.
+            if canonical_type(&config.protocol).is_none()
+                && !is_awg_protocol(&config.protocol)
+                && !is_noise_protocol(&config.protocol)
+            {
                 return Err(EngineError::UnsupportedProtocol {
                     name: config.name.clone(),
                     protocol: config.protocol.clone(),
@@ -1721,15 +1856,16 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         .map(|egress| format!("\"{}\"", egress.owner))
         .collect::<Vec<_>>()
         .join(", ");
-    let extra_names = extra
-        .as_ref()
+    let extra_names = extras
+        .iter()
         .map(|row| format!("\"{}\"", row.name))
-        .unwrap_or_default();
+        .collect::<Vec<_>>()
+        .join(", ");
     Ok(ActivationPlan {
         main_rows,
         fork_rows,
         egresses,
-        extra,
+        extras,
         replacements,
         fork_names,
         fork_xhttp,
@@ -1906,9 +2042,15 @@ fn build_standard_node(
     // endpoint schema with the AWG fields, passed through verbatim); the
     // fork's own `check` stays authoritative for value shapes. XHTTP on
     // the VLESS family is fork-routed with its params verbatim.
+    // Ticket 27: standalone Noise validates its own shape and becomes a
+    // fork `noise` outbound (fork sidecar path); native SSH/AnyTLS validate
+    // their credentials and stay stock outbounds.
     let (canonical, fork_row) = if is_awg_protocol(&config.protocol) {
         validate_awg_row(&config.name, params)?;
         ("wireguard", true)
+    } else if is_noise_protocol(&config.protocol) {
+        validate_noise_row(&config.name, params)?;
+        ("noise", true)
     } else if let Some(canonical) = canonical_type(&config.protocol) {
         if xhttp && !matches!(canonical, "vless" | "vmess" | "trojan") {
             return Err(EngineError::WrongLayer {
@@ -1918,6 +2060,11 @@ fn build_standard_node(
                     "xhttp is a VLESS-family transport, not a \"{canonical}\" transport (wrong layer; research 02)"
                 ),
             });
+        }
+        if canonical == "ssh" {
+            validate_ssh_row(&config.name, params)?;
+        } else if canonical == "anytls" {
+            validate_anytls_row(&config.name, params)?;
         }
         (canonical, xhttp)
     } else {
@@ -2683,7 +2830,8 @@ fn unique_config_path(stem: &str) -> PathBuf {
 const LOG_POISON_NOTICE: &str = "log pipe unreadable (log reader failed)";
 
 /// Write the sidecar config with owner-only permissions (0600 on Unix; the
-/// Windows temp dir is per-user by construction). The file holds secrets, so
+/// Windows temp dir is per-user by construction, tightened best-effort via
+/// [`crate::store::harden_file_permissions`]). The file holds secrets, so
 /// creation must not widen access.
 fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String> {
     use std::io::Write as _;
@@ -2699,6 +2847,10 @@ fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String>
         .map_err(|error| format!("cannot write engine config ({error})"))?;
     file.write_all(config_json.as_bytes())
         .map_err(|error| format!("cannot write engine config ({error})"))?;
+    drop(file);
+    // Ticket 27: user-only permissions on every platform (Unix already 0600
+    // at create; Windows ACL tightening is best-effort here).
+    crate::store::harden_file_permissions(path);
     Ok(())
 }
 
@@ -2863,9 +3015,9 @@ fn wait_child_bounded(child: &mut std::process::Child, timeout: Duration) {
 /// so the stock and fork sidecars run beside each other).
 ///
 /// Ticket 08: the same driver serves the Xray sidecar
-/// ([`RealEngineBackend::xray`]: `xray run -c`, own temp file) and the
-/// single user extra-core slot ([`RealEngineBackend::extra`]: the user's
-/// executable from the app dir, config file passed through as
+/// ([`RealEngineBackend::xray`]: `xray run -c`, own temp file) and each user
+/// extra-core slot ([`RealEngineBackend::extra_slot`]: the row's executable
+/// from the app dir, config file passed through as
 /// `-c <config>`, spawned unprivileged — never elevated — with its own
 /// temp file). Neither Xray nor extra-core has a stable cross-version
 /// `check` CLI contract in this repo's context, so their `check_config`
@@ -3415,17 +3567,19 @@ pub enum EngineStatus {
 ///
 /// Ticket 08: four sidecars — the Xray sidecar bridges Xray-only rows over
 /// loopback ingress listeners (paired config + tag-count cross-check), and
-/// the single extra-core slot runs the user's executable unprivileged with
-/// its config passed through. Custom full-config rows replace their owning
-/// core's generated config wholesale.
+/// Ticket 27: N named extra-core slot sidecars (one per active extra-core
+/// row) run the user's executables unprivileged with their configs passed
+/// through. Custom full-config rows replace their owning core's generated
+/// config wholesale.
 pub struct EngineController {
     backend: Box<dyn EngineBackend>,
     /// Ticket 07: fork-core sidecar for exotic rows only.
     fork_backend: Box<dyn EngineBackend>,
     /// Ticket 08: Xray-core sidecar for Xray-only rows.
     xray_backend: Box<dyn EngineBackend>,
-    /// Ticket 08: single user extra-core slot sidecar.
-    extra_backend: Box<dyn EngineBackend>,
+    /// Ticket 27: one user extra-core sidecar per active extra-core row
+    /// (activation order; replaces the ticket-08 singleton).
+    extra_backends: Vec<Box<dyn EngineBackend>>,
     /// Ticket 07: fork-binary probe seam (default: real resolution; tests
     /// inject present/missing without touching the filesystem).
     fork_probe: Box<dyn Fn() -> Result<PathBuf, EngineError>>,
@@ -3443,9 +3597,12 @@ pub struct EngineController {
     /// [`EngineError::LanConfirmRequired`] independent of any UI gate.
     lan_confirmed: HashSet<(String, String)>,
     /// Ticket 23: last configs successfully served per shard
-    /// (stock/fork/xray/extra) — the rollback target when a later apply's
+    /// (stock/fork/xray) — the rollback target when a later apply's
     /// spawn fails midway.
-    served: [Option<String>; 4],
+    served: [Option<String>; 3],
+    /// Ticket 27: last configs served per extra slot (parallel to
+    /// [`EngineController::extra_backends`]).
+    served_extra: Vec<Option<String>>,
     active: Vec<ProxyConfig>,
     status: EngineStatus,
     last_error: Option<String>,
@@ -3501,13 +3658,14 @@ impl EngineController {
             backend,
             fork_backend: Box::new(RealEngineBackend::fork()),
             xray_backend: Box::new(RealEngineBackend::xray()),
-            extra_backend: Box::new(RealEngineBackend::extra_slot()),
+            extra_backends: vec![Box::new(RealEngineBackend::extra_slot())],
             fork_probe: Box::new(resolve_fork_binary),
             xray_probe: Box::new(resolve_xray_binary),
             extra_probe: Box::new(resolve_extra_binary),
             stock_probe: Box::new(resolve_engine_binary),
             lan_confirmed: HashSet::new(),
-            served: [None, None, None, None],
+            served: [None, None, None],
+            served_extra: vec![None],
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -3542,6 +3700,9 @@ impl EngineController {
     /// Ticket 08: test controller with handles to all four mock drivers.
     /// Fork/xray/extra probes default to missing (deterministic without
     /// touching the filesystem); override with the `set_*_probe` setters.
+    /// Ticket 27: the extra handle is the first of
+    /// [`EngineController::extra_backends`]; use
+    /// [`EngineController::push_test_extra_backend`] for more slots.
     #[cfg(test)]
     pub fn fake_quartet() -> (Self, FakeHandle, FakeHandle, FakeHandle, FakeHandle) {
         let (backend, stock) = FakeEngineBackend::shared();
@@ -3552,7 +3713,7 @@ impl EngineController {
             backend: Box::new(backend),
             fork_backend: Box::new(fork_backend),
             xray_backend: Box::new(xray_backend),
-            extra_backend: Box::new(extra_backend),
+            extra_backends: vec![Box::new(extra_backend)],
             fork_probe: Box::new(|| {
                 Err(EngineError::MissingForkBinary {
                     rows: String::new(),
@@ -3580,13 +3741,25 @@ impl EngineController {
             // scenarios.
             stock_probe: Box::new(|| Ok(PathBuf::from("test-stock-bin"))),
             lan_confirmed: HashSet::new(),
-            served: [None, None, None, None],
+            served: [None, None, None],
+            served_extra: vec![None],
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
             last_config_json: None,
         };
         (controller, stock, fork, xray, extra)
+    }
+
+    /// Ticket 27: test-only extra slot growth — push one more mock extra
+    /// backend and return its handle (keeps `fake_quartet` hermetic for
+    /// N-slot tests without touching the filesystem).
+    #[cfg(test)]
+    pub fn push_test_extra_backend(&mut self) -> FakeHandle {
+        let (backend, handle) = FakeEngineBackend::shared();
+        self.extra_backends.push(Box::new(backend));
+        self.served_extra.push(None);
+        handle
     }
 
     /// Ticket 07: override the fork-binary probe (tests inject present /
@@ -3631,13 +3804,14 @@ impl EngineController {
         self.lan_confirmed.retain(|entry| live.contains(entry));
     }
 
-    /// Ticket 23: shard backend by index (0 stock, 1 fork, 2 xray, 3 extra).
+    /// Ticket 23: shard backend by index (0 stock, 1 fork, 2 xray).
+    /// Ticket 27: extra slots ride in [`EngineController::extra_backends`]
+    /// (see `apply`: per-slot start/stop, never a shared index).
     fn backend_at(&mut self, index: usize) -> &mut dyn EngineBackend {
         match index {
             0 => self.backend.as_mut(),
             1 => self.fork_backend.as_mut(),
-            2 => self.xray_backend.as_mut(),
-            _ => self.extra_backend.as_mut(),
+            _ => self.xray_backend.as_mut(),
         }
     }
 
@@ -3647,7 +3821,16 @@ impl EngineController {
         self.backend.is_running()
             || self.fork_backend.is_running()
             || self.xray_backend.is_running()
-            || self.extra_backend.is_running()
+            || self.extra_backends.iter().any(|slot| slot.is_running())
+    }
+
+    /// Ticket 27: index of one extra row among the active extra slots
+    /// (activation order — the same order `apply` serves them in).
+    fn extra_slot_index(&self, id: &str) -> Option<usize> {
+        self.active
+            .iter()
+            .filter(|row| is_extra_core_protocol(&row.protocol))
+            .position(|row| row.id == id)
     }
 
     /// Start one config (idempotent); restarts the sidecar with the union.
@@ -3809,11 +3992,16 @@ impl EngineController {
             self.backend.stop();
             self.fork_backend.stop();
             self.xray_backend.stop();
-            self.extra_backend.stop();
-            // Ticket 23 LOW: the emptied slot forgets its executable; the
-            // served snapshots reset with the membership.
-            self.extra_backend.clear_extra_exe();
-            self.served = [None, None, None, None];
+            for slot in self.extra_backends.iter_mut() {
+                slot.stop();
+                // Ticket 23 LOW: the emptied slot forgets its executable.
+                slot.clear_extra_exe();
+            }
+            // Ticket 23 LOW: the served snapshots reset with the membership.
+            self.served = [None, None, None];
+            for served in self.served_extra.iter_mut() {
+                *served = None;
+            }
             self.status = EngineStatus::Stopped;
             self.last_config_json = None;
             return Ok(());
@@ -3863,22 +4051,29 @@ impl EngineController {
                 }
             }
         }
-        let extra_path: Option<PathBuf> = match &plan.extra {
-            Some(row) => {
-                let (exe, _) = validate_extra_row(row).inspect_err(|error| {
+        // Ticket 27: one binary gate per extra slot (each names its own exe;
+        // a missing exe fails only the extra rows, like every other gate).
+        // Grow real sidecars for slots beyond the current backends (tests
+        // pre-size via `push_test_extra_backend`, so no real spawn there).
+        while self.extra_backends.len() < plan.extras.len() {
+            self.extra_backends
+                .push(Box::new(RealEngineBackend::extra_slot()));
+            self.served_extra.push(None);
+        }
+        let mut extra_paths: Vec<Option<PathBuf>> = Vec::with_capacity(plan.extras.len());
+        for row in &plan.extras {
+            let (exe, _) = validate_extra_row(row).inspect_err(|error| {
+                self.last_error = Some(error.to_string());
+            })?;
+            match (self.extra_probe)(&exe) {
+                Ok(path) => extra_paths.push(Some(path)),
+                Err(error) => {
+                    let error = missing_extra_for(error, &plan.extra_names);
                     self.last_error = Some(error.to_string());
-                })?;
-                match (self.extra_probe)(&exe) {
-                    Ok(path) => Some(path),
-                    Err(error) => {
-                        let error = missing_extra_for(error, &plan.extra_names);
-                        self.last_error = Some(error.to_string());
-                        return Err(error);
-                    }
+                    return Err(error);
                 }
             }
-            None => None,
-        };
+        }
         // Per-sidecar configs. Custom full-config rows replace their core
         // wholesale; anything else generates. Subsets of a validated union
         // cannot fail validation again, but the errors stay typed.
@@ -3930,12 +4125,13 @@ impl EngineController {
                     .json,
             ),
         };
-        let extra_gen: Option<String> = match &plan.extra {
-            Some(row) => Some(extra_config_json(row).inspect_err(|error| {
+        // Ticket 27: one passed-through config per extra slot.
+        let mut extra_gens: Vec<Option<String>> = Vec::with_capacity(plan.extras.len());
+        for row in &plan.extras {
+            extra_gens.push(Some(extra_config_json(row).inspect_err(|error| {
                 self.last_error = Some(error.to_string());
-            })?),
-            None => None,
-        };
+            })?));
+        }
         // Bridge bookkeeping cross-checks (load-bearing): the sidecar
         // tag counts must match the bridge count, and every pointer must
         // have survived into the serving main config (a stock replacement
@@ -4020,7 +4216,7 @@ impl EngineController {
             for row in plan.main_rows.iter().chain(plan.fork_rows.iter()) {
                 endpoints.push((row.name.clone(), row.bind_ip.clone(), row.port));
             }
-            if let Some(row) = &plan.extra {
+            for row in &plan.extras {
                 endpoints.push((row.name.clone(), row.bind_ip.clone(), row.port));
             }
             for egress in &plan.egresses {
@@ -4046,7 +4242,6 @@ impl EngineController {
             ("stock", &mut self.backend, &stock_gen),
             ("fork", &mut self.fork_backend, &fork_gen),
             ("xray", &mut self.xray_backend, &xray_gen),
-            ("extra", &mut self.extra_backend, &extra_gen),
         ] {
             if let Some(json) = gen {
                 if let Err(mut detail) = backend.check_config(json) {
@@ -4059,23 +4254,37 @@ impl EngineController {
                 }
             }
         }
-        // Restart only populated sidecars; empty subsets stay down. The extra
-        // slot driver is pointed at the active row's executable first (single
-        // active row enforced by the plan); when the slot empties it forgets
-        // the executable (ticket 23 LOW).
-        if let Some(path) = &extra_path {
-            self.extra_backend.set_extra_exe(path.clone());
-        } else {
-            self.extra_backend.clear_extra_exe();
+        // Ticket 27: every extra slot checks its own passed-through config.
+        for (slot, gen) in self.extra_backends.iter_mut().zip(extra_gens.iter()) {
+            if let Some(json) = gen {
+                if let Err(detail) = slot.check_config(json) {
+                    let error = EngineError::CheckFailed { detail };
+                    self.last_error = Some(error.to_string());
+                    return Err(error);
+                }
+            } else {
+                break;
+            }
+        }
+        // Restart only populated sidecars; empty subsets stay down. Each
+        // extra slot driver is pointed at its row's executable first; slots
+        // beyond the plan forget theirs (ticket 23 LOW).
+        for (index, slot) in self.extra_backends.iter_mut().enumerate() {
+            if let Some(path) = extra_paths.get(index).and_then(|path| path.as_ref()) {
+                slot.set_extra_exe(path.clone());
+            } else {
+                slot.clear_extra_exe();
+            }
         }
         // Ticket 23 HIGH: a failed spawn rolls the shards this apply touched
         // back to their previously served configs (snapshot below) instead of
         // leaving a split brain — some shards on the new set, one shard down.
-        const SHARDS: [&str; 4] = ["stock", "fork", "xray", "extra"];
-        let gens: [Option<String>; 4] = [stock_gen, fork_gen, xray_gen, extra_gen];
+        const SHARDS: [&str; 3] = ["stock", "fork", "xray"];
+        let gens: [Option<String>; 3] = [stock_gen, fork_gen, xray_gen];
         let prev_served = self.served.clone();
+        let prev_served_extra = self.served_extra.clone();
         let mut failures: Vec<(String, EngineError)> = Vec::new();
-        for index in 0..4 {
+        for index in 0..3 {
             let json = gens[index].clone();
             match json {
                 Some(json) => {
@@ -4101,6 +4310,52 @@ impl EngineController {
                 }
             }
         }
+        // Ticket 27: each extra slot serves its own endpoint; shrink the
+        // served tail when the plan holds fewer slots than the backends.
+        for (index, gen) in extra_gens.iter().enumerate() {
+            let label = format!(
+                "extra-{}",
+                plan.extras
+                    .get(index)
+                    .map(|row| row.id.as_str())
+                    .unwrap_or("?")
+            );
+            match gen {
+                Some(json) => {
+                    let slot = &mut self.extra_backends[index];
+                    slot.stop();
+                    match slot.start(json) {
+                        Ok(()) => {
+                            if index < self.served_extra.len() {
+                                self.served_extra[index] = Some(json.clone());
+                            }
+                        }
+                        Err(detail) => {
+                            if index < self.served_extra.len() {
+                                self.served_extra[index] = None;
+                            }
+                            failures.push((label, EngineError::SpawnFailed { detail }));
+                        }
+                    }
+                }
+                None => {
+                    if let Some(slot) = self.extra_backends.get_mut(index) {
+                        slot.stop();
+                    }
+                    if index < self.served_extra.len() {
+                        self.served_extra[index] = None;
+                    }
+                }
+            }
+        }
+        for index in extra_gens.len()..self.extra_backends.len() {
+            if let Some(slot) = self.extra_backends.get_mut(index) {
+                slot.stop();
+            }
+            if index < self.served_extra.len() {
+                self.served_extra[index] = None;
+            }
+        }
         if !failures.is_empty() {
             // Restore every shard to its pre-apply served config — including
             // shards whose new spawn just failed (the failure may be
@@ -4116,6 +4371,31 @@ impl EngineController {
                         Err(_) => self.served[index] = None,
                     },
                     None => self.served[index] = None,
+                }
+            }
+            // Ticket 27: extra slots roll back to their own snapshots.
+            for (index, prev) in prev_served_extra.clone().into_iter().enumerate() {
+                if let Some(slot) = self.extra_backends.get_mut(index) {
+                    slot.stop();
+                    match prev {
+                        Some(prev) => match slot.start(&prev) {
+                            Ok(()) => {
+                                if index < self.served_extra.len() {
+                                    self.served_extra[index] = Some(prev);
+                                }
+                            }
+                            Err(_) => {
+                                if index < self.served_extra.len() {
+                                    self.served_extra[index] = None;
+                                }
+                            }
+                        },
+                        None => {
+                            if index < self.served_extra.len() {
+                                self.served_extra[index] = None;
+                            }
+                        }
+                    }
                 }
             }
             let detail = failures
@@ -4144,30 +4424,46 @@ impl EngineController {
             .clone()
             .or_else(|| gens[1].clone())
             .or_else(|| gens[2].clone())
-            .or(gens[3].clone());
+            .or_else(|| extra_gens.iter().find_map(|gen| gen.clone()));
         self.last_error = None;
         Ok(())
     }
 
     /// Crash detection: call on UI actions; reports every crashed shard.
-    /// Ticket 23 MED: all four sidecars are reaped per poll (stock first) —
+    /// Ticket 23 MED: all sidecars are reaped per poll (stock first) —
     /// a one-shot poll no longer loses N-1 causes. A single crash returns
     /// its bare cause (previous contract); several join as
     /// `"shard: cause; shard: cause"`. Any observed crash transitions the
     /// status (and records `last_error`), so callers see the failure even
     /// when they only need the per-shard list.
+    /// Ticket 27: every extra slot polls as `extra-<id>` (or `extra-<index>`
+    /// when the row is gone).
     pub fn poll_shards(&mut self) -> Vec<(String, String)> {
         let mut crashes = Vec::new();
         for (shard, backend) in [
             ("stock", &mut self.backend),
             ("fork", &mut self.fork_backend),
             ("xray", &mut self.xray_backend),
-            ("extra", &mut self.extra_backend),
         ] {
             // Ticket 23 HIGH: the failed shard's secret file is cleaned by
             // `poll_exit` itself; siblings keep running untouched.
             if let Some(cause) = backend.poll_exit() {
                 crashes.push((shard.to_string(), cause));
+            }
+        }
+        let extra_ids: Vec<String> = self
+            .active
+            .iter()
+            .filter(|row| is_extra_core_protocol(&row.protocol))
+            .map(|row| row.id.clone())
+            .collect();
+        for (index, slot) in self.extra_backends.iter_mut().enumerate() {
+            if let Some(cause) = slot.poll_exit() {
+                let shard = extra_ids
+                    .get(index)
+                    .map(|id| format!("extra-{id}"))
+                    .unwrap_or_else(|| format!("extra-{index}"));
+                crashes.push((shard, cause));
             }
         }
         if crashes.is_empty() || self.active.is_empty() {
@@ -4209,13 +4505,15 @@ impl EngineController {
     }
 
     /// Ticket 13: take buffered stderr lines from every sidecar (stock,
-    /// fork, xray, extra). The UI ingests them into `LogStore` on every
-    /// reload, so live lines appear without user clicks.
+    /// fork, xray, every extra slot). The UI ingests them into `LogStore` on
+    /// every reload, so live lines appear without user clicks.
     pub fn drain_log_lines(&mut self) -> Vec<String> {
         let mut lines = self.backend.drain_log_lines();
         lines.extend(self.fork_backend.drain_log_lines());
         lines.extend(self.xray_backend.drain_log_lines());
-        lines.extend(self.extra_backend.drain_log_lines());
+        for slot in self.extra_backends.iter_mut() {
+            lines.extend(slot.drain_log_lines());
+        }
         lines
     }
 
@@ -4237,10 +4535,15 @@ impl EngineController {
             return false;
         };
         // Ticket 08: each row reports its serving sidecar. Xray rows ride
-        // the xray bridge; custom rows follow their owning core; the extra
-        // slot has its own process; chains are served by the main config.
+        // the xray bridge; custom rows follow their owning core; each extra
+        // row reports its own named slot; chains are served by the main config.
+        // Ticket 27: the slot index is the row's position among active
+        // extra rows (the order `apply` serves them in).
         if is_extra_core_protocol(&row.protocol) {
-            return self.extra_backend.is_running();
+            return self
+                .extra_slot_index(id)
+                .and_then(|index| self.extra_backends.get(index))
+                .is_some_and(|slot| slot.is_running());
         }
         if is_custom_config_protocol(&row.protocol) {
             let core = params_object(row)
@@ -4567,20 +4870,22 @@ mod tests {
     }
 
     /// Exotic protocols stay out of this slice with a named error.
+    /// Ticket 27: AnyTLS/SSH/Noise are native now — the residual
+    /// UnsupportedProtocol case is a genuinely unknown protocol.
     #[test]
     fn unsupported_protocol_names_config_without_secrets() {
         let configs = vec![fixture(
             "9",
             "Odd",
-            "anytls",
-            json!({"server": "10.0.0.9", "server_port": 443, "password": "TOP-SECRET"}),
+            "naive",
+            json!({"server": "10.0.0.9", "server_port": 443, "username": "u", "password": "TOP-SECRET"}),
             "127.0.0.1",
             10809,
         )];
-        let error = generate(&configs).expect_err("anytls is not standard");
+        let error = generate(&configs).expect_err("naive is not standard");
         let text = error.to_string();
         assert!(text.contains("\"Odd\""), "names config: {text}");
-        assert!(text.contains("anytls"), "names protocol: {text}");
+        assert!(text.contains("naive"), "names protocol: {text}");
         assert!(!text.contains("TOP-SECRET"), "no secrets: {text}");
     }
 
@@ -5641,11 +5946,12 @@ mod tests {
         assert!(error.to_string().contains("\"core\""), "got {error}");
     }
 
-    /// Extra-core slot: app-dir-only resolution rejects traversal, a
-    /// missing exe names the row + file, the single slot holds one row,
-    /// and the active row's config reaches its sidecar unprivileged.
+    /// Extra-core slots: app-dir-only resolution rejects traversal, a
+    /// missing exe names the row + file, and N named slots each serve their
+    /// own endpoint (ticket 27 replaces the ticket-08 singleton).
+    /// The active rows' configs reach their sidecars unprivileged.
     #[test]
-    fn extra_slot_appdir_unprivileged_single() {
+    fn extra_slots_appdir_unprivileged_named() {
         assert!(resolve_extra_binary_in(None, "core.exe").is_err());
         for bad in [
             "../evil.exe",
@@ -5710,13 +6016,15 @@ mod tests {
         );
 
         let rival = extra_fixture("6", "Rival", 10806);
-        let error = controller
+        // Ticket 27: N named slots — the second row starts beside the first
+        // (its own sidecar, its own endpoint), no singleton cap.
+        let _rival_extra = controller.push_test_extra_backend();
+        controller
             .start_one(&rival)
-            .expect_err("single slot holds one row");
-        assert!(
-            error.to_string().contains("only one extra-core"),
-            "got {error}"
-        );
+            .expect("second extra slot starts beside the first");
+        assert!(controller.is_running("5"), "first slot keeps serving");
+        assert!(controller.is_running("6"), "second slot serves too");
+        assert_eq!(controller.running_count(), 3);
     }
 
     /// Egress-only rule: Extra/Custom/Xray hops mid-chain are rejected with
@@ -6310,5 +6618,211 @@ mod tests {
             path
         };
         assert!(!path.exists(), "drop cleaned: {}", path.display());
+    }
+
+    // -- Ticket 27: SSH + AnyTLS + Noise end-to-end -------------------------
+
+    fn ssh_fixture(id: &str, name: &str, port: u16) -> ProxyConfig {
+        fixture(
+            id,
+            name,
+            "ssh",
+            json!({"type": "ssh", "server": "198.51.100.7", "server_port": 22,
+                   "user": "alice", "password": "hunter2"}),
+            "127.0.0.1",
+            port,
+        )
+    }
+
+    fn anytls_fixture(id: &str, name: &str, port: u16) -> ProxyConfig {
+        fixture(
+            id,
+            name,
+            "anytls",
+            json!({"type": "anytls", "server": "198.51.100.9", "server_port": 443,
+                   "password": "anytls-secret"}),
+            "127.0.0.1",
+            port,
+        )
+    }
+
+    fn noise_fixture(id: &str, name: &str, port: u16) -> ProxyConfig {
+        fixture(
+            id,
+            name,
+            "noise",
+            json!({"type": "noise", "server": "192.0.2.44", "server_port": 51820,
+                   "password": "NOISE-KEY", "key": "NOISE-KEY"}),
+            "127.0.0.1",
+            port,
+        )
+    }
+
+    /// SSH rows generate native stock `ssh` outbounds on their own endpoint
+    /// (no fork, no UnsupportedProtocol, no secrets in errors).
+    #[test]
+    fn ticket27_ssh_generates_native_stock_outbound() {
+        assert!(is_ssh_protocol("SSH"));
+        assert!(!needs_fork(&ssh_fixture("1", "SshOne", 10801)));
+        let generated = generate(&[ssh_fixture("1", "SshOne", 10801)]).expect("ssh generates");
+        assert!(!generated.requires_fork, "native stock, not fork");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("1")))
+            .expect("ssh outbound present");
+        assert_eq!(node["type"], json!("ssh"));
+        let rule = value["route"]["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["inbound"] == json!(inbound_tag("1")))
+            .expect("ssh rule present");
+        assert_eq!(rule["outbound"], json!(outbound_tag("1")));
+
+        let mut bad = ssh_fixture("2", "NoUser", 10802);
+        bad.params = json!({"type": "ssh", "server": "198.51.100.7",
+            "server_port": 22, "password": "hunter2"})
+        .to_string();
+        let error = generate(std::slice::from_ref(&bad)).expect_err("user required");
+        assert!(
+            matches!(error, EngineError::BadParams { .. }),
+            "typed, got {error}"
+        );
+        assert!(
+            !error.to_string().contains("hunter2"),
+            "no secrets: {error}"
+        );
+    }
+
+    /// AnyTLS rows generate native stock `anytls` outbounds (the old
+    /// UnsupportedProtocol is gone).
+    #[test]
+    fn ticket27_anytls_generates_native_stock_outbound() {
+        let generated =
+            generate(&[anytls_fixture("9", "AnyOne", 10809)]).expect("anytls generates");
+        assert!(!generated.requires_fork, "native stock, not fork");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("9")))
+            .expect("anytls outbound present");
+        assert_eq!(node["type"], json!("anytls"));
+
+        let mut bad = anytls_fixture("9", "NoPass", 10809);
+        bad.params =
+            json!({"type": "anytls", "server": "198.51.100.9", "server_port": 443}).to_string();
+        let error = generate(std::slice::from_ref(&bad)).expect_err("password required");
+        assert!(
+            matches!(error, EngineError::BadParams { .. }),
+            "typed, got {error}"
+        );
+    }
+
+    /// Standalone Noise rows ride the fork sidecar with explicit AWG-vs-Noise
+    /// mismatch guards in both directions (plus Xray-noise on stock).
+    #[test]
+    fn ticket27_noise_routes_fork_with_mismatch_guards() {
+        assert!(is_noise_protocol("noise"));
+        assert!(needs_fork(&noise_fixture("3", "NoiseOne", 10803)));
+        let generated =
+            generate(&[noise_fixture("3", "NoiseOne", 10803)]).expect("noise generates");
+        assert!(generated.requires_fork, "fork sidecar path");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("3")))
+            .expect("noise outbound present");
+        assert_eq!(node["type"], json!("noise"));
+
+        // AWG obfuscation on a Noise row: explicit AWG-vs-Noise rejection.
+        let mut awg_on_noise = noise_fixture("4", "Confused", 10804);
+        awg_on_noise.params = json!({"type": "noise", "server": "192.0.2.44",
+            "server_port": 51820, "password": "k", "jc": "4"})
+        .to_string();
+        let error = generate(std::slice::from_ref(&awg_on_noise)).expect_err("AWG on Noise fails");
+        assert!(
+            matches!(error, EngineError::WrongLayer { .. }),
+            "typed, got {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("\"jc\""), "names field: {text}");
+        assert!(text.contains("Noise"), "names confusion: {text}");
+
+        // Xray noise semantics on a stock row: explicit wrong-layer rejection.
+        let mut xray_on_stock = fixture(
+            "5",
+            "StockNoise",
+            "vless",
+            json!({"type": "vless", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "noise": "a"}),
+            "127.0.0.1",
+            10805,
+        );
+        let error =
+            generate(std::slice::from_ref(&xray_on_stock)).expect_err("noise on stock fails");
+        assert!(
+            matches!(error, EngineError::WrongLayer { .. }),
+            "typed, got {error}"
+        );
+
+        // Fork gate: a missing fork binary fails only the Noise row.
+        let (mut controller, stock, _, _, _) = EngineController::fake_quartet();
+        controller
+            .start_all(&[fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            )])
+            .expect("stock starts without fork");
+        assert!(stock.is_running());
+        let error = controller
+            .start_one(&noise_fixture("3", "NoiseOne", 10803))
+            .expect_err("missing fork fails Noise only");
+        assert!(
+            matches!(error, EngineError::MissingForkBinary { .. }),
+            "typed, got {error}"
+        );
+        let _ = &mut xray_on_stock;
+    }
+
+    /// Three extra-core rows start together with per-slot isolation (N named
+    /// slots, each its own endpoint and sidecar config).
+    #[test]
+    fn ticket27_three_extra_slots_serve_each_endpoint() {
+        let rows = vec![
+            extra_fixture("5", "SlotA", 10805),
+            extra_fixture("6", "SlotB", 10806),
+            extra_fixture("7", "SlotC", 10807),
+        ];
+        let plan = validate_activation(&rows).expect("three extras plan");
+        assert_eq!(plan.extras.len(), 3, "no singleton cap");
+        let (mut controller, _, _, _, first) = EngineController::fake_quartet();
+        let second = controller.push_test_extra_backend();
+        let third = controller.push_test_extra_backend();
+        controller.set_extra_probe(|_| Ok(PathBuf::from("test-extra-exe")));
+        controller.start_all(&rows).expect("start-all serves each");
+        assert_eq!(controller.running_count(), 3);
+        assert!(controller.is_running("5"));
+        assert!(controller.is_running("6"));
+        assert!(controller.is_running("7"));
+        for (handle, row) in [&first, &second, &third].iter().zip(rows.iter()) {
+            assert!(handle.is_running(), "{} up", row.name);
+            let served = handle.last_config().expect("slot got its config");
+            assert!(
+                served.contains("127.0.0.1"),
+                "{} config passed through: {served}",
+                row.name
+            );
+        }
     }
 }

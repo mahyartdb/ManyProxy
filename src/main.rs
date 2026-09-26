@@ -996,10 +996,18 @@ fn lan_hint_for_bind(bind: &str) -> Option<String> {
 /// Errors are generic on purpose (never echo the URL: tokens hide in
 /// queries). Bodies are capped at 8 MiB and must be UTF-8; anything else is
 /// a refresh failure that keeps the last-good members.
+/// Ticket 27: the fetch enforces [`store::subscription_fetch_policy`] first —
+/// internal hosts Block without touching the network (SSRF guard); plaintext
+/// http Warns (proceeds: LAN-provider compat, tokens leak in plaintext).
 async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Result<String, String> {
     use futures::AsyncReadExt as _;
     const MAX_BYTES: usize = 8 * 1024 * 1024;
     const TIMEOUT_SECS: u64 = 20;
+    match store::subscription_fetch_policy(url) {
+        store::SubscriptionFetchPolicy::Block { reason } => return Err(reason.to_string()),
+        store::SubscriptionFetchPolicy::Warn { .. } => {}
+        store::SubscriptionFetchPolicy::Allow => {}
+    }
     let request = http_client::http::Request::builder()
         .uri(url)
         .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
