@@ -18,15 +18,17 @@
 //! egress (each probe dials its own `bind:port`); secrets never reach stored
 //! or displayed log lines ([`redact_secrets`] runs on every ingest).
 
-#[cfg(test)]
-use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+/// Ticket 26: the fake prober crosses threads (health probes run on the
+/// background executor via `spawn_probe`), so its shared script state is
+/// `Arc<Mutex<…>>` instead of `Rc<RefCell<…>>`. The scripting API
+/// (`shared`, latencies, failures, deny-list, call log) is unchanged.
 #[cfg(test)]
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::{inbound_tag, outbound_tag};
@@ -161,9 +163,9 @@ pub fn is_probeable_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Production driver: blocking TCP dials with a per-test timeout. Runs on
-/// the UI thread in v1 (timeouts bound the freeze; background scheduling is
-/// deferred — see ledger ruling).
+/// Production driver: blocking TCP dials with a per-test timeout. Ticket 26:
+/// the blocking calls run on the background executor via
+/// `AppView::spawn_probe` — never on the UI thread.
 pub struct RealHealthProber {
     timeout: Duration,
 }
@@ -974,21 +976,23 @@ pub struct ProbeCall {
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct FakeHealthHandle {
-    state: Rc<RefCell<FakeProbeState>>,
+    state: Arc<Mutex<FakeProbeState>>,
 }
 
 #[cfg(test)]
 impl FakeHealthHandle {
     pub fn script_latency(&self, config_id: &str, latency_ms: u64) {
         self.state
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .latency
             .insert(config_id.to_string(), latency_ms);
     }
 
     pub fn script_failure(&self, config_id: &str, cause: &str) {
         self.state
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .failures
             .insert(config_id.to_string(), cause.to_string());
     }
@@ -997,14 +1001,16 @@ impl FakeHealthHandle {
     /// touching the runner; the runner records a named skip).
     pub fn deny_protocol(&self, protocol: &str) {
         self.state
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .denied
             .insert(protocol.trim().to_ascii_lowercase());
     }
 
     pub fn calls_for(&self, config_id: &str) -> Vec<ProbeCall> {
         self.state
-            .borrow()
+            .lock()
+            .unwrap()
             .calls
             .iter()
             .filter(|call| call.config_id == config_id)
@@ -1017,14 +1023,14 @@ impl FakeHealthHandle {
 /// All health tests run against this.
 #[cfg(test)]
 pub struct FakeHealthProber {
-    state: Rc<RefCell<FakeProbeState>>,
+    state: Arc<Mutex<FakeProbeState>>,
     default_latency: u64,
 }
 
 #[cfg(test)]
 impl FakeHealthProber {
     pub fn shared() -> (Self, FakeHealthHandle) {
-        let state = Rc::new(RefCell::new(FakeProbeState::default()));
+        let state = Arc::new(Mutex::new(FakeProbeState::default()));
         (
             Self {
                 state: state.clone(),
@@ -1035,7 +1041,7 @@ impl FakeHealthProber {
     }
 
     fn scripted(&self, config: &ProxyConfig) -> Result<ProbeSuccess, String> {
-        let state = self.state.borrow();
+        let state = self.state.lock().unwrap();
         if let Some(cause) = state.failures.get(&config.id) {
             return Err(cause.clone());
         }
@@ -1057,7 +1063,8 @@ impl HealthProber for FakeHealthProber {
     fn supports(&self, config: &ProxyConfig) -> bool {
         !self
             .state
-            .borrow()
+            .lock()
+            .unwrap()
             .denied
             .contains(&config.protocol.trim().to_ascii_lowercase())
     }
@@ -1069,7 +1076,7 @@ impl HealthProber for FakeHealthProber {
         port: u16,
         url: &str,
     ) -> Result<ProbeSuccess, String> {
-        self.state.borrow_mut().calls.push(ProbeCall {
+        self.state.lock().unwrap().calls.push(ProbeCall {
             config_id: config.id.clone(),
             kind: HealthKind::UrlTest,
             bind: bind.to_string(),
@@ -1085,7 +1092,7 @@ impl HealthProber for FakeHealthProber {
         bind: &str,
         port: u16,
     ) -> Result<ProbeSuccess, String> {
-        self.state.borrow_mut().calls.push(ProbeCall {
+        self.state.lock().unwrap().calls.push(ProbeCall {
             config_id: config.id.clone(),
             kind: HealthKind::TcpPing,
             bind: bind.to_string(),

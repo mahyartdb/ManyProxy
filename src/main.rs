@@ -34,15 +34,47 @@ use health::{
 };
 use import::{
     commit_batch, effective_hint_for_text, format_import_failures, import_file_content,
-    import_multi_file_contents, import_text, is_addsub_attempt, parse_addsub_link, AddSubRequest,
-    ImportError,
+    import_multi_file_contents, import_text, is_addsub_attempt, is_library_export,
+    parse_addsub_link, AddSubRequest, ImportError,
 };
 use store::{
     count_importable, delete_confirm_text, due_for_refresh, export_confirm_description, now_unix,
-    proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig, Store, StoreError,
-    Subscription as ProxySubscription, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND, DEFAULT_GROUP,
-    DEFAULT_PROTOCOL,
+    proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig, RestoreOutcome, Store,
+    StoreError, Subscription as ProxySubscription, DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND,
+    DEFAULT_GROUP, DEFAULT_PROTOCOL,
 };
+
+// Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
+// [`bind_app_keys`]; the shell div handles them via `.on_action(...)`.
+// Every handler is a no-op while any dialog is open, so shortcut keys never
+// steal dialog input (the dialog keeps its own Confirm/Cancel keys).
+actions!(
+    manyproxy,
+    [
+        AddConfig,
+        ImportConfigs,
+        StartSelected,
+        StopSelected,
+        TestSelected
+    ]
+);
+
+/// Ticket 26: key context owning the five app shortcuts (was the bare
+/// `"manyproxy-library"` literal with no bindings — a dead context).
+pub const APP_KEY_CONTEXT: &str = "manyproxy-library";
+
+/// Ticket 26: register the app shortcuts under [`APP_KEY_CONTEXT`].
+/// Modifier-only chords (never printable characters) so list search typing
+/// is unaffected; dialogs are guarded at the handler, not the binding.
+pub fn bind_app_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-n", AddConfig, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-o", ImportConfigs, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("f5", StartSelected, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("shift-f5", StopSelected, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-t", TestSelected, Some(APP_KEY_CONTEXT)),
+    ]);
+}
 
 /// Ticket 12: background tick intervals. Each tick is bounded (engine poll
 /// is O(1); the subscription pass only starts already-due subs; the
@@ -110,6 +142,10 @@ impl LibraryDelegate {
     }
 
     fn apply_filter(&mut self) {
+        // Ticket 26: re-derive the selection by config id (the `set_rows`
+        // pattern), never by stale index. A narrowed filter clears a
+        // filtered-out selection instead of landing actions on the wrong row.
+        let selected_id = self.selected_row().map(|row| row.id.clone());
         let query = self.query.clone();
         self.visible = self
             .rows
@@ -120,11 +156,12 @@ impl LibraryDelegate {
             .filter(|(_, row)| library_row_matches(row, &query))
             .map(|(index, _)| index)
             .collect();
-        if let Some(selected) = self.selected {
-            if selected.row >= self.visible.len() {
-                self.selected = None;
-            }
-        }
+        self.selected = selected_id.and_then(|id| {
+            self.visible
+                .iter()
+                .position(|&index| self.rows[index].id == id)
+                .map(IndexPath::new)
+        });
     }
 
     fn row_at(&self, index: IndexPath) -> Option<ProxyConfig> {
@@ -258,6 +295,12 @@ type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 /// user action can never fire both paths (no double-commit). Button ids are
 /// stable per dialog; observability comes from the base button itself
 /// (`Button::new(id)` wraps a `div().id(id).test_support()`).
+/// Ticket 26 (L7 ruling): no idempotency token is added on top. The framework
+/// routes one user gesture to exactly one path (a click never dispatches the
+/// Confirm key action and vice versa — verified against the `Dialog` render
+/// in ticket 18), and both paths share the single `Rc` closure, so there is
+/// no second execution to dedupe. Dialogs with real re-entrancy risk (import
+/// parse, refresh fetch) carry their own in-flight guards instead.
 fn dialog_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
@@ -385,14 +428,29 @@ impl ConfigForm {
         }
     }
 
-    fn as_patch(&self, cx: &App) -> ConfigPatch {
+    /// Ticket 26: patch relative to the dialog-open snapshot. Fields the user
+    /// did not touch stay `None` (unchanged), so a concurrent refresh that
+    /// landed after the dialog opened survives the commit on every untouched
+    /// field. Only genuinely edited fields are written. Blank-vs-snapshot
+    /// keeps the store's blank-equals-keep semantics (`Some("")` on genuinely
+    /// edited fields behaves exactly like the old full patch).
+    fn as_patch_vs(&self, cx: &App, baseline: &ProxyConfig) -> ConfigPatch {
+        fn changed(current: &str, baseline: &str) -> bool {
+            current != baseline
+        }
+        let name = self.name.read(cx).value().to_string();
+        let protocol = self.protocol.read(cx).value().to_string();
+        let params = self.params.read(cx).value().to_string();
+        let group = self.group.read(cx).value().to_string();
+        let bind = self.bind.read(cx).value().to_string();
+        let port = self.port.read(cx).value().to_string();
         ConfigPatch {
-            name: Some(self.name.read(cx).value().to_string()),
-            protocol: Some(self.protocol.read(cx).value().to_string()),
-            params: Some(self.params.read(cx).value().to_string()),
-            group: Some(self.group.read(cx).value().to_string()),
-            bind_ip: Some(self.bind.read(cx).value().to_string()),
-            port: Some(self.port.read(cx).value().to_string()),
+            name: changed(&name, &baseline.name).then_some(name),
+            protocol: changed(&protocol, &baseline.protocol).then_some(protocol),
+            params: changed(&params, &baseline.params).then_some(params),
+            group: changed(&group, &baseline.group).then_some(group),
+            bind_ip: changed(&bind, &baseline.bind_ip).then_some(bind),
+            port: changed(&port, &baseline.port.to_string()).then_some(port),
         }
     }
 }
@@ -601,6 +659,62 @@ fn import_preview_message(valid: usize, invalid: usize) -> String {
     format!("{valid} valid · {invalid} invalid")
 }
 
+/// Ticket 26: parse-ready import inputs, shared by the synchronous commit
+/// (tests, headless) and the background dialog commit. `original` is the
+/// dialog prefill: edited text drops the stale drop hint and multi-file
+/// bytes and sniffs as its own type.
+struct ResolvedImport {
+    text: String,
+    group: String,
+    file_hint: Option<String>,
+    multi: Option<Vec<(String, String)>>,
+}
+
+fn resolve_import_inputs(
+    text: String,
+    group: String,
+    file_hint: Option<String>,
+    original: Option<String>,
+    multi: Option<Vec<(String, String)>>,
+) -> ResolvedImport {
+    let edited = match original.as_deref() {
+        Some(prefill) => text.trim() != prefill.trim(),
+        None => false,
+    };
+    let multi = if edited { None } else { multi };
+    let file_hint = if edited {
+        None
+    } else {
+        effective_hint_for_text(file_hint.as_deref(), &text)
+    };
+    ResolvedImport {
+        text,
+        group,
+        file_hint,
+        multi,
+    }
+}
+
+/// Ticket 26: pure CPU parse of resolved inputs (runs on the background
+/// executor on the dialog path). Unedited multi-file drops parse per file
+/// (stems/keys survive); everything else sniffs single-text.
+fn parse_import_inputs(resolved: &ResolvedImport) -> crate::import::BatchResult {
+    // Unedited multi-file drop: per-file parse keeps stems/keys.
+    if let Some(files) = &resolved.multi {
+        if resolved.file_hint.is_none() {
+            let refs: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(name, content)| (name.as_str(), content.as_str()))
+                .collect();
+            return import_multi_file_contents(&refs);
+        }
+    }
+    match &resolved.file_hint {
+        Some(name) => import_file_content(name, &resolved.text),
+        None => import_text(&resolved.text),
+    }
+}
+
 /// Ticket 17: basename of a dropped path (dialogs show file names, never
 /// full paths — paths can carry OS usernames).
 fn file_basename(path: &str) -> String {
@@ -660,23 +774,29 @@ fn subscription_failures_text(failures: &[crate::import::ImportFailure]) -> Stri
 
 /// Ticket 17: one coalesced background-tick summary for N refreshes.
 /// `None` when there is nothing to report (never an empty toast).
-/// The bool is the warning flag (any failed member warns).
+/// The bool is the warning flag (any failed member — or any preserved user
+/// edit — warns).
 fn coalesced_refresh_message(
     subs: usize,
     added: usize,
     updated: usize,
     removed: usize,
     failed: usize,
+    conflicts: usize,
 ) -> Option<(bool, String)> {
     if subs == 0 {
         return None;
     }
     let text =
         format!("Background refresh: {subs} subscription(s): +{added} ~{updated} -{removed}");
-    if failed == 0 {
+    if failed == 0 && conflicts == 0 {
         Some((false, text))
     } else {
-        Some((true, format!("{text} · {failed} failed")))
+        let mut full = format!("{text} · {failed} failed");
+        if conflicts > 0 {
+            full.push_str(&format!(" · {conflicts} conflict(s) — your edits kept"));
+        }
+        Some((true, full))
     }
 }
 
@@ -701,6 +821,71 @@ fn stop_all_message(running: usize) -> String {
 /// Ticket 17: honest stop-on-stopped copy naming the row.
 fn already_stopped_message(name: &str) -> String {
     format!("\"{name}\" is already stopped")
+}
+
+/// Ticket 26: the enabled flag is NOT the engine. The switch and the Enable
+/// button write the stored flag only — they never start or stop an endpoint
+/// (see [`AppView::commit_enabled_flag`]). This copy says so on every
+/// successful toggle so the two states can never be confused.
+fn enabled_flag_message(name: &str, enabled: bool) -> String {
+    if enabled {
+        format!("\"{name}\" enabled (flag only — Start to serve)")
+    } else {
+        format!("\"{name}\" disabled (flag only — Stop to close the endpoint)")
+    }
+}
+
+/// Ticket 26: store-list failure copy. Names the database error instead of
+/// rendering (or toasting about) an empty library that is not really empty.
+fn db_list_error_message(error: &StoreError) -> String {
+    format!("Cannot load library: {error}")
+}
+
+/// Ticket 26: one refresh completion rendered as text. Returns the warning
+/// flag (any failure OR any preserved user edit warns) plus the line.
+/// Conflicts are user edits the merge refused to revert — they are named,
+/// never folded into silence.
+#[allow(clippy::too_many_arguments)]
+fn refresh_summary_text(
+    label: &str,
+    added: usize,
+    updated: usize,
+    removed: usize,
+    skipped: usize,
+    duplicates: usize,
+    failures: usize,
+    conflicts: usize,
+) -> (bool, String) {
+    let mut summary = format!("{label}: +{added} ~{updated} -{removed}");
+    if skipped > 0 {
+        summary.push_str(&format!(" · {skipped} skipped"));
+    }
+    if duplicates > 0 {
+        summary.push_str(&format!(" · {duplicates} duplicates"));
+    }
+    if failures > 0 {
+        summary.push_str(&format!(" · {failures} failed"));
+    }
+    if conflicts > 0 {
+        summary.push_str(&format!(" · {conflicts} conflict(s) — your edits kept"));
+    }
+    (failures > 0 || conflicts > 0, summary)
+}
+
+/// Ticket 26 (ticket-25 consumer): restore completion copy. Counts come from
+/// [`RestoreOutcome`]; failures are loud errors at the call site, never
+/// folded into this line.
+fn restore_done_message(outcome: &RestoreOutcome) -> String {
+    format!(
+        "Restored {} config(s), {} subscription(s)",
+        outcome.configs, outcome.subscriptions
+    )
+}
+
+/// Ticket 26: dropped-but-unreadable files are named (basenames only — full
+/// paths can carry OS usernames), never swallowed.
+fn unreadable_drop_message(names: &[String]) -> String {
+    format!("Skipped unreadable file(s): {}", names.join(", "))
 }
 
 /// Ticket 19: upstream `host:port` for a library row, read from the params
@@ -863,16 +1048,34 @@ struct SubForm {
 }
 
 impl SubForm {
-    fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
+    /// Ticket 26: the only add-form constructor. Fresh opens pass empty
+    /// strings; refresh-driven reopens pass the stashed in-progress text so
+    /// a background completion never wipes what the user already typed.
+    fn restored(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        label: &str,
+        url: &str,
+        group: &str,
+        auto_refresh: bool,
+    ) -> Self {
         Self {
-            label: cx.new(|cx| InputState::new(window, cx).placeholder("Label")),
-            url: cx.new(|cx| InputState::new(window, cx).placeholder("https://…")),
+            label: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Label")
+                    .default_value(label.to_string())
+            }),
+            url: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("https://…")
+                    .default_value(url.to_string())
+            }),
             group: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("Group")
-                    .default_value(DEFAULT_GROUP)
+                    .default_value(group.to_string())
             }),
-            auto_refresh: Rc::new(RefCell::new(true)),
+            auto_refresh: Rc::new(RefCell::new(auto_refresh)),
         }
     }
 
@@ -956,7 +1159,9 @@ fn subscription_row(
             .on_click(move |_, window, cx| {
                 let sub_id = auto_id.clone();
                 auto_view.update(cx, |view, cx| {
-                    view.commit_subscription_auto(&sub_id, auto_now, window, cx);
+                    // Ticket 26: only the id travels — the current flag is
+                    // re-read at commit (the rendered label may be stale).
+                    view.commit_subscription_auto(&sub_id, window, cx);
                 });
             }),
     );
@@ -976,28 +1181,40 @@ fn subscription_row(
 /// Ticket 12: run one background tick loop: sleep `secs`, run one bounded
 /// pass, then exit when ticks are stopped or the view is released (fail
 /// closed: a released view ends its loops instead of updating dead state).
+/// Ticket 26: the sleep runs in 1s slices with a stop/release check per
+/// slice, so stopping ticks (or closing the window) cancels promptly instead
+/// of lingering up to a full 300s due-subscription interval.
 fn spawn_tick(
     cx: &mut Context<AppView>,
     secs: u64,
     tick: impl Fn(&mut AppView, &mut Context<AppView>) + 'static,
 ) {
     let weak = cx.entity().downgrade();
-    cx.spawn(async move |_entity, cx| loop {
-        cx.background_executor()
-            .timer(Duration::from_secs(secs))
-            .await;
-        let keep_going = cx.update(|cx| {
-            weak.update(cx, |view, cx| {
-                if !view.ticks_enabled {
-                    return false;
+    cx.spawn(async move |_entity, cx| {
+        let mut elapsed = 0u64;
+        loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let live = cx.update(|cx| {
+                weak.update(cx, |view, _| view.ticks_enabled)
+                    .unwrap_or(false)
+            });
+            if !live {
+                break;
+            }
+            elapsed += 1;
+            if elapsed >= secs.max(1) {
+                elapsed = 0;
+                let ran = cx.update(|cx| {
+                    weak.update(cx, |view, cx| {
+                        tick(view, cx);
+                        true
+                    })
+                    .unwrap_or(false)
+                });
+                if !ran {
+                    break;
                 }
-                tick(view, cx);
-                true
-            })
-            .unwrap_or(false)
-        });
-        if !keep_going {
-            break;
+            }
         }
     })
     .detach();
@@ -1023,18 +1240,41 @@ struct AppView {
     health_store: HealthStore,
     logs: LogStore,
     log_filter: String,
-    prober: Box<dyn HealthProber>,
+    /// Ticket 26: `Send` so blocking probes can move to the background
+    /// executor ([`AppView::spawn_probe`]); the fake stays API-identical.
+    prober: Box<dyn HealthProber + Send>,
     ticks_enabled: bool,
     /// Ticket 17: background-refresh toast coalescing. `refresh_batch_members`
     /// holds the in-flight background member ids; completions for members
     /// accumulate counts instead of notifying, and the last member flushes at
     /// most one toast. Manual refreshes notify immediately as before.
+    /// Ticket 26: `refresh_generation` is the batch epoch (bumped only when a
+    /// batch opens from empty — a tick never resets an open batch, it unions
+    /// into it); `inflight_refreshes` dedupes manual-vs-tick double fetches
+    /// by sub id; `refresh_batch_conflicts` accumulates preserved user edits
+    /// for the coalesced copy.
     refresh_batch_total: usize,
     refresh_batch_members: HashSet<String>,
     refresh_batch_added: usize,
     refresh_batch_updated: usize,
     refresh_batch_removed: usize,
     refresh_batch_failed: usize,
+    refresh_batch_conflicts: usize,
+    refresh_generation: u64,
+    inflight_refreshes: HashSet<String>,
+    /// Ticket 26: a health probe (URL test or ping) is running off-thread.
+    /// A second probe request toasts instead of stacking (the placeholder
+    /// prober swap in [`AppView::spawn_probe`] is never observable).
+    probe_in_flight: bool,
+    /// Ticket 26: the live subscriptions-dialog add form, stashed on open so
+    /// a genuine reopen (background refresh completion) can carry
+    /// in-progress text across instead of rebuilding a blank form. `None`
+    /// means no subs dialog was opened (foreign dialogs are never touched).
+    subs_form: Option<SubForm>,
+    /// Ticket 26: an import-dialog parse is running on the background
+    /// executor. A second OK while it runs is ignored (the first completion
+    /// closes or keeps the dialog exactly once — no double commit).
+    import_parse_in_flight: bool,
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
@@ -1081,6 +1321,12 @@ impl AppView {
             refresh_batch_updated: 0,
             refresh_batch_removed: 0,
             refresh_batch_failed: 0,
+            refresh_batch_conflicts: 0,
+            refresh_generation: 0,
+            inflight_refreshes: HashSet::new(),
+            probe_in_flight: false,
+            subs_form: None,
+            import_parse_in_flight: false,
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
@@ -1089,35 +1335,28 @@ impl AppView {
             ),
         };
         let mut view = view;
+        let rows = match view.store.list() {
+            Ok(rows) => rows,
+            // Ticket 14: a broken database must not render as a silent empty
+            // library.
+            Err(error) => {
+                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+                Vec::new()
+            }
+        };
         // Ticket 12: restore last latencies + dead flags across restart.
         // Only snapshots of still-known rows hydrate (removed configs never
         // resurrect); traffic stays session-only; logs are never persisted.
+        // Ticket 26: the known set reuses the rows listed above (a second
+        // list that fails would silently hydrate nothing on a broken DB).
         if let Ok(snapshots) = view.store.load_health_snapshots() {
-            let known: HashSet<String> = view
-                .store
-                .list()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|row| row.id)
-                .collect();
+            let known: HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
             let kept: Vec<HealthSnapshot> = snapshots
                 .into_iter()
                 .filter(|snapshot| known.contains(&snapshot.config_id))
                 .collect();
             view.health_store.hydrate(&kept);
         }
-        let rows = match view.store.list() {
-            Ok(rows) => rows,
-            // Ticket 14: a broken database must not render as a silent empty
-            // library.
-            Err(error) => {
-                window.push_notification(
-                    Notification::error(format!("Cannot load library: {error}")),
-                    cx,
-                );
-                Vec::new()
-            }
-        };
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
             // Ticket 19: the rows cache refreshes inside `ListState::render`
@@ -1145,10 +1384,7 @@ impl AppView {
     /// window (background ticks, headless refresh) use [`AppView::reload_quiet`].
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.reload_inner(cx) {
-            window.push_notification(
-                Notification::error(format!("Cannot load library: {error}")),
-                cx,
-            );
+            window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
         cx.notify();
     }
@@ -1178,8 +1414,47 @@ impl AppView {
         window.push_notification(Notification::error(format!("Cannot save: {error}")), cx);
     }
 
+    /// Ticket 26: list the library or notify once with the database error.
+    /// `None` means the rows are unknown — callers must return early instead
+    /// of acting on a lying empty list (never "the library is empty" over a
+    /// corrupt database).
+    fn list_or_notify(&self, window: &mut Window, cx: &mut App) -> Option<Vec<ProxyConfig>> {
+        match self.store.list() {
+            Ok(rows) => Some(rows),
+            Err(error) => {
+                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+                None
+            }
+        }
+    }
+
+    /// Ticket 26: running rows for a probe, or notify once on a database
+    /// error (never "no running endpoints" over a corrupt database).
+    fn running_rows_or_notify(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Vec<ProxyConfig>> {
+        let running = self.engine.running_ids();
+        match self.store.list() {
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .filter(|row| running.contains(&row.id))
+                    .collect(),
+            ),
+            Err(error) => {
+                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+                None
+            }
+        }
+    }
+
     /// Ticket 17: success names the row (informational toast, never a
     /// blocking modal; nothing fires on keystrokes).
+    /// Ticket 26 (L6 ruling): the search filter is user state and survives
+    /// the add — a new row hidden by the active filter is confirmed by the
+    /// toast plus the status count, and appears when the filter clears.
+    /// Clearing the user's query behind their back would be worse.
     fn commit_add(
         &mut self,
         input: NewConfig,
@@ -1200,6 +1475,12 @@ impl AppView {
         }
     }
 
+    /// Ticket 26: re-read the row at commit. A row deleted while the dialog
+    /// was open warns "Already removed" and closes (nothing left to edit);
+    /// a store failure keeps the dialog open with the error (retryable).
+    /// Staleness inside the row is handled by the caller, which builds the
+    /// patch relative to the dialog-open snapshot (only user-touched fields
+    /// are `Some` — see [`ConfigForm::as_patch_vs`]).
     fn commit_edit(
         &mut self,
         id: &str,
@@ -1207,17 +1488,27 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        match self.store.update(id, patch) {
-            Ok(updated) => {
-                let message = config_updated_message(&updated.name);
-                self.reload(window, cx);
-                window.push_notification(Notification::success(message), cx);
+        match self.store.get(id) {
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
                 true
             }
             Err(error) => {
                 self.report_save_error(error, window, cx);
                 false
             }
+            Ok(Some(_)) => match self.store.update(id, patch) {
+                Ok(updated) => {
+                    let message = config_updated_message(&updated.name);
+                    self.reload(window, cx);
+                    window.push_notification(Notification::success(message), cx);
+                    true
+                }
+                Err(error) => {
+                    self.report_save_error(error, window, cx);
+                    false
+                }
+            },
         }
     }
 
@@ -1256,18 +1547,48 @@ impl AppView {
         }
     }
 
-    fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.selected_config(cx) else {
-            return;
-        };
-        // Ticket 14: a failed write notifies (never a dead click).
-        match self.store.set_enabled(&config.id, !config.enabled) {
-            Ok(_) => self.reload(window, cx),
+    /// Ticket 26: the single enabled-flag commit behind the detail switch and
+    /// the Enable/Disable button. The flag is re-read fresh (never a stale
+    /// snapshot write) and the engine is deliberately untouched — the toast
+    /// says so ([`enabled_flag_message`]): enable ≠ start, disable ≠ stop.
+    /// One semantic, documented at the only place it can be confused.
+    fn commit_enabled_flag(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .store
+            .get(id)
+            .ok()
+            .flatten()
+            .map(|row| row.name)
+            .unwrap_or_else(|| id.to_string());
+        // Ticket 14: a failed write notifies (never a dead switch).
+        match self.store.set_enabled(id, enabled) {
+            Ok(_) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::info(enabled_flag_message(&name, enabled)),
+                    cx,
+                );
+            }
             Err(error) => {
                 window
                     .push_notification(Notification::error(format!("Cannot toggle: {error}")), cx);
             }
         }
+    }
+
+    fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            return;
+        };
+        let id = config.id.clone();
+        let enabled = !config.enabled;
+        self.commit_enabled_flag(&id, enabled, window, cx);
     }
 
     fn copy_selected_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1350,12 +1671,28 @@ impl AppView {
         }
         match self.engine.start_one_confirmed(&config) {
             Ok(()) => {
-                let _ = self.store.set_enabled(id, true);
-                self.reload(window, cx);
-                window.push_notification(
-                    Notification::success(format!("Started \"{}\"", config.name)),
-                    cx,
-                );
+                // Ticket 26: a flag write that fails after a successful start
+                // is loud (never a silent `let _`): the endpoint runs while
+                // the flag lies, so the toast says exactly that.
+                match self.store.set_enabled(id, true) {
+                    Ok(_) => {
+                        self.reload(window, cx);
+                        window.push_notification(
+                            Notification::success(format!("Started \"{}\"", config.name)),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        self.reload(window, cx);
+                        window.push_notification(
+                            Notification::error(format!(
+                                "Started \"{}\" but could not save its flag: {error}",
+                                config.name
+                            )),
+                            cx,
+                        );
+                    }
+                }
             }
             Err(error) => {
                 window
@@ -1372,12 +1709,27 @@ impl AppView {
         };
         let id = config.id.clone();
         if self.engine.stop_one(&id) {
-            let _ = self.store.set_enabled(&id, false);
-            self.reload(window, cx);
-            window.push_notification(
-                Notification::success(format!("Stopped \"{}\"", config.name)),
-                cx,
-            );
+            // Ticket 26: loud on flag-write failure (the endpoint stopped
+            // while the flag still claims enabled).
+            match self.store.set_enabled(&id, false) {
+                Ok(_) => {
+                    self.reload(window, cx);
+                    window.push_notification(
+                        Notification::success(format!("Stopped \"{}\"", config.name)),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    self.reload(window, cx);
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Stopped \"{}\" but could not save its flag: {error}",
+                            config.name
+                        )),
+                        cx,
+                    );
+                }
+            }
         } else {
             // Ticket 17: honest stop-on-stopped (never silence, never a
             // success claim over nothing).
@@ -1392,8 +1744,17 @@ impl AppView {
     /// endpoint; the enabled flag follows the engine state).
     /// Ticket 09: any non-loopback bind routes through one confirm dialog
     /// naming every LAN-bound row — nothing starts until the user confirms.
+    /// Ticket 26 (L2 ruling): the confirm text snapshots the rows at open
+    /// while [`AppView::commit_start_all`] re-lists fresh at commit. The text
+    /// is point-in-time information; the commit set is authoritative, and the
+    /// LAN gate re-evaluates on the fresh rows — a row added or removed
+    /// between open and confirm can neither sneak past nor dodge the gate.
     fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.store.list().unwrap_or_default();
+        // Ticket 26: a broken database errors here (never "the library is
+        // empty" over rows we simply failed to read).
+        let Some(rows) = self.list_or_notify(window, cx) else {
+            return;
+        };
         let lan: Vec<(String, String)> = rows
             .iter()
             .filter(|row| requires_lan_confirm(&row.bind_ip))
@@ -1425,19 +1786,45 @@ impl AppView {
     /// Ticket 23: post-gate starts use the confirmed variant; check output
     /// is redacted for display.
     fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.store.list().unwrap_or_default();
+        // Ticket 26: same honesty as the pre-gate read — a corrupt database
+        // names its error instead of claiming an empty library.
+        let Some(rows) = self.list_or_notify(window, cx) else {
+            return;
+        };
         if rows.is_empty() {
             window.push_notification(Notification::warning(start_all_message(0)), cx);
             return;
         }
         match self.engine.start_all_confirmed(&rows) {
             Ok(()) => {
+                // Ticket 26: flag writes after a successful start are loud
+                // in aggregate (never silent per-row `let _`).
+                let mut flag_errors = 0;
+                let mut first_error = String::new();
                 for row in &rows {
-                    let _ = self.store.set_enabled(&row.id, true);
+                    if let Err(error) = self.store.set_enabled(&row.id, true) {
+                        if flag_errors == 0 {
+                            first_error = error.to_string();
+                        }
+                        flag_errors += 1;
+                    }
                 }
                 self.reload(window, cx);
                 self.warn_for_lan_binds(window, cx);
-                window.push_notification(Notification::success(start_all_message(rows.len())), cx);
+                if flag_errors == 0 {
+                    window.push_notification(
+                        Notification::success(start_all_message(rows.len())),
+                        cx,
+                    );
+                } else {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Started {} endpoint(s) but {flag_errors} flag(s) failed to save: {first_error}",
+                            rows.len()
+                        )),
+                        cx,
+                    );
+                }
             }
             Err(error) => {
                 window
@@ -1452,29 +1839,43 @@ impl AppView {
     fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let running = self.engine.running_count();
         self.engine.stop_all();
-        let rows = self.store.list().unwrap_or_default();
-        for row in &rows {
-            let _ = self.store.set_enabled(&row.id, false);
+        // Ticket 26: the engine stops regardless; the flag sweep after it is
+        // loud on database failure (and skips the stale-flag lie).
+        match self.store.list() {
+            Ok(rows) => {
+                let mut flag_errors = 0;
+                let mut first_error = String::new();
+                for row in &rows {
+                    if let Err(error) = self.store.set_enabled(&row.id, false) {
+                        if flag_errors == 0 {
+                            first_error = error.to_string();
+                        }
+                        flag_errors += 1;
+                    }
+                }
+                self.reload(window, cx);
+                if flag_errors > 0 {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Stopped all endpoints but {flag_errors} flag(s) failed to save: {first_error}"
+                        )),
+                        cx,
+                    );
+                    return;
+                }
+            }
+            Err(error) => {
+                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+                self.reload_quiet(cx);
+                return;
+            }
         }
-        self.reload(window, cx);
         let message = stop_all_message(running);
         if running == 0 {
             window.push_notification(Notification::warning(message), cx);
         } else {
             window.push_notification(Notification::success(message), cx);
         }
-    }
-
-    /// Ticket 06: stored rows backing the running endpoints (each probe
-    /// dials its own row's endpoint, so results are per-egress).
-    fn active_health_rows(&self) -> Vec<ProxyConfig> {
-        let running = self.engine.running_ids();
-        self.store
-            .list()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|row| running.contains(&row.id))
-            .collect()
     }
 
     /// Ticket 06: per-row summaries for the virtualized list.
@@ -1523,31 +1924,31 @@ impl AppView {
     }
 
     /// Ticket 06: run one URL test per active endpoint, record samples +
-    /// traffic, refresh the rows, and summarize. Synchronous in v1 with a
-    /// bounded per-test timeout (background scheduling deferred).
+    /// traffic, refresh the rows, and summarize.
     /// Ticket 12: outcomes persist (latest sample + dead flag survive
     /// restart) via [`AppView::record_and_persist`].
+    /// Ticket 26 (ticket-25 consumer): the blocking probes run on the
+    /// background executor via [`AppView::spawn_probe`] — the click returns
+    /// after starting them, never after a 5s-per-row freeze. Returns the
+    /// number of probes started.
     fn test_all_health(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
-        let rows = self.active_health_rows();
+        let Some(rows) = self.running_rows_or_notify(window, cx) else {
+            return 0;
+        };
         if rows.is_empty() {
             window.push_notification(Notification::warning("No running endpoints to test"), cx);
             return 0;
         }
-        let outcomes = test_all(&rows, DEFAULT_TEST_URL, &mut *self.prober);
-        self.record_and_persist(&outcomes);
-        let (live, dead) = self.health_counts();
-        self.reload(window, cx);
-        window.push_notification(
-            Notification::success(format!(
-                "Tested {} endpoint(s): {live} live · {dead} dead",
-                outcomes.len()
-            )),
-            cx,
-        );
-        outcomes.len()
+        if self.probe_in_flight {
+            window.push_notification(Notification::info("A health test is already running"), cx);
+            return 0;
+        }
+        self.spawn_probe(rows, false, true, Some(window.window_handle()), cx)
     }
 
     /// Ticket 06: URL-test just the selected config's endpoint.
+    /// Ticket 26: off-thread via [`AppView::spawn_probe`] (silent record,
+    /// like before — no toast).
     fn test_selected_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             return;
@@ -1559,16 +1960,15 @@ impl AppView {
             );
             return;
         }
-        let outcomes = test_all(
-            std::slice::from_ref(&config),
-            DEFAULT_TEST_URL,
-            &mut *self.prober,
-        );
-        self.record_and_persist(&outcomes);
-        self.reload(window, cx);
+        if self.probe_in_flight {
+            window.push_notification(Notification::info("A health test is already running"), cx);
+            return;
+        }
+        self.spawn_probe(vec![config], false, false, None, cx);
     }
 
     /// Ticket 06: TCP-ping just the selected config's endpoint.
+    /// Ticket 26: off-thread via [`AppView::spawn_probe`] (silent record).
     fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             return;
@@ -1580,9 +1980,93 @@ impl AppView {
             );
             return;
         }
-        let outcomes = ping_all(std::slice::from_ref(&config), &mut *self.prober);
-        self.record_and_persist(&outcomes);
-        self.reload(window, cx);
+        if self.probe_in_flight {
+            window.push_notification(Notification::info("A health test is already running"), cx);
+            return;
+        }
+        self.spawn_probe(vec![config], true, false, None, cx);
+    }
+
+    /// Ticket 26 (ticket-25 consumer): run `test_all`/`ping_all` off the UI
+    /// thread. The boxed prober moves into the background task (a default
+    /// stands in, guarded by `probe_in_flight` so it is never observable);
+    /// completion restores the prober and records on the main thread via
+    /// [`AppView::finish_probe`]. `toast` selects the manual-test summary
+    /// (the captured window) versus the silent tick record. A released view
+    /// — or a window closed mid-flight — fails closed: outcomes are recorded
+    /// quietly or dropped without touching dead state.
+    /// Returns the number of probes started.
+    fn spawn_probe(
+        &mut self,
+        rows: Vec<ProxyConfig>,
+        ping: bool,
+        toast: bool,
+        window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if rows.is_empty() || self.probe_in_flight {
+            return 0;
+        }
+        let count = rows.len();
+        self.probe_in_flight = true;
+        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let (outcomes, prober) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut prober = prober;
+                    let outcomes = if ping {
+                        ping_all(&rows, &mut *prober)
+                    } else {
+                        test_all(&rows, DEFAULT_TEST_URL, &mut *prober)
+                    };
+                    (outcomes, prober)
+                })
+                .await;
+            cx.update(|cx| {
+                // Record half: restore the prober, clear the flag, persist.
+                // The borrow ends here so the toast half below re-enters
+                // cleanly (never update-while-updating).
+                let recorded = weak.update(cx, |view, _| {
+                    view.prober = prober;
+                    view.probe_in_flight = false;
+                    view.record_and_persist(&outcomes);
+                    (view.health_counts(), outcomes.len())
+                });
+                let Ok(((live, dead), count)) = recorded else {
+                    return;
+                };
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                // Toast half (fresh borrow): manual tests toast through the
+                // captured window; everything else reloads quietly.
+                if toast {
+                    if let Some(handle) = window {
+                        if handle
+                            .update(cx, |_, window, cx| {
+                                view.update(cx, |view, cx| {
+                                    view.reload(window, cx);
+                                    window.push_notification(
+                                        Notification::success(format!(
+                                            "Tested {count} endpoint(s): {live} live · {dead} dead"
+                                        )),
+                                        cx,
+                                    );
+                                });
+                            })
+                            .is_ok()
+                        {
+                            return;
+                        }
+                    }
+                }
+                view.update(cx, |view, cx| view.reload_quiet(cx));
+            });
+        })
+        .detach();
+        count
     }
 
     /// Ticket 13: ingest buffered sidecar stderr into the session LogStore
@@ -1595,7 +2079,11 @@ impl AppView {
         if lines.is_empty() {
             return;
         }
-        let active = self.store.list().unwrap_or_default();
+        // Ticket 26: a broken database skips ingest (keeps old lines) instead
+        // of tagging against a lying empty row set.
+        let Ok(active) = self.store.list() else {
+            return;
+        };
         for line in &lines {
             self.logs.push_raw(line, &active);
         }
@@ -1632,6 +2120,9 @@ impl AppView {
 
     /// Ticket 06: per-config log dialog with a filter field. OK applies the
     /// filter and re-renders when still open.
+    /// Ticket 26 (L4 ruling): the lines snapshot at open; new sidecar lines
+    /// need a reopen. Live re-rendering an open dialog on every engine tick
+    /// would fight the user's scroll position and filter typing.
     fn open_logs_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.log_filter.clone();
         let filter_state = cx.new(|cx| {
@@ -1648,13 +2139,16 @@ impl AppView {
         };
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path).
-        let commit: DialogCommit = Rc::new(move |window, cx| {
+        // Ticket 26 (L5): the commit never closes directly — returning true
+        // lets the key path (framework) and the mouse path (footer) each
+        // close exactly once. The previous explicit `close_all_dialogs` here
+        // double-closed on the mouse path.
+        let commit: DialogCommit = Rc::new(move |_window, cx| {
             let filter = reader.read(cx).value().to_string();
             view.update(cx, |view, cx| {
                 view.log_filter = filter;
                 cx.notify();
             });
-            window.close_all_dialogs(cx);
             true
         });
         let commit_key = commit.clone();
@@ -1702,9 +2196,17 @@ impl AppView {
     /// import grammar (re-import yields duplicates, never adds).
     /// Ticket 17: the dialog previews row counts, the destination path, and
     /// an overwrite warning when the file already exists.
+    /// Ticket 26 (L3 ruling): the preview snapshots at open (standard dialog
+    /// behavior). The commit re-lists for its toast, and the overwrite
+    /// confirm stands regardless — reopening the dialog refreshes the
+    /// preview.
     fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
-        let rows = self.store.list().unwrap_or_default();
+        // Ticket 26: a broken database errors instead of previewing counts
+        // over rows we failed to read.
+        let Some(rows) = self.list_or_notify(window, cx) else {
+            return;
+        };
         let path = Store::default_export_path();
         let preview = export_preview_description(
             rows.len(),
@@ -1762,6 +2264,107 @@ impl AppView {
         }
     }
 
+    /// Ticket 26 (ticket-25 consumer): library-export restore behind an
+    /// explicit confirm. The payload carries full-fidelity rows, subs, and
+    /// tombstones; restoring replaces the current library verbatim (row ids,
+    /// groups, enabled flags, subscriptions, and deletions land exactly as
+    /// exported), so the dialog names what it will do. Dismissing changes
+    /// nothing. The notification names only counts — never row contents.
+    fn open_restore_confirm(
+        &mut self,
+        payload: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let payload = payload.clone();
+            alert
+                .confirm()
+                .title("Restore library")
+                .description(
+                    "This replaces the current library with the exported backup \
+                     (row ids, groups, enabled flags, subscriptions, and deletions \
+                     are restored exactly).",
+                )
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.commit_library_restore(&payload, window, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Ticket 26: the actual restore (post-confirm). The payload is dry-run
+    /// into a throwaway store first (a malformed backup must never wipe a
+    /// good library), then the current library is wiped and the payload
+    /// rebuilt verbatim in its single transaction. Success reloads and names
+    /// the restored counts ([`restore_done_message`]); failure names the
+    /// export error. Row ids survive, so running endpoints are unaffected.
+    fn commit_library_restore(
+        &mut self,
+        payload: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match Store::open_in_memory()
+            .and_then(|mut dry| dry.restore_library_json(payload).map(|_| ()))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                window
+                    .push_notification(Notification::error(format!("Restore failed: {error}")), cx);
+                return;
+            }
+        }
+        if let Err(error) = self.wipe_library_for_restore() {
+            window.push_notification(
+                Notification::error(format!(
+                    "Restore failed: cannot clear the library ({error})"
+                )),
+                cx,
+            );
+            return;
+        }
+        match self.store.restore_library_json(payload) {
+            Ok(outcome) => {
+                self.reload(window, cx);
+                window.push_notification(Notification::success(restore_done_message(&outcome)), cx);
+            }
+            Err(error) => {
+                // The dry run passed, so this is unreachable in practice;
+                // reported loudly all the same (the library was cleared).
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::error(format!(
+                        "Restore failed after clearing the library: {error}"
+                    )),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ticket 26: empty the library ahead of a verbatim restore.
+    /// Subscriptions go first: [`Store::remove_subscription`] releases their
+    /// rows to hand-owned instead of deleting them, so the wipe itself
+    /// records no tombstones; the row sweep then deletes cleanly. Tombstones
+    /// that predate the wipe carry over (they only gate re-adding vanished
+    /// rows, never the restored rows themselves).
+    fn wipe_library_for_restore(&mut self) -> Result<(), StoreError> {
+        let subs = self.store.list_subscriptions()?;
+        for sub in &subs {
+            self.store.remove_subscription(&sub.id)?;
+        }
+        let rows = self.store.list()?;
+        for row in &rows {
+            self.store.remove(&row.id)?;
+        }
+        Ok(())
+    }
+
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let form = ConfigForm::blank(window, cx);
         let view = cx.entity();
@@ -1806,10 +2409,13 @@ impl AppView {
         let title = format!("Edit {}", config.name);
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
+        // Ticket 26: the patch is relative to this dialog-open snapshot —
+        // only fields the user actually changed are written, so a refresh
+        // that lands mid-edit survives on every untouched field.
+        let snapshot = config.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
-            view.update(cx, |view, cx| {
-                view.commit_edit(&id, reader.as_patch(cx), window, cx)
-            })
+            let patch = reader.as_patch_vs(cx, &snapshot);
+            view.update(cx, |view, cx| view.commit_edit(&id, patch, window, cx))
         });
         let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
@@ -1894,6 +2500,9 @@ impl AppView {
         let reader = form.clone();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
+        // Ticket 26: the dialog commit parses on the background executor
+        // ([`AppView::commit_import_dialog`]) — it returns false immediately
+        // and the completion closes the dialog on success.
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let text = reader.text.read(cx).value().to_string();
             let group = reader.group.read(cx).value().to_string();
@@ -1901,15 +2510,7 @@ impl AppView {
             let original = reader.original_text.clone();
             let multi = reader.multi_files.clone();
             view.update(cx, |view, cx| {
-                view.commit_import_with_context(
-                    text,
-                    group,
-                    hint,
-                    Some(original),
-                    multi,
-                    window,
-                    cx,
-                )
+                view.commit_import_dialog(text, group, hint, Some(original), multi, window, cx)
             })
         });
         let commit_key = commit.clone();
@@ -1951,6 +2552,8 @@ impl AppView {
     /// `.conf` content parses as WireGuard with stem-based peer names.
     /// Ticket 16: multi-file drops retain every file's bytes so per-file
     /// `.conf` stems/keys survive; the dialog still shows the merged text.
+    /// Ticket 26: unreadable files are named (basenames only — full paths can
+    /// carry OS usernames), never silently skipped.
     fn import_dropped_files(
         &mut self,
         paths: &ExternalPaths,
@@ -1960,6 +2563,7 @@ impl AppView {
         let mut merged = String::new();
         let mut names: Vec<String> = Vec::new();
         let mut files: Vec<(String, String)> = Vec::new();
+        let mut unreadable: Vec<String> = Vec::new();
         for path in paths.0.iter() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 if !merged.is_empty() {
@@ -1969,11 +2573,26 @@ impl AppView {
                 let name = path.to_string_lossy().into_owned();
                 names.push(name.clone());
                 files.push((name, content));
+            } else {
+                unreadable.push(file_basename(&path.to_string_lossy()));
             }
         }
         if merged.trim().is_empty() {
-            window.push_notification(Notification::warning("No readable files dropped"), cx);
+            if unreadable.is_empty() {
+                window.push_notification(Notification::warning("No readable files dropped"), cx);
+            } else {
+                window.push_notification(
+                    Notification::warning(unreadable_drop_message(&unreadable)),
+                    cx,
+                );
+            }
             return;
+        }
+        if !unreadable.is_empty() {
+            window.push_notification(
+                Notification::warning(unreadable_drop_message(&unreadable)),
+                cx,
+            );
         }
         if names.len() == 1 {
             let file_hint = names.into_iter().next();
@@ -2015,6 +2634,9 @@ impl AppView {
     /// is the dialog prefill (when `text` differs, the drop hint and the
     /// multi-file bytes are stale and the edited text sniffs as its own
     /// type); `multi` carries every dropped file for unedited multi-commits.
+    /// Ticket 26: library-export payloads divert to the restore confirm
+    /// path; everything else shares [`resolve_import_inputs`] /
+    /// [`parse_import_inputs`] with the background dialog path.
     #[allow(clippy::too_many_arguments)]
     fn commit_import_with_context(
         &mut self,
@@ -2026,53 +2648,146 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let edited = match original.as_deref() {
-            Some(prefill) => text.trim() != prefill.trim(),
-            None => false,
-        };
-        let multi = if edited { None } else { multi };
-        let file_hint = if edited {
-            None
-        } else {
-            effective_hint_for_text(file_hint.as_deref(), &text)
-        };
-        // Unedited multi-file drop: per-file parse keeps stems/keys.
-        if let Some(files) = multi {
-            if file_hint.is_none() {
-                let refs: Vec<(&str, &str)> = files
-                    .iter()
-                    .map(|(name, content)| (name.as_str(), content.as_str()))
-                    .collect();
-                let batch = import_multi_file_contents(&refs);
-                return self.finish_import_batch(batch, &group, window, cx);
-            }
+        if is_library_export(&text) {
+            self.open_restore_confirm(text, window, cx);
+            return false;
         }
-        let trimmed = text.trim();
-        if !trimmed.is_empty() && !trimmed.contains('\n') && file_hint.is_none() {
-            // Ticket 14: only addsub lines divert; a malformed one reports
-            // its own parse reason (never the generic unknown-command) and
-            // keeps the dialog open.
-            if is_addsub_attempt(trimmed) {
-                return match parse_addsub_link(trimmed) {
-                    Ok(request) => {
-                        let effective = effective_addsub_group(&group, &request.group);
-                        self.commit_addsub_request_with_group(request, &effective, window, cx)
-                    }
-                    Err(error) => {
-                        window.push_notification(
-                            Notification::error(addsub_error_message(&error)),
-                            cx,
-                        );
-                        false
-                    }
-                };
-            }
+        let resolved = resolve_import_inputs(text, group, file_hint, original, multi);
+        if let Some(done) = self.try_addsub_commit(&resolved, window, cx) {
+            return done;
         }
-        let batch = match file_hint {
-            Some(name) => import_file_content(&name, &text),
-            None => import_text(&text),
-        };
-        self.finish_import_batch(batch, &group, window, cx)
+        let batch = parse_import_inputs(&resolved);
+        self.finish_import_batch(batch, &resolved.group, window, cx)
+    }
+
+    /// Ticket 26: the dialog import commit — the CPU parse runs on the
+    /// background executor, the store commit stays on the main thread (the
+    /// store owns a `!Send` connection; the single-transaction
+    /// [`commit_batch`] keeps it fast). Returns false immediately: the dialog
+    /// stays open until the completion commits and closes it on success, or
+    /// toasts the failure with the dialog kept open. A second OK while a
+    /// parse runs is ignored (no double commit).
+    #[allow(clippy::too_many_arguments)]
+    fn commit_import_dialog(
+        &mut self,
+        text: String,
+        group: String,
+        file_hint: Option<String>,
+        original: Option<String>,
+        multi: Option<Vec<(String, String)>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if is_library_export(&text) {
+            self.open_restore_confirm(text, window, cx);
+            return false;
+        }
+        let resolved = resolve_import_inputs(text, group, file_hint, original, multi);
+        if let Some(done) = self.try_addsub_commit(&resolved, window, cx) {
+            return done;
+        }
+        if self.import_parse_in_flight {
+            return false;
+        }
+        self.import_parse_in_flight = true;
+        let weak = cx.entity().downgrade();
+        // Ticket 26: the completion commits through THIS window's handle
+        // (captured now — `active_window` is unreliable by completion time,
+        // and the dialog to close lives here). A window closed mid-parse
+        // falls back to the silent headless commit.
+        let handle = window.window_handle();
+        cx.spawn(async move |_entity, cx| {
+            let group = resolved.group.clone();
+            let batch = cx
+                .background_executor()
+                .spawn(async move { parse_import_inputs(&resolved) })
+                .await;
+            cx.update(|cx| {
+                let mut pending = Some((batch, group));
+                let delivered = handle
+                    .update(cx, |_, window, cx| {
+                        if let Some((batch, group)) = pending.take() {
+                            let _ = weak.update(cx, |view, cx| {
+                                view.finish_import_parse(batch, group, window, cx);
+                            });
+                        }
+                    })
+                    .is_ok();
+                if !delivered {
+                    if let Some((batch, group)) = pending.take() {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.finish_import_parse_no_window(batch, group, cx);
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+        false
+    }
+
+    /// Ticket 26: main-thread completion for [`AppView::commit_import_dialog`].
+    /// Commits through the shared [`AppView::finish_import_batch`] tail and
+    /// closes the dialog on success (total failure keeps it open with the
+    /// error, exactly like the synchronous path).
+    fn finish_import_parse(
+        &mut self,
+        batch: crate::import::BatchResult,
+        group: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.import_parse_in_flight = false;
+        if self.finish_import_batch(batch, &group, window, cx) {
+            window.close_all_dialogs(cx);
+        }
+    }
+
+    /// Ticket 26: window-less completion (the window closed mid-parse). The
+    /// user-initiated commit still lands via the single-transaction
+    /// [`commit_batch`]; with no window there is nothing to toast to and
+    /// nothing to close.
+    fn finish_import_parse_no_window(
+        &mut self,
+        batch: crate::import::BatchResult,
+        group: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.import_parse_in_flight = false;
+        if commit_batch(&mut self.store, batch, &group).is_ok() {
+            self.reload_quiet(cx);
+        }
+    }
+
+    /// Ticket 26: single-line `throne://addsub/...` fast path shared by the
+    /// synchronous and background commits. Returns `Some(done)` when the
+    /// inputs are addsub-shaped (the parse itself is trivial CPU; the intake
+    /// touches the store on this thread), `None` for everything else.
+    /// Ticket 14: a malformed link reports its own parse reason (never the
+    /// generic unknown-command) and keeps the dialog open.
+    fn try_addsub_commit(
+        &mut self,
+        resolved: &ResolvedImport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let trimmed = resolved.text.trim();
+        if trimmed.is_empty() || trimmed.contains('\n') || resolved.file_hint.is_some() {
+            return None;
+        }
+        if !is_addsub_attempt(trimmed) {
+            return None;
+        }
+        Some(match parse_addsub_link(trimmed) {
+            Ok(request) => {
+                let effective = effective_addsub_group(&resolved.group, &request.group);
+                self.commit_addsub_request_with_group(request, &effective, window, cx)
+            }
+            Err(error) => {
+                window.push_notification(Notification::error(addsub_error_message(&error)), cx);
+                false
+            }
+        })
     }
 
     /// Ticket 03/14: shared batch-commit tail (reload + truthful summary).
@@ -2186,22 +2901,31 @@ impl AppView {
     /// completions accumulate instead of notifying; the last member flushes
     /// at most one toast (see [`AppView::accumulate_batch_member`]). Empty
     /// input is a no-op (never an empty toast).
+    /// Ticket 26: opening never resets an open batch. A tick that fires while
+    /// members are still in flight unions its ids in (totals grow by the new
+    /// ids only) and keeps every accumulated count — no partial loss, no dup
+    /// toasts. The generation bumps only on the empty → open transition, so
+    /// tests can pin the batch epoch.
     fn begin_refresh_batch(&mut self, ids: &[String]) {
         if ids.is_empty() {
             return;
         }
-        self.refresh_batch_total = ids.len();
-        self.refresh_batch_members = ids.iter().cloned().collect();
-        self.refresh_batch_added = 0;
-        self.refresh_batch_updated = 0;
-        self.refresh_batch_removed = 0;
-        self.refresh_batch_failed = 0;
+        if self.refresh_batch_members.is_empty() {
+            self.refresh_generation += 1;
+        }
+        for id in ids {
+            if self.refresh_batch_members.insert(id.clone()) {
+                self.refresh_batch_total += 1;
+            }
+        }
     }
 
     /// Ticket 17: accumulate one batch member completion. Returns true when
     /// this completion finished the batch (the caller then flushes once).
     /// Callers check [`AppView::is_batch_member`] first: non-members notify
     /// immediately instead of accumulating.
+    /// Ticket 26: conflicts (preserved user edits) accumulate alongside the
+    /// churn counts for the coalesced copy.
     fn accumulate_batch_member(
         &mut self,
         sub_id: &str,
@@ -2209,6 +2933,7 @@ impl AppView {
         updated: usize,
         removed: usize,
         failed: usize,
+        conflicts: usize,
     ) -> bool {
         if !self.refresh_batch_members.remove(sub_id) {
             return false;
@@ -2217,6 +2942,7 @@ impl AppView {
         self.refresh_batch_updated += updated;
         self.refresh_batch_removed += removed;
         self.refresh_batch_failed += failed;
+        self.refresh_batch_conflicts += conflicts;
         self.refresh_batch_members.is_empty()
     }
 
@@ -2228,7 +2954,7 @@ impl AppView {
     /// Ticket 17: close one batch slot, flushing the single coalesced toast
     /// when the last member lands. No-op for non-members.
     fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
-        if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0) {
+        if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0) {
             self.flush_refresh_batch(window, cx);
         }
     }
@@ -2245,11 +2971,12 @@ impl AppView {
         updated: usize,
         removed: usize,
         failed: usize,
+        conflicts: usize,
         window: &mut Window,
         cx: &mut App,
     ) {
         if self.is_batch_member(sub_id) {
-            if self.accumulate_batch_member(sub_id, added, updated, removed, failed) {
+            if self.accumulate_batch_member(sub_id, added, updated, removed, failed, conflicts) {
                 self.flush_refresh_batch(window, cx);
             }
         } else {
@@ -2257,23 +2984,28 @@ impl AppView {
         }
     }
 
+    /// Ticket 26: take every batch counter (plus the member set size) and
+    /// reset the batch in one step — the atomic swap. A completion racing a
+    /// flush can never observe a half-reset batch.
+    fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize) {
+        self.refresh_batch_members.clear();
+        let total = std::mem::take(&mut self.refresh_batch_total);
+        let added = std::mem::take(&mut self.refresh_batch_added);
+        let updated = std::mem::take(&mut self.refresh_batch_updated);
+        let removed = std::mem::take(&mut self.refresh_batch_removed);
+        let failed = std::mem::take(&mut self.refresh_batch_failed);
+        let conflicts = std::mem::take(&mut self.refresh_batch_conflicts);
+        (total, added, updated, removed, failed, conflicts)
+    }
+
     /// Ticket 17: flush a completed batch as at most one toast, then reset.
     /// `total` is always ≥ 1 here (batches never open empty), so the message
     /// helper always returns `Some`.
     fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
-        let (warn, text) = coalesced_refresh_message(
-            self.refresh_batch_total,
-            self.refresh_batch_added,
-            self.refresh_batch_updated,
-            self.refresh_batch_removed,
-            self.refresh_batch_failed,
-        )
-        .unwrap_or((false, String::new()));
-        self.refresh_batch_total = 0;
-        self.refresh_batch_added = 0;
-        self.refresh_batch_updated = 0;
-        self.refresh_batch_removed = 0;
-        self.refresh_batch_failed = 0;
+        let (total, added, updated, removed, failed, conflicts) = self.take_batch_counts();
+        let (warn, text) =
+            coalesced_refresh_message(total, added, updated, removed, failed, conflicts)
+                .unwrap_or((false, String::new()));
         if text.is_empty() {
             return;
         }
@@ -2292,37 +3024,66 @@ impl AppView {
     /// the error (never a dead click).
     /// Ticket 17: manual refreshes leave any background batch (their
     /// completion notifies immediately instead of merging into it).
+    /// Ticket 26: a manual refresh never double-fetches. When the sub already
+    /// has a fetch in flight (tick or earlier click), the manual call adopts
+    /// it — the sub leaves the background batch (with the total adjusted so
+    /// the coalesced copy stays honest) and the shared completion notifies
+    /// immediately. Returns true when a new fetch started.
     fn refresh_subscription_by_id(
         &mut self,
         sub_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.refresh_batch_members.remove(sub_id);
+    ) -> bool {
+        // Adopt first: the completion must notify immediately either way.
+        if self.refresh_batch_members.remove(sub_id) {
+            self.refresh_batch_total = self.refresh_batch_total.saturating_sub(1);
+        }
         match self.store.get_subscription(sub_id) {
             Ok(Some(sub)) => self.start_subscription_refresh(sub, cx),
             Ok(None) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
+                false
             }
             Err(error) => {
                 window.push_notification(
                     Notification::error(format!("Cannot refresh subscription: {error}")),
                     cx,
                 );
+                false
             }
         }
     }
 
     /// Ticket 14: auto-refresh toggle with truthful outcomes (never a dead
     /// click on store failure).
+    /// Ticket 26: the current value is re-read at commit — the row's `Auto`
+    /// button snapshot may be stale (a tick or another click may have flipped
+    /// it since the dialog rendered). A missing row warns; a store failure
+    /// names the error.
     fn commit_subscription_auto(
         &mut self,
         sub_id: &str,
-        auto_now: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.store.set_subscription_auto_refresh(sub_id, !auto_now) {
+        let current = match self.store.get_subscription(sub_id) {
+            Ok(Some(sub)) => sub.auto_refresh,
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+                self.reopen_subscriptions_if_open(window, cx);
+                return;
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot change auto-refresh: {error}")),
+                    cx,
+                );
+                self.reopen_subscriptions_if_open(window, cx);
+                return;
+            }
+        };
+        match self.store.set_subscription_auto_refresh(sub_id, !current) {
             Ok(_) => self.reload(window, cx),
             Err(error) => {
                 window.push_notification(
@@ -2334,13 +3095,34 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
+    /// Ticket 26: record one fetch as in flight. Returns false when the sub
+    /// already has a fetch running (manual-vs-tick double fetch is skipped,
+    /// never stacked). Pure state — tests drive it without touching the
+    /// network.
+    fn note_refresh_started(&mut self, sub_id: &str) -> bool {
+        self.inflight_refreshes.insert(sub_id.to_string())
+    }
+
     /// Ticket 04: fetch one subscription without blocking the UI, then merge
     /// through the tested [`Store::refresh_with_body`] seam.
     /// Ticket 12: window-free (the completion path branches on the active
     /// window itself) so the due-subscription background tick can call it.
-    fn start_subscription_refresh(&mut self, sub: ProxySubscription, cx: &mut Context<Self>) {
+    /// Ticket 26: the task holds a `WeakEntity` — a released view fails
+    /// closed (no post-close store writes). A sub with a fetch already in
+    /// flight is skipped (see [`AppView::note_refresh_started`]); manual
+    /// callers adopt the shared fetch instead (see
+    /// [`AppView::refresh_subscription_by_id`]). Returns true when a fetch
+    /// started.
+    fn start_subscription_refresh(
+        &mut self,
+        sub: ProxySubscription,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.note_refresh_started(&sub.id) {
+            return false;
+        }
         let client = cx.http_client();
-        let view = cx.entity();
+        let weak = cx.entity().downgrade();
         let sub_id = sub.id.clone();
         let label = sub.label.clone();
         let url = sub.url.clone();
@@ -2350,20 +3132,21 @@ impl AppView {
             cx.update(|cx| {
                 if let Some(handle) = cx.active_window() {
                     let _ = handle.update(cx, |_, window, cx| {
-                        view.update(cx, |view, cx| {
+                        let _ = weak.update(cx, |view, cx| {
                             view.finish_subscription_refresh(
                                 &sub_id, &label, fetched, now, window, cx,
                             );
                         });
                     });
                 } else {
-                    view.update(cx, |view, cx| {
+                    let _ = weak.update(cx, |view, cx| {
                         view.finish_subscription_refresh_no_window(&sub_id, fetched, now, cx);
                     });
                 }
             });
         })
         .detach();
+        true
     }
 
     /// Ticket 04: apply a fetched body (or fetch error) with user feedback,
@@ -2379,6 +3162,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ticket 26: the fetch is no longer in flight (a manual refresh may
+        // already have adopted its completion — see
+        // [`AppView::refresh_subscription_by_id`]).
+        self.inflight_refreshes.remove(sub_id);
         // Ticket 14: the subscription may have been deleted while the fetch
         // was in flight — drop the result silently (no failure toast for a
         // sub the user removed on purpose). A store failure here still
@@ -2399,6 +3186,7 @@ impl AppView {
                     0,
                     0,
                     1,
+                    0,
                     window,
                     cx,
                 );
@@ -2418,26 +3206,29 @@ impl AppView {
                             0,
                             0,
                             1,
+                            0,
                             window,
                             cx,
                         );
                     } else {
-                        let mut summary = format!(
-                            "{}: +{} ~{} -{}",
-                            label, outcome.added, outcome.updated, outcome.removed
-                        );
-                        if outcome.skipped > 0 {
-                            summary.push_str(&format!(" · {} skipped", outcome.skipped));
-                        }
-                        if outcome.duplicates > 0 {
-                            summary.push_str(&format!(" · {} duplicates", outcome.duplicates));
-                        }
+                        // Ticket 26 (ticket-25 consumer): conflicts surface —
+                        // the merge kept the user's edits, and the toast says
+                        // so instead of reporting a clean sync.
                         let failed = outcome.failures.len();
-                        let notice = if failed == 0 {
-                            Notification::success(summary)
-                        } else {
-                            summary.push_str(&format!(" · {failed} failed"));
+                        let (warn, summary) = refresh_summary_text(
+                            label,
+                            outcome.added,
+                            outcome.updated,
+                            outcome.removed,
+                            outcome.skipped,
+                            outcome.duplicates,
+                            failed,
+                            outcome.conflicts,
+                        );
+                        let notice = if warn {
                             Notification::warning(summary)
+                        } else {
+                            Notification::success(summary)
                         };
                         self.route_refresh_completion(
                             sub_id,
@@ -2446,6 +3237,7 @@ impl AppView {
                             outcome.updated,
                             outcome.removed,
                             failed,
+                            outcome.conflicts,
                             window,
                             cx,
                         );
@@ -2464,6 +3256,7 @@ impl AppView {
                             0,
                             0,
                             1,
+                            0,
                             window,
                             cx,
                         );
@@ -2480,6 +3273,7 @@ impl AppView {
                         0,
                         0,
                         1,
+                        0,
                         window,
                         cx,
                     );
@@ -2497,6 +3291,7 @@ impl AppView {
                         0,
                         0,
                         1,
+                        0,
                         window,
                         cx,
                     );
@@ -2509,6 +3304,11 @@ impl AppView {
     /// Ticket 04: headless completion path (no window for notifications).
     /// Ticket 17: batch members accumulate silently (no window exists to
     /// flush a toast to); the counters reset when the batch completes.
+    /// Ticket 26: conflicts accumulate like any other count; the reset is
+    /// the atomic [`AppView::take_batch_counts`] swap. L1 ruling: a
+    /// completed headless batch drops its toast by necessity (no window
+    /// exists to toast to — the ticket-14 window-free precedent); the counts
+    /// still accumulate so a later windowed flush stays honest.
     fn finish_subscription_refresh_no_window(
         &mut self,
         sub_id: &str,
@@ -2516,6 +3316,7 @@ impl AppView {
         now: i64,
         cx: &mut Context<Self>,
     ) {
+        self.inflight_refreshes.remove(sub_id);
         match fetched {
             Ok(body) => match self.store.refresh_with_body(sub_id, &body, now) {
                 Ok(outcome) => {
@@ -2525,41 +3326,79 @@ impl AppView {
                         outcome.updated,
                         outcome.removed,
                         outcome.failures.len(),
+                        outcome.conflicts,
                     );
                 }
                 Err(_) => {
-                    self.accumulate_batch_member(sub_id, 0, 0, 0, 1);
+                    self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0);
                 }
             },
             Err(error) => {
                 let _ = self.store.record_subscription_error(sub_id, &error);
-                self.accumulate_batch_member(sub_id, 0, 0, 0, 1);
+                self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0);
             }
         }
         if self.refresh_batch_members.is_empty() {
-            self.refresh_batch_total = 0;
-            self.refresh_batch_added = 0;
-            self.refresh_batch_updated = 0;
-            self.refresh_batch_removed = 0;
-            self.refresh_batch_failed = 0;
+            self.take_batch_counts();
         }
         self.reload_quiet(cx);
     }
 
     /// Ticket 04: re-render the subscriptions dialog after an action, but
     /// only if the user still has it open.
+    /// Ticket 26: never touch a foreign dialog. The reopen fires only while
+    /// the subscriptions dialog itself owns the screen — tracked by the
+    /// stashed [`SubForm`], which every dismiss path (OK, Cancel, Escape,
+    /// backdrop/X via `.on_close`) clears. A background refresh completing
+    /// while the user types in Add/Import/Edit/Export/Logs finds no stash
+    /// and leaves that dialog and its input intact. A genuine reopen carries
+    /// the in-progress add-form text across instead of rebuilding it blank.
     fn reopen_subscriptions_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.has_active_dialog(cx) {
-            window.close_all_dialogs(cx);
-            self.open_subscriptions_dialog(window, cx);
+        if !window.has_active_dialog(cx) {
+            // No dialog at all: drop any stale stash and leave.
+            self.subs_form = None;
+            return;
         }
+        let Some(form) = &self.subs_form else {
+            // Some other dialog owns the screen — leave it alone.
+            return;
+        };
+        let label = form.label.read(cx).value().to_string();
+        let url = form.url.read(cx).value().to_string();
+        let group = form.group.read(cx).value().to_string();
+        let auto = *form.auto_refresh.borrow();
+        window.close_all_dialogs(cx);
+        self.open_subscriptions_dialog_restored(&label, &url, &group, auto, window, cx);
     }
 
     /// Ticket 04: subscription manager dialog — existing subscriptions with
     /// per-row Refresh / Auto / Remove plus an add form committed by OK.
     /// An empty add form just closes the dialog.
+    /// Ticket 26: user entry always starts blank; refresh-driven reopens go
+    /// through [`AppView::open_subscriptions_dialog_restored`] (carries
+    /// in-progress text).
     fn open_subscriptions_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let form = SubForm::blank(window, cx);
+        self.open_subscriptions_dialog_restored("", "", DEFAULT_GROUP, true, window, cx);
+    }
+
+    /// Ticket 26: subscriptions dialog with a prefilled add form (the
+    /// refresh-driven reopen path). The form is stashed on the view so the
+    /// next genuine reopen can carry the text forward again; any OK-dismiss
+    /// (empty close or committed add) clears the stash, and Cancel/close
+    /// leftovers are dropped by
+    /// [`AppView::reopen_subscriptions_if_open`] when no dialog is open.
+    #[allow(clippy::too_many_arguments)]
+    fn open_subscriptions_dialog_restored(
+        &mut self,
+        label: &str,
+        url: &str,
+        group: &str,
+        auto: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = SubForm::restored(window, cx, label, url, group, auto);
+        self.subs_form = Some(form.clone());
         let view = cx.entity();
         let reader = form.clone();
         let subs = match self.store.list_subscriptions() {
@@ -2608,10 +3447,15 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
+        // Ticket 26: every dismiss path (OK-close, Cancel, Escape,
+        // backdrop/X) clears the stashed form through `.on_close`, so a
+        // later foreign dialog can never be mistaken for this one.
+        let close_view = view.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let view_for_rows = view.clone();
+            let close_view = close_view.clone();
             let mut body = div().flex().flex_col().gap_2();
             if subs.is_empty() {
                 body = body.child("No subscriptions yet — paste a subscription URL below");
@@ -2632,6 +3476,11 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
+                .on_close(move |_, _, cx| {
+                    close_view.update(cx, |view, _| {
+                        view.subs_form = None;
+                    });
+                })
                 .footer(dialog_footer(
                     "subscriptions-dialog-ok",
                     "subscriptions-dialog-cancel",
@@ -2710,6 +3559,9 @@ impl AppView {
     /// Subscriptions due for auto-refresh right now (pure query behind the
     /// due-subscription pass and the startup pass). Never enables anything;
     /// the pass only fetches already-due subscription URLs.
+    /// Ticket 26: window-less by necessity (ticks and startup have no window
+    /// to notify through), so a database error yields no due subs — the pass
+    /// starts nothing instead of acting on a lie (ticket-14 precedent).
     fn due_subscriptions(&self) -> Vec<ProxySubscription> {
         let now = now_unix();
         self.store
@@ -2745,6 +3597,8 @@ impl AppView {
     /// views start nothing.
     /// Ticket 17: the pass opens one coalescing batch, so N completions
     /// flush at most one toast instead of N.
+    /// Ticket 26: returns the number of fetches actually started (a sub with
+    /// a fetch already in flight is skipped, never double-fetched).
     fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
@@ -2752,30 +3606,37 @@ impl AppView {
         let due = self.due_subscriptions();
         let ids: Vec<String> = due.iter().map(|sub| sub.id.clone()).collect();
         self.begin_refresh_batch(&ids);
-        let count = due.len();
+        let mut started = 0;
         for sub in due {
-            self.start_subscription_refresh(sub, cx);
+            if self.start_subscription_refresh(sub, cx) {
+                started += 1;
+            }
         }
-        count
+        started
     }
 
     /// One re-probe of running rows only, without user clicks: silent (no
     /// notification), recorded + persisted like a manual test. Idle views
     /// (nothing running) do nothing: no network traffic, no errors.
     /// Stopped views probe nothing.
+    /// Ticket 26: off-thread via [`AppView::spawn_probe`]. Returns the number
+    /// of probes started (outcomes land on completion).
     fn tick_reprobe_running(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
         }
-        let rows = self.active_health_rows();
+        let running = self.engine.running_ids();
+        let Ok(rows) = self.store.list() else {
+            return 0;
+        };
+        let rows: Vec<ProxyConfig> = rows
+            .into_iter()
+            .filter(|row| running.contains(&row.id))
+            .collect();
         if rows.is_empty() {
             return 0;
         }
-        let outcomes = test_all(&rows, DEFAULT_TEST_URL, &mut *self.prober);
-        let count = outcomes.len();
-        self.record_and_persist(&outcomes);
-        self.reload_quiet(cx);
-        count
+        self.spawn_probe(rows, false, false, None, cx)
     }
 
     /// Spawn the three background tick loops. Each loop sleeps its interval,
@@ -2860,19 +3721,11 @@ impl AppView {
                                 let enabled = *enabled;
                                 let id = switch_id_for_handler.clone();
                                 switch_view.update(cx, |view, cx| {
-                                    // Ticket 14: a failed write notifies
-                                    // (never a dead switch).
-                                    match view.store.set_enabled(&id, enabled) {
-                                        Ok(_) => view.reload(window, cx),
-                                        Err(error) => {
-                                            window.push_notification(
-                                                Notification::error(format!(
-                                                    "Cannot toggle: {error}"
-                                                )),
-                                                cx,
-                                            );
-                                        }
-                                    }
+                                    // Ticket 26: one flag semantic — the
+                                    // switch writes the stored flag only (see
+                                    // [`AppView::commit_enabled_flag`]);
+                                    // starting/stopping stays on Start/Stop.
+                                    view.commit_enabled_flag(&id, enabled, window, cx);
                                 });
                             }),
                     )
@@ -2976,7 +3829,40 @@ impl Render for AppView {
             .flex()
             .flex_col()
             .track_focus(&self.focus)
-            .key_context("manyproxy-library")
+            .key_context(APP_KEY_CONTEXT)
+            // Ticket 26: app shortcuts (Add/Import/Start/Stop/Test). Each
+            // handler no-ops while any dialog is open, so shortcut keys
+            // never steal dialog input.
+            .on_action(cx.listener(|view, _: &AddConfig, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.open_add_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ImportConfigs, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &StartSelected, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.start_selected_engine(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &StopSelected, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.stop_selected_engine(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &TestSelected, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.test_selected_health(window, cx);
+            }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
                     view.import_dropped_files(paths, window, cx);
@@ -3071,6 +3957,8 @@ impl Render for AppView {
 fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
+        // Ticket 26: app keyboard shortcuts (Add/Import/Start/Stop/Test).
+        bind_app_keys(cx);
         cx.spawn(async move |cx| {
             cx.open_window(app_window_options(), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
@@ -3523,6 +4411,8 @@ mod tests {
 
         let reprobed = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_reprobe_running(cx)));
         assert_eq!(reprobed, 2, "both running rows re-probed");
+        // Ticket 26: probes complete off-thread — pump the completion.
+        cx.run_until_parked();
         assert_eq!(handle.calls_for(&alpha.id).len(), 1);
         assert_eq!(handle.calls_for(&beta.id).len(), 1);
 
@@ -3593,6 +4483,8 @@ mod tests {
         let tested =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(tested, 2);
+        // Ticket 26: probes complete off-thread — pump the completion.
+        cx.run_until_parked();
         drop(view);
 
         // "Restart": a fresh view over the same file, no probing at all.
@@ -3977,6 +4869,8 @@ mod tests {
         let tested =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(tested, 2);
+        // Ticket 26: probes complete off-thread — pump the completion.
+        cx.run_until_parked();
 
         let (alpha_live, beta_dead) = view.read_with(cx, |view, _| {
             (
@@ -4456,7 +5350,7 @@ mod tests {
         });
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
-                view.commit_subscription_auto(&sub_id, true, window, cx)
+                view.commit_subscription_auto(&sub_id, window, cx)
             });
         });
         assert_eq!(notification_count(cx), 1, "auto-toggle failure notifies");
@@ -4907,12 +5801,17 @@ mod tests {
     /// default on.
     #[gpui_kit::test]
     fn sub_add_form_auto_defaults_on(cx: &mut TestAppContext) {
+        use crate::store::DEFAULT_GROUP;
         use crate::SubForm;
         cx.update(gpui_kit::init);
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
         let auto = cx.update(|window, cx| {
-            view.update(cx, |_, cx| SubForm::blank(window, cx).auto_refresh.clone())
+            view.update(cx, |_, cx| {
+                SubForm::restored(window, cx, "", "", DEFAULT_GROUP, true)
+                    .auto_refresh
+                    .clone()
+            })
         });
         assert!(*auto.borrow(), "auto-refresh defaults on");
     }
@@ -4922,16 +5821,24 @@ mod tests {
     #[test]
     fn coalesced_refresh_message_single_toast() {
         use crate::coalesced_refresh_message;
-        assert_eq!(coalesced_refresh_message(0, 0, 0, 0, 0), None);
-        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0).expect("batch reports");
+        assert_eq!(coalesced_refresh_message(0, 0, 0, 0, 0, 0), None);
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0, 0).expect("batch reports");
         assert!(!warn);
         assert!(
             text.contains('3') && text.contains("+5"),
             "one line: {text}"
         );
-        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 2).expect("batch reports");
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 2, 0).expect("batch reports");
         assert!(warn, "failures warn: {text}");
         assert!(text.contains('2'), "failed count in: {text}");
+        // Ticket 26: preserved user edits surface in the coalesced copy and
+        // warn (a "clean" sync that silently kept yours would lie).
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0, 2).expect("batch reports");
+        assert!(warn, "conflicts warn: {text}");
+        assert!(
+            text.contains('2') && text.contains("conflict"),
+            "conflict count + copy in: {text}"
+        );
     }
 
     /// Scenario: 3 background completions flush exactly one toast.
@@ -5620,6 +6527,8 @@ mod tests {
         let tested =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(tested, 2);
+        // Ticket 26: probes complete off-thread — pump the completion.
+        cx.run_until_parked();
         cx.run_until_parked();
         paint_frame(cx);
         cx.run_until_parked();
@@ -5750,5 +6659,734 @@ mod tests {
             let shown = upstream_host_port(&row(params)).unwrap_or_default();
             assert!(!shown.contains(canary), "no credentials in {shown}");
         }
+    }
+
+    // -- Ticket 26: UI-state races + error surfacing -------------------------
+
+    /// Seed with engine-startable params (the fake driver validates like the
+    /// real one; bare `seed_input` rows fail the start gate).
+    fn t26_engine_seed(name: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    /// Scenario: select A, filter to only C → the selection clears (never
+    /// lands on C); a filter that still matches A keeps A (pure delegate).
+    #[test]
+    fn filter_selection_follows_id_never_wrong_row() {
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        fn row(id: &str, name: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+            }
+        }
+        use gpui_kit::component::IndexPath;
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta"), row("3", "Gamma")]);
+        delegate.selected = Some(IndexPath::new(0));
+        assert_eq!(
+            delegate.selected_row().map(|row| row.id),
+            Some("1".to_string())
+        );
+        // Narrow to only Gamma: Alpha is gone, so the selection clears
+        // instead of pointing at Gamma's index.
+        delegate.query = "gamma".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            delegate.selected_row(),
+            None,
+            "filtered-out selection clears"
+        );
+        // Clearing the filter restores all rows (selection stays cleared —
+        // filtering never invents one).
+        delegate.query = String::new();
+        delegate.apply_filter();
+        assert_eq!(delegate.selected_row(), None);
+        // A filter matching every row keeps Alpha by id (not by index).
+        delegate.selected = Some(IndexPath::new(0));
+        delegate.query = "a".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            delegate.selected_row().map(|row| row.id),
+            Some("1".to_string()),
+            "visible selection preserved by id"
+        );
+    }
+
+    /// Scenario: type in the Add dialog during a background refresh →
+    /// the Add dialog and its input stay intact (never hijacked).
+    #[gpui_kit::test]
+    fn background_refresh_never_hijacks_add_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
+        // A background refresh completion arrives mid-typing.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reopen_subscriptions_if_open(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "foreign dialog survives the refresh"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("field-name").is_some()),
+            "Add dialog keeps its fields"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("field-sub-url").is_none()),
+            "Subscriptions dialog never opens uninvited"
+        );
+        assert_eq!(notification_count(cx), 0, "no toast for a non-event");
+    }
+
+    /// Scenario: subscriptions dialog open with typed text + background
+    /// refresh → the dialog reopens with the text intact, not blank.
+    #[gpui_kit::test]
+    fn subs_dialog_reopen_preserves_form_text(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // Type into the add form (the stashed live entities).
+        cx.update(|window, cx| {
+            let form = view.read_with(cx, |view, _| view.subs_form.clone());
+            let form = form.expect("subs form stashed on open");
+            form.url.update(cx, |state, cx| {
+                state.set_value("https://example.com/typed.txt", window, cx);
+            });
+        });
+        // Genuine reopen (background completion while subs is open).
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reopen_subscriptions_if_open(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "subs dialog reopens"
+        );
+        let url = view.read_with(cx, |view, cx| {
+            view.subs_form
+                .clone()
+                .expect("form restashed")
+                .url
+                .read(cx)
+                .value()
+                .to_string()
+        });
+        assert_eq!(url, "https://example.com/typed.txt", "typed text survives");
+    }
+
+    /// Scenario: edit opened, refresh changes params underneath, user renames
+    /// → commit writes ONLY the rename; the refreshed params survive.
+    #[gpui_kit::test]
+    fn edit_commit_writes_only_user_changed_fields(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Dialog-open snapshot.
+        let snapshot = view.read_with(cx, |view, _| {
+            view.store
+                .get(&seeded.id)
+                .expect("get works")
+                .expect("row there")
+        });
+        // Concurrent refresh lands after the dialog opened.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                use crate::store::ConfigPatch;
+                view.store
+                    .update(
+                        &seeded.id,
+                        ConfigPatch {
+                            params: Some("{\"type\":\"vless\",\"server\":\"9.9.9.9\"}".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("concurrent edit works");
+            });
+        });
+        // User renames only: build the relative patch like the dialog does.
+        let renamed = cx.update(|window, cx| {
+            view.update(cx, |_view, cx| {
+                use crate::ConfigForm;
+                let form = ConfigForm::prefilled(window, cx, &snapshot);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("Renamed", window, cx);
+                });
+                form.as_patch_vs(cx, &snapshot)
+            })
+        });
+        assert!(renamed.name.is_some(), "touched field writes");
+        assert!(renamed.params.is_none(), "untouched field stays None");
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit(&seeded.id, renamed, window, cx)
+            })
+        });
+        assert!(closed, "valid edit closes");
+        let row = view.read_with(cx, |view, _| {
+            view.store
+                .get(&seeded.id)
+                .expect("get works")
+                .expect("row there")
+        });
+        assert_eq!(row.name, "Renamed");
+        assert_eq!(
+            row.params, "{\"type\":\"vless\",\"server\":\"9.9.9.9\"}",
+            "concurrent refresh survives on the untouched field"
+        );
+    }
+
+    /// Scenario: row deleted while the edit dialog is open → commit warns
+    /// "Already removed" and closes (never edits a ghost).
+    #[gpui_kit::test]
+    fn edit_commit_missing_row_warns_and_closes(cx: &mut TestAppContext) {
+        use crate::store::ConfigPatch;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.remove(&seeded.id).expect("remove works");
+            });
+        });
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit(&seeded.id, ConfigPatch::default(), window, cx)
+            })
+        });
+        assert!(closed, "ghost edit closes");
+        assert_eq!(notification_count(cx), 1, "removal warns once");
+    }
+
+    /// Scenario: batch {a,b} open, tick adds {c} mid-flight → union, no
+    /// reset, one toast; the generation only bumps on empty → open.
+    #[gpui_kit::test]
+    fn batch_union_never_resets_open_batch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut ids = Vec::new();
+        for label in ["One", "Two", "Three"] {
+            let sub = store
+                .add_subscription(label, "https://example.com/sub.txt", "g", true)
+                .expect("seed works");
+            ids.push((sub.id.clone(), sub.label.clone()));
+        }
+        let (view, cx) = mount_view(store, cx);
+        let gen0 = view.read_with(cx, |view, _| view.refresh_generation);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.begin_refresh_batch(&[ids[0].0.clone(), ids[1].0.clone()]);
+            });
+        });
+        let gen1 = view.read_with(cx, |view, _| view.refresh_generation);
+        assert_eq!(gen1, gen0 + 1, "fresh batch bumps the generation");
+        // First member completes with churn.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &ids[0].0,
+                    &ids[0].1,
+                    Ok(
+                        "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                            .to_string(),
+                    ),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 0, "open batch stays silent");
+        // A second tick unions its id: no reset, same generation.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.begin_refresh_batch(&[ids[2].0.clone()]);
+            });
+        });
+        let (gen2, total) = view.read_with(cx, |view, _| {
+            (view.refresh_generation, view.refresh_batch_total)
+        });
+        assert_eq!(gen2, gen1, "union keeps the epoch");
+        assert_eq!(total, 3, "union grows the total");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.refresh_batch_added),
+            1,
+            "accumulated churn survives the union"
+        );
+        for (id, label) in ids.iter().skip(1) {
+            let id = id.clone();
+            let label = label.clone();
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.finish_subscription_refresh(
+                        &id,
+                        &label,
+                        Ok(
+                            "vless://11111111-2222-4333-8444-555555555555@b.example.com:443#two"
+                                .to_string(),
+                        ),
+                        999,
+                        window,
+                        cx,
+                    );
+                });
+            });
+        }
+        assert_eq!(notification_count(cx), 1, "one batch, one toast");
+    }
+
+    /// Scenario: manual refresh while a tick fetch runs → adopted (no second
+    /// fetch); the shared completion notifies immediately, once.
+    #[gpui_kit::test]
+    fn manual_refresh_adopts_inflight_fetch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.begin_refresh_batch(std::slice::from_ref(&sub_id));
+                assert!(view.note_refresh_started(&sub_id), "first fetch starts");
+                assert!(!view.note_refresh_started(&sub_id), "second fetch dedupes");
+            });
+        });
+        // Manual click adopts: no new fetch, member leaves the batch.
+        let started = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.refresh_subscription_by_id(&sub_id, window, cx)
+            })
+        });
+        assert!(!started, "in-flight fetch is adopted, not restarted");
+        // The shared completion notifies immediately (not batched).
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    "Nightly",
+                    Ok(
+                        "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                            .to_string(),
+                    ),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "adopted completion notifies once"
+        );
+    }
+
+    /// Scenario: auto flag flipped behind the dialog's back → commit toggles
+    /// the CURRENT value, not the stale rendered one.
+    #[gpui_kit::test]
+    fn commit_subscription_auto_rereads_current(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        // Someone flips it behind the dialog's back (dialog still shows on).
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store
+                    .set_subscription_auto_refresh(&sub_id, false)
+                    .expect("flip works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_subscription_auto(&sub_id, window, cx)
+            });
+        });
+        let current = view.read_with(cx, |view, _| {
+            view.store
+                .get_subscription(&sub_id)
+                .expect("get works")
+                .expect("sub there")
+                .auto_refresh
+        });
+        assert!(current, "fresh false toggles back to true (not stale on)");
+    }
+
+    /// Scenario: corrupt DB → Start all errors honestly, never claims the
+    /// library is empty (pure copy + headless delivery).
+    #[test]
+    fn db_list_error_names_database_never_empty() {
+        use crate::db_list_error_message;
+        use crate::store::StoreError;
+        let text = db_list_error_message(&StoreError::NotFound("7".to_string()));
+        assert!(text.contains("Cannot load library"), "names it: {text}");
+        assert!(!text.contains("empty"), "never the empty claim: {text}");
+    }
+
+    /// Scenario: corrupt DB → Start all errors honestly, never claims the
+    /// library is empty (headless delivery: exactly one notice).
+    #[gpui_kit::test]
+    fn corrupt_db_start_all_errors_never_empty_claim(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.break_schema_for_test().expect("break works");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "db error notifies once");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts on an unreadable library"
+        );
+    }
+
+    /// Scenario: the enable toast always says flag-only (pure copy).
+    #[test]
+    fn enabled_flag_message_names_row_and_meaning() {
+        use crate::enabled_flag_message;
+        let on = enabled_flag_message("Work", true);
+        assert!(on.contains("Work"), "names the row: {on}");
+        assert!(on.contains("flag only"), "one semantic: {on}");
+        assert!(on.contains("Start"), "points at Start: {on}");
+        let off = enabled_flag_message("Work", false);
+        assert!(off.contains("Work"), "names the row: {off}");
+        assert!(off.contains("Stop"), "points at Stop: {off}");
+    }
+
+    /// Scenario: a successful toggle toasts the flag meaning (never silent,
+    /// never start-shaped).
+    #[gpui_kit::test]
+    fn toggle_success_toasts_flag_meaning(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.toggle_selected_enabled(window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "toggle explains itself");
+        assert!(
+            view.read_with(cx, |view, cx| view
+                .selected_config(cx)
+                .map(|row| row.enabled)
+                .unwrap_or(false)),
+            "flag flips"
+        );
+    }
+
+    /// Scenario: read-only DB → Start toasts the flag failure loudly (the
+    /// endpoint runs while the flag lies — never silent).
+    #[gpui_kit::test]
+    fn start_selected_flag_write_failure_is_loud(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.store
+                    .set_query_only_for_test()
+                    .expect("readonly works");
+            });
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        let id = view.read_with(cx, |view, cx| {
+            view.selected_config(cx).expect("selected").id
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_selected(&id, window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "flag failure is loud");
+    }
+
+    /// Scenario: dropped paths name the unreadable files (pure copy +
+    /// headless delivery, basenames only).
+    #[test]
+    fn unreadable_drop_message_names_basenames() {
+        use crate::unreadable_drop_message;
+        let text = unreadable_drop_message(&["a.conf".to_string(), "b.txt".to_string()]);
+        assert!(text.contains("a.conf") && text.contains("b.txt"), "{text}");
+        assert!(!text.contains("Users"), "never full paths: {text}");
+    }
+
+    /// Scenario: dropping an unreadable path toasts its name, stores nothing.
+    #[gpui_kit::test]
+    fn import_drop_names_unreadable_files(cx: &mut TestAppContext) {
+        use gpui_kit::ExternalPaths;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let paths = ExternalPaths(
+            vec![std::path::PathBuf::from(
+                "E:\\definitely-not-here\\ghost.conf",
+            )]
+            .into(),
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.import_dropped_files(&paths, window, cx));
+        });
+        assert_eq!(notification_count(cx), 1, "unreadable drop names itself");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "nothing stored"
+        );
+    }
+
+    /// Scenario: Ctrl+N opens Add; a second Ctrl+N with the dialog open is a
+    /// no-op (never steals dialog keys, never stacks dialogs).
+    #[gpui_kit::test]
+    fn keyboard_shortcuts_open_and_guard_dialogs(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        // Focus the shell so the library key context matches.
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let press = |cx: &mut VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+        };
+        press(cx, "ctrl-n");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Ctrl+N opens Add"
+        );
+        assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
+        // Guarded while open: no second dialog, no toast, no steal.
+        press(cx, "ctrl-n");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog stays exactly one"
+        );
+        assert_eq!(notification_count(cx), 0, "guarded shortcut is silent");
+    }
+
+    /// Scenario: F5 starts the selected loopback row headless.
+    #[gpui_kit::test]
+    fn keyboard_f5_starts_selected(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use gpui_kit::component::IndexPath;
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t26_engine_seed("Work", "10911"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let keystroke = Keystroke::parse("f5").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "F5 starts the selected row"
+        );
+    }
+
+    /// Scenario: Logs OK applies the filter and closes exactly once (L5:
+    /// never an explicit close plus a framework close).
+    #[gpui_kit::test]
+    fn logs_ok_closes_exactly_once(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| {
+            window.click("logs-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Logs OK closes"
+        );
+        assert_eq!(notification_count(cx), 0, "filter apply is silent");
+    }
+
+    /// Scenario: a refresh that preserves user edits warns and names the
+    /// conflict count (pure copy).
+    #[test]
+    fn refresh_summary_text_names_conflicts() {
+        use crate::refresh_summary_text;
+        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0);
+        assert!(!warn);
+        assert!(text.contains("Nightly") && text.contains("+1"), "{text}");
+        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 2);
+        assert!(warn, "conflicts warn: {text}");
+        assert!(
+            text.contains('2') && text.contains("conflict"),
+            "conflict copy in: {text}"
+        );
+        assert!(
+            text.contains("your edits kept"),
+            "kept, not reverted: {text}"
+        );
+    }
+
+    /// Scenario: pasting an export payload opens the restore confirm (never
+    /// the import path); confirming restores rows verbatim.
+    #[gpui_kit::test]
+    fn export_payload_restores_library(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let payload = store.export_library_json().expect("export works");
+        // Diverge: an extra row the backup does not have.
+        store.add(seed_input("Extra")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
+        // Pasting the payload diverts to the restore confirm.
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import(payload.clone(), "g".to_string(), None, window, cx)
+            })
+        });
+        assert!(!closed, "restore waits for confirm");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "restore confirm opens"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        // Confirm path restores verbatim (Extra is gone, Work is back).
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_library_restore(&payload, window, cx)
+            });
+        });
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
+        let name = view.read_with(cx, |view, _| {
+            view.store.list().expect("list works").remove(0).name
+        });
+        assert_eq!(name, "Work");
+        assert_eq!(notification_count(cx), 1, "restore names its counts");
+    }
+
+    /// Scenario: a second probe while one runs is deduped with an info
+    /// toast (never stacked blocking work).
+    #[gpui_kit::test]
+    fn probe_dedupe_second_request_warns(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t26_engine_seed("Work", "10912"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, _) = FakeHealthProber::shared();
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        let before = notification_count(cx);
+        let first =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
+        assert_eq!(first, 1, "first probe starts");
+        let second =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
+        assert_eq!(second, 0, "second probe dedupes");
+        cx.run_until_parked();
+        // Info (already running) + success (completion) = two new notices.
+        assert_eq!(notification_count(cx) - before, 2, "dedupe explains itself");
+        assert!(
+            !view.read_with(cx, |view, _| view.probe_in_flight),
+            "flag clears on completion"
+        );
     }
 }

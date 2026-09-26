@@ -7,7 +7,7 @@
 //! and collect per-item [`ImportFailure`]s (with the item index) instead of
 //! failing the batch. [`commit_batch`] appends parsed items to the library as
 //! disabled records in the chosen group and skips exact re-imports
-//! (normalized identity: protocol + params).
+//! (widened identity: protocol + params plus transport/security extras).
 //!
 //! Field validation follows research 05
 //! (`.planning/research/05-import-grammars.md`): base64 (standard + urlsafe,
@@ -1766,6 +1766,28 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
     }
 }
 
+/// Ticket 26: true when pasted/dropped text is a ManyProxy library export
+/// (a JSON object carrying the `library` and `subscriptions` sections from
+/// [`crate::store::export_payload_full`]) rather than import-shaped input.
+/// Export payloads restore verbatim via [`Store::restore_library_json`] on
+/// the UI confirm path; the import grammar keeps reading only `outbounds`,
+/// so this predicate — not the grammar — owns the branch. A full sing-box
+/// config has `outbounds` but never both export sections, so it stays on the
+/// import path (duplicates, never a restore).
+pub fn is_library_export(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map)) => {
+            matches!(map.get("library"), Some(serde_json::Value::Array(_)))
+                && matches!(map.get("subscriptions"), Some(serde_json::Value::Array(_)))
+        }
+        _ => false,
+    }
+}
+
 /// Parse pasted/clipboard text: JSON (outbounds array or full config,
 /// BOM-prefixed or not), a WireGuard conf (any marker case), limited Clash
 /// YAML (`proxies:` — same support as subscription bodies), or one share
@@ -1844,17 +1866,20 @@ pub fn import_file_content(file_name: &str, content: &str) -> BatchResult {
 }
 
 /// Write a batch into the store as disabled records in `group` (blank falls
-/// back to the default group). Ticket 16: dedupe uses
-/// [`normalized_identity`] — the same key as subscription refresh — so the
-/// same server with different case/whitespace or a flow-only change commits
-/// a single row instead of duplicating. Identical re-imports never duplicate.
-/// Import never enables or starts configs: it only calls [`Store::add`],
-/// which creates disabled records.
+/// back to the default group). Ticket 26: dedupe uses
+/// [`crate::store::widened_identity`] — the same key as subscription refresh
+/// — so transport/security/flow-only variants commit as distinct rows instead
+/// of over-merging, while identical re-imports never duplicate. The write is
+/// one [`Store::add_batch`] transaction: validation runs fully before any
+/// write, so one bad item rejects the whole batch and writes nothing (never a
+/// half-committed import). Import never enables or starts configs: it only
+/// creates disabled records.
 pub fn commit_batch(
     store: &mut Store,
     batch: BatchResult,
     group: &str,
 ) -> Result<ImportOutcome, StoreError> {
+    use crate::store::widened_identity;
     let group = group.trim();
     let group = if group.is_empty() {
         DEFAULT_GROUP.to_string()
@@ -1864,28 +1889,33 @@ pub fn commit_batch(
     let mut seen: HashSet<String> = store
         .list()?
         .iter()
-        .map(|config| normalized_identity(&config.protocol, &config.params))
+        .map(|config| widened_identity(&config.protocol, &config.params))
         .collect();
     let mut outcome = ImportOutcome {
         imported: 0,
         duplicates: 0,
         failures: batch.failures,
     };
+    let mut inputs: Vec<NewConfig> = Vec::with_capacity(batch.configs.len());
     for config in batch.configs {
-        if !seen.insert(normalized_identity(&config.protocol, &config.params)) {
+        if !seen.insert(widened_identity(&config.protocol, &config.params)) {
             outcome.duplicates += 1;
             continue;
         }
-        store.add(NewConfig {
+        inputs.push(NewConfig {
             name: config.name,
             protocol: config.protocol,
             params: config.params,
             group: group.clone(),
             bind_ip: String::new(),
             port: String::new(),
-        })?;
-        outcome.imported += 1;
+        });
     }
+    if inputs.is_empty() {
+        return Ok(outcome);
+    }
+    let added = store.add_batch(inputs)?;
+    outcome.imported = added.len();
     Ok(outcome)
 }
 
@@ -1940,8 +1970,10 @@ pub fn effective_hint_for_text(hint: Option<&str>, text: &str) -> Option<String>
 /// identity); credential values stay verbatim. Ticket 24 (LOW): `flow` and
 /// `security` are deliberately excluded from identity (same server with a
 /// flow-only change is the same row); ports are numeric (no trim needed).
-/// Ticket 16: [`commit_batch`] uses this same key so paste/import dedupes
-/// exactly like subscription refresh.
+/// Ticket 16: [`commit_batch`] uses the widened key
+/// ([`crate::store::widened_identity`], same base plus transport/security
+/// extras) so paste/import dedupes exactly like subscription refresh without
+/// over-merging distinct nodes.
 pub fn normalized_identity(protocol: &str, params: &str) -> String {
     fn get(obj: &Params, keys: &[&str]) -> Option<String> {
         keys.iter().find_map(|wanted| {
@@ -2538,6 +2570,37 @@ mod tests {
     // -- fixture corpus: one per grammar -----------------------------------
 
     const UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Ticket 26: export payloads route to restore (both sections present);
+    /// sing-box configs, links, and partial shapes stay on the import path.
+    #[test]
+    fn is_library_export_routes_only_full_payloads() {
+        use crate::store::export_payload_full;
+        let full = export_payload_full(&[], &[], &[]);
+        assert!(is_library_export(&full), "real export restores");
+        assert!(
+            !is_library_export("{\"outbounds\": [], \"library\": []}"),
+            "missing subscriptions stays import"
+        );
+        assert!(
+            !is_library_export("{\"subscriptions\": []}"),
+            "missing library stays import"
+        );
+        assert!(
+            !is_library_export("{\"outbounds\": [{\"type\": \"vless\"}]}"),
+            "sing-box stays import"
+        );
+        assert!(
+            !is_library_export(&format!("vless://{UUID}@a.example.com:443#one")),
+            "links stay import"
+        );
+        assert!(!is_library_export(""), "empty stays import");
+        assert!(!is_library_export("[1, 2]"), "arrays stay import");
+        assert!(
+            !is_library_export("{\"library\": {}, \"subscriptions\": []}"),
+            "non-array library stays import"
+        );
+    }
 
     #[test]
     fn vless_full_link() {
@@ -3501,10 +3564,12 @@ mod tests {
 
     // -- ticket 16: validation coherence + dedupe/group consistency --------
 
-    /// Scenario 3: same server with different case/whitespace, or a flow-only
-    /// change, shares the normalized identity — commit dedupes like refresh.
+    /// Ticket 26: `commit_batch` dedupes on the widened identity (same key as
+    /// subscription refresh): case/whitespace-only variants still dedupe,
+    /// but a flow-only change is a DIFFERENT node and commits a second row
+    /// instead of over-merging.
     #[test]
-    fn commit_dedupes_on_normalized_identity() {
+    fn commit_dedupes_on_widened_identity() {
         let mut store = Store::open_in_memory().expect("store opens");
         let first = import_text(&format!("vless://{UUID}@a.example.com:443#one"));
         let outcome = commit_batch(&mut store, first, "g").expect("commit works");
@@ -3521,14 +3586,22 @@ mod tests {
         assert_eq!(outcome.imported, 0, "case variant adds nothing");
         assert_eq!(outcome.duplicates, 1);
 
-        // Flow-only change rides outside the identity key: still one row.
+        // Flow-only change rides INSIDE the widened key: a distinct node.
         let flowed = import_text(&format!(
             "vless://{UUID}@a.example.com:443?flow=xtls-rprx-vision#three"
         ));
         let outcome = commit_batch(&mut store, flowed, "g").expect("recommit works");
-        assert_eq!(outcome.imported, 0, "flow variant adds nothing");
+        assert_eq!(outcome.imported, 1, "flow variant is a distinct node");
+        assert_eq!(outcome.duplicates, 0);
+        assert_eq!(store.list().expect("list works").len(), 2);
+
+        // Re-importing the exact flowed row dedupes again.
+        let flowed_again = import_text(&format!(
+            "vless://{UUID}@a.example.com:443?flow=xtls-rprx-vision#three"
+        ));
+        let outcome = commit_batch(&mut store, flowed_again, "g").expect("recommit works");
+        assert_eq!(outcome.imported, 0, "exact re-import adds nothing");
         assert_eq!(outcome.duplicates, 1);
-        assert_eq!(store.list().expect("list works").len(), 1);
     }
 
     /// Normalized identity trims surrounding whitespace before lowercasing.
