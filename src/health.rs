@@ -1165,6 +1165,7 @@ mod tests {
             port,
             subscription_id: None,
             identity_key: None,
+            preset_id: None,
         }
     }
 

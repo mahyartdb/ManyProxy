@@ -348,6 +348,9 @@ pub enum EngineError {
         field: String,
         detail: String,
     },
+    /// Ticket 37: attached routing-preset failure (names the row and the
+    /// rule index + field; never echoes rule content).
+    BadPreset { name: String, detail: String },
     /// The sidecar process could not be spawned.
     SpawnFailed { detail: String },
     /// Ticket 23: a local endpoint is already held (by another process or a
@@ -477,6 +480,10 @@ impl std::fmt::Display for EngineError {
             EngineError::BadExtra { name, field, detail } => write!(
                 f,
                 "bad extra-core slot for \"{name}\": \"{field}\" ({detail})"
+            ),
+            EngineError::BadPreset { name, detail } => write!(
+                f,
+                "bad routing preset for \"{name}\": {detail}"
             ),
             EngineError::SpawnFailed { detail } => {
                 write!(f, "engine failed to start ({detail})")
@@ -2065,7 +2072,24 @@ impl GeneratedConfig {
 /// Order: conflict check → per-row outbound/endpoint mapping → route table →
 /// structural self-check. Pure: no processes, no network, no secrets in
 /// errors.
+///
+/// Ticket 37: rows without an attached preset generate exactly as before;
+/// use [`generate_with_presets`] to merge per-row preset rules. Production
+/// serves through the controller (which always threads its preset map);
+/// this entry stays for preset-less callers and the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError> {
+    generate_with_presets(configs, &HashMap::new())
+}
+
+/// Ticket 37: [`generate`] plus per-row routing presets. `presets` maps
+/// preset id → ordered route-rule objects (see [`Store::preset_rules_map`]);
+/// each attached row's rules merge ahead of its own isolation rule. An empty
+/// map is byte-identical to [`generate`].
+pub fn generate_with_presets(
+    configs: &[ProxyConfig],
+    presets: &HashMap<String, Vec<serde_json::Value>>,
+) -> Result<GeneratedConfig, EngineError> {
     if configs.is_empty() {
         return Err(EngineError::NoActiveConfigs);
     }
@@ -2099,7 +2123,86 @@ pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError>
         .map(|row| row.port)
         .collect();
     let bridges = assign_bridge_ports(&keys, &taken_ports)?;
-    build_main_config(configs, &bridges)
+    build_main_config(configs, &bridges, presets)
+}
+
+/// Ticket 37: resolve one row's attached preset into merge-ready route rules.
+/// Route actions point at the row's serving tag (route to row outbound).
+/// Direct passes through, and the Throne `block` spelling is served as
+/// `reject` (live-proven: stock sing-box 1.14.2 has no `block` action).
+/// Rules without an `inbound` scope to the row's inbound. Presets are
+/// per-row policy, so an unscoped rule must never leak onto sibling rows
+/// sharing the sidecar; an explicit `inbound` is kept verbatim. Stored rules
+/// re-validate here (index and field, never values). A dangling preset id
+/// fails loudly instead of serving preset-less.
+fn preset_rules_for(
+    config: &ProxyConfig,
+    serving_tag: &str,
+    inbound_tag: &str,
+    presets: &HashMap<String, Vec<serde_json::Value>>,
+) -> Result<Vec<serde_json::Value>, EngineError> {
+    let bad = |detail: String| EngineError::BadPreset {
+        name: config.name.clone(),
+        detail,
+    };
+    let Some(preset_id) = config.preset_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let Some(stored) = presets.get(preset_id) else {
+        return Err(bad(format!(
+            "attached routing preset (id {preset_id}) is missing — detach it or re-import it"
+        )));
+    };
+    let mut out = Vec::with_capacity(stored.len());
+    for (index, rule) in stored.iter().enumerate() {
+        let obj = rule
+            .as_object()
+            .ok_or_else(|| bad(format!("rule {index}: must be a JSON object")))?;
+        let action = obj
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| bad(format!("rule {index}: field \"action\" is required")))?;
+        if !crate::preset::VALID_PRESET_ACTIONS.contains(&action) {
+            return Err(bad(format!(
+                "rule {index}: field \"action\" must be one of {}",
+                crate::preset::VALID_PRESET_ACTIONS.join(", ")
+            )));
+        }
+        if action == "route" {
+            if let Some(outbound) = obj.get("outbound") {
+                if !outbound.is_string() {
+                    return Err(bad(format!(
+                        "rule {index}: field \"outbound\" must be a string"
+                    )));
+                }
+            }
+        } else if obj.contains_key("outbound") {
+            return Err(bad(format!(
+                "rule {index}: field \"outbound\" needs action \"route\""
+            )));
+        }
+        let mut merged = obj.clone();
+        // Normalize the served spelling (`block` → `reject`); route/direct
+        // spellings are already what the sidecar accepts.
+        merged.insert(
+            "action".to_string(),
+            serde_json::Value::String(crate::preset::served_action(action).to_string()),
+        );
+        if action == "route" {
+            merged.insert(
+                "outbound".to_string(),
+                serde_json::Value::String(serving_tag.to_string()),
+            );
+        }
+        if !merged.contains_key("inbound") {
+            merged.insert(
+                "inbound".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::String(inbound_tag.to_string())]),
+            );
+        }
+        out.push(serde_json::Value::Object(merged));
+    }
+    Ok(out)
 }
 /// rows and xray-core customs; `{id}#hop{i}` for xray-last inline chain
 /// hops). Both [`generate`] and [`validate_activation`] derive keys this
@@ -3142,6 +3245,7 @@ fn build_ticket08_row(
 fn build_main_config(
     configs: &[ProxyConfig],
     bridges: &HashMap<String, u16>,
+    presets: &HashMap<String, Vec<serde_json::Value>>,
 ) -> Result<GeneratedConfig, EngineError> {
     if configs.is_empty() {
         return Err(EngineError::NoActiveConfigs);
@@ -3175,6 +3279,11 @@ fn build_main_config(
                 "listen": config.bind_ip,
                 "listen_port": config.port,
             }));
+            // Ticket 37: attached preset rules merge ahead of the row's own
+            // isolation rule (route→row-outbound, scoped to this inbound).
+            for preset_rule in preset_rules_for(config, &built.serving_tag, &in_tag, presets)? {
+                rules.push(preset_rule);
+            }
             rules.push(serde_json::json!({
                 "inbound": [in_tag],
                 "action": "route",
@@ -3205,6 +3314,11 @@ fn build_main_config(
             "listen": config.bind_ip,
             "listen_port": config.port,
         }));
+        // Ticket 37: attached preset rules merge ahead of the row's own
+        // isolation rule (route→row-outbound, scoped to this inbound).
+        for preset_rule in preset_rules_for(config, &out_tag, &in_tag, presets)? {
+            rules.push(preset_rule);
+        }
         rules.push(serde_json::json!({
             "inbound": [in_tag],
             "action": "route",
@@ -3341,20 +3455,34 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
             }
             _ => return Err(invalid("rule without inbound array")),
         };
-        let outbound = obj
-            .get("outbound")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| invalid("rule without outbound"))?;
-        if obj.get("action").and_then(serde_json::Value::as_str) != Some("route") {
-            return Err(invalid("rule without route action"));
+        let outbound = obj.get("outbound").and_then(serde_json::Value::as_str);
+        // Ticket 37: preset rules carry `direct`/`reject` actions (no
+        // outbound); isolation rules stay `route`. A raw `block` reaching
+        // this gate means the merge skipped normalization — fail closed.
+        // Anything else fails.
+        match obj.get("action").and_then(serde_json::Value::as_str) {
+            Some("route") => {
+                let outbound = outbound.ok_or_else(|| invalid("rule without outbound"))?;
+                if !exits.contains(outbound) {
+                    return Err(invalid(&format!("rule references unknown \"{outbound}\"")));
+                }
+            }
+            Some("direct") | Some("reject") => {
+                if outbound.is_some() {
+                    return Err(invalid("rule with direct/reject action carries outbound"));
+                }
+            }
+            Some("block") => {
+                return Err(invalid(
+                    "rule action \"block\" must be normalized to \"reject\" before serving",
+                ));
+            }
+            _ => return Err(invalid("rule without route action")),
         }
         for inbound in inbound_names_list {
             if !inbound_names.contains(inbound) {
                 return Err(invalid(&format!("rule references unknown \"{inbound}\"")));
             }
-        }
-        if !exits.contains(outbound) {
-            return Err(invalid(&format!("rule references unknown \"{outbound}\"")));
         }
     }
     let final_outbound = route
@@ -4440,6 +4568,10 @@ pub struct EngineController {
     /// Ticket 27: last configs served per extra slot (parallel to
     /// [`EngineController::extra_backends`]).
     served_extra: Vec<Option<String>>,
+    /// Ticket 37: preset id → ordered route-rule objects for the engine
+    /// merge (synced from the store before start; empty means no row
+    /// carries a preset). Dangling references fail loudly at merge time.
+    preset_rules: HashMap<String, Vec<serde_json::Value>>,
     active: Vec<ProxyConfig>,
     status: EngineStatus,
     last_error: Option<String>,
@@ -4503,6 +4635,7 @@ impl EngineController {
             lan_confirmed: HashSet::new(),
             served: [None, None, None],
             served_extra: vec![None],
+            preset_rules: HashMap::new(),
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -4580,6 +4713,7 @@ impl EngineController {
             lan_confirmed: HashSet::new(),
             served: [None, None, None],
             served_extra: vec![None],
+            preset_rules: HashMap::new(),
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -4628,6 +4762,13 @@ impl EngineController {
     #[cfg(test)]
     pub fn set_stock_probe(&mut self, probe: impl Fn() -> Result<PathBuf, EngineError> + 'static) {
         self.stock_probe = Box::new(probe);
+    }
+
+    /// Ticket 37: replace the preset rules for the engine merge (the UI
+    /// syncs these from the store before every start; tests inject
+    /// directly). Empty means no row carries a preset.
+    pub fn set_preset_rules(&mut self, presets: HashMap<String, Vec<serde_json::Value>>) {
+        self.preset_rules = presets;
     }
 
     /// Ticket 23: drop LAN confirms for rows that are no longer active (or
@@ -4952,7 +5093,7 @@ impl EngineController {
             Some(json) => Some(json),
             None if plan.main_rows.is_empty() => None,
             None => Some(
-                build_main_config(&plan.main_rows, &plan_bridges)
+                build_main_config(&plan.main_rows, &plan_bridges, &self.preset_rules)
                     .inspect_err(|error| {
                         self.last_error = Some(error.to_string());
                     })?
@@ -4963,7 +5104,7 @@ impl EngineController {
             Some(json) => Some(json),
             None if plan.fork_rows.is_empty() => None,
             None => Some(
-                generate(&plan.fork_rows)
+                generate_with_presets(&plan.fork_rows, &self.preset_rules)
                     .inspect_err(|error| {
                         self.last_error = Some(error.to_string());
                     })?
@@ -5631,6 +5772,7 @@ mod tests {
             port,
             subscription_id: None,
             identity_key: None,
+            preset_id: None,
         }
     }
 
@@ -6470,6 +6612,7 @@ mod tests {
                         port: 10901,
                         subscription_id: None,
                         identity_key: None,
+                        preset_id: None,
                     };
                     check_one(&binary, label, std::slice::from_ref(&row));
                 }
@@ -8469,5 +8612,227 @@ mod tests {
         assert!(!text.contains(char::from(27u8)), "stripped: {text:?}");
         let last = controller.last_error().expect("recorded");
         assert!(!last.contains(char::from(27u8)), "stored clean: {last:?}");
+    }
+
+    // -- Ticket 37: routing presets --------------------------------------
+
+    fn t37_preset_map() -> HashMap<String, Vec<serde_json::Value>> {
+        let mut map = HashMap::new();
+        map.insert(
+            "p1".to_string(),
+            vec![
+                json!({"action": "route", "domain": ["example.com"]}),
+                json!({"action": "direct", "ip_cidr": ["10.0.0.0/8"]}),
+                json!({"action": "block", "port": [25]}),
+            ],
+        );
+        map
+    }
+
+    fn t37_row_with_preset() -> ProxyConfig {
+        let mut row = fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pw"),
+            "127.0.0.1",
+            10801,
+        );
+        row.preset_id = Some("p1".to_string());
+        row
+    }
+
+    /// Ticket 37: no presets attached means byte-identical output to the
+    /// pre-preset generator (unattached rows never change behavior).
+    #[test]
+    fn ticket37_generate_without_presets_is_byte_identical() {
+        let rows = three_standard();
+        let plain = generate(&rows).expect("generates");
+        let empty = HashMap::new();
+        let with_empty = generate_with_presets(&rows, &empty).expect("generates");
+        assert_eq!(plain.json, with_empty.json, "empty map changes nothing");
+    }
+
+    /// Ticket 37: an attached preset merges its rules ahead of the row's
+    /// isolation rule — route actions point at the row outbound, direct
+    /// passes through, the Throne `block` spelling is served as `reject`
+    /// (what stock 1.14.2 accepts), and every preset rule is scoped to the
+    /// row inbound.
+    #[test]
+    fn ticket37_preset_rules_merge_before_isolation_rule() {
+        let row = t37_row_with_preset();
+        let generated = generate_with_presets(std::slice::from_ref(&row), &t37_preset_map())
+            .expect("generates");
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 4, "3 preset + 1 isolation, got {rules:?}");
+        let in_tag = inbound_tag(&row.id);
+        let out_tag = outbound_tag(&row.id);
+        for (index, rule) in rules.iter().take(3).enumerate() {
+            assert_eq!(
+                rule["inbound"],
+                json!([in_tag]),
+                "preset rule {index} scoped to the row, got {rule}"
+            );
+        }
+        assert_eq!(rules[0]["action"], json!("route"));
+        assert_eq!(rules[0]["outbound"], json!(out_tag));
+        assert_eq!(rules[0]["domain"], json!(["example.com"]));
+        assert_eq!(rules[1]["action"], json!("direct"));
+        assert_eq!(rules[2]["action"], json!("reject"), "block normalizes");
+        // The isolation rule still closes the table.
+        assert_eq!(rules[3]["inbound"], json!([in_tag]));
+        assert_eq!(rules[3]["outbound"], json!(out_tag));
+    }
+
+    /// Ticket 37: a second row without a preset keeps exactly its isolation
+    /// rule while the attached row carries its presets (no cross-row leak).
+    #[test]
+    fn ticket37_unattached_rows_keep_isolation_only() {
+        let attached = t37_row_with_preset();
+        let plain = fixture(
+            "2",
+            "Beta",
+            "shadowsocks",
+            ss_params("pw2"),
+            "127.0.0.1",
+            10802,
+        );
+        let generated =
+            generate_with_presets(&[attached, plain], &t37_preset_map()).expect("generates");
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 5, "3 preset + 2 isolation, got {rules:?}");
+        let beta_in = inbound_tag("2");
+        let beta_rules: Vec<&serde_json::Value> = rules
+            .iter()
+            .filter(|rule| rule["inbound"] == json!([beta_in]))
+            .collect();
+        assert_eq!(beta_rules.len(), 1, "unattached row keeps one rule");
+        assert_eq!(beta_rules[0]["action"], json!("route"));
+    }
+
+    /// Ticket 37: a dangling preset reference fails loudly naming the row
+    /// (never a silent no-preset serve).
+    #[test]
+    fn ticket37_dangling_preset_reference_fails_loud() {
+        let row = t37_row_with_preset();
+        let empty = HashMap::new();
+        let error = generate_with_presets(std::slice::from_ref(&row), &empty)
+            .expect_err("dangling preset must fail");
+        let text = error.to_string();
+        assert!(text.contains("Alpha"), "names the row, got {text}");
+        assert!(matches!(error, EngineError::BadPreset { .. }));
+    }
+
+    /// Ticket 37: corrupt stored preset rules fail naming the rule index and
+    /// the field (never values).
+    #[test]
+    fn ticket37_bad_stored_rule_names_index_and_field() {
+        let row = t37_row_with_preset();
+        let mut map = HashMap::new();
+        map.insert(
+            "p1".to_string(),
+            vec![json!({"action": "route"}), json!({"nope": true})],
+        );
+        let error = generate_with_presets(std::slice::from_ref(&row), &map)
+            .expect_err("bad stored rule must fail");
+        let text = error.to_string();
+        assert!(text.contains("rule 1"), "names rule index, got {text}");
+        assert!(text.contains("\"action\""), "names field, got {text}");
+        assert!(!text.contains("nope"), "never echoes content, got {text}");
+    }
+
+    /// Ticket 37: the controller serves preset rules ahead of the isolation
+    /// rule on start (fake backend records the served config).
+    #[test]
+    fn ticket37_controller_start_serves_preset_rules_first() {
+        let (mut controller, stock, _, _, _) = EngineController::fake_quartet();
+        controller.set_preset_rules(t37_preset_map());
+        let row = t37_row_with_preset();
+        controller.start_one_confirmed(&row).expect("start works");
+        let served: serde_json::Value =
+            serde_json::from_str(&stock.last_config().expect("config served"))
+                .expect("served JSON parses");
+        let rules = served["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules.len(),
+            4,
+            "preset rules before isolation, got {rules:?}"
+        );
+        assert_eq!(rules[0]["action"], json!("route"));
+        assert_eq!(rules[0]["outbound"], json!(outbound_tag("1")));
+        assert_eq!(rules[3]["outbound"], json!(outbound_tag("1")));
+    }
+
+    /// Ticket 37: controller without preset rules keeps serving the
+    /// isolation-only shape (unattached start path unchanged).
+    #[test]
+    fn ticket37_controller_start_without_presets_unchanged() {
+        let (mut controller, stock, _, _, _) = EngineController::fake_quartet();
+        let row = fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pw"),
+            "127.0.0.1",
+            10801,
+        );
+        controller.start_one_confirmed(&row).expect("start works");
+        let served: serde_json::Value =
+            serde_json::from_str(&stock.last_config().expect("config served"))
+                .expect("served JSON parses");
+        let rules = served["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1, "isolation only, got {rules:?}");
+    }
+
+    /// Ticket 37 (live): an attached preset passes the real stock sing-box
+    /// 1.14.2 `check` (EXIT 0) with the preset rules present before the
+    /// isolation rule. Hermetic by default — runs only with
+    /// `MANYPROXY_LIVE_CHECK=1` (TEMP files only, removed afterwards). The
+    /// binary resolves via `MANYPROXY_SINGBOX_BIN` (else the debug build
+    /// beside the crate).
+    #[test]
+    fn ticket37_live_singbox_check_accepts_preset_rules() {
+        if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
+            return;
+        }
+        let binary = std::env::var("MANYPROXY_SINGBOX_BIN").map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    PathBuf::from("target/debug/sing-box.exe")
+                } else {
+                    PathBuf::from("target/debug/sing-box")
+                }
+            },
+            PathBuf::from,
+        );
+        let row = t37_row_with_preset();
+        let generated = generate_with_presets(std::slice::from_ref(&row), &t37_preset_map())
+            .expect("PROBE preset: generates");
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 4, "preset rules before isolation");
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-t37-live-preset-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, &generated.json).expect("temp config writes");
+        let output = std::process::Command::new(&binary)
+            .arg("check")
+            .arg("-c")
+            .arg(&path)
+            .output()
+            .expect("check runs");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            output.status.success(),
+            "PROBE preset: sing-box check EXIT 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
