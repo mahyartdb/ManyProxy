@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod dpapi;
 mod engine;
 mod health;
 mod import;

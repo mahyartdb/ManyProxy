@@ -513,7 +513,21 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
         id: id.to_string(),
         name: row.get(1)?,
         protocol: row.get(2)?,
-        params: row.get(3)?,
+        // Ticket 35: the params column is sealed at rest; open it here —
+        // the single read funnel, so every consumer sees plaintext.
+        params: {
+            let stored: String = row.get(3)?;
+            crate::dpapi::unseal_params(&stored).map_err(|message| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        message,
+                    )),
+                )
+            })?
+        },
         group: row.get(4)?,
         enabled: enabled != 0,
         bind_ip: row.get(6)?,
@@ -1294,7 +1308,7 @@ impl Store {
     }
 
     fn open(conn: Connection) -> Result<Self, StoreError> {
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.apply_pragmas()?;
         store.create_schema()?;
         Ok(store)
@@ -1314,12 +1328,33 @@ impl Store {
 
     /// Ticket 25: schema version behind `PRAGMA user_version`. Version 1 is
     /// every table/column through ticket 17; version 2 adds the ticket-25
-    /// ownership columns (`adoptable`, `synced_params`). Fresh and legacy
+    /// ownership columns (`adoptable`, `synced_params`); version 3 seals
+    /// params at rest (ticket 35, DPAPI). Fresh and legacy
     /// (`user_version = 0`) databases migrate forward idempotently; a
     /// database from a NEWER build fails loudly (never a silent empty).
-    const SCHEMA_VERSION: i64 = 2;
+    const SCHEMA_VERSION: i64 = 3;
     /// Minimum SQLite for this schema: STRICT tables need 3.37+.
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
+
+    /// Ticket 35: seal params for storage. A DPAPI failure aborts the
+    /// write loudly (never silent plaintext).
+    fn seal_or_fail(plaintext: &str) -> Result<String, StoreError> {
+        crate::dpapi::seal_params(plaintext).map_err(|message| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )))
+        })
+    }
+
+    /// Ticket 35: open stored params. Sealed values decrypt; legacy JSON
+    /// passes through; anything else fails loudly.
+    fn unseal_or_fail(stored: &str) -> Result<String, StoreError> {
+        crate::dpapi::unseal_params(stored).map_err(|message| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )))
+        })
+    }
 
     /// Ticket 25: loud schema failure (newer-than-supported version, too-old
     /// SQLite, post-migration drift). Reuses `StoreError::Sql` so the public
@@ -1368,7 +1403,7 @@ impl Store {
         Ok(())
     }
 
-    fn create_schema(&self) -> Result<(), StoreError> {
+    fn create_schema(&mut self) -> Result<(), StoreError> {
         self.assert_sqlite_version()?;
         let version: i64 = self
             .conn
@@ -1441,6 +1476,35 @@ impl Store {
         // last-synced upstream baseline behind the user-vs-upstream compare.
         self.ensure_column("proxy_configs", "adoptable", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("proxy_configs", "synced_params", "TEXT")?;
+        // Ticket 35 (version 3): seal params at rest. Legacy JSON values
+        // seal in one transaction; already-sealed rows are untouched, so the
+        // migration is idempotent and reruns are no-ops.
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 3 {
+            let tx = self.conn.transaction()?;
+            for column in ["params", "synced_params"] {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT id, {column} FROM proxy_configs WHERE {column} IS NOT NULL"
+                ))?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (id, value) in rows {
+                    if value.trim_start().starts_with('{') {
+                        let sealed = Self::seal_or_fail(&value)?;
+                        tx.execute(
+                            &format!("UPDATE proxy_configs SET {column} = ?1 WHERE id = ?2"),
+                            rusqlite::params![sealed, id],
+                        )?;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
         // Unknown drift fails loudly: every column the merge relies on must
         // exist after migration, never a silent empty read.
         for (table, column) in [
@@ -1561,6 +1625,10 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut ids: Vec<i64> = Vec::with_capacity(assigned.len());
         for item in &assigned {
+            // Ticket 35: seal before the write; a DPAPI failure returns
+            // before commit, so the transaction rolls back with nothing
+            // written.
+            let sealed = Self::seal_or_fail(&item.params)?;
             tx.execute(
                 "INSERT INTO proxy_configs
                    (name, protocol, params, grp, enabled, bind_ip, port)
@@ -1568,7 +1636,7 @@ impl Store {
                 params![
                     item.name,
                     item.protocol,
-                    item.params,
+                    sealed,
                     item.group,
                     item.bind_ip,
                     item.port as i64,
@@ -1646,7 +1714,8 @@ impl Store {
             params![
                 merged.name,
                 merged.protocol,
-                merged.params,
+                // Ticket 35: sealed at rest.
+                Self::seal_or_fail(&merged.params)?,
                 merged.group,
                 merged.bind_ip,
                 merged.port as i64,
@@ -2037,6 +2106,11 @@ impl Store {
             })?;
             for pair in pairs {
                 let (id, baseline) = pair?;
+                // Ticket 35: the baseline column is sealed at rest; open it
+                // once here so the versioned compare below stays plaintext.
+                let baseline = baseline
+                    .map(|sealed| Self::unseal_or_fail(&sealed))
+                    .transpose()?;
                 synced.insert(id.to_string(), baseline);
             }
         }
@@ -2330,6 +2404,8 @@ impl Store {
         for op in ops {
             match op {
                 Op::Insert { key, config, port } => {
+                    // Ticket 35: params and the sync baseline seal together.
+                    let sealed = Self::seal_or_fail(&config.params)?;
                     tx.execute(
                         "INSERT INTO proxy_configs
                            (name, protocol, params, grp, enabled, bind_ip, port,
@@ -2338,13 +2414,13 @@ impl Store {
                         params![
                             config.name,
                             config.protocol,
-                            config.params,
+                            sealed,
                             subscription.group,
                             DEFAULT_BIND,
                             port as i64,
                             subscription.id,
                             key,
-                            config.params,
+                            sealed,
                         ],
                     )?;
                 }
@@ -2359,12 +2435,14 @@ impl Store {
                     })?;
                     // Ticket 25: refreshes the identity key and the upstream
                     // baseline together; id/port/enabled/name/bind survive.
+                    // Ticket 35: sealed at rest.
+                    let sealed = Self::seal_or_fail(&params)?;
                     tx.execute(
                         "UPDATE proxy_configs
                          SET protocol = ?1, params = ?2, grp = ?3,
                              identity_key = ?4, synced_params = ?5
                          WHERE id = ?6",
-                        params![protocol, params, subscription.group, key, params, rowid],
+                        params![protocol, sealed, subscription.group, key, sealed, rowid],
                     )?;
                 }
                 Op::GroupFollow { id } => {
@@ -2383,6 +2461,8 @@ impl Store {
                     // Ticket 25 adoption: a released row joins the
                     // subscription in place (id/port/enabled/name kept); the
                     // row was untouched since release, so upstream params win.
+                    // Ticket 35: sealed at rest.
+                    let sealed = Self::seal_or_fail(&params)?;
                     tx.execute(
                         "UPDATE proxy_configs
                          SET subscription_id = ?1, identity_key = ?2,
@@ -2392,8 +2472,8 @@ impl Store {
                         params![
                             subscription.id,
                             key,
-                            params,
-                            params,
+                            sealed,
+                            sealed,
                             subscription.group,
                             rowid
                         ],
@@ -2507,6 +2587,11 @@ impl Store {
             })?;
             for entry in entries {
                 let (id, adoptable, synced) = entry?;
+                // Ticket 35: the export carries plaintext (decrypt-then-write
+                // behind the verbatim warning); unseal the baseline here.
+                let synced = synced
+                    .map(|sealed| Self::unseal_or_fail(&sealed))
+                    .transpose()?;
                 side.insert(id.to_string(), (adoptable != 0, synced));
             }
         }
@@ -2737,6 +2822,14 @@ impl Store {
             )?;
         }
         for row in &rows {
+            // Ticket 35: the export carries plaintext; seal on the way back
+            // in (same at-rest invariant as live rows).
+            let sealed_params = Self::seal_or_fail(&row.params)?;
+            let sealed_synced = row
+                .synced_params
+                .as_deref()
+                .map(Self::seal_or_fail)
+                .transpose()?;
             tx.execute(
                 "INSERT INTO proxy_configs
                    (id, name, protocol, params, grp, enabled, bind_ip, port,
@@ -2746,14 +2839,14 @@ impl Store {
                     row.id,
                     row.name,
                     row.protocol,
-                    row.params,
+                    sealed_params,
                     row.group,
                     row.enabled as i64,
                     row.bind_ip,
                     row.port,
                     row.subscription_id,
                     row.identity_key,
-                    row.synced_params,
+                    sealed_synced,
                     row.adoptable as i64,
                 ],
             )?;
@@ -5262,6 +5355,132 @@ mod tests {
                 "typed, got {error}"
             );
         }
+    }
+
+    // -- Ticket 35: DPAPI secrets at rest ------------------------------
+
+    /// Ticket 35: DPAPI round trip — sealed bytes carry no plaintext and
+    /// open back to the exact input.
+    #[test]
+    fn ticket35_dpapi_round_trip() {
+        let plain = br#"{"private_key":"SECRET-PRIVATE-KEY-MATERIAL"}"#;
+        let sealed = crate::dpapi::protect(plain).expect("protects");
+        assert!(
+            !sealed.windows(6).any(|w| w == b"SECRET"),
+            "sealed bytes carry no plaintext"
+        );
+        let opened = crate::dpapi::unprotect(&sealed).expect("unprotects");
+        assert_eq!(opened, plain, "round trip is exact");
+    }
+
+    /// Ticket 35: tampered ciphertext fails loudly (never silent plaintext).
+    #[test]
+    fn ticket35_dpapi_tamper_fails_loud() {
+        let mut sealed = crate::dpapi::protect(b"hello").expect("protects");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        let error = crate::dpapi::unprotect(&sealed).expect_err("tamper must fail");
+        assert!(!error.contains("hello"), "no secret echo: {error}");
+    }
+
+    /// Ticket 35: a stored row's params column carries no credential
+    /// plaintext at rest, and reads back identically.
+    #[test]
+    fn ticket35_stored_params_have_no_plaintext() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store
+            .add(NewConfig {
+                name: "Sealed".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"SECRET-PASSWORD"}"#.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("add works");
+        let raw: String = store
+            .conn
+            .query_row(
+                "SELECT params FROM proxy_configs WHERE id = ?1",
+                rusqlite::params![created.rowid()],
+                |row| row.get(0),
+            )
+            .expect("raw read works");
+        assert!(
+            !raw.contains("SECRET-PASSWORD"),
+            "params column sealed at rest"
+        );
+        let back = store.list().expect("list works");
+        assert_eq!(back.len(), 1);
+        assert!(
+            back[0].params.contains("SECRET-PASSWORD"),
+            "reads decrypt transparently"
+        );
+    }
+
+    /// Ticket 35: a v2 plaintext database migrates to sealed params on open
+    /// with zero data loss (file-backed migration fixture).
+    #[test]
+    fn ticket35_v2_plaintext_migrates_to_sealed() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t35-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        {
+            let mut store = Store::open_file(&path).expect("v3 store opens");
+            store
+                .add(NewConfig {
+                    name: "Legacy".to_string(),
+                    protocol: "shadowsocks".to_string(),
+                    params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"LEGACY-SECRET"}"#.to_string(),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .expect("add works");
+            // Rewind to a v2 plaintext shape: raw params + user_version 2.
+            store
+                .conn
+                .execute(
+                    "UPDATE proxy_configs SET params = ?1",
+                    rusqlite::params![r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"LEGACY-SECRET"}"#],
+                )
+                .expect("rewind works");
+            store
+                .conn
+                .execute_batch("PRAGMA user_version = 2;")
+                .expect("version rewind works");
+        }
+        {
+            let store = Store::open_file(&path).expect("migrated open works");
+            let rows = store.list().expect("list works");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].name, "Legacy");
+            assert!(
+                rows[0].params.contains("LEGACY-SECRET"),
+                "row survives migration"
+            );
+            let raw: String = store
+                .conn
+                .query_row("SELECT params FROM proxy_configs", [], |row| row.get(0))
+                .expect("raw read works");
+            assert!(
+                !raw.contains("LEGACY-SECRET"),
+                "migration sealed the column"
+            );
+            let version: i64 = store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("version reads");
+            assert_eq!(version, 3, "schema advanced to 3");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -- Ticket 31: dialogs + import + subscriptions ---------------------
