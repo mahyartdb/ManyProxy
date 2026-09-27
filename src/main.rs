@@ -87,6 +87,10 @@ pub fn bind_app_keys(cx: &mut App) {
 pub const ENGINE_POLL_TICK_SECS: u64 = 5;
 pub const DUE_SUBSCRIPTION_TICK_SECS: u64 = 300;
 pub const REPROBE_TICK_SECS: u64 = 60;
+/// Ticket 36: data-plane traffic cadence. Each pass polls every serving
+/// core's loopback clash controller (fast refuse-or-reply, 5s bound per
+/// core like the probe bound above) and persists per-row deltas.
+pub const TRAFFIC_TICK_SECS: u64 = 5;
 
 /// Ticket 21: single branding seam — the OS window title and the TitleBar
 /// caption both read this name (the exe icon is `assets/icon.ico`, wired
@@ -1576,12 +1580,18 @@ struct AppView {
     /// with a per-config UI filter, and the boxed measure driver
     /// (production dials each config's own endpoint; tests swap in the
     /// fake via direct field assignment like the engine).
-    /// Ticket 12: `ticks_enabled` gates the three background ticks
+    /// Ticket 12: `ticks_enabled` gates the four background ticks
     /// ([`AppView::stop_background_ticks`]); the latest sample per row is
     /// also persisted so restart restores latencies + dead flags.
     health_store: HealthStore,
     logs: LogStore,
     log_filter: String,
+    /// Ticket 36: last-seen clash connection bytes (`core/conn-id` → (rx,
+    /// tx)) for the traffic tick. Keyed per connection (not per row) so a
+    /// connection that closes between polls cannot double-count the bytes
+    /// of the connections still open. In-memory only (rebuilt per poll;
+    /// the persisted totals in the store are the source of truth).
+    traffic_last_seen: HashMap<String, (u64, u64)>,
     /// Ticket 26: `Send` so blocking probes can move to the background
     /// executor ([`AppView::spawn_probe`]); the fake stays API-identical.
     prober: Box<dyn HealthProber + Send>,
@@ -1662,6 +1672,7 @@ impl AppView {
             health_store: HealthStore::default(),
             logs: LogStore::default(),
             log_filter: String::new(),
+            traffic_last_seen: HashMap::new(),
             prober: Box::new(RealHealthProber::default()),
             ticks_enabled: true,
             refresh_batch_total: 0,
@@ -1707,6 +1718,17 @@ impl AppView {
                 .filter(|snapshot| known.contains(&snapshot.config_id))
                 .collect();
             view.health_store.hydrate(&kept);
+            // Ticket 36: resume data-plane counters from persisted totals
+            // (never zeroed). Only known rows hydrate, and only nonzero
+            // totals flip the display — untracked rows keep the probe-byte
+            // display, and removed configs never resurrect.
+            if let Ok(totals) = view.store.traffic_totals() {
+                for (id, (rx, tx)) in &totals {
+                    if (*rx, *tx) != (0, 0) && known.contains(id) {
+                        view.health_store.set_data_traffic(id, *rx, *tx);
+                    }
+                }
+            }
         }
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
@@ -4486,7 +4508,92 @@ impl AppView {
         self.spawn_probe(rows, false, false, None, cx)
     }
 
-    /// Spawn the three background tick loops. Each loop sleeps its interval,
+    /// Ticket 36: one data-plane traffic pass over every serving core's
+    /// clash controller: poll live entries, diff per-connection bytes
+    /// against the last-seen map, persist per-row deltas, mirror persisted
+    /// absolutes for display, repaint. Probe flows never reach the traffic
+    /// columns ([`crate::health::is_probe_destination`]); missed polls keep
+    /// last totals (never zero). Stopped views and untracked cores do
+    /// nothing (no network). Returns the number of rows with new bytes.
+    fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
+        if !self.ticks_enabled {
+            return 0;
+        }
+        let targets = self.engine.clash_targets().to_vec();
+        if targets.is_empty() {
+            return 0;
+        }
+        let probe = crate::health::probe_host();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut deltas: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut seen: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut ok_cores: HashSet<String> = HashSet::new();
+        for target in &targets {
+            let Ok(entries) =
+                crate::health::poll_clash_entries(target.port, &target.secret, timeout)
+            else {
+                continue;
+            };
+            ok_cores.insert(target.core.clone());
+            for entry in &entries {
+                let Some(row) = entry.row_id.as_deref() else {
+                    continue;
+                };
+                if crate::health::is_probe_destination(&entry.dest, &probe) {
+                    continue;
+                }
+                let key = format!("{}/{}", target.core, entry.id);
+                let (rx, tx) = (entry.rx_bytes, entry.tx_bytes);
+                let (last_rx, last_tx) =
+                    self.traffic_last_seen.get(&key).copied().unwrap_or((0, 0));
+                let (delta_rx, delta_tx) = if (rx, tx) >= (last_rx, last_tx) {
+                    (rx - last_rx, tx - last_tx)
+                } else {
+                    // Controller reset (sidecar restart): a new epoch, so the
+                    // current reading is the delta.
+                    (rx, tx)
+                };
+                seen.insert(key, (rx, tx));
+                if delta_rx > 0 || delta_tx > 0 {
+                    let slot = deltas.entry(row.to_string()).or_insert((0, 0));
+                    slot.0 = slot.0.saturating_add(delta_rx);
+                    slot.1 = slot.1.saturating_add(delta_tx);
+                }
+            }
+        }
+        // Connections closed since the last poll leave the map (their bytes
+        // were already persisted as deltas while they lived). Cores whose
+        // poll failed keep their ids — a failed poll must never look like a
+        // mass close (that would double-count on recovery).
+        self.traffic_last_seen.retain(|id, _| {
+            let core = id.split('/').next().unwrap_or("");
+            !ok_cores.contains(core) || seen.contains_key(id)
+        });
+        for (id, pair) in &seen {
+            self.traffic_last_seen.insert(id.clone(), *pair);
+        }
+        let mut updated = 0;
+        for (row, (rx, tx)) in &deltas {
+            // A row removed mid-tick misses its write (NotFound) — the next
+            // poll drops its connection ids via the row-claim filter.
+            if self.store.add_traffic(row, *rx, *tx).is_ok() {
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            if let Ok(totals) = self.store.traffic_totals() {
+                for row in deltas.keys() {
+                    if let Some((rx, tx)) = totals.get(row) {
+                        self.health_store.set_data_traffic(row, *rx, *tx);
+                    }
+                }
+            }
+            self.reload_quiet(cx);
+        }
+        updated
+    }
+
+    /// Spawn the four background tick loops. Each loop sleeps its interval,
     /// runs one bounded pass, and exits when ticks are stopped or the view
     /// is released. Never called by tests (headless tests call the tick
     /// methods directly with mock seams, never touching the network).
@@ -4499,6 +4606,9 @@ impl AppView {
         });
         spawn_tick(cx, REPROBE_TICK_SECS, |view, cx| {
             view.tick_reprobe_running(cx);
+        });
+        spawn_tick(cx, TRAFFIC_TICK_SECS, |view, cx| {
+            view.tick_traffic_poll(cx);
         });
     }
 
@@ -5655,6 +5765,199 @@ mod tests {
             handle.calls_for(&alpha.id).is_empty(),
             "stopped ticks never touch the network"
         );
+    }
+
+    // -- Ticket 36: data-plane traffic tick ---------------------------------
+
+    /// Stub clash controller: serves one `/connections` body per accepted
+    /// connection (Bearer-checked like the real sidecar), then exits.
+    fn stub_clash_server(bodies: Vec<String>, secret: &str) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        let secret = secret.to_string();
+        let server = std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept works");
+                let mut head = [0u8; 2048];
+                let n = stream.read(&mut head).unwrap_or(0);
+                let authed = String::from_utf8_lossy(&head[..n])
+                    .contains(&format!("Authorization: Bearer {secret}"));
+                let (status, payload) = if authed {
+                    ("200 OK", body)
+                } else {
+                    (
+                        "401 Unauthorized",
+                        r#"{"error":"unauthorized"}"#.to_string(),
+                    )
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("reply works");
+            }
+        });
+        (port, server)
+    }
+
+    /// One data flow plus one health-probe flow for `row` (synthetic bytes
+    /// only — never the live DB, never real credentials).
+    fn traffic_body(row: &str, rx: u64, tx: u64) -> String {
+        serde_json::json!({
+            "connections": [
+                {"download": rx, "id": "conn-1",
+                 "metadata": {"destinationIP": "93.184.216.34", "destinationPort": "80",
+                              "host": "example.com", "network": "tcp",
+                              "sourceIP": "127.0.0.1", "sourcePort": "51241",
+                              "type": format!("mixed/in-{row}")},
+                 "upload": tx},
+                {"download": 500, "id": "probe-1",
+                 "metadata": {"destinationIP": "93.184.216.34", "destinationPort": "80",
+                              "host": "www.gstatic.com", "network": "tcp",
+                              "sourceIP": "127.0.0.1", "sourcePort": "51242",
+                              "type": format!("mixed/in-{row}")},
+                 "upload": 60},
+            ],
+            "downloadTotal": 1500, "uploadTotal": 110,
+        })
+        .to_string()
+    }
+
+    /// Ticket 36: the traffic tick persists per-row data-plane deltas
+    /// (probe flows excluded), mirrors absolutes for display, and never
+    /// double-counts a repeated poll.
+    #[gpui_kit::test]
+    fn tick_traffic_poll_persists_deltas_and_mirrors(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10856"))
+            .expect("seed works");
+
+        let (port, server) = stub_clash_server(
+            vec![
+                traffic_body(&alpha.id, 1000, 50),
+                traffic_body(&alpha.id, 1500, 70),
+                traffic_body(&alpha.id, 1500, 70),
+            ],
+            "s3cret",
+        );
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (mut engine, _) = EngineController::fake();
+                engine.set_clash_targets(vec![ClashTarget {
+                    core: "stock".to_string(),
+                    port,
+                    secret: "s3cret".to_string(),
+                }]);
+                view.engine = engine;
+            });
+        });
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 1, "one row gains data-plane bytes");
+        let totals = view.read_with(cx, |view, _| {
+            view.store.traffic_totals().expect("totals read")
+        });
+        assert_eq!(
+            totals.get(&alpha.id),
+            Some(&(1000, 50)),
+            "probe bytes never reach the traffic columns"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.data_traffic(&alpha.id)),
+            Some((1000, 50)),
+            "mirror tracks persisted absolutes"
+        );
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 1, "grown connections persist the delta");
+        let totals = view.read_with(cx, |view, _| {
+            view.store.traffic_totals().expect("totals read")
+        });
+        assert_eq!(totals.get(&alpha.id), Some(&(1500, 70)));
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(
+            updated, 0,
+            "identical poll persists nothing (no double count)"
+        );
+        let totals = view.read_with(cx, |view, _| {
+            view.store.traffic_totals().expect("totals read")
+        });
+        assert_eq!(totals.get(&alpha.id), Some(&(1500, 70)));
+        server.join().expect("stub drains");
+    }
+
+    /// Ticket 36: restart resumes data-plane counters from persisted
+    /// totals (never zeroed) with no new polling.
+    #[gpui_kit::test]
+    fn restart_restores_traffic_mirror(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-tick36-restart-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let alpha_id = {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            let alpha = store
+                .add(tick12_seed("Alpha", "10857"))
+                .expect("seed works");
+            store
+                .add_traffic(&alpha.id, 1_048_782, 88)
+                .expect("traffic persists");
+            alpha.id.clone()
+        };
+        let store = Store::open_file(&path).expect("reopen works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let restarted = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(restarted.clone());
+            Root::new(restarted, window, cx)
+        });
+        let restarted = stash.borrow().clone().expect("AppView stashed");
+
+        assert_eq!(
+            restarted.read_with(cx, |view, _| view.health_store.data_traffic(&alpha_id)),
+            Some((1_048_782, 88)),
+            "counters resume from persisted totals"
+        );
+        // TEMP files auto-removed: swap the view's store for an empty
+        // in-memory one (direct field assignment, the fake-engine
+        // precedent) so the file connection closes and unlocks, then
+        // remove the DB + WAL sidecars and prove it.
+        cx.update(|_, cx| {
+            restarted.update(cx, |view, _| {
+                view.store = Store::open_in_memory().expect("swap works");
+            });
+        });
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let sibling = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            let _ = std::fs::remove_file(&sibling);
+        }
+        assert!(!path.exists(), "restart temp db removed");
     }
 
     // -- Ticket 13: live sidecar log pipe ------------------------------------

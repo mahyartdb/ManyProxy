@@ -70,6 +70,124 @@ pub const XHTTP_KNOWN_BUGS: &str = "known fork issue: XHTTP stream-one/auto mode
 /// listeners; research 02 sidecar-bridge model).
 pub const XRAY_BINARY_BASE: &str = "xray";
 
+/// Ticket 36: loopback clash-controller range for per-core traffic
+/// metering. Disjoint from endpoints (10801-10999 + 18081 spillover),
+/// the xray bridge (11801-11999), and row binds.
+pub const CLASH_PORT_START: u16 = 18501;
+pub const CLASH_PORT_END: u16 = 18999;
+
+/// Ticket 36: one clash controller identity per serving core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClashTarget {
+    pub core: String,
+    pub port: u16,
+    pub secret: String,
+}
+
+/// Ticket 36: loopback bearer secret (16 hex chars from pid + wall clock
+/// + an atomic nonce — never persisted, regenerated per start).
+fn clash_secret(core: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = DefaultHasher::new();
+    (
+        std::process::id(),
+        std::time::SystemTime::now(),
+        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        core,
+    )
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Ticket 36: first free loopback port in the clash range (single-shot
+/// binds, no retry sleeps — the caller probe-binds the pick for real).
+fn find_clash_port() -> Option<u16> {
+    (CLASH_PORT_START..=CLASH_PORT_END)
+        .find(|port| std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_ok())
+}
+
+/// Ticket 36: splice a loopback-only clash controller into a generated
+/// sidecar config (shape proven live against stock 1.14.2 `check`).
+/// Refuses non-JSON input typed (never emits a half-document). Never
+/// called on user-owned custom JSON (generated cores only). No
+/// re-validation here: `generate()` already validated the pre-image and
+/// the added `experimental` block cannot affect route structure.
+fn inject_clash_api(json: &str, port: u16, secret: &str) -> Result<String, EngineError> {
+    let invalid = |detail: &str| EngineError::InvalidGenerated {
+        detail: detail.to_string(),
+    };
+    let mut document: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| invalid("sidecar config is not JSON (clash injection refused)"))?;
+    let obj = document
+        .as_object_mut()
+        .ok_or_else(|| invalid("sidecar config is not an object (clash injection refused)"))?;
+    obj.insert(
+        "experimental".to_string(),
+        serde_json::json!({"clash_api": {
+            "external_controller": format!("127.0.0.1:{port}"),
+            "secret": secret,
+        }}),
+    );
+    serde_json::to_string(&document)
+        .map_err(|_| invalid("clash-injected config does not serialize"))
+}
+
+/// Ticket 36: listen (bind, port) pairs served by a sidecar config, read
+/// best-effort for the re-apply probe skip. Garbage fails open to an
+/// empty set (probe everything — never skip on a guess).
+fn served_listen_ports(json: &str) -> Vec<(String, u16)> {
+    let mut out = Vec::new();
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(json) else {
+        return out;
+    };
+    let Some(inbounds) = document
+        .get("inbounds")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return out;
+    };
+    for node in inbounds {
+        let port = node
+            .get("listen_port")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|port| (1..=65_535).contains(port))
+            .map(|port| port as u16);
+        let bind = node
+            .get("listen")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if let (Some(bind), Some(port)) = (bind, port) {
+            out.push((bind, port));
+        }
+    }
+    out
+}
+
+/// Ticket 36: recover a clash target from a served sidecar config (the
+/// injected `experimental.clash_api` block). Anything else (user-owned
+/// replacements, extra slots, garbage) yields nothing — those cores stay
+/// untracked.
+fn clash_target_from_served(core: &str, json: &str) -> Option<ClashTarget> {
+    let document: serde_json::Value = serde_json::from_str(json).ok()?;
+    let api = document.get("experimental")?.get("clash_api")?;
+    let controller = api.get("external_controller")?.as_str()?;
+    let port: u16 = controller.rsplit(':').next()?.parse().ok()?;
+    if !controller.starts_with("127.0.0.1:") && !controller.starts_with("localhost:") {
+        return None;
+    }
+    let secret = api.get("secret")?.as_str()?.to_string();
+    if secret.is_empty() {
+        return None;
+    }
+    Some(ClashTarget {
+        core: core.to_string(),
+        port,
+        secret,
+    })
+}
+
 /// Ticket 08: loopback bridge-port range for Xray ingress listeners.
 /// Disjoint from the library auto-port range (10801-10999) so bridge
 /// listeners never collide with user endpoints by construction; the
@@ -4444,6 +4562,11 @@ pub struct EngineController {
     status: EngineStatus,
     last_error: Option<String>,
     last_config_json: Option<String>,
+    /// Ticket 36: live clash controllers per serving core (port + secret).
+    /// In-memory only (regenerated per start, never persisted); cleared
+    /// with the served snapshots whenever membership empties or a core
+    /// serves a user-owned replacement (never mutated user JSON).
+    clash: Vec<ClashTarget>,
 }
 
 /// Ticket 07: fill row names + the XHTTP note flag into a probe failure.
@@ -4507,6 +4630,7 @@ impl EngineController {
             status: EngineStatus::Stopped,
             last_error: None,
             last_config_json: None,
+            clash: Vec::new(),
         }
     }
 
@@ -4584,6 +4708,7 @@ impl EngineController {
             status: EngineStatus::Stopped,
             last_error: None,
             last_config_json: None,
+            clash: Vec::new(),
         };
         (controller, stock, fork, xray, extra)
     }
@@ -4948,7 +5073,7 @@ impl EngineController {
         for egress in &plan.egresses {
             plan_bridges.insert(egress.bridge_key.clone(), egress.bridge_port);
         }
-        let stock_gen: Option<String> = match replacement(OwningCore::Stock) {
+        let mut stock_gen: Option<String> = match replacement(OwningCore::Stock) {
             Some(json) => Some(json),
             None if plan.main_rows.is_empty() => None,
             None => Some(
@@ -4959,7 +5084,7 @@ impl EngineController {
                     .json,
             ),
         };
-        let fork_gen: Option<String> = match replacement(OwningCore::Fork) {
+        let mut fork_gen: Option<String> = match replacement(OwningCore::Fork) {
             Some(json) => Some(json),
             None if plan.fork_rows.is_empty() => None,
             None => Some(
@@ -4970,6 +5095,44 @@ impl EngineController {
                     .json,
             ),
         };
+        // Ticket 36: loopback clash controllers on generated cores only
+        // (user-owned replacements are never mutated — those cores stay
+        // untracked). Exhaustion and injection failures are typed here,
+        // before anything stops, like every other apply gate.
+        let mut clash: Vec<ClashTarget> = Vec::new();
+        for (core, gen, rows_present) in [
+            ("stock", &mut stock_gen, !plan.main_rows.is_empty()),
+            ("fork", &mut fork_gen, !plan.fork_rows.is_empty()),
+        ] {
+            let generated = match core {
+                "stock" => replacement(OwningCore::Stock).is_none() && rows_present,
+                _ => replacement(OwningCore::Fork).is_none() && rows_present,
+            };
+            let Some(json) = gen.as_mut() else {
+                continue;
+            };
+            if !generated {
+                continue;
+            }
+            let port = find_clash_port().ok_or_else(|| {
+                let error = EngineError::PortUnavailable {
+                    bind: "127.0.0.1".to_string(),
+                    port: CLASH_PORT_START,
+                    name: format!("clash controller ({core}, range exhausted)"),
+                };
+                self.last_error = Some(error.to_string());
+                error
+            })?;
+            let secret = clash_secret(core);
+            *json = inject_clash_api(json, port, &secret).inspect_err(|error| {
+                self.last_error = Some(error.to_string());
+            })?;
+            clash.push(ClashTarget {
+                core: core.to_string(),
+                port,
+                secret,
+            });
+        }
         let xray_gen: Option<String> = match replacement(OwningCore::Xray) {
             Some(json) => Some(json),
             None if plan.egresses.is_empty() => None,
@@ -5067,7 +5230,22 @@ impl EngineController {
         // Ticket 23 MED: probe-bind every serving endpoint (plus every
         // bridge listener) BEFORE any sidecar is stopped — a foreign holder
         // fails typed here, while rollback is still free.
+        // Ticket 36: pairs our currently-served sidecars already hold are
+        // skipped (re-apply/start-one-more/stop-one must not mistake our
+        // own sockets for a foreign holder). The skip set comes only from
+        // configs we served (never guessed); a foreign squatter on a
+        // previously-served port surfaces later as a typed spawn failure.
         {
+            let mut own: std::collections::HashSet<(String, u16)> =
+                std::collections::HashSet::new();
+            for served in self
+                .served
+                .iter()
+                .flatten()
+                .chain(self.served_extra.iter().flatten())
+            {
+                own.extend(served_listen_ports(served));
+            }
             let mut endpoints: Vec<(String, String, u16)> = Vec::new();
             for row in plan.main_rows.iter().chain(plan.fork_rows.iter()) {
                 endpoints.push((row.name.clone(), row.bind_ip.clone(), row.port));
@@ -5082,7 +5260,18 @@ impl EngineController {
                     egress.bridge_port,
                 ));
             }
+            // Ticket 36: clash controllers join the same probe gate.
+            for target in &clash {
+                endpoints.push((
+                    format!("clash controller ({})", target.core),
+                    "127.0.0.1".to_string(),
+                    target.port,
+                ));
+            }
             for (name, bind, port) in &endpoints {
+                if own.contains(&(bind.clone(), *port)) {
+                    continue;
+                }
                 if probe_bind_available(bind, *port).is_err() {
                     let error = EngineError::PortUnavailable {
                         bind: bind.clone(),
@@ -5267,6 +5456,8 @@ impl EngineController {
                 .join("; ");
             self.last_error = Some(detail);
             let (_, first) = failures.into_iter().next().expect("failures non-empty");
+            // Ticket 36: controllers follow the restored served set.
+            self.sync_clash_from_served();
             self.status = if self.any_backend_running() {
                 EngineStatus::Running
             } else {
@@ -5287,6 +5478,8 @@ impl EngineController {
             .or_else(|| gens[1].clone())
             .or_else(|| gens[2].clone())
             .or_else(|| extra_gens.iter().find_map(|gen| gen.clone()));
+        // Ticket 36: controllers follow the newly served set.
+        self.sync_clash_from_served();
         self.last_error = None;
         Ok(())
     }
@@ -5402,6 +5595,36 @@ impl EngineController {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn running_count(&self) -> usize {
         self.active.len()
+    }
+
+    /// Ticket 36: live clash controllers per serving core (port + secret)
+    /// for the traffic poll tick. Empty when nothing generated serves
+    /// (stopped cores, user-owned replacements, extra slots).
+    pub fn clash_targets(&self) -> &[ClashTarget] {
+        &self.clash
+    }
+
+    /// Ticket 36: test seam — point the traffic tick at stub controllers
+    /// (mirrors the `set_*_probe` setter precedent).
+    #[cfg(test)]
+    pub fn set_clash_targets(&mut self, targets: Vec<ClashTarget>) {
+        self.clash = targets;
+    }
+
+    /// Ticket 36: rebuild [`EngineController::clash`] from the served
+    /// configs (single source of truth — covers success, rollback-restore,
+    /// and teardown uniformly).
+    fn sync_clash_from_served(&mut self) {
+        const CORES: [&str; 2] = ["stock", "fork"];
+        self.clash = CORES
+            .into_iter()
+            .zip(self.served.iter().take(2))
+            .filter_map(|(core, served)| {
+                served
+                    .as_deref()
+                    .and_then(|json| clash_target_from_served(core, json))
+            })
+            .collect();
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -5744,7 +5967,319 @@ mod tests {
         assert!(generated.outbound_tags.contains(&outbound_tag("1")));
     }
 
-    /// Live-proven mapping (2026-09-26, real fork handshake + HTTP 301
+    /// Ticket 36: clash injection adds a loopback-only controller block
+    /// (shape proven live against stock 1.14.2); garbage input fails typed.
+    #[test]
+    fn ticket36_inject_clash_api() {
+        let doc = serde_json::json!({
+            "log": {"level": "warn"},
+            "inbounds": [], "outbounds": [],
+            "endpoints": [], "route": {"rules": [], "final": "direct"},
+        });
+        let out = inject_clash_api(&doc.to_string(), 18501, "s3cret").expect("injects");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("stays JSON");
+        assert_eq!(
+            parsed["experimental"]["clash_api"]["external_controller"],
+            serde_json::json!("127.0.0.1:18501")
+        );
+        assert_eq!(
+            parsed["experimental"]["clash_api"]["secret"],
+            serde_json::json!("s3cret")
+        );
+        assert!(
+            inject_clash_api("not json", 18501, "s3cret").is_err(),
+            "garbage fails typed"
+        );
+    }
+
+    /// Ticket 36 (re-apply prerequisite): served listen ports parse out of
+    /// served configs; garbage fails open to probing (never a skip).
+    #[test]
+    fn ticket36_served_listen_ports() {
+        let doc = serde_json::json!({
+            "inbounds": [
+                {"type": "mixed", "tag": "in-1", "listen": "127.0.0.1", "listen_port": 10801},
+                {"type": "mixed", "tag": "in-2", "listen": "0.0.0.0", "listen_port": 10802},
+                {"type": "mixed", "tag": "no-port"},
+            ],
+        });
+        assert_eq!(
+            served_listen_ports(&doc.to_string()),
+            vec![
+                ("127.0.0.1".to_string(), 10801),
+                ("0.0.0.0".to_string(), 10802),
+            ]
+        );
+        assert!(
+            served_listen_ports("not json").is_empty(),
+            "garbage fails open"
+        );
+    }
+
+    /// Ticket 36 (re-apply prerequisite): starting a second row while the
+    /// first is served does not trip the bind probe on the already-served
+    /// port (the test listener stands in for our own sidecar's hold), and
+    /// stopping one of two served rows works too. A genuinely foreign
+    /// holder on a NEW port still fails typed.
+    #[test]
+    fn ticket36_reapply_skips_own_served_ports() {
+        let (mut controller, _stock, _fork) = EngineController::fake_pair();
+        let rows = vec![fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            18411,
+        )];
+        controller.start_all(&rows).expect("first start works");
+        // A real hold on the served port (standing in for our own
+        // sidecar's socket): the re-apply must recognize its own ports
+        // and skip them instead of crying foreign-holder.
+        let held = std::net::TcpListener::bind("127.0.0.1:18411").expect("holds 18411");
+        controller
+            .start_all(&rows)
+            .expect("re-apply skips own ports");
+        let two = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                18411,
+            ),
+            fixture(
+                "2",
+                "Beta",
+                "shadowsocks",
+                ss_params("pass2"),
+                "127.0.0.1",
+                18412,
+            ),
+        ];
+        controller.start_all(&two).expect("second row starts");
+        assert!(controller.stop_one("1"), "stop one of two works");
+        assert!(controller.is_running("2"), "other row keeps serving");
+        // A genuinely foreign hold on a NEW port still fails typed.
+        let _foreign = std::net::TcpListener::bind("127.0.0.1:18413").expect("holds 18413");
+        let blocked = vec![fixture(
+            "9",
+            "Blocked",
+            "shadowsocks",
+            ss_params("pass9"),
+            "127.0.0.1",
+            18413,
+        )];
+        let error = controller
+            .start_all(&blocked)
+            .expect_err("foreign hold fails");
+        assert!(
+            error.to_string().contains("18413"),
+            "names the port, got {error}"
+        );
+        drop(held);
+    }
+
+    /// Ticket 36 (live): a real stock sing-box 1.14.2 sidecar serves a
+    /// single-row generated config with the injected clash controller; a
+    /// throttled HTTP-proxy burst through the mixed inbound moves the
+    /// clash totals (Bearer-authenticated; wrong secret gets 401). The
+    /// row's upstream is a loopback TCP acceptor (accept + close): live
+    /// probing showed sing-box only counts connection bytes once the
+    /// outbound leg establishes, so an unreachable server counts nothing
+    /// while an accepted-then-closed leg counts the inbound bytes. Hermetic
+    /// by default — runs only with `MANYPROXY_LIVE_TRAFFIC=1` (loopback +
+    /// TEMP files only, removed afterwards; the sidecar is killed before
+    /// return).
+    #[test]
+    fn ticket36_live_clash_totals_move() {
+        if std::env::var("MANYPROXY_LIVE_TRAFFIC").unwrap_or_default() != "1" {
+            return;
+        }
+        use std::time::{Duration, Instant};
+        let binary = std::env::var("MANYPROXY_SINGBOX_BIN").map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    PathBuf::from("target/debug/sing-box.exe")
+                } else {
+                    PathBuf::from("target/debug/sing-box")
+                }
+            },
+            PathBuf::from,
+        );
+        fn free_port() -> u16 {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("probe bind works")
+                .local_addr()
+                .expect("addr works")
+                .port()
+        }
+        // Dumb upstream: accepts each outbound dial then closes (no
+        // shadowsocks handshake — tunnel bytes are not the point, the
+        // established leg that starts the inbound counting is). Bound
+        // before the sidecar starts; the acceptor thread takes exactly the
+        // signalled dial count then exits (nonblocking + deadline, so the
+        // join below can never hang the suite).
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("upstream binds");
+        let upstream_port = upstream.local_addr().expect("addr works").port();
+        upstream.set_nonblocking(true).expect("nonblocking works");
+        let (count_tx, count_rx) = std::sync::mpsc::channel::<u32>();
+        let upstream_handle = std::thread::spawn(move || {
+            let want = count_rx.recv().unwrap_or(0);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut taken = 0u32;
+            while taken < want && Instant::now() < deadline {
+                match upstream.accept() {
+                    Ok((peer, _)) => {
+                        taken += 1;
+                        drop(peer);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let inbound_port = free_port();
+        let clash_port = free_port();
+        let secret = "live-traffic-s3cret";
+        let row = fixture(
+            "7",
+            "TrafficLive",
+            "shadowsocks",
+            json!({"type": "shadowsocks", "server": "127.0.0.1", "server_port": upstream_port,
+                   "method": "aes-128-gcm", "password": "live-pass-1"}),
+            "127.0.0.1",
+            inbound_port,
+        );
+        let generated = generate(std::slice::from_ref(&row)).expect("single row generates");
+        let injected =
+            inject_clash_api(&generated.json, clash_port, secret).expect("clash injects");
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-t36-live-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, &injected).expect("temp config writes");
+        let check = std::process::Command::new(&binary)
+            .arg("check")
+            .arg("-c")
+            .arg(&path)
+            .output()
+            .expect("check runs");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            check.status.success(),
+            "PROBE live-traffic: sing-box check EXIT 0, stderr: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        std::fs::write(&path, &injected).expect("temp config writes");
+        let mut child = std::process::Command::new(&binary)
+            .arg("run")
+            .arg("-c")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sidecar runs");
+        let result = (|| -> Result<String, String> {
+            use std::io::{Read as _, Write as _};
+            // The controller comes up with the sidecar — poll to readiness.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let (rx0, tx0) = loop {
+                match crate::health::poll_clash_totals(clash_port, secret, Duration::from_secs(2)) {
+                    Ok(totals) => break totals,
+                    Err(error) if error.contains("unauthorized") => {
+                        return Err(format!("live clash auth broken: {error}"));
+                    }
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(error) => {
+                        return Err(format!("clash controller never came up: {error}"));
+                    }
+                }
+            };
+            // Wrong secret is rejected (live Bearer-auth proof).
+            if crate::health::poll_clash_totals(clash_port, "wrong", Duration::from_secs(5)).is_ok()
+            {
+                return Err("clash accepted a bad secret".to_string());
+            }
+            // Throttled transfer: N plain HTTP-proxy GETs (the health-probe
+            // byte shape) at an unreachable TEST-NET host. The tunnel leg
+            // to the loopback acceptor establishes (starting the inbound
+            // counting); the request bytes then count however the relay
+            // ends.
+            let request = "GET http://192.0.2.1/ HTTP/1.1\r\nHost: 192.0.2.1\r\n\
+                 Connection: close\r\nUser-Agent: ManyProxy-live\r\n\r\n";
+            let mut sent = 0u32;
+            for _ in 0..8 {
+                let endpoint = format!("127.0.0.1:{inbound_port}");
+                let addr: std::net::SocketAddr = endpoint
+                    .parse()
+                    .map_err(|_| "bad inbound port".to_string())?;
+                let mut stream =
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+                        .map_err(|error| format!("inbound dial failed ({error})"))?;
+                stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                stream
+                    .write_all(request.as_bytes())
+                    .map_err(|error| format!("inbound write failed ({error})"))?;
+                sent += 1;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+            }
+            let _ = count_tx.send(sent);
+            // Totals flush on connection close — allow a lag window.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let (rx1, tx1) =
+                    crate::health::poll_clash_totals(clash_port, secret, Duration::from_secs(5))
+                        .map_err(|error| format!("totals re-poll failed ({error})"))?;
+                let delta_up = tx1.saturating_sub(tx0);
+                if delta_up >= 10 * sent as u64 {
+                    return Ok(format!(
+                        "upload {tx0}->{tx1} (+{delta_up}B over {sent} requests), \
+                         download {rx0}->{rx1}"
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "totals never moved: upload {tx0}->{tx1}, download {rx0}->{rx1} \
+                         after {sent} requests"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+        let _ = upstream_handle.join();
+        assert!(
+            std::env::temp_dir()
+                .read_dir()
+                .map(|entries| {
+                    entries.filter_map(Result::ok).all(|entry| {
+                        !entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("manyproxy-t36-live-")
+                    })
+                })
+                .unwrap_or(true),
+            "no temp litter left"
+        );
+        result.expect("PROBE live-traffic: clash totals move");
+    }
     /// through the tunnel): outbound-style stored keys become endpoint
     /// schema — peer in `peers[]`, list fields as lists, numerics as
     /// numbers, internal markers and client settings dropped. The fork

@@ -40,6 +40,14 @@ use crate::store::{now_unix, HealthSnapshot, ProxyConfig};
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 /// Per-test ceiling so 5 rows finish inside the 30s scenario budget.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ticket 36: host of the health-test URL — clash flows to this host are
+/// probes, never data-plane bytes (single source of truth derived from
+/// [`DEFAULT_TEST_URL`], never a second literal to drift).
+pub fn probe_host() -> String {
+    split_http_url(DEFAULT_TEST_URL)
+        .map(|(_, host)| host.to_string())
+        .unwrap_or_default()
+}
 /// In-memory bounds (durable persistence defers to a later ticket).
 const MAX_SAMPLES: usize = 10_000;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -487,11 +495,214 @@ pub fn truncate(text: &str, limit: usize) -> String {
     kept
 }
 
+/// Ticket 36: parse a clash-API `/connections` body into
+/// `(download_total, upload_total)`. Live shape (stock sing-box 1.14.2):
+/// `{"connections":[],"downloadTotal":1048782,"memory":4497408,
+/// "uploadTotal":88}`. Missing/non-integer totals fail named (never zero).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_clash_totals(body: &str) -> Result<(u64, u64), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "clash totals are not JSON".to_string())?;
+    let total = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("clash totals lack integer {key}"))
+    };
+    Ok((total("downloadTotal")?, total("uploadTotal")?))
+}
+
+/// Ticket 36: one live clash connection with cumulative bytes and its
+/// owning row (`metadata.type` is `<inbound-type>/<inbound-tag>`; our
+/// tags are `in-<rowid>`, so the suffix is the row id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClashConn {
+    pub id: String,
+    pub row_id: Option<String>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// Destination host/IP for probe exclusion.
+    pub dest: String,
+}
+
+/// Ticket 36: parse the `connections` array. Malformed entries are
+/// skipped (never a whole-poll failure); a non-JSON body fails named.
+pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "clash connections are not JSON".to_string())?;
+    let items = value
+        .get("connections")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "clash connections lack a connections array".to_string())?;
+    let mut out = Vec::new();
+    for item in items {
+        let id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let rx = item.get("download").and_then(serde_json::Value::as_u64);
+        let tx = item.get("upload").and_then(serde_json::Value::as_u64);
+        let meta = item.get("metadata");
+        let inbound = meta
+            .and_then(|m| m.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let dest = meta
+            .and_then(|m| {
+                m.get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|host| !host.is_empty())
+                    .or_else(|| m.get("destinationIP").and_then(serde_json::Value::as_str))
+            })
+            .unwrap_or("");
+        let (Some(rx), Some(tx)) = (rx, tx) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let row_id = inbound
+            .rsplit('/')
+            .next()
+            .and_then(|tag| tag.strip_prefix("in-"))
+            .filter(|row| !row.is_empty())
+            .map(str::to_string);
+        out.push(ClashConn {
+            id: id.to_string(),
+            row_id,
+            rx_bytes: rx,
+            tx_bytes: tx,
+            dest: dest.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Ticket 36: true when a clash entry destination is the health-test
+/// host (probe flows must never pollute data-plane counters). Shared by
+/// [`attribute_entries`] and the traffic tick so the exclusion can never
+/// drift between the two.
+pub fn is_probe_destination(dest: &str, probe_host: &str) -> bool {
+    !probe_host.is_empty()
+        && (dest == probe_host
+            || dest
+                .strip_prefix("www.")
+                .is_some_and(|rest| probe_host.strip_prefix("www.").unwrap_or(probe_host) == rest))
+}
+
+/// Ticket 36: sum entry bytes per row, excluding flows to the health-test
+/// host (probes must never pollute data-plane counters) and entries no
+/// row claims. Returns `row_id -> (rx, tx)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn attribute_entries(
+    entries: &[ClashConn],
+    probe_host: &str,
+) -> std::collections::HashMap<String, (u64, u64)> {
+    let mut totals = std::collections::HashMap::new();
+    for entry in entries {
+        let Some(row) = entry.row_id.as_deref() else {
+            continue;
+        };
+        if is_probe_destination(&entry.dest, probe_host) {
+            continue;
+        }
+        let slot = totals.entry(row.to_string()).or_insert((0u64, 0u64));
+        slot.0 = slot.0.saturating_add(entry.rx_bytes);
+        slot.1 = slot.1.saturating_add(entry.tx_bytes);
+    }
+    totals
+}
+
+/// Ticket 36: raw `/connections` body off one clash controller.
+fn fetch_clash_body(
+    port: u16,
+    secret: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::{Read as _, Write as _};
+    let endpoint = format!("127.0.0.1:{port}");
+    let addr: std::net::SocketAddr = endpoint
+        .parse()
+        .map_err(|_| format!("clash poll: bad controller port {port}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|error| format!("clash dial {endpoint}: {error}"))?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+    let request = format!(
+        "GET /connections HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {secret}\r\nConnection: close\r\nUser-Agent: ManyProxy-traffic\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("clash poll {endpoint}: write failed ({error})"))?;
+    // Bodies stay small (single-core sidecars hold few connections); the
+    // cap keeps a pathological peer from growing us without bound.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= 2_097_152 {
+                    return Err(format!("clash poll {endpoint}: response too large"));
+                }
+            }
+            Err(error) => {
+                return Err(format!("clash poll {endpoint}: read failed ({error})"));
+            }
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let status = head
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("clash poll {endpoint}: bad response"))?;
+    if status == 401 {
+        return Err(format!("clash poll {endpoint}: unauthorized (bad secret)"));
+    }
+    if status != 200 {
+        return Err(format!("clash poll {endpoint}: unexpected status {status}"));
+    }
+    let end = find_headers_end(&buf)
+        .ok_or_else(|| format!("clash poll {endpoint}: malformed response"))?;
+    Ok(String::from_utf8_lossy(&buf[end..]).into_owned())
+}
+
+/// Ticket 36: poll one clash controller's `/connections` totals over
+/// loopback. Any failure is a named `Err` (the tick skips that row,
+/// keeping its last totals — never zeroing on a missed poll).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn poll_clash_totals(
+    port: u16,
+    secret: &str,
+    timeout: std::time::Duration,
+) -> Result<(u64, u64), String> {
+    parse_clash_totals(&fetch_clash_body(port, secret, timeout)?)
+}
+
+/// Ticket 36: poll one clash controller's live connection entries (for
+/// per-row attribution by inbound tag).
+pub fn poll_clash_entries(
+    port: u16,
+    secret: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<ClashConn>, String> {
+    parse_clash_entries(&fetch_clash_body(port, secret, timeout)?)
+}
+
 /// Append-only samples + per-config traffic accumulation.
 #[derive(Debug, Default)]
 pub struct HealthStore {
     samples: Vec<HealthSample>,
     traffic: HashMap<String, TrafficStats>,
+    /// Ticket 36: data-plane totals per config, mirrored from the store
+    /// (persisted) after every clash poll. Present means the row is
+    /// clash-tracked; absent rows keep the probe-byte display.
+    data_traffic: HashMap<String, (u64, u64)>,
 }
 
 impl HealthStore {
@@ -608,11 +819,36 @@ impl HealthStore {
         self.traffic.get(config_id).copied().unwrap_or_default()
     }
 
+    /// Ticket 36: mirror persisted data-plane totals for display.
+    pub fn set_data_traffic(&mut self, config_id: &str, rx_bytes: u64, tx_bytes: u64) {
+        self.data_traffic
+            .insert(config_id.to_string(), (rx_bytes, tx_bytes));
+    }
+
+    /// Ticket 36: pass-through for the poll tick (untracked rows stay None).
+    pub fn data_traffic(&self, config_id: &str) -> Option<(u64, u64)> {
+        self.data_traffic.get(config_id).copied()
+    }
+
     /// Ticket 33: probe-byte counts are labeled `probe:` — they measure
     /// health-probe request/response bytes through the row's own endpoint,
     /// never data-plane traffic (there is no data-plane meter in v1).
+    /// Ticket 36: clash-tracked rows report data-plane totals instead; the
+    /// probe count rides along as context. Untracked rows keep the v1
+    /// probe display.
     fn traffic_text(&self, config_id: &str) -> String {
         let stats = self.traffic(config_id);
+        if let Some((rx, tx)) = self.data_traffic(config_id) {
+            if stats.probes == 0 {
+                return format!("↑{} ↓{}", format_bytes(tx), format_bytes(rx));
+            }
+            return format!(
+                "↑{} ↓{} · {} probe(s)",
+                format_bytes(tx),
+                format_bytes(rx),
+                stats.probes
+            );
+        }
         if stats.probes == 0 {
             "probe: no traffic yet".to_string()
         } else {
@@ -1642,6 +1878,111 @@ mod tests {
         let line = store.detail_line("1");
         assert!(line.contains("probe:"), "probe bytes labeled, got {line}");
         assert!(line.contains("1 probe(s)"), "probe count shown, got {line}");
+    }
+
+    /// Ticket 36: the clash `/connections` totals parse (live shape from
+    /// stock sing-box 1.14.2); missing fields and garbage fail named.
+    #[test]
+    fn ticket36_parse_clash_totals() {
+        let (rx, tx) = crate::health::parse_clash_totals(
+            r#"{"connections":[],"downloadTotal":1048782,"memory":4497408,"uploadTotal":88}"#,
+        )
+        .expect("live shape parses");
+        assert_eq!((rx, tx), (1048782, 88));
+        assert!(
+            crate::health::parse_clash_totals(r#"{"connections":[]}"#).is_err(),
+            "missing totals fail"
+        );
+        assert!(
+            crate::health::parse_clash_totals("not json").is_err(),
+            "garbage fails"
+        );
+    }
+
+    /// Ticket 36: once data-plane totals exist, the traffic line reports
+    /// them (not probe bytes); untracked rows keep the probe label.
+    #[test]
+    fn ticket36_traffic_text_prefers_data_plane() {
+        let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
+        let (mut prober, _) = FakeHealthProber::shared();
+        let mut store = HealthStore::default();
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+            store.record_outcome(&outcome);
+        }
+        store.set_data_traffic("1", 1_048_782, 88);
+        let line = store.detail_line("1");
+        assert!(line.contains("↑"), "data bytes shown, got {line}");
+        assert!(
+            !line.contains("probe: ↑"),
+            "probe bytes no longer the source, got {line}"
+        );
+        let untracked = store.detail_line("9");
+        assert_eq!(untracked, "health: not tested");
+    }
+
+    /// Ticket 36: the clash poller reads totals off a live controller
+    /// (stub TCP server speaking the live shape) and rejects bad auth.
+    #[test]
+    fn ticket36_poll_clash_totals() {
+        use std::io::Write as _;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.expect("accept works");
+                let mut head = [0u8; 1024];
+                use std::io::Read as _;
+                let n = stream.read(&mut head).unwrap_or(0);
+                let authed =
+                    String::from_utf8_lossy(&head[..n]).contains("Authorization: Bearer s3cret");
+                let body = if authed {
+                    r#"{"connections":[],"downloadTotal":1048782,"memory":1,"uploadTotal":88}"#
+                } else {
+                    r#"{"error":"unauthorized"}"#
+                };
+                let status = if authed { "200 OK" } else { "401 Unauthorized" };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("reply works");
+            }
+        });
+        let (rx, tx) = crate::health::poll_clash_totals(port, "s3cret", Duration::from_secs(5))
+            .expect("authed poll works");
+        assert_eq!((rx, tx), (1048782, 88));
+        assert!(
+            crate::health::poll_clash_totals(port, "wrong", Duration::from_secs(5)).is_err(),
+            "bad secret fails"
+        );
+        server.join().expect("stub drains");
+        assert!(
+            crate::health::poll_clash_totals(1, "s3cret", Duration::from_millis(200)).is_err(),
+            "refused port fails"
+        );
+    }
+
+    /// Ticket 36: connection entries parse with per-connection bytes and
+    /// the owning row (from `metadata.type: "mixed/in-<rowid>"`); probe
+    /// destinations filter out so health checks never pollute counters.
+    #[test]
+    fn ticket36_parse_clash_entries() {
+        let body = r#"{"connections":[{"chains":["direct"],"download":2877275,"id":"a99cac52","metadata":{"destinationIP":"127.0.0.1","destinationPort":"19097","host":"","network":"tcp","sourceIP":"127.0.0.1","sourcePort":"51241","type":"mixed/in-7"},"rule":"final","upload":89},{"chains":["direct"],"download":500,"id":"probe-1","metadata":{"destinationIP":"93.184.216.34","destinationPort":"80","host":"www.gstatic.com","network":"tcp","sourceIP":"127.0.0.1","sourcePort":"51242","type":"mixed/in-7"},"rule":"final","upload":60}],"downloadTotal":2877775,"uploadTotal":149}"#;
+        let entries = crate::health::parse_clash_entries(body).expect("entries parse");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].row_id.as_deref(), Some("7"));
+        assert_eq!((entries[0].rx_bytes, entries[0].tx_bytes), (2877275, 89));
+        let attributed = crate::health::attribute_entries(&entries, "www.gstatic.com");
+        assert_eq!(
+            attributed.get("7"),
+            Some(&(2877275, 89)),
+            "probe flow excluded"
+        );
     }
 
     /// Scenario 2: per-config log filter shows only its lines, secrets

@@ -1476,6 +1476,11 @@ impl Store {
         // last-synced upstream baseline behind the user-vs-upstream compare.
         self.ensure_column("proxy_configs", "adoptable", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("proxy_configs", "synced_params", "TEXT")?;
+        // Ticket 36: cumulative data-plane byte counters (clash-API
+        // sourced; probe bytes never land here). Plain ADD COLUMN expand —
+        // no version bump (same precedent as the ticket-25 columns).
+        self.ensure_column("proxy_configs", "traffic_rx", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("proxy_configs", "traffic_tx", "INTEGER NOT NULL DEFAULT 0")?;
         // Ticket 35 (version 3): seal params at rest. Legacy JSON values
         // seal in one transaction; already-sealed rows are untouched, so the
         // migration is idempotent and reruns are no-ops.
@@ -2864,6 +2869,55 @@ impl Store {
             subscriptions: sub_rows.len(),
             tombstones: tomb_rows.len(),
         })
+    }
+
+    // -- Ticket 36: data-plane traffic counters ----------------------------
+
+    /// Add data-plane byte deltas for one config. Totals persist (restart
+    /// resumes from these, never zeroed) and saturate at `i64::MAX`
+    /// (SQLite integers are 64-bit signed).
+    pub fn add_traffic(&mut self, id: &str, rx: u64, tx: u64) -> Result<(), StoreError> {
+        let rowid: i64 = id
+            .parse()
+            .map_err(|_| StoreError::Invalid(vec![FieldError::new("id", "bad config id")]))?;
+        let (cur_rx, cur_tx): (i64, i64) = match self.conn.query_row(
+            "SELECT traffic_rx, traffic_tx FROM proxy_configs WHERE id = ?1",
+            params![rowid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ) {
+            Ok(pair) => pair,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(StoreError::NotFound(id.to_string()));
+            }
+            Err(other) => return Err(other.into()),
+        };
+        let rx = cur_rx.saturating_add(rx.min(i64::MAX as u64) as i64);
+        let tx = cur_tx.saturating_add(tx.min(i64::MAX as u64) as i64);
+        self.conn.execute(
+            "UPDATE proxy_configs SET traffic_rx = ?1, traffic_tx = ?2 WHERE id = ?3",
+            params![rx, tx, rowid],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted data-plane totals keyed by config id (for display
+    /// hydration after restart).
+    pub fn traffic_totals(&self) -> Result<HashMap<String, (u64, u64)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, traffic_rx, traffic_tx FROM proxy_configs")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let rx: i64 = row.get(1)?;
+            let tx: i64 = row.get(2)?;
+            Ok((id.to_string(), (rx.max(0) as u64, tx.max(0) as u64)))
+        })?;
+        let mut totals = HashMap::new();
+        for row in rows {
+            let (id, pair) = row?;
+            totals.insert(id, pair);
+        }
+        Ok(totals)
     }
 
     // -- Ticket 12: health snapshot persistence ------------------------------
@@ -5481,6 +5535,30 @@ mod tests {
             assert_eq!(version, 3, "schema advanced to 3");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Ticket 36: data-plane traffic counters ------------------------
+
+    /// Ticket 36: traffic deltas accumulate per row and read back as a map.
+    #[test]
+    fn ticket36_traffic_accumulates_per_row() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store
+            .add(NewConfig {
+                name: "Flow".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("add works");
+        store
+            .add_traffic(&created.id, 1_048_782, 88)
+            .expect("add works");
+        store.add_traffic(&created.id, 100, 10).expect("add works");
+        let totals = store.traffic_totals().expect("totals read");
+        assert_eq!(totals.get(&created.id), Some(&(1_048_882, 98)));
     }
 
     // -- Ticket 31: dialogs + import + subscriptions ---------------------
