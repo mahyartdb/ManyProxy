@@ -4,6 +4,7 @@ mod dpapi;
 mod engine;
 mod health;
 mod import;
+mod preset;
 mod store;
 
 use std::cell::RefCell;
@@ -1524,6 +1525,136 @@ fn subscription_row(
     )
 }
 
+/// Ticket 37: single-line `throne://route/...` / `throne://remoteroute/...`
+/// failure text. Surfaces the intake's own reason — parse errors never echo
+/// payloads or URLs, so this is safe for notifications.
+fn preset_error_message(error: &crate::preset::PresetError) -> String {
+    format!("Invalid routing preset: {error}")
+}
+
+/// Ticket 37: success toast copy for a stored preset (name + rule count —
+/// never rule content).
+fn preset_imported_message(name: &str, count: usize) -> String {
+    format!("Routing preset \"{name}\" imported ({count} rule(s))")
+}
+
+/// Ticket 37: one-line summary for a preset manager row (name, source, rule
+/// count, attachments). Rule content never appears; corrupt stored rules
+/// report `invalid rules` instead of a count.
+fn preset_row_summary(preset: &store::RoutePreset, attached: &[String]) -> String {
+    let rules = match preset.rules() {
+        Ok(rules) => format!("{} rule(s)", rules.len()),
+        Err(_) => "invalid rules".to_string(),
+    };
+    let attached = if attached.is_empty() {
+        "unattached".to_string()
+    } else {
+        format!("attached to {}", attached.join(", "))
+    };
+    format!("{} · {} · {rules} · {attached}", preset.name, preset.source)
+}
+
+/// Ticket 37: detach-delete confirm text naming the preset and every
+/// attached row (explicit path after a refused plain delete).
+fn preset_delete_confirm_description(name: &str, attached: &[String]) -> String {
+    format!(
+        "Delete routing preset \"{name}\"? It is still attached to {} row(s): {}. \
+         Deleting detaches every listed row first; unattached rows are unaffected.",
+        attached.len(),
+        attached.join(", ")
+    )
+}
+
+/// Ticket 37: create-form for the presets manager dialog (name plus an
+/// optional rules body — a preset object or a bare rules array; empty means
+/// an empty preset rules are added to later). Entities are created once in
+/// the button handler and cloned into the dialog builder.
+#[derive(Clone)]
+struct PresetForm {
+    name: Entity<InputState>,
+    rules: Entity<TextareaState>,
+}
+
+impl PresetForm {
+    fn restored(window: &mut Window, cx: &mut Context<AppView>, name: &str, rules: &str) -> Self {
+        Self {
+            name: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Preset name")
+                    .default_value(name.to_string())
+            }),
+            rules: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Optional rules JSON (preset object or rules array)")
+                    .default_value(rules.to_string())
+            }),
+        }
+    }
+
+    /// Consumes a clone; every built element owns its state entity.
+    fn element(self, _cx: &App) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(dialog_field("field-preset-name", "Name", self.name))
+            .child(
+                div()
+                    .id("field-preset-rules")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(Label::new("Rules JSON (optional)"))
+                    .child(Textarea::new(&self.rules).h(px(120.))),
+            )
+    }
+}
+
+/// Ticket 37: one preset row for the manager dialog (summary + explicit
+/// Refresh for URL presets + Remove). Refresh re-reads the record so a stale
+/// snapshot cannot fetch a removed preset; Remove refuses while attached
+/// (the confirm path detaches explicitly).
+fn preset_row(
+    view: Entity<AppView>,
+    preset: store::RoutePreset,
+    attached: Vec<String>,
+) -> impl IntoElement {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(Label::new(preset.name.clone()))
+        .child(preset_row_summary(&preset, &attached));
+    if preset.source == "url" && preset.source_url.is_some() {
+        let refresh_view = view.clone();
+        let refresh_id = preset.id.clone();
+        row = row.child(
+            Button::new(format!("preset-refresh-{}", preset.id))
+                .label("Refresh")
+                .on_click(move |_, window, cx| {
+                    let id = refresh_id.clone();
+                    refresh_view.update(cx, |view, cx| {
+                        view.refresh_preset_by_id(&id, window, cx);
+                    });
+                }),
+        );
+    }
+    let remove_view = view.clone();
+    let remove_id = preset.id.clone();
+    row.child(
+        Button::new(format!("preset-remove-{}", preset.id))
+            .label("Remove")
+            .on_click(move |_, window, cx| {
+                let id = remove_id.clone();
+                remove_view.update(cx, |view, cx| {
+                    view.commit_preset_remove(&id, window, cx);
+                });
+            }),
+    )
+}
+
 /// Ticket 12: run one background tick loop: sleep `secs`, run one bounded
 /// pass, then exit when ticks are stopped or the view is released (fail
 /// closed: a released view ends its loops instead of updating dead state).
@@ -1623,6 +1754,11 @@ struct AppView {
     /// in-progress text across instead of rebuilding a blank form. `None`
     /// means no subs dialog was opened (foreign dialogs are never touched).
     subs_form: Option<SubForm>,
+    /// Ticket 37: the live presets-dialog create form, stashed on open so a
+    /// list-mutation reopen (remove / refresh completion) carries
+    /// in-progress text across instead of rebuilding a blank form. `None`
+    /// means no presets dialog was opened.
+    preset_form: Option<PresetForm>,
     /// Ticket 26: an import-dialog parse is running on the background
     /// executor. A second OK while it runs is ignored (the first completion
     /// closes or keeps the dialog exactly once — no double commit).
@@ -1686,6 +1822,7 @@ impl AppView {
             inflight_refreshes: HashSet::new(),
             probe_in_flight: false,
             subs_form: None,
+            preset_form: None,
             import_parse_in_flight: false,
             close_confirmed: false,
             start_in_flight: false,
@@ -2178,6 +2315,13 @@ impl AppView {
             self.start_in_flight = false;
             return;
         };
+        // Ticket 37: attached preset rules merge at serve time — sync them
+        // first; a corrupt store aborts the start loudly, never preset-less.
+        if let Err(reason) = self.sync_presets_to_engine() {
+            self.start_in_flight = false;
+            window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
+            return;
+        };
         let was_running = self.engine.is_running(id);
         if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
             window.push_notification(Notification::warning(warning), cx);
@@ -2325,6 +2469,13 @@ impl AppView {
         if rows.is_empty() {
             window.push_notification(Notification::warning(start_all_message(0)), cx);
             self.start_in_flight = false;
+            return;
+        }
+        // Ticket 37: attached preset rules merge at serve time — sync them
+        // first; a corrupt store aborts the start loudly, never preset-less.
+        if let Err(reason) = self.sync_presets_to_engine() {
+            self.start_in_flight = false;
+            window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
             return;
         }
         match self.engine.start_all_confirmed(&rows) {
@@ -3358,6 +3509,9 @@ impl AppView {
         if let Some(done) = self.try_addsub_commit(&resolved, window, cx) {
             return done;
         }
+        if let Some(done) = self.try_preset_commit(&resolved, window, cx) {
+            return done;
+        }
         let batch = parse_import_inputs(&resolved);
         self.finish_import_batch(batch, &resolved.group, window, cx)
     }
@@ -3386,6 +3540,9 @@ impl AppView {
         }
         let resolved = resolve_import_inputs(text, group, file_hint, original, multi);
         if let Some(done) = self.try_addsub_commit(&resolved, window, cx) {
+            return done;
+        }
+        if let Some(done) = self.try_preset_commit(&resolved, window, cx) {
             return done;
         }
         if self.import_parse_in_flight {
@@ -4121,6 +4278,693 @@ impl AppView {
         self.open_subscriptions_dialog_restored(&label, &url, &group, auto, window, cx);
     }
 
+    // -- Ticket 37: routing presets -------------------------------------
+
+    /// Ticket 37: sync the store's presets into the engine merge map before
+    /// every start. A corrupt stored rules array aborts the start loudly
+    /// (never a silent preset-less serve).
+    fn sync_presets_to_engine(&mut self) -> Result<(), String> {
+        match self.store.preset_rules_map() {
+            Ok(map) => {
+                self.engine.set_preset_rules(map);
+                Ok(())
+            }
+            Err(error) => Err(format!("cannot load routing presets: {error}")),
+        }
+    }
+
+    /// Ticket 37: preset intake shared by the synchronous and background
+    /// import commits. Returns `Some(done)` when the inputs are
+    /// preset-shaped: a single `throne://route/...` line (stored at once),
+    /// a single `throne://remoteroute/...` line (shell stored, explicit
+    /// fetch fills the rules), or preset JSON (object or bare rules array).
+    /// `None` for everything else (endpoint path). Malformed input reports
+    /// its own reason and keeps the dialog open.
+    fn try_preset_commit(
+        &mut self,
+        resolved: &ResolvedImport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        use crate::preset::{
+            decode_remote_route_link, is_remote_route_attempt, is_route_attempt,
+            looks_like_preset_json,
+        };
+        let trimmed = resolved.text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let single_line =
+            !trimmed.contains('\n') && resolved.file_hint.is_none() && resolved.multi.is_none();
+        if single_line && is_route_attempt(trimmed) {
+            return Some(match self.store.import_route_link(trimmed) {
+                Ok(preset) => {
+                    let count = preset.rules().map(|rules| rules.len()).unwrap_or(0);
+                    self.reload(window, cx);
+                    window.push_notification(
+                        Notification::success(preset_imported_message(&preset.name, count)),
+                        cx,
+                    );
+                    true
+                }
+                Err(error) => {
+                    // Decode and validation failures share the typed
+                    // `StoreError::Invalid` path (field + reason, never
+                    // payload echoes); the dialog stays open for retry.
+                    self.report_save_error(error, window, cx);
+                    false
+                }
+            });
+        }
+        if single_line && is_remote_route_attempt(trimmed) {
+            return Some(match decode_remote_route_link(trimmed) {
+                Ok(request) => {
+                    match self
+                        .store
+                        .import_remote_preset_shell(&request.name, &request.url)
+                    {
+                        Ok(preset) => {
+                            self.reload(window, cx);
+                            window.push_notification(
+                                Notification::success(format!(
+                                    "Routing preset \"{}\" added — fetching rules",
+                                    preset.name
+                                )),
+                                cx,
+                            );
+                            self.start_preset_refresh(preset, cx);
+                            true
+                        }
+                        Err(error) => {
+                            self.report_save_error(error, window, cx);
+                            false
+                        }
+                    }
+                }
+                Err(error) => {
+                    window.push_notification(Notification::error(preset_error_message(&error)), cx);
+                    false
+                }
+            });
+        }
+        if resolved.multi.is_none() && looks_like_preset_json(trimmed) {
+            return Some(
+                match self.store.import_preset_json(
+                    trimmed,
+                    if resolved.file_hint.is_some() {
+                        "file"
+                    } else {
+                        "manual"
+                    },
+                    resolved.file_hint.as_deref(),
+                ) {
+                    Ok(preset) => {
+                        let count = preset.rules().map(|rules| rules.len()).unwrap_or(0);
+                        self.reload(window, cx);
+                        window.push_notification(
+                            Notification::success(preset_imported_message(&preset.name, count)),
+                            cx,
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        self.report_save_error(error, window, cx);
+                        false
+                    }
+                },
+            );
+        }
+        None
+    }
+
+    /// Ticket 37: create a preset from the manager dialog (name + optional
+    /// rules body). An empty name just closes; success toasts and closes;
+    /// validation failures keep the dialog open with the error.
+    fn commit_preset_create(
+        &mut self,
+        name: String,
+        rules_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if name.trim().is_empty() && rules_text.trim().is_empty() {
+            return true;
+        }
+        let rules = if rules_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            match crate::preset::parse_preset_json(&rules_text, &name) {
+                Ok(parsed) => parsed.rules,
+                Err(error) => {
+                    window.push_notification(Notification::error(preset_error_message(&error)), cx);
+                    return false;
+                }
+            }
+        };
+        let create_name = if name.trim().is_empty() {
+            // A bare rules array still needs a name — the parser already
+            // rejected the nameless case above; this is unreachable, but a
+            // loud error beats a silent default.
+            window.push_notification(
+                Notification::error("Invalid routing preset: preset needs a name"),
+                cx,
+            );
+            return false;
+        } else {
+            name.trim().to_string()
+        };
+        match self
+            .store
+            .create_preset(&create_name, "manual", None, &rules)
+        {
+            Ok(preset) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(preset_imported_message(&preset.name, rules.len())),
+                    cx,
+                );
+                true
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                false
+            }
+        }
+    }
+
+    /// Ticket 37: remove a preset. Success reloads and reopens the manager;
+    /// an already-gone row warns; a refused (attached) delete opens the
+    /// explicit detach-delete confirm; any other store failure names the
+    /// error.
+    fn commit_preset_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.delete_preset(id) {
+            Ok(true) => {
+                self.reload(window, cx);
+                window.push_notification(Notification::success("Routing preset removed"), cx);
+            }
+            Ok(false) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(StoreError::Invalid(_)) => {
+                // Attached: offer the explicit detach-then-delete path.
+                let (name, attached) = match self.store.get_preset(id) {
+                    Ok(Some(preset)) => {
+                        let rows = self
+                            .store
+                            .preset_attachments(id)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|row| format!("\"{}\"", row.name))
+                            .collect::<Vec<_>>();
+                        (preset.name, rows)
+                    }
+                    _ => ("preset".to_string(), Vec::new()),
+                };
+                let preset_id = id.to_string();
+                self.open_preset_detach_delete_confirm(&preset_id, &name, &attached, window, cx);
+                return;
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot remove routing preset: {error}")),
+                    cx,
+                );
+            }
+        }
+        self.reopen_presets_if_open(window, cx);
+    }
+
+    /// Ticket 37: explicit detach-then-delete confirm for an attached preset.
+    /// Confirming detaches every listed row and deletes; dismissing changes
+    /// nothing.
+    fn open_preset_detach_delete_confirm(
+        &mut self,
+        id: &str,
+        name: &str,
+        attached: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let preset_id = id.to_string();
+        let description = preset_delete_confirm_description(name, attached);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let preset_id = preset_id.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Delete routing preset")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.commit_preset_detach_delete(&preset_id, window, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Ticket 37: the actual detach-delete (post-confirm).
+    fn commit_preset_detach_delete(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.delete_preset_detaching(id) {
+            Ok(true) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success("Routing preset removed (rows detached)"),
+                    cx,
+                );
+            }
+            Ok(false) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot remove routing preset: {error}")),
+                    cx,
+                );
+            }
+        }
+        self.reopen_presets_if_open(window, cx);
+    }
+
+    /// Ticket 37: attach (`Some`) or detach (`None`) a preset on one row.
+    /// Ghost presets/rows report `NotFound`-loud; success reloads and closes
+    /// the picker.
+    fn commit_preset_attach(
+        &mut self,
+        config_id: &str,
+        preset_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .store
+            .set_config_preset(config_id, preset_id.as_deref())
+        {
+            Ok(row) => {
+                self.reload(window, cx);
+                let message = match preset_id {
+                    Some(_) => {
+                        let name = self
+                            .preset_name_for(row.preset_id.as_deref())
+                            .unwrap_or_else(|| "preset".to_string());
+                        format!("\"{}\" now routes with \"{name}\"", row.name)
+                    }
+                    None => format!("\"{}\" detached from its routing preset", row.name),
+                };
+                window.push_notification(Notification::success(message), cx);
+                window.close_all_dialogs(cx);
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+            }
+        }
+    }
+
+    /// Ticket 37: attached preset name for one row (detail bar). `None`
+    /// when unattached or the store fails (the bar never blocks on a preset
+    /// lookup).
+    fn preset_name_for(&self, preset_id: Option<&str>) -> Option<String> {
+        let id = preset_id?;
+        self.store
+            .get_preset(id)
+            .ok()
+            .flatten()
+            .map(|preset| preset.name)
+    }
+
+    /// Ticket 37: explicit refresh of one URL preset (fetch + replace rules).
+    /// Re-reads the record so a stale snapshot cannot fetch a removed
+    /// preset. Only URL presets with a source URL refresh; anything else
+    /// explains itself.
+    fn refresh_preset_by_id(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.get_preset(id) {
+            Ok(Some(preset)) => {
+                if preset.source != "url" || preset.source_url.is_none() {
+                    window.push_notification(
+                        Notification::warning("Only URL presets can refresh"),
+                        cx,
+                    );
+                    return false;
+                }
+                self.start_preset_refresh(preset, cx);
+                true
+            }
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+                false
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot refresh routing preset: {error}")),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    /// Ticket 37: fetch one preset URL without blocking the UI, then replace
+    /// its rules through the tested [`Store::set_preset_rules`] seam. Every
+    /// fetch is user-initiated (Refresh button or remote-link paste) — never
+    /// automatic, never on a timer.
+    fn start_preset_refresh(&mut self, preset: store::RoutePreset, cx: &mut Context<Self>) -> bool {
+        let Some(url) = preset.source_url.clone() else {
+            return false;
+        };
+        let client = cx.http_client();
+        let weak = cx.entity().downgrade();
+        let preset_id = preset.id.clone();
+        let preset_name = preset.name.clone();
+        cx.spawn(async move |_entity, cx| {
+            let fetched = fetch_subscription_body(client, &url).await;
+            cx.update(|cx| {
+                if let Some(handle) = cx.active_window() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.finish_preset_refresh(
+                                &preset_id,
+                                &preset_name,
+                                fetched,
+                                window,
+                                cx,
+                            );
+                        });
+                    });
+                } else {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.finish_preset_refresh_no_window(&preset_id, fetched, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Ticket 37: apply a fetched preset body (or fetch error) with user
+    /// feedback. A preset deleted mid-flight drops its result silently; a
+    /// parse failure names the rule index + field.
+    fn finish_preset_refresh(
+        &mut self,
+        id: &str,
+        name: &str,
+        fetched: Result<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let body = match fetched {
+            Ok(body) => body,
+            Err(reason) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot refresh routing preset: {reason}")),
+                    cx,
+                );
+                return;
+            }
+        };
+        let rules = match crate::preset::parse_preset_json(&body, name) {
+            Ok(parsed) => parsed.rules,
+            Err(error) => {
+                window.push_notification(Notification::error(preset_error_message(&error)), cx);
+                return;
+            }
+        };
+        match self.store.set_preset_rules(id, &rules) {
+            Ok(preset) => {
+                let count = preset.rules().map(|rules| rules.len()).unwrap_or(0);
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Routing preset \"{}\" refreshed ({count} rule(s))",
+                        preset.name
+                    )),
+                    cx,
+                );
+            }
+            Err(StoreError::NotFound(_)) => {
+                self.reload(window, cx);
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot refresh routing preset: {error}")),
+                    cx,
+                );
+            }
+        }
+        self.reopen_presets_if_open(window, cx);
+    }
+
+    /// Ticket 37: window-less completion (the window closed mid-fetch). The
+    /// user-initiated fetch still lands; with no window there is nothing to
+    /// toast to and nothing to reopen.
+    fn finish_preset_refresh_no_window(
+        &mut self,
+        id: &str,
+        fetched: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(body) = fetched else {
+            return;
+        };
+        let name = self
+            .store
+            .get_preset(id)
+            .ok()
+            .flatten()
+            .map(|preset| preset.name)
+            .unwrap_or_default();
+        let Ok(parsed) = crate::preset::parse_preset_json(&body, &name) else {
+            return;
+        };
+        if self.store.set_preset_rules(id, &parsed.rules).is_ok() {
+            self.reload_quiet(cx);
+        }
+    }
+
+    /// Ticket 37: presets manager dialog — stored presets with per-row
+    /// Refresh (URL only) / Remove plus a create form committed by OK. An
+    /// empty create form just closes the dialog.
+    fn open_presets_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_presets_dialog_restored("", "", window, cx);
+    }
+
+    /// Ticket 37: presets dialog with a prefilled create form (the
+    /// list-mutation reopen path carries in-progress text forward, mirroring
+    /// the subscriptions dialog stash).
+    fn open_presets_dialog_restored(
+        &mut self,
+        name: &str,
+        rules: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = PresetForm::restored(window, cx, name, rules);
+        self.preset_form = Some(form.clone());
+        let view = cx.entity();
+        let reader = form.clone();
+        let presets = match self.store.list_presets() {
+            Ok(presets) => presets,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load routing presets: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
+        let rows = match self.store.list() {
+            Ok(rows) => rows,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load library: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
+        let mut attached: HashMap<String, Vec<String>> = HashMap::new();
+        for row in &rows {
+            if let Some(preset_id) = row.preset_id.as_deref() {
+                attached
+                    .entry(preset_id.to_string())
+                    .or_default()
+                    .push(format!("\"{}\"", row.name));
+            }
+        }
+        let commit_view = view.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let name = reader.name.read(cx).value().to_string();
+            let rules = reader.rules.read(cx).value().to_string();
+            if name.trim().is_empty() && rules.trim().is_empty() {
+                return true;
+            }
+            commit_view.update(cx, |view, cx| {
+                view.commit_preset_create(name, rules, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        let close_view = view.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let view_for_rows = view.clone();
+            let close_view = close_view.clone();
+            let mut body = div().flex().flex_col().gap_2();
+            if presets.is_empty() {
+                body = body.child(
+                    "No routing presets yet — paste a throne://route link in Import, or create one below",
+                );
+            }
+            for preset in &presets {
+                body = body.child(preset_row(
+                    view_for_rows.clone(),
+                    preset.clone(),
+                    attached.get(&preset.id).cloned().unwrap_or_default(),
+                ));
+            }
+            body = body.child(form.clone().element(cx));
+            dialog
+                .title("Routing presets")
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .on_close(move |_, _, cx| {
+                    close_view.update(cx, |view, _| {
+                        view.preset_form = None;
+                    });
+                })
+                .footer(dialog_footer(
+                    "presets-dialog-ok",
+                    "presets-dialog-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 37: reopen the presets manager when it owns the screen (list
+    /// mutations from its own row buttons), carrying the create form text
+    /// forward. Foreign dialogs are never touched; with no dialog open the
+    /// stash is dropped.
+    fn reopen_presets_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.has_active_dialog(cx) {
+            self.preset_form = None;
+            return;
+        }
+        let Some(form) = &self.preset_form else {
+            return;
+        };
+        let name = form.name.read(cx).value().to_string();
+        let rules = form.rules.read(cx).value().to_string();
+        window.close_all_dialogs(cx);
+        self.open_presets_dialog_restored(&name, &rules, window, cx);
+    }
+
+    /// Ticket 37: per-row preset picker — every stored preset with an Attach
+    /// action plus a Detach action when the row carries one. One choice
+    /// commits, reloads, and closes the picker.
+    fn open_preset_attach_dialog(
+        &mut self,
+        config: ProxyConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let config_id = config.id.clone();
+        let config_name = config.name.clone();
+        let current = config.preset_id.clone();
+        let presets = match self.store.list_presets() {
+            Ok(presets) => presets,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load routing presets: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
+        let commit: DialogCommit = Rc::new(|_, _| true);
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let mut body = div().flex().flex_col().gap_2();
+            if presets.is_empty() {
+                body = body.child(
+                    "No routing presets yet — import one first (throne://route link or preset JSON)",
+                );
+            }
+            for preset in &presets {
+                let attach_view = view.clone();
+                let attach_config = config_id.clone();
+                let attach_preset = preset.id.clone();
+                let mut line = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new(preset.name.clone()));
+                if current.as_deref() == Some(preset.id.as_str()) {
+                    line = line.child("attached");
+                } else {
+                    line = line.child(
+                        Button::new(format!("preset-attach-{}", preset.id))
+                            .label("Attach")
+                            .on_click(move |_, window, cx| {
+                                let config = attach_config.clone();
+                                let preset = attach_preset.clone();
+                                attach_view.update(cx, |view, cx| {
+                                    view.commit_preset_attach(&config, Some(preset), window, cx);
+                                });
+                            }),
+                    );
+                }
+                body = body.child(line);
+            }
+            if current.is_some() {
+                let detach_view = view.clone();
+                let detach_config = config_id.clone();
+                body = body.child(
+                    Button::new("preset-detach")
+                        .label("Detach")
+                        .on_click(move |_, window, cx| {
+                            let config = detach_config.clone();
+                            detach_view.update(cx, |view, cx| {
+                                view.commit_preset_attach(&config, None, window, cx);
+                            });
+                        }),
+                );
+            }
+            dialog
+                .title(format!("Routing preset for \"{config_name}\""))
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "preset-attach-ok",
+                    "preset-attach-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
     /// Ticket 04: subscription manager dialog — existing subscriptions with
     /// per-row Refresh / Auto / Remove plus an add form committed by OK.
     /// An empty add form just closes the dialog.
@@ -4690,6 +5534,23 @@ impl AppView {
                     .test_support()
                     .child(self.health_store.detail_line(&config.id)),
             )
+            // Ticket 37: attached routing preset (name only — rules live in
+            // the presets manager) plus the picker entry point.
+            .child(div().id("config-preset").test_support().child(
+                match self.preset_name_for(config.preset_id.as_deref()) {
+                    Some(name) => format!("routing preset: {name}"),
+                    None => "no routing preset".to_string(),
+                },
+            ))
+            .child(
+                Button::new("preset-open")
+                    .label("Preset")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        if let Some(config) = view.selected_config(cx) {
+                            view.open_preset_attach_dialog(config, window, cx);
+                        }
+                    })),
+            )
             .child(
                 div()
                     .flex()
@@ -4936,6 +5797,13 @@ impl Render for AppView {
                             .label("Subscriptions")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_subscriptions_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("routing-presets")
+                            .label("Presets")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_presets_dialog(window, cx);
                             })),
                     )
                     .child(
@@ -7355,6 +8223,7 @@ mod tests {
                 port,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             }
         }
         let alpha = row("Alpha", "a.example.com", "127.0.0.1", 10801);
@@ -7598,6 +8467,7 @@ mod tests {
                 "subscriptions-dialog-ok",
                 "subscriptions-dialog-cancel",
             ),
+            ("presets", "presets-dialog-ok", "presets-dialog-cancel"),
             ("logs", "logs-dialog-ok", "logs-dialog-cancel"),
         ] {
             let target = seeded.clone();
@@ -7607,6 +8477,7 @@ mod tests {
                     "edit" => view.open_edit_dialog(target, window, cx),
                     "import" => view.open_import_dialog("vless://x", "travel", None, window, cx),
                     "subscriptions" => view.open_subscriptions_dialog(window, cx),
+                    "presets" => view.open_presets_dialog(window, cx),
                     _ => view.open_logs_dialog(window, cx),
                 });
             });
@@ -7958,6 +8829,7 @@ mod tests {
                 port: 10801,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             }
         }
         let full = library_row_lines(
@@ -8011,6 +8883,7 @@ mod tests {
                 port: 10801,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             }
         }
         assert_eq!(
@@ -8086,6 +8959,7 @@ mod tests {
                 port: 10801,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             }
         }
         use gpui_kit::component::IndexPath;
@@ -8818,6 +9692,7 @@ mod tests {
                 port: 10801,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             }
         }
         let running = library_row_lines(&row(), Some("87ms"), true).join("\n");
@@ -9145,6 +10020,7 @@ mod tests {
                 port: 10801,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             }
         }
         let mut delegate = LibraryDelegate::new();
@@ -9511,5 +10387,257 @@ mod tests {
         });
         assert!(ghost, "ghost edit closes with a warning");
         assert_eq!(notification_count(cx), 2, "ghost warns once more");
+    }
+
+    // -- Ticket 37: routing presets --------------------------------------
+
+    fn t37_route_link(name: &str) -> String {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::STANDARD.encode(format!(
+            "{{\"name\":\"{name}\",\"rules\":[{{\"action\":\"block\",\"domain_suffix\":[\"ads.example\"]}}]}}"
+        ));
+        format!("throne://route/{payload}")
+    }
+
+    /// Ticket 37: pure preset copies — errors name reasons, summaries name
+    /// names/sources/counts/attachments, never rule content.
+    #[test]
+    fn preset_copy_names_reasons_never_content() {
+        use crate::store::RoutePreset;
+        use crate::{preset_delete_confirm_description, preset_error_message, preset_row_summary};
+        let error = crate::preset::decode_route_link("throne://route/!!!").expect_err("fails");
+        let text = preset_error_message(&error);
+        assert!(text.contains("Invalid routing preset"), "{text}");
+        let preset = RoutePreset {
+            id: "1".to_string(),
+            name: "ads".to_string(),
+            source: "link".to_string(),
+            source_url: None,
+            rules_json: r#"[{"action":"block"}]"#.to_string(),
+            updated_at: None,
+        };
+        let summary = preset_row_summary(&preset, &["\"Row\"".to_string()]);
+        assert!(summary.contains("ads"), "{summary}");
+        assert!(summary.contains("1 rule(s)"), "{summary}");
+        assert!(summary.contains("\"Row\""), "{summary}");
+        let lone = preset_row_summary(&preset, &[]);
+        assert!(lone.contains("unattached"), "{lone}");
+        let confirm = preset_delete_confirm_description("ads", &["\"Row\"".to_string()]);
+        assert!(confirm.contains("ads"), "{confirm}");
+        assert!(confirm.contains("\"Row\""), "{confirm}");
+        assert!(confirm.contains("detaches"), "{confirm}");
+    }
+
+    /// Ticket 37: a single `throne://route` line in the import box stores a
+    /// named preset with its rules (replaces the v1 named error).
+    #[gpui_kit::test]
+    fn preset_route_link_commit_stores_preset(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let done = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import(t37_route_link("ads"), "g".to_string(), None, window, cx)
+            })
+        });
+        assert!(done, "route link commits and closes");
+        let presets = view.read_with(cx, |view, _| view.store.list_presets().expect("list works"));
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].name, "ads");
+        assert_eq!(
+            presets[0].rules().expect("rules decode").len(),
+            1,
+            "rules stored"
+        );
+    }
+
+    /// Ticket 37: preset JSON in the import box stores a preset; malformed
+    /// rules keep the dialog open and never echo rule content.
+    #[gpui_kit::test]
+    fn preset_json_commit_stores_preset_and_rejects_bad_rules(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let done = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import(
+                    r#"{"name":"office","rules":[{"action":"direct"}]}"#.to_string(),
+                    "g".to_string(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(done, "preset JSON commits and closes");
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .store
+                .list_presets()
+                .expect("list works")
+                .len()),
+            1
+        );
+        let kept_open = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_import(
+                    r#"{"name":"bad","rules":[{"action":"route"},{"SECRET":true}]}"#.to_string(),
+                    "g".to_string(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!kept_open, "malformed rules keep the dialog open");
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .store
+                .list_presets()
+                .expect("list works")
+                .len()),
+            1,
+            "nothing stored on failure"
+        );
+        assert_eq!(notification_count(cx), 2, "success + error notices");
+    }
+
+    /// Ticket 37: per-row attach/detach commits persist and toast honestly.
+    #[gpui_kit::test]
+    fn preset_attach_and_detach_commit(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(seed_input("Work")).expect("seed works");
+        let preset = store
+            .create_preset(
+                "ads",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "block"})],
+            )
+            .expect("preset seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_attach(&row.id, Some(preset.id.clone()), window, cx);
+            });
+        });
+        let attached = view.read_with(cx, |view, _| {
+            view.store
+                .get(&row.id)
+                .expect("get works")
+                .expect("row kept")
+        });
+        assert_eq!(attached.preset_id.as_deref(), Some(preset.id.as_str()));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_attach(&row.id, None, window, cx);
+            });
+        });
+        let detached = view.read_with(cx, |view, _| {
+            view.store
+                .get(&row.id)
+                .expect("get works")
+                .expect("row kept")
+        });
+        assert_eq!(detached.preset_id, None);
+    }
+
+    /// Ticket 37: the presets manager opens with footer buttons and lists
+    /// the stored preset.
+    #[gpui_kit::test]
+    fn presets_dialog_opens_with_footer(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .create_preset(
+                "ads",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "block"})],
+            )
+            .expect("preset seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(cx.update(|window, _| window.try_find("presets-dialog-ok").is_some()));
+        assert!(cx.update(|window, _| window.try_find("presets-dialog-cancel").is_some()));
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+    }
+
+    /// Ticket 37: attached start serves preset rules ahead of the isolation
+    /// rule end to end (store → engine sync → fake sidecar config).
+    #[gpui_kit::test]
+    fn attached_start_serves_preset_rules_first(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(NewConfig {
+                name: "Work".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                    \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let preset = store
+            .create_preset(
+                "ads",
+                "manual",
+                None,
+                &[serde_json::json!({"action":"route","domain":["example.com"]})],
+            )
+            .expect("preset seeds");
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works");
+        let (view, cx) = mount_view(store, cx);
+        let (engine, stock, _, _, _) = EngineController::fake_quartet();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.engine = engine;
+            });
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        // The library snapshot predates the attach (selection by id
+        // re-resolves after reload); force a reload through any toast-free
+        // path first by selecting after a fresh read.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.reload_quiet(cx);
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_selected_engine(window, cx));
+        });
+        let served: serde_json::Value =
+            serde_json::from_str(&stock.last_config().expect("sidecar served a config"))
+                .expect("served JSON parses");
+        let rules = served["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2, "preset rule + isolation, got {rules:?}");
+        assert_eq!(rules[0]["action"], serde_json::json!("route"));
+        assert_eq!(rules[0]["domain"], serde_json::json!(["example.com"]));
+        assert!(
+            rules[1].get("domain").is_none(),
+            "isolation closes the table"
+        );
     }
 }

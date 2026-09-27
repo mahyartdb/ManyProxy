@@ -1263,8 +1263,9 @@ fn parse_noise(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// `throne://add/<base64-outbound-json>` (case-insensitive command, single
 /// outbound, no confirm). Query/fragment bytes corrupt the payload and fail
 /// as bad base64; unknown commands are skipped+counted.
-/// Ticket 33: `throne://route/...` (routing presets) gets a named error, not
-/// the generic unknown-command text — v1 has no routing-rule editor.
+/// Ticket 37: `throne://route/...` (routing presets) gets a named error, not
+/// the generic unknown-command text — the pure batch path cannot store
+/// presets; the single-line import path stores them (see `preset.rs`).
 fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
     if rest.trim().is_empty() {
         return Err(ImportError::new(
@@ -1278,7 +1279,7 @@ fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
     };
     if command.eq_ignore_ascii_case("route") {
         return Err(unknown_scheme(
-            "routing presets not supported in v1 (throne://route links carry no importable endpoint)",
+            "routing preset link: paste it as a single line to import the preset (throne://route links carry no importable endpoint)",
         ));
     }
     if !command.eq_ignore_ascii_case("add") {
@@ -3080,6 +3081,7 @@ mod tests {
             port: 10801,
             subscription_id: None,
             identity_key: None,
+            preset_id: None,
         };
         assert!(
             crate::engine::needs_fork(&row),
@@ -3284,18 +3286,18 @@ mod tests {
         );
     }
 
-    /// Ticket 33: `throne://route` links fail with the named v1 error, not
-    /// the generic unknown-command text.
+    /// Ticket 37: `throne://route` links fail with the named preset-intake
+    /// error, not the generic unknown-command text (the pure batch path
+    /// cannot store presets — the single-line import path does, see the
+    /// ticket-37 store tests).
     #[test]
-    fn failure_throne_route_names_routing_unsupported() {
+    fn failure_throne_route_names_preset_intake() {
         for link in ["throne://route/abc", "throne://ROUTE/abc"] {
             let error = parse_link(link).expect_err("route command fails");
             assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
             assert!(
-                error
-                    .message
-                    .contains("routing presets not supported in v1"),
-                "named v1 error, got {error}"
+                error.message.contains("single line"),
+                "named preset-intake error, got {error}"
             );
         }
     }

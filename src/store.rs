@@ -240,6 +240,10 @@ pub struct ProxyConfig {
     pub subscription_id: Option<String>,
     /// Normalized subscription identity (ticket 04), if owned.
     pub identity_key: Option<String>,
+    /// Attached routing preset id (ticket 37), if any. `None` means no
+    /// preset: the engine serves the row's isolation rule alone (unattached
+    /// rows are byte-identical to before presets existed).
+    pub preset_id: Option<String>,
 }
 
 /// Raw input for creating a config. All strings are unvalidated; empty
@@ -534,6 +538,56 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
         port: port as u16,
         subscription_id: row.get(8)?,
         identity_key: row.get(9)?,
+        preset_id: row.get(10)?,
+    })
+}
+
+/// A stored routing preset (ticket 37): a named, ordered list of sing-box
+/// route-rule objects applied per attached row. `rules_json` is the raw
+/// rules array (routing policy, not credentials — DPAPI sealing stays on
+/// `proxy_configs.params` only, ticket-35 behavior preserved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutePreset {
+    /// Stable string id, never reused (AUTOINCREMENT rowid rendered as text).
+    pub id: String,
+    pub name: String,
+    /// Intake origin: `link` (`throne://route`), `url` (explicit fetch of a
+    /// preset URL / `throne://remoteroute`), `file` (preset JSON file), or
+    /// `manual` (hand-created in the manager).
+    pub source: String,
+    /// Origin URL for `url` presets (fetch target, explicit refresh only —
+    /// never auto-fetched). `None` otherwise.
+    pub source_url: Option<String>,
+    /// Raw JSON array of route-rule objects.
+    pub rules_json: String,
+    /// Unix seconds of the last write (create / rule edit / refresh fill).
+    pub updated_at: Option<i64>,
+}
+
+impl RoutePreset {
+    /// Decode the stored rules array. Corrupt rows fail with a static
+    /// message (never rule content).
+    pub fn rules(&self) -> Result<Vec<serde_json::Value>, String> {
+        match serde_json::from_str::<serde_json::Value>(&self.rules_json) {
+            Ok(serde_json::Value::Array(rules)) => Ok(rules),
+            _ => Err(format!(
+                "preset \"{}\" holds invalid rules (re-import it)",
+                self.name
+            )),
+        }
+    }
+}
+
+/// Map one result row to a RoutePreset (STRICT table guarantees the shapes).
+fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
+    let id: i64 = row.get(0)?;
+    Ok(RoutePreset {
+        id: id.to_string(),
+        name: row.get(1)?,
+        source: row.get(2)?,
+        source_url: row.get(3)?,
+        rules_json: row.get(4)?,
+        updated_at: row.get(5)?,
     })
 }
 
@@ -1251,8 +1305,9 @@ impl Store {
     /// failing store instead of a silent empty list).
     #[cfg(test)]
     pub fn break_schema_for_test(&self) -> Result<(), StoreError> {
-        self.conn
-            .execute_batch("DROP TABLE proxy_configs; DROP TABLE subscriptions;")?;
+        self.conn.execute_batch(
+            "DROP TABLE proxy_configs; DROP TABLE subscriptions; DROP TABLE route_presets;",
+        )?;
         Ok(())
     }
 
@@ -1329,10 +1384,12 @@ impl Store {
     /// Ticket 25: schema version behind `PRAGMA user_version`. Version 1 is
     /// every table/column through ticket 17; version 2 adds the ticket-25
     /// ownership columns (`adoptable`, `synced_params`); version 3 seals
-    /// params at rest (ticket 35, DPAPI). Fresh and legacy
-    /// (`user_version = 0`) databases migrate forward idempotently; a
-    /// database from a NEWER build fails loudly (never a silent empty).
-    const SCHEMA_VERSION: i64 = 3;
+    /// params at rest (ticket 35, DPAPI); version 4 adds routing presets
+    /// (ticket 37: `route_presets` table + `proxy_configs.preset_id`). Fresh
+    /// and legacy (`user_version = 0`) databases migrate forward
+    /// idempotently; a database from a NEWER build fails loudly (never a
+    /// silent empty).
+    const SCHEMA_VERSION: i64 = 4;
     /// Minimum SQLite for this schema: STRICT tables need 3.37+.
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
 
@@ -1461,8 +1518,21 @@ impl Store {
                kind TEXT NOT NULL DEFAULT 'url-test',
                latency_ms INTEGER,
                error TEXT
-             ) STRICT;",
+             ) STRICT;
+              CREATE TABLE IF NOT EXISTS route_presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL DEFAULT 'manual',
+                source_url TEXT,
+                rules_json TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER
+              ) STRICT;
+              CREATE INDEX IF NOT EXISTS idx_route_presets_name
+                ON route_presets(name);",
         )?;
+        // Ticket 37: per-row preset attachment (null = none; validated on
+        // attach, so no FK — a dangling id fails loudly at merge time).
+        self.ensure_column("proxy_configs", "preset_id", "TEXT")?;
         // Migrate pre-ticket-04 databases that lack the new columns.
         for (column, ddl) in [("subscription_id", "TEXT"), ("identity_key", "TEXT")] {
             self.ensure_column("proxy_configs", column, ddl)?;
@@ -1517,6 +1587,7 @@ impl Store {
             ("proxy_configs", "identity_key"),
             ("proxy_configs", "adoptable"),
             ("proxy_configs", "synced_params"),
+            ("proxy_configs", "preset_id"),
             ("subscriptions", "failures"),
         ] {
             if !self.column_exists(table, column)? {
@@ -1664,7 +1735,7 @@ impl Store {
     pub fn list(&self) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
-              subscription_id, identity_key
+              subscription_id, identity_key, preset_id
              FROM proxy_configs ORDER BY id",
         )?;
         let rows = stmt
@@ -1681,7 +1752,7 @@ impl Store {
         };
         let mut stmt = self.conn.prepare(
             "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
-              subscription_id, identity_key
+              subscription_id, identity_key, preset_id
              FROM proxy_configs WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_row)?;
@@ -1784,6 +1855,343 @@ impl Store {
         }
         self.get(id)?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    // -- Ticket 37: routing presets --------------------------------------
+
+    /// Attach (`Some`) or detach (`None`) a routing preset on one row.
+    /// Attaching validates the preset exists (`NotFound` otherwise);
+    /// detaching always succeeds on a live row. `NotFound` for ghost rows.
+    pub fn set_config_preset(
+        &mut self,
+        config_id: &str,
+        preset_id: Option<&str>,
+    ) -> Result<ProxyConfig, StoreError> {
+        if let Some(preset) = preset_id {
+            if self.get_preset(preset)?.is_none() {
+                return Err(StoreError::NotFound(preset.to_string()));
+            }
+        }
+        let rowid: i64 = match config_id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(config_id.to_string())),
+        };
+        let changed = self.conn.execute(
+            "UPDATE proxy_configs SET preset_id = ?1 WHERE id = ?2",
+            params![preset_id, rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(config_id.to_string()));
+        }
+        self.get(config_id)?
+            .ok_or_else(|| StoreError::NotFound(config_id.to_string()))
+    }
+
+    /// Preset rules for the engine merge: `preset_id` → ordered rule
+    /// objects. Corrupt stored rules fail loudly (never a silent empty
+    /// merge); rows without presets contribute nothing.
+    pub fn preset_rules_map(&self) -> Result<HashMap<String, Vec<serde_json::Value>>, StoreError> {
+        let mut map = HashMap::new();
+        for preset in self.list_presets()? {
+            let rules = preset.rules().map_err(|message| {
+                StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+                )))
+            })?;
+            map.insert(preset.id, rules);
+        }
+        Ok(map)
+    }
+
+    /// Create a preset from validated rules. Names are non-empty and unique;
+    /// rules validate field-by-field (rejections name rule index + field).
+    pub fn create_preset(
+        &mut self,
+        name: &str,
+        source: &str,
+        source_url: Option<&str>,
+        rules: &[serde_json::Value],
+    ) -> Result<RoutePreset, StoreError> {
+        let name = Self::validated_preset_name(name)?;
+        Self::check_preset_rules(rules)?;
+        let source = Self::validated_preset_source(source);
+        let rules_json = serde_json::Value::Array(rules.to_vec()).to_string();
+        let now = now_unix();
+        match self.conn.execute(
+            "INSERT INTO route_presets (name, source, source_url, rules_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, source, source_url, rules_json, now],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "name",
+                    format!("preset \"{name}\" already exists"),
+                )]));
+            }
+            Err(error) => return Err(StoreError::Sql(error)),
+        }
+        let id = self.conn.last_insert_rowid();
+        self.get_preset(&id.to_string())?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Import a `throne://route/...` link as a named preset (source
+    /// `link`). Replaces the v1 named error: route links now store.
+    pub fn import_route_link(&mut self, line: &str) -> Result<RoutePreset, StoreError> {
+        let parsed = crate::preset::decode_route_link(line).map_err(Self::preset_parse_error)?;
+        self.create_preset(&parsed.name, "link", None, &parsed.rules)
+    }
+
+    /// Import preset JSON (preset URL bodies after an explicit fetch, or
+    /// dropped/pasted JSON files) as a named preset.
+    pub fn import_preset_json(
+        &mut self,
+        text: &str,
+        source: &str,
+        source_url: Option<&str>,
+    ) -> Result<RoutePreset, StoreError> {
+        let parsed =
+            crate::preset::parse_preset_json(text, "").map_err(Self::preset_parse_error)?;
+        self.create_preset(&parsed.name, source, source_url, &parsed.rules)
+    }
+
+    /// Record a fetched remote preset URL as an empty-rules shell (source
+    /// `url`); the explicit fetch fills it via [`Store::set_preset_rules`].
+    /// Lets a `throne://remoteroute/...` paste land without any silent fetch.
+    pub fn import_remote_preset_shell(
+        &mut self,
+        name: &str,
+        url: &str,
+    ) -> Result<RoutePreset, StoreError> {
+        self.create_preset(name, "url", Some(url), &[])
+    }
+
+    /// Replace a preset's rules wholesale (the explicit-refresh write path).
+    /// Validates field-by-field like create.
+    pub fn set_preset_rules(
+        &mut self,
+        id: &str,
+        rules: &[serde_json::Value],
+    ) -> Result<RoutePreset, StoreError> {
+        Self::check_preset_rules(rules)?;
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let rules_json = serde_json::Value::Array(rules.to_vec()).to_string();
+        let changed = self.conn.execute(
+            "UPDATE route_presets SET rules_json = ?1, updated_at = ?2 WHERE id = ?3",
+            params![rules_json, now_unix(), rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_preset(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Append one rule object to a preset (manager add-rule). The rule
+    /// validates in place: the rejection names the (new) rule index + field.
+    /// Test-covered store seam for the manager add-rule scenario (the v1
+    /// manager UI covers list/create/delete/detach; rule edits go through
+    /// create-with-JSON there).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn add_preset_rule(
+        &mut self,
+        id: &str,
+        rule: serde_json::Value,
+    ) -> Result<RoutePreset, StoreError> {
+        let mut preset = self
+            .get_preset(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let mut rules = preset.rules().map_err(|message| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )))
+        })?;
+        rules.push(rule);
+        if let Err(error) = crate::preset::validate_preset_rules(&rules) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "rule",
+                error.message.clone(),
+            )]));
+        }
+        self.set_preset_rules(id, &rules)?;
+        preset = self
+            .get_preset(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        Ok(preset)
+    }
+
+    /// Remove one rule by index (manager remove-rule). Out-of-range indices
+    /// fail typed; nothing is written. Test-covered store seam (see
+    /// [`Store::add_preset_rule`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remove_preset_rule(
+        &mut self,
+        id: &str,
+        index: usize,
+    ) -> Result<RoutePreset, StoreError> {
+        let preset = self
+            .get_preset(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let mut rules = preset.rules().map_err(|message| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )))
+        })?;
+        if index >= rules.len() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "rule",
+                format!(
+                    "rule {index} does not exist (preset has {} rule(s))",
+                    rules.len()
+                ),
+            )]));
+        }
+        rules.remove(index);
+        self.set_preset_rules(id, &rules)
+    }
+
+    /// All presets in stable id order.
+    pub fn list_presets(&self) -> Result<Vec<RoutePreset>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, source, source_url, rules_json, updated_at
+             FROM route_presets ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], map_preset_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch one preset by id.
+    pub fn get_preset(&self, id: &str) -> Result<Option<RoutePreset>, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Ok(None),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, source, source_url, rules_json, updated_at
+             FROM route_presets WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![rowid], map_preset_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a preset. Refused (`Invalid`) while any row attaches it — the
+    /// refusal names the attached rows, so the UI can offer the explicit
+    /// detach-then-delete path ([`Store::delete_preset_detaching`]).
+    pub fn delete_preset(&mut self, id: &str) -> Result<bool, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Ok(false),
+        };
+        if self.get_preset(id)?.is_none() {
+            return Ok(false);
+        }
+        let attached = self.preset_attachments(id)?;
+        if !attached.is_empty() {
+            let names: Vec<String> = attached
+                .iter()
+                .map(|row| format!("\"{}\" (id {})", row.name, row.id))
+                .collect();
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "preset",
+                format!(
+                    "preset is still attached to {} row(s): {} — detach first or delete explicitly with detach",
+                    attached.len(),
+                    names.join(", ")
+                ),
+            )]));
+        }
+        let removed = self
+            .conn
+            .execute("DELETE FROM route_presets WHERE id = ?1", params![rowid])?;
+        Ok(removed > 0)
+    }
+
+    /// Delete a preset, detaching every attached row first (the explicit
+    /// path: one transaction, never a half-detached delete).
+    pub fn delete_preset_detaching(&mut self, id: &str) -> Result<bool, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Ok(false),
+        };
+        if self.get_preset(id)?.is_none() {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE proxy_configs SET preset_id = NULL WHERE preset_id = ?1",
+            params![id],
+        )?;
+        let removed = tx.execute("DELETE FROM route_presets WHERE id = ?1", params![rowid])?;
+        tx.commit()?;
+        Ok(removed > 0)
+    }
+
+    /// Rows currently attaching a preset (stable id order).
+    pub fn preset_attachments(&self, id: &str) -> Result<Vec<ProxyConfig>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
+              subscription_id, identity_key, preset_id
+             FROM proxy_configs WHERE preset_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![id], map_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn validated_preset_name(raw: &str) -> Result<String, StoreError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                "preset name must not be empty",
+            )]));
+        }
+        let capped: String = if trimmed.chars().count() > crate::preset::MAX_PRESET_NAME_CHARS {
+            trimmed
+                .chars()
+                .take(crate::preset::MAX_PRESET_NAME_CHARS)
+                .collect()
+        } else {
+            trimmed.to_string()
+        };
+        Ok(capped)
+    }
+
+    fn validated_preset_source(raw: &str) -> String {
+        match raw.trim() {
+            "link" | "url" | "file" | "manual" => raw.trim().to_string(),
+            _ => "manual".to_string(),
+        }
+    }
+
+    /// Field-level rule validation behind create/set/add. Rejections name
+    /// rule index + field (never values).
+    fn check_preset_rules(rules: &[serde_json::Value]) -> Result<(), StoreError> {
+        if let Err(error) = crate::preset::validate_preset_rules(rules) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "rules",
+                error.message.clone(),
+            )]));
+        }
+        Ok(())
+    }
+
+    /// Map a preset parse failure into [`StoreError::Invalid`] (field
+    /// `preset`; messages never echo payloads by construction of the parser).
+    fn preset_parse_error(error: crate::preset::PresetError) -> StoreError {
+        StoreError::Invalid(vec![FieldError::new("preset", error.to_string())])
     }
 
     // -- Ticket 04: subscriptions -----------------------------------------
@@ -2829,6 +3237,13 @@ impl Store {
         for row in &rows {
             // Ticket 35: the export carries plaintext; seal on the way back
             // in (same at-rest invariant as live rows).
+            // Ticket 37: `preset_id` is intentionally not restored — backups
+            // cover endpoints, not routing policy. Restored rows rebuild
+            // unattached (the `route_presets` table itself is untouched by
+            // restore, so presets survive for re-attach in the manager).
+            // Rebuilding an attachment from a bare id would risk dangling
+            // references on cross-database restores; a dropped attachment
+            // is visible in the manager, a dangling one would fail starts.
             let sealed_params = Self::seal_or_fail(&row.params)?;
             let sealed_synced = row
                 .synced_params
@@ -4423,6 +4838,7 @@ mod tests {
                 port: 10801,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             },
             ProxyConfig {
                 id: "2".to_string(),
@@ -4435,6 +4851,7 @@ mod tests {
                 port: 10802,
                 subscription_id: None,
                 identity_key: None,
+                preset_id: None,
             },
         ];
         assert_eq!(count_importable(&rows), 1);
@@ -5532,7 +5949,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("version reads");
-            assert_eq!(version, 3, "schema advanced to 3");
+            assert_eq!(version, 4, "schema advanced to 4");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5757,5 +6174,256 @@ mod tests {
             .expect("second saves too — warning, never a block");
         assert_ne!(first.id, second.id, "two rows, no silent dedup");
         assert_eq!(store.list().expect("list works").len(), 2);
+    }
+
+    // -- Ticket 37: routing presets --------------------------------------
+
+    fn t37_seed_row(store: &mut Store, name: &str) -> ProxyConfig {
+        store
+            .add(NewConfig {
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed row saves")
+    }
+
+    fn t37_rules_json() -> Vec<serde_json::Value> {
+        serde_json::from_str::<Vec<serde_json::Value>>(
+            r#"[{"action":"route","domain":["example.com"]},{"action":"direct","ip_cidr":["10.0.0.0/8"]},{"action":"block","port":[25]}]"#,
+        )
+        .expect("fixture rules parse")
+    }
+
+    /// Ticket 37: `throne://route` link imports a named preset with its rules
+    /// (replaces the v1 named error).
+    #[test]
+    fn ticket37_route_link_imports_named_preset() {
+        use base64::Engine as _;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let payload = base64::engine::general_purpose::STANDARD.encode(
+            r#"{"name":"ads","rules":[{"action":"block","domain_suffix":["ads.example"]}]}"#,
+        );
+        let preset = store
+            .import_route_link(&format!("throne://route/{payload}"))
+            .expect("route link imports");
+        assert_eq!(preset.name, "ads");
+        assert_eq!(preset.rules().expect("rules decode").len(), 1);
+        let listed = store.list_presets().expect("list works");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "ads");
+    }
+
+    /// Ticket 37: preset URL/JSON bodies import; malformed rules are rejected
+    /// naming the rule index and the field (never values).
+    #[test]
+    fn ticket37_preset_json_import_and_malformed_rule_error() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .import_preset_json(
+                r#"{"name":"office","rules":[{"action":"direct"}]}"#,
+                "file",
+                Some("office.json"),
+            )
+            .expect("valid JSON imports");
+        assert_eq!(preset.name, "office");
+        assert_eq!(preset.source, "file");
+        assert_eq!(preset.source_url.as_deref(), Some("office.json"));
+        let error = store
+            .import_preset_json(
+                r#"{"name":"bad","rules":[{"action":"route"},{"nope":true}]}"#,
+                "file",
+                None,
+            )
+            .expect_err("malformed rule must fail");
+        let text = error.to_string();
+        assert!(text.contains("rule 1"), "names rule index, got {text}");
+        assert!(text.contains("\"action\""), "names field, got {text}");
+        assert!(
+            !text.contains("nope"),
+            "never echoes rule content, got {text}"
+        );
+        assert_eq!(store.list_presets().expect("list works").len(), 1);
+    }
+
+    /// Ticket 37: preset manager — create / add rule / remove rule / detach
+    /// persist and validate; delete of an attached preset is refused.
+    #[test]
+    fn ticket37_preset_manager_crud_and_refused_delete() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = t37_seed_row(&mut store, "Row");
+        assert_eq!(row.preset_id, None, "rows start unattached");
+        let preset = store
+            .create_preset("empty", "manual", None, &[])
+            .expect("empty create works");
+        assert_eq!(preset.rules().expect("rules decode").len(), 0);
+        store
+            .add_preset_rule(&preset.id, serde_json::json!({"action": "direct"}))
+            .expect("add rule works");
+        let back = store
+            .get_preset(&preset.id)
+            .expect("get works")
+            .expect("preset kept");
+        assert_eq!(back.rules().expect("rules decode").len(), 1);
+        let bad = store.add_preset_rule(&preset.id, serde_json::json!({"nope": true}));
+        assert!(bad.is_err(), "bad rule rejected");
+        store
+            .remove_preset_rule(&preset.id, 0)
+            .expect("remove rule works");
+        let back = store
+            .get_preset(&preset.id)
+            .expect("get works")
+            .expect("preset kept");
+        assert_eq!(back.rules().expect("rules decode").len(), 0);
+        // Attach, then delete must refuse.
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works");
+        let attached = store.get(&row.id).expect("get works").expect("row kept");
+        assert_eq!(attached.preset_id.as_deref(), Some(preset.id.as_str()));
+        let refused = store
+            .delete_preset(&preset.id)
+            .expect_err("attached delete refused");
+        assert!(
+            refused.to_string().contains(&row.id) || refused.to_string().contains("attached"),
+            "refusal names the attachment, got {refused}"
+        );
+        assert!(
+            store.get_preset(&preset.id).expect("get works").is_some(),
+            "refused delete keeps the preset"
+        );
+        // Explicit detach, then delete succeeds.
+        store
+            .set_config_preset(&row.id, None)
+            .expect("detach works");
+        let detached = store.get(&row.id).expect("get works").expect("row kept");
+        assert_eq!(detached.preset_id, None);
+        assert!(store.delete_preset(&preset.id).expect("delete works"));
+        assert!(
+            store.get_preset(&preset.id).expect("get works").is_none(),
+            "preset gone"
+        );
+    }
+
+    /// Ticket 37: explicit delete-detaches-then-deletes in one call.
+    #[test]
+    fn ticket37_delete_detaching_clears_attachments() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = t37_seed_row(&mut store, "Row");
+        let preset = store
+            .create_preset("p", "manual", None, &t37_rules_json())
+            .expect("create works");
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works");
+        assert!(store
+            .delete_preset_detaching(&preset.id)
+            .expect("explicit delete works"));
+        let back = store.get(&row.id).expect("get works").expect("row kept");
+        assert_eq!(back.preset_id, None, "attachment cleared");
+        assert!(
+            store.get_preset(&preset.id).expect("get works").is_none(),
+            "preset gone"
+        );
+    }
+
+    /// Ticket 37: attaching a ghost preset is NotFound; attaching to a ghost
+    /// row is NotFound; removing a ghost rule index fails typed.
+    #[test]
+    fn ticket37_preset_ghost_references_fail_typed() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = t37_seed_row(&mut store, "Row");
+        assert!(
+            matches!(
+                store.set_config_preset(&row.id, Some("9999")),
+                Err(StoreError::NotFound(_))
+            ),
+            "ghost preset attach is NotFound"
+        );
+        assert!(
+            matches!(
+                store.set_config_preset("9999", None),
+                Err(StoreError::NotFound(_))
+            ),
+            "ghost row attach is NotFound"
+        );
+        let preset = store
+            .create_preset("p", "manual", None, &[])
+            .expect("create works");
+        assert!(
+            store.remove_preset_rule(&preset.id, 3).is_err(),
+            "ghost rule index fails"
+        );
+    }
+
+    /// Ticket 37: fresh rows carry no preset and survive a restart-shaped
+    /// reopen with their attachment intact (isolated temp DB, synthetic row).
+    #[test]
+    fn ticket37_preset_attachment_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t37-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        let (row_id, preset_id) = {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            let row = t37_seed_row(&mut store, "Row");
+            let preset = store
+                .create_preset("p", "manual", None, &t37_rules_json())
+                .expect("create works");
+            store
+                .set_config_preset(&row.id, Some(&preset.id))
+                .expect("attach works");
+            (row.id, preset.id)
+        };
+        {
+            let store = Store::open_file(&path).expect("reopen works");
+            let back = store.get(&row_id).expect("get works").expect("row kept");
+            assert_eq!(back.preset_id.as_deref(), Some(preset_id.as_str()));
+            let preset = store
+                .get_preset(&preset_id)
+                .expect("get works")
+                .expect("preset kept");
+            assert_eq!(preset.rules().expect("rules decode").len(), 3);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ticket 37: restore rebuilds rows unattached while the presets table
+    /// itself survives (backups cover endpoints, not routing policy). The
+    /// preset stays listed for re-attach — never a dangling reference.
+    #[test]
+    fn ticket37_restore_rebuilds_rows_unattached_presets_survive() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = t37_seed_row(&mut store, "Row");
+        let preset = store
+            .create_preset("p", "manual", None, &t37_rules_json())
+            .expect("create works");
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works");
+        let payload = store.export_library_json().expect("export works");
+        // Restore runs against a wiped library in the same database (the
+        // production path wipes rows + subscriptions, never route_presets).
+        for row in store.list().expect("list works") {
+            store.remove(&row.id).expect("wipe works");
+        }
+        let outcome = store.restore_library_json(&payload).expect("restore works");
+        assert_eq!(outcome.configs, 1);
+        let back = store.get(&row.id).expect("get works").expect("row kept");
+        assert_eq!(back.preset_id, None, "restored rows rebuild unattached");
+        let kept = store
+            .get_preset(&preset.id)
+            .expect("get works")
+            .expect("preset survives restore");
+        assert_eq!(kept.rules().expect("rules decode").len(), 3);
     }
 }
