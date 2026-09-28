@@ -56,6 +56,9 @@ unsafe extern "system" {
 /// Encrypt `plaintext` for the current Windows user. Fails loudly when
 /// DPAPI is unavailable (never silently returns plaintext).
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    if fail_for_test() {
+        return Err("dpapi protect failed (injected for test)".to_string());
+    }
     // SAFETY: in-blob borrows the caller's slice for the duration of the
     // call; all pointers are null except the input; UI is forbidden so the
     // call never blocks on a dialog. The out-blob is copied then freed.
@@ -122,6 +125,9 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Seal a params string for storage: `dpapi1:<base64>`.
 pub fn seal_params(plaintext: &str) -> Result<String, String> {
+    if fail_for_test() {
+        return Err("dpapi protect failed (injected for test)".to_string());
+    }
     use base64::Engine as _;
     protect(plaintext.as_bytes()).map(|bytes| {
         format!(
@@ -148,4 +154,18 @@ pub fn unseal_params(stored: &str) -> Result<String, String> {
         return Ok(stored.to_string());
     }
     Err("unknown params storage marker (refusing to guess)".to_string())
+}
+
+thread_local! {
+    static FAIL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: force [`protect`]/[`seal_params`] to fail loudly on this thread.
+#[allow(dead_code)]
+pub fn set_fail_for_test(fail: bool) {
+    FAIL_FOR_TEST.with(|flag| flag.set(fail));
+}
+
+fn fail_for_test() -> bool {
+    FAIL_FOR_TEST.with(|flag| flag.get())
 }

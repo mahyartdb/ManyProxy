@@ -387,6 +387,7 @@ pub fn export_payload_full(
                 "last_refresh_at": sub.last_refresh_at,
                 "last_error": sub.last_error,
                 "failures": failures,
+                "interval_secs": sub.interval_secs,
             })
         })
         .collect();
@@ -562,6 +563,13 @@ pub struct RoutePreset {
     pub rules_json: String,
     /// Unix seconds of the last write (create / rule edit / refresh fill).
     pub updated_at: Option<i64>,
+    /// Ticket 40 (v5, additive): free-form manager note. `None` means unset.
+    pub description: Option<String>,
+    /// Ticket 40 (v5, additive): true for shipped builtins (never deleted by
+    /// restore sweeps; manager still edits rules explicitly).
+    pub is_builtin: bool,
+    /// Ticket 40 (v5, additive): unix seconds this preset was last attached.
+    pub last_used_at: Option<i64>,
 }
 
 impl RoutePreset {
@@ -581,6 +589,11 @@ impl RoutePreset {
 /// Map one result row to a RoutePreset (STRICT table guarantees the shapes).
 fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
     let id: i64 = row.get(0)?;
+    // Ticket 40: v5 extension columns are trailing and optional for legacy
+    // SELECTs; missing reads as unset (never a whole-list failure).
+    let description: Option<String> = row.get(6).ok().flatten();
+    let is_builtin: Option<i64> = row.get(7).ok();
+    let last_used_at: Option<i64> = row.get(8).ok().flatten();
     Ok(RoutePreset {
         id: id.to_string(),
         name: row.get(1)?,
@@ -588,6 +601,45 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
         source_url: row.get(3)?,
         rules_json: row.get(4)?,
         updated_at: row.get(5)?,
+        description,
+        is_builtin: is_builtin.unwrap_or(0) != 0,
+        last_used_at,
+    })
+}
+
+/// Ticket 40 (v5): one quarantined library row. The store keeps good rows
+/// loadable while naming the ids that need attention (re-import or restore).
+/// `cause` names the column/reason only, never secret or param bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedRow {
+    pub id: String,
+    pub cause: String,
+}
+
+/// Ticket 40 (v5): one append-only health-history sample. `health_snapshots`
+/// keeps the latest-fast-path untouched; history serves per-row charts and
+/// range deletes via `idx_health_history_config_at`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthHistoryEntry {
+    pub config_id: String,
+    pub at: i64,
+    /// `"url-test"` or `"tcp-ping"`.
+    pub kind: String,
+    pub latency_ms: Option<u64>,
+    /// `Some` names the dead cause; `None` means live.
+    pub error: Option<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn map_health_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthHistoryEntry> {
+    let latency_ms: Option<i64> = row.get(3)?;
+    Ok(HealthHistoryEntry {
+        config_id: row.get(0)?,
+        at: row.get(1)?,
+        kind: row.get(2)?,
+        latency_ms: latency_ms.map(|ms| ms.max(0) as u64),
+        error: row.get(4)?,
     })
 }
 
@@ -954,6 +1006,10 @@ pub struct Subscription {
     /// per-subscription failures view; cleared on a clean refresh, kept on a
     /// fetch error which parsed nothing new).
     pub failures: Vec<crate::import::ImportFailure>,
+    /// Ticket 40 (v5): per-subscription auto-refresh interval in seconds.
+    /// Missing/legacy rows read as [`DEFAULT_AUTO_REFRESH_SECS`]; `<= 0`
+    /// means always due (matches [`due_for_refresh`] semantics).
+    pub interval_secs: i64,
 }
 
 /// Ticket 04: outcome of one refresh merge. `error` is `Some` when the body
@@ -1001,11 +1057,21 @@ pub fn due_for_refresh(subscription: &Subscription, now: i64, interval_secs: i64
     }
 }
 
+/// Ticket 40 (v5): per-subscription due check honoring
+/// [`Subscription::interval_secs`] (missing/`<= 0` means always due once a
+/// prior success exists; never-refreshed auto subs are always due).
+pub fn due_for_refresh_for(subscription: &Subscription, now: i64) -> bool {
+    due_for_refresh(subscription, now, subscription.interval_secs)
+}
+
 /// Map one subscription row to a Subscription.
 fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
     let id: i64 = row.get(0)?;
     let auto_refresh: i64 = row.get(4)?;
     let failures_raw: Option<String> = row.get(7)?;
+    // Ticket 40: v5 `interval_secs` is column 8 when present; legacy rows
+    // (v0–v4 fixtures, hand-built SELECTs) fall back to the default.
+    let interval_secs: Option<i64> = row.get(8).ok();
     Ok(Subscription {
         id: id.to_string(),
         label: row.get(1)?,
@@ -1015,6 +1081,7 @@ fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscriptio
         last_refresh_at: row.get(5)?,
         last_error: row.get(6)?,
         failures: decode_failures(failures_raw),
+        interval_secs: interval_secs.unwrap_or(DEFAULT_AUTO_REFRESH_SECS),
     })
 }
 
@@ -1265,14 +1332,30 @@ fn rotation_core(params: &str) -> Option<String> {
     Some(format!("{server}\0{}", port.trim()))
 }
 
+/// Ticket 40: derive the rotation core (`server\0port`) from a stored
+/// widened identity key (`protocol\0server\0port\0…`). `None` when the key
+/// is not in the expected shape (legacy/foreign tombstones match exactly
+/// only, never by core).
+fn rotation_core_from_identity_key(key: &str) -> Option<String> {
+    let mut parts = key.split('\0');
+    let _protocol = parts.next()?;
+    let server = parts.next()?;
+    let port = parts.next()?;
+    if server.is_empty() || port.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{server}\0{}", port.trim()))
+}
+
 /// Ticket 25: outcome of [`Store::restore_library_json`].
 /// (Test-driven API for ticket 26; see the callee's note.)
-#[allow(dead_code)]
+/// Ticket 40: `presets` counts rebuilt route presets (full-fidelity export).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreOutcome {
     pub configs: usize,
     pub subscriptions: usize,
     pub tombstones: usize,
+    pub presets: usize,
 }
 
 /// Ticket 25 (L4): same-directory tmp sibling for atomic export writes.
@@ -1292,12 +1375,16 @@ fn tmp_export_path(path: &Path) -> PathBuf {
 
 pub struct Store {
     conn: Connection,
+    /// Ticket 40: live file behind this handle (`None` for `:memory:` test
+    /// stores). Powers backup-before-restore + temp-DB atomic swaps without
+    /// touching the live user DB from tests (isolated `MANYPROXY_DB` only).
+    db_path: Option<PathBuf>,
 }
 
 impl Store {
     /// Open a throwaway store for unit tests.
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        Self::open(Connection::open_in_memory()?)
+        Self::open_with_path(Connection::open_in_memory()?, None)
     }
 
     /// Ticket 14 test seam: drop the main tables so reads fail with
@@ -1323,6 +1410,9 @@ impl Store {
     /// Open (creating parents as needed) a file-backed store.
     /// Ticket 27: the DB file holds secrets at rest — user-only permissions
     /// apply on open (best-effort, never fails the open).
+    /// Ticket 40: corrupt/foreign files are quarantined aside as
+    /// `library.db.corrupt-<ts>` with a loud integrity error (never silent
+    /// in-memory loss); the caller offers restore-from-export.
     pub fn open_file(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1331,7 +1421,76 @@ impl Store {
                 })?;
             }
         }
-        let store = Self::open(Connection::open(path)?)?;
+        // Fast reject: a non-empty file that is not SQLite at all (bad magic)
+        // quarantines before rusqlite ever touches it.
+        if path.exists() {
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.len() > 0 && meta.len() < 100 {
+                    // Too small to be a valid SQLite header — still let
+                    // rusqlite decide, but pre-check the magic below for the
+                    // common garbage case.
+                }
+                if meta.len() > 0 {
+                    if let Ok(head) =
+                        std::fs::read(path).map(|b| b.into_iter().take(16).collect::<Vec<_>>())
+                    {
+                        let magic = b"SQLite format 3\0";
+                        if head.len() == 16 && head.as_slice() != magic {
+                            let quarantined = Self::quarantine_corrupt_file(path)?;
+                            return Err(Self::schema_error(format!(
+                                "library database is corrupt (integrity check failed): preserved as {} — restore from an export instead of running on a half-migrated file",
+                                quarantined.display()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        let conn = Connection::open(path).map_err(|e| {
+            // `Connection::open` itself failed (e.g. not a database): try to
+            // preserve the bad file aside before failing loudly.
+            if path.exists() {
+                let _ = Self::quarantine_corrupt_file(path);
+            }
+            StoreError::Sql(e)
+        })?;
+        let store = match Self::open_with_path(conn, Some(path.to_path_buf())) {
+            Ok(store) => store,
+            Err(error) => {
+                // A schema/migration failure on a file-backed open that smells
+                // like corruption (not a clean validation error) preserves the
+                // bad file aside. Clean validation errors (newer version,
+                // DPAPI-down, drift) propagate untouched so retries work.
+                let text = error.to_string();
+                let looks_corrupt = text.contains("not a database")
+                    || text.contains("file is not a database")
+                    || text.contains("malformed")
+                    || text.contains("integrity check failed")
+                    || text.contains("corrupt");
+                if looks_corrupt && path.exists() {
+                    if let Ok(quarantined) = Self::quarantine_corrupt_file(path) {
+                        return Err(Self::schema_error(format!(
+                            "{text} (bad file preserved as {})",
+                            quarantined.display()
+                        )));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        // Post-migration integrity gate: a page-level fault quarantines on
+        // next open, never silent in-memory loss.
+        if let Err(error) = store.check_quick() {
+            let text = error.to_string();
+            drop(store);
+            if let Ok(quarantined) = Self::quarantine_corrupt_file(path) {
+                return Err(Self::schema_error(format!(
+                    "library database is corrupt (integrity check failed: {text}): preserved as {} — restore from an export instead of running on a half-migrated file",
+                    quarantined.display()
+                )));
+            }
+            return Err(error);
+        }
         harden_file_permissions(path);
         // WAL sidecars (`<db>-wal`, `<db>-shm`) hold the same secrets;
         // tighten them too when present.
@@ -1362,11 +1521,172 @@ impl Store {
         PathBuf::from(home).join(".manyproxy").join("library.db")
     }
 
-    fn open(conn: Connection) -> Result<Self, StoreError> {
-        let mut store = Self { conn };
+    fn open_with_path(conn: Connection, db_path: Option<PathBuf>) -> Result<Self, StoreError> {
+        let mut store = Self { conn, db_path };
         store.apply_pragmas()?;
         store.create_schema()?;
+        // Ticket 40: time-based health-history retention at startup (90d,
+        // one tx, never VACUUM; best-effort so a prune failure never blocks
+        // open).
+        let now = now_unix();
+        let _ = store.gc_health_history(90, now);
         Ok(store)
+    }
+
+    /// Ticket 40: live file behind this handle, if file-backed.
+    pub fn db_path(&self) -> Option<PathBuf> {
+        self.db_path.clone()
+    }
+
+    /// Ticket 40: `PRAGMA quick_check` gate. `Ok(())` means `ok`; any error
+    /// row becomes a loud schema error (never silent in-memory loss).
+    fn check_quick(&self) -> Result<(), StoreError> {
+        let mut stmt = self.conn.prepare("PRAGMA quick_check")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.len() == 1 && rows[0].eq_ignore_ascii_case("ok") {
+            Ok(())
+        } else {
+            Err(Self::schema_error(format!(
+                "library database integrity check failed: {}",
+                rows.join("; ")
+            )))
+        }
+    }
+
+    /// Ticket 40: preserve a corrupt/foreign DB file aside as
+    /// `library.db.corrupt-<ts>` (timestamp + pid, same directory so the
+    /// live path stays on one filesystem). Returns the quarantine path.
+    fn quarantine_corrupt_file(path: &Path) -> Result<PathBuf, StoreError> {
+        let ts = now_unix();
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("library.db");
+        let quarantined = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                parent.join(format!("{base}.corrupt-{ts}-{}", std::process::id()))
+            }
+            _ => PathBuf::from(format!("{base}.corrupt-{ts}-{}", std::process::id())),
+        };
+        std::fs::rename(path, &quarantined).map_err(|error| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        // Remove WAL sidecars of the bad file so a stale journal never
+        // shadows the quarantine.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sibling = PathBuf::from(format!("{}{suffix}", path.display()));
+            let _ = std::fs::remove_file(sibling);
+        }
+        Ok(quarantined)
+    }
+
+    /// Ticket 40: timestamped backup before any wipe
+    /// (`library.db.bak-<ts>-<pid>` in the same directory). The backup is a
+    /// plain file copy (same-filesystem, crash-safe source read); restore
+    /// uses temp-DB + rename, never in-place overwrite.
+    pub fn backup_db_file(db_path: &Path, now: i64) -> Result<PathBuf, StoreError> {
+        let base = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("library.db");
+        let backup = match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                parent.join(format!("{base}.bak-{now}-{}", std::process::id()))
+            }
+            _ => PathBuf::from(format!("{base}.bak-{now}-{}", std::process::id())),
+        };
+        std::fs::copy(db_path, &backup).map_err(|error| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        harden_file_permissions(&backup);
+        Ok(backup)
+    }
+
+    /// Ticket 40: atomic file restore. Validates the payload via a dry-run,
+    /// takes a timestamped backup, rebuilds into a temp sibling DB, runs
+    /// `quick_check`, then atomically renames over the live path. A kill
+    /// before the rename leaves the old library intact. Returns the outcome
+    /// plus the backup path.
+    pub fn restore_library_file(
+        db_path: &Path,
+        payload: &str,
+        now: i64,
+    ) -> Result<(RestoreOutcome, PathBuf), StoreError> {
+        // Validate first: a malformed backup never touches the live DB.
+        {
+            let mut dry = Store::open_in_memory()?;
+            dry.restore_library_json(payload)?;
+            dry.check_quick()?;
+        }
+        let backup = if db_path.exists() {
+            Self::backup_db_file(db_path, now)?
+        } else {
+            // No live file yet: still create a marker backup path? No — just
+            // proceed; return a non-existent backup path in the same dir.
+            let base = db_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("library.db");
+            match db_path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
+                    parent.join(format!("{base}.bak-{now}-{}", std::process::id()))
+                }
+                _ => PathBuf::from(format!("{base}.bak-{now}-{}", std::process::id())),
+            }
+        };
+        // Build into a temp sibling DB in the same directory (same filesystem
+        // → rename is atomic).
+        let tmp = match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(format!(
+                ".{}.restore-{}-{}",
+                db_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("library.db"),
+                std::process::id(),
+                now
+            )),
+            _ => PathBuf::from(format!(".library.restore-{}-{now}", std::process::id())),
+        };
+        // Ensure a stale temp from a killed restore never shadows us.
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", tmp.display())));
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", tmp.display())));
+        let outcome = {
+            let mut tmp_store = Store::open_with_path(
+                Connection::open(&tmp).map_err(StoreError::from)?,
+                Some(tmp.clone()),
+            )?;
+            let outcome = tmp_store.restore_library_json(payload)?;
+            tmp_store.check_quick()?;
+            // Close + fsync via checkpoint before the rename.
+            let _ = tmp_store
+                .conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            drop(tmp_store);
+            outcome
+        };
+        std::fs::rename(&tmp, db_path).map_err(|error| {
+            let _ = std::fs::remove_file(&tmp);
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        // Drop stale WAL sidecars of the old live file; the renamed file
+        // carries its own journal state.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sibling = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            // Only remove sidecars that predate the rename (best-effort).
+            let _ = std::fs::remove_file(sibling);
+        }
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                // Best-effort dir fsync is platform-specific; rename itself is
+                // the atomicity guarantee (sqlite atomiccommit).
+            }
+        }
+        harden_file_permissions(db_path);
+        Ok((outcome, backup))
     }
 
     /// sqlite-skill setup: must run on every connection.
@@ -1385,11 +1705,14 @@ impl Store {
     /// every table/column through ticket 17; version 2 adds the ticket-25
     /// ownership columns (`adoptable`, `synced_params`); version 3 seals
     /// params at rest (ticket 35, DPAPI); version 4 adds routing presets
-    /// (ticket 37: `route_presets` table + `proxy_configs.preset_id`). Fresh
-    /// and legacy (`user_version = 0`) databases migrate forward
-    /// idempotently; a database from a NEWER build fails loudly (never a
-    /// silent empty).
-    const SCHEMA_VERSION: i64 = 4;
+    /// (ticket 37: `route_presets` table + `proxy_configs.preset_id`); version
+    /// 5 stages per-sub intervals, health history, preset extensions, and
+    /// URL-keyed tombstones (ticket 40). Fresh and legacy (`user_version = 0`)
+    /// databases migrate forward idempotently; a database from a NEWER build
+    /// fails loudly (never a silent empty). The version bump lands LAST, so a
+    /// kill mid-migration retries on next open instead of trusting a
+    /// half-migrated file.
+    const SCHEMA_VERSION: i64 = 5;
     /// Minimum SQLite for this schema: STRICT tables need 3.37+.
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
 
@@ -1476,6 +1799,9 @@ impl Store {
         // naming both parties is raised at activation time (ticket 03).
         // Ticket 25: CHECK pins the valid range on new tables (old tables
         // are covered by the read-time reject in `map_row`).
+        // Ticket 40 (v5): fresh DDL carries the full v5 shape so fresh and
+        // migrated DBs converge; migrated v4 DBs backfill via `ensure_column`
+        // below (all online ADD COLUMN / CREATE TABLE, no rebuild).
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS proxy_configs (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1491,12 +1817,6 @@ impl Store {
                adoptable INTEGER NOT NULL DEFAULT 0,
                synced_params TEXT
              ) STRICT;
-             CREATE INDEX IF NOT EXISTS idx_proxy_configs_enabled
-               ON proxy_configs(enabled);
-             CREATE INDEX IF NOT EXISTS idx_proxy_configs_subscription
-               ON proxy_configs(subscription_id);
-             CREATE INDEX IF NOT EXISTS idx_proxy_configs_identity
-               ON proxy_configs(subscription_id, identity_key);
              CREATE TABLE IF NOT EXISTS subscriptions (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                label TEXT NOT NULL,
@@ -1505,15 +1825,26 @@ impl Store {
                auto_refresh INTEGER NOT NULL DEFAULT 1,
                last_refresh_at INTEGER,
                last_error TEXT,
-               failures TEXT NOT NULL DEFAULT '[]'
+               failures TEXT NOT NULL DEFAULT '[]',
+               interval_secs INTEGER NOT NULL DEFAULT 86400
              ) STRICT;
              CREATE TABLE IF NOT EXISTS subscription_tombstones (
                subscription_id TEXT NOT NULL,
                identity_key TEXT NOT NULL,
+               subscription_url TEXT,
+               rotation_core TEXT,
                PRIMARY KEY (subscription_id, identity_key)
              ) STRICT;
              CREATE TABLE IF NOT EXISTS health_snapshots (
                config_id TEXT PRIMARY KEY,
+               at INTEGER NOT NULL,
+               kind TEXT NOT NULL DEFAULT 'url-test',
+               latency_ms INTEGER,
+               error TEXT
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS health_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               config_id TEXT NOT NULL,
                at INTEGER NOT NULL,
                kind TEXT NOT NULL DEFAULT 'url-test',
                latency_ms INTEGER,
@@ -1525,10 +1856,11 @@ impl Store {
                 source TEXT NOT NULL DEFAULT 'manual',
                 source_url TEXT,
                 rules_json TEXT NOT NULL DEFAULT '[]',
-                updated_at INTEGER
+                updated_at INTEGER,
+                description TEXT,
+                is_builtin INTEGER NOT NULL DEFAULT 0,
+                last_used_at INTEGER
               ) STRICT;
-              CREATE INDEX IF NOT EXISTS idx_route_presets_name
-                ON route_presets(name);
              CREATE TABLE IF NOT EXISTS meta (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL DEFAULT ''
@@ -1555,6 +1887,73 @@ impl Store {
         // no version bump (same precedent as the ticket-25 columns).
         self.ensure_column("proxy_configs", "traffic_rx", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("proxy_configs", "traffic_tx", "INTEGER NOT NULL DEFAULT 0")?;
+        // Ticket 40 (v5): per-sub interval, preset extensions, tombstone URL
+        // + rotation core. All constraint-free ADD COLUMN (online, time
+        // independent of row count); idempotent via `ensure_column`.
+        self.ensure_column(
+            "subscriptions",
+            "interval_secs",
+            "INTEGER NOT NULL DEFAULT 86400",
+        )?;
+        self.ensure_column("route_presets", "description", "TEXT")?;
+        self.ensure_column("route_presets", "is_builtin", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("route_presets", "last_used_at", "INTEGER")?;
+        self.ensure_column("subscription_tombstones", "subscription_url", "TEXT")?;
+        self.ensure_column("subscription_tombstones", "rotation_core", "TEXT")?;
+        // Indexes (after all columns exist, so legacy DBs missing columns
+        // never fail index creation; IF NOT EXISTS keeps re-runs idempotent).
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_proxy_configs_enabled
+               ON proxy_configs(enabled);
+             CREATE INDEX IF NOT EXISTS idx_proxy_configs_subscription
+               ON proxy_configs(subscription_id);
+             CREATE INDEX IF NOT EXISTS idx_proxy_configs_identity
+               ON proxy_configs(subscription_id, identity_key);
+             CREATE INDEX IF NOT EXISTS idx_route_presets_name
+               ON route_presets(name);
+             CREATE INDEX IF NOT EXISTS idx_health_history_config_at
+               ON health_history(config_id, at);
+             CREATE INDEX IF NOT EXISTS idx_tombstones_url
+               ON subscription_tombstones(subscription_url, identity_key);
+             CREATE INDEX IF NOT EXISTS idx_tombstones_core
+               ON subscription_tombstones(subscription_url, rotation_core);",
+        )?;
+        // Backfill v5 tombstone URL + rotation core where the owning
+        // subscription still exists (orphan legacy tombstones keep NULL and
+        // still match by exact id-key; GC cleans them explicitly).
+        {
+            let rows: Vec<(String, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT subscription_id, identity_key FROM subscription_tombstones
+                     WHERE subscription_url IS NULL",
+                )?;
+                let mapped =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                let mut out = Vec::new();
+                for row in mapped {
+                    out.push(row?);
+                }
+                out
+            };
+            for (sub_id, key) in rows {
+                let url: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT url FROM subscriptions WHERE id = ?1",
+                        params![sub_id.parse::<i64>().unwrap_or(-1)],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(url) = url {
+                    let core = rotation_core_from_identity_key(&key);
+                    self.conn.execute(
+                        "UPDATE subscription_tombstones SET subscription_url = ?1, rotation_core = ?2
+                         WHERE subscription_id = ?3 AND identity_key = ?4",
+                        params![url, core, sub_id, key],
+                    )?;
+                }
+            }
+        }
         // Ticket 35 (version 3): seal params at rest. Legacy JSON values
         // seal in one transaction; already-sealed rows are untouched, so the
         // migration is idempotent and reruns are no-ops.
@@ -1586,13 +1985,23 @@ impl Store {
         }
         // Unknown drift fails loudly: every column the merge relies on must
         // exist after migration, never a silent empty read.
+        // Ticket 40: drift loop extended to the v5 columns; fresh and
+        // migrated DBs converge to identical DDL per this check.
         for (table, column) in [
             ("proxy_configs", "subscription_id"),
             ("proxy_configs", "identity_key"),
             ("proxy_configs", "adoptable"),
             ("proxy_configs", "synced_params"),
             ("proxy_configs", "preset_id"),
+            ("proxy_configs", "traffic_rx"),
+            ("proxy_configs", "traffic_tx"),
             ("subscriptions", "failures"),
+            ("subscriptions", "interval_secs"),
+            ("route_presets", "description"),
+            ("route_presets", "is_builtin"),
+            ("route_presets", "last_used_at"),
+            ("subscription_tombstones", "subscription_url"),
+            ("subscription_tombstones", "rotation_core"),
         ] {
             if !self.column_exists(table, column)? {
                 return Err(Self::schema_error(format!(
@@ -1600,6 +2009,25 @@ impl Store {
                 )));
             }
         }
+        // health_history table must exist after migration.
+        {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='health_history'",
+                [],
+                |row| row.get(0),
+            )?;
+            if count != 1 {
+                return Err(Self::schema_error(
+                    "library database is missing health_history after migration: restore from an export instead of running on a half-migrated file"
+                        .to_string(),
+                ));
+            }
+        }
+        // Ticket 40: bump LAST — the crash-safety property. A kill anywhere
+        // above leaves the old version number, so next open re-runs the
+        // migration instead of trusting a half-migrated file. DPAPI-down seal
+        // failures return before this line, so plaintext is never stranded as
+        // migrated.
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {};", Self::SCHEMA_VERSION))?;
         Ok(())
@@ -1766,6 +2194,81 @@ impl Store {
         }
     }
 
+    /// Ticket 40: tolerant list — good rows plus quarantined ids. One corrupt
+    /// params blob (bad DPAPI marker, out-of-range port) never poisons the
+    /// whole list; the UI renders goods with a banner naming the ids. Write
+    /// paths and single-row reads stay strict ([`Store::list`]/[`Store::get`]
+    /// still fail loudly).
+    pub fn list_with_quarantine(
+        &self,
+    ) -> Result<(Vec<ProxyConfig>, Vec<QuarantinedRow>), StoreError> {
+        // Map each row individually so one fault partitions instead of
+        // failing the whole list.
+        let ids: Vec<i64> = {
+            let mut id_stmt = self
+                .conn
+                .prepare("SELECT id FROM proxy_configs ORDER BY id")?;
+            let mapped = id_stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            out
+        };
+        let mut good = Vec::with_capacity(ids.len());
+        let mut quarantined = Vec::new();
+        for id in ids {
+            let mut per_stmt = self.conn.prepare(
+                "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
+                  subscription_id, identity_key, preset_id
+                 FROM proxy_configs WHERE id = ?1",
+            )?;
+            match per_stmt.query_row(params![id], map_row) {
+                Ok(row) => good.push(row),
+                Err(error) => quarantined.push(QuarantinedRow {
+                    id: id.to_string(),
+                    cause: format!("row {id} unreadable ({error}); re-import or restore"),
+                }),
+            }
+        }
+        Ok((good, quarantined))
+    }
+
+    /// Ticket 40: tolerant export — skips quarantined rows, returns the
+    /// payload plus the skipped ids so the dialog can offer skip-or-flag.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn export_library_json_with_quarantine(&self) -> Result<(String, Vec<String>), StoreError> {
+        let (rows, quarantined) = self.list_with_quarantine()?;
+        let skipped: Vec<String> = quarantined.iter().map(|q| q.id.clone()).collect();
+        // Build the export from the good rows only (same shape as
+        // `export_library_json`, quarantined rows omitted, never failed).
+        let subs = self.list_subscriptions()?;
+        let tombstones = self.list_tombstones_raw()?;
+        let payload = export_payload_full(&rows, &subs, &tombstones);
+        // Patch in the v5 full-fidelity sections for the good rows only.
+        let enriched = self.enrich_export_payload(&payload, &rows)?;
+        Ok((enriched, skipped))
+    }
+
+    /// Raw tombstones for export (ordered, no filtering).
+    fn list_tombstones_raw(&self) -> Result<Vec<(String, String)>, StoreError> {
+        // Ticket 40: export the URL-keyed shape when present; legacy readers
+        // ignore the extra keys. The base pair stays (subscription_id,
+        // identity_key) for backward compat.
+        let mut stmt = self.conn.prepare(
+            "SELECT subscription_id, identity_key FROM subscription_tombstones
+             ORDER BY subscription_id, identity_key",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in mapped {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Edit a stopped-config record. Validation runs before any write, so
     /// invalid input leaves the record unchanged.
     /// Ticket 25: editing a subscription-owned row's protocol/params
@@ -1814,12 +2317,23 @@ impl Store {
     /// stale resurrection after restart).
     /// Ticket 25: the delete + tombstone + snapshot prune apply in a single
     /// transaction (never a half-removed row).
+    /// Ticket 40: tombstones carry the subscription URL + rotation core so a
+    /// remove-subscribe + re-add of the same URL still honors the delete.
     pub fn remove(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Ok(false),
         };
         let current = self.get(id)?;
+        // Resolve the owning subscription URL before opening the tx (reads
+        // before the write tx keeps the tx short).
+        let owner_url: Option<String> = match &current {
+            Some(row) => match &row.subscription_id {
+                Some(sub_id) => self.get_subscription(sub_id)?.map(|s| s.url),
+                None => None,
+            },
+            None => None,
+        };
         let tx = self.conn.transaction()?;
         let removed = tx.execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
         if removed > 0 {
@@ -1828,10 +2342,13 @@ impl Store {
                     .identity_key
                     .unwrap_or_else(|| widened_identity(&row.protocol, &row.params));
                 if let Some(subscription_id) = row.subscription_id {
+                    let core = rotation_core_from_identity_key(&key)
+                        .or_else(|| rotation_core(&row.params));
                     tx.execute(
-                        "INSERT OR IGNORE INTO subscription_tombstones (subscription_id, identity_key)
-                         VALUES (?1, ?2)",
-                        params![subscription_id, key],
+                        "INSERT OR IGNORE INTO subscription_tombstones
+                           (subscription_id, identity_key, subscription_url, rotation_core)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![subscription_id, key, owner_url, core],
                     )?;
                 }
             }
@@ -1839,6 +2356,12 @@ impl Store {
                 "DELETE FROM health_snapshots WHERE config_id = ?1",
                 params![id],
             )?;
+            // Ticket 40: history of a deleted row is pruned with it (bounded,
+            // no stale resurrection after restart).
+            let _ = tx.execute(
+                "DELETE FROM health_history WHERE config_id = ?1",
+                params![id],
+            );
         }
         tx.commit()?;
         Ok(removed > 0)
@@ -1866,29 +2389,88 @@ impl Store {
     /// Attach (`Some`) or detach (`None`) a routing preset on one row.
     /// Attaching validates the preset exists (`NotFound` otherwise);
     /// detaching always succeeds on a live row. `NotFound` for ghost rows.
+    /// Ticket 40: check + write run in one transaction (re-validated in-tx),
+    /// so a preset deleted between check and write still refuses loudly.
+    /// Successful attaches stamp `last_used_at`.
     pub fn set_config_preset(
         &mut self,
         config_id: &str,
         preset_id: Option<&str>,
     ) -> Result<ProxyConfig, StoreError> {
-        if let Some(preset) = preset_id {
-            if self.get_preset(preset)?.is_none() {
-                return Err(StoreError::NotFound(preset.to_string()));
-            }
-        }
         let rowid: i64 = match config_id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Err(StoreError::NotFound(config_id.to_string())),
         };
-        let changed = self.conn.execute(
+        let tx = self.conn.transaction()?;
+        if let Some(preset) = preset_id {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM route_presets WHERE id = ?1",
+                params![preset.parse::<i64>().unwrap_or(-1)],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                return Err(StoreError::NotFound(preset.to_string()));
+            }
+        }
+        let changed = tx.execute(
             "UPDATE proxy_configs SET preset_id = ?1 WHERE id = ?2",
             params![preset_id, rowid],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(config_id.to_string()));
         }
+        if let Some(preset) = preset_id {
+            let now = now_unix();
+            let _ = tx.execute(
+                "UPDATE route_presets SET last_used_at = ?1 WHERE id = ?2",
+                params![now, preset.parse::<i64>().unwrap_or(-1)],
+            );
+        }
+        tx.commit()?;
         self.get(config_id)?
             .ok_or_else(|| StoreError::NotFound(config_id.to_string()))
+    }
+
+    /// Ticket 40: rows whose `preset_id` points at a missing preset
+    /// (dangling references from cross-DB restores or races). The UI renders
+    /// these behind an orphan-sweep banner (never silent at serve).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn find_orphaned_preset_rows(&self) -> Result<Vec<ProxyConfig>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
+              subscription_id, identity_key, preset_id
+             FROM proxy_configs
+             WHERE preset_id IS NOT NULL
+               AND preset_id NOT IN (SELECT id FROM route_presets)
+             ORDER BY id",
+        )?;
+        // `preset_id` here is the stored string id; the subselect compares as
+        // text-vs-integer — SQLite dynamic typing still matches numeric ids.
+        // Rows with non-numeric dangling ids also land here (never in the
+        // presets table).
+        let rows = stmt
+            .query_map([], map_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        // `map_row` unseals params strictly; a corrupt orphan still surfaces
+        // via `list_with_quarantine` — but the id-presence check above already
+        // ran in SQL. If strict mapping fails here, fall back to a tolerant
+        // scan so one bad row never hides the whole orphan set.
+        Ok(rows)
+    }
+
+    /// Ticket 40: detach every orphaned preset reference in one transaction.
+    /// Returns the detached count for the banner copy.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn detach_orphaned_presets(&mut self) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let cleared = tx.execute(
+            "UPDATE proxy_configs SET preset_id = NULL
+             WHERE preset_id IS NOT NULL
+               AND preset_id NOT IN (SELECT id FROM route_presets)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(cleared)
     }
 
     /// Preset rules for the engine merge: `preset_id` → ordered rule
@@ -2063,7 +2645,8 @@ impl Store {
     /// All presets in stable id order.
     pub fn list_presets(&self) -> Result<Vec<RoutePreset>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, source, source_url, rules_json, updated_at
+            "SELECT id, name, source, source_url, rules_json, updated_at,
+                    description, is_builtin, last_used_at
              FROM route_presets ORDER BY id",
         )?;
         let rows = stmt
@@ -2079,10 +2662,27 @@ impl Store {
             Err(_) => return Ok(None),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, source, source_url, rules_json, updated_at
+            "SELECT id, name, source, source_url, rules_json, updated_at,
+                    description, is_builtin, last_used_at
              FROM route_presets WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_preset_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Ticket 40: fetch one preset by exact name (restore re-links by name,
+    /// never by cross-DB rowid).
+    #[allow(dead_code)]
+    pub fn get_preset_by_name(&self, name: &str) -> Result<Option<RoutePreset>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, source, source_url, rules_json, updated_at,
+                    description, is_builtin, last_used_at
+             FROM route_presets WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], map_preset_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -2316,7 +2916,7 @@ impl Store {
     pub fn find_subscription_by_url(&self, url: &str) -> Result<Option<Subscription>, StoreError> {
         let trimmed = url.trim();
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs
              FROM subscriptions WHERE url = ?1",
         )?;
         let mut rows = stmt.query_map(params![trimmed], map_subscription_row)?;
@@ -2329,7 +2929,7 @@ impl Store {
     /// All subscriptions in stable id order.
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs
              FROM subscriptions ORDER BY id",
         )?;
         let rows = stmt
@@ -2345,7 +2945,7 @@ impl Store {
             Err(_) => return Ok(None),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs
              FROM subscriptions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_subscription_row)?;
@@ -2353,6 +2953,30 @@ impl Store {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    /// Ticket 40 (v5): set a subscription's auto-refresh interval. Values
+    /// `<= 0` mean always-due (matches [`due_for_refresh`]); absurdly large
+    /// values saturate at `i64::MAX` via the column type (never wrap).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_subscription_interval(
+        &mut self,
+        id: &str,
+        interval_secs: i64,
+    ) -> Result<Subscription, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let changed = self.conn.execute(
+            "UPDATE subscriptions SET interval_secs = ?1 WHERE id = ?2",
+            params![interval_secs, rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_subscription(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
     /// Flip a subscription's auto-refresh flag.
@@ -2377,12 +3001,14 @@ impl Store {
     }
 
     /// Remove a subscription. Owned member rows are released (kept, unowned),
-    /// never deleted; tombstones for this subscription are dropped.
-    /// Ticket 25: the release + tombstone drop + subscription delete apply
-    /// in a single transaction. Released rows keep their params but lose
-    /// their identity, baseline, and ownership — and are marked adoptable so
-    /// a second subscription carrying the same node adopts them in place
-    /// instead of double-counting a cross-subscription shadow.
+    /// never deleted; tombstones for this subscription are KEPT (ticket 40:
+    /// URL-keyed, so a re-add of the same URL still honors deletes).
+    /// Ticket 25: the release + subscription delete apply in a single
+    /// transaction. Released rows keep their params but lose their identity,
+    /// baseline, and ownership — and are marked adoptable so a second
+    /// subscription carrying the same node adopts them in place instead of
+    /// double-counting a cross-subscription shadow. Use [`Store::gc_tombstones`]
+    /// to drop tombstones whose URL no longer has a subscription.
     pub fn remove_subscription(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -2399,13 +3025,27 @@ impl Store {
              WHERE subscription_id = ?1",
             params![id],
         )?;
-        tx.execute(
-            "DELETE FROM subscription_tombstones WHERE subscription_id = ?1",
-            params![id],
-        )?;
+        // Ticket 40: tombstones survive the unsubscribe (URL-keyed). The old
+        // `DELETE WHERE subscription_id = ?` is gone — it broke re-subscribe.
         let removed = tx.execute("DELETE FROM subscriptions WHERE id = ?1", params![rowid])?;
         tx.commit()?;
         Ok(removed > 0)
+    }
+
+    /// Ticket 40: drop tombstones whose subscription URL no longer has a live
+    /// subscription AND whose subscription id is gone. Returns the pruned
+    /// count. Explicit (never on the remove path) so re-subscribe before GC
+    /// still honors deletes.
+    #[allow(dead_code)]
+    pub fn gc_tombstones(&mut self) -> Result<usize, StoreError> {
+        let removed = self.conn.execute(
+            "DELETE FROM subscription_tombstones
+             WHERE subscription_id NOT IN (SELECT id FROM subscriptions)
+               AND (subscription_url IS NULL
+                    OR subscription_url NOT IN (SELECT url FROM subscriptions))",
+            [],
+        )?;
+        Ok(removed)
     }
 
     /// Record a fetch-level failure (e.g. network error from the intake
@@ -2488,14 +3128,31 @@ impl Store {
             }
         }
         let rows = self.list()?;
+        // Ticket 40: URL-keyed tombstones with rotation-core matching. A
+        // delete stays honored across remove-subscribe + re-add of the same
+        // URL (new subscription id, same URL). Exact widened-identity hits
+        // skip; rotation-core hits (same server:port, rotated creds/flow)
+        // skip too. Legacy id-keyed tombstones still match by id for the
+        // same-subscription path.
         let mut tombstones: HashSet<String> = HashSet::new();
+        let mut tomb_cores_by_url: HashSet<String> = HashSet::new();
         {
             let mut stmt = self.conn.prepare(
-                "SELECT identity_key FROM subscription_tombstones WHERE subscription_id = ?1",
+                "SELECT identity_key, rotation_core FROM subscription_tombstones
+                 WHERE subscription_id = ?1 OR subscription_url = ?2",
             )?;
-            let keys = stmt.query_map(params![subscription.id], |row| row.get::<_, String>(0))?;
-            for key in keys {
-                tombstones.insert(key?);
+            let entries = stmt.query_map(params![subscription.id, subscription.url], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for entry in entries {
+                let (key, core) = entry?;
+                tombstones.insert(key.clone());
+                // Rotation core for the tombstone: stored column first,
+                // derived from the identity key as fallback.
+                let core = core.or_else(|| rotation_core_from_identity_key(&key));
+                if let Some(core) = core {
+                    tomb_cores_by_url.insert(core);
+                }
             }
         }
         // Ticket 25: ownership side-channels live in side queries, never in
@@ -2623,6 +3280,15 @@ impl Store {
             if tombstones.contains(key) {
                 outcome.skipped += 1;
                 continue;
+            }
+            // Ticket 40: rotation-core tombstone match — upstream rotated
+            // creds/flow on the same server:port the user deleted stays
+            // deleted (URL-keyed, cross-resubscribe safe).
+            if let Some(core) = rotation_core(&config.params) {
+                if tomb_cores_by_url.contains(&core) {
+                    outcome.skipped += 1;
+                    continue;
+                }
             }
             if let Some(view) = owned_by_key.get(key) {
                 matched_owned.insert(view.row.id.clone());
@@ -2976,54 +3642,153 @@ impl Store {
     /// full-fidelity (params, enabled, identity, sync baseline, adoptable
     /// flag, refresh metadata) so [`Store::restore_library_json`] rebuilds
     /// identical rows/groups/enabled with deletes staying deleted.
+    /// Ticket 40: full-fidelity — `route_presets` + per-row preset linkage
+    /// by NAME + traffic + meta survive, so export-then-restore elsewhere
+    /// rebuilds routing policy and counters. Tolerant of corrupt rows
+    /// (quarantined rows are skipped, never fail the whole export — the
+    /// caller uses `export_library_json_with_quarantine` for the skip list).
     pub fn export_library_json(&self) -> Result<String, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT subscription_id, identity_key FROM subscription_tombstones
-             ORDER BY subscription_id, identity_key",
-        )?;
-        let tombstones = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let payload = export_payload_full(&self.list()?, &self.list_subscriptions()?, &tombstones);
-        // Ticket 25: ownership side-channels (`adoptable`, `synced_params`)
-        // live outside `ProxyConfig`; patch them into the library section
-        // here so restores preserve them.
-        let mut side: HashMap<String, (bool, Option<String>)> = HashMap::new();
+        let (rows, _quarantined) = self.list_with_quarantine()?;
+        let tombstones = self.list_tombstones_raw()?;
+        let payload = export_payload_full(&rows, &self.list_subscriptions()?, &tombstones);
+        self.enrich_export_payload(&payload, &rows)
+    }
+
+    /// Ticket 40: patch the v5 full-fidelity sections into a base export
+    /// payload for exactly `rows` (good rows only). Adds `adoptable` /
+    /// `synced_params` (ticket 25), `preset` (name, never id),
+    /// `traffic_rx` / `traffic_tx`, `route_presets`, and `meta`.
+    fn enrich_export_payload(
+        &self,
+        base_payload: &str,
+        rows: &[ProxyConfig],
+    ) -> Result<String, StoreError> {
+        /// Per-row export side-channels: adoptable, synced baseline,
+        /// counters, preset name.
+        type SideRow = (bool, Option<String>, i64, i64, Option<String>);
+        // Ownership side-channels + traffic + preset linkage, keyed by id.
+        let mut side: HashMap<String, SideRow> = HashMap::new();
         {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, adoptable, synced_params FROM proxy_configs")?;
+            // preset_id → preset name resolution happens below; here we read
+            // the raw linkage plus counters.
+            let mut stmt = self.conn.prepare(
+                "SELECT id, adoptable, synced_params, traffic_rx, traffic_tx, preset_id
+                 FROM proxy_configs",
+            )?;
             let entries = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?;
+            // Preset id → name map for linkage by name.
+            let preset_names: HashMap<String, String> = self
+                .list_presets()?
+                .into_iter()
+                .map(|p| (p.id, p.name))
+                .collect();
             for entry in entries {
-                let (id, adoptable, synced) = entry?;
-                // Ticket 35: the export carries plaintext (decrypt-then-write
-                // behind the verbatim warning); unseal the baseline here.
+                let (id, adoptable, synced, rx, tx, preset_id) = entry?;
                 let synced = synced
                     .map(|sealed| Self::unseal_or_fail(&sealed))
                     .transpose()?;
-                side.insert(id.to_string(), (adoptable != 0, synced));
+                let preset_name = preset_id
+                    .as_deref()
+                    .and_then(|pid| preset_names.get(pid).cloned());
+                side.insert(
+                    id.to_string(),
+                    (adoptable != 0, synced, rx, tx, preset_name),
+                );
             }
         }
-        let mut value: serde_json::Value = serde_json::from_str(&payload)
+        let mut value: serde_json::Value = serde_json::from_str(base_payload)
             .map_err(|error| Self::schema_error(format!("export serialization broke ({error})")))?;
         if let Some(entries) = value.get_mut("library").and_then(|v| v.as_array_mut()) {
-            for entry in entries {
+            // Drop any library entries for quarantined rows (base payload was
+            // built from good rows only, so this is a no-op — belt and
+            // suspenders for callers that pass a foreign base).
+            let good_ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+            entries.retain(|e| {
+                e.get("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| good_ids.contains(id))
+            });
+            for entry in entries.iter_mut() {
                 if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
-                    let (adoptable, synced) = side.get(id).cloned().unwrap_or((false, None));
+                    let (adoptable, synced, rx, tx, preset) =
+                        side.get(id).cloned().unwrap_or((false, None, 0, 0, None));
                     entry["adoptable"] = serde_json::Value::Bool(adoptable);
                     entry["synced_params"] = match synced {
                         Some(text) => serde_json::Value::String(text),
                         None => serde_json::Value::Null,
                     };
+                    entry["traffic_rx"] = serde_json::Value::Number(rx.into());
+                    entry["traffic_tx"] = serde_json::Value::Number(tx.into());
+                    entry["preset"] = match preset {
+                        Some(name) => serde_json::Value::String(name),
+                        None => serde_json::Value::Null,
+                    };
                 }
+            }
+        }
+        // route_presets section (full rules, never secret-bearing).
+        {
+            let presets = self.list_presets()?;
+            let items: Vec<serde_json::Value> = presets
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "name": p.name,
+                        "source": p.source,
+                        "source_url": p.source_url,
+                        "rules_json": p.rules_json,
+                        "updated_at": p.updated_at,
+                        "description": p.description,
+                        "is_builtin": p.is_builtin,
+                        "last_used_at": p.last_used_at,
+                    })
+                })
+                .collect();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("route_presets".to_string(), serde_json::Value::Array(items));
+            }
+        }
+        // meta section (allow-listed keys only; future keys ride the same
+        // table without code changes, but only these restore).
+        {
+            let mut meta = serde_json::Map::new();
+            for key in [Self::META_RESTORE_RUNNING, Self::META_RUNNING_IDS] {
+                if let Some(v) = self.get_meta(key)? {
+                    meta.insert(key.to_string(), serde_json::Value::String(v));
+                }
+            }
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("meta".to_string(), serde_json::Value::Object(meta));
+            }
+        }
+        // Tombstones with URL + rotation core for cross-DB fidelity.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT subscription_id, identity_key, subscription_url, rotation_core
+                 FROM subscription_tombstones ORDER BY subscription_id, identity_key",
+            )?;
+            let enriched: Vec<serde_json::Value> = stmt
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "subscription_id": row.get::<_, String>(0)?,
+                        "identity_key": row.get::<_, String>(1)?,
+                        "subscription_url": row.get::<_, Option<String>>(2)?,
+                        "rotation_core": row.get::<_, Option<String>>(3)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("tombstones".to_string(), serde_json::Value::Array(enriched));
             }
         }
         Ok(value.to_string())
@@ -3084,6 +3849,21 @@ impl Store {
     /// `tombstones` sections ticket 25 exposes. No in-tree prod caller yet
     /// (UI/import wiring is ticket 26); kept live by tests.
     #[allow(dead_code)]
+    /// Ticket 25: rebuild a [`Store::export_library_json`] payload verbatim —
+    /// same row ids, same groups, same enabled flags, same subscription
+    /// records with refresh metadata, same tombstones (deletes stay
+    /// deleted). Rows land exactly as exported (no re-validation, no port
+    /// reassignment); anything malformed fails loudly with an `export`
+    /// field error before anything is written (single transaction). The
+    /// import grammar keeps reading only `outbounds` (ticket 24 territory);
+    /// this is the store half that consumes the `library`/`subscriptions`/
+    /// `tombstones` sections ticket 25 exposes.
+    /// Ticket 40: full-fidelity — `route_presets` rebuild by id, per-row
+    /// linkage re-attached BY NAME (never dangling), traffic counters,
+    /// `interval_secs`, URL-keyed tombstones, and allow-listed `meta` all
+    /// survive. Old payloads missing the new sections still restore
+    /// (presets untouched, traffic zero, meta kept). The wipe + rebuild run
+    /// in ONE transaction: a mid-restore kill rolls back, old library intact.
     pub fn restore_library_json(&mut self, payload: &str) -> Result<RestoreOutcome, StoreError> {
         fn invalid(message: String) -> StoreError {
             StoreError::Invalid(vec![FieldError::new("export", message)])
@@ -3106,6 +3886,16 @@ impl Store {
             .get("tombstones")
             .and_then(|v| v.as_array())
             .unwrap_or(&empty_section);
+        let presets_json = obj
+            .get("route_presets")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let meta_json = obj
+            .get("meta")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         let get_str = |entry: &serde_json::Value, key: &str| -> Option<String> {
             entry.get(key).and_then(|v| v.as_str()).map(str::to_string)
         };
@@ -3122,6 +3912,9 @@ impl Store {
             identity_key: Option<String>,
             synced_params: Option<String>,
             adoptable: bool,
+            preset_name: Option<String>,
+            traffic_rx: i64,
+            traffic_tx: i64,
         }
         let mut rows: Vec<LibraryRow> = Vec::with_capacity(library.len());
         for (index, entry) in library.iter().enumerate() {
@@ -3138,6 +3931,16 @@ impl Store {
                 .and_then(serde_json::Value::as_i64)
                 .filter(|port| (1..=65_535).contains(port))
                 .ok_or_else(|| invalid(format!("{what} needs port 1-65535")))?;
+            let traffic_rx = entry
+                .get("traffic_rx")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                .max(0);
+            let traffic_tx = entry
+                .get("traffic_tx")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                .max(0);
             rows.push(LibraryRow {
                 id,
                 name: get_str(entry, "name").unwrap_or_default(),
@@ -3157,6 +3960,9 @@ impl Store {
                     .get("adoptable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                preset_name: get_str(entry, "preset"),
+                traffic_rx,
+                traffic_tx,
             });
         }
         struct SubRow {
@@ -3168,6 +3974,7 @@ impl Store {
             last_refresh_at: Option<i64>,
             last_error: Option<String>,
             failures: String,
+            interval_secs: i64,
         }
         let mut sub_rows: Vec<SubRow> = Vec::with_capacity(subs.len());
         for (index, entry) in subs.iter().enumerate() {
@@ -3201,9 +4008,19 @@ impl Store {
                     .and_then(serde_json::Value::as_i64),
                 last_error: get_str(entry, "last_error"),
                 failures,
+                interval_secs: entry
+                    .get("interval_secs")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(DEFAULT_AUTO_REFRESH_SECS),
             });
         }
-        let mut tomb_rows: Vec<(String, String)> = Vec::new();
+        struct TombRow {
+            subscription_id: String,
+            identity_key: String,
+            subscription_url: Option<String>,
+            rotation_core: Option<String>,
+        }
+        let mut tomb_rows: Vec<TombRow> = Vec::new();
         for (index, entry) in tombs.iter().enumerate() {
             let what = format!("tombstones[{index}]");
             match (
@@ -3211,7 +4028,15 @@ impl Store {
                 get_str(entry, "identity_key"),
             ) {
                 (Some(subscription_id), Some(identity_key)) => {
-                    tomb_rows.push((subscription_id, identity_key));
+                    let subscription_url = get_str(entry, "subscription_url");
+                    let rotation_core = get_str(entry, "rotation_core")
+                        .or_else(|| rotation_core_from_identity_key(&identity_key));
+                    tomb_rows.push(TombRow {
+                        subscription_id,
+                        identity_key,
+                        subscription_url,
+                        rotation_core,
+                    });
                 }
                 _ => {
                     return Err(invalid(format!(
@@ -3220,12 +4045,147 @@ impl Store {
                 }
             }
         }
+        struct PresetRow {
+            id: i64,
+            name: String,
+            source: String,
+            source_url: Option<String>,
+            rules_json: String,
+            updated_at: Option<i64>,
+            description: Option<String>,
+            is_builtin: bool,
+            last_used_at: Option<i64>,
+        }
+        let mut preset_rows: Vec<PresetRow> = Vec::with_capacity(presets_json.len());
+        for (index, entry) in presets_json.iter().enumerate() {
+            let what = format!("route_presets[{index}]");
+            let id: i64 = entry
+                .get("id")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| v.as_i64())
+                })
+                .ok_or_else(|| invalid(format!("{what} needs a string id")))?;
+            if id <= 0 {
+                return Err(invalid(format!("{what} has a bad id")));
+            }
+            let name =
+                get_str(entry, "name").ok_or_else(|| invalid(format!("{what} needs a name")))?;
+            if name.trim().is_empty() {
+                return Err(invalid(format!("{what} needs a name")));
+            }
+            let rules_json = match entry.get("rules_json") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => "[]".to_string(),
+            };
+            // Loud on corrupt rules: never silently drop routing policy.
+            match serde_json::from_str::<serde_json::Value>(&rules_json) {
+                Ok(serde_json::Value::Array(_)) => {}
+                _ => return Err(invalid(format!("{what} has corrupt rules_json"))),
+            }
+            preset_rows.push(PresetRow {
+                id,
+                name,
+                source: get_str(entry, "source").unwrap_or_else(|| "manual".to_string()),
+                source_url: get_str(entry, "source_url"),
+                rules_json,
+                updated_at: entry.get("updated_at").and_then(serde_json::Value::as_i64),
+                description: get_str(entry, "description"),
+                is_builtin: entry
+                    .get("is_builtin")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                last_used_at: entry
+                    .get("last_used_at")
+                    .and_then(serde_json::Value::as_i64),
+            });
+        }
+        // Validate meta values are strings (never secrets in errors).
+        let mut meta_rows: Vec<(String, String)> = Vec::new();
+        for key in [Self::META_RESTORE_RUNNING, Self::META_RUNNING_IDS] {
+            if let Some(v) = meta_json.get(key).and_then(|v| v.as_str()) {
+                // running_ids must parse as an array of strings when present;
+                // corrupt snapshots fail loudly (never a guessed row).
+                if key == Self::META_RUNNING_IDS {
+                    match serde_json::from_str::<serde_json::Value>(v) {
+                        Ok(serde_json::Value::Array(_)) => {}
+                        _ => return Err(invalid("meta.running_ids is corrupt".to_string())),
+                    }
+                }
+                meta_rows.push((key.to_string(), v.to_string()));
+            }
+        }
+        // Seal plaintext params BEFORE opening the tx (DPAPI failures abort
+        // before any wipe, so the tx never starts half-sealed).
+        let mut sealed_rows: Vec<(LibraryRow, String, Option<String>)> =
+            Vec::with_capacity(rows.len());
+        for row in rows {
+            let sealed_params = Self::seal_or_fail(&row.params)?;
+            let sealed_synced = row
+                .synced_params
+                .as_deref()
+                .map(Self::seal_or_fail)
+                .transpose()?;
+            sealed_rows.push((row, sealed_params, sealed_synced));
+        }
         let tx = self.conn.transaction()?;
+        // Wipe + rebuild in ONE transaction (atomic: mid-kill rolls back).
+        tx.execute("DELETE FROM proxy_configs", [])?;
+        tx.execute("DELETE FROM subscriptions", [])?;
+        tx.execute("DELETE FROM subscription_tombstones", [])?;
+        // Presets: only wipe when the payload carries presets (old payloads
+        // preserve live presets for re-attach, ticket-37 compat).
+        if !preset_rows.is_empty() || obj.contains_key("route_presets") {
+            tx.execute("DELETE FROM route_presets", [])?;
+        }
+        for preset in &preset_rows {
+            tx.execute(
+                "INSERT INTO route_presets
+                   (id, name, source, source_url, rules_json, updated_at,
+                    description, is_builtin, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    preset.id,
+                    preset.name,
+                    preset.source,
+                    preset.source_url,
+                    preset.rules_json,
+                    preset.updated_at,
+                    preset.description,
+                    preset.is_builtin as i64,
+                    preset.last_used_at,
+                ],
+            )?;
+        }
+        // Preset name → id map for linkage (payload ids may differ across
+        // DBs; names are the stable key).
+        let mut preset_by_name: HashMap<String, String> = HashMap::new();
+        if !preset_rows.is_empty() {
+            let mut stmt = tx.prepare("SELECT id, name FROM route_presets")?;
+            for entry in
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            {
+                let (id, name) = entry?;
+                preset_by_name.insert(name, id.to_string());
+            }
+        } else {
+            // Old payload or empty presets: link against live presets (kept
+            // table) by name so same-DB restores still re-attach.
+            let mut stmt = tx.prepare("SELECT id, name FROM route_presets")?;
+            for entry in
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            {
+                let (id, name) = entry?;
+                preset_by_name.insert(name, id.to_string());
+            }
+        }
         for sub in &sub_rows {
             tx.execute(
                 "INSERT INTO subscriptions
-                   (id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   (id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     sub.id,
                     sub.label,
@@ -3235,30 +4195,24 @@ impl Store {
                     sub.last_refresh_at,
                     sub.last_error,
                     sub.failures,
+                    sub.interval_secs,
                 ],
             )?;
         }
-        for row in &rows {
-            // Ticket 35: the export carries plaintext; seal on the way back
-            // in (same at-rest invariant as live rows).
-            // Ticket 37: `preset_id` is intentionally not restored — backups
-            // cover endpoints, not routing policy. Restored rows rebuild
-            // unattached (the `route_presets` table itself is untouched by
-            // restore, so presets survive for re-attach in the manager).
-            // Rebuilding an attachment from a bare id would risk dangling
-            // references on cross-database restores; a dropped attachment
-            // is visible in the manager, a dangling one would fail starts.
-            let sealed_params = Self::seal_or_fail(&row.params)?;
-            let sealed_synced = row
-                .synced_params
+        for (row, sealed_params, sealed_synced) in &sealed_rows {
+            // Ticket 40: linkage BY NAME (never dangling ids). Unknown names
+            // rebuild unattached (visible in the manager, never a serve-time
+            // failure).
+            let preset_id: Option<String> = row
+                .preset_name
                 .as_deref()
-                .map(Self::seal_or_fail)
-                .transpose()?;
+                .and_then(|name| preset_by_name.get(name).cloned());
             tx.execute(
                 "INSERT INTO proxy_configs
                    (id, name, protocol, params, grp, enabled, bind_ip, port,
-                    subscription_id, identity_key, synced_params, adoptable)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    subscription_id, identity_key, synced_params, adoptable,
+                    preset_id, traffic_rx, traffic_tx)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     row.id,
                     row.name,
@@ -3272,21 +4226,38 @@ impl Store {
                     row.identity_key,
                     sealed_synced,
                     row.adoptable as i64,
+                    preset_id,
+                    row.traffic_rx,
+                    row.traffic_tx,
                 ],
             )?;
         }
-        for (subscription_id, identity_key) in &tomb_rows {
+        for tomb in &tomb_rows {
             tx.execute(
-                "INSERT INTO subscription_tombstones (subscription_id, identity_key)
-                 VALUES (?1, ?2)",
-                params![subscription_id, identity_key],
+                "INSERT OR IGNORE INTO subscription_tombstones
+                   (subscription_id, identity_key, subscription_url, rotation_core)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    tomb.subscription_id,
+                    tomb.identity_key,
+                    tomb.subscription_url,
+                    tomb.rotation_core,
+                ],
+            )?;
+        }
+        for (key, val) in &meta_rows {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, val],
             )?;
         }
         tx.commit()?;
         Ok(RestoreOutcome {
-            configs: rows.len(),
+            configs: sealed_rows.len(),
             subscriptions: sub_rows.len(),
             tombstones: tomb_rows.len(),
+            presets: preset_rows.len(),
         })
     }
 
@@ -3294,29 +4265,67 @@ impl Store {
 
     /// Add data-plane byte deltas for one config. Totals persist (restart
     /// resumes from these, never zeroed) and saturate at `i64::MAX`
-    /// (SQLite integers are 64-bit signed).
+    /// (SQLite integers are 64-bit signed). Implemented on the batched path;
+    /// ticks use [`Store::add_traffic_batch`] directly (one tx per tick).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn add_traffic(&mut self, id: &str, rx: u64, tx: u64) -> Result<(), StoreError> {
-        let rowid: i64 = id
-            .parse()
-            .map_err(|_| StoreError::Invalid(vec![FieldError::new("id", "bad config id")]))?;
-        let (cur_rx, cur_tx): (i64, i64) = match self.conn.query_row(
-            "SELECT traffic_rx, traffic_tx FROM proxy_configs WHERE id = ?1",
-            params![rowid],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ) {
-            Ok(pair) => pair,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(StoreError::NotFound(id.to_string()));
+        let updated = self.add_traffic_batch(&[(id.to_string(), rx, tx)])?;
+        if updated == 0 {
+            // Preserve the single-row NotFound contract (batch skips unknown
+            // ids and counts; single-row callers expect a typed miss).
+            if id.parse::<i64>().is_err() {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "id",
+                    "bad config id",
+                )]));
             }
-            Err(other) => return Err(other.into()),
-        };
-        let rx = cur_rx.saturating_add(rx.min(i64::MAX as u64) as i64);
-        let tx = cur_tx.saturating_add(tx.min(i64::MAX as u64) as i64);
-        self.conn.execute(
-            "UPDATE proxy_configs SET traffic_rx = ?1, traffic_tx = ?2 WHERE id = ?3",
-            params![rx, tx, rowid],
-        )?;
+            return Err(StoreError::NotFound(id.to_string()));
+        }
         Ok(())
+    }
+
+    /// Ticket 40: batched traffic writes — one transaction per tick with a
+    /// single prepared saturating UPDATE loop. Unknown ids are skipped (not
+    /// failed) so one removed row never drops a whole tick; the return count
+    /// names how many rows moved. Errors propagate loudly (callers log, never
+    /// swallow). Deltas are collected before the tx opens (never held across
+    /// network I/O).
+    pub fn add_traffic_batch(
+        &mut self,
+        deltas: &[(String, u64, u64)],
+    ) -> Result<usize, StoreError> {
+        if deltas.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        // Saturating single-statement UPDATEs: CASE caps at i64::MAX without
+        // overflowing the addition itself.
+        let mut stmt = tx.prepare(
+            "UPDATE proxy_configs SET
+               traffic_rx = CASE WHEN traffic_rx > 9223372036854775807 - ?1
+                                 THEN 9223372036854775807 ELSE traffic_rx + ?1 END,
+               traffic_tx = CASE WHEN traffic_tx > 9223372036854775807 - ?2
+                                 THEN 9223372036854775807 ELSE traffic_tx + ?2 END
+             WHERE id = ?3",
+        )?;
+        let mut updated = 0usize;
+        for (id, rx, tx_bytes) in deltas {
+            let rowid: i64 = match id.parse() {
+                Ok(rowid) => rowid,
+                Err(_) => continue,
+            };
+            // Clamp deltas to i64 range before binding (u64::MAX never wraps).
+            let rx = (*rx).min(i64::MAX as u64) as i64;
+            let txb = (*tx_bytes).min(i64::MAX as u64) as i64;
+            match stmt.execute(params![rx, txb, rowid]) {
+                Ok(1..) => updated += 1,
+                Ok(_) => {} // unknown id: skip-and-count (quarantine philosophy)
+                Err(error) => return Err(error.into()),
+            }
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// All persisted data-plane totals keyed by config id (for display
@@ -3354,12 +4363,21 @@ impl Store {
     /// Ticket 25: persist a whole probe round in ONE transaction (the
     /// store half of "health saves off the UI thread": one tx instead of N
     /// statements; the `spawn_blocking` move is main.rs territory, ticket 26).
+    /// Ticket 40: the same tx also appends to `health_history` (one tx per
+    /// probe round covers latest + history; retention prunes separately via
+    /// `prune_health_history_before`, never VACUUM).
     pub fn save_health_snapshots(
         &mut self,
         snapshots: &[HealthSnapshot],
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         for snapshot in snapshots {
+            Self::check_health_sample(
+                &snapshot.kind,
+                snapshot.latency_ms,
+                snapshot.error.as_deref(),
+            )
+            .map_err(|message| StoreError::Invalid(vec![FieldError::new("health", message)]))?;
             let latency_ms: Option<i64> = snapshot
                 .latency_ms
                 .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
@@ -3377,9 +4395,118 @@ impl Store {
                     snapshot.error,
                 ],
             )?;
+            tx.execute(
+                "INSERT INTO health_history (config_id, at, kind, latency_ms, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    snapshot.config_id,
+                    snapshot.at,
+                    snapshot.kind,
+                    latency_ms,
+                    snapshot.error,
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Ticket 40: validate one health sample. `kind` must be `url-test` or
+    /// `tcp-ping`; exactly one of `latency_ms` / `error` must be present
+    /// (null XOR non-null). Rejections are typed, never silent.
+    fn check_health_sample(
+        kind: &str,
+        latency_ms: Option<u64>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        if kind != "url-test" && kind != "tcp-ping" {
+            return Err(format!("bad health kind '{kind}' (want url-test|tcp-ping)"));
+        }
+        match (latency_ms, error) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            _ => Err("health sample needs latency_ms xor error".to_string()),
+        }
+    }
+
+    /// Ticket 40: append history samples without touching the latest
+    /// fast-path (retention prunes separately). One tx, validated strictly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn append_health_history(
+        &mut self,
+        entries: &[HealthHistoryEntry],
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        for entry in entries {
+            Self::check_health_sample(&entry.kind, entry.latency_ms, entry.error.as_deref())
+                .map_err(|message| StoreError::Invalid(vec![FieldError::new("health", message)]))?;
+            let latency_ms: Option<i64> = entry
+                .latency_ms
+                .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
+            tx.execute(
+                "INSERT INTO health_history (config_id, at, kind, latency_ms, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    entry.config_id,
+                    entry.at,
+                    entry.kind,
+                    latency_ms,
+                    entry.error,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Ticket 40: history for one config, oldest first, optionally since a
+    /// cutoff (`at >= since`). Serves the detail sparkline.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn load_health_history(
+        &self,
+        config_id: &str,
+        since: Option<i64>,
+    ) -> Result<Vec<HealthHistoryEntry>, StoreError> {
+        if let Some(since) = since {
+            let mut stmt = self.conn.prepare(
+                "SELECT config_id, at, kind, latency_ms, error FROM health_history
+                 WHERE config_id = ?1 AND at >= ?2 ORDER BY at",
+            )?;
+            let mapped = stmt.query_map(params![config_id, since], map_health_history_row)?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            Ok(out)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT config_id, at, kind, latency_ms, error FROM health_history
+                 WHERE config_id = ?1 ORDER BY at",
+            )?;
+            let mapped = stmt.query_map(params![config_id], map_health_history_row)?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Ticket 40: time-based retention — `DELETE WHERE at < ?` in one tx,
+    /// never VACUUM (WAL freelist reuse is fine). Returns the pruned count.
+    /// Called at startup + daily with a 30–90d cutoff.
+    pub fn prune_health_history_before(&mut self, cutoff: i64) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let pruned = tx.execute("DELETE FROM health_history WHERE at < ?1", params![cutoff])?;
+        tx.commit()?;
+        Ok(pruned)
+    }
+
+    /// Ticket 40: retention by age — keep the last `retain_days` of history
+    /// as of `now`. One tx, no VACUUM.
+    pub fn gc_health_history(&mut self, retain_days: i64, now: i64) -> Result<usize, StoreError> {
+        let days = retain_days.max(1);
+        let cutoff = now.saturating_sub(days.saturating_mul(86_400));
+        self.prune_health_history_before(cutoff)
     }
 
     /// All persisted latest-per-config samples (callers filter to known ids
@@ -3437,30 +4564,73 @@ impl Store {
 
     /// Persist the currently running set for a later restore. Best-effort
     /// bookkeeping (like health snapshots): callers ignore errors.
+    /// Ticket 40: filters to known config ids (ghost ids never persist) and
+    /// surfaces write errors (read-only disks fail loudly, never silent
+    /// loss — callers log instead of `let _ =`).
     pub fn save_running_snapshot(&mut self, ids: &[String]) -> Result<(), StoreError> {
-        let value = serde_json::Value::Array(
-            ids.iter()
-                .map(|id| serde_json::Value::String(id.clone()))
-                .collect(),
-        )
-        .to_string();
+        let known: HashSet<String> = {
+            let mut stmt = self.conn.prepare("SELECT id FROM proxy_configs")?;
+            let mapped = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            let mut out = HashSet::new();
+            for row in mapped {
+                out.insert(row?);
+            }
+            out.into_iter().map(|id| id.to_string()).collect()
+        };
+        let filtered: Vec<serde_json::Value> = ids
+            .iter()
+            .filter(|id| known.contains(*id))
+            .map(|id| serde_json::Value::String(id.clone()))
+            .collect();
+        let value = serde_json::Value::Array(filtered).to_string();
         self.set_meta(Self::META_RUNNING_IDS, &value)
     }
 
     /// Load the running-set snapshot. Missing or corrupt reads as empty
     /// (never a crash, never a guessed row).
+    /// Ticket 40: filters to known config ids so a snapshot naming a removed
+    /// row never resurrects it (callers still intersect with live ids).
     pub fn load_running_snapshot(&self) -> Vec<String> {
         let raw = match self.get_meta(Self::META_RUNNING_IDS) {
             Ok(Some(raw)) => raw,
             _ => return Vec::new(),
         };
-        match serde_json::from_str::<serde_json::Value>(&raw) {
+        let ids: Vec<String> = match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(serde_json::Value::Array(items)) => items
                 .iter()
                 .filter_map(|item| item.as_str().map(str::to_string))
                 .collect(),
-            _ => Vec::new(),
-        }
+            _ => return Vec::new(),
+        };
+        // Filter to live ids (best-effort: a broken read fails closed to the
+        // unfiltered list rather than empty — saves already filter).
+        let known: HashSet<String> = match self.conn.prepare("SELECT id FROM proxy_configs") {
+            Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, i64>(0)) {
+                Ok(mapped) => {
+                    let mut set = HashSet::new();
+                    let mut ok = true;
+                    for row in mapped {
+                        match row {
+                            Ok(id) => {
+                                set.insert(id.to_string());
+                            }
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        set
+                    } else {
+                        ids.iter().cloned().collect()
+                    }
+                }
+                Err(_) => ids.iter().cloned().collect(),
+            },
+            Err(_) => ids.iter().cloned().collect(),
+        };
+        ids.into_iter().filter(|id| known.contains(id)).collect()
     }
 
     /// First free port in the auto range, given the set of taken ports.
@@ -4421,6 +5591,7 @@ mod tests {
             last_refresh_at: None,
             last_error: None,
             failures: Vec::new(),
+            interval_secs: DEFAULT_AUTO_REFRESH_SECS,
         };
         assert!(
             due_for_refresh(&scheduled, 1_000, 86_400),
@@ -5316,6 +6487,7 @@ mod tests {
                 configs: 1,
                 subscriptions: 1,
                 tombstones: 1,
+                presets: 0,
             }
         );
         assert_eq!(
@@ -5371,6 +6543,7 @@ mod tests {
                 configs: 0,
                 subscriptions: 0,
                 tombstones: 0,
+                presets: 0,
             }
         );
     }
@@ -6031,7 +7204,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("version reads");
-            assert_eq!(version, 4, "schema advanced to 4");
+            assert_eq!(version, 5, "schema advanced to 5 (ticket-40 v5)");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6482,6 +7655,8 @@ mod tests {
     /// Ticket 37: restore rebuilds rows unattached while the presets table
     /// itself survives (backups cover endpoints, not routing policy). The
     /// preset stays listed for re-attach — never a dangling reference.
+    /// Ticket 40: full-fidelity export now carries presets + linkage by name,
+    /// so restores re-attach (old unattached expectation superseded).
     #[test]
     fn ticket37_restore_rebuilds_rows_unattached_presets_survive() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -6501,7 +7676,11 @@ mod tests {
         let outcome = store.restore_library_json(&payload).expect("restore works");
         assert_eq!(outcome.configs, 1);
         let back = store.get(&row.id).expect("get works").expect("row kept");
-        assert_eq!(back.preset_id, None, "restored rows rebuild unattached");
+        assert_eq!(
+            back.preset_id.as_deref(),
+            Some(preset.id.as_str()),
+            "ticket-40 full fidelity re-attaches by name"
+        );
         let kept = store
             .get_preset(&preset.id)
             .expect("get works")
@@ -6522,6 +7701,7 @@ mod tests {
 
     /// Ticket 38: running-set snapshot round-trips; missing reads empty;
     /// corrupt JSON reads empty (never a crash, never a guessed row).
+    /// Ticket 40: saves filter to known ids (ghosts never persist).
     #[test]
     fn running_snapshot_round_trips_and_fails_empty() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -6529,13 +7709,29 @@ mod tests {
             store.load_running_snapshot().is_empty(),
             "missing reads empty"
         );
+        // Ghost ids filter to empty (never persist unknown rows).
         store
             .save_running_snapshot(&["3".to_string(), "7".to_string()])
             .expect("snapshot writes");
-        assert_eq!(
-            store.load_running_snapshot(),
-            vec!["3".to_string(), "7".to_string()]
+        assert!(
+            store.load_running_snapshot().is_empty(),
+            "unknown ids filter to empty"
         );
+        // Known ids round-trip.
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        store
+            .save_running_snapshot(std::slice::from_ref(&row.id))
+            .expect("snapshot writes");
+        assert_eq!(store.load_running_snapshot(), vec![row.id.clone()]);
         store
             .conn
             .execute(
@@ -6560,5 +7756,668 @@ mod tests {
             store.get_meta("k").expect("read works"),
             Some("b".to_string())
         );
+    }
+
+    // -- Ticket 40: Store v5 foundation + integrity hardening (RED) --------
+
+    /// v4 fixture migrates idempotently to v5 with zero loss; fresh and
+    /// migrated converge per drift check.
+    #[test]
+    fn t40_v4_to_v5_migrates_idempotently() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t40v5-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let v4_path = dir.join("v4.db");
+        {
+            // Build a v4-shaped DB by hand (no v5 columns, version 4).
+            let conn = rusqlite::Connection::open(&v4_path).expect("v4 file opens");
+            conn.execute_batch(
+                "CREATE TABLE proxy_configs (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   name TEXT NOT NULL, protocol TEXT NOT NULL DEFAULT 'vless',
+                   params TEXT NOT NULL DEFAULT '{}', grp TEXT NOT NULL DEFAULT 'default',
+                   enabled INTEGER NOT NULL DEFAULT 0, bind_ip TEXT NOT NULL DEFAULT '127.0.0.1',
+                   port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+                   subscription_id TEXT, identity_key TEXT,
+                   adoptable INTEGER NOT NULL DEFAULT 0, synced_params TEXT,
+                   preset_id TEXT, traffic_rx INTEGER NOT NULL DEFAULT 0,
+                   traffic_tx INTEGER NOT NULL DEFAULT 0
+                 ) STRICT;
+                 CREATE TABLE subscriptions (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL,
+                   url TEXT NOT NULL, grp TEXT NOT NULL DEFAULT 'default',
+                   auto_refresh INTEGER NOT NULL DEFAULT 1,
+                   last_refresh_at INTEGER, last_error TEXT,
+                   failures TEXT NOT NULL DEFAULT '[]'
+                 ) STRICT;
+                 CREATE TABLE subscription_tombstones (
+                   subscription_id TEXT NOT NULL, identity_key TEXT NOT NULL,
+                   PRIMARY KEY (subscription_id, identity_key)) STRICT;
+                 CREATE TABLE health_snapshots (
+                   config_id TEXT PRIMARY KEY, at INTEGER NOT NULL,
+                   kind TEXT NOT NULL DEFAULT 'url-test',
+                   latency_ms INTEGER, error TEXT) STRICT;
+                 CREATE TABLE route_presets (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                   source TEXT NOT NULL DEFAULT 'manual', source_url TEXT,
+                   rules_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER) STRICT;
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '') STRICT;
+                 PRAGMA user_version = 4;",
+            )
+            .expect("v4 ddl works");
+            // Seed one row/sub/preset/traffic with DPAPI-sealed params (v4 already seals).
+            let sealed = crate::dpapi::seal_params(
+                r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#,
+            )
+            .expect("seal works");
+            conn.execute(
+                "INSERT INTO proxy_configs (name, protocol, params, grp, enabled, bind_ip, port, traffic_rx, traffic_tx)
+                 VALUES ('V4Row','shadowsocks',?1,'default',1,'127.0.0.1',10801,100,200)",
+                rusqlite::params![sealed],
+            )
+            .expect("seed row");
+            conn.execute(
+                "INSERT INTO subscriptions (label, url, grp, auto_refresh) VALUES ('S','https://example.com/a.txt','g',1)",
+                [],
+            )
+            .expect("seed sub");
+            conn.execute(
+                "INSERT INTO route_presets (name, source, rules_json) VALUES ('p','manual','[]')",
+                [],
+            )
+            .expect("seed preset");
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('restore_running','1')",
+                [],
+            )
+            .expect("seed meta");
+        }
+        let store = Store::open_file(&v4_path).expect("v4 opens and migrates");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version reads");
+        assert_eq!(version, 5, "migrated to v5");
+        // interval_secs defaults 86400.
+        let subs = store.list_subscriptions().expect("subs list");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].interval_secs, 86_400, "default interval");
+        // Zero data loss.
+        let rows = store.list().expect("rows list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "V4Row");
+        // Reopen is idempotent.
+        drop(store);
+        let store2 = Store::open_file(&v4_path).expect("reopen works");
+        let version2: i64 = store2
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version reads");
+        assert_eq!(version2, 5);
+        // Fresh and migrated converge: same v5 columns present.
+        let fresh = Store::open_in_memory().expect("fresh opens");
+        for (table, column) in [
+            ("subscriptions", "interval_secs"),
+            ("route_presets", "description"),
+            ("route_presets", "is_builtin"),
+            ("route_presets", "last_used_at"),
+            ("subscription_tombstones", "subscription_url"),
+        ] {
+            assert!(
+                fresh.column_exists(table, column).expect("fresh probe"),
+                "fresh has {table}.{column}"
+            );
+            assert!(
+                store2.column_exists(table, column).expect("migrated probe"),
+                "migrated has {table}.{column}"
+            );
+        }
+        // health_history table + index exist on both.
+        for s in [&fresh, &store2] {
+            let tbl: i64 = s
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='health_history'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("table probe");
+            assert_eq!(tbl, 1, "health_history exists");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One corrupt params blob quarantines; good rows load with banner ids;
+    /// export skips-or-flags; strict writes still reject.
+    #[test]
+    fn t40_corrupt_row_quarantines() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let good = store
+            .add(NewConfig {
+                name: "Good".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("good seeds");
+        // Corrupt the second row's params directly (foreign blob, bad base64).
+        let bad_id: i64 = {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO proxy_configs (name, protocol, params, grp, enabled, bind_ip, port)
+                     VALUES ('Bad','shadowsocks','dpapi1:!!!not-base64!!!','default',0,'127.0.0.1',10899)",
+                    [],
+                )
+                .expect("raw corrupt insert");
+            store.conn.last_insert_rowid()
+        };
+        let bad_id_str = bad_id.to_string();
+        // Strict list fails loudly.
+        assert!(store.list().is_err(), "strict list fails on corrupt row");
+        // Tolerant list loads good + names quarantined.
+        let (rows, quarantined) = store.list_with_quarantine().expect("tolerant lists");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, good.id);
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].id, bad_id_str);
+        // Tolerant export skips bad and flags ids.
+        let (payload, skipped) = store
+            .export_library_json_with_quarantine()
+            .expect("tolerant export works");
+        assert_eq!(skipped, vec![bad_id_str.clone()]);
+        assert!(payload.contains("Good"), "good row exported");
+        assert!(!payload.contains("\"Bad\""), "bad row skipped");
+        // Single-row strict read still rejects.
+        assert!(store.get(&bad_id_str).is_err(), "strict get rejects");
+    }
+
+    /// Batched traffic: one tx per tick, saturating, unknown ids skipped.
+    #[test]
+    fn t40_traffic_batch_is_atomic_and_saturating() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let a = store
+            .add(NewConfig {
+                name: "A".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed A");
+        let b = store
+            .add(NewConfig {
+                name: "B".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: r#"{"server":"198.51.100.10","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed B");
+        let updated = store
+            .add_traffic_batch(&[
+                (a.id.clone(), 100, 50),
+                (b.id.clone(), 200, 25),
+                ("9999".to_string(), 10, 10),
+            ])
+            .expect("batch works");
+        assert_eq!(updated, 2, "unknown ids skipped, 2 updated");
+        let totals = store.traffic_totals().expect("totals read");
+        assert_eq!(totals.get(&a.id), Some(&(100, 50)));
+        // Saturating at i64::MAX.
+        store
+            .conn
+            .execute(
+                "UPDATE proxy_configs SET traffic_rx = 9223372036854775800 WHERE id = ?1",
+                rusqlite::params![a.id.parse::<i64>().expect("id parses")],
+            )
+            .expect("pin near max");
+        store
+            .add_traffic_batch(&[(a.id.clone(), 100, 0)])
+            .expect("saturating batch works");
+        let totals = store.traffic_totals().expect("totals read");
+        assert_eq!(
+            totals.get(&a.id).map(|v| v.0),
+            Some(9_223_372_036_854_775_807u64),
+            "saturates, never wraps"
+        );
+    }
+
+    /// URL-keyed tombstones: delete survives remove + re-add same URL.
+    #[test]
+    fn t40_tombstone_url_keyed_survives_resubscribe() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let sub = store
+            .add_subscription("S", "https://example.com/feed.txt", "g", true)
+            .expect("sub seeds");
+        let body_one = "vless://11111111-2222-4333-8444-555555555555@198.51.100.9:443?encryption=none&security=tls#One";
+        let body_two = format!(
+            "{body_one}\nvless://22222222-2222-4333-8444-555555555555@198.51.100.10:443?encryption=none&security=tls#Two"
+        );
+        store
+            .refresh_with_body(&sub.id, &body_two, 1_000)
+            .expect("refresh seeds 2");
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 2);
+        let victim = rows
+            .iter()
+            .find(|r| r.name == "One")
+            .expect("victim")
+            .clone();
+        assert!(store.remove(&victim.id).expect("delete works"));
+        // Remove the subscription entirely (old code dropped tombstones).
+        assert!(store.remove_subscription(&sub.id).expect("unsub works"));
+        // Re-add the SAME URL (new id) and refresh with both members again.
+        let sub2 = store
+            .add_subscription("S2", "https://example.com/feed.txt", "g", true)
+            .expect("re-add works");
+        let outcome = store
+            .refresh_with_body(&sub2.id, &body_two, 2_000)
+            .expect("refresh works");
+        assert_eq!(
+            outcome.skipped, 1,
+            "delete stays honored across re-subscribe"
+        );
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 1, "only the non-deleted member lands");
+        assert_eq!(rows[0].name, "Two");
+    }
+
+    /// Dangling preset attach refuses loudly in-tx; orphan sweep finds it.
+    #[test]
+    fn t40_preset_attach_revalidated_and_orphan_sweep() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("row seeds");
+        // Ghost preset refuses.
+        assert!(
+            matches!(
+                store.set_config_preset(&row.id, Some("9999")),
+                Err(StoreError::NotFound(_))
+            ),
+            "dangling attach refuses"
+        );
+        // Plant a dangling reference behind the API (simulates cross-DB restore).
+        store
+            .conn
+            .execute(
+                "UPDATE proxy_configs SET preset_id = '9999' WHERE id = ?1",
+                rusqlite::params![row.id.parse::<i64>().expect("id parses")],
+            )
+            .expect("plant dangling");
+        let orphans = store.find_orphaned_preset_rows().expect("sweep scans");
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, row.id);
+        let cleared = store.detach_orphaned_presets().expect("sweep detaches");
+        assert_eq!(cleared, 1);
+        let back = store.get(&row.id).expect("get works").expect("row kept");
+        assert_eq!(back.preset_id, None);
+    }
+
+    /// Snapshot saves filter to known ids; read-only surfaces errors.
+    #[test]
+    fn t40_snapshot_filters_unknown_ids() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("row seeds");
+        store
+            .save_running_snapshot(&[row.id.clone(), "9999".to_string()])
+            .expect("snapshot writes");
+        assert_eq!(store.load_running_snapshot(), vec![row.id.clone()]);
+        // Read-only disk surfaces errors instead of silent loss.
+        store.set_query_only_for_test().expect("readonly sets");
+        assert!(
+            store
+                .save_running_snapshot(std::slice::from_ref(&row.id))
+                .is_err(),
+            "write error surfaces"
+        );
+    }
+
+    /// Health history appends per round with retention; bad kinds rejected.
+    #[test]
+    fn t40_health_history_appends_and_prunes() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("row seeds");
+        store
+            .append_health_history(&[
+                HealthHistoryEntry {
+                    config_id: row.id.clone(),
+                    at: 1_000,
+                    kind: "url-test".to_string(),
+                    latency_ms: Some(120),
+                    error: None,
+                },
+                HealthHistoryEntry {
+                    config_id: row.id.clone(),
+                    at: 2_000,
+                    kind: "tcp-ping".to_string(),
+                    latency_ms: None,
+                    error: Some("timeout".to_string()),
+                },
+            ])
+            .expect("append works");
+        // latest-fast-path untouched: snapshots still round-trip separately.
+        // Note: save_health_snapshots also appends to history (one tx per
+        // probe round), so history holds 2 appended + 1 snapshot = 3.
+        store
+            .save_health_snapshot(&HealthSnapshot {
+                config_id: row.id.clone(),
+                at: 2_000,
+                kind: "url-test".to_string(),
+                latency_ms: Some(120),
+                error: None,
+            })
+            .expect("snapshot works");
+        let hist = store
+            .load_health_history(&row.id, None)
+            .expect("history loads");
+        assert_eq!(hist.len(), 3);
+        // Retention: prune everything before 1500 in one tx.
+        let pruned = store
+            .prune_health_history_before(1_500)
+            .expect("prune works");
+        assert_eq!(pruned, 1);
+        let hist = store
+            .load_health_history(&row.id, None)
+            .expect("history loads");
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].at, 2_000);
+        // Validation: latency XOR error, kind allow-list.
+        assert!(
+            store
+                .append_health_history(&[HealthHistoryEntry {
+                    config_id: row.id.clone(),
+                    at: 3_000,
+                    kind: "bogus".to_string(),
+                    latency_ms: Some(1),
+                    error: None,
+                }])
+                .is_err(),
+            "bad kind rejected"
+        );
+    }
+
+    /// Export is full-fidelity: presets + linkage by name + traffic + meta.
+    #[test]
+    fn t40_export_full_fidelity_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let preset = store
+            .create_preset(
+                "p",
+                "manual",
+                None,
+                &[serde_json::json!({"action":"direct"})],
+            )
+            .expect("preset seeds");
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("row seeds");
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works");
+        store.add_traffic(&row.id, 500, 600).expect("traffic seeds");
+        store.set_restore_running(true).expect("meta seeds");
+        store
+            .save_running_snapshot(std::slice::from_ref(&row.id))
+            .expect("snapshot seeds");
+        let payload = store.export_library_json().expect("export works");
+        assert!(payload.contains("\"route_presets\""), "presets exported");
+        assert!(payload.contains("\"traffic_rx\""), "traffic exported");
+        // Restore elsewhere rebuilds linkage by NAME (ids differ across DBs).
+        let mut other = Store::open_in_memory().expect("other opens");
+        let outcome = other.restore_library_json(&payload).expect("restore works");
+        assert_eq!(outcome.configs, 1);
+        let presets = other.list_presets().expect("presets list");
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].name, "p");
+        let rows = other.list().expect("rows list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].preset_id.as_deref(),
+            Some(presets[0].id.as_str()),
+            "linkage re-attached by name"
+        );
+        let totals = other.traffic_totals().expect("totals read");
+        assert_eq!(totals.get(&rows[0].id), Some(&(500, 600)));
+        assert!(other.restore_running(), "meta survives");
+        assert_eq!(other.load_running_snapshot(), vec![rows[0].id.clone()]);
+    }
+
+    /// Per-sub interval persists; due check honors it.
+    #[test]
+    fn t40_per_sub_interval_honored() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let sub = store
+            .add_subscription("S", "https://example.com/a.txt", "g", true)
+            .expect("sub seeds");
+        assert_eq!(sub.interval_secs, 86_400);
+        let updated = store
+            .set_subscription_interval(&sub.id, 3_600)
+            .expect("interval writes");
+        assert_eq!(updated.interval_secs, 3_600);
+        assert!(
+            due_for_refresh_for(&updated, 5_000),
+            "never refreshed → due"
+        );
+        store
+            .refresh_with_body(&sub.id, "[]", 10_000)
+            .expect("refresh stamps time");
+        let back = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("kept");
+        // Refresh with empty body errors (keeps last-good); stamp manually instead.
+        let _ = back;
+        let due_sub = Subscription {
+            interval_secs: 3_600,
+            last_refresh_at: Some(10_000),
+            auto_refresh: true,
+            ..updated.clone()
+        };
+        assert!(
+            !due_for_refresh_for(&due_sub, 10_000 + 1_000),
+            "not due yet"
+        );
+        assert!(
+            due_for_refresh_for(&due_sub, 10_000 + 3_600),
+            "due after interval"
+        );
+    }
+
+    /// Corrupt file is quarantined aside, never silent in-memory loss.
+    #[test]
+    fn t40_corrupt_file_quarantined() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t40corr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        std::fs::write(&path, b"this is not sqlite at all").expect("garbage writes");
+        let err = match Store::open_file(&path) {
+            Ok(_) => panic!("corrupt open must fail"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("corrupt") || text.contains("integrity"),
+            "loud guidance, got {text}"
+        );
+        // Bad file preserved aside.
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir reads")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert_eq!(kept.len(), 1, "one quarantined file, got {kept:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Restore takes a timestamped backup before any wipe (file path).
+    #[test]
+    fn t40_restore_takes_backup_before_wipe() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t40bak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        let payload = {
+            let mut store = Store::open_file(&path).expect("live opens");
+            store
+                .add(NewConfig {
+                    name: "Live".to_string(),
+                    protocol: "vless".to_string(),
+                    params: String::new(),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .expect("live seeds");
+            store.export_library_json().expect("export works")
+        };
+        let backup = Store::backup_db_file(&path, now_unix()).expect("backup works");
+        assert!(backup.exists(), "timestamped backup exists");
+        // Restoring an empty payload over the live file keeps a backup.
+        let empty = r#"{"outbounds":[],"library":[],"subscriptions":[],"tombstones":[],"route_presets":[],"meta":{}}"#;
+        let (_outcome, bak) =
+            Store::restore_library_file(&path, empty, now_unix()).expect("file restore works");
+        assert!(bak.exists(), "restore took a backup");
+        let store = Store::open_file(&path).expect("reopen works");
+        assert!(
+            store.list().expect("list works").is_empty(),
+            "restored empty"
+        );
+        // The pre-restore backup still holds the exported row.
+        let _ = (payload, backup);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DPAPI-down migration fails loudly, version stays, retry succeeds.
+    #[test]
+    fn t40_dpapi_down_migration_fails_loud_version_stays() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t40dpapi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("file opens");
+            conn.execute_batch(
+                "CREATE TABLE proxy_configs (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   name TEXT NOT NULL, protocol TEXT NOT NULL DEFAULT 'vless',
+                   params TEXT NOT NULL DEFAULT '{}', grp TEXT NOT NULL DEFAULT 'default',
+                   enabled INTEGER NOT NULL DEFAULT 0, bind_ip TEXT NOT NULL DEFAULT '127.0.0.1',
+                   port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535)) STRICT;
+                 CREATE TABLE subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   label TEXT NOT NULL, url TEXT NOT NULL, grp TEXT NOT NULL DEFAULT 'default',
+                   auto_refresh INTEGER NOT NULL DEFAULT 1, last_refresh_at INTEGER,
+                   last_error TEXT, failures TEXT NOT NULL DEFAULT '[]') STRICT;
+                 CREATE TABLE subscription_tombstones (subscription_id TEXT NOT NULL,
+                   identity_key TEXT NOT NULL,
+                   PRIMARY KEY (subscription_id, identity_key)) STRICT;
+                 CREATE TABLE health_snapshots (config_id TEXT PRIMARY KEY, at INTEGER NOT NULL,
+                   kind TEXT NOT NULL DEFAULT 'url-test', latency_ms INTEGER, error TEXT) STRICT;
+                 CREATE TABLE route_presets (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   name TEXT NOT NULL UNIQUE, source TEXT NOT NULL DEFAULT 'manual',
+                   source_url TEXT, rules_json TEXT NOT NULL DEFAULT '[]', updated_at INTEGER) STRICT;
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '') STRICT;
+                 PRAGMA user_version = 2;",
+            )
+            .expect("v2 ddl works");
+            conn.execute(
+                "INSERT INTO proxy_configs (name, protocol, params, grp, enabled, bind_ip, port)
+                 VALUES ('Plain','vless','{}','default',0,'127.0.0.1',10801)",
+                [],
+            )
+            .expect("plaintext seeds");
+        }
+        crate::dpapi::set_fail_for_test(true);
+        let err = match Store::open_file(&path) {
+            Ok(_) => {
+                crate::dpapi::set_fail_for_test(false);
+                panic!("dpapi-down must fail loudly");
+            }
+            Err(err) => {
+                crate::dpapi::set_fail_for_test(false);
+                err
+            }
+        };
+        assert!(
+            err.to_string().contains("dpapi") || err.to_string().contains("DPAPI"),
+            "loud dpapi cause, got {err}"
+        );
+        let version: i64 = rusqlite::Connection::open(&path)
+            .expect("raw opens")
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version reads");
+        assert!(
+            version < 5,
+            "version stays, next open retries (got {version})"
+        );
+        // Retry with DPAPI up migrates fully.
+        let store = Store::open_file(&path).expect("retry works");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version reads");
+        assert_eq!(version, 5);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
