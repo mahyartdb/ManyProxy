@@ -34,6 +34,8 @@ pub const VALID_PROTOCOLS: &[&str] = &[
     "wireguard",
     "amneziawg",
     "socks",
+    "snell",
+    "shadowtls",
     "anytls",
     "ssh",
     "noise",
@@ -734,6 +736,9 @@ fn canonical_protocol(raw: &str) -> Option<String> {
         "wireguard" | "wg" => Some("wireguard".to_string()),
         "amneziawg" | "awg" | "amnezia-wg" => Some("amneziawg".to_string()),
         "socks" | "socks5" => Some("socks".to_string()),
+        // Ticket 42: native 1.14.2 outbounds (serve-everything).
+        "snell" => Some("snell".to_string()),
+        "shadowtls" | "shadow-tls" | "shadow_tls" => Some("shadowtls".to_string()),
         "anytls" => Some("anytls".to_string()),
         // Ticket 27: native SSH outbound (sing-box `ssh`) + standalone Noise
         // (fork sidecar; AWG-vs-Noise mismatch rejected in the engine).
@@ -794,6 +799,11 @@ pub fn protocol_params_template(protocol: &str) -> String {
             blank(&mut params, "method");
             blank(&mut params, "password");
         }
+        // Ticket 42: snell needs its psk; shadowtls v1 rows may omit the
+        // password (v2/v3 carry it) so the template leaves it blank-only
+        // when the dialog targets a passworded shape — blank stays a
+        // template, never a committed row (commit names the field).
+        "snell" => blank(&mut params, "psk"),
         "tuic" => {
             blank(&mut params, "uuid");
             blank(&mut params, "password");
@@ -969,6 +979,9 @@ fn validate_protocol_params(
             // (password or key) so rows never connect nowhere silently.
             "ssh" => has(&["username", "user"]) && has(&["password", "private_key", "privatekey"]),
             "noise" => has(&["password", "key"]),
+            // Ticket 42: snell needs its psk; shadowtls/socks/http serve
+            // without link credentials (v1 shadowtls omits the password).
+            "snell" => has(&["psk"]),
             _ => true,
         };
         if !credential_ok {
@@ -984,6 +997,7 @@ fn validate_protocol_params(
                 "naive" => "username and password",
                 "ssh" => "username and a password or private_key",
                 "noise" => "password or key",
+                "snell" => "psk",
                 _ => "credentials",
             };
             errors.push(missing(what));
@@ -7610,6 +7624,29 @@ mod tests {
         let listed = store.list_presets().expect("list works");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "ads");
+    }
+
+    /// Ticket 42 (US-28): route links store in all three encodings
+    /// (standard-b64, urlsafe-b64, raw JSON).
+    #[test]
+    fn t42_route_link_all_encodings_store() {
+        use base64::Engine as _;
+        let inner =
+            r#"{"kind":"throne-route-profile","v":1,"name":"enc","rules":[{"action":"direct"}]}"#;
+        let std = base64::engine::general_purpose::STANDARD.encode(inner.as_bytes());
+        let urlsafe = base64::engine::general_purpose::URL_SAFE.encode(inner.as_bytes());
+        for (label, link) in [
+            ("standard", format!("throne://route/{std}")),
+            ("urlsafe", format!("throne://route/{urlsafe}")),
+            ("raw", format!("throne://route/{inner}")),
+        ] {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let preset = store
+                .import_route_link(&link)
+                .unwrap_or_else(|error| panic!("{label} stores: {error}"));
+            assert_eq!(preset.name, "enc", "{label}");
+            assert_eq!(preset.rules().expect("rules decode").len(), 1, "{label}");
+        }
     }
 
     /// Ticket 37: preset URL/JSON bodies import; malformed rules are rejected

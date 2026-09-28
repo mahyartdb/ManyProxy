@@ -18,17 +18,23 @@ pub const MAX_PRESET_NAME_CHARS: usize = 256;
 
 /// Route-rule actions a preset may carry. `route` means "route to the
 /// attached row's outbound" (the engine rewrites `outbound` at merge);
+/// `proxy` is the Throne alias of `route` (normalized at merge);
 /// `direct` passes through verbatim; `block` is the Throne spelling of the
 /// sing-box `reject` action and is normalized at merge (live-proven: stock
 /// sing-box 1.14.2 has no `block` action — see [`served_action`]).
-pub const VALID_PRESET_ACTIONS: &[&str] = &["route", "direct", "block", "reject"];
+/// `warp`/`warp-bypass` never validate (see [`validate_preset_rules`]):
+/// warp needs an endpoint design, so it fails with a guidance error.
+pub const VALID_PRESET_ACTIONS: &[&str] = &["route", "proxy", "direct", "block", "reject"];
 
 /// Merge-time spelling for a validated preset action. Stored rules keep the
 /// intake spelling (`block` stays `block` in the database); the served
-/// config carries what the sidecar accepts (`reject`).
+/// config carries what the sidecar accepts (`reject`, and `proxy` as
+/// `route`).
 pub fn served_action(action: &str) -> &str {
     if action == "block" {
         "reject"
+    } else if action == "proxy" {
+        "route"
     } else {
         action
     }
@@ -125,6 +131,17 @@ pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
             .get("action")
             .and_then(Value::as_str)
             .ok_or_else(|| bad_rule(index, "field \"action\" is required"))?;
+        // Ticket 42 (US-29): `warp`/`warp-bypass` have no endpoint to point
+        // at — a guidance error naming the missing design, never a bare
+        // BadRule and never a silent drop.
+        if action == "warp" || action == "warp-bypass" {
+            return Err(bad_rule(
+                index,
+                format!(
+                    "field \"action\" \"{action}\" is not servable (warp needs an endpoint design — no sing-box outbound to point at; use \"route\", \"proxy\", \"direct\", or \"reject\")"
+                ),
+            ));
+        }
         if !VALID_PRESET_ACTIONS.contains(&action) {
             return Err(bad_rule(
                 index,
@@ -134,7 +151,9 @@ pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
                 ),
             ));
         }
-        if action == "route" {
+        // Ticket 42: `proxy` aliases `route` (both point at the row's
+        // serving tag at merge).
+        if action == "route" || action == "proxy" {
             if let Some(outbound) = obj.get("outbound") {
                 if !outbound.is_string() {
                     return Err(bad_rule(index, "field \"outbound\" must be a string"));
@@ -155,11 +174,22 @@ fn preset_name_from(obj: &serde_json::Map<String, Value>) -> Option<String> {
         .map(cap_name)
 }
 
+/// Strip leading UTF-8 BOMs (mirrors the import grammar: a BOM is not
+/// whitespace to `str::trim`, so BOM-prefixed bodies strip here before any
+/// `{`/`[` sniffing).
+fn strip_preset_bom(text: &str) -> &str {
+    let mut rest = text;
+    while let Some(stripped) = rest.strip_prefix('\u{FEFF}') {
+        rest = stripped;
+    }
+    rest
+}
+
 /// Parse preset JSON: an object with a name plus a `rules` array, or a bare
 /// rules array (named by `default_name`, e.g. the file stem). Rejections name
 /// the field, or the rule index + field for bad rules.
 pub fn parse_preset_json(text: &str, default_name: &str) -> Result<PresetImport, PresetError> {
-    let trimmed = text.trim();
+    let trimmed = strip_preset_bom(text.trim()).trim();
     if trimmed.is_empty() {
         return Err(PresetError::new(
             PresetErrorKind::Empty,
@@ -189,6 +219,30 @@ pub fn parse_preset_json(text: &str, default_name: &str) -> Result<PresetImport,
             "preset must be an object or a rules array",
         )
     })?;
+    // Ticket 42 (US-28): the Throne kind envelope is checked when present
+    // (`kind` must be `throne-route-profile`, `v` must be 1) — a foreign
+    // envelope never stores silently as routing policy.
+    if let Some(kind) = obj.get("kind").and_then(Value::as_str) {
+        if kind != "throne-route-profile" {
+            return Err(PresetError::new(
+                PresetErrorKind::InvalidJson,
+                "preset \"kind\" must be \"throne-route-profile\"",
+            ));
+        }
+    }
+    if let Some(v) = obj.get("v") {
+        let one = match v {
+            Value::Number(number) => number.as_u64().is_some_and(|v| v == 1),
+            Value::String(text) => text.trim() == "1",
+            _ => false,
+        };
+        if !one {
+            return Err(PresetError::new(
+                PresetErrorKind::InvalidJson,
+                "preset \"v\" must be 1",
+            ));
+        }
+    }
     let name = preset_name_from(obj).or_else(|| {
         let fallback = default_name.trim();
         if fallback.is_empty() {
@@ -317,8 +371,33 @@ pub fn is_remote_route_attempt(line: &str) -> bool {
         .eq_ignore_ascii_case("remoteroute")
 }
 
-/// Decode `throne://route/<standard-base64 of preset JSON>` (the addsub
-/// envelope contract). Replaces the v1 named error: route links now import.
+/// Urlsafe-base64 decode (the route-link counterpart to [`decode_std_b64`]:
+/// standard bytes are rejected, whitespace is ignored).
+fn decode_urlsafe_b64(payload: &str) -> Result<Vec<u8>, PresetError> {
+    use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+    let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return Err(PresetError::new(
+            PresetErrorKind::Empty,
+            "throne link is missing its payload",
+        ));
+    }
+    if compact.chars().any(|c| c == '+' || c == '/') {
+        return Err(PresetError::new(
+            PresetErrorKind::BadBase64,
+            "payload must be urlsafe base64",
+        ));
+    }
+    URL_SAFE
+        .decode(&compact)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(&compact))
+        .map_err(|_| PresetError::new(PresetErrorKind::BadBase64, "bad base64 payload"))
+}
+
+/// Decode `throne://route/...` (the addsub envelope contract, extended by
+/// ticket 42): standard-base64 of preset JSON, urlsafe-base64 of preset
+/// JSON, or the raw preset JSON itself. The kind envelope (`kind`/`v`) is
+/// checked when present; rejections never echo the payload.
 pub fn decode_route_link(line: &str) -> Result<PresetImport, PresetError> {
     let (command, payload) = split_throne_command(line)?;
     if !command.eq_ignore_ascii_case("route") {
@@ -327,7 +406,17 @@ pub fn decode_route_link(line: &str) -> Result<PresetImport, PresetError> {
             "not a route preset link",
         ));
     }
-    let bytes = decode_std_b64(payload)?;
+    let trimmed = strip_preset_bom(payload.trim()).trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return parse_preset_json(trimmed, "");
+    }
+    let bytes = match decode_std_b64(payload) {
+        Ok(bytes) => bytes,
+        Err(std_error) => match decode_urlsafe_b64(payload) {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(std_error),
+        },
+    };
     let inner = String::from_utf8(bytes)
         .map_err(|_| PresetError::new(PresetErrorKind::NonUtf8, "payload is not UTF-8"))?;
     parse_preset_json(&inner, "")
@@ -607,5 +696,104 @@ mod tests {
     #[test]
     fn usable_sample_rules_validate() {
         validate_preset_rules(&sample_rules()).expect("sample rules validate");
+    }
+
+    // -- Ticket 42: envelope + aliases -----------------------------------
+    // Route links accept three encodings with a checked kind envelope;
+    // `proxy` aliases `route`; `warp` fails with a guidance error; BOMs parse.
+
+    fn t42_route_payload(inner: &str) -> (String, String) {
+        use base64::Engine as _;
+        let std = base64::engine::general_purpose::STANDARD.encode(inner.as_bytes());
+        let urlsafe = base64::engine::general_purpose::URL_SAFE.encode(inner.as_bytes());
+        (std, urlsafe)
+    }
+
+    /// Ticket 42 (US-28): route links store in standard-b64, urlsafe-b64,
+    /// and raw JSON encodings.
+    #[test]
+    fn t42_route_link_three_encodings_decode() {
+        let inner = r#"{"name":"t42","rules":[{"action":"direct"}]}"#;
+        let (std, urlsafe) = t42_route_payload(inner);
+        for link in [
+            format!("throne://route/{std}"),
+            format!("throne://route/{urlsafe}"),
+            format!("throne://route/{inner}"),
+        ] {
+            let parsed = decode_route_link(&link).expect("encoding decodes: {link}");
+            assert_eq!(parsed.name, "t42");
+            assert_eq!(parsed.rules.len(), 1);
+        }
+    }
+
+    /// Ticket 42 (US-28): the kind envelope is checked when present
+    /// (`kind` must be `throne-route-profile`, `v` must be 1).
+    #[test]
+    fn t42_route_link_kind_envelope_checked() {
+        let ok =
+            r#"{"kind":"throne-route-profile","v":1,"name":"k","rules":[{"action":"direct"}]}"#;
+        let (std, _) = t42_route_payload(ok);
+        let parsed =
+            decode_route_link(&format!("throne://route/{std}")).expect("envelope accepted");
+        assert_eq!(parsed.name, "k");
+        let bad_kind = r#"{"kind":"something-else","name":"k","rules":[]}"#;
+        let (std, _) = t42_route_payload(bad_kind);
+        let error =
+            decode_route_link(&format!("throne://route/{std}")).expect_err("bad kind rejects");
+        assert!(error.message.contains("kind"), "names kind: {error}");
+        let bad_v = r#"{"kind":"throne-route-profile","v":2,"name":"k","rules":[]}"#;
+        let (std, _) = t42_route_payload(bad_v);
+        let error = decode_route_link(&format!("throne://route/{std}")).expect_err("bad v rejects");
+        assert!(error.message.contains("\"v\""), "names v: {error}");
+    }
+
+    /// Ticket 42 (US-29): `proxy` validates like `route` and serves as it.
+    #[test]
+    fn t42_proxy_action_valid_and_served_as_route() {
+        validate_preset_rules(&[serde_json::json!({"action": "proxy"})]).expect("proxy validates");
+        assert_eq!(served_action("proxy"), "route");
+    }
+
+    /// Ticket 42 (US-29): `warp`/`warp-bypass` fail with a guidance error
+    /// naming the missing endpoint design (never a bare BadRule).
+    #[test]
+    fn t42_warp_action_guidance_error() {
+        for action in ["warp", "warp-bypass"] {
+            let error = validate_preset_rules(&[serde_json::json!({"action": action})])
+                .expect_err(&format!("{action} rejects"));
+            assert_eq!(error.kind, PresetErrorKind::BadRule);
+            assert!(error.message.contains(action), "names action: {error}");
+            assert!(
+                error.message.contains("endpoint"),
+                "names the missing endpoint design: {error}"
+            );
+        }
+    }
+
+    /// Ticket 42 (US-28): BOM-prefixed preset JSON parses (strip like import).
+    #[test]
+    fn t42_preset_bom_parses() {
+        let parsed = parse_preset_json(
+            "\u{FEFF}{\"name\":\"bom\",\"rules\":[{\"action\":\"direct\"}]}",
+            "",
+        )
+        .expect("BOM preset parses");
+        assert_eq!(parsed.name, "bom");
+    }
+
+    /// Ticket 42 (US-28): a remoteroute URL blocked at decode time is also
+    /// blocked at fetch time (the fetch re-checks the SSRF policy — decode
+    /// alone is insufficient against redirect/plain-http drift).
+    #[test]
+    fn t42_remoteroute_fetch_policy_parity() {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::STANDARD.encode("http://127.0.0.1/p.json");
+        let error = decode_remote_route_link(&format!("throne://remoteroute/{payload}"))
+            .expect_err("loopback blocked at decode");
+        assert_eq!(error.kind, PresetErrorKind::BadUrl);
+        assert!(matches!(
+            crate::store::subscription_fetch_policy("http://127.0.0.1/p.json"),
+            crate::store::SubscriptionFetchPolicy::Block { .. }
+        ));
     }
 }
