@@ -43,10 +43,10 @@ use import::{
     parse_addsub_link, AddSubRequest, ImportError,
 };
 use store::{
-    count_importable, delete_confirm_text, due_for_refresh, export_confirm_description, now_unix,
-    protocol_params_template, proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig,
-    RestoreOutcome, Store, StoreError, Subscription as ProxySubscription,
-    DEFAULT_AUTO_REFRESH_SECS, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    count_importable, delete_confirm_text, due_for_refresh_for, export_confirm_description,
+    now_unix, protocol_params_template, proxy_urls, ConfigPatch, HealthSnapshot, NewConfig,
+    ProxyConfig, RestoreOutcome, Store, StoreError, Subscription as ProxySubscription,
+    DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -2692,15 +2692,16 @@ impl AppView {
     }
 
     /// Ticket 38: persist the running set when it changes (the restore
-    /// source). Best-effort like health snapshots: a write failure never
-    /// breaks the reload, and the in-memory guard still advances so the
-    /// next change retries with fresh state.
+    /// source). Ticket 40: write errors surface (never silent loss — a
+    /// read-only disk fails loudly here instead of `let _ =`).
     fn snapshot_running_set(&mut self, running: &[String]) {
         if self.last_snapshot.as_slice() == running {
             return;
         }
         self.last_snapshot = running.to_vec();
-        let _ = self.store.save_running_snapshot(running);
+        if let Err(error) = self.store.save_running_snapshot(running) {
+            eprintln!("running snapshot failed: {error}");
+        }
     }
 
     /// Ticket 38: build tray presence on the main thread. Loud failure
@@ -3534,6 +3535,9 @@ impl AppView {
     /// rebuilt verbatim in its single transaction. Success reloads and names
     /// the restored counts ([`restore_done_message`]); failure names the
     /// export error. Row ids survive, so running endpoints are unaffected.
+    /// Ticket 40: file-backed stores restore atomically — timestamped backup
+    /// first, temp sibling DB + validate + quick_check + rename, so a kill
+    /// mid-restore leaves the old library intact.
     fn commit_library_restore(
         &mut self,
         payload: &str,
@@ -3548,6 +3552,46 @@ impl AppView {
                 window
                     .push_notification(Notification::error(format!("Restore failed: {error}")), cx);
                 return;
+            }
+        }
+        // File-backed atomic path: backup + temp-DB + rename (mid-kill safe).
+        if let Some(live_path) = self.store.db_path() {
+            match Store::restore_library_file(&live_path, payload, now_unix()) {
+                Ok((outcome, backup)) => {
+                    // Reopen the swapped file so the live handle tracks it.
+                    match Store::open_file(&live_path) {
+                        Ok(fresh) => {
+                            self.store = fresh;
+                            self.reload(window, cx);
+                            window.push_notification(
+                                Notification::success(format!(
+                                    "{} (backup {})",
+                                    restore_done_message(&outcome),
+                                    backup.display()
+                                )),
+                                cx,
+                            );
+                        }
+                        Err(error) => {
+                            self.reload(window, cx);
+                            window.push_notification(
+                                Notification::error(format!(
+                                    "Restore swapped but reopen failed ({error}); backup at {}",
+                                    backup.display()
+                                )),
+                                cx,
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(format!("Restore failed: {error}")),
+                        cx,
+                    );
+                    return;
+                }
             }
         }
         if let Err(error) = self.wipe_library_for_restore() {
@@ -5663,7 +5707,9 @@ impl AppView {
             .list_subscriptions()
             .unwrap_or_default()
             .into_iter()
-            .filter(|sub| due_for_refresh(sub, now, DEFAULT_AUTO_REFRESH_SECS))
+            // Ticket 40: per-sub intervals (each sub honors its own
+            // `interval_secs`, never the global daily).
+            .filter(|sub| due_for_refresh_for(sub, now))
             .collect()
     }
 
@@ -5825,11 +5871,17 @@ impl AppView {
             self.traffic_last_seen.insert(id.clone(), *pair);
         }
         let mut updated = 0;
-        for (row, (rx, tx)) in &deltas {
-            // A row removed mid-tick misses its write (NotFound) — the next
-            // poll drops its connection ids via the row-claim filter.
-            if self.store.add_traffic(row, *rx, *tx).is_ok() {
-                updated += 1;
+        // Ticket 40: one transaction per tick (batched, saturating
+        // single-statement UPDATEs). Unknown ids skip (a row removed mid-tick
+        // misses its write); errors log loudly, never swallowed.
+        if !deltas.is_empty() {
+            let batch: Vec<(String, u64, u64)> = deltas
+                .iter()
+                .map(|(row, (rx, tx))| (row.clone(), *rx, *tx))
+                .collect();
+            match self.store.add_traffic_batch(&batch) {
+                Ok(count) => updated = count,
+                Err(error) => eprintln!("traffic tick failed: {error}"),
             }
         }
         if updated > 0 {
@@ -10882,6 +10934,9 @@ mod tests {
             source_url: None,
             rules_json: r#"[{"action":"block"}]"#.to_string(),
             updated_at: None,
+            description: None,
+            is_builtin: false,
+            last_used_at: None,
         };
         let summary = preset_row_summary(&preset, &["\"Row\"".to_string()]);
         assert!(summary.contains("ads"), "{summary}");
