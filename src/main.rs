@@ -1818,47 +1818,120 @@ fn already_subscribed_message(label: &str) -> String {
 /// Ticket 27: the fetch enforces [`store::subscription_fetch_policy`] first —
 /// internal hosts Block without touching the network (SSRF guard); plaintext
 /// http Warns (proceeds: LAN-provider compat, tokens leak in plaintext).
+/// Ticket 48: redirects never auto-follow — the client is pinned to
+/// NoFollow and each hop re-runs the fetch policy (fetch-time SSRF
+/// re-check), so a benign host redirecting to loopback/private/link-local
+/// is blocked before any byte is fetched from it. Same-policy hops are
+/// followed (CDN compat) up to a small bound; anything else fails loudly.
 async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Result<String, String> {
     use futures::AsyncReadExt as _;
     const MAX_BYTES: usize = 8 * 1024 * 1024;
     const TIMEOUT_SECS: u64 = 20;
-    match store::subscription_fetch_policy(url) {
-        store::SubscriptionFetchPolicy::Block { reason } => return Err(reason.to_string()),
-        store::SubscriptionFetchPolicy::Warn { .. } => {}
-        store::SubscriptionFetchPolicy::Allow => {}
-    }
-    let request = http_client::http::Request::builder()
-        .uri(url)
-        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-        .body(AsyncBody::empty())
-        .map_err(|_| "subscription request failed".to_string())?;
-    let mut response = client
-        .send(request)
-        .await
-        .map_err(|_| "subscription fetch failed".to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "subscription fetch failed (status {})",
-            response.status().as_u16()
-        ));
-    }
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 65_536];
-    loop {
-        let n = response
-            .body_mut()
-            .read(&mut chunk)
+    const MAX_REDIRECTS: usize = 5;
+    let mut current = url.trim().to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        match store::subscription_fetch_policy(&current) {
+            store::SubscriptionFetchPolicy::Block { reason } => return Err(reason.to_string()),
+            store::SubscriptionFetchPolicy::Warn { .. } => {}
+            store::SubscriptionFetchPolicy::Allow => {}
+        }
+        let request = http_client::http::Request::builder()
+            .uri(current.as_str())
+            .follow_redirects(http_client::RedirectPolicy::NoFollow)
+            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .body(AsyncBody::empty())
+            .map_err(|_| "subscription request failed".to_string())?;
+        let mut response = client
+            .send(request)
             .await
             .map_err(|_| "subscription fetch failed".to_string())?;
-        if n == 0 {
-            break;
+        if is_fetch_redirect(response.status()) {
+            match fetch_redirect_location(response.headers(), &current) {
+                Some(next) => {
+                    current = next;
+                    continue;
+                }
+                None => return Err("subscription fetch failed (bad redirect)".to_string()),
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_BYTES {
-            return Err("subscription body too large".to_string());
+        if !response.status().is_success() {
+            return Err(format!(
+                "subscription fetch failed (status {})",
+                response.status().as_u16()
+            ));
         }
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65_536];
+        loop {
+            let n = response
+                .body_mut()
+                .read(&mut chunk)
+                .await
+                .map_err(|_| "subscription fetch failed".to_string())?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > MAX_BYTES {
+                return Err("subscription body too large".to_string());
+            }
+        }
+        return String::from_utf8(buf).map_err(|_| "subscription body is not UTF-8".to_string());
     }
-    String::from_utf8(buf).map_err(|_| "subscription body is not UTF-8".to_string())
+    Err("subscription fetch failed (too many redirects)".to_string())
+}
+
+/// Ticket 48: redirect statuses the fetch follows by hand (each hop
+/// re-checked — never client-auto-followed past the SSRF guard).
+fn is_fetch_redirect(status: http_client::http::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+/// Ticket 48: resolve a `Location` value against the fetched URL.
+/// Absolute http(s) URLs pass through (the caller re-checks the policy);
+/// origin-absolute paths resolve against the current origin. Anything
+/// else (relative segments, other schemes, empties) is refused — the
+/// fetch fails instead of guessing where to go.
+fn resolve_fetch_redirect(current_url: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return None;
+    }
+    if location.starts_with('/') {
+        let scheme_end = current_url.find("://")?;
+        let after_scheme = &current_url[scheme_end + 3..];
+        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        let origin = &current_url[..scheme_end + 3 + authority_end];
+        if origin.ends_with("://") {
+            return None;
+        }
+        return Some(format!("{origin}{location}"));
+    }
+    if location
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || location
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Some(location.to_string());
+    }
+    None
+}
+
+/// Ticket 48: read the redirect target off response headers (first
+/// `Location` only — never a joined list), resolved against the URL just
+/// fetched. `None` means the hop is unusable (missing, non-ASCII, or
+/// unresolvable) and the fetch fails loudly.
+fn fetch_redirect_location(
+    headers: &http_client::http::HeaderMap,
+    current_url: &str,
+) -> Option<String> {
+    let location = headers
+        .get(http_client::http::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    resolve_fetch_redirect(current_url, location)
 }
 
 /// Handles to the subscription add form inside the subscriptions dialog.
@@ -14478,5 +14551,327 @@ mod tests {
         let quit =
             cx.update(|window, cx| view.update(cx, |view, cx| view.poll_tray_once(window, cx)));
         assert!(!quit, "no tray, no quit, no event drain");
+    }
+
+    // -- Ticket 48: tray dispatch + fetch guards ---------------------------
+
+    /// Ticket 48 (US-62): every tray menu id dispatches headless to its
+    /// handler — StartAll serves the library, StopAll stops it, Show is a
+    /// windowing no-op that never touches the engine, Quit stops +
+    /// clears + drops. Foreign ids map to nothing (tray.rs). Windowing
+    /// itself stays manual-tour only.
+    #[gpui_kit::test]
+    fn t48_tray_dispatch_every_menu_id_runs_its_handler(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::tray::{action_for_menu_id, menu_id, TrayAction};
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10871"))
+            .expect("seed works");
+        let beta = store.add(tick12_seed("Beta", "10872")).expect("seed works");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        // The wall: every known id maps to exactly one action, foreign
+        // ids map to nothing and never reach a handler.
+        for (id, action) in [
+            (menu_id::SHOW, TrayAction::Show),
+            (menu_id::START_ALL, TrayAction::StartAll),
+            (menu_id::STOP_ALL, TrayAction::StopAll),
+            (menu_id::QUIT, TrayAction::Quit),
+        ] {
+            assert_eq!(action_for_menu_id(id), Some(action), "id {id} dispatches");
+            assert_eq!(
+                crate::tray::menu_id_for_action(action),
+                id,
+                "id {id} round-trips"
+            );
+        }
+        assert_eq!(action_for_menu_id("foreign-id"), None);
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::StartAll, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            2,
+            "StartAll serves the library"
+        );
+        let mut snapshot = view.read_with(cx, |view, _| view.store.load_running_snapshot());
+        snapshot.sort();
+        let mut expected = vec![alpha.id.clone(), beta.id.clone()];
+        expected.sort();
+        assert_eq!(snapshot, expected, "snapshot names the serving set");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::Show, window, cx)
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            2,
+            "Show never touches the engine"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::StopAll, window, cx)
+            });
+        });
+        // Ticket-43 semantics: StopAll dispatches into the confirm gate —
+        // the dialog opens, nothing stops until the user confirms.
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            2,
+            "confirm gates the kill"
+        );
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "StopAll dispatch opens the confirm"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_stop_all(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "confirmed StopAll stops every endpoint"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot())
+                .is_empty(),
+            "stop clears the snapshot"
+        );
+
+        // Quit from a serving state: engine stopped, snapshot cleared,
+        // icon dropped — the caller then quits the app.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::StartAll, window, cx)
+            });
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 2);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::Quit, window, cx)
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "Quit stops the engine"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot())
+                .is_empty(),
+            "Quit clears the snapshot"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.tray.is_none()),
+            "Quit drops the icon"
+        );
+    }
+
+    /// Ticket 48 (US-66): redirect resolution table — absolute http(s)
+    /// URLs pass through for the policy re-check, origin-absolute paths
+    /// resolve against the current origin, everything else is refused.
+    #[test]
+    fn t48_resolve_fetch_redirect_table() {
+        use crate::{is_fetch_redirect, resolve_fetch_redirect};
+        use gpui_kit::http_client::http::StatusCode;
+        for code in [301u16, 302, 303, 307, 308] {
+            assert!(
+                is_fetch_redirect(StatusCode::from_u16(code).expect("status builds")),
+                "{code} follows by hand"
+            );
+        }
+        for code in [200u16, 204, 404, 500] {
+            assert!(
+                !is_fetch_redirect(StatusCode::from_u16(code).expect("status builds")),
+                "{code} is not a redirect"
+            );
+        }
+        assert_eq!(
+            resolve_fetch_redirect(
+                "https://example.com/sub.txt",
+                "https://cdn.example.com/sub.txt"
+            ),
+            Some("https://cdn.example.com/sub.txt".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a/sub.txt", "/b/sub.txt"),
+            Some("https://example.com/b/sub.txt".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com:8443/a", "/b"),
+            Some("https://example.com:8443/b".to_string())
+        );
+        // Refused, never guessed: relative segments, other schemes,
+        // empties, and unparsable currents.
+        for (current, location) in [
+            ("https://example.com/a", "b/sub.txt"),
+            ("https://example.com/a", "../sub.txt"),
+            ("https://example.com/a", "ftp://example.com/sub.txt"),
+            ("https://example.com/a", "file:///etc/passwd"),
+            ("https://example.com/a", ""),
+            ("https://example.com/a", "   "),
+            ("not-a-url", "/b"),
+            ("https://", "/b"),
+        ] {
+            assert_eq!(
+                resolve_fetch_redirect(current, location),
+                None,
+                "refused: {current:?} + {location:?}"
+            );
+        }
+    }
+
+    /// Stub `HttpClient` recording every fetched URL in order (shared
+    /// across the `Fn` handler).
+    fn t48_recording_client(
+        handler: impl Fn(String) -> gpui_kit::http_client::http::Response<gpui_kit::http_client::AsyncBody>
+            + Send
+            + Sync
+            + 'static,
+    ) -> (
+        std::sync::Arc<dyn gpui_kit::http_client::HttpClient>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use gpui_kit::http_client::FakeHttpClient;
+        let handler = std::sync::Arc::new(handler);
+        let fetched = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = fetched.clone();
+        let client = FakeHttpClient::create(move |req| {
+            let seen = seen.clone();
+            let handler = handler.clone();
+            let uri = req.uri().to_string();
+            async move {
+                seen.lock().expect("record works").push(uri.clone());
+                Ok(handler(uri))
+            }
+        });
+        (client, fetched)
+    }
+
+    fn t48_response(
+        status: u16,
+        location: Option<&str>,
+        body: &str,
+    ) -> gpui_kit::http_client::http::Response<gpui_kit::http_client::AsyncBody> {
+        use gpui_kit::http_client::AsyncBody;
+        let mut builder = gpui_kit::http_client::http::Response::builder().status(status);
+        if let Some(location) = location {
+            builder = builder.header("location", location);
+        }
+        builder
+            .body(AsyncBody::from(body.to_string()))
+            .expect("response builds")
+    }
+
+    /// Ticket 48 (US-66): a redirect to an internal host is blocked by
+    /// the fetch-time re-check — the second hop is never fetched.
+    #[test]
+    fn t48_fetch_redirect_to_internal_blocked_without_fetch() {
+        let (client, fetched) = t48_recording_client(|uri| {
+            if uri == "https://example.com/sub.txt" {
+                t48_response(302, Some("http://127.0.0.1/evil"), "")
+            } else {
+                t48_response(200, None, "must never fetch")
+            }
+        });
+        let error = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+        ))
+        .expect_err("internal redirect blocked");
+        assert!(error.contains("internal"), "SSRF cause, got {error}");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec!["https://example.com/sub.txt".to_string()],
+            "the evil hop is never fetched"
+        );
+    }
+
+    /// Ticket 48 (US-66): a redirect to a public host is followed once
+    /// (CDN compat) and its body lands; the entry policy still gates the
+    /// first hop, so direct internal URLs never touch the client.
+    #[test]
+    fn t48_fetch_redirect_to_public_followed_once() {
+        let (client, fetched) = t48_recording_client(|uri| {
+            if uri == "https://example.com/sub.txt" {
+                t48_response(302, Some("https://cdn.example.com/sub.txt"), "")
+            } else {
+                t48_response(200, None, "cdn-body")
+            }
+        });
+        let body = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+        ))
+        .expect("public redirect followed");
+        assert_eq!(body, "cdn-body");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec![
+                "https://example.com/sub.txt".to_string(),
+                "https://cdn.example.com/sub.txt".to_string(),
+            ]
+        );
+
+        let (client, fetched) = t48_recording_client(|_| t48_response(200, None, "unreachable"));
+        let error = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "http://127.0.0.1/direct",
+        ))
+        .expect_err("direct internal blocked");
+        assert!(error.contains("internal"), "SSRF cause, got {error}");
+        assert!(
+            fetched.lock().expect("read works").is_empty(),
+            "blocked before any fetch"
+        );
+    }
+
+    /// Ticket 48 (US-66): redirect loops are bounded and location-less
+    /// redirects fail loudly instead of hanging or guessing.
+    #[test]
+    fn t48_fetch_redirect_loop_bounded_and_locationless_loud() {
+        let (client, fetched) =
+            t48_recording_client(|_| t48_response(302, Some("https://example.com/elsewhere"), ""));
+        let error = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+        ))
+        .expect_err("loop bounded");
+        assert!(
+            error.contains("too many redirects"),
+            "bounded cause, got {error}"
+        );
+        assert_eq!(
+            fetched.lock().expect("read works").len(),
+            6,
+            "initial plus five hops, then give up"
+        );
+
+        let (client, _) = t48_recording_client(|_| t48_response(302, None, ""));
+        let error = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+        ))
+        .expect_err("location-less redirect fails");
+        assert!(error.contains("bad redirect"), "loud cause, got {error}");
     }
 }

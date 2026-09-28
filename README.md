@@ -10,7 +10,7 @@ Windows 10/11 64-bit (v1 platform).
 
 1. Put the app exe plus sidecar binaries **in the same folder** (portable or installed, either works as long as they sit together): `sing-box`, `sing-box-awg` (AmneziaWG/Noise/XHTTP rows only), `xray` (Xray-only VLESS bridge only), plus at most one user-supplied extra-core executable (app dir only). Resolution is app-dir ONLY, never `PATH` (ticket 23, `resolve_*_binary_in`, `src/engine.rs`). Verified by `missing_binaries_state_never_downloads`.
 2. Run: `cargo run` (dev) or launch the built exe. No admin needed for default (loopback) use; no registry keys, services, or drivers (`PACKAGING-NOTES.md`).
-3. Data lives in a local user-owned SQLite file; logs/health are session-only (`src/store.rs`, `src/health.rs`; tickets 06/12/13).
+3. Data lives in a local user-owned SQLite file; secrets at rest are sealed with Windows DPAPI (user scope, `dpapi1:` marker, `src/dpapi.rs`) — the app is Windows-only, and off-Windows builds fail DPAPI ops loudly instead of storing plaintext; logs/health are session-only (`src/store.rs`, `src/health.rs`; tickets 06/12/13).
 
 ## Add your first config manually
 

@@ -139,15 +139,28 @@ fn clash_secret(core: &str) -> String {
 /// whole range, so a transient holder just shifts the pick (retry by
 /// construction). `None` only when the range is truly exhausted.
 fn reserve_clash_port(holds: &mut Vec<std::net::TcpListener>) -> Option<u16> {
-    (CLASH_PORT_START..=CLASH_PORT_END).find(|port| {
-        match std::net::TcpListener::bind(format!("127.0.0.1:{port}")) {
+    reserve_port_in_range(holds, CLASH_PORT_START, CLASH_PORT_END)
+}
+
+/// Ticket 48: range-generic bind-and-hold behind [`reserve_clash_port`].
+/// Tests prove the exhausted-`None` arm on a small private range (the
+/// live clash range is shared with parallel controller tests, so a
+/// full-range exhaustion assert would race their holds); production
+/// delegates here unchanged, so the proof transfers to the real range.
+fn reserve_port_in_range(
+    holds: &mut Vec<std::net::TcpListener>,
+    start: u16,
+    end: u16,
+) -> Option<u16> {
+    (start..=end).find(
+        |port| match std::net::TcpListener::bind(format!("127.0.0.1:{port}")) {
             Ok(listener) => {
                 holds.push(listener);
                 true
             }
             Err(_) => false,
-        }
-    })
+        },
+    )
 }
 
 /// Ticket 36: splice a loopback-only clash controller into a generated
@@ -5521,19 +5534,37 @@ fn unconfirmed_lan(
 /// `timeout` for the exit, escalates with a second kill, then gives up rather
 /// than hanging the UI thread (a SIGKILL-equivalent reap is near-certain, so
 /// the give-up arm is pathological only).
-fn wait_child_bounded(child: &mut std::process::Child, timeout: Duration) {
+/// Ticket 48: the reap target is a trait seam ([`WaitTarget`]) so the
+/// give-up arm is provable with a stub that never exits — behavior on real
+/// children is unchanged.
+trait WaitTarget {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+}
+
+impl WaitTarget for std::process::Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        std::process::Child::kill(self)
+    }
+}
+
+fn wait_child_bounded(target: &mut impl WaitTarget, timeout: Duration) {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        match child.try_wait() {
+        match target.try_wait() {
             Ok(Some(_)) => return,
             Ok(None) => {}
             Err(_) => return,
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
+    let _ = target.kill();
     for _ in 0..20 {
-        match child.try_wait() {
+        match target.try_wait() {
             Ok(Some(_)) => return,
             Ok(None) => {}
             Err(_) => return,
@@ -12441,6 +12472,143 @@ Active Connections\r
         assert!(
             text.contains("endpoint"),
             "names the missing endpoint design: {text}"
+        );
+    }
+
+    // -- Ticket 48: lifecycle / port-race / reap proofs --------------------
+
+    /// Ticket 48 (US-63): an exhausted reservation range yields None
+    /// (the caller names the range instead of racing), and a freed range
+    /// reserves again. Proved on a small private range with real loopback
+    /// listeners — the shared clash range would race parallel controller
+    /// holds (ticket-39 class flake), and production delegates unchanged.
+    #[test]
+    fn t48_clash_reservation_none_when_exhausted() {
+        const START: u16 = 12777;
+        const END: u16 = 12778;
+        let mut held = Vec::new();
+        for port in START..=END {
+            held.push(
+                std::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+                    .expect("private range binds"),
+            );
+        }
+        let mut extra = Vec::new();
+        assert!(
+            reserve_port_in_range(&mut extra, START, END).is_none(),
+            "exhausted range yields None"
+        );
+        drop(held);
+        let mut fresh = Vec::new();
+        assert!(
+            reserve_port_in_range(&mut fresh, START, END).is_some(),
+            "freed range reserves again"
+        );
+    }
+
+    /// Ticket 48 (US-63): the give-up arm returns instead of hanging when
+    /// a child never exits and ignores kills (pathological only on real
+    /// children — SIGKILL-equivalent reap is near-certain there).
+    #[test]
+    fn t48_wait_give_up_arm_returns() {
+        struct NeverExits {
+            kills: usize,
+        }
+
+        impl WaitTarget for NeverExits {
+            fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+                Ok(None)
+            }
+
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.kills += 1;
+                Ok(())
+            }
+        }
+
+        let mut stub = NeverExits { kills: 0 };
+        let start = Instant::now();
+        wait_child_bounded(&mut stub, Duration::from_millis(10));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "give-up returns instead of hanging"
+        );
+        assert!(stub.kills >= 1, "escalation kill attempted");
+    }
+
+    /// Ticket 48 (US-61): sidecar lifecycle against stub executables —
+    /// a real exited child reaps via `poll_exit` (named cause, cleared
+    /// slot), a real sleeping child dies fast via `stop_child` (buffer
+    /// cleared, generation fenced), and `drain_log_lines` takes the
+    /// producer's buffered lines. No sing-box, loopback only.
+    #[cfg(windows)]
+    #[test]
+    fn t48_stub_executable_lifecycle() {
+        use std::io::BufRead as _;
+
+        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+
+        // Exited stub: two stderr lines, then exit 3.
+        let mut exiter = std::process::Command::new(&comspec)
+            .args(["/c", "(echo line-one>&2 & echo line-two>&2 & exit 3)"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("stub spawns");
+        let pipe = exiter.stderr.take().expect("stderr piped");
+        let reader = std::io::BufReader::new(pipe);
+        // `echo x>&2` trails a space on cmd — content asserted trimmed.
+        let lines: Vec<String> = reader
+            .lines()
+            .map(|line| line.expect("stub stderr reads").trim_end().to_string())
+            .collect();
+        assert_eq!(lines, vec!["line-one", "line-two"]);
+
+        let mut backend = RealEngineBackend::new();
+        backend.child = Some(exiter);
+        assert!(backend.is_running());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cause = loop {
+            if let Some(cause) = backend.poll_exit() {
+                break cause;
+            }
+            assert!(Instant::now() < deadline, "exited stub reaps");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(cause.contains("engine exited"), "named cause: {cause}");
+        assert!(cause.contains('3'), "exit code carried: {cause}");
+        assert!(backend.poll_exit().is_none(), "reap is once");
+        assert!(!backend.is_running());
+
+        // Buffered lines drain through the real producer path, then clear.
+        let buffer = backend.log_buffer.clone();
+        let gen = backend.reader_gen;
+        push_pipe_line(&buffer, gen, "sidecar-hello".to_string());
+        assert_eq!(backend.drain_log_lines(), vec!["sidecar-hello"]);
+        assert!(backend.drain_log_lines().is_empty(), "drain takes");
+
+        // Sleeping stub: `stop_child` kills fast and fences the reader.
+        let sleeper = std::process::Command::new(&comspec)
+            .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sleeper spawns");
+        let pid = sleeper.id();
+        backend.child = Some(sleeper);
+        push_pipe_line(&buffer, backend.reader_gen, "stale-line".to_string());
+        let start = Instant::now();
+        backend.stop_child();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "stop never hangs the caller"
+        );
+        assert!(!backend.is_running(), "child reaped (pid {pid})");
+        assert!(
+            backend.drain_log_lines().is_empty(),
+            "stop drops stale lines with the sidecar"
         );
     }
 }

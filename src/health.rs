@@ -2473,4 +2473,109 @@ mod tests {
         assert!(!store.is_stale("1"));
         assert!(!store.detail_line("1").contains("stale"));
     }
+
+    // -- Ticket 48: clash error-arm table + probe edges ---------------------
+
+    /// One canned HTTP reply per accepted connection (raw bytes, exactly
+    /// what a hostile or broken controller could send).
+    fn stub_clash_raw(replies: Vec<Vec<u8>>) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        let server = std::thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().expect("accept works");
+                let mut head = [0u8; 4096];
+                let _ = stream.read(&mut head);
+                // Best-effort: the oversize arm stops reading at its cap
+                // and goes away mid-write (RST), which must not fail the stub.
+                let _ = stream.write_all(&reply);
+            }
+        });
+        (port, server)
+    }
+
+    fn http_reply(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Ticket 48 (US-64): every clash error shape maps to its typed
+    /// outcome — oversize, 401, non-200, malformed headers, garbage
+    /// status, non-JSON 200 body — on the TcpListener harness. The tick
+    /// skips these rows keeping last totals, never zeroing.
+    #[test]
+    fn t48_clash_error_arm_table() {
+        use std::time::Duration;
+        let oversize = vec![b'x'; 2_200_000];
+        let (port, server) = stub_clash_raw(vec![
+            http_reply("200 OK", &oversize),
+            http_reply("401 Unauthorized", br#"{"error":"unauthorized"}"#),
+            http_reply("500 Internal Server Error", b"boom"),
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nno-headers-end".to_vec(),
+            b"not even a status line\r\n\r\n{}".to_vec(),
+            http_reply("200 OK", b"not json"),
+        ]);
+        let timeout = Duration::from_secs(5);
+        for (index, &needle) in [
+            "response too large",
+            "unauthorized",
+            "unexpected status 500",
+            "malformed response",
+            "bad response",
+            "not JSON",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let error = crate::health::poll_clash_totals(port, "s3cret", timeout)
+                .expect_err(&format!("arm {index} must fail"));
+            assert!(
+                error.contains(needle),
+                "arm {index}: typed cause ({needle}), got {error}"
+            );
+        }
+        server.join().expect("stub drains");
+    }
+
+    /// Ticket 48 (US-64): probe-destination edges — www folding in both
+    /// directions, IPv4-mapped IPv6, junk (non-numeric) port suffixes,
+    /// and empty sides never matching.
+    #[test]
+    fn t48_probe_destination_edges() {
+        let probe = "example.com";
+        // www folding is dest-driven: a www clash entry folds against
+        // the probe, but a bare entry never folds up to a www probe
+        // (apex traffic stays counted, never hidden as probes).
+        assert!(is_probe_destination("www.example.com", probe));
+        assert!(!is_probe_destination("example.com", "www.example.com"));
+        assert!(is_probe_destination("WWW.EXAMPLE.COM.:443", probe));
+        // IPv4-mapped IPv6 reporters match the v4 probe IP.
+        let ips = vec!["93.184.216.34".parse().expect("ip parses")];
+        assert!(is_probe_destination_with_ips(
+            "::ffff:93.184.216.34",
+            probe,
+            &ips
+        ));
+        assert!(!is_probe_destination_with_ips(
+            "::ffff:203.0.113.7",
+            probe,
+            &ips
+        ));
+        // Only numeric tails are ports: junk suffixes are names, never a
+        // match for the bare probe host.
+        assert!(!is_probe_destination("example.com:abc", probe));
+        assert!(!is_probe_destination("example.com:", probe));
+        // Empty sides never match, whatever the other side holds.
+        assert!(!is_probe_destination("", probe));
+        assert!(!is_probe_destination("example.com", ""));
+        assert!(!is_probe_destination("", ""));
+        // Case and trailing-dot variants of an exact probe still match.
+        assert!(is_probe_destination("EXAMPLE.COM.", probe));
+    }
 }

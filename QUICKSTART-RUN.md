@@ -85,6 +85,36 @@ ranges is an honest error, never a silent reuse
 (`ticket27_auto_ports_assign_250_with_spillover_and_honest_exhaustion`).
 Live: blank-port adds past 199 rows keep assigning (spillover), all unique.
 
+## Opt-in live CI (pinned sidecar, default off)
+
+The default suite is hermetic: `cargo test` with no gate env vars runs
+517+ unit/headless tests and every live test returns immediately, so no
+run downloads anything or spawns a real sidecar. The live proofs run
+only in the opt-in CI job `.github/workflows/live.yml`:
+
+- Trigger: manual `workflow_dispatch` only (never push/PR). Input
+  `singbox_version` pins the binary (default `1.14.2`, the generator
+  target); the job downloads that exact release zip, extracts
+  `sing-box.exe` to `target/debug/`, and points `MANYPROXY_SINGBOX_BIN`
+  at it.
+- Gates: `MANYPROXY_LIVE_CHECK=1` (stock `check` over every generated
+  row shape — `t32_live_singbox_check_accepts_standard_rows`, TEMP
+  files only, removed afterwards) and `MANYPROXY_LIVE_TRAFFIC=1`
+  (real sidecar + clash totals/Auth/totals-move —
+  `ticket36_live_clash_totals_move`, loopback + TEMP files only, the
+  sidecar is killed before return).
+- The job also runs `cargo fmt --check` and
+  `cargo clippy --all-targets` (deny warnings), same as the hermetic gate.
+
+Local opt-in run (same shape, your own binary):
+
+```powershell
+$env:MANYPROXY_SINGBOX_BIN = "C:\path\to\sing-box.exe"
+$env:MANYPROXY_LIVE_CHECK = "1"
+$env:MANYPROXY_LIVE_TRAFFIC = "1"
+cargo test
+```
+
 ## Secrets audit (grep-level proof)
 
 - `redact_secrets_covers_credential_forms` (health log ingest: key=value,
