@@ -443,9 +443,11 @@ fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot>
 /// input allows blank-means-auto and plain digits, while link/JSON ports
 /// enforce the strict grammar (no leading zeros/signs, multi-port
 /// first-wins); one parser would change rejections on one path.
+/// Ticket 43: the word `auto` (any case, padded or not) also means
+/// auto-assign, so an edited concrete port can return to auto by typing it.
 pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
         return Ok(None);
     }
     match trimmed.parse::<u32>() {
@@ -477,6 +479,16 @@ pub fn proxy_urls(bind_ip: &str, port: u16) -> (String, String) {
 /// Confirm-dialog description for removing a config. Names the config.
 pub fn delete_confirm_text(name: &str) -> String {
     format!("Remove \"{name}\"? The stored configuration is deleted. Nothing else changes.")
+}
+
+/// Ticket 43: confirm-dialog description for removing a RUNNING config. The
+/// endpoint stops first, and the copy says so — the stopped-row text above
+/// would lie here.
+pub fn delete_running_confirm_text(name: &str) -> String {
+    format!(
+        "Remove \"{name}\"? Its endpoint is running and will be stopped first, \
+         then the stored configuration is deleted."
+    )
 }
 
 /// Ticket 09: explicit warning copy for any user-owned plaintext export.
@@ -1997,6 +2009,35 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
+    /// Ticket 43: rename a preset (manager edit path). The new name validates
+    /// like create (blank fails); a taken name fails with the same
+    /// already-exists copy — never a silent overwrite. Rules are untouched.
+    pub fn rename_preset(&mut self, id: &str, name: &str) -> Result<RoutePreset, StoreError> {
+        let name = Self::validated_preset_name(name)?;
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        match self.conn.execute(
+            "UPDATE route_presets SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![name, now_unix(), rowid],
+        ) {
+            Ok(0) => return Err(StoreError::NotFound(id.to_string())),
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "name",
+                    format!("preset \"{name}\" already exists"),
+                )]));
+            }
+            Err(error) => return Err(StoreError::Sql(error)),
+        }
+        self.get_preset(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
     /// Append one rule object to a preset (manager add-rule). The rule
     /// validates in place: the rejection names the (new) rule index + field.
     /// Test-covered store seam for the manager add-rule scenario (the v1
@@ -3339,6 +3380,39 @@ impl Store {
         Ok(totals)
     }
 
+    /// Ticket 43: zero one row's data-plane totals (per-row reset, behind a
+    /// confirm in the UI). `NotFound` for ghost rows — never a silent no-op.
+    pub fn reset_traffic(&mut self, id: &str) -> Result<(), StoreError> {
+        let rowid: i64 = id
+            .parse()
+            .map_err(|_| StoreError::NotFound(id.to_string()))?;
+        let changed = self.conn.execute(
+            "UPDATE proxy_configs SET traffic_rx = 0, traffic_tx = 0 WHERE id = ?1",
+            params![rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Ticket 43: zero every row's data-plane totals (Settings "clear
+    /// traffic"). Returns the row count so the toast can name it.
+    pub fn clear_all_traffic(&mut self) -> Result<usize, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE proxy_configs SET traffic_rx = 0, traffic_tx = 0",
+            [],
+        )?;
+        Ok(changed)
+    }
+
+    /// Ticket 43: drop every persisted health snapshot (Settings "clear
+    /// health"). Returns the row count so the toast can name it.
+    pub fn clear_health_snapshots(&mut self) -> Result<usize, StoreError> {
+        let changed = self.conn.execute("DELETE FROM health_snapshots", [])?;
+        Ok(changed)
+    }
+
     // -- Ticket 12: health snapshot persistence ------------------------------
 
     /// Persist one config's latest sample (upsert keyed by `config_id`).
@@ -3401,6 +3475,10 @@ impl Store {
     pub const META_RESTORE_RUNNING: &str = "restore_running";
     /// Meta key behind the running-set snapshot (JSON array of config ids).
     pub const META_RUNNING_IDS: &str = "running_ids";
+    /// Ticket 43: meta key behind the global probe-URL override (unset means
+    /// the documented default). Per-row overrides live under
+    /// `test_url:<config_id>`.
+    pub const META_TEST_URL: &str = "test_url";
 
     /// Read one meta value (`None` when unset). Callers decide the default.
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -3445,6 +3523,68 @@ impl Store {
         )
         .to_string();
         self.set_meta(Self::META_RUNNING_IDS, &value)
+    }
+
+    /// Ticket 43: clear the running snapshot (Settings "reset snapshot").
+    /// A later launch restores nothing; the live engine is untouched.
+    pub fn clear_running_snapshot(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::META_RUNNING_IDS],
+        )?;
+        Ok(())
+    }
+
+    /// Ticket 43: global probe-URL override (`None` means the documented
+    /// default). Blank reads as unset, never as a URL.
+    pub fn test_url(&self) -> Option<String> {
+        match self.get_meta(Self::META_TEST_URL) {
+            Ok(Some(url)) if !url.trim().is_empty() => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Ticket 43: persist the global probe-URL override (validated upstream;
+    /// stored trimmed).
+    pub fn set_test_url(&mut self, url: &str) -> Result<(), StoreError> {
+        self.set_meta(Self::META_TEST_URL, url.trim())
+    }
+
+    /// Ticket 43: drop the global probe-URL override (back to the default).
+    pub fn clear_test_url(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::META_TEST_URL],
+        )?;
+        Ok(())
+    }
+
+    /// Ticket 43: meta key for one row's probe-URL override.
+    fn row_test_url_key(id: &str) -> String {
+        format!("{}:{id}", Self::META_TEST_URL)
+    }
+
+    /// Ticket 43: one row's probe-URL override (`None` falls back to the
+    /// global override, then the default). Blank reads as unset.
+    pub fn row_test_url(&self, id: &str) -> Option<String> {
+        match self.get_meta(&Self::row_test_url_key(id)) {
+            Ok(Some(url)) if !url.trim().is_empty() => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Ticket 43: persist one row's probe-URL override (validated upstream).
+    pub fn set_row_test_url(&mut self, id: &str, url: &str) -> Result<(), StoreError> {
+        self.set_meta(&Self::row_test_url_key(id), url.trim())
+    }
+
+    /// Ticket 43: drop one row's probe-URL override (back to the global).
+    pub fn clear_row_test_url(&mut self, id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::row_test_url_key(id)],
+        )?;
+        Ok(())
     }
 
     /// Load the running-set snapshot. Missing or corrupt reads as empty
@@ -6559,6 +6699,152 @@ mod tests {
         assert_eq!(
             store.get_meta("k").expect("read works"),
             Some("b".to_string())
+        );
+    }
+
+    /// Ticket 43: the word `auto` (any case) means auto-assign, like blank.
+    #[test]
+    fn port_field_auto_word_means_auto_assign() {
+        assert_eq!(super::parse_port_field("").expect("blank ok"), None);
+        assert_eq!(super::parse_port_field("auto").expect("auto ok"), None);
+        assert_eq!(super::parse_port_field("AUTO").expect("AUTO ok"), None);
+        assert_eq!(
+            super::parse_port_field("  Auto  ").expect("padded ok"),
+            None
+        );
+        assert_eq!(
+            super::parse_port_field("10801").expect("digits ok"),
+            Some(10801)
+        );
+    }
+
+    /// Ticket 43: global test-URL override round-trips; empty reads as unset.
+    #[test]
+    fn test_url_global_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(store.test_url(), None, "unset by default");
+        store
+            .set_test_url("https://example.com/ping")
+            .expect("write works");
+        assert_eq!(
+            store.test_url(),
+            Some("https://example.com/ping".to_string())
+        );
+        store.clear_test_url().expect("clear works");
+        assert_eq!(store.test_url(), None, "clear returns to default");
+    }
+
+    /// Ticket 43: per-row test-URL override round-trips independently.
+    #[test]
+    fn test_url_row_override_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(valid_input("probe-me")).expect("seed works");
+        assert_eq!(store.row_test_url(&row.id), None, "unset by default");
+        store
+            .set_row_test_url(&row.id, "http://192.0.2.1/health")
+            .expect("write works");
+        assert_eq!(
+            store.row_test_url(&row.id),
+            Some("http://192.0.2.1/health".to_string())
+        );
+        store.clear_row_test_url(&row.id).expect("clear works");
+        assert_eq!(store.row_test_url(&row.id), None, "clear returns to global");
+    }
+
+    /// Ticket 43: per-row traffic reset zeroes one row; clear-all zeroes all.
+    #[test]
+    fn traffic_reset_and_clear_all() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store.add(valid_input("traffic-a")).expect("seed works");
+        let beta = store.add(valid_input("traffic-b")).expect("seed works");
+        store.add_traffic(&alpha.id, 1000, 50).expect("delta lands");
+        store.add_traffic(&beta.id, 2000, 70).expect("delta lands");
+        store.reset_traffic(&alpha.id).expect("reset works");
+        let totals = store.traffic_totals().expect("totals read");
+        assert_eq!(totals.get(&alpha.id), Some(&(0, 0)), "alpha zeroed");
+        assert_eq!(totals.get(&beta.id), Some(&(2000, 70)), "beta untouched");
+        assert!(
+            store.reset_traffic("999999").is_err(),
+            "ghost reset fails loudly"
+        );
+        let cleared = store.clear_all_traffic().expect("clear-all works");
+        assert_eq!(cleared, 2, "both rows cleared");
+        let totals = store.traffic_totals().expect("totals read");
+        assert_eq!(totals.get(&beta.id), Some(&(0, 0)), "beta zeroed");
+    }
+
+    /// Ticket 43: preset rename validates + keeps rules; duplicates fail.
+    #[test]
+    fn preset_rename_validates_and_keeps_rules() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .create_preset("first", "manual", None, &[])
+            .expect("seed works");
+        store
+            .create_preset("second", "manual", None, &[])
+            .expect("seed works");
+        let renamed = store
+            .rename_preset(&preset.id, "renamed")
+            .expect("rename works");
+        assert_eq!(renamed.name, "renamed");
+        assert!(
+            store.rename_preset(&preset.id, "   ").is_err(),
+            "blank rename fails"
+        );
+        assert!(
+            store.rename_preset(&preset.id, "second").is_err(),
+            "duplicate rename fails"
+        );
+        assert!(
+            store.rename_preset("999999", "ghost").is_err(),
+            "ghost rename fails"
+        );
+    }
+
+    /// Ticket 43: the running-remove confirm promises stop-first.
+    #[test]
+    fn delete_running_confirm_promises_stop_first() {
+        let stopped = super::delete_confirm_text("Work");
+        assert!(
+            !stopped.contains("stopped"),
+            "idle text claims nothing: {stopped}"
+        );
+        let running = super::delete_running_confirm_text("Work");
+        assert!(running.contains("Work"), "names row: {running}");
+        assert!(
+            running.contains("stopped first"),
+            "promises stop-first: {running}"
+        );
+    }
+
+    /// Ticket 43: clearing health snapshots empties the table.
+    #[test]
+    fn clear_health_snapshots_empties() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(valid_input("health-me")).expect("seed works");
+        store
+            .save_health_snapshot(&super::HealthSnapshot {
+                config_id: row.id.clone(),
+                at: 1,
+                kind: "url-test".to_string(),
+                latency_ms: Some(21),
+                error: None,
+            })
+            .expect("snapshot saves");
+        assert!(
+            !store
+                .load_health_snapshots()
+                .expect("load works")
+                .is_empty(),
+            "snapshot present"
+        );
+        store.clear_health_snapshots().expect("clear works");
+        assert!(
+            store
+                .load_health_snapshots()
+                .expect("load works")
+                .is_empty(),
+            "snapshots cleared"
         );
     }
 }
