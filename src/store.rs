@@ -1528,7 +1528,11 @@ impl Store {
                 updated_at INTEGER
               ) STRICT;
               CREATE INDEX IF NOT EXISTS idx_route_presets_name
-                ON route_presets(name);",
+                ON route_presets(name);
+             CREATE TABLE IF NOT EXISTS meta (
+               key TEXT PRIMARY KEY,
+               value TEXT NOT NULL DEFAULT ''
+             ) STRICT;",
         )?;
         // Ticket 37: per-row preset attachment (null = none; validated on
         // attach, so no FK — a dangling id fails loudly at merge time).
@@ -3389,6 +3393,74 @@ impl Store {
             .query_map([], map_snapshot_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // -- Ticket 38: opt-in autostart/restore state --------------------------
+
+    /// Meta key behind the session-restore opt-in (`"1"` = on).
+    pub const META_RESTORE_RUNNING: &str = "restore_running";
+    /// Meta key behind the running-set snapshot (JSON array of config ids).
+    pub const META_RUNNING_IDS: &str = "running_ids";
+
+    /// Read one meta value (`None` when unset). Callers decide the default.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write one meta value (upsert).
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// True only when the user opted into session restore. A broken read
+    /// fails closed (no restore), never open.
+    pub fn restore_running(&self) -> bool {
+        self.get_meta(Self::META_RESTORE_RUNNING)
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    /// Persist the session-restore opt-in (explicit Settings checkbox only).
+    pub fn set_restore_running(&mut self, on: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_RESTORE_RUNNING, if on { "1" } else { "0" })
+    }
+
+    /// Persist the currently running set for a later restore. Best-effort
+    /// bookkeeping (like health snapshots): callers ignore errors.
+    pub fn save_running_snapshot(&mut self, ids: &[String]) -> Result<(), StoreError> {
+        let value = serde_json::Value::Array(
+            ids.iter()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .collect(),
+        )
+        .to_string();
+        self.set_meta(Self::META_RUNNING_IDS, &value)
+    }
+
+    /// Load the running-set snapshot. Missing or corrupt reads as empty
+    /// (never a crash, never a guessed row).
+    pub fn load_running_snapshot(&self) -> Vec<String> {
+        let raw = match self.get_meta(Self::META_RUNNING_IDS) {
+            Ok(Some(raw)) => raw,
+            _ => return Vec::new(),
+        };
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// First free port in the auto range, given the set of taken ports.
@@ -6435,5 +6507,58 @@ mod tests {
             .expect("get works")
             .expect("preset survives restore");
         assert_eq!(kept.rules().expect("rules decode").len(), 3);
+    }
+    /// Ticket 38: restore opt-in defaults off and round-trips (explicit
+    /// checkbox only — nothing enables it silently).
+    #[test]
+    fn restore_running_defaults_off_and_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(!store.restore_running(), "default off");
+        store.set_restore_running(true).expect("opt-in writes");
+        assert!(store.restore_running(), "opt-in reads back");
+        store.set_restore_running(false).expect("opt-out writes");
+        assert!(!store.restore_running(), "opt-out reads back");
+    }
+
+    /// Ticket 38: running-set snapshot round-trips; missing reads empty;
+    /// corrupt JSON reads empty (never a crash, never a guessed row).
+    #[test]
+    fn running_snapshot_round_trips_and_fails_empty() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(
+            store.load_running_snapshot().is_empty(),
+            "missing reads empty"
+        );
+        store
+            .save_running_snapshot(&["3".to_string(), "7".to_string()])
+            .expect("snapshot writes");
+        assert_eq!(
+            store.load_running_snapshot(),
+            vec!["3".to_string(), "7".to_string()]
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = 'not-json{{' WHERE key = 'running_ids'",
+                [],
+            )
+            .expect("corrupt the snapshot");
+        assert!(
+            store.load_running_snapshot().is_empty(),
+            "corrupt reads empty"
+        );
+    }
+
+    /// Ticket 38: meta upserts (same key twice keeps the latest).
+    #[test]
+    fn meta_upserts() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(store.get_meta("k").expect("read works"), None);
+        store.set_meta("k", "a").expect("write works");
+        store.set_meta("k", "b").expect("rewrite works");
+        assert_eq!(
+            store.get_meta("k").expect("read works"),
+            Some("b".to_string())
+        );
     }
 }
