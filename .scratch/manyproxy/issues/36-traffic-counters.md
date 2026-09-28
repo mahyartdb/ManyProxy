@@ -13,3 +13,5 @@
 - [ ] Scenario: app restart → Action: relaunch → Expected: counters resume from persisted totals, never zeroed. Verification: automated test. Priority: required.
 - [ ] Scenario: clash shape → Action: poll stock sing-box 1.14.2 `/connections` → Expected: totals parse, Bearer auth accepted (verified live before building). Verification: live binary check. Priority: required.
 - [ ] Prohibited side effect: no new dependencies; controller ports never collide with endpoint ports; secrets never logged.
+
+**Status:** done (commit 3d0ef54; 424 serial green, fmt+clippy clean, live clash proof vs sing-box 1.14.2)
