@@ -19,7 +19,6 @@
 //! or displayed log lines ([`redact_secrets`] runs on every ingest).
 
 use std::collections::HashMap;
-#[cfg(test)]
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -454,11 +453,15 @@ pub enum RowState {
 }
 
 /// Latest-sample view for one row (dead carries the named cause).
+/// Ticket 41: dead rows also carry the classified kind (DNS vs local vs
+/// egress) so health tells resolution failure apart from reachability
+/// failure without changing the displayed cause copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowHealth {
     pub state: RowState,
     pub latency_ms: Option<u64>,
     pub cause: Option<String>,
+    pub cause_kind: Option<HealthCause>,
 }
 
 /// Accumulated traffic for one config.
@@ -582,28 +585,198 @@ pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
 /// host (probe flows must never pollute data-plane counters). Shared by
 /// [`attribute_entries`] and the traffic tick so the exclusion can never
 /// drift between the two.
+/// Ticket 41: both sides normalize (lowercase, no port, no trailing dot —
+/// see [`normalize_probe_host`]) and resolved probe IPs match too (see
+/// [`is_probe_destination_with_ips`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_probe_destination(dest: &str, probe_host: &str) -> bool {
-    !probe_host.is_empty()
-        && (dest == probe_host
-            || dest
-                .strip_prefix("www.")
-                .is_some_and(|rest| probe_host.strip_prefix("www.").unwrap_or(probe_host) == rest))
+    is_probe_destination_with_ips(dest, probe_host, &[])
+}
+
+/// Ticket 41: normalize one clash-entry destination / probe host for
+/// attribution: lowercase, strip scheme + path/query, strip one `:port`
+/// suffix (single-colon hosts only — bare IPv6 keeps its colons), strip
+/// brackets, strip one trailing dot. `www.` folding stays in the caller
+/// (probe hosts are single-sourced from [`DEFAULT_TEST_URL`]).
+pub fn normalize_probe_host(raw: &str) -> String {
+    let mut host = raw.trim().to_ascii_lowercase();
+    if let Some(rest) = host
+        .strip_prefix("http://")
+        .or_else(|| host.strip_prefix("https://"))
+    {
+        host = rest.to_string();
+    }
+    if let Some(end) = host.find(['/', '?', '#']) {
+        host.truncate(end);
+    }
+    // Bracketed IPv6 (`[::1]` or `[::1]:port`).
+    if let Some(inner) = host.strip_prefix('[') {
+        if let Some(end) = inner.find(']') {
+            return inner[..end].trim_end_matches('.').to_string();
+        }
+        return inner.trim_end_matches('.').to_string();
+    }
+    // Bare IPv6 (two or more colons) never carries a port suffix here.
+    if host.chars().filter(|c| *c == ':').count() >= 2 {
+        return host.trim_end_matches('.').to_string();
+    }
+    // One optional `:port` suffix (numeric tail only — a junk suffix is
+    // part of the name, never a port).
+    if let Some((head, tail)) = host.rsplit_once(':') {
+        if !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()) {
+            host = head.to_string();
+        }
+    }
+    host.trim_end_matches('.').to_string()
+}
+
+/// Ticket 41: probe-destination match over normalized forms, plus resolved
+/// probe IPs: a clash entry whose destination is the probe host's resolved
+/// IP (the common case — clash reports `destinationIP` while health dials
+/// the name) is still a probe flow, in every casing/port/dot variant.
+pub fn is_probe_destination_with_ips(
+    dest: &str,
+    probe_host: &str,
+    probe_ips: &[std::net::IpAddr],
+) -> bool {
+    if probe_host.is_empty() {
+        return false;
+    }
+    let (dest, probe) = (normalize_probe_host(dest), normalize_probe_host(probe_host));
+    if dest.is_empty() || probe.is_empty() {
+        return false;
+    }
+    if dest == probe
+        || dest
+            .strip_prefix("www.")
+            .is_some_and(|rest| probe.strip_prefix("www.").unwrap_or(&probe) == rest)
+    {
+        return true;
+    }
+    // Resolved-IP leg: compare as addresses (string forms can spell one IP
+    // several ways — `::ffff:1.2.3.4` vs `1.2.3.4`).
+    if let Ok(dest_ip) = dest.parse::<std::net::IpAddr>() {
+        if probe_ips.contains(&dest_ip) {
+            return true;
+        }
+        // IPv4-mapped IPv6 normalization for mixed reporters.
+        if let std::net::IpAddr::V6(v6) = dest_ip {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                let mapped = std::net::IpAddr::V4(mapped);
+                if probe_ips.contains(&mapped) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Ticket 41: best-effort resolution of the probe host to its IPs (numeric
+/// fast path, real DNS otherwise). Empty on failure (fail-open: the
+/// hostname leg above still applies — resolution must never turn a probe
+/// into data-plane bytes, nor data-plane bytes into a probe).
+pub fn resolve_probe_ips(host: &str) -> Vec<std::net::IpAddr> {
+    let normalized = normalize_probe_host(host);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
+        return vec![ip];
+    }
+    use std::net::ToSocketAddrs as _;
+    let mut ips: Vec<std::net::IpAddr> = (normalized.as_str(), 80)
+        .to_socket_addrs()
+        .map(|addrs| {
+            let mut out: Vec<std::net::IpAddr> = addrs.map(|addr| addr.ip()).collect();
+            out.sort();
+            out.dedup();
+            out
+        })
+        .unwrap_or_default();
+    ips.truncate(16);
+    ips
+}
+
+/// Ticket 41: health-cause classifier — DNS failures (the name never
+/// resolved) vs local failures (bind/permission/reserved/port) vs egress
+/// failures (the far end unreachable/refused/timed out). The validation
+/// gate fails fast with [`crate::engine::EngineError::DnsFailure`]; this
+/// is the probe-time twin so health rows read DNS-vs-egress honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthCause {
+    Dns,
+    Local,
+    Egress,
+}
+
+/// Ticket 41: classify one health/probe cause string. Matching is
+/// case-insensitive substring over the cause text (causes are already
+/// redacted upstream — no secrets reach this match).
+pub fn classify_health_cause(cause: &str) -> HealthCause {
+    let lowered = cause.to_ascii_lowercase();
+    const DNS_MARKERS: &[&str] = &[
+        "dns",
+        "resolv",
+        "lookup",
+        "nodename",
+        "nxdomain",
+        "no such host",
+        "name or service not known",
+        "getaddrinfo",
+        "eai_",
+        "temporary failure in name resolution",
+    ];
+    const LOCAL_MARKERS: &[&str] = &[
+        "loopback",
+        "lan confirm",
+        "privileged",
+        "permission",
+        "reserved",
+        "port in use",
+        "already in use",
+        "cannot assign",
+        "bind",
+        "bad local port",
+        "bad bind",
+    ];
+    if DNS_MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        return HealthCause::Dns;
+    }
+    if LOCAL_MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        return HealthCause::Local;
+    }
+    HealthCause::Egress
 }
 
 /// Ticket 36: sum entry bytes per row, excluding flows to the health-test
 /// host (probes must never pollute data-plane counters) and entries no
 /// row claims. Returns `row_id -> (rx, tx)`.
+/// Ticket 41: hostname-leg only; use [`attribute_entries_with_ips`] when
+/// the probe host's resolved IPs are known.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn attribute_entries(
     entries: &[ClashConn],
     probe_host: &str,
+) -> std::collections::HashMap<String, (u64, u64)> {
+    attribute_entries_with_ips(entries, probe_host, &[])
+}
+
+/// Ticket 41: [`attribute_entries`] plus the resolved-IP leg — probe flows
+/// addressed by resolved IP (case/port/dot variants included) are excluded
+/// from usage counters in all variants.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn attribute_entries_with_ips(
+    entries: &[ClashConn],
+    probe_host: &str,
+    probe_ips: &[std::net::IpAddr],
 ) -> std::collections::HashMap<String, (u64, u64)> {
     let mut totals = std::collections::HashMap::new();
     for entry in entries {
         let Some(row) = entry.row_id.as_deref() else {
             continue;
         };
-        if is_probe_destination(&entry.dest, probe_host) {
+        if is_probe_destination_with_ips(&entry.dest, probe_host, probe_ips) {
             continue;
         }
         let slot = totals.entry(row.to_string()).or_insert((0u64, 0u64));
@@ -703,6 +876,10 @@ pub struct HealthStore {
     /// (persisted) after every clash poll. Present means the row is
     /// clash-tracked; absent rows keep the probe-byte display.
     data_traffic: HashMap<String, (u64, u64)>,
+    /// Ticket 41: per-row stale-totals markers — set when a crash drops the
+    /// row's core (dead sockets are skipped, last totals kept but flagged),
+    /// cleared on the next successful poll of the row.
+    stale: HashSet<String>,
 }
 
 impl HealthStore {
@@ -784,6 +961,7 @@ impl HealthStore {
                 state: RowState::Unknown,
                 latency_ms: None,
                 cause: None,
+                cause_kind: None,
             };
         }
         let dead_cause = url
@@ -794,6 +972,7 @@ impl HealthStore {
                 state: RowState::Dead,
                 latency_ms: None,
                 cause: Some(cause.to_string()),
+                cause_kind: Some(classify_health_cause(cause)),
             },
             None => RowHealth {
                 state: RowState::Live,
@@ -801,6 +980,7 @@ impl HealthStore {
                     .and_then(|sample| sample.latency_ms)
                     .or_else(|| ping.and_then(|sample| sample.latency_ms)),
                 cause: None,
+                cause_kind: None,
             },
         }
     }
@@ -830,6 +1010,31 @@ impl HealthStore {
         self.data_traffic.get(config_id).copied()
     }
 
+    /// Ticket 41: mark one row's totals stale (its core crashed and ticks
+    /// skip it — last totals are kept but flagged, never trusted fresh).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn mark_stale(&mut self, config_id: &str) {
+        self.stale.insert(config_id.to_string());
+    }
+
+    /// Ticket 41: mark several rows stale at once (one crash drops a whole
+    /// core's rows).
+    pub fn mark_stale_all(&mut self, config_ids: &[String]) {
+        self.stale.extend(config_ids.iter().cloned());
+    }
+
+    /// Ticket 41: clear one row's stale marker (its next successful poll
+    /// landed after recovery).
+    pub fn clear_stale(&mut self, config_id: &str) {
+        self.stale.remove(config_id);
+    }
+
+    /// Ticket 41: true when the row's totals are stale (crashed, skipped by
+    /// ticks until recovery).
+    pub fn is_stale(&self, config_id: &str) -> bool {
+        self.stale.contains(config_id)
+    }
+
     /// Ticket 33: probe-byte counts are labeled `probe:` — they measure
     /// health-probe request/response bytes through the row's own endpoint,
     /// never data-plane traffic (there is no data-plane meter in v1).
@@ -837,13 +1042,20 @@ impl HealthStore {
     /// probe count rides along as context. Untracked rows keep the v1
     /// probe display.
     fn traffic_text(&self, config_id: &str) -> String {
+        // Ticket 41: stale totals read as stale (crashed core, ticks
+        // skipping) — never as fresh.
+        let stale = if self.is_stale(config_id) {
+            " (stale)"
+        } else {
+            ""
+        };
         let stats = self.traffic(config_id);
         if let Some((rx, tx)) = self.data_traffic(config_id) {
             if stats.probes == 0 {
-                return format!("↑{} ↓{}", format_bytes(tx), format_bytes(rx));
+                return format!("↑{} ↓{}{stale}", format_bytes(tx), format_bytes(rx));
             }
             return format!(
-                "↑{} ↓{} · {} probe(s)",
+                "↑{} ↓{} · {} probe(s){stale}",
                 format_bytes(tx),
                 format_bytes(rx),
                 stats.probes
@@ -2085,5 +2297,180 @@ mod tests {
         assert!(split_http_url("https://example.com/x").is_ok());
         assert!(split_http_url("notaurl").is_err());
         assert!(split_http_url(DEFAULT_TEST_URL).is_ok());
+    }
+
+    // -- Ticket 41: probe attribution normalization + cause classifier ------
+
+    /// Normalization strips casing, ports, schemes, paths, brackets, and
+    /// one trailing dot; bare IPv6 keeps its colons.
+    #[test]
+    fn t41_normalize_probe_host_variants() {
+        assert_eq!(normalize_probe_host("www.gstatic.com"), "www.gstatic.com");
+        assert_eq!(
+            normalize_probe_host("WWW.GStatic.COM.:443"),
+            "www.gstatic.com"
+        );
+        assert_eq!(
+            normalize_probe_host("https://Example.COM:8443/generate_204?q=1"),
+            "example.com"
+        );
+        assert_eq!(normalize_probe_host("[::1]:8080"), "::1");
+        assert_eq!(normalize_probe_host("[::1]"), "::1");
+        assert_eq!(normalize_probe_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_probe_host("93.184.216.34:80"), "93.184.216.34");
+        assert_eq!(normalize_probe_host("  Example.COM. "), "example.com");
+        assert_eq!(normalize_probe_host(""), "");
+    }
+
+    /// Probe matching holds across case/port/dot variants and resolved IPs;
+    /// strangers and empty probes never match.
+    #[test]
+    fn t41_probe_match_variants_and_resolved_ips() {
+        let probe = "www.gstatic.com";
+        for dest in [
+            "www.gstatic.com",
+            "WWW.GSTATIC.COM:443",
+            "www.gstatic.com.",
+            "https://www.gstatic.com/generate_204",
+        ] {
+            assert!(is_probe_destination(dest, probe), "probe: {dest}");
+        }
+        assert!(!is_probe_destination("example.com", probe));
+        assert!(!is_probe_destination("www.gstatic.com", ""));
+        assert!(!is_probe_destination("", probe));
+        // Resolved-IP leg: clash reports the IP while health dials the name.
+        let ips = vec!["93.184.216.34".parse().expect("ip parses")];
+        assert!(is_probe_destination_with_ips("93.184.216.34", probe, &ips));
+        assert!(is_probe_destination_with_ips(
+            "93.184.216.34:443",
+            probe,
+            &ips
+        ));
+        assert!(!is_probe_destination_with_ips("93.184.216.34", probe, &[]));
+        assert!(!is_probe_destination_with_ips("203.0.113.7", probe, &ips));
+        // Numeric probe hosts resolve without DNS.
+        assert_eq!(resolve_probe_ips("93.184.216.34"), ips, "numeric fast path");
+        assert!(resolve_probe_ips("").is_empty());
+    }
+
+    /// Attribution excludes probe flows in every variant; legit flows count.
+    #[test]
+    fn t41_attribute_excludes_all_probe_variants() {
+        fn entry(id: &str, row: &str, dest: &str, rx: u64, tx: u64) -> ClashConn {
+            ClashConn {
+                id: id.to_string(),
+                row_id: Some(row.to_string()),
+                rx_bytes: rx,
+                tx_bytes: tx,
+                dest: dest.to_string(),
+            }
+        }
+        let probe = "www.gstatic.com";
+        let ips = vec!["93.184.216.34".parse().expect("ip parses")];
+        let entries = vec![
+            entry("a", "7", "WWW.GSTATIC.COM:443", 500, 60),
+            entry("b", "7", "www.gstatic.com.", 500, 60),
+            entry("c", "7", "93.184.216.34", 500, 60),
+            entry("d", "7", "93.184.216.34:443", 500, 60),
+            entry("e", "7", "203.0.113.7", 1000, 100),
+            entry("f", "8", "198.51.100.9", 2000, 200),
+        ];
+        let attributed = attribute_entries_with_ips(&entries, probe, &ips);
+        assert_eq!(attributed.get("7"), Some(&(1000, 100)), "{attributed:?}");
+        assert_eq!(attributed.get("8"), Some(&(2000, 200)), "{attributed:?}");
+        // Hostname-leg compat entry point still excludes exact probes.
+        let hostname_only = attribute_entries(&entries[4..], probe);
+        assert_eq!(hostname_only.get("7"), Some(&(1000, 100)));
+    }
+
+    /// The cause classifier tells DNS failure from local and egress failure.
+    #[test]
+    fn t41_classify_health_cause() {
+        for cause in [
+            "cannot resolve endpoint bad.invalid:443",
+            "DNS lookup failed: nodename nor servname",
+            "temporary failure in name resolution",
+            "getaddrinfo EAI_NONAME",
+            "no such host",
+        ] {
+            assert_eq!(classify_health_cause(cause), HealthCause::Dns, "{cause}");
+        }
+        for cause in [
+            "port 18501 is inside the reserved clash-controller range",
+            "bad local port (port 0 serves nothing)",
+            "LAN confirm required",
+            "bind permission denied",
+        ] {
+            assert_eq!(classify_health_cause(cause), HealthCause::Local, "{cause}");
+        }
+        for cause in [
+            "dial 203.0.113.7:8388: connection refused",
+            "url test timed out",
+            "upstream reset by peer",
+        ] {
+            assert_eq!(classify_health_cause(cause), HealthCause::Egress, "{cause}");
+        }
+    }
+
+    /// Dead rows carry the classified kind on the status seam; live and
+    /// unknown rows carry none.
+    #[test]
+    fn t41_status_carries_cause_kind() {
+        fn outcome(id: &str, error: Option<&str>) -> TestOutcome {
+            TestOutcome {
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at: now_unix(),
+                    kind: HealthKind::UrlTest,
+                    latency_ms: if error.is_none() { Some(9) } else { None },
+                    error: error.map(str::to_string),
+                },
+                success: None,
+            }
+        }
+        let mut store = HealthStore::default();
+        store.record_outcome(&outcome(
+            "dns",
+            Some("cannot resolve endpoint bad.invalid:443"),
+        ));
+        store.record_outcome(&outcome(
+            "egress",
+            Some("dial 203.0.113.7:8388: connection refused"),
+        ));
+        store.record_outcome(&outcome("live", None));
+        let dns = store.status("dns");
+        assert!(matches!(dns.state, RowState::Dead));
+        assert_eq!(dns.cause_kind, Some(HealthCause::Dns));
+        assert!(dns.cause.as_deref().unwrap_or("").contains("bad.invalid"));
+        let egress = store.status("egress");
+        assert_eq!(egress.cause_kind, Some(HealthCause::Egress));
+        let live = store.status("live");
+        assert!(matches!(live.state, RowState::Live));
+        assert_eq!(live.cause_kind, None);
+        assert_eq!(store.status("missing").cause_kind, None);
+    }
+
+    /// Stale markers flag crashed rows' totals and clear on fresh polls.
+    #[test]
+    fn t41_stale_markers_flag_and_clear() {
+        let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
+        let (mut prober, _) = FakeHealthProber::shared();
+        let mut store = HealthStore::default();
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+            store.record_outcome(&outcome);
+        }
+        store.set_data_traffic("1", 1_048_782, 88);
+        assert!(!store.is_stale("1"));
+        assert!(!store.detail_line("1").contains("stale"));
+        store.mark_stale("1");
+        assert!(store.is_stale("1"));
+        let line = store.detail_line("1");
+        assert!(line.contains("(stale)"), "stale reads stale: {line}");
+        assert!(line.contains("↑"), "totals kept: {line}");
+        store.mark_stale_all(&["1".to_string(), "2".to_string()]);
+        assert!(store.is_stale("2"));
+        store.clear_stale("1");
+        assert!(!store.is_stale("1"));
+        assert!(!store.detail_line("1").contains("stale"));
     }
 }

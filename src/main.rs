@@ -1067,17 +1067,26 @@ fn crash_notification_text(detail: &str) -> String {
 /// failures — each names its row). Union-level failures (port conflicts,
 /// missing binaries, check/spawn failures, bridge skew, LAN gate) stay
 /// atomic: nothing starts, exactly like before.
+/// Ticket 41: delegates to the engine seam (extended with the ticket-41
+/// row-local variants: bad bind/port, reserved ports, DNS failures) so the
+/// split can never drift between the two.
 fn is_row_local_start_error(error: &EngineError) -> bool {
-    matches!(
-        error,
-        EngineError::InvalidParamsJson { .. }
-            | EngineError::BadParams { .. }
-            | EngineError::UnsupportedProtocol { .. }
-            | EngineError::BadAwg { .. }
-            | EngineError::WrongLayer { .. }
-            | EngineError::BadCustom { .. }
-            | EngineError::ChainViolation { .. }
-    )
+    crate::engine::is_row_local_error(error)
+}
+
+/// Ticket 41: save gate — reserved ranges + garbage binds fail typed before
+/// any write (the engine seam names the range). Blank ports (auto) and
+/// unparseable ports flow through: store validation + auto-assign own those
+/// errors, and this gate must never double-report them.
+fn save_listen_gate(name: &str, bind_raw: &str, port_raw: &str) -> Result<(), String> {
+    let port: u16 = match port_raw.trim() {
+        "" => return Ok(()),
+        raw => match raw.parse() {
+            Ok(port) => port,
+            Err(_) => return Ok(()),
+        },
+    };
+    crate::engine::validate_listen_for_save(name, bind_raw, port).map_err(|error| error.to_string())
 }
 
 /// Ticket 26: the enabled flag is NOT the engine. The switch and the Enable
@@ -1811,6 +1820,19 @@ impl AppView {
         // Ticket 38: seed the snapshot guard from the stored set so the
         // first reload does not rewrite an unchanged snapshot.
         let last_snapshot = store.load_running_snapshot();
+        // Ticket 41: crash-safe startup — a hard kill orphans sidecars
+        // holding our ports and leaves secret temp files behind. The reaper
+        // kills only matching sidecar binaries holding our ports (never
+        // anything else) and sweeps our stale temp files, so relaunch
+        // serves again with no manual port cleanup. Best-effort: failures
+        // never block or toast the launch.
+        {
+            let our_ports: Vec<u16> = store
+                .list()
+                .map(|rows| rows.iter().map(|row| row.port).collect())
+                .unwrap_or_default();
+            crate::engine::production_startup_reap(&our_ports);
+        }
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
@@ -1998,6 +2020,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Ticket 41: reserved ranges + garbage binds fail before any write.
+        if let Err(reason) = save_listen_gate(&input.name, &input.bind_ip, &input.port) {
+            window.push_notification(Notification::error(reason), cx);
+            return false;
+        }
         match self.store.add(input) {
             Ok(created) => {
                 let message = row_action_message("Added", &created.name);
@@ -2024,7 +2051,17 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        match self.store.add(form.as_new(cx)) {
+        // Ticket 41: save gate first (inline slot + focus, like every other
+        // field error — the dialog stays open, retryable).
+        let input = form.as_new(cx);
+        if let Err(reason) = save_listen_gate(&input.name, &input.bind_ip, &input.port) {
+            *form_error.borrow_mut() = Some(("port".to_string(), reason.clone()));
+            form.focus_field("port", window, cx);
+            window.push_notification(Notification::error(reason), cx);
+            cx.notify();
+            return false;
+        }
+        match self.store.add(input) {
             Ok(created) => {
                 *form_error.borrow_mut() = None;
                 let message = row_action_message("Added", &created.name);
@@ -2069,18 +2106,36 @@ impl AppView {
                 self.report_save_error(error, window, cx);
                 false
             }
-            Ok(Some(_)) => match self.store.update(id, patch) {
-                Ok(updated) => {
-                    let message = row_action_message("Updated", &updated.name);
-                    self.reload(window, cx);
-                    window.push_notification(Notification::success(message), cx);
-                    true
+            Ok(Some(existing)) => {
+                // Ticket 41: save gate on the effective row (patch over the
+                // stored row) — reserved ranges + garbage binds fail before
+                // any write.
+                let name = patch.name.as_deref().unwrap_or(&existing.name);
+                let bind = patch.bind_ip.as_deref().unwrap_or(&existing.bind_ip);
+                let port_gate = match patch.port.as_deref() {
+                    Some(port_raw) => save_listen_gate(name, bind, port_raw),
+                    None if patch.bind_ip.is_some() || patch.name.is_some() => {
+                        save_listen_gate(name, bind, &existing.port.to_string())
+                    }
+                    None => Ok(()),
+                };
+                if let Err(reason) = port_gate {
+                    window.push_notification(Notification::error(reason), cx);
+                    return false;
                 }
-                Err(error) => {
-                    self.report_save_error(error, window, cx);
-                    false
+                match self.store.update(id, patch) {
+                    Ok(updated) => {
+                        let message = row_action_message("Updated", &updated.name);
+                        self.reload(window, cx);
+                        window.push_notification(Notification::success(message), cx);
+                        true
+                    }
+                    Err(error) => {
+                        self.report_save_error(error, window, cx);
+                        false
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -2106,24 +2161,45 @@ impl AppView {
                 self.report_save_error(error, window, cx);
                 false
             }
-            Ok(Some(_)) => match self.store.update(id, patch) {
-                Ok(updated) => {
-                    *form_error.borrow_mut() = None;
-                    let message = row_action_message("Updated", &updated.name);
-                    self.reload(window, cx);
-                    window.push_notification(Notification::success(message), cx);
-                    true
-                }
-                Err(error) => {
-                    if let Some((field, message)) = field_error_target(&error) {
-                        *form_error.borrow_mut() = Some((field.to_string(), message));
-                        form.focus_field(field, window, cx);
+            Ok(Some(existing)) => {
+                // Ticket 41: save gate on the effective row (inline slot +
+                // focus, like every other field error — the dialog stays
+                // open, retryable).
+                let name = patch.name.as_deref().unwrap_or(&existing.name);
+                let bind = patch.bind_ip.as_deref().unwrap_or(&existing.bind_ip);
+                let port_gate = match patch.port.as_deref() {
+                    Some(port_raw) => save_listen_gate(name, bind, port_raw),
+                    None if patch.bind_ip.is_some() || patch.name.is_some() => {
+                        save_listen_gate(name, bind, &existing.port.to_string())
                     }
-                    self.report_save_error(error, window, cx);
+                    None => Ok(()),
+                };
+                if let Err(reason) = port_gate {
+                    *form_error.borrow_mut() = Some(("port".to_string(), reason.clone()));
+                    form.focus_field("port", window, cx);
+                    window.push_notification(Notification::error(reason), cx);
                     cx.notify();
-                    false
+                    return false;
                 }
-            },
+                match self.store.update(id, patch) {
+                    Ok(updated) => {
+                        *form_error.borrow_mut() = None;
+                        let message = row_action_message("Updated", &updated.name);
+                        self.reload(window, cx);
+                        window.push_notification(Notification::success(message), cx);
+                        true
+                    }
+                    Err(error) => {
+                        if let Some((field, message)) = field_error_target(&error) {
+                            *form_error.borrow_mut() = Some((field.to_string(), message));
+                            form.focus_field(field, window, cx);
+                        }
+                        self.report_save_error(error, window, cx);
+                        cx.notify();
+                        false
+                    }
+                }
+            }
         }
     }
 
@@ -2251,10 +2327,71 @@ impl AppView {
     /// Ticket 30: notify one crash as an error naming shard/cause with the
     /// View-logs path. No-op when there is no crash. Returns the detail when
     /// notified (tests pin delivery by count + the pure copy).
+    /// Ticket 41: opt-in auto-restart runs first — when the policy is
+    /// enabled, a retry is left, and the backoff fence has passed, one
+    /// bounded restart attempt replaces the crash notice (recovery toasts
+    /// instead; exhaustion falls through to the crash notice). Disabled by
+    /// default: the notice path is byte-identical when never opted in.
     fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut App) -> Option<String> {
         let detail = self.poll_engine_detail()?;
+        if self.engine.auto_restart_due(std::time::Instant::now()) {
+            self.engine
+                .note_auto_restart_attempt(std::time::Instant::now());
+            match self.engine.restart_crashed() {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(format!("Engine recovered ({detail})")),
+                        cx,
+                    );
+                    return Some(detail);
+                }
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Engine auto-restart failed: {}",
+                            redact_secrets(&error.to_string())
+                        )),
+                        cx,
+                    );
+                }
+            }
+        }
         window.push_notification(Notification::error(crash_notification_text(&detail)), cx);
         Some(detail)
+    }
+
+    /// Ticket 41: manual Restart — re-applies the active set so every
+    /// crashed shard restarts beside its healthy siblings. Starting a
+    /// crashed row (or start-all) restarts it the same way through
+    /// re-apply; this is the explicit entry point. A quiet info toast when
+    /// nothing crashed (never a fake "Restarted"); failures toast loud.
+    /// Test-called until the crash-notice action lands (follow-up slice).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn restart_crashed_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let crashed = self.engine.crashed_shards();
+        if crashed.is_empty() {
+            window.push_notification(Notification::info("No crashed endpoints to restart"), cx);
+            return;
+        }
+        match self.engine.restart_crashed() {
+            Ok(()) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!("Restarted {}", crashed.join(", "))),
+                    cx,
+                );
+            }
+            Err(error) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::error(format!(
+                        "Restart failed: {}",
+                        redact_secrets(&error.to_string())
+                    )),
+                    cx,
+                );
+            }
+        }
     }
 
     /// Ticket 05: warn once per non-loopback bind going live (LAN exposure
@@ -2382,12 +2519,29 @@ impl AppView {
 
     /// Ticket 05: stop the selected config; its endpoint closes, the rest
     /// keep serving on a regenerated config.
+    /// Ticket 41: a stop failure toasts instead of claiming false success.
     fn stop_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             return;
         };
         let id = config.id.clone();
-        if self.engine.stop_one(&id) {
+        let (removed, stop_error) = self.engine.stop_one_result(&id);
+        if removed {
+            // Ticket 41: the membership moved but the re-gen failed — the
+            // engine restored its snapshot, so this is a failure toast,
+            // never a "Stopped" claim.
+            if let Some(error) = stop_error {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::error(format!(
+                        "Stop of \"{}\" failed: {}",
+                        config.name,
+                        redact_secrets(&error.to_string())
+                    )),
+                    cx,
+                );
+                return;
+            }
             // Ticket 26: loud on flag-write failure (the endpoint stopped
             // while the flag still claims enabled).
             match self.store.set_enabled(&id, false) {
@@ -2469,10 +2623,12 @@ impl AppView {
     /// Ticket 17: an empty library warns honestly (never "Started 0").
     /// Ticket 23: post-gate starts use the confirmed variant; check output
     /// is redacted for display.
-    /// Ticket 30: best-effort — one broken row never blocks the rest. The
-    /// fast path starts the whole set at once; on failure each row starts
-    /// alone so valid rows keep serving while the toast names the failed
-    /// rows plus both counts. Re-entrant calls are ignored (busy guard).
+    /// Ticket 30: best-effort — one broken row never blocks the rest.
+    /// Ticket 41: single-apply subset — the fast path starts the whole set
+    /// at once; on a row-local failure the maximal healthy subset serves
+    /// exactly once (no O(n²) per-row flapping) while the toast names the
+    /// failed rows plus both counts. Union-level failures stay atomic.
+    /// Re-entrant calls are ignored (busy guard).
     fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
@@ -2544,27 +2700,36 @@ impl AppView {
                     );
                     return;
                 }
-                // Best-effort fallback: isolate the broken rows per-row.
-                // Start from a clean slate so a half-validated fast path
-                // leaves no residue, then serve each row alone.
-                self.engine.stop_all();
-                let mut started: Vec<ProxyConfig> = Vec::new();
-                let mut failed_names: Vec<String> = Vec::new();
-                for row in &rows {
-                    match self.engine.start_one_confirmed(row) {
-                        Ok(()) => started.push(row.clone()),
-                        Err(_) => {
-                            failed_names.push(format!("\"{}\"", row.name));
-                        }
-                    }
+                // Best-effort fallback: single-apply subset (ticket 41) — the
+                // maximal healthy subset serves exactly once while every
+                // excluded row is named. No per-row O(n²) flapping.
+                let outcome = self.engine.start_all_subset(&rows, true);
+                if let Some(error) = outcome.error.as_deref() {
+                    // Union-level abort: nothing applied.
+                    self.reload(window, cx);
+                    self.start_in_flight = false;
+                    window.push_notification(Notification::error(redact_secrets(error)), cx);
+                    return;
                 }
+                let started: Vec<ProxyConfig> = rows
+                    .iter()
+                    .filter(|row| outcome.applied.contains(&row.id))
+                    .cloned()
+                    .collect();
+                let failed_names: Vec<String> = outcome
+                    .failed
+                    .iter()
+                    .map(|(name, _)| format!("\"{name}\""))
+                    .collect();
                 if started.is_empty() {
                     self.reload(window, cx);
                     self.start_in_flight = false;
-                    window.push_notification(
-                        Notification::error(redact_secrets(&fast_error.to_string())),
-                        cx,
-                    );
+                    let reason = outcome
+                        .failed
+                        .first()
+                        .map(|(_, cause)| cause.clone())
+                        .unwrap_or_else(|| fast_error.to_string());
+                    window.push_notification(Notification::error(redact_secrets(&reason)), cx);
                     return;
                 }
                 // Flag only the rows that actually serve (never claim a
@@ -2596,6 +2761,12 @@ impl AppView {
                     Notification::warning(start_all_partial_message(started.len(), &failed_names)),
                     cx,
                 );
+                // Ticket 41: plan warnings (typo hints) surface beside the
+                // partial toast — never silent, never blocking.
+                if !outcome.warnings.is_empty() {
+                    window
+                        .push_notification(Notification::warning(outcome.warnings.join("; ")), cx);
+                }
             }
         }
     }
@@ -2603,9 +2774,18 @@ impl AppView {
     /// Ticket 05: stop everything and take the sidecar down.
     /// Ticket 17: honest when nothing runs (never a success claim over
     /// silence).
+    /// Ticket 41: a stop failure toasts instead of claiming false success.
     fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let running = self.engine.running_count();
-        self.engine.stop_all();
+        let stop_error = self.engine.stop_all_result().map(|error| error.to_string());
+        if let Some(error) = stop_error {
+            self.reload(window, cx);
+            window.push_notification(
+                Notification::error(format!("Stop-all failed: {}", redact_secrets(&error))),
+                cx,
+            );
+            return;
+        }
         // Ticket 26: the engine stops regardless; the flag sweep after it is
         // loud on database failure (and skips the stale-flag lie).
         match self.store.list() {
@@ -5742,6 +5922,8 @@ impl AppView {
     /// Stopped views probe nothing.
     /// Ticket 26: off-thread via [`AppView::spawn_probe`]. Returns the number
     /// of probes started (outcomes land on completion).
+    /// Ticket 41: rows on crashed shards are skipped (their sidecar is
+    /// down — probing a dead socket only manufactures errors).
     fn tick_reprobe_running(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
@@ -5752,7 +5934,7 @@ impl AppView {
         };
         let rows: Vec<ProxyConfig> = rows
             .into_iter()
-            .filter(|row| running.contains(&row.id))
+            .filter(|row| running.contains(&row.id) && self.engine.is_running(&row.id))
             .collect();
         if rows.is_empty() {
             return 0;
@@ -5767,19 +5949,25 @@ impl AppView {
     /// columns ([`crate::health::is_probe_destination`]); missed polls keep
     /// last totals (never zero). Stopped views and untracked cores do
     /// nothing (no network). Returns the number of rows with new bytes.
+    /// Ticket 41: crashed cores are skipped via `live_clash_targets` (dead
+    /// sockets are never trusted), and probe attribution normalizes
+    /// (lowercase, no port, no trailing dot) plus the resolved-IP leg.
     fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
         }
-        let targets = self.engine.clash_targets().to_vec();
+        let targets = self.engine.live_clash_targets();
         if targets.is_empty() {
             return 0;
         }
         let probe = crate::health::probe_host();
+        let probe_ips = crate::health::resolve_probe_ips(&probe);
         let timeout = std::time::Duration::from_secs(5);
         let mut deltas: HashMap<String, (u64, u64)> = HashMap::new();
         let mut seen: HashMap<String, (u64, u64)> = HashMap::new();
         let mut ok_cores: HashSet<String> = HashSet::new();
+        // Ticket 41: rows freshly polled on live cores (clears stale below).
+        let mut fresh_rows: HashSet<String> = HashSet::new();
         for target in &targets {
             let Ok(entries) =
                 crate::health::poll_clash_entries(target.port, &target.secret, timeout)
@@ -5791,9 +5979,10 @@ impl AppView {
                 let Some(row) = entry.row_id.as_deref() else {
                     continue;
                 };
-                if crate::health::is_probe_destination(&entry.dest, &probe) {
+                if crate::health::is_probe_destination_with_ips(&entry.dest, &probe, &probe_ips) {
                     continue;
                 }
+                fresh_rows.insert(row.to_string());
                 let key = format!("{}/{}", target.core, entry.id);
                 let (rx, tx) = (entry.rx_bytes, entry.tx_bytes);
                 let (last_rx, last_tx) =
@@ -5831,6 +6020,14 @@ impl AppView {
             if self.store.add_traffic(row, *rx, *tx).is_ok() {
                 updated += 1;
             }
+        }
+        // Ticket 41: rows on crashed cores keep last totals but read stale
+        // (their cores were skipped above); rows freshly polled on live
+        // cores clear the marker on recovery.
+        self.health_store
+            .mark_stale_all(&self.engine.ids_on_crashed_shards());
+        for row in &fresh_rows {
+            self.health_store.clear_stale(row);
         }
         if updated > 0 {
             if let Ok(totals) = self.store.traffic_totals() {
@@ -9218,6 +9415,9 @@ mod tests {
     /// Scenario: a health tick (fake engine + scripted prober) refreshes the
     /// rows in place — painted rows match the store and carry the new health
     /// summaries with no restart.
+    /// Ticket 41: seeds use documentation IPs — the start path resolves
+    /// egress hostnames before spawn, so unresolvable doc names stay in the
+    /// render/search tests that never start.
     #[gpui_kit::test]
     fn library_health_tick_repaints_rows(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -9225,10 +9425,10 @@ mod tests {
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let first = store
-            .add(row19_seed("Work", "a.example.com", "10811"))
+            .add(row19_seed("Work", "198.51.100.9", "10811"))
             .expect("seed works");
         let second = store
-            .add(row19_seed("Home", "b.example.com", "10812"))
+            .add(row19_seed("Home", "203.0.113.7", "10812"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
         cx.run_until_parked();
@@ -10322,6 +10522,149 @@ mod tests {
         // The copy itself (names + counts) is pinned at the pure seam.
         let copy = crate::start_all_partial_message(4, &["\"Broken\"".to_string()]);
         assert!(copy.contains('4') && copy.contains('1') && copy.contains("Broken"));
+    }
+
+    /// Scenario: saving a row inside a reserved range (or with a garbage
+    /// bind) fails at the save gate — nothing is written, the error names
+    /// the range. Blank ports (auto) still save.
+    #[gpui_kit::test]
+    fn t41_save_gate_rejects_reserved_port_and_garbage_bind(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        // Clash-reserved port.
+        let mut squatter = t30_engine_seed("Squatter", "18501");
+        let added = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_add(squatter.clone(), window, cx))
+        });
+        assert!(!added, "reserved port never saves");
+        // Bridge-reserved port.
+        squatter.port = "11801".to_string();
+        let added = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_add(squatter.clone(), window, cx))
+        });
+        assert!(!added, "bridge range never saves");
+        // Garbage bind.
+        squatter.port = "10991".to_string();
+        squatter.bind_ip = "999.999.0.1".to_string();
+        let added = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_add(squatter.clone(), window, cx))
+        });
+        assert!(!added, "garbage bind never saves");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "nothing written"
+        );
+        assert_eq!(notification_count(cx), 3, "one error toast per refusal");
+        // Blank port (auto) still saves.
+        squatter.bind_ip = String::new();
+        squatter.port = String::new();
+        let added = cx
+            .update(|window, cx| view.update(cx, |view, cx| view.commit_add(squatter, window, cx)));
+        assert!(added, "auto port saves");
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
+    }
+
+    /// Scenario: editing a row into a reserved range fails before any write
+    /// — the stored port is untouched.
+    #[gpui_kit::test]
+    fn t41_commit_edit_into_reserved_range_rejected(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::store::ConfigPatch;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store
+            .add(t30_engine_seed("Work", "10931"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        let patch = ConfigPatch {
+            port: Some("18501".to_string()),
+            ..Default::default()
+        };
+        let updated = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit(&created.id, patch, window, cx)
+            })
+        });
+        assert!(!updated, "reserved edit never writes");
+        let row = view.read_with(cx, |view, _| {
+            view.store
+                .get(&created.id)
+                .expect("read works")
+                .expect("row kept")
+        });
+        assert_eq!(row.port, 10931, "stored port untouched, got {}", row.port);
+    }
+
+    /// Scenario: one crashed shard → Restart recovers it with a success
+    /// toast; Restart with nothing crashed is a quiet info (never a fake
+    /// "Restarted").
+    #[gpui_kit::test]
+    fn t41_restart_crashed_recovers_and_idle_quiet(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Work", "10941"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let handle = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, handle) = EngineController::fake();
+                view.engine = engine;
+                handle
+            })
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        let id = view.read_with(cx, |view, _| view.engine.running_ids()[0].clone());
+        assert!(
+            view.read_with(cx, |view, _| view.engine.is_running(&id)),
+            "serving before the crash"
+        );
+        handle.inject_crash("signal: segmentation fault");
+        // The windowless tick registers the crash (no toast by necessity).
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| view.tick_engine_poll(cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.crashed_shards().len()),
+            1,
+            "crash registered"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.restart_crashed_engines(window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 1, "one recovery toast");
+        assert!(
+            view.read_with(cx, |view, _| view.engine.crashed_shards().is_empty()),
+            "crashed set cleared"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.engine.clash_targets().len() == 1),
+            "clash recovered"
+        );
+        // Idle restart: quiet info, no fake success.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.restart_crashed_engines(window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 2, "one idle toast");
     }
 
     /// Scenario: double Start while busy → ignored with an info toast, no
