@@ -5,6 +5,7 @@ mod engine;
 mod health;
 mod import;
 mod store;
+mod tray;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -171,7 +172,7 @@ fn about_body(
     out.push_str(&format!(
         "\nData:\n  library: {db_path}\n  export default: {export_path}\n"
     ));
-    out.push_str("\nNo autostart, no registry writes, no auto-update in v1.\n");
+    out.push_str("\nOpt-in only: autostart (HKCU Run entry) and session restore live in Settings, both default off; no auto-update.\n");
     out.push_str("\nShortcuts:\n");
     for (action, keys) in SHORTCUT_LINES {
         out.push_str(&format!("  {action}: {keys}\n"));
@@ -1620,6 +1621,13 @@ struct AppView {
     /// Ticket 33: set once the user confirms the close-with-running-endpoints
     /// dialog, so the confirmed second close is never vetoed again.
     close_confirmed: bool,
+    /// Ticket 38: live tray presence (`None` when the shell refused the
+    /// icon — the close-confirm then stays instead of a dishonest hide).
+    /// Main thread only, like everything in this view.
+    tray: Option<crate::tray::TrayHandle>,
+    /// Ticket 38: last running set written to the store snapshot (change
+    /// guard so the background poll does not rewrite the DB every 5s).
+    last_snapshot: Vec<String>,
     /// Ticket 30: an engine start (single or start-all) is in flight. A
     /// second Start while set is ignored with an info toast (no second
     /// apply); the detail Start button reads `Starting…` while set.
@@ -1654,6 +1662,9 @@ impl AppView {
                 .searchable(true)
                 .selectable(true)
         });
+        // Ticket 38: seed the snapshot guard from the stored set so the
+        // first reload does not rewrite an unchanged snapshot.
+        let last_snapshot = store.load_running_snapshot();
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
@@ -1677,6 +1688,8 @@ impl AppView {
             subs_form: None,
             import_parse_in_flight: false,
             close_confirmed: false,
+            tray: None,
+            last_snapshot,
             start_in_flight: false,
             _libraries_subscription: cx.subscribe(
                 &libraries,
@@ -1760,6 +1773,12 @@ impl AppView {
         let rows = self.store.list()?;
         let health = self.health_map();
         let running = self.engine.running_ids();
+        // Ticket 38: persist the running set on change (session-restore
+        // source) and refresh the tray tooltip with the live count.
+        self.snapshot_running_set(&running);
+        if let Some(tray) = &self.tray {
+            tray.set_running(running.len());
+        }
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
             state.delegate_mut().set_health(health);
@@ -2486,6 +2505,8 @@ impl AppView {
     /// OK): stops every endpoint, best-effort clears the enabled flags so a
     /// relaunch does not show running rows that died with the window, and
     /// marks the close confirmed so the hook lets the second close through.
+    /// Ticket 38: also clears the running snapshot (nothing serves after
+    /// this close, so a restore must not resurrect it).
     fn confirm_close_stop(&mut self) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
@@ -2493,7 +2514,394 @@ impl AppView {
                 let _ = self.store.set_enabled(&row.id, false);
             }
         }
+        self.snapshot_running_set(&[]);
         self.close_confirmed = true;
+    }
+
+    /// Ticket 38: persist the running set when it changes (the restore
+    /// source). Best-effort like health snapshots: a write failure never
+    /// breaks the reload, and the in-memory guard still advances so the
+    /// next change retries with fresh state.
+    fn snapshot_running_set(&mut self, running: &[String]) {
+        if self.last_snapshot.as_slice() == running {
+            return;
+        }
+        self.last_snapshot = running.to_vec();
+        let _ = self.store.save_running_snapshot(running);
+    }
+
+    /// Ticket 38: build tray presence on the main thread. Loud failure
+    /// leaves `tray` as `None` (the close-confirm stays) — never a tray
+    /// without hide.
+    fn create_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::tray::TrayHandle::build() {
+            Ok(tray) => {
+                tray.set_running(self.engine.running_count());
+                self.tray = Some(tray);
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::warning(format!(
+                        "Tray unavailable ({error}) — closing still confirms"
+                    )),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ticket 38: hide to tray instead of closing (endpoints keep serving —
+    /// hiding is purely windowing, the engine is untouched). The tooltip
+    /// refreshes with the live count so the icon never misreports.
+    fn hide_to_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        match crate::tray::hwnd_from_window(window) {
+            Some(hwnd) => {
+                crate::tray::hide_window_handle(hwnd);
+            }
+            // No HWND behind the window: minimize rather than lie about a
+            // hide (should not happen on Windows; never silent).
+            None => window.minimize_window(),
+        }
+        #[cfg(not(windows))]
+        window.minimize_window();
+        if let Some(tray) = &self.tray {
+            tray.set_running(self.engine.running_count());
+        }
+        cx.notify();
+    }
+
+    /// Ticket 38: restore a hidden window (tray Show / left-click).
+    fn show_window_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        if let Some(hwnd) = crate::tray::hwnd_from_window(window) {
+            crate::tray::show_window_handle(hwnd);
+        }
+        window.activate_window();
+        cx.notify();
+    }
+
+    /// Ticket 38: one tray poll on the main thread — drains menu events
+    /// (Show / Start all / Stop all / Quit) plus left-click toggles.
+    /// Returns true when the app should quit (handled by the caller, which
+    /// owns the `App` for `quit()`).
+    fn poll_tray_once(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.tray.is_none() {
+            return false;
+        }
+        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if let Some(action) = crate::tray::action_for_menu_id(event.id.as_ref()) {
+                if action == crate::tray::TrayAction::Quit {
+                    self.quit_from_tray();
+                    return true;
+                }
+                self.handle_tray_action(action, window, cx);
+            }
+        }
+        while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            if matches!(
+                event,
+                tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                }
+            ) {
+                self.handle_tray_action(crate::tray::TrayAction::Show, window, cx);
+            }
+        }
+        false
+    }
+
+    /// Ticket 38: tray menu dispatch (Quit is handled by the caller —
+    /// see [`AppView::poll_tray_once`]).
+    fn handle_tray_action(
+        &mut self,
+        action: crate::tray::TrayAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            crate::tray::TrayAction::Show => self.show_window_from_tray(window, cx),
+            crate::tray::TrayAction::StartAll => self.start_all_engines(window, cx),
+            crate::tray::TrayAction::StopAll => self.stop_all_engines(window, cx),
+            crate::tray::TrayAction::Quit => self.quit_from_tray(),
+        }
+    }
+
+    /// Ticket 38: tray Quit — stops every endpoint, clears the snapshot
+    /// (nothing serves after quit), drops the icon (no orphan), and asks
+    /// the caller to quit the app.
+    fn quit_from_tray(&mut self) {
+        self.engine.stop_all();
+        self.snapshot_running_set(&[]);
+        // Drop first so the icon (NIM_DELETE) is gone before the loop ends.
+        self.tray = None;
+    }
+
+    /// Ticket 38: explicit autostart opt-in behind the Settings checkbox.
+    /// The ONLY UI path to [`crate::tray::set_autostart_enabled`] (the only
+    /// writer of the real Run key). Returns true on success. Loud on
+    /// failure, and the dialog re-renders from the caller's state cell so a
+    /// failed write never shows a lying switch.
+    fn commit_autostart(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match crate::tray::set_autostart_enabled(enabled) {
+            Ok(()) => {
+                let message = if enabled {
+                    "Autostart on — ManyProxy starts with Windows (HKCU Run entry written)"
+                } else {
+                    "Autostart off — Run entry removed"
+                };
+                window.push_notification(Notification::success(message), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Autostart change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Ticket 38: explicit session-restore opt-in behind the Settings
+    /// checkbox (default off; the store is the only persistence). Returns
+    /// true on success (see [`AppView::commit_autostart`] for the honesty
+    /// contract).
+    fn commit_restore_opt_in(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_restore_running(enabled) {
+            Ok(()) => {
+                let message = if enabled {
+                    "Session restore on — the running set returns on next launch"
+                } else {
+                    "Session restore off"
+                };
+                window.push_notification(Notification::success(message), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Restore setting failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Ticket 38: Settings dialog — the two explicit opt-ins (autostart +
+    /// session restore, both default off) with their exact side effects
+    /// stated inline. Switches are controlled values over shared cells:
+    /// a toggle commits immediately, and the cell advances only on success,
+    /// so a failed write repaints the old (true) state with an error toast
+    /// instead of a lying switch. Cells are snapshotted before the dialog
+    /// opens — the builder must never borrow the view (it can run while
+    /// the view is already borrowed).
+    fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
+        let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let autostart_view = view.clone();
+            let restore_view = view.clone();
+            let autostart_cell = autostart_state.clone();
+            let restore_cell = restore_state.clone();
+            let autostart_on = *autostart_state.borrow();
+            let restore_on = *restore_state.borrow();
+            dialog
+                .title("Settings")
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("settings-autostart")
+                                .test_support()
+                                .child(
+                                    Switch::new("settings-autostart-switch")
+                                        .checked(autostart_on)
+                                        .label("Start with Windows")
+                                        .on_change(move |next: &bool, window, cx| {
+                                            let next = *next;
+                                            let cell = autostart_cell.clone();
+                                            autostart_view.update(cx, |view, cx| {
+                                                if view.commit_autostart(next, window, cx) {
+                                                    *cell.borrow_mut() = next;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("settings-autostart-note")
+                                .test_support()
+                                .child(
+                                    "On writes HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run \
+                                     for this exe; off removes it. Default off; nothing writes silently.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("settings-restore")
+                                .test_support()
+                                .child(
+                                    Switch::new("settings-restore-switch")
+                                        .checked(restore_on)
+                                        .label("Restore running endpoints on launch")
+                                        .on_change(move |next: &bool, window, cx| {
+                                            let next = *next;
+                                            let cell = restore_cell.clone();
+                                            restore_view.update(cx, |view, cx| {
+                                                if view.commit_restore_opt_in(next, window, cx) {
+                                                    *cell.borrow_mut() = next;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("settings-restore-note")
+                                .test_support()
+                                .child(
+                                    "On relaunches the previously running set. Loopback rows start \
+                                     directly; LAN-bound rows still need their confirm. Default off.",
+                                ),
+                        )
+                        .child(
+                            div().id("settings-tray-note").test_support().child(
+                                "Closing the window hides to the tray while endpoints run; \
+                                 Quit in the tray menu stops everything and exits.",
+                            ),
+                        ),
+                )
+                .button_props(DialogButtonProps::default().show_cancel(true))
+                .footer(dialog_footer(
+                    "settings-dialog-ok",
+                    "settings-dialog-cancel",
+                    Rc::new(|_, _| true),
+                ))
+        });
+    }
+
+    /// Ticket 38: launch-time session restore. Runs only with the explicit
+    /// opt-in; loopback rows start immediately while LAN-bound rows stay
+    /// behind the standard LAN confirm (the gate is never bypassed —
+    /// `start_all_confirmed`-style silent confirms are NOT used here).
+    /// Unknown (deleted) snapshot ids are dropped; an empty snapshot or a
+    /// broken database restores nothing.
+    fn restore_on_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.store.restore_running() {
+            return;
+        }
+        let snapshot = self.store.load_running_snapshot();
+        if snapshot.is_empty() {
+            return;
+        }
+        let rows = match self.store.list() {
+            Ok(rows) => rows,
+            Err(error) => {
+                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+                return;
+            }
+        };
+        let (now, gated) = crate::tray::partition_restore(&rows, &snapshot);
+        if !now.is_empty() {
+            self.commit_restore_subset(&now, window, cx);
+        }
+        if !gated.is_empty() {
+            self.open_restore_lan_confirm(gated, window, cx);
+        }
+    }
+
+    /// Ticket 38: start the loopback restore subset (post-partition, no LAN
+    /// rows inside — the gate never sees this call). Best-effort per row so
+    /// one broken row never blocks the rest; flags follow the engine.
+    fn commit_restore_subset(
+        &mut self,
+        rows: &[ProxyConfig],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut started = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for row in rows {
+            match self.engine.start_one_confirmed(row) {
+                Ok(()) => {
+                    if self.store.set_enabled(&row.id, true).is_ok() {
+                        started += 1;
+                    } else {
+                        failed.push(format!("\"{}\"", row.name));
+                    }
+                }
+                Err(_) => failed.push(format!("\"{}\"", row.name)),
+            }
+        }
+        self.reload(window, cx);
+        if failed.is_empty() {
+            window.push_notification(
+                Notification::success(format!("Restored {started} endpoint(s)")),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                Notification::warning(start_all_partial_message(started, &failed)),
+                cx,
+            );
+        }
+    }
+
+    /// Ticket 38: LAN confirm for the gated restore subset — the standard
+    /// LAN gate copy over exactly these rows; nothing starts until the user
+    /// confirms, dismissing starts nothing.
+    fn open_restore_lan_confirm(
+        &mut self,
+        rows: Vec<ProxyConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let lan: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.name.clone(), row.bind_ip.clone()))
+            .collect();
+        let description = format!(
+            "{}\n\nThese were running before; confirm to restart them.",
+            lan_confirm_description(&lan)
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let rows = rows.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title(LAN_CONFIRM_TITLE)
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_restore_subset(&rows, window, cx));
+                    true
+                })
+        });
     }
 
     /// Ticket 33: About dialog — version + git hash + sidecar presence +
@@ -4855,6 +5263,13 @@ impl Render for AppView {
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_about_dialog(window, cx);
                             })),
+                    )
+                    .child(
+                        Button::new("settings-dialog")
+                            .label("Settings")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_settings_dialog(window, cx);
+                            })),
                     ),
             )
             // Ticket 17: visible drop affordance (the shell has no
@@ -4899,16 +5314,61 @@ fn main() {
                     view.refresh_due_on_startup(cx);
                     view.start_background_ticks(cx);
                 });
+                // Ticket 38: tray presence + session restore, both on the
+                // main thread. A refused tray icon keeps the ticket-33
+                // close-confirm below (never a tray-less hide); restore runs
+                // only behind its explicit opt-in with the LAN gate intact.
+                view.update(cx, |view, cx| {
+                    view.create_tray(window, cx);
+                    view.restore_on_launch(window, cx);
+                });
+                // Ticket 38: tray event pump (menu actions + left-click
+                // toggle) on the main thread. Ends when the window is gone;
+                // a Quit action stops the engines, drops the icon, and quits
+                // the app from here (the view owns engine + icon only).
+                let poll_view = view.clone();
+                let poll_handle = window.window_handle();
+                cx.spawn(async move |cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(150))
+                            .await;
+                        // `Err` when the window or app is gone: the pump
+                        // ends with it. `Ok(true)` is a tray Quit.
+                        let tick = cx.update_window(poll_handle, |_, window, cx| {
+                            poll_view.update(cx, |view, cx| view.poll_tray_once(window, cx))
+                        });
+                        match tick {
+                            // Quit requested: stop the pump, then quit.
+                            Ok(true) => {
+                                cx.update(|cx| cx.quit());
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .detach();
                 // Ticket 33: never silently kill running endpoints on window
-                // close. The hook vetoes the close while endpoints run and
-                // opens a confirm naming them; OK stops everything and closes
-                // via `remove_window` (the confirmed flag lets that second
-                // close through). No tray/minimize in v1 (kit-only, no new
-                // deps) — see PACKAGING-NOTES.md.
+                // close. Ticket 38: with a tray icon the close hides to the
+                // tray instead (endpoints keep serving); without one the hook
+                // vetoes the close while endpoints run and opens a confirm
+                // naming them; OK stops everything and closes via
+                // `remove_window` (the confirmed flag lets that second close
+                // through). No minimize in v1 (kit-only, no new deps) — see
+                // PACKAGING-NOTES.md.
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     let Some(view) = weak.upgrade() else {
                         return true;
+                    };
+                    // Ticket 38: tray present → hide (never confirm, never
+                    // kill — the endpoints survive behind the icon).
+                    let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
+                    if has_tray {
+                        view.update(cx, |view, cx| view.hide_to_tray(window, cx));
+                        return false;
                     };
                     match view.read_with(cx, |view, _| view.close_veto_text()) {
                         None => true,
@@ -5002,7 +5462,9 @@ mod tests {
     }
 
     /// Ticket 33: About carries version + git hash + sidecar presence +
-    /// data paths + the shortcut list (and the no-autostart contract).
+    /// data paths + the shortcut list (and the opt-in-only contract).
+    /// Ticket 38: the old "No autostart" line is gone — autostart exists
+    /// behind the Settings opt-in, so About states the opt-in contract.
     #[test]
     fn about_body_carries_version_sidecars_paths_shortcuts() {
         let body = crate::about_body(
@@ -5023,10 +5485,15 @@ mod tests {
             "Ctrl-T",
             "Ctrl-N",
             "Ctrl-O",
-            "No autostart",
+            "Opt-in only",
+            "default off",
         ] {
             assert!(body.contains(needle), "about names {needle}");
         }
+        assert!(
+            !body.contains("No autostart"),
+            "ticket 38: the v1 no-autostart line is gone (opt-in exists)"
+        );
         assert_eq!(
             crate::sidecar_presence_line("x.exe", false),
             "x.exe: missing (place it next to the app exe)"
@@ -9208,5 +9675,268 @@ mod tests {
         });
         assert!(ghost, "ghost edit closes with a warning");
         assert_eq!(notification_count(cx), 2, "ghost warns once more");
+    }
+
+    // -- Ticket 38: tray + autostart + session restore ------------------------
+
+    fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: String::new(),
+            bind_ip: bind.to_string(),
+            port: port.to_string(),
+        }
+    }
+
+    /// Ticket 38: launch restore starts loopback snapshot rows immediately
+    /// while LAN rows wait behind the standard confirm (the gate is never
+    /// bypassed); unknown snapshot ids are dropped; dismissing the confirm
+    /// starts nothing.
+    #[gpui_kit::test]
+    fn restore_on_launch_starts_loopback_and_gates_lan(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let loopback = store
+            .add(restore_seed("Loop", "", "10871"))
+            .expect("seed works");
+        let lan = store
+            .add(restore_seed("Lan", "0.0.0.0", "10872"))
+            .expect("seed works");
+        store.set_restore_running(true).expect("opt-in writes");
+        store
+            .save_running_snapshot(&[loopback.id.clone(), lan.id.clone(), "9999".to_string()])
+            .expect("snapshot writes");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.restore_on_launch(window, cx));
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.engine.is_running(&loopback.id)),
+            "loopback snapshot row restores"
+        );
+        assert!(
+            !view.read_with(cx, |view, _| view.engine.is_running(&lan.id)),
+            "LAN snapshot row waits for its confirm"
+        );
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "LAN confirm dialog opens"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        assert!(
+            !view.read_with(cx, |view, _| view.engine.is_running(&lan.id)),
+            "dismissing the confirm starts nothing"
+        );
+    }
+
+    /// Ticket 38: without the opt-in the snapshot is ignored (default off
+    /// restores nothing, never a silent start).
+    #[gpui_kit::test]
+    fn restore_off_restores_nothing(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Loop", "", "10873"))
+            .expect("seed works");
+        store
+            .save_running_snapshot(std::slice::from_ref(&row.id))
+            .expect("snapshot writes");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.restore_on_launch(window, cx));
+        });
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "opt-out restores nothing"
+        );
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    /// Ticket 38: start-all persists the running set, stop-all clears it
+    /// (the snapshot always matches the engine, via the reload hook).
+    #[gpui_kit::test]
+    fn start_all_snapshots_running_set_and_stop_clears(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(restore_seed("Alpha", "", "10874"))
+            .expect("seed works");
+        let beta = store
+            .add(restore_seed("Beta", "", "10875"))
+            .expect("seed works");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        let mut snapshot = view.read_with(cx, |view, _| view.store.load_running_snapshot());
+        snapshot.sort();
+        let mut expected = vec![alpha.id.clone(), beta.id.clone()];
+        expected.sort();
+        assert_eq!(snapshot, expected, "running set snapshots on start");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.stop_all_engines(window, cx));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot())
+                .is_empty(),
+            "stop-all clears the snapshot"
+        );
+    }
+
+    /// Ticket 38: the restore checkbox commits to the store (the headless
+    /// half; the autostart checkbox writes the real Run key, so it is
+    /// manual-review only by design).
+    #[gpui_kit::test]
+    fn settings_restore_commit_round_trips(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_restore_opt_in(true, window, cx));
+        });
+        assert!(view.read_with(cx, |view, _| view.store.restore_running()));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_restore_opt_in(false, window, cx));
+        });
+        assert!(!view.read_with(cx, |view, _| view.store.restore_running()));
+        assert_eq!(notification_count(cx), 2, "each commit toasts once");
+    }
+
+    /// Ticket 38: the Settings dialog opens with both opt-in switches plus
+    /// their side-effect notes (and the toolbar carries the entry point).
+    #[gpui_kit::test]
+    fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(|window, _| window.try_find("settings-dialog").is_some()));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        for id in [
+            "settings-autostart",
+            "settings-autostart-switch",
+            "settings-autostart-note",
+            "settings-restore",
+            "settings-restore-switch",
+            "settings-restore-note",
+            "settings-tray-note",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "settings dialog renders {id}"
+            );
+        }
+    }
+
+    /// Ticket 38: tray Quit stops the engine, clears the snapshot, and
+    /// drops the icon (headless: no real icon — the poll short-circuits
+    /// without one and never quits the app).
+    #[gpui_kit::test]
+    fn quit_from_tray_stops_engine_and_clears_snapshot(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Solo", "", "10876"))
+            .expect("seed works");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 1);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot()),
+            vec![row.id.clone()]
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.quit_from_tray());
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
+        assert!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot())
+                .is_empty(),
+            "quit clears the snapshot"
+        );
+        assert!(view.read_with(cx, |view, _| view.tray.is_none()));
+
+        let quit =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.poll_tray_once(window, cx)));
+        assert!(!quit, "no tray, no quit, no event drain");
     }
 }

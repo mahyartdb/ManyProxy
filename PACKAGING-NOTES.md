@@ -30,16 +30,21 @@
   `manyproxy-export.json` next to the library file); cancel writes nothing.
   The confirm surfaces `export_warning_text()` verbatim
   (asserted by `export_warning_names_secret_classes`).
-- **Window close with running endpoints**: closing the window opens a
-  confirm naming every running row (`close_confirm_description`) — OK stops
-  all endpoints and closes, Cancel keeps them running. Never a silent kill.
-  There is no minimize-to-tray in v1 (no new deps for it); closing really
-  stops the sidecars, so Stop-all before close is equivalent.
-- **No autostart, no registry writes**: v1 registers nothing at startup or
-  shutdown (no Run keys, services, protocol handlers, or single-instance
-  lock) — asserted by construction: the only file writes are the library
-  DB, the export path on explicit confirm, and per-launch sidecar configs
-  in the temp dir (removed on stop/crash).
+- **Window close with running endpoints**: closing the window hides to the
+  system tray instead of killing proxies (`ManyProxy · N running` tooltip;
+  Show / Start all / Stop all / Quit menu; left-click shows). Endpoints keep
+  serving behind the icon; Quit stops every endpoint and exits with no
+  orphans. If the shell refuses the tray icon, the close falls back to a
+  confirm naming every running row — OK stops all endpoints and closes,
+  Cancel keeps them running. Never a silent kill, never a tray without hide.
+- **Opt-in autostart, no silent registry writes**: the app registers nothing
+  by itself. The Settings dialog offers two explicit opt-ins, both default
+  off: "Start with Windows" (writes `HKCU\Software\Microsoft\Windows\
+  CurrentVersion\Run\ManyProxy = "<exe>"`, removing the value on opt-out)
+  and "Restore running endpoints on launch" (restarts the snapshotted
+  running set; loopback rows start directly, LAN-bound rows still need their
+  confirm). Registry is touched only through the checkbox; tests use temp
+  keys, never the real Run key.
 
 ## AV / heuristic expectations
 
