@@ -34,7 +34,7 @@ use engine::{
     LAN_CONFIRM_TITLE,
 };
 use health::{
-    ping_all, redact_secrets, test_all, truncate, HealthProber, HealthStore, LogStore,
+    ping_all, redact_secrets, test_all, truncate, HealthProber, HealthStore, LogLevel, LogStore,
     RealHealthProber, TestOutcome, DEFAULT_TEST_URL,
 };
 use import::{
@@ -43,10 +43,10 @@ use import::{
     parse_addsub_link, AddSubRequest, ImportError,
 };
 use store::{
-    count_importable, delete_confirm_text, due_for_refresh_for, export_confirm_description,
-    now_unix, protocol_params_template, proxy_urls, ConfigPatch, HealthSnapshot, NewConfig,
-    ProxyConfig, RestoreOutcome, Store, StoreError, Subscription as ProxySubscription,
-    DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
+    export_confirm_description, now_unix, protocol_params_template, proxy_urls, ConfigPatch,
+    HealthSnapshot, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
+    Subscription as ProxySubscription, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -201,6 +201,13 @@ struct LibraryDelegate {
     /// Ticket 30: serving truth per row (`config_id` set while running).
     /// The badge renders from this — never from the enabled flag.
     running: HashSet<String>,
+    /// Ticket 43: persisted traffic totals (`config_id` → `(rx, tx)`), set on
+    /// every reload so the list shows per-row usage.
+    traffic: HashMap<String, (u64, u64)>,
+    /// Ticket 43: subscription labels + preset names by id, set on reload so
+    /// the extended search never reads the store per keystroke.
+    sub_labels: HashMap<String, String>,
+    preset_names: HashMap<String, String>,
 }
 
 impl LibraryDelegate {
@@ -212,6 +219,9 @@ impl LibraryDelegate {
             selected: None,
             health: HashMap::new(),
             running: HashSet::new(),
+            traffic: HashMap::new(),
+            sub_labels: HashMap::new(),
+            preset_names: HashMap::new(),
         }
     }
 
@@ -234,13 +244,22 @@ impl LibraryDelegate {
         // filtered-out selection instead of landing actions on the wrong row.
         let selected_id = self.selected_row().map(|row| row.id.clone());
         let query = self.query.clone();
+        // Ticket 43: the extended matcher (sub label, preset name, state,
+        // serving, and health words) over a reload-built context — no store
+        // reads per keystroke (see [`MatchContext`]).
+        let ctx = MatchContext {
+            sub_labels: self.sub_labels.clone(),
+            preset_names: self.preset_names.clone(),
+            running: self.running.clone(),
+            health: self.health.clone(),
+        };
         self.visible = self
             .rows
             .iter()
             .enumerate()
             // Ticket 17: search covers host/bind/port, not just
             // name/protocol/group (see [`library_row_matches`]).
-            .filter(|(_, row)| library_row_matches(row, &query))
+            .filter(|(_, row)| library_row_matches_full(row, &query, &ctx))
             .map(|(index, _)| index)
             .collect();
         self.selected = selected_id.and_then(|id| {
@@ -276,6 +295,23 @@ impl LibraryDelegate {
     /// Badges render from this — never from the enabled flag.
     fn set_running(&mut self, ids: Vec<String>) {
         self.running = ids.into_iter().collect();
+    }
+
+    /// Ticket 43: replace the per-row traffic totals (persisted store
+    /// counters, keyed by config id).
+    fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
+        self.traffic = traffic;
+    }
+
+    /// Ticket 43: replace the search context maps (subscription labels and
+    /// preset names by id). Set on reload; filters never touch the store.
+    fn set_search_context(
+        &mut self,
+        sub_labels: HashMap<String, String>,
+        preset_names: HashMap<String, String>,
+    ) {
+        self.sub_labels = sub_labels;
+        self.preset_names = preset_names;
     }
 
     /// (total rows, enabled rows) for the status bar.
@@ -349,8 +385,10 @@ impl ListDelegate for LibraryDelegate {
             .map(String::as_str)
             .filter(|summary| !summary.is_empty());
         let is_running = self.running.contains(&row.id);
+        // Ticket 43: per-row persisted traffic totals ride into the row.
+        let traffic = self.traffic.get(&row.id).copied();
         let mut item = ListItem::new(format!("library-row-{}", row.id)).selected(selected);
-        for line in library_row_lines(&row, health, is_running) {
+        for line in library_row_lines(&row, health, is_running, traffic) {
             item = item.child(line);
         }
         Some(item)
@@ -468,10 +506,16 @@ fn dialog_footer(
 struct ConfigForm {
     name: Entity<InputState>,
     protocol: Entity<InputState>,
-    params: Entity<InputState>,
+    /// Ticket 43: multiline params editor (was single-line `Input` — JSON
+    /// needs room). Reads/writes go through the same `value()` seam.
+    params: Entity<TextareaState>,
     group: Entity<InputState>,
     bind: Entity<InputState>,
     port: Entity<InputState>,
+    /// Ticket 43: per-row probe-URL override (edit only — blank means the
+    /// global override, then the default). Persisted in store meta, never in
+    /// the row itself, so no schema change.
+    test_url: Entity<InputState>,
 }
 
 impl ConfigForm {
@@ -493,6 +537,23 @@ impl ConfigForm {
         })
     }
 
+    /// Ticket 43: one multiline builder for the params box (same
+    /// placeholder + default wiring as [`ConfigForm::field`]).
+    fn area(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        placeholder: &str,
+        default: Option<&str>,
+    ) -> Entity<TextareaState> {
+        cx.new(|cx| {
+            let state = TextareaState::new(window, cx).placeholder(placeholder);
+            match default {
+                Some(value) => state.default_value(value.to_string()),
+                None => state,
+            }
+        })
+    }
+
     fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
         // Ticket 31: the params box opens with the per-protocol field
         // template (guided add, not raw JSON first). Submitting it untouched
@@ -501,21 +562,32 @@ impl ConfigForm {
         Self {
             name: Self::field(window, cx, "Name", None),
             protocol: Self::field(window, cx, "Protocol", Some(DEFAULT_PROTOCOL)),
-            params: Self::field(window, cx, "Protocol params (optional)", Some(&template)),
+            params: Self::area(
+                window,
+                cx,
+                "Protocol params JSON (multiline)",
+                Some(&template),
+            ),
             group: Self::field(window, cx, "Group", Some(DEFAULT_GROUP)),
             bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
-            port: Self::field(window, cx, "Port (blank = auto)", None),
+            port: Self::field(window, cx, "Port (blank or auto = auto-assign)", None),
+            test_url: Self::field(window, cx, "Test URL (blank = global)", None),
         }
     }
 
-    fn prefilled(window: &mut Window, cx: &mut Context<AppView>, config: &ProxyConfig) -> Self {
+    fn prefilled(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        config: &ProxyConfig,
+        test_url: Option<&str>,
+    ) -> Self {
         Self {
             name: Self::field(window, cx, "Name", Some(config.name.as_str())),
             protocol: Self::field(window, cx, "Protocol", Some(config.protocol.as_str())),
-            params: Self::field(
+            params: Self::area(
                 window,
                 cx,
-                "Protocol params (optional)",
+                "Protocol params JSON (multiline)",
                 Some(config.params.as_str()),
             ),
             group: Self::field(window, cx, "Group", Some(config.group.as_str())),
@@ -523,9 +595,10 @@ impl ConfigForm {
             port: Self::field(
                 window,
                 cx,
-                "Port (blank = auto)",
+                "Port (blank or auto = auto-assign)",
                 Some(&config.port.to_string()),
             ),
+            test_url: Self::field(window, cx, "Test URL (blank = global)", test_url),
         }
     }
 
@@ -537,23 +610,89 @@ impl ConfigForm {
     /// rows snapshot); `form_error` is the shared first-error slot shown
     /// inline under the fields. All owned strings — the built element keeps
     /// no borrows.
+    /// Ticket 43: the params box is multiline with Format (pretty-print in
+    /// place) and Template (fill the per-protocol starter for the current
+    /// protocol field) buttons on both add and edit. Validation failures
+    /// name the JSON error inline via the shared `form_error` path at commit.
+    /// `show_test_url` renders the per-row probe-URL override (edit only —
+    /// the add dialog never implies a row exists yet).
     fn element(
         self,
+        view: Entity<AppView>,
         cx: &App,
         collision: Option<String>,
         form_error: Option<(String, String)>,
+        show_test_url: bool,
     ) -> impl IntoElement {
         let bind = self.bind.read(cx).value().to_string();
+        let format_view = view.clone();
+        let format_params = self.params.clone();
+        let template_view = view.clone();
+        let template_params = self.params.clone();
+        let template_protocol = self.protocol.clone();
+        let validate_view = view.clone();
+        let validate_params = self.params.clone();
+        let params_row = div()
+            .id("field-params")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(Label::new("Params"))
+            .child(Textarea::new(&self.params).h(px(120.)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(Button::new("params-format").label("Format JSON").on_click(
+                        move |_, window, cx| {
+                            format_view.update(cx, |view, cx| {
+                                view.format_dialog_params(&format_params, window, cx);
+                            });
+                        },
+                    ))
+                    .child(
+                        Button::new("params-template")
+                            .label("Load protocol template")
+                            .on_click(move |_, window, cx| {
+                                template_view.update(cx, |view, cx| {
+                                    view.template_dialog_params(
+                                        &template_params,
+                                        &template_protocol,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
+                    .child(Button::new("params-validate").label("Validate").on_click(
+                        move |_, window, cx| {
+                            validate_view.update(cx, |view, cx| {
+                                view.validate_dialog_params(&validate_params, window, cx);
+                            });
+                        },
+                    )),
+            );
         let mut col = div()
             .flex()
             .flex_col()
             .gap_2()
             .child(dialog_field("field-name", "Name", self.name))
             .child(dialog_field("field-protocol", "Protocol", self.protocol))
-            .child(dialog_field("field-params", "Params", self.params))
+            .child(params_row)
             .child(dialog_field("field-group", "Group", self.group))
             .child(dialog_field("field-bind", "Bind address", self.bind))
             .child(dialog_field("field-port", "Port", self.port));
+        // Ticket 43: per-row probe override lives on edit only.
+        if show_test_url {
+            col = col.child(dialog_field(
+                "field-test-url",
+                "Test URL (blank = global)",
+                self.test_url,
+            ));
+        }
         if let Some(hint) = lan_hint_for_bind(&bind) {
             col = col.child(div().id("lan-hint").test_support().child(hint));
         }
@@ -580,17 +719,19 @@ impl ConfigForm {
     /// (`name`/`protocol`/`params`/`group`/`bind_ip`/`port`). Unknown names
     /// focus nothing (never a wrong field).
     fn focus_field(&self, field: &str, window: &mut Window, cx: &mut App) {
-        let target = match field {
-            "name" => Some(&self.name),
-            "protocol" => Some(&self.protocol),
-            "params" => Some(&self.params),
-            "group" => Some(&self.group),
-            "bind_ip" => Some(&self.bind),
-            "port" => Some(&self.port),
+        // Ticket 43: `params` is a textarea state — every arm converts to
+        // the shared [`AnyInputState`] (the match cannot mix entity types).
+        let target: Option<AnyInputState> = match field {
+            "name" => Some(AnyInputState::from(self.name.clone())),
+            "protocol" => Some(AnyInputState::from(self.protocol.clone())),
+            "params" => Some(AnyInputState::from(self.params.clone())),
+            "group" => Some(AnyInputState::from(self.group.clone())),
+            "bind_ip" => Some(AnyInputState::from(self.bind.clone())),
+            "port" => Some(AnyInputState::from(self.port.clone())),
             _ => None,
         };
         if let Some(state) = target {
-            let handle = AnyInputState::from(state.clone()).focus_handle(cx);
+            let handle = state.focus_handle(cx);
             window.focus(&handle, cx);
         }
     }
@@ -682,7 +823,10 @@ impl ImportForm {
     /// every render from the current box contents, so it tracks typing and
     /// pasting) plus the dropped file names when present. The preview is
     /// inline text, never a toast.
-    fn element(self, cx: &App) -> impl IntoElement {
+    /// Ticket 43: the first failure reason shows inline pre-commit (fixable
+    /// before OK), plus a Browse button that picks files from disk (the
+    /// current box text is carried over, never dropped).
+    fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
         let text = self.text.read(cx).value().to_string();
         let (valid, invalid) = import_preview_counts(&text, self.file_hint.as_deref());
         let mut col = div()
@@ -699,13 +843,44 @@ impl ImportForm {
                     .child(Label::new("Links, JSON, or conf"))
                     .child(Textarea::new(&self.text).h(px(160.))),
             )
-            .child(dialog_field("field-import-group", "Group", self.group))
-            .child(
-                div()
-                    .id("import-preview")
-                    .test_support()
-                    .child(import_preview_message(valid, invalid)),
+            .child(dialog_field(
+                "field-import-group",
+                "Group",
+                self.group.clone(),
+            ));
+        // Ticket 43: Browse — the platform file picker; picked bytes merge
+        // with (never replace) the current box text.
+        {
+            let browse_view = view.clone();
+            let browse_text = self.text.clone();
+            let browse_group = self.group.clone();
+            col = col.child(
+                Button::new("import-browse")
+                    .label("Browse files…")
+                    .on_click(move |_, window, cx| {
+                        let current_text = browse_text.read(cx).value().to_string();
+                        let current_group = browse_group.read(cx).value().to_string();
+                        browse_view.update(cx, |view, cx| {
+                            view.browse_for_import_files(current_text, current_group, window, cx);
+                        });
+                    }),
             );
+        }
+        col = col.child(
+            div()
+                .id("import-preview")
+                .test_support()
+                .child(import_preview_message(valid, invalid)),
+        );
+        // Ticket 43: first-failure reason pre-commit (inline, never toast-only).
+        if let Some(reason) = first_import_failure_reason(&text, self.file_hint.as_deref()) {
+            col = col.child(
+                div()
+                    .id("import-first-failure")
+                    .test_support()
+                    .child(format!("first problem: {reason}")),
+            );
+        }
         if let Some(files) =
             import_files_label(self.file_hint.as_deref(), self.multi_files.as_deref())
         {
@@ -982,12 +1157,79 @@ fn start_all_message(count: usize) -> String {
 }
 
 /// Ticket 17: honest stop-all copy — never a success claim over silence.
+/// Ticket 43: the success names the count, never a bare claim.
 fn stop_all_message(running: usize) -> String {
     if running == 0 {
         "Nothing to stop — no endpoints are running".to_string()
     } else {
-        "Stopped all endpoints".to_string()
+        format!("Stopped {running} endpoint(s)")
     }
+}
+
+/// Ticket 43: stop-all confirm text — names the count plus every running row
+/// so the confirm can never be a blind kill. Empty input still names the
+/// zero (callers only show it when something runs).
+fn stop_all_confirm_description(names: &[String]) -> String {
+    let named = names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Stop {} running endpoint(s): {named}? Endpoints close and flags clear.",
+        names.len()
+    )
+}
+
+/// Ticket 43: edit-while-running copy — names the row and says the serving
+/// config is unchanged until a restart (no stale-serves-as-live).
+fn restart_to_apply_message(name: &str) -> String {
+    format!("Updated \"{name}\" — restart it to apply (still serving the previous config)")
+}
+
+/// Ticket 43: remove copy — a running row's endpoint stops first, and the
+/// toast says so; an idle row says nothing about stopping.
+fn removed_message(name: &str, was_running: bool) -> String {
+    if was_running {
+        format!("Removed \"{name}\" (endpoint stopped first)")
+    } else {
+        format!("Removed \"{name}\"")
+    }
+}
+
+/// Ticket 43: duplicate display name — `{base} copy`, suffixed while taken.
+/// Pure so tests pin uniqueness without touching the store.
+fn duplicate_name(base: &str, taken: &[String]) -> String {
+    let first = format!("{base} copy");
+    if !taken.iter().any(|name| name == &first) {
+        return first;
+    }
+    let mut index = 2usize;
+    loop {
+        let candidate = format!("{first} {index}");
+        if !taken.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+/// Ticket 43: one probe outcome rendered as a toast — names the row plus the
+/// latency on success or the redacted cause on failure (the cause is already
+/// redacted at the health seam).
+fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) -> String {
+    let verb = if ping { "Ping" } else { "Test" };
+    match (outcome.sample.latency_ms, outcome.sample.error.as_deref()) {
+        (Some(ms), _) => format!("{verb} \"{name}\": live, {ms}ms"),
+        (None, Some(cause)) => format!("{verb} \"{name}\": dead — {cause}"),
+        (None, None) => format!("{verb} \"{name}\": dead"),
+    }
+}
+
+/// Ticket 43: multi-probe summary toast — names all three counts so it never
+/// claims a clean sweep over failures.
+fn probe_summary_toast(count: usize, live: usize, dead: usize) -> String {
+    format!("Tested {count} endpoint(s): {live} live · {dead} dead")
 }
 
 /// Ticket 17: honest stop-on-stopped copy naming the row.
@@ -1199,10 +1441,17 @@ fn upstream_host_port(row: &ProxyConfig) -> Option<String> {
 /// third line. Health folds into the badge when running (no separate health
 /// child). Pure so tests pin the complete content;
 /// [`LibraryDelegate::render_item`] maps each line to a child.
-fn library_row_lines(row: &ProxyConfig, health: Option<&str>, is_running: bool) -> Vec<String> {
+/// Ticket 43: `traffic` appends a fifth `↓rx ↑tx` line, but only when bytes
+/// have actually flowed (idle rows keep the four-line shape).
+fn library_row_lines(
+    row: &ProxyConfig,
+    health: Option<&str>,
+    is_running: bool,
+    traffic: Option<(u64, u64)>,
+) -> Vec<String> {
     let upstream = upstream_host_port(row).unwrap_or_else(|| "no upstream".to_string());
     let state = if row.enabled { "enabled" } else { "disabled" };
-    vec![
+    let mut lines = vec![
         row.name.clone(),
         format!("{} · {upstream}", row.protocol),
         format!(
@@ -1210,22 +1459,104 @@ fn library_row_lines(row: &ProxyConfig, health: Option<&str>, is_running: bool) 
             row.group, row.bind_ip, row.port
         ),
         serving_badge(is_running, row.port, health),
-    ]
+    ];
+    if let Some((rx, tx)) = traffic {
+        if let Some(summary) = traffic_summary_text(rx, tx) {
+            lines.push(summary);
+        }
+    }
+    lines
 }
 
 /// Ticket 17: a library row matches the search query by name, protocol,
 /// group, bind address, port, or upstream host (the `server`/`address` inside
 /// params — never credential fields).
+/// Ticket 43: kept as the pinned base-matcher seam (the delegate filters
+/// through [`library_row_matches_full`); tests pin both.
+#[cfg_attr(not(test), allow(dead_code))]
 fn library_row_matches(row: &ProxyConfig, query: &str) -> bool {
+    library_row_matches_full(row, query, &MatchContext::empty())
+}
+
+/// Ticket 43: search context for the extended matcher — subscription labels
+/// and preset names by id (set on reload, never per keystroke), the serving
+/// set, and the per-row health summaries.
+#[derive(Debug, Default)]
+struct MatchContext {
+    sub_labels: HashMap<String, String>,
+    preset_names: HashMap<String, String>,
+    running: HashSet<String>,
+    health: HashMap<String, String>,
+}
+
+impl MatchContext {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// Ticket 43: extended library matcher — everything [`library_row_matches`]
+/// covers plus subscription label, preset name, enabled/disabled, running/
+/// stopped, and health words (live/dead/untested plus the summary text).
+/// Credential fields are never read.
+fn library_row_matches_full(row: &ProxyConfig, query: &str, ctx: &MatchContext) -> bool {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return true;
     }
-    if row.name.to_lowercase().contains(&q)
-        || row.protocol.to_lowercase().contains(&q)
-        || row.group.to_lowercase().contains(&q)
-        || row.bind_ip.to_lowercase().contains(&q)
-        || row.port.to_string().contains(&q)
+    if library_row_matches_base(row, &q) {
+        return true;
+    }
+    if let Some(owner) = row.subscription_id.as_deref() {
+        if let Some(label) = ctx.sub_labels.get(owner) {
+            if label.to_lowercase().contains(&q) {
+                return true;
+            }
+        }
+    }
+    if let Some(preset) = row.preset_id.as_deref() {
+        if let Some(name) = ctx.preset_names.get(preset) {
+            if name.to_lowercase().contains(&q) {
+                return true;
+            }
+        }
+    }
+    let state_word = if row.enabled { "enabled" } else { "disabled" };
+    if state_word.contains(&q) {
+        return true;
+    }
+    let serve_word = if ctx.running.contains(&row.id) {
+        "running"
+    } else {
+        "stopped"
+    };
+    if serve_word.contains(&q) {
+        return true;
+    }
+    let summary = ctx
+        .health
+        .get(&row.id)
+        .map(|summary| summary.trim().to_lowercase())
+        .unwrap_or_default();
+    if summary.is_empty() {
+        return "untested".contains(&q);
+    }
+    if summary.contains(&q) {
+        return true;
+    }
+    let health_word = if summary == "dead" { "dead" } else { "live" };
+    health_word.contains(&q)
+}
+
+/// Ticket 43: the pre-extension matcher (name/protocol/group/bind/port/
+/// upstream host), split out so the extended matcher reuses it.
+fn library_row_matches_base(row: &ProxyConfig, q: &str) -> bool {
+    if row.name.to_lowercase().contains(q)
+        || row.protocol.to_lowercase().contains(q)
+        || row.group.to_lowercase().contains(q)
+        || row.bind_ip.to_lowercase().contains(q)
+        || row.port.to_string().contains(q)
     {
         return true;
     }
@@ -1234,13 +1565,178 @@ fn library_row_matches(row: &ProxyConfig, query: &str) -> bool {
     {
         for key in ["server", "address"] {
             if let Some(serde_json::Value::String(host)) = map.get(key) {
-                if host.to_lowercase().contains(&q) {
+                if host.to_lowercase().contains(q) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// Ticket 43: validate a probe-URL override — http(s) with a host, nothing
+/// else. Returns the trimmed URL or the reason it cannot be used.
+fn normalize_test_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("test URL must not be empty".to_string());
+    }
+    let rest = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .ok_or_else(|| "test URL must start with http:// or https://".to_string())?;
+    let host = rest.split('/').next().unwrap_or("").trim();
+    if host.is_empty() {
+        return Err("test URL needs a host".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Ticket 43: probe-URL precedence — per-row override, then the global
+/// override, then the documented default.
+fn effective_probe_url(row_override: Option<&str>, global: Option<&str>) -> String {
+    row_override
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| global.filter(|url| !url.trim().is_empty()))
+        .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_TEST_URL.to_string())
+}
+
+/// Ticket 43: byte counts for traffic display (`88 B`, `2.0 KB`, `1.0 MB`).
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Ticket 43: per-row traffic line (`↓1.0 MB ↑88 B`). `None` when both
+/// counters are zero, so idle rows stay quiet.
+fn traffic_summary_text(rx: u64, tx: u64) -> Option<String> {
+    if rx == 0 && tx == 0 {
+        return None;
+    }
+    Some(format!("↓{} ↑{}", format_bytes(rx), format_bytes(tx)))
+}
+
+/// Ticket 43: summed traffic for the status bar. `None` when nothing has
+/// flowed, so the bar stays quiet on a fresh library.
+fn traffic_status_text(total_rx: u64, total_tx: u64) -> Option<String> {
+    traffic_summary_text(total_rx, total_tx).map(|summary| format!("traffic {summary}"))
+}
+
+/// Ticket 43: pretty-print params JSON for the Format button. Returns the
+/// pretty text or the reason it cannot format (the box keeps the original).
+fn format_params_json(text: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("params are not valid JSON: {error}"))?;
+    serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("params cannot be formatted: {error}"))
+}
+
+/// Ticket 43: params validation for the Validate button — blank means the
+/// store default, anything else must parse as JSON.
+fn validate_params_json(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .map(|_| ())
+        .map_err(|error| format!("params are not valid JSON: {error}"))
+}
+
+/// Ticket 43: first import failure rendered pre-commit (`item N (label):
+/// reason`), reusing the read-only preview parse. `None` when everything
+/// parses (or the box is empty) — the dialog then shows no reason line.
+fn first_import_failure_reason(text: &str, file_hint: Option<&str>) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let batch = match effective_hint_for_text(file_hint, text) {
+        Some(name) => import_file_content(&name, text),
+        None => import_text(text),
+    };
+    batch.failures.first().map(|failure| {
+        format!(
+            "item {} ({}): {}",
+            failure.index + 1,
+            failure.label,
+            failure.reason
+        )
+    })
+}
+
+/// Ticket 43: picked-file merge outcome — merged box text, the single-file
+/// hint (stems/keys survive), and the unedited multi-file pairs.
+type BrowsedImport = (String, Option<String>, Option<Vec<(String, String)>>);
+
+/// Ticket 43: fold picked files into the import dialog inputs — the current
+/// box text is kept, file bytes are appended; a single file keeps its name
+/// (stem/keys survive), several keep every pair (unedited multi path).
+fn merge_browse_results(existing: &str, files: &[(String, String)]) -> BrowsedImport {
+    let mut merged = existing.to_string();
+    for (_, content) in files {
+        if !merged.trim().is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(content);
+    }
+    if files.len() == 1 {
+        let hint = files.first().map(|(name, _)| name.clone());
+        (merged, hint, None)
+    } else if files.len() > 1 {
+        (merged, None, Some(files.to_vec()))
+    } else {
+        (merged, None, None)
+    }
+}
+
+/// Ticket 43: browse-read toast — names the count plus every file (basenames
+/// only; full paths can carry OS usernames).
+fn browse_read_message(names: &[String]) -> String {
+    let short: Vec<String> = names.iter().map(|name| file_basename(name)).collect();
+    format!("Read {} file(s): {}", short.len(), short.join(", "))
+}
+
+/// Ticket 43: second-gate overwrite confirm — names the exact path that will
+/// be clobbered. The write only runs on confirm.
+fn export_overwrite_confirm_description(path: &str) -> String {
+    format!("\"{path}\" already exists. Overwrite it with the new export?")
+}
+
+/// Ticket 43: log severity filter — `None` shows everything, `Some` keeps
+/// exactly that level.
+fn log_level_matches(level: LogLevel, filter: Option<LogLevel>) -> bool {
+    match filter {
+        None => true,
+        Some(wanted) => level == wanted,
+    }
+}
+
+/// Ticket 43: member names of one subscription, in library order. Empty when
+/// the sub owns nothing (never a missing-members lie).
+fn subscription_member_names(rows: &[ProxyConfig], sub_id: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.subscription_id.as_deref() == Some(sub_id))
+        .map(|row| row.name.clone())
+        .collect()
+}
+
+/// Ticket 43: Settings tick-interval line, read from the real constants so
+/// the copy can never drift from the timers.
+fn tick_interval_summary() -> String {
+    format!(
+        "engine poll {ENGINE_POLL_TICK_SECS}s · subscriptions {DUE_SUBSCRIPTION_TICK_SECS}s · \
+         reprobe {REPROBE_TICK_SECS}s · traffic {TRAFFIC_TICK_SECS}s"
+    )
 }
 
 /// Ticket 17: inline LAN-confirm hint for add/edit dialogs. `Some` when
@@ -1452,10 +1948,17 @@ impl SubForm {
 /// Remove actions. Refresh re-reads the record so a stale snapshot cannot
 /// fetch a removed subscription.
 /// Ticket 31: plus an Edit action opening the label/url/group editor.
+/// Ticket 37: one subscription row — label + redacted URL + group + auto +
+/// member count, plus Refresh / Auto / Edit / Remove.
+/// Ticket 43: expandable — an expanded row lists member names, a copy-URL
+/// button (redacted, never the token-bearing original), and the same Refresh
+/// retry. `expanded` + `members` come from the manager dialog's snapshot.
 fn subscription_row(
     view: Entity<AppView>,
     sub: ProxySubscription,
     count: usize,
+    expanded: bool,
+    members: Vec<String>,
 ) -> impl IntoElement {
     let mut row = div()
         .flex()
@@ -1481,6 +1984,48 @@ fn subscription_row(
                 .id(format!("sub-failures-{}", sub.id))
                 .test_support()
                 .child(failures),
+        );
+    }
+    // Ticket 43: expand affordance + expanded member detail.
+    let expand_view = view.clone();
+    let expand_id = sub.id.clone();
+    row = row.child(
+        Button::new(format!("sub-expand-{}", sub.id))
+            .label(if expanded { "Collapse" } else { "Expand" })
+            .on_click(move |_, window, cx| {
+                let sub_id = expand_id.clone();
+                expand_view.update(cx, |view, cx| {
+                    view.toggle_sub_expanded(&sub_id, window, cx);
+                });
+            }),
+    );
+    if expanded {
+        let names = if members.is_empty() {
+            "no member rows".to_string()
+        } else {
+            members.join(", ")
+        };
+        row = row.child(
+            div()
+                .id(format!("sub-members-{}", sub.id))
+                .test_support()
+                .child(format!("members: {names}")),
+        );
+        let copy_view = view.clone();
+        let copy_url = sub.url.clone();
+        row = row.child(
+            Button::new(format!("sub-copy-url-{}", sub.id))
+                .label("Copy URL")
+                .on_click(move |_, window, cx| {
+                    let redacted = redact_subscription_url(&copy_url);
+                    cx.write_to_clipboard(ClipboardItem::new_string(redacted));
+                    copy_view.update(cx, |_, cx| {
+                        window.push_notification(
+                            Notification::success("Copied subscription URL (redacted)"),
+                            cx,
+                        );
+                    });
+                }),
         );
     }
     let refresh_view = view.clone();
@@ -1653,6 +2198,30 @@ fn preset_row(
     }
     let remove_view = view.clone();
     let remove_id = preset.id.clone();
+    let edit_view = view.clone();
+    let edit_preset = preset.clone();
+    row = row.child(
+        Button::new(format!("preset-edit-{}", preset.id))
+            .label("Edit")
+            .on_click(move |_, window, cx| {
+                let preset = edit_preset.clone();
+                edit_view.update(cx, |view, cx| {
+                    view.open_preset_edit_dialog(preset, window, cx);
+                });
+            }),
+    );
+    let duplicate_view = view.clone();
+    let duplicate_id = preset.id.clone();
+    row = row.child(
+        Button::new(format!("preset-duplicate-{}", preset.id))
+            .label("Duplicate")
+            .on_click(move |_, window, cx| {
+                let id = duplicate_id.clone();
+                duplicate_view.update(cx, |view, cx| {
+                    view.commit_preset_duplicate(&id, window, cx);
+                });
+            }),
+    );
     row.child(
         Button::new(format!("preset-remove-{}", preset.id))
             .label("Remove")
@@ -1727,6 +2296,17 @@ struct AppView {
     health_store: HealthStore,
     logs: LogStore,
     log_filter: String,
+    /// Ticket 43: logs-dialog severity filter (`None` shows every level) and
+    /// the live-tail switch (on = reopen on new lines unless paused).
+    /// `logs_open` tracks the dialog so background reloads only touch it.
+    log_level: Option<LogLevel>,
+    log_tail: bool,
+    logs_open: bool,
+    /// Ticket 43: stored-record count at the last logs-dialog open — the
+    /// live-tail watermark (a reload with more records reopens when tailing).
+    logs_seen: usize,
+    /// Ticket 43: expanded subscription rows in the manager dialog (sub ids).
+    expanded_subs: HashSet<String>,
     /// Ticket 36: last-seen clash connection bytes (`core/conn-id` → (rx,
     /// tx)) for the traffic tick. Keyed per connection (not per row) so a
     /// connection that closes between polls cannot double-count the bytes
@@ -1841,6 +2421,11 @@ impl AppView {
             health_store: HealthStore::default(),
             logs: LogStore::default(),
             log_filter: String::new(),
+            log_level: None,
+            log_tail: true,
+            logs_open: false,
+            logs_seen: 0,
+            expanded_subs: HashSet::new(),
             traffic_last_seen: HashMap::new(),
             prober: Box::new(RealHealthProber::default()),
             ticks_enabled: true,
@@ -1938,6 +2523,19 @@ impl AppView {
         if let Err(error) = self.reload_inner(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
+        // Ticket 43: live-tail — the logs dialog follows new sidecar lines
+        // unless paused. Only our own dialog reopens (the `logs_open` proof);
+        // a paused dialog or a foreign screen is never touched.
+        if self.logs_open
+            && self.log_tail
+            && self.logs.all().len() != self.logs_seen
+            && window.has_active_dialog(cx)
+        {
+            window.close_all_dialogs(cx);
+            self.logs_open = false;
+            self.open_logs_dialog(window, cx);
+            return;
+        }
         cx.notify();
     }
 
@@ -1960,11 +2558,31 @@ impl AppView {
         if let Some(tray) = &self.tray {
             tray.set_running(running.len());
         }
+        // Ticket 43: traffic totals + search context ride into the delegate
+        // on every reload (a broken totals read shows no traffic, never a
+        // lying zero — the delegate keeps its last-good map).
+        let traffic = self.store.traffic_totals().unwrap_or_default();
+        let mut sub_labels = HashMap::new();
+        if let Ok(subs) = self.store.list_subscriptions() {
+            for sub in &subs {
+                sub_labels.insert(sub.id.clone(), sub.label.clone());
+            }
+        }
+        let mut preset_names = HashMap::new();
+        if let Ok(presets) = self.store.list_presets() {
+            for preset in &presets {
+                preset_names.insert(preset.id.clone(), preset.name.clone());
+            }
+        }
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
             state.delegate_mut().set_health(health);
             // Ticket 30: serving truth follows the engine on every reload.
             state.delegate_mut().set_running(running);
+            state.delegate_mut().set_traffic(traffic);
+            state
+                .delegate_mut()
+                .set_search_context(sub_labels, preset_names);
             // Ticket 19: notify the list entity itself (see `with_store`).
             list_cx.notify();
         });
@@ -2081,6 +2699,89 @@ impl AppView {
         }
     }
 
+    /// Ticket 43: Format-JSON button behind the add/edit params box —
+    /// pretty-prints the box in place (undoable). Bad JSON toasts the
+    /// reason and keeps the original text; blank boxes stay blank (the
+    /// store default), never a guessed object.
+    fn format_dialog_params(
+        &mut self,
+        params: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = params.read(cx).value().to_string();
+        if current.trim().is_empty() {
+            window.push_notification(
+                Notification::info("Params are blank — the protocol default applies"),
+                cx,
+            );
+            return;
+        }
+        match format_params_json(&current) {
+            Ok(pretty) => {
+                params.update(cx, |state, cx| {
+                    state.set_value(pretty, window, cx);
+                });
+            }
+            Err(reason) => {
+                window.push_notification(Notification::error(reason), cx);
+            }
+        }
+    }
+
+    /// Ticket 43: Template button behind the add/edit params box — fills the
+    /// per-protocol starter for the current protocol field (overwrites the
+    /// box; Format/undo restores typing). The toast names the protocol so a
+    /// stale-field fill is never mysterious.
+    fn template_dialog_params(
+        &mut self,
+        params: &Entity<TextareaState>,
+        protocol: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = protocol.read(cx).value().to_string();
+        let template = protocol_params_template(&name);
+        params.update(cx, |state, cx| {
+            state.set_value(template, window, cx);
+        });
+        let shown = name.trim();
+        window.push_notification(
+            Notification::info(format!(
+                "Loaded {} template — fill the blank fields",
+                if shown.is_empty() { "default" } else { shown }
+            )),
+            cx,
+        );
+    }
+
+    /// Ticket 43: Validate button behind the add/edit params box — blank
+    /// means the protocol default (valid), anything else must parse as JSON.
+    /// Both outcomes toast (success names nothing secret — just validity).
+    fn validate_dialog_params(
+        &mut self,
+        params: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = params.read(cx).value().to_string();
+        match validate_params_json(&current) {
+            Ok(()) => {
+                window.push_notification(
+                    Notification::success(if current.trim().is_empty() {
+                        "Params blank — the protocol default applies"
+                    } else {
+                        "Params are valid JSON"
+                    }),
+                    cx,
+                );
+            }
+            Err(reason) => {
+                window.push_notification(Notification::error(reason), cx);
+            }
+        }
+    }
+
     /// Ticket 26: re-read the row at commit. A row deleted while the dialog
     /// was open warns "Already removed" and closes (nothing left to edit);
     /// a store failure keeps the dialog open with the error (retryable).
@@ -2108,7 +2809,7 @@ impl AppView {
             }
             Ok(Some(existing)) => {
                 // Ticket 41: save gate on the effective row (patch over the
-                // stored row) — reserved ranges + garbage binds fail before
+                // stored row) - reserved ranges + garbage binds fail before
                 // any write.
                 let name = patch.name.as_deref().unwrap_or(&existing.name);
                 let bind = patch.bind_ip.as_deref().unwrap_or(&existing.bind_ip);
@@ -2125,7 +2826,14 @@ impl AppView {
                 }
                 match self.store.update(id, patch) {
                     Ok(updated) => {
-                        let message = row_action_message("Updated", &updated.name);
+                        // Ticket 43: a running row keeps serving its previous
+                        // config until a restart - the toast names the row and
+                        // says so instead of implying the edit is live.
+                        let message = if self.engine.is_running(id) {
+                            restart_to_apply_message(&updated.name)
+                        } else {
+                            row_action_message("Updated", &updated.name)
+                        };
                         self.reload(window, cx);
                         window.push_notification(Notification::success(message), cx);
                         true
@@ -2163,7 +2871,7 @@ impl AppView {
             }
             Ok(Some(existing)) => {
                 // Ticket 41: save gate on the effective row (inline slot +
-                // focus, like every other field error — the dialog stays
+                // focus, like every other field error - the dialog stays
                 // open, retryable).
                 let name = patch.name.as_deref().unwrap_or(&existing.name);
                 let bind = patch.bind_ip.as_deref().unwrap_or(&existing.bind_ip);
@@ -2184,7 +2892,13 @@ impl AppView {
                 match self.store.update(id, patch) {
                     Ok(updated) => {
                         *form_error.borrow_mut() = None;
-                        let message = row_action_message("Updated", &updated.name);
+                        // Ticket 43: restart-to-apply prompt on the dialog path
+                        // too (see [`AppView::commit_edit`]).
+                        let message = if self.engine.is_running(id) {
+                            restart_to_apply_message(&updated.name)
+                        } else {
+                            row_action_message("Updated", &updated.name)
+                        };
                         self.reload(window, cx);
                         window.push_notification(Notification::success(message), cx);
                         true
@@ -2203,6 +2917,9 @@ impl AppView {
         }
     }
 
+    /// Ticket 43: deleting a running row stops its endpoint FIRST, then the
+    /// row disappears — no orphan keeps serving. The toast names the row and
+    /// says the endpoint stopped first; an idle row keeps the plain copy.
     fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // Ticket 17: the toast names the row (looked up before the delete).
         let name = self
@@ -2212,6 +2929,7 @@ impl AppView {
             .flatten()
             .map(|row| row.name)
             .unwrap_or_else(|| id.to_string());
+        let was_running = self.engine.stop_one(id);
         match self.store.remove(id) {
             Ok(true) => {
                 // Ticket 19: only drop the selection when the removed row was
@@ -2227,7 +2945,7 @@ impl AppView {
                 }
                 self.reload(window, cx);
                 window.push_notification(
-                    Notification::success(row_action_message("Removed", &name)),
+                    Notification::success(removed_message(&name, was_running)),
                     cx,
                 );
             }
@@ -2237,6 +2955,299 @@ impl AppView {
             Err(error) => {
                 window
                     .push_notification(Notification::error(format!("Cannot remove: {error}")), cx);
+            }
+        }
+    }
+
+    /// Ticket 43: duplicate one row — the copy lands disabled with a fresh
+    /// auto-assign port (blank port text), a unique `… copy` name, and the
+    /// same protocol/params/group/bind. Ghost rows warn; the toast names both
+    /// rows.
+    fn commit_duplicate(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let source = match self.store.get(id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+                return;
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                return;
+            }
+        };
+        let taken: Vec<String> = self
+            .store
+            .list()
+            .map(|rows| rows.into_iter().map(|row| row.name).collect())
+            .unwrap_or_default();
+        let name = duplicate_name(&source.name, &taken);
+        let input = NewConfig {
+            name: name.clone(),
+            protocol: source.protocol.clone(),
+            params: source.params.clone(),
+            group: source.group.clone(),
+            bind_ip: source.bind_ip.clone(),
+            port: String::new(),
+        };
+        match self.store.add(input) {
+            Ok(created) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Duplicated \"{}\" as \"{}\" (disabled, port :{})",
+                        source.name, created.name, created.port
+                    )),
+                    cx,
+                );
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+            }
+        }
+    }
+    /// Ticket 43: reset one row's traffic totals (post-confirm). Store and
+    /// session mirror zero together, then the rows repaint; the toast names
+    /// the row. Ghost rows warn loudly.
+    fn commit_reset_traffic(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .store
+            .get(id)
+            .ok()
+            .flatten()
+            .map(|row| row.name)
+            .unwrap_or_else(|| id.to_string());
+        match self.store.reset_traffic(id) {
+            Ok(()) => {
+                self.health_store.set_data_traffic(id, 0, 0);
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!("Reset traffic for \"{name}\"")),
+                    cx,
+                );
+            }
+            Err(StoreError::NotFound(_)) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot reset traffic: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ticket 43: confirm-reset wrapper for one row's traffic — names the row
+    /// and its current totals so the reset is never blind.
+    fn open_traffic_reset_confirm(
+        &mut self,
+        config: ProxyConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let id = config.id.clone();
+        let totals = self
+            .store
+            .traffic_totals()
+            .ok()
+            .and_then(|map| map.get(&config.id).copied())
+            .unwrap_or((0, 0));
+        let description = format!(
+            "Reset traffic counters for \"{}\"? Current totals: ↓{} ↑{}. \
+             This zeroes the stored counters.",
+            config.name,
+            format_bytes(totals.0),
+            format_bytes(totals.1)
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let id = id.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Reset traffic")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_reset_traffic(&id, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Ticket 43: Settings commit — validate and store the global test-URL
+    /// override. Blank clears back to the documented default. The toast names
+    /// the effective URL so the setting visibly takes effect.
+    fn commit_test_url(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            match self.store.clear_test_url() {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(format!(
+                            "Test URL cleared — probes use the default ({DEFAULT_TEST_URL})"
+                        )),
+                        cx,
+                    );
+                    true
+                }
+                Err(error) => {
+                    self.report_save_error(error, window, cx);
+                    false
+                }
+            }
+        } else {
+            match normalize_test_url(trimmed) {
+                Ok(url) => match self.store.set_test_url(&url) {
+                    Ok(()) => {
+                        window.push_notification(
+                            Notification::success(format!("Test URL set — probes use {url}")),
+                            cx,
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        self.report_save_error(error, window, cx);
+                        false
+                    }
+                },
+                Err(reason) => {
+                    window.push_notification(
+                        Notification::error(format!("Invalid test URL: {reason}")),
+                        cx,
+                    );
+                    false
+                }
+            }
+        }
+    }
+
+    /// Ticket 43: edit-dialog commit for one row's probe-URL override.
+    /// Unchanged values stay silent (no toast on a no-op save); blank clears
+    /// back to the global; anything else validates before it persists. The
+    /// toast names the row plus the effective URL.
+    fn commit_row_test_url(
+        &mut self,
+        id: &str,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let current = self.store.row_test_url(id).unwrap_or_default();
+        let trimmed = raw.trim();
+        if trimmed == current.trim() {
+            return true;
+        }
+        let name = self
+            .store
+            .get(id)
+            .ok()
+            .flatten()
+            .map(|row| row.name)
+            .unwrap_or_else(|| id.to_string());
+        if trimmed.is_empty() {
+            match self.store.clear_row_test_url(id) {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(format!(
+                            "Test URL for \"{name}\" cleared — uses the global"
+                        )),
+                        cx,
+                    );
+                    true
+                }
+                Err(error) => {
+                    self.report_save_error(error, window, cx);
+                    false
+                }
+            }
+        } else {
+            match normalize_test_url(trimmed) {
+                Ok(url) => match self.store.set_row_test_url(id, &url) {
+                    Ok(()) => {
+                        window.push_notification(
+                            Notification::success(format!(
+                                "Test URL for \"{name}\" set — probes use {url}"
+                            )),
+                            cx,
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        self.report_save_error(error, window, cx);
+                        false
+                    }
+                },
+                Err(reason) => {
+                    window.push_notification(
+                        Notification::error(format!("Invalid test URL: {reason}")),
+                        cx,
+                    );
+                    false
+                }
+            }
+        }
+    }
+
+    /// Ticket 43: Settings commit — clear every row's traffic totals. The
+    /// toast names the cleared row count; the session mirrors rehydrate on
+    /// the next tick.
+    fn commit_clear_traffic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.clear_all_traffic() {
+            Ok(count) => {
+                self.traffic_last_seen.clear();
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!("Cleared traffic for {count} row(s)")),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot clear traffic: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ticket 43: Settings commit — drop every persisted health snapshot.
+    /// The toast names the cleared count; the live session store is untouched
+    /// (restart rehydrates from empty, honestly untested).
+    fn commit_clear_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.clear_health_snapshots() {
+            Ok(count) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!("Cleared {count} health snapshot(s)")),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot clear health: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ticket 43: Settings commit — drop the running snapshot so a later
+    /// launch restores nothing. The live engine is untouched.
+    fn commit_clear_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.clear_running_snapshot() {
+            Ok(()) => {
+                self.last_snapshot = Vec::new();
+                window.push_notification(
+                    Notification::success("Running snapshot cleared — next launch starts clean"),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot clear snapshot: {error}")),
+                    cx,
+                );
             }
         }
     }
@@ -2278,9 +3289,11 @@ impl AppView {
 
     /// Ticket 30: the removed duplicate Enable/Disable button's commit path.
     /// Test-only seam — production uses the `Enabled` Switch.
+    /// Ticket 43: no selection explains itself — never a dead click.
     #[cfg(test)]
     fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         };
         let id = config.id.clone();
@@ -2288,11 +3301,14 @@ impl AppView {
         self.commit_enabled_flag(&id, enabled, window, cx);
     }
 
+    /// Ticket 43: no selection explains itself — never a dead click.
     fn copy_selected_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(config) = self.selected_config(cx) {
             let (socks, http) = proxy_urls(&config.bind_ip, config.port);
             cx.write_to_clipboard(ClipboardItem::new_string(format!("{socks}\n{http}")));
             window.push_notification(Notification::success("Copied proxy URLs"), cx);
+        } else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
         }
     }
 
@@ -2520,8 +3536,10 @@ impl AppView {
     /// Ticket 05: stop the selected config; its endpoint closes, the rest
     /// keep serving on a regenerated config.
     /// Ticket 41: a stop failure toasts instead of claiming false success.
+    /// Ticket 43: no selection explains itself — never a dead click.
     fn stop_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         };
         let id = config.id.clone();
@@ -2775,7 +3793,36 @@ impl AppView {
     /// Ticket 17: honest when nothing runs (never a success claim over
     /// silence).
     /// Ticket 41: a stop failure toasts instead of claiming false success.
+    /// Ticket 43: stop-all behind a confirm that names the count plus every
+    /// running row — one click never kills everything silently. With nothing
+    /// running there is nothing to confirm, so the honest idle warning fires
+    /// directly (no confirm over silence).
     fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.engine.running_count() == 0 {
+            let message = stop_all_message(0);
+            window.push_notification(Notification::warning(message), cx);
+            return;
+        }
+        let names = self.running_names_for_close();
+        let view = cx.entity();
+        let description = stop_all_confirm_description(&names);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Stop all endpoints")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_stop_all(window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Ticket 43: the actual stop-all (post-confirm). Stops every endpoint,
+    /// clears flags best-effort-loud, and names the stopped count.
+    fn commit_stop_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let running = self.engine.running_count();
         let stop_error = self.engine.stop_all_result().map(|error| error.to_string());
         if let Some(error) = stop_error {
@@ -3070,6 +4117,18 @@ impl AppView {
         let view = cx.entity();
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
+        // Ticket 43: test-URL field prefilled with the override (blank means
+        // the documented default); the commit validates + persists.
+        let current_test_url = self.store.test_url().unwrap_or_default();
+        let test_url_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format!("Default: {DEFAULT_TEST_URL}"))
+                .default_value(current_test_url)
+        });
+        let test_url_reader = test_url_state.clone();
+        let test_url_view = view.clone();
+        let db_path = Store::default_path().display().to_string();
+        let export_path = Store::default_export_path().display().to_string();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let autostart_view = view.clone();
             let restore_view = view.clone();
@@ -3077,6 +4136,19 @@ impl AppView {
             let restore_cell = restore_state.clone();
             let autostart_on = *autostart_state.borrow();
             let restore_on = *restore_state.borrow();
+            // Ticket 43: copy-path + clear-data buttons (each re-reads live
+            // state through the view — never a stale snapshot). Every clone
+            // is per-render (the builder is `Fn`): button handlers own these,
+            // never the outer bindings.
+            let save_reader = test_url_reader.clone();
+            let save_view = test_url_view.clone();
+            let copy_db_view = test_url_view.clone();
+            let db_path_for_copy = db_path.clone();
+            let copy_export_view = test_url_view.clone();
+            let export_path_for_copy = export_path.clone();
+            let clear_traffic_view = test_url_view.clone();
+            let clear_health_view = test_url_view.clone();
+            let clear_snapshot_view = test_url_view.clone();
             dialog
                 .title("Settings")
                 .child(
@@ -3141,6 +4213,113 @@ impl AppView {
                                     "On relaunches the previously running set. Loopback rows start \
                                      directly; LAN-bound rows still need their confirm. Default off.",
                                 ),
+                        )
+                        // Ticket 43: probe URL (global override; blank =
+                        // default; per-row overrides ride in each row's Test).
+                        .child(dialog_field(
+                            "field-settings-test-url",
+                            "Test URL (blank = default)",
+                            test_url_reader.clone(),
+                        ))
+                        .child(
+                            div()
+                                .id("settings-test-url-note")
+                                .test_support()
+                                .child(format!(
+                                    "Probes GET this URL through each endpoint. \
+                                     Default: {DEFAULT_TEST_URL}"
+                                )),
+                        )
+                        .child(
+                            Button::new("settings-save-test-url")
+                                .label("Save test URL")
+                                .on_click(move |_, window, cx| {
+                                    let url = save_reader.read(cx).value().to_string();
+                                    save_view.update(cx, |view, cx| {
+                                        view.commit_test_url(&url, window, cx);
+                                    });
+                                }),
+                        )
+                        // Ticket 43: tick intervals (read-only — the real
+                        // constants, so the copy cannot drift).
+                        .child(
+                            div()
+                                .id("settings-ticks")
+                                .test_support()
+                                .child(format!("Timers: {}", tick_interval_summary())),
+                        )
+                        // Ticket 43: paths (display + copy; reveal = copy —
+                        // the shell never shells out to an explorer).
+                        .child(
+                            div()
+                                .id("settings-db-path")
+                                .test_support()
+                                .child(format!("Data folder: {db_path}")),
+                        )
+                        .child(
+                            Button::new("settings-copy-db-path")
+                                .label("Copy data path")
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        db_path_for_copy.clone(),
+                                    ));
+                                    copy_db_view.update(cx, |_, cx| {
+                                        window.push_notification(
+                                            Notification::success("Copied data path"),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("settings-export-path")
+                                .test_support()
+                                .child(format!("Export default: {export_path}")),
+                        )
+                        .child(
+                            Button::new("settings-copy-export-path")
+                                .label("Copy export path")
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        export_path_for_copy.clone(),
+                                    ));
+                                    copy_export_view.update(cx, |_, cx| {
+                                        window.push_notification(
+                                            Notification::success("Copied export path"),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                        // Ticket 43: destructive maintenance — each behind
+                        // its own explicit click + honest count toast.
+                        .child(
+                            Button::new("settings-clear-traffic")
+                                .label("Clear traffic counters")
+                                .on_click(move |_, window, cx| {
+                                    clear_traffic_view.update(cx, |view, cx| {
+                                        view.commit_clear_traffic(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("settings-clear-health")
+                                .label("Clear health snapshots")
+                                .on_click(move |_, window, cx| {
+                                    clear_health_view.update(cx, |view, cx| {
+                                        view.commit_clear_health(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("settings-clear-snapshot")
+                                .label("Reset running snapshot")
+                                .on_click(move |_, window, cx| {
+                                    clear_snapshot_view.update(cx, |view, cx| {
+                                        view.commit_clear_snapshot(window, cx);
+                                    });
+                                }),
                         )
                         .child(
                             div().id("settings-tray-note").test_support().child(
@@ -3355,8 +4534,11 @@ impl AppView {
     /// Ticket 06: URL-test just the selected config's endpoint.
     /// Ticket 26: off-thread via [`AppView::spawn_probe`] (silent record,
     /// like before — no toast).
+    /// Ticket 43: the selected test toasts its result (latency or redacted
+    /// cause, naming the row); no selection explains itself.
     fn test_selected_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         };
         if !self.engine.running_ids().contains(&config.id) {
@@ -3370,13 +4552,15 @@ impl AppView {
             window.push_notification(Notification::info("A health test is already running"), cx);
             return;
         }
-        self.spawn_probe(vec![config], false, false, None, cx);
+        self.spawn_probe(vec![config], false, true, Some(window.window_handle()), cx);
     }
 
     /// Ticket 06: TCP-ping just the selected config's endpoint.
     /// Ticket 26: off-thread via [`AppView::spawn_probe`] (silent record).
+    /// Ticket 43: the selected ping toasts its result like the test above.
     fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         };
         if !self.engine.running_ids().contains(&config.id) {
@@ -3393,6 +4577,18 @@ impl AppView {
         self.spawn_probe(vec![config], true, false, None, cx);
     }
 
+    /// Ticket 43: the probe URL for these rows — a lone selected row uses its
+    /// own override when set, otherwise the global override, otherwise the
+    /// documented default. Multi-row probes share the global (never a mix).
+    fn effective_test_url(&self, rows: &[ProxyConfig]) -> String {
+        let global = self.store.test_url();
+        if rows.len() == 1 {
+            let row_override = self.store.row_test_url(&rows[0].id);
+            return effective_probe_url(row_override.as_deref(), global.as_deref());
+        }
+        effective_probe_url(None, global.as_deref())
+    }
+
     /// Ticket 26 (ticket-25 consumer): run `test_all`/`ping_all` off the UI
     /// thread. The boxed prober moves into the background task (a default
     /// stands in, guarded by `probe_in_flight` so it is never observable);
@@ -3401,6 +4597,10 @@ impl AppView {
     /// (the captured window) versus the silent tick record. A released view
     /// — or a window closed mid-flight — fails closed: outcomes are recorded
     /// quietly or dropped without touching dead state.
+    /// Ticket 43: probes use the effective test URL (per-row override, then
+    /// the global override, then the documented default). A single selected
+    /// probe toasts its own result (latency or redacted cause, naming the
+    /// row); multi-probe toasts name all three counts.
     /// Returns the number of probes started.
     fn spawn_probe(
         &mut self,
@@ -3414,9 +4614,17 @@ impl AppView {
             return 0;
         }
         let count = rows.len();
+        let url = self.effective_test_url(&rows);
+        let names: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.id.clone(), row.name.clone()))
+            .collect();
         self.probe_in_flight = true;
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
         let weak = cx.entity().downgrade();
+        // `ping` moves into the background task below; the toast half keeps
+        // its own copy (`bool` is `Copy`, but the inner `async move` takes it).
+        let toast_ping = ping;
         cx.spawn(async move |_entity, cx| {
             let (outcomes, prober) = cx
                 .background_executor()
@@ -3425,7 +4633,7 @@ impl AppView {
                     let outcomes = if ping {
                         ping_all(&rows, &mut *prober)
                     } else {
-                        test_all(&rows, DEFAULT_TEST_URL, &mut *prober)
+                        test_all(&rows, &url, &mut *prober)
                     };
                     (outcomes, prober)
                 })
@@ -3448,18 +4656,31 @@ impl AppView {
                 };
                 // Toast half (fresh borrow): manual tests toast through the
                 // captured window; everything else reloads quietly.
+                // Ticket 43: a single selected probe toasts its own result
+                // (latency or redacted cause, naming the row); anything else
+                // toasts the three counts.
                 if toast {
+                    let message = if count == 1 {
+                        match outcomes.first() {
+                            Some(outcome) => {
+                                let name = names
+                                    .iter()
+                                    .find(|(id, _)| *id == outcome.sample.config_id)
+                                    .map(|(_, name)| name.clone())
+                                    .unwrap_or_else(|| outcome.sample.config_id.clone());
+                                probe_result_toast(&name, outcome, toast_ping)
+                            }
+                            None => probe_summary_toast(count, live, dead),
+                        }
+                    } else {
+                        probe_summary_toast(count, live, dead)
+                    };
                     if let Some(handle) = window {
                         if handle
                             .update(cx, |_, window, cx| {
                                 view.update(cx, |view, cx| {
                                     view.reload(window, cx);
-                                    window.push_notification(
-                                        Notification::success(format!(
-                                            "Tested {count} endpoint(s): {live} live · {dead} dead"
-                                        )),
-                                        cx,
-                                    );
+                                    window.push_notification(Notification::success(message), cx);
                                 });
                             })
                             .is_ok()
@@ -3502,9 +4723,12 @@ impl AppView {
     /// `[31m`/`[38;5;…`); the Logs dialog renders them stripped via the
     /// shared `strip_ansi_codes` helper. Stored records stay verbatim so
     /// filtering and any future export see the original bytes.
+    /// Ticket 43: the severity filter (`log_level`) applies on top — `None`
+    /// shows every level.
     fn log_lines(&self, cx: &App) -> Vec<String> {
         let selected = self.selected_config(cx).map(|config| config.id);
         let filter = self.log_filter.trim().to_lowercase();
+        let level = self.log_level;
         let render =
             |level: &str, message: &str| format!("[{}] {}", level, strip_ansi_codes(message));
         let mut lines: Vec<String> = match selected.as_deref() {
@@ -3512,12 +4736,14 @@ impl AppView {
                 .logs
                 .for_config(id)
                 .iter()
+                .filter(|record| log_level_matches(record.level, level))
                 .map(|record| render(record.level.as_str(), &record.message))
                 .collect(),
             None => self
                 .logs
                 .all()
                 .iter()
+                .filter(|record| log_level_matches(record.level, level))
                 .map(|record| render(record.level.as_str(), &record.message))
                 .collect(),
         };
@@ -3530,11 +4756,69 @@ impl AppView {
         lines
     }
 
+    /// Ticket 43: copy the currently visible log lines to the clipboard
+    /// (the same snapshot the dialog shows — substring + level filtered,
+    /// newest last, capped). Empty warns instead of copying nothing.
+    fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.log_lines(cx);
+        if lines.is_empty() {
+            window.push_notification(Notification::warning("No log lines to copy"), cx);
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        window.push_notification(
+            Notification::success(format!("Copied {} log line(s)", lines.len())),
+            cx,
+        );
+    }
+
+    /// Ticket 43: set the logs-dialog severity filter and re-render the open
+    /// dialog around the new filter (the filter text is preserved).
+    fn set_log_level(
+        &mut self,
+        level: Option<LogLevel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.log_level = level;
+        if self.logs_open && window.has_active_dialog(cx) {
+            window.close_all_dialogs(cx);
+            self.logs_open = false;
+            self.open_logs_dialog(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Ticket 43: pause/resume the live tail. Resuming reopens around the
+    /// latest lines so the dialog catches up; the toast names the state.
+    fn toggle_log_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.log_tail = !self.log_tail;
+        window.push_notification(
+            Notification::info(if self.log_tail {
+                "Log tail resumed"
+            } else {
+                "Log tail paused"
+            }),
+            cx,
+        );
+        if self.logs_open && window.has_active_dialog(cx) {
+            window.close_all_dialogs(cx);
+            self.logs_open = false;
+            self.open_logs_dialog(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     /// Ticket 06: per-config log dialog with a filter field. OK applies the
     /// filter and re-renders when still open.
     /// Ticket 26 (L4 ruling): the lines snapshot at open; new sidecar lines
     /// need a reopen. Live re-rendering an open dialog on every engine tick
     /// would fight the user's scroll position and filter typing.
+    /// Ticket 43: the dialog gains a severity filter, a Copy-visible button,
+    /// and a Pause/Resume tail switch; while tailing, [`AppView::reload`]
+    /// reopens the dialog when new lines land (paused dialogs never move).
     fn open_logs_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.log_filter.clone();
         let filter_state = cx.new(|cx| {
@@ -3555,23 +4839,102 @@ impl AppView {
         // lets the key path (framework) and the mouse path (footer) each
         // close exactly once. The previous explicit `close_all_dialogs` here
         // double-closed on the mouse path.
+        // Ticket 43: cloned up front — the chrome snapshot below needs one too.
+        let commit_view = view.clone();
         let commit: DialogCommit = Rc::new(move |_window, cx| {
             let filter = reader.read(cx).value().to_string();
-            view.update(cx, |view, cx| {
+            commit_view.update(cx, |view, cx| {
                 view.log_filter = filter;
                 cx.notify();
             });
             true
         });
         let commit_key = commit.clone();
+        // Ticket 43: mark the dialog live (tail watermark = stored records).
+        self.logs_open = true;
+        self.logs_seen = self.logs.all().len();
+        // Ticket 43: dialog-chrome snapshot for the level/tail buttons (the
+        // builder re-runs per render, so the labels track state). Copied up
+        // front — the builder runs synchronously inside `update` callers
+        // (level set, tail toggle, tail reopen), so it must never read the
+        // view entity itself while the view is borrowed.
+        let chrome_view = view.clone();
+        let chrome_level = self.log_level;
+        let chrome_tail = self.log_tail;
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
-            let mut body = div().flex().flex_col().gap_2().child(dialog_field(
-                "field-log-filter",
-                "Filter",
-                filter_state.clone(),
-            ));
+            // Ticket 43: severity filter row + Copy/tail row. Each button
+            // re-renders this same dialog around its new state.
+            let (current_level, tail_on) = (chrome_level, chrome_tail);
+            let mut level_row = div()
+                .id("log-level-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2();
+            for (id, label, level) in [
+                ("log-level-all", "All", None),
+                ("log-level-debug", "Debug", Some(LogLevel::Debug)),
+                ("log-level-info", "Info", Some(LogLevel::Info)),
+                ("log-level-warn", "Warn", Some(LogLevel::Warn)),
+                ("log-level-error", "Error", Some(LogLevel::Error)),
+            ] {
+                let level_view = chrome_view.clone();
+                let active = current_level == level;
+                level_row = level_row.child(
+                    Button::new(id)
+                        .label(if active {
+                            format!("● {label}")
+                        } else {
+                            label.to_string()
+                        })
+                        .on_click(move |_, window, cx| {
+                            level_view.update(cx, |view, cx| {
+                                view.set_log_level(level, window, cx);
+                            });
+                        }),
+                );
+            }
+            let copy_view = chrome_view.clone();
+            let tail_view = chrome_view.clone();
+            let action_row = div()
+                .id("log-actions-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("log-copy-visible")
+                        .label("Copy visible")
+                        .on_click(move |_, window, cx| {
+                            copy_view.update(cx, |view, cx| {
+                                view.copy_visible_logs(window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("log-tail-toggle")
+                        .label(if tail_on { "Pause tail" } else { "Resume tail" })
+                        .on_click(move |_, window, cx| {
+                            tail_view.update(cx, |view, cx| {
+                                view.toggle_log_tail(window, cx);
+                            });
+                        }),
+                );
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(level_row)
+                .child(action_row)
+                .child(dialog_field(
+                    "field-log-filter",
+                    "Filter",
+                    filter_state.clone(),
+                ));
             let mut list = div()
                 .id("log-lines")
                 .test_support()
@@ -3585,6 +4948,7 @@ impl AppView {
                 list = list.child(line.clone());
             }
             body = body.child(list);
+            let close_view = chrome_view.clone();
             dialog
                 .title(title.clone())
                 .child(body)
@@ -3593,6 +4957,11 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
+                .on_close(move |_, _, cx| {
+                    close_view.update(cx, |view, _| {
+                        view.logs_open = false;
+                    });
+                })
                 .footer(dialog_footer(
                     "logs-dialog-ok",
                     "logs-dialog-cancel",
@@ -3612,6 +4981,10 @@ impl AppView {
     /// behavior). The commit re-lists for its toast, and the overwrite
     /// confirm stands regardless — reopening the dialog refreshes the
     /// preview.
+    /// Ticket 43: the destination is an editable path (prefilled with the
+    /// default) — gate one names the path and offers the choice; when the
+    /// chosen file already exists, gate two names it again and demands an
+    /// explicit overwrite confirm. No silent clobber, ever.
     fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         // Ticket 26: a broken database errors instead of previewing counts
@@ -3619,35 +4992,116 @@ impl AppView {
         let Some(rows) = self.list_or_notify(window, cx) else {
             return;
         };
-        let path = Store::default_export_path();
+        let default_path = Store::default_export_path().display().to_string();
+        let path_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Export file path")
+                .default_value(default_path)
+        });
         let preview = export_preview_description(
             rows.len(),
             count_importable(&rows),
-            &path.display().to_string(),
-            path.exists(),
+            &Store::default_export_path().display().to_string(),
+            Store::default_export_path().exists(),
         );
-        let description = format!("{}\n\n{preview}", export_confirm_description());
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let view = view.clone();
-            let description = description.clone();
-            alert
-                .confirm()
+        let warning = export_confirm_description().to_string();
+        let reader = path_state.clone();
+        let commit_view = view.clone();
+        // Ticket 18: Rc-shared with the footer OK button (mouse commits
+        // identically to the Confirm key path, including the second gate).
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let path = reader.read(cx).value().to_string();
+            commit_view.update(cx, |view, cx| view.commit_export_dialog(path, window, cx))
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
                 .title("Export library")
-                .description(description)
-                .on_ok(move |_, window, cx| {
-                    view.update(cx, |view, cx| view.commit_export_write(window, cx));
-                    true
-                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("export-warning")
+                                .test_support()
+                                .child(warning.clone()),
+                        )
+                        .child(
+                            div()
+                                .id("export-preview")
+                                .test_support()
+                                .child(preview.clone()),
+                        )
+                        .child(dialog_field(
+                            "field-export-path",
+                            "Export file path",
+                            path_state.clone(),
+                        )),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "export-dialog-ok",
+                    "export-dialog-cancel",
+                    commit_click,
+                ))
         });
     }
 
-    /// Ticket 11: the actual export write (post-confirm). The notification
-    /// names only the destination path and the row count — never secrets.
-    /// Ticket 16: the count is honest — import-shaped (re-importable) vs
-    /// total, so hand-made metadata-only rows never inflate the claim.
-    fn commit_export_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = Store::default_export_path();
-        match self.store.commit_export(&path, true) {
+    /// Ticket 43: export dialog commit — gate two. A blank path errors (never
+    /// a guessed destination); an existing file opens the explicit overwrite
+    /// confirm naming the path; anything else writes immediately.
+    fn commit_export_dialog(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            window.push_notification(Notification::error("Export path must not be empty"), cx);
+            return false;
+        }
+        if std::path::Path::new(trimmed).exists() {
+            let view = cx.entity();
+            let description = export_overwrite_confirm_description(trimmed);
+            let target = trimmed.to_string();
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let view = view.clone();
+                let target = target.clone();
+                let description = description.clone();
+                alert
+                    .confirm()
+                    .title("Overwrite export?")
+                    .description(description)
+                    .on_ok(move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.commit_export_write_to(&target, window, cx)
+                        });
+                        true
+                    })
+            });
+            return false;
+        }
+        self.commit_export_write_to(trimmed, window, cx);
+        true
+    }
+
+    /// Ticket 43: the actual export write to one explicit path (both gates
+    /// passed). Headless/test seam — the dialog commit funnels here.
+    /// Ticket 11/16 (moved with the path choice): the notification names
+    /// only the destination path and the honest import-shaped-vs-total
+    /// count — never secrets, never an inflated claim.
+    fn commit_export_write_to(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let target = std::path::PathBuf::from(path.trim());
+        match self.store.commit_export(&target, true) {
             Ok(Some(path)) => {
                 let rendered = path.display().to_string();
                 // Ticket 14: the export itself succeeded — name the path with
@@ -3833,6 +5287,9 @@ impl AppView {
         let rows = self.store.list().unwrap_or_default();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
+        // Ticket 43: cloned up front — the builder needs one for the params
+        // Format/Template buttons too.
+        let element_view = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             view.update(cx, |view, cx| {
                 view.commit_add_with_focus(&reader, &error_for_commit, window, cx)
@@ -3851,7 +5308,10 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title("Add proxy configuration")
-                .child(form.clone().element(cx, collision, inline))
+                .child(
+                    form.clone()
+                        .element(element_view.clone(), cx, collision, inline, false),
+                )
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -3871,7 +5331,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = ConfigForm::prefilled(window, cx, &config);
+        let form = ConfigForm::prefilled(
+            window,
+            cx,
+            &config,
+            self.store.row_test_url(&config.id).as_deref(),
+        );
         let view = cx.entity();
         let reader = form.clone();
         let id = config.id.clone();
@@ -3888,11 +5353,22 @@ impl AppView {
         // Ticket 26: the patch is relative to this dialog-open snapshot —
         // only fields the user actually changed are written, so a refresh
         // that lands mid-edit survives on every untouched field.
+        // Ticket 43: cloned up front — the builder needs one for the params
+        // Format/Template buttons too. The per-row test URL commits
+        // alongside the patch (unchanged URLs stay silent).
         let snapshot = config.clone();
+        let element_view = view.clone();
+        let url_id = id.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let patch = reader.as_patch_vs(cx, &snapshot);
+            let url = reader.test_url.read(cx).value().to_string();
             view.update(cx, |view, cx| {
-                view.commit_edit_with_focus(&id, patch, &reader, &error_for_commit, window, cx)
+                let ok =
+                    view.commit_edit_with_focus(&id, patch, &reader, &error_for_commit, window, cx);
+                if ok {
+                    view.commit_row_test_url(&url_id, &url, window, cx);
+                }
+                ok
             })
         });
         let commit_key = commit.clone();
@@ -3906,7 +5382,10 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title(title.clone())
-                .child(form.clone().element(cx, collision, inline))
+                .child(
+                    form.clone()
+                        .element(element_view.clone(), cx, collision, inline, true),
+                )
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -3929,13 +5408,21 @@ impl AppView {
         let view = cx.entity();
         let id = config.id.clone();
         let name = config.name.clone();
+        // Ticket 43: a running row is promised stop-first; the idle copy
+        // stays (it would lie about stopping here).
+        let description = if self.engine.is_running(&config.id) {
+            delete_running_confirm_text(&name)
+        } else {
+            delete_confirm_text(&name)
+        };
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let id = id.clone();
+            let description = description.clone();
             alert
                 .confirm()
                 .title("Remove configuration")
-                .description(delete_confirm_text(&name))
+                .description(description)
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| view.commit_remove(&id, window, cx));
                     true
@@ -3988,13 +5475,16 @@ impl AppView {
         // Ticket 26: the dialog commit parses on the background executor
         // ([`AppView::commit_import_dialog`]) — it returns false immediately
         // and the completion closes the dialog on success.
+        // Ticket 43: cloned up front — the builder needs one for Browse too.
+        let commit_view = view.clone();
+        let element_view = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let text = reader.text.read(cx).value().to_string();
             let group = reader.group.read(cx).value().to_string();
             let hint = reader.file_hint.clone();
             let original = reader.original_text.clone();
             let multi = reader.multi_files.clone();
-            view.update(cx, |view, cx| {
+            commit_view.update(cx, |view, cx| {
                 view.commit_import_dialog(text, group, hint, Some(original), multi, window, cx)
             })
         });
@@ -4004,7 +5494,7 @@ impl AppView {
             let commit_click = commit.clone();
             dialog
                 .title("Import proxy configurations")
-                .child(form.clone().element(cx))
+                .child(form.clone().element(element_view.clone(), cx))
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -4092,6 +5582,86 @@ impl AppView {
                 cx,
             );
         }
+    }
+
+    /// Ticket 43: Browse button behind the import dialog — the platform file
+    /// picker (multi-select); picked bytes merge with the current box text
+    /// via [`finish_browse_pick`]. Cancelling picks nothing and changes
+    /// nothing; unreadable files are named, never swallowed.
+    fn browse_for_import_files(
+        &mut self,
+        current_text: String,
+        current_group: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        let view = cx.entity();
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                _ => return,
+            };
+            let mut files: Vec<(String, String)> = Vec::new();
+            let mut unreadable: Vec<String> = Vec::new();
+            for path in &paths {
+                match std::fs::read_to_string(path) {
+                    Ok(content) => files.push((path.to_string_lossy().into_owned(), content)),
+                    Err(_) => unreadable.push(file_basename(&path.to_string_lossy())),
+                }
+            }
+            if files.is_empty() && unreadable.is_empty() {
+                return;
+            }
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.finish_browse_pick(
+                        current_text,
+                        current_group,
+                        files,
+                        unreadable,
+                        window,
+                        cx,
+                    );
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Ticket 43: Browse completion (windowed) — unreadable files toast by
+    /// name, picked bytes reopen the dialog merged with the carried box text
+    /// (stems/keys survive via [`merge_browse_results`]), and the read toast
+    /// names every file. Nothing picked changes nothing.
+    fn finish_browse_pick(
+        &mut self,
+        current_text: String,
+        current_group: String,
+        files: Vec<(String, String)>,
+        unreadable: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !unreadable.is_empty() {
+            window.push_notification(
+                Notification::warning(unreadable_drop_message(&unreadable)),
+                cx,
+            );
+        }
+        if files.is_empty() {
+            return;
+        }
+        let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        let (merged, hint, multi) = merge_browse_results(&current_text, &files);
+        window.close_all_dialogs(cx);
+        self.open_import_dialog_with_files(&merged, &current_group, hint, multi, window, cx);
+        window.push_notification(Notification::success(browse_read_message(&names)), cx);
     }
 
     /// Ticket 03: commit a paste box through the existing add flow. Valid
@@ -4883,6 +6453,16 @@ impl AppView {
         self.reload_quiet(cx);
     }
 
+    /// Ticket 43: flip one subscription row's expanded state, then re-render
+    /// the manager when it owns the screen (same guard as every other
+    /// manager mutation — foreign dialogs are never touched).
+    fn toggle_sub_expanded(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.expanded_subs.remove(id) {
+            self.expanded_subs.insert(id.to_string());
+        }
+        self.reopen_subscriptions_if_open(window, cx);
+    }
+
     /// Ticket 04: re-render the subscriptions dialog after an action, but
     /// only if the user still has it open.
     /// Ticket 26: never touch a foreign dialog. The reopen fires only while
@@ -5082,6 +6662,148 @@ impl AppView {
                 false
             }
         }
+    }
+
+    /// Ticket 43: edit a preset's name + rules (manager edit path). Rules
+    /// validate pre-commit via the same parser as create; failures keep the
+    /// dialog open with the error. Success reloads, reopens the manager, and
+    /// toasts name + rule count (never rule content).
+    fn commit_preset_edit(
+        &mut self,
+        id: &str,
+        name: String,
+        rules_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let rules = if rules_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            match crate::preset::parse_preset_json(&rules_text, &name) {
+                Ok(parsed) => parsed.rules,
+                Err(error) => {
+                    window.push_notification(Notification::error(preset_error_message(&error)), cx);
+                    return false;
+                }
+            }
+        };
+        let renamed = match self.store.rename_preset(id, &name) {
+            Ok(preset) => preset,
+            Err(StoreError::NotFound(_)) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+                return true;
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                return false;
+            }
+        };
+        match self.store.set_preset_rules(id, &rules) {
+            Ok(_) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Preset \"{}\" updated ({} rule(s))",
+                        renamed.name,
+                        rules.len()
+                    )),
+                    cx,
+                );
+                self.reopen_presets_if_open(window, cx);
+                true
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                false
+            }
+        }
+    }
+
+    /// Ticket 43: duplicate a preset — same source/rules under a unique
+    /// `… copy` name. Ghost rows warn; the toast names the copy.
+    fn commit_preset_duplicate(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let preset = match self.store.get_preset(id) {
+            Ok(Some(preset)) => preset,
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+                return;
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot duplicate routing preset: {error}")),
+                    cx,
+                );
+                return;
+            }
+        };
+        let taken: Vec<String> = self
+            .store
+            .list_presets()
+            .map(|presets| presets.into_iter().map(|preset| preset.name).collect())
+            .unwrap_or_default();
+        let name = duplicate_name(&preset.name, &taken);
+        let rules = preset.rules().unwrap_or_default();
+        match self
+            .store
+            .create_preset(&name, &preset.source, preset.source_url.as_deref(), &rules)
+        {
+            Ok(created) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(preset_imported_message(&created.name, rules.len())),
+                    cx,
+                );
+                self.reopen_presets_if_open(window, cx);
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+            }
+        }
+    }
+
+    /// Ticket 43: preset edit dialog — name + rules prefilled from the
+    /// record (re-read fresh so a stale row cannot overwrite a removed
+    /// preset). Stacks above the manager, which stays intact underneath.
+    fn open_preset_edit_dialog(
+        &mut self,
+        preset: store::RoutePreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rules_text = preset
+            .rules()
+            .map(|rules| serde_json::Value::Array(rules).to_string())
+            .unwrap_or_default();
+        let form = PresetForm::restored(window, cx, &preset.name, &rules_text);
+        let view = cx.entity();
+        let reader = form.clone();
+        let id = preset.id.clone();
+        let title = format!("Edit preset {}", preset.name);
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let name = reader.name.read(cx).value().to_string();
+            let rules = reader.rules.read(cx).value().to_string();
+            view.update(cx, |view, cx| {
+                view.commit_preset_edit(&id, name, rules, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
+                .title(title.clone())
+                .child(form.clone().element(cx))
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "preset-edit-ok",
+                    "preset-edit-cancel",
+                    commit_click,
+                ))
+        });
     }
 
     /// Ticket 37: remove a preset. Success reloads and reopens the manager;
@@ -5655,6 +7377,9 @@ impl AppView {
                 *counts.entry(owner.to_string()).or_insert(0) += 1;
             }
         }
+        // Ticket 43: expanded-row snapshot + member names for the builder.
+        let expanded = self.expanded_subs.clone();
+        let member_rows = rows.clone();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path; an empty add form just closes).
         // `commit_view` is a clone: the builder below still needs `view` for
@@ -5691,6 +7416,8 @@ impl AppView {
                     view_for_rows.clone(),
                     sub.clone(),
                     counts.get(&sub.id).copied().unwrap_or(0),
+                    expanded.contains(&sub.id),
+                    subscription_member_names(&member_rows, &sub.id),
                 ));
             }
             body = body.child(form.clone().element(cx));
@@ -6250,6 +7977,35 @@ impl AppView {
                                 }
                             })),
                     )
+                    // Ticket 43: one-click duplicate (disabled copy, fresh
+                    // auto port) plus per-row traffic reset (confirm names
+                    // the row + current totals).
+                    .child(Button::new("duplicate-config").label("Duplicate").on_click(
+                        cx.listener(|view, _, window, cx| {
+                            if let Some(config) = view.selected_config(cx) {
+                                view.commit_duplicate(&config.id, window, cx);
+                            } else {
+                                window.push_notification(
+                                    Notification::info(no_selection_message()),
+                                    cx,
+                                );
+                            }
+                        }),
+                    ))
+                    .child(
+                        Button::new("reset-traffic")
+                            .label("Reset traffic")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_traffic_reset_confirm(config, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
                     .child(
                         Button::new("copy-urls")
                             .label("Copy URLs")
@@ -6298,21 +8054,35 @@ impl AppView {
         let (total, enabled) = self.libraries.read(cx).delegate().counts();
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
-        StatusBar::new().left(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .id("status-count")
-                        .test_support()
-                        .child(format!("{total} configurations · {enabled} enabled")),
-                )
-                .child(div().id("engine-status").test_support().child(engine_text))
-                .child(div().id("health-status").test_support().child(health_text)),
-        )
+        // Ticket 43: summed data-plane totals (a broken totals read shows
+        // nothing — never a lying zero).
+        let traffic_text = self
+            .store
+            .traffic_totals()
+            .ok()
+            .map(|totals| {
+                totals.values().fold((0u64, 0u64), |(rx, tx), (r, t)| {
+                    (rx.saturating_add(*r), tx.saturating_add(*t))
+                })
+            })
+            .and_then(|(rx, tx)| traffic_status_text(rx, tx));
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("status-count")
+                    .test_support()
+                    .child(format!("{total} configurations · {enabled} enabled")),
+            )
+            .child(div().id("engine-status").test_support().child(engine_text))
+            .child(div().id("health-status").test_support().child(health_text));
+        if let Some(traffic) = traffic_text {
+            row = row.child(div().id("traffic-status").test_support().child(traffic));
+        }
+        StatusBar::new().left(row)
     }
 
     /// Ticket 30: `N of M` search count above the list (visible while a
@@ -6358,6 +8128,46 @@ impl AppView {
             list_cx.notify();
         });
         cx.notify();
+    }
+
+    /// Ticket 43: empty-library CTAs — clickable Add and Import buttons under
+    /// the list when the library is truly empty (no rows AND no query). A
+    /// filtered-to-zero list keeps the Clear-search path instead (see
+    /// [`LibraryDelegate::render_empty`]); a broken database shows no CTAs
+    /// over unknown rows (counts read from the delegate's last-good rows —
+    /// zero only when the list really is empty).
+    fn render_empty_ctas(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (total, _, query) = self
+            .libraries
+            .read(cx)
+            .delegate()
+            .delegate_counts_for_search();
+        if total != 0 || !query.trim().is_empty() {
+            return div().id("empty-ctas").test_support().into_any_element();
+        }
+        div()
+            .id("empty-ctas")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                Button::new("empty-add")
+                    .label("Add configuration")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_add_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("empty-import")
+                    .label("Import configurations")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                    })),
+            )
+            .into_any_element()
     }
 }
 
@@ -6463,25 +8273,48 @@ impl Render for AppView {
                                 view.open_presets_dialog(window, cx);
                             })),
                     )
+                    .child(Button::new("engine-start-all").label("Start all").on_click(
+                        cx.listener(|view, _, window, cx| {
+                            view.start_all_engines(window, cx);
+                        }),
+                    ))
+                    // Ticket 43: the F5 key starts the SELECTED row (see
+                    // [`bind_app_keys`]) — the old "Start all (F5)" label
+                    // lied. Selected actions carry their key hints; bulk
+                    // actions carry none.
                     .child(
-                        Button::new("engine-start-all")
-                            .label("Start all (F5)")
+                        Button::new("start-selected")
+                            .label("Start selected (F5)")
                             .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_all_engines(window, cx);
+                                view.start_selected_engine(window, cx);
                             })),
                     )
                     .child(
                         Button::new("engine-stop-all")
-                            .label("Stop all (Shift-F5)")
+                            .label("Stop all")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_all_engines(window, cx);
                             })),
                     )
                     .child(
+                        Button::new("stop-selected")
+                            .label("Stop selected (Shift-F5)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.stop_selected_engine(window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("health-test-all")
-                            .label("Test health (Ctrl-T)")
+                            .label("Test all")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_all_health(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("test-selected")
+                            .label("Test selected (Ctrl-T)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.test_selected_health(window, cx);
                             })),
                     )
                     .child(
@@ -6518,7 +8351,8 @@ impl Render for AppView {
                         .child(self.render_search_count(cx))
                         .child(
                             List::new(&self.libraries).search_placeholder("Search configurations"),
-                        ),
+                        )
+                        .child(self.render_empty_ctas(cx)),
                 ),
             )
             .child(self.render_detail(cx))
@@ -7748,7 +9582,7 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("engine-stop-all").is_some()));
 
         cx.update(|window, cx| {
-            view.update(cx, |view, cx| view.stop_all_engines(window, cx));
+            view.update(cx, |view, cx| view.commit_stop_all(window, cx));
         });
         assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
         assert!(!handle.is_running());
@@ -8862,9 +10696,874 @@ mod tests {
         assert!(start_all_message(3).contains('3'));
         let idle = stop_all_message(0);
         assert!(idle.contains("Nothing to stop"), "honest: {idle}");
-        assert_eq!(stop_all_message(2), "Stopped all endpoints");
+        // Ticket 43: the stop-all success names the count, never a bare claim.
+        let stopped = stop_all_message(2);
+        assert!(stopped.contains('2'), "names the count: {stopped}");
         assert!(already_stopped_message("Work").contains("Work"));
         assert!(already_stopped_message("Work").contains("already stopped"));
+    }
+
+    /// Ticket 43: stop-all confirm names the count + every row; restart
+    /// prompt names the row; removed-running says the endpoint stopped first;
+    /// duplicate names are unique.
+    #[test]
+    fn ticket43_honest_mutation_copy() {
+        use crate::{
+            duplicate_name, removed_message, restart_to_apply_message, stop_all_confirm_description,
+        };
+        let confirm = stop_all_confirm_description(&["A".to_string(), "B".to_string()]);
+        assert!(confirm.contains('2'), "count: {confirm}");
+        assert!(confirm.contains("\"A\""), "names A: {confirm}");
+        assert!(confirm.contains("\"B\""), "names B: {confirm}");
+        let restart = restart_to_apply_message("Work");
+        assert!(restart.contains("Work"), "names row: {restart}");
+        assert!(restart.contains("restart"), "says restart: {restart}");
+        let removed_running = removed_message("Work", true);
+        assert!(
+            removed_running.contains("Work"),
+            "names row: {removed_running}"
+        );
+        assert!(
+            removed_running.contains("stopped"),
+            "says stopped first: {removed_running}"
+        );
+        let removed_idle = removed_message("Work", false);
+        assert!(
+            !removed_idle.contains("stopped"),
+            "no stop claim: {removed_idle}"
+        );
+        assert_eq!(duplicate_name("Work", &[]), "Work copy");
+        assert_eq!(
+            duplicate_name("Work", &["Work copy".to_string()]),
+            "Work copy 2"
+        );
+        assert_eq!(
+            duplicate_name(
+                "Work",
+                &["Work copy".to_string(), "Work copy 2".to_string()]
+            ),
+            "Work copy 3"
+        );
+    }
+
+    /// Ticket 43: single probe toasts name latency or the redacted cause;
+    /// multi probe toasts name both counts.
+    #[test]
+    fn ticket43_probe_result_toasts() {
+        use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
+        use crate::{probe_result_toast, probe_summary_toast};
+        fn outcome(id: &str, latency: Option<u64>, error: Option<&str>) -> TestOutcome {
+            TestOutcome {
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at: 1,
+                    kind: HealthKind::UrlTest,
+                    latency_ms: latency,
+                    error: error.map(str::to_string),
+                },
+                success: latency.map(|ms| ProbeSuccess {
+                    latency_ms: ms,
+                    bytes_rx: 0,
+                    bytes_tx: 0,
+                }),
+            }
+        }
+        let live = probe_result_toast("Work", &outcome("1", Some(33), None), false);
+        assert!(live.contains("Work"), "names row: {live}");
+        assert!(live.contains("33ms"), "names latency: {live}");
+        let dead = probe_result_toast("Work", &outcome("1", None, Some("timeout")), false);
+        assert!(dead.contains("Work"), "names row: {dead}");
+        assert!(dead.contains("timeout"), "names cause: {dead}");
+        let ping = probe_result_toast("Work", &outcome("1", Some(7), None), true);
+        assert!(ping.contains("7ms"), "ping latency: {ping}");
+        let summary = probe_summary_toast(3, 2, 1);
+        assert!(summary.contains('3') && summary.contains('2') && summary.contains('1'));
+    }
+
+    /// Ticket 43: test-URL validation + precedence (row > global > default).
+    #[test]
+    fn ticket43_test_url_rules() {
+        use crate::{effective_probe_url, normalize_test_url, DEFAULT_TEST_URL};
+        assert_eq!(
+            normalize_test_url("https://example.com/ping").expect("valid"),
+            "https://example.com/ping"
+        );
+        assert!(
+            normalize_test_url("ftp://example.com").is_err(),
+            "scheme gated"
+        );
+        assert!(normalize_test_url("https://").is_err(), "host required");
+        assert!(normalize_test_url("   ").is_err(), "blank rejected");
+        assert_eq!(
+            effective_probe_url(Some("http://row/"), Some("http://global/")),
+            "http://row/"
+        );
+        assert_eq!(
+            effective_probe_url(None, Some("http://global/")),
+            "http://global/"
+        );
+        assert_eq!(effective_probe_url(None, None), DEFAULT_TEST_URL);
+    }
+
+    /// Ticket 43: traffic formatting (per-row + status) hides all-zero.
+    #[test]
+    fn ticket43_traffic_text() {
+        use crate::{format_bytes, traffic_status_text, traffic_summary_text};
+        assert_eq!(format_bytes(88), "88 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(1_048_782), "1.0 MB");
+        assert_eq!(traffic_summary_text(0, 0), None, "zero hides");
+        let line = traffic_summary_text(1_048_782, 88).expect("nonzero shows");
+        assert!(line.contains("1.0 MB") && line.contains("88 B"), "{line}");
+        assert_eq!(traffic_status_text(0, 0), None, "zero hides");
+        let status = traffic_status_text(1000, 50).expect("nonzero shows");
+        assert!(status.contains("traffic"), "{status}");
+    }
+
+    /// Ticket 43: extended search covers sub label, preset name, state words,
+    /// running words, and health words.
+    #[test]
+    fn ticket43_search_covers_sub_preset_state() {
+        use crate::store::ProxyConfig;
+        use crate::{library_row_matches_full, MatchContext};
+        fn row() -> ProxyConfig {
+            ProxyConfig {
+                id: "7".to_string(),
+                name: "Work".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443}"
+                    .to_string(),
+                group: "default".to_string(),
+                enabled: true,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: Some("sub-1".to_string()),
+                identity_key: None,
+                preset_id: Some("preset-1".to_string()),
+            }
+        }
+        let mut ctx = MatchContext::empty();
+        ctx.sub_labels
+            .insert("sub-1".to_string(), "News Feed".to_string());
+        ctx.preset_names
+            .insert("preset-1".to_string(), "Direct Out".to_string());
+        ctx.running.insert("7".to_string());
+        ctx.health.insert("7".to_string(), "33ms".to_string());
+        let alpha = row();
+        assert!(library_row_matches_full(&alpha, "news", &ctx), "sub label");
+        assert!(
+            library_row_matches_full(&alpha, "direct", &ctx),
+            "preset name"
+        );
+        assert!(
+            library_row_matches_full(&alpha, "enabled", &ctx),
+            "enabled word"
+        );
+        assert!(!library_row_matches_full(&alpha, "disabled", &ctx));
+        assert!(
+            library_row_matches_full(&alpha, "running", &ctx),
+            "running word"
+        );
+        assert!(!library_row_matches_full(&alpha, "stopped", &ctx));
+        assert!(library_row_matches_full(&alpha, "live", &ctx), "live word");
+        assert!(
+            library_row_matches_full(&alpha, "33ms", &ctx),
+            "latency text"
+        );
+        assert!(!library_row_matches_full(&alpha, "dead", &ctx));
+        let empty = MatchContext::empty();
+        assert!(
+            !library_row_matches_full(&alpha, "news", &empty),
+            "no ctx, no match"
+        );
+        assert!(
+            library_row_matches_full(&alpha, "work", &empty),
+            "name still matches"
+        );
+    }
+
+    /// Ticket 43: params format/validate are honest about bad JSON.
+    #[test]
+    fn ticket43_params_format_validate() {
+        use crate::{format_params_json, validate_params_json};
+        let pretty = format_params_json("{\"a\":1}").expect("valid formats");
+        assert!(pretty.contains('\n'), "multiline: {pretty}");
+        assert!(format_params_json("not json").is_err(), "bad JSON fails");
+        assert!(validate_params_json("{\"a\":1}").is_ok());
+        assert!(
+            validate_params_json("   ").is_ok(),
+            "blank uses the default"
+        );
+        assert!(validate_params_json("{oops").is_err(), "broken JSON named");
+    }
+
+    /// Ticket 43: import preview names the first failure pre-commit; browse
+    /// merge keeps stems and carries existing text.
+    #[test]
+    fn ticket43_import_preview_and_browse() {
+        use crate::{browse_read_message, first_import_failure_reason, merge_browse_results};
+        let reason = first_import_failure_reason("bogus://x", None).expect("reason shown");
+        assert!(!reason.is_empty(), "names something");
+        assert_eq!(
+            first_import_failure_reason("", None),
+            None,
+            "empty names nothing"
+        );
+        let files = vec![("a.conf".to_string(), "[Interface]\n".to_string())];
+        let (merged, hint, multi) = merge_browse_results("typed\n", &files);
+        assert!(merged.contains("typed") && merged.contains("[Interface]"));
+        assert_eq!(hint, Some("a.conf".to_string()), "single keeps hint");
+        assert!(multi.is_none(), "single is not multi");
+        let files2 = vec![
+            ("a.conf".to_string(), "x".to_string()),
+            ("b.txt".to_string(), "y".to_string()),
+        ];
+        let (_, hint2, multi2) = merge_browse_results("", &files2);
+        assert_eq!(hint2, None, "multi has no single hint");
+        assert_eq!(multi2.expect("multi kept").len(), 2);
+        let msg = browse_read_message(&["a.conf".to_string(), "b.txt".to_string()]);
+        assert!(msg.contains('2') && msg.contains("a.conf"), "{msg}");
+    }
+
+    /// Ticket 43: export overwrite gate names the path; log level filter
+    /// matches severities; sub members list names.
+    #[test]
+    fn ticket43_export_logs_subs_copy() {
+        use crate::health::LogLevel;
+        use crate::store::ProxyConfig;
+        use crate::{
+            export_overwrite_confirm_description, log_level_matches, subscription_member_names,
+            tick_interval_summary,
+        };
+        let desc = export_overwrite_confirm_description("/tmp/x.json");
+        assert!(desc.contains("/tmp/x.json"), "names path: {desc}");
+        assert!(desc.contains("Overwrite"), "says overwrite: {desc}");
+        assert!(log_level_matches(LogLevel::Error, None));
+        assert!(log_level_matches(LogLevel::Error, Some(LogLevel::Error)));
+        assert!(!log_level_matches(LogLevel::Info, Some(LogLevel::Error)));
+        fn member(name: &str, sub: Option<&str>) -> ProxyConfig {
+            ProxyConfig {
+                id: format!("id-{name}"),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "g".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: sub.map(str::to_string),
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let rows = vec![
+            member("A", Some("s1")),
+            member("B", Some("s1")),
+            member("C", None),
+        ];
+        assert_eq!(subscription_member_names(&rows, "s1"), vec!["A", "B"]);
+        assert!(subscription_member_names(&rows, "s9").is_empty());
+        let ticks = tick_interval_summary();
+        assert!(
+            ticks.contains("5s") && ticks.contains("300s") && ticks.contains("60s"),
+            "{ticks}"
+        );
+    }
+
+    // -- Ticket 43: UI honesty slice (headless) ------------------------------
+
+    fn ticket43_seed(name: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    /// Scenario: running row deleted → endpoint stops first, row disappears,
+    /// one toast (US-1).
+    #[gpui_kit::test]
+    fn ticket43_delete_running_stops_first(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10851"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert!(view.read_with(cx, |view, _| view.engine.is_running(&alpha.id)));
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_remove(&alpha.id, window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 1, "one remove toast");
+        assert!(
+            !view.read_with(cx, |view, _| view.engine.is_running(&alpha.id)),
+            "endpoint stopped first"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "no orphan serves"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.store.get(&alpha.id).expect("get works"))
+                .is_none(),
+            "row disappears"
+        );
+    }
+
+    /// Scenario: running row edited → restart-to-apply toast (US-6); idle
+    /// row edited → plain updated toast.
+    #[gpui_kit::test]
+    fn ticket43_edit_running_prompts_restart(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::store::ConfigPatch;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10852"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        let before = notification_count(cx);
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit(
+                    &alpha.id,
+                    ConfigPatch {
+                        name: Some("Alpha2".to_string()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(closed, "valid edit closes");
+        assert_eq!(notification_count(cx), before + 1, "restart prompt toasts");
+        assert!(
+            view.read_with(cx, |view, _| view.engine.is_running(&alpha.id)),
+            "edit never stops the endpoint by itself"
+        );
+    }
+
+    /// Scenario: nothing selected → Stop/Copy/Toggle/Test/Ping each toast
+    /// "Select a configuration first" (US-5).
+    #[gpui_kit::test]
+    fn ticket43_no_selection_toasts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(ticket43_seed("Work", "10853"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        assert!(view
+            .read_with(cx, |view, cx| view.selected_config(cx))
+            .is_none());
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.stop_selected_engine(window, cx));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.toggle_selected_enabled(window, cx));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.test_selected_health(window, cx));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.ping_selected(window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 5, "every action toasts");
+    }
+
+    /// Scenario: Duplicate → new disabled row, fresh auto port, unique name
+    /// (US-8).
+    #[gpui_kit::test]
+    fn ticket43_duplicate_creates_disabled_auto_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10854"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_duplicate(&alpha.id, window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 1, "duplicate toasts");
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert_eq!(rows.len(), 2, "copy lands");
+        let copy = rows
+            .iter()
+            .find(|row| row.id != alpha.id)
+            .expect("copy there");
+        assert_eq!(copy.name, "Alpha copy");
+        assert!(!copy.enabled, "copy lands disabled");
+        assert_ne!(copy.port, alpha.port, "fresh auto port");
+        assert!(crate::store::is_auto_port(copy.port), "port is auto-range");
+        assert_eq!(copy.protocol, alpha.protocol);
+        assert_eq!(copy.params, alpha.params);
+    }
+
+    /// Scenario: edited concrete port → "auto" returns to auto-assign (US-3).
+    #[gpui_kit::test]
+    fn ticket43_reauto_port_via_auto_word(cx: &mut TestAppContext) {
+        use crate::store::ConfigPatch;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10855"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit(
+                    &alpha.id,
+                    ConfigPatch {
+                        port: Some("auto".to_string()),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(closed, "re-auto closes");
+        let row = view.read_with(cx, |view, _| {
+            view.store
+                .get(&alpha.id)
+                .expect("get works")
+                .expect("row there")
+        });
+        assert_ne!(row.port, 10855, "concrete port released");
+        assert!(crate::store::is_auto_port(row.port), "back to auto-assign");
+    }
+
+    /// Scenario: N running → stop-all opens a confirm (no silent kill);
+    /// the post-confirm half stops everything with a counted toast (US-15).
+    #[gpui_kit::test]
+    fn ticket43_stop_all_confirms_naming_count(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(ticket43_seed("Alpha", "10856"))
+            .expect("seed works");
+        store
+            .add(ticket43_seed("Beta", "10857"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 2);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.stop_all_engines(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            2,
+            "confirm gates the kill — nothing stops yet"
+        );
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "confirm opens"
+        );
+        assert_eq!(notification_count(cx), before, "no toast before confirm");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        let names = view.read_with(cx, |view, _| view.running_names_for_close());
+        assert_eq!(names.len(), 2, "confirm would name both rows");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_stop_all(window, cx));
+        });
+        assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "counted toast after confirm"
+        );
+    }
+
+    /// Scenario: Settings test URL validates + persists; blank clears to the
+    /// default; per-row override round-trips (US-11).
+    #[gpui_kit::test]
+    fn ticket43_test_url_commits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10858"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let ok = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_test_url("https://example.com/ping", window, cx)
+            })
+        });
+        assert!(ok, "valid URL saves");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.test_url()),
+            Some("https://example.com/ping".to_string())
+        );
+        let bad = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_test_url("ftp://x", window, cx))
+        });
+        assert!(!bad, "bad scheme fails");
+        let cleared = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_test_url("   ", window, cx))
+        });
+        assert!(cleared, "blank clears");
+        assert_eq!(view.read_with(cx, |view, _| view.store.test_url()), None);
+        let row_ok = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_test_url(&alpha.id, "http://192.0.2.1/h", window, cx)
+            })
+        });
+        assert!(row_ok, "row override saves");
+        let url = view.read_with(cx, |view, _| {
+            let rows = vec![view.store.get(&alpha.id).expect("get works").expect("row")];
+            view.effective_test_url(&rows)
+        });
+        assert_eq!(url, "http://192.0.2.1/h", "row beats global");
+        let row_bad = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_test_url(&alpha.id, "gopher://x", window, cx)
+            })
+        });
+        assert!(!row_bad, "bad row URL fails");
+    }
+
+    /// Scenario: selected Test toasts through the fake (latency recorded);
+    /// traffic reset zeroes one row; clear commits zero everything (US-12/14).
+    #[gpui_kit::test]
+    fn ticket43_probe_toast_and_traffic_resets(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10859"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, handle) = FakeHealthProber::shared();
+                handle.script_latency(&alpha.id, 33);
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reload(window, cx));
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                use gpui_kit::component::IndexPath;
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.test_selected_health(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(notification_count(cx), before + 1, "selected test toasts");
+        let latency = view.read_with(cx, |view, _| view.health_store.status(&alpha.id).latency_ms);
+        assert_eq!(latency, Some(33), "latency recorded");
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store
+                    .add_traffic(&alpha.id, 1000, 50)
+                    .expect("delta lands");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_reset_traffic(&alpha.id, window, cx)
+            });
+        });
+        let totals = view.read_with(cx, |view, _| view.store.traffic_totals().expect("totals"));
+        assert_eq!(totals.get(&alpha.id), Some(&(0, 0)), "row reset zeroes");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_clear_traffic(window, cx));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_clear_health(window, cx));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_clear_snapshot(window, cx));
+        });
+        assert_eq!(
+            notification_count(cx),
+            before + 5,
+            "each maintenance toasts"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot())
+                .is_empty(),
+            "snapshot cleared while the endpoint still runs"
+        );
+    }
+
+    /// Scenario: preset edit validates pre-commit + duplicate copies rules
+    /// (US-17).
+    #[gpui_kit::test]
+    fn ticket43_preset_edit_and_duplicate(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .create_preset("Base", "manual", None, &[])
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let bad = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_edit(
+                    &preset.id,
+                    "Base".to_string(),
+                    "{oops".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!bad, "bad rules stay open");
+        let ok = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_edit(
+                    &preset.id,
+                    "Renamed".to_string(),
+                    String::new(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(ok, "valid edit closes");
+        let renamed = view.read_with(cx, |view, _| {
+            view.store
+                .get_preset(&preset.id)
+                .expect("get works")
+                .expect("preset there")
+        });
+        assert_eq!(renamed.name, "Renamed");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_duplicate(&preset.id, window, cx)
+            });
+        });
+        let presets = view.read_with(cx, |view, _| view.store.list_presets().expect("list works"));
+        assert_eq!(presets.len(), 2, "duplicate lands");
+        assert!(presets.iter().any(|preset| preset.name == "Renamed copy"));
+    }
+
+    /// Scenario: export writes to the chosen path with honest counts; browse
+    /// picks merge into the dialog (US-7/9 headless halves).
+    #[gpui_kit::test]
+    fn ticket43_export_to_path_and_browse_pick(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(ticket43_seed("Alpha", "10860"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let dir = std::env::temp_dir().join("manyproxy-43-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("export-43.json");
+        let _ = std::fs::remove_file(&target);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_export_write_to(&target.display().to_string(), window, cx)
+            });
+        });
+        let body = std::fs::read_to_string(&target).expect("export file written");
+        assert!(body.contains("library"), "payload has library section");
+        let _ = std::fs::remove_file(&target);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_browse_pick(
+                    "typed".to_string(),
+                    "g".to_string(),
+                    vec![("a.txt".to_string(), "vless://x".to_string())],
+                    Vec::new(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), before + 1, "browse read toasts");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog reopens merged"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Scenario: logs level filter narrows; copy-visible writes the clipboard
+    /// (US-13 headless halves).
+    #[gpui_kit::test]
+    fn ticket43_logs_level_and_copy(cx: &mut TestAppContext) {
+        use crate::health::LogLevel;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(ticket43_seed("Alpha", "10861"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.logs.push_raw("panic: sidecar blew up", &[]);
+                view.logs.push_raw("listening on 127.0.0.1:10861", &[]);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_log_level(Some(LogLevel::Error), window, cx)
+            });
+        });
+        let lines = view.read_with(cx, |view, cx| view.log_lines(cx));
+        assert!(!lines.is_empty(), "error line survives the filter");
+        assert!(
+            lines.iter().all(|line| line.contains("[error]")),
+            "only errors: {lines:?}"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.copy_visible_logs(window, cx));
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(clip.contains("panic"), "clipboard carries visible lines");
+    }
+
+    /// Scenario: subscription expand flips + toolbar/empty/params/import/
+    /// settings chrome paints (US-2/4/9/10/13/16/19 paint halves).
+    #[gpui_kit::test]
+    fn ticket43_chrome_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        // Ticket 43: selected-vs-bulk buttons exist with honest labels (the
+        // toolbar overflows at test width, so presence — not paint — is the
+        // assertion here, matching the existing engine-status precedent).
+        for id in [
+            "start-selected",
+            "stop-selected",
+            "test-selected",
+            "empty-add",
+            "empty-import",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} renders"
+            );
+        }
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.toggle_sub_expanded("sub-1", window, cx));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.expanded_subs.contains("sub-1")),
+            "expand flips on"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.toggle_sub_expanded("sub-1", window, cx));
+        });
+        assert!(
+            !view.read_with(cx, |view, _| view.expanded_subs.contains("sub-1")),
+            "expand flips off"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "field-params");
+        assert_painted(cx, "params-format");
+        assert_painted(cx, "params-template");
+        assert_painted(cx, "params-validate");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_import_dialog("bogus://x", "g", None, window, cx)
+            });
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "import-browse");
+        assert_painted(cx, "import-first-failure");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "field-settings-test-url");
+        assert_painted(cx, "settings-save-test-url");
+        assert_painted(cx, "settings-ticks");
+        // The dialog scrolls at test height — below-the-fold controls assert
+        // presence (they render in the completed frame).
+        for id in [
+            "settings-copy-db-path",
+            "settings-copy-export-path",
+            "settings-clear-traffic",
+            "settings-clear-health",
+            "settings-clear-snapshot",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} renders"
+            );
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "log-level-row");
+        assert_painted(cx, "log-copy-visible");
+        assert_painted(cx, "log-tail-toggle");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Scenario: honest empty start-all and stop-on-stopped toasts headless.
@@ -9555,6 +12254,7 @@ mod tests {
             &row(true, "{\"server\":\"a.example.com\",\"server_port\":443}"),
             Some("87ms"),
             true,
+            Some((1_048_782, 88)),
         )
         .join("\n");
         for want in [
@@ -9565,10 +12265,12 @@ mod tests {
             "127.0.0.1:10801",
             "enabled",
             "87ms",
+            "1.0 MB",
+            "88 B",
         ] {
             assert!(full.contains(want), "{want} visible in:\n{full}");
         }
-        let plain = library_row_lines(&row(false, "{}"), None, false).join("\n");
+        let plain = library_row_lines(&row(false, "{}"), None, false, None).join("\n");
         assert!(
             plain.contains("disabled"),
             "enabled state visible:\n{plain}"
@@ -9578,9 +12280,19 @@ mod tests {
             "metadata-only rows say so honestly:\n{plain}"
         );
         assert_eq!(
-            library_row_lines(&row(false, "{}"), None, false).len(),
+            library_row_lines(&row(false, "{}"), None, false, None).len(),
             4,
             "badge line always present (stopped here)"
+        );
+        assert_eq!(
+            library_row_lines(&row(false, "{}"), None, false, Some((0, 0))).len(),
+            4,
+            "zero traffic adds no line"
+        );
+        assert_eq!(
+            library_row_lines(&row(false, "{}"), None, false, Some((10, 0))).len(),
+            5,
+            "flowing traffic appends its line"
         );
     }
 
@@ -9822,7 +12534,7 @@ mod tests {
         let renamed = cx.update(|window, cx| {
             view.update(cx, |_view, cx| {
                 use crate::ConfigForm;
-                let form = ConfigForm::prefilled(window, cx, &snapshot);
+                let form = ConfigForm::prefilled(window, cx, &snapshot, None);
                 form.name.update(cx, |state, cx| {
                     state.set_value("Renamed", window, cx);
                 });
@@ -10414,7 +13126,7 @@ mod tests {
                 preset_id: None,
             }
         }
-        let running = library_row_lines(&row(), Some("87ms"), true).join("\n");
+        let running = library_row_lines(&row(), Some("87ms"), true, None).join("\n");
         assert!(
             running.contains(&serving_badge(true, 10801, Some("87ms"))),
             "running badge in row:\n{running}"
@@ -10423,7 +13135,7 @@ mod tests {
             running.contains("disabled"),
             "flag stays secondary:\n{running}"
         );
-        let stopped = library_row_lines(&row(), Some("87ms"), false).join("\n");
+        let stopped = library_row_lines(&row(), Some("87ms"), false, None).join("\n");
         assert!(
             stopped.contains("○ Stopped"),
             "stopped badge in row:\n{stopped}"
@@ -11644,7 +14356,7 @@ mod tests {
         assert_eq!(snapshot, expected, "running set snapshots on start");
 
         cx.update(|window, cx| {
-            view.update(cx, |view, cx| view.stop_all_engines(window, cx));
+            view.update(cx, |view, cx| view.commit_stop_all(window, cx));
         });
         assert!(
             view.read_with(cx, |view, _| view.store.load_running_snapshot())
