@@ -5314,10 +5314,20 @@ mod tests {
         store.commit_export(&path, true).expect("export works");
         let on_disk = std::fs::read_to_string(&path).expect("file written");
         serde_json::from_str::<serde_json::Value>(&on_disk).expect("parses");
+        // Ticket 39: scan only this export's own tmp sibling
+        // (`.{filename}.tmp-{pid}`, see `tmp_export_path`) — never the
+        // whole shared temp dir, where a concurrent test's in-flight
+        // export tmp is legitimate work, not our litter.
+        let own_tmp_prefix = format!(
+            ".{}.tmp-",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+        );
         let litter: Vec<_> = std::fs::read_dir(&dir)
             .expect("read dir")
             .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-            .filter(|name| name.to_string_lossy().contains(".tmp-"))
+            .filter(|name| name.to_string_lossy().starts_with(&own_tmp_prefix))
             .collect();
         assert!(litter.is_empty(), "no tmp litter, got {litter:?}");
         let _ = std::fs::remove_file(&path);
