@@ -899,8 +899,10 @@ fn parse_ss_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
     })
 }
 
-/// Hysteria2 (`hysteria2://`, `hy2://`, `hysteria2+realm://`): auth required,
-/// port omitted → 443, multi-port first-wins.
+/// Hysteria2 (`hysteria2://`, `hy2://`): auth required, port omitted → 443,
+/// multi-port first-wins. Ticket 42: the `hysteria2+realm` rendezvous scheme
+/// never reaches here — [`parse_link`] rejects it with guidance (the realm
+/// block conflicts with server addressing and has no link mapping).
 fn parse_hy2(scheme: &str, parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     let auth = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     if auth.trim().is_empty() {
@@ -932,6 +934,155 @@ fn parse_hy2(scheme: &str, parts: &UriParts) -> Result<ImportedConfig, ImportErr
         host: parts.host.clone(),
         port,
     })
+}
+
+/// Ticket 42: snell link (`snell://psk@host:port?version=4&…`). The psk
+/// rides in the userinfo (or `?psk=`); `version` validates here (4|6,
+/// default 4) so a bad version rejects at import, never at start. Known
+/// option spellings fold to sing-box names; anything else passes through
+/// for the engine's strict per-protocol check (typed bad-option, never a
+/// silent mis-serve).
+fn parse_snell(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    let mut psk = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
+    if psk.trim().is_empty() {
+        psk = parts.query.get("psk").cloned().unwrap_or_default();
+    }
+    if psk.trim().is_empty() {
+        return Err(missing_credential("snell link is missing psk"));
+    }
+    let version = parts
+        .query
+        .get("version")
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "4".to_string());
+    if version != "4" && version != "6" {
+        return Err(invalid_json(format!(
+            "snell link has a bad \"version\" ({version})"
+        )));
+    }
+    let port = require_port(parts.port_text.as_deref())?;
+    let mut params = base_params("snell", &parts.host, port);
+    insert_str(&mut params, "psk", psk);
+    insert_str(&mut params, "version", version);
+    for (query_key, json_key) in [
+        ("obfs", "obfs_mode"),
+        ("obfs-mode", "obfs_mode"),
+        ("obfs_mode", "obfs_mode"),
+        ("obfs-host", "obfs_host"),
+        ("obfs_host", "obfs_host"),
+        ("userkey", "userkey"),
+        ("reuse", "reuse"),
+        ("mode", "mode"),
+        ("network", "network"),
+    ] {
+        if let Some(value) = parts.query.get(query_key) {
+            if !value.trim().is_empty() && !params.contains_key(json_key) {
+                insert_str(&mut params, json_key, value.clone());
+            }
+        }
+    }
+    insert_extras(
+        &mut params,
+        &parts.query,
+        &[
+            "psk",
+            "version",
+            "obfs",
+            "obfs-mode",
+            "obfs_mode",
+            "obfs-host",
+            "obfs_host",
+            "userkey",
+            "reuse",
+            "mode",
+            "network",
+            "server",
+            "server_port",
+            "port",
+        ],
+    );
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "snell", &parts.host, port),
+        protocol: "snell".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
+/// Ticket 42: shadowTLS link (`shadowtls://password@host:port?version=3&…`,
+/// `shadow-tls://` alias). The password rides in the userinfo (empty only
+/// for v1); `version` validates here (1|2|3) so a bad version rejects at
+/// import. With a password but no version the row defaults to 3 (the
+/// passwordless v1 shape omits the key and takes the schema default 1);
+/// `sni` falls back to the host exactly like the other TLS protocols.
+fn parse_shadowtls(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    let password = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
+    let version = match parts
+        .query
+        .get("version")
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty())
+    {
+        None => {
+            if password.trim().is_empty() {
+                None
+            } else {
+                Some("3".to_string())
+            }
+        }
+        Some(version) if ["1", "2", "3"].contains(&version.as_str()) => Some(version),
+        Some(version) => {
+            return Err(invalid_json(format!(
+                "shadowtls link has a bad \"version\" ({version})"
+            )));
+        }
+    };
+    let port = require_port(parts.port_text.as_deref())?;
+    let sni = query_sni(&parts.query, &parts.host);
+    let mut params = base_params("shadowtls", &parts.host, port);
+    if let Some(version) = version {
+        insert_str(&mut params, "version", version);
+    }
+    if !password.trim().is_empty() {
+        insert_str(&mut params, "password", password);
+    }
+    insert_str(&mut params, "sni", sni);
+    insert_extras(
+        &mut params,
+        &parts.query,
+        &[
+            "version",
+            "password",
+            "sni",
+            "server",
+            "server_port",
+            "port",
+        ],
+    );
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "shadowtls", &parts.host, port),
+        protocol: "shadowtls".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
+/// Ticket 42: protocols with no sing-box 1.14.2 outbound schema reject at
+/// import with per-protocol guidance (never parse-ok/start-fail). Messages
+/// name the scheme and the gap only — never userinfo or hosts.
+fn unsupported_protocol_guidance(scheme: &str) -> ImportError {
+    let detail = match scheme {
+        "mieru" => "mieru has no sing-box 1.14.2 outbound schema (only the third-party mbox fork serves mieru) — import rejected; serve it via a custom full-config row on a fork core instead",
+        "juicity" => "juicity has no sing-box outbound schema (upstream feature request, never merged) — import rejected; serve it via a custom full-config row instead",
+        "openvpn" => "openvpn is a sing-box endpoint (openvpn-client), not a 1.14.2 outbound — import rejected; serve it via a custom full-config row instead",
+        "masque" => "masque-client is a sing-box 1.15.0+ endpoint, not a 1.14.2 outbound — import rejected; serve it via a custom full-config row on a newer core instead",
+        "trusttunnel" => "trusttunnel has no sing-box 1.14.2 outbound schema — import rejected; serve it via a custom full-config row instead",
+        _ => "this protocol has no sing-box 1.14.2 outbound schema — import rejected",
+    };
+    unknown_scheme(format!("unsupported scheme '{scheme}' ({detail})"))
 }
 
 /// Legacy Hysteria v1 (`hysteria://auth@host:port?…`): auth and port required.
@@ -1086,6 +1237,11 @@ fn parse_socks_like(
     }
     if protocol == "socks" {
         insert_str(&mut params, "version", "5".to_string());
+    }
+    // Ticket 42: `https` links are TLS by definition — the engine serves
+    // them through the same `http` outbound with TLS on.
+    if protocol == "https" {
+        insert_str(&mut params, "security", "tls".to_string());
     }
     insert_extras(
         &mut params,
@@ -1320,6 +1476,8 @@ pub const VALID_OUTBOUND_TYPES: &[&str] = &[
     "wireguard",
     "amneziawg",
     "socks",
+    "snell",
+    "shadowtls",
     "anytls",
     "ssh",
     "noise",
@@ -1357,6 +1515,10 @@ pub const VALID_LINK_SCHEMES: &[&str] = &[
     "amnezia-wg",
     "socks",
     "socks5",
+    "snell",
+    "shadowtls",
+    "shadow-tls",
+    "v2rayn",
     "anytls",
     "ssh",
     "noise",
@@ -1368,10 +1530,13 @@ fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
         "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-        | "wireguard" | "amneziawg" | "socks" | "anytls" | "ssh" | "noise" | "http" | "https"
-        | "naive" => Ok(lower),
+        | "wireguard" | "amneziawg" | "socks" | "snell" | "anytls" | "ssh" | "noise" | "http"
+        | "https" | "naive" => Ok(lower),
         "ss" => Ok("shadowsocks".to_string()),
         "socks5" => Ok("socks".to_string()),
+        // Ticket 42: link-scheme aliases shared with the link grammar.
+        "v2rayn" => Ok("vmess".to_string()),
+        "shadow-tls" | "shadow_tls" => Ok("shadowtls".to_string()),
         // Ticket 07: AWG aliases fold to the canonical stored form.
         "awg" | "amnezia-wg" => Ok("amneziawg".to_string()),
         "hy2" | "hysteria2+realm" => Ok("hysteria2".to_string()),
@@ -1517,15 +1682,30 @@ fn require_json_credentials(protocol: &str, obj: &Params) -> Result<(), ImportEr
                 && present(obj, &["public_key", "publickey"], true)
         }
         "naive" => present(obj, &["username"], true) && present(obj, &["password"], false),
+        // Ticket 42: snell needs its psk; shadowtls/socks/http serve
+        // credential-less (shadowtls v1 omits the password, socks/http
+        // allow anonymous).
+        "snell" => present(obj, &["psk"], false),
         _ => true,
     };
-    if ok {
-        Ok(())
-    } else {
-        Err(missing_credential(format!(
+    if !ok {
+        return Err(missing_credential(format!(
             "item is missing credentials for \"{protocol}\""
-        )))
+        )));
     }
+    // Ticket 42: reality without pbk rejects at import exactly like links
+    // do (never parse-ok/start-fail). Native `tls.reality` objects are a
+    // separate intake shape and are judged by the engine.
+    let reality_flat = obj
+        .get("security")
+        .and_then(|value| value.as_str())
+        .is_some_and(|security| security.eq_ignore_ascii_case("reality"));
+    if reality_flat && !present(obj, &["pbk"], true) {
+        return Err(missing_credential(
+            "item is missing pbk (required for reality)",
+        ));
+    }
+    Ok(())
 }
 
 /// Limited SIP008 server item: explicit `type`/`protocol` goes through the
@@ -1674,7 +1854,22 @@ fn import_json_value(value: &serde_json::Value) -> BatchResult {
             .unwrap_or("json");
         match json_outbound(index, item) {
             Ok(config) => out.configs.push(config),
-            Err(error) => out.failures.push(ImportFailure::new(index, label, error)),
+            Err(error) => {
+                // Ticket 42 (US-27): bare SIP008 server lists carry no
+                // `type`/`protocol` (just server + method + password) —
+                // synthesize Shadowsocks instead of failing the item.
+                let bare_sip008 = item
+                    .as_object()
+                    .is_some_and(|obj| !obj.contains_key("type") && !obj.contains_key("protocol"));
+                if bare_sip008 {
+                    match sip008_server(item) {
+                        Ok(config) => out.configs.push(config),
+                        Err(_) => out.failures.push(ImportFailure::new(index, label, error)),
+                    }
+                } else {
+                    out.failures.push(ImportFailure::new(index, label, error));
+                }
+            }
         }
     }
     dedupe_names(&mut out.configs);
@@ -1826,6 +2021,35 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
                     insert_str(&mut params, json_key, value);
                 }
             }
+            // Ticket 42 (US-25): parity with URI intake — endpoint-meaningful
+            // conf keys the mapper above does not rename (reserved bytes,
+            // fwmark spellings, keepalive spellings) ride verbatim under
+            // their lowercased name, peer wins with the Interface snapshot
+            // as fallback. Anything else keeps the old drop behavior (a
+            // conf-only scripting key like Table must never become a
+            // start-fail the URI path would not produce either).
+            const CONF_VERBATIM: &[&str] = &[
+                "reserved",
+                "fwmark",
+                "fmark",
+                "fm",
+                "keepalive",
+                "keep_alive",
+            ];
+            for verbatim in CONF_VERBATIM {
+                if params.contains_key(*verbatim) {
+                    continue;
+                }
+                let value = conf_value(peer, verbatim);
+                let value = if value.trim().is_empty() {
+                    conf_value(iface, verbatim)
+                } else {
+                    value
+                };
+                if !value.trim().is_empty() {
+                    insert_str(&mut params, verbatim, value);
+                }
+            }
             if protocol == "amneziawg" {
                 // AmneziaWG obfuscation params ride verbatim (peer wins, the
                 // Interface snapshot is the fallback — stock AmneziaWG confs
@@ -1968,7 +2192,10 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
     let scheme = scheme_raw.to_ascii_lowercase();
     let rest = &text[sep + 3..];
     match scheme.as_str() {
-        "vmess" => {
+        // Ticket 42: v2rayn links are legacy-vmess blobs under another
+        // scheme (base64 alphabet has no `@`, so the legacy branch owns
+        // them exactly like `vmess://`).
+        "vmess" | "v2rayn" => {
             // New URI form carries `@` before any `?`/`#`; otherwise legacy.
             let authority_end = rest.find(['?', '#']).unwrap_or(rest.len());
             if rest[..authority_end].contains('@') {
@@ -1991,7 +2218,14 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         // the row keeps the `xray` kind so the engine bridges it to the
         // Xray sidecar (Xray-only fields pass through verbatim).
         "xray" => parse_vless_like("xray", &split_uri(&scheme, rest)?, "uuid"),
-        "hysteria2" | "hy2" | "hysteria2+realm" => parse_hy2(&scheme, &split_uri(&scheme, rest)?),
+        "hysteria2" | "hy2" => parse_hy2(&scheme, &split_uri(&scheme, rest)?),
+        // Ticket 42 (US-22): realm rendezvous has no link mapping (the
+        // realm block conflicts with server addressing) — loud import
+        // reject with guidance, never parse-ok/start-fail. Native `realm`
+        // objects inside JSON intake still serve (engine passthrough).
+        "hysteria2+realm" => Err(unknown_scheme(
+            "hysteria2+realm rendezvous links carry no importable endpoint mapping (realm conflicts with server addressing in sing-box 1.14.2) — import rejected; serve it via a custom full-config row with a native \"realm\" block instead",
+        )),
         "hysteria" => parse_hy1(&split_uri(&scheme, rest)?),
         "tuic" => parse_tuic(&split_uri(&scheme, rest)?),
         "wireguard" | "wg" => parse_wg_uri(&split_uri(&scheme, rest)?),
@@ -2004,6 +2238,14 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         "http" => parse_socks_like("http", &split_uri(&scheme, rest)?, Some(80)),
         "https" => parse_socks_like("https", &split_uri(&scheme, rest)?, Some(443)),
         "naive+https" => parse_naive(&split_uri(&scheme, rest)?),
+        // Ticket 42 (US-24): native 1.14.x outbounds.
+        "snell" => parse_snell(&split_uri(&scheme, rest)?),
+        "shadowtls" | "shadow-tls" => parse_shadowtls(&split_uri(&scheme, rest)?),
+        // Ticket 42 (US-24): no upstream 1.14.2 schema (or endpoint-only /
+        // 1.15+-only) — loud import reject with per-protocol guidance.
+        "mieru" | "juicity" | "openvpn" | "masque" | "trusttunnel" => {
+            Err(unsupported_protocol_guidance(&scheme))
+        }
         // Ticket 31: a typo scheme names the valid schemes.
         _ => Err(unknown_scheme(format!(
             "unknown scheme '{scheme}' (valid: {})",
@@ -2075,7 +2317,21 @@ pub fn import_text(body: &str) -> BatchResult {
         if line.is_empty() {
             continue;
         }
-        match parse_link(line) {
+        // Ticket 42 (US-27): a pasted bare v2rayn line (base64 of vmess
+        // JSON, no scheme) parses as a legacy vmess blob.
+        let owned;
+        let effective = if !line.contains("://") {
+            match decode_b64_utf8(line) {
+                Ok(text) if looks_like_vmess_json(&text) => {
+                    owned = format!("vmess://{line}");
+                    owned.as_str()
+                }
+                _ => line,
+            }
+        } else {
+            line
+        };
+        match parse_link(effective) {
             Ok(config) => out.configs.push(config),
             Err(error) => out
                 .failures
@@ -2410,6 +2666,27 @@ pub fn parse_addsub_link(line: &str) -> Result<AddSubRequest, ImportError> {
     })
 }
 
+/// Ticket 42 (US-27): true when `text` is a legacy-vmess JSON object
+/// (v2rayn subscription lines are per-line base64 of exactly this shape,
+/// with no scheme). Both `add` and `id` are required — the legacy parser
+/// rejects anything less, so this predicate never claims non-vmess JSON.
+fn looks_like_vmess_json(text: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(text.trim()) {
+        Ok(serde_json::Value::Object(map)) => {
+            let has_add = map
+                .get("add")
+                .and_then(|value| value.as_str())
+                .is_some_and(|add| !add.trim().is_empty());
+            let has_id = map
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|id| !id.trim().is_empty());
+            has_add && has_id
+        }
+        _ => false,
+    }
+}
+
 /// Parse a subscription response body, reusing the ticket-03 parsers:
 /// JSON (arrays, full configs, limited SIP008 `servers[]`), limited Clash
 /// YAML (`proxies:` with `type`/`server`/`port`), base64 blobs of share links
@@ -2440,7 +2717,9 @@ pub fn import_subscription_body(body: &str) -> BatchResult {
         .collect();
     if lines.len() > 1 {
         // v2rayN-style multi-line base64: decode the lines that decode,
-        // keep the rest verbatim, then parse the rebuilt body.
+        // keep the rest verbatim, then parse the rebuilt body. Ticket 42:
+        // v2rayn lines decode to schemeless vmess JSON — they re-enter as
+        // `vmess://` legacy blobs instead of failing as non-links.
         let mut rebuilt = Vec::with_capacity(lines.len());
         let mut decoded_any = false;
         for line in &lines {
@@ -2450,6 +2729,9 @@ pub fn import_subscription_body(body: &str) -> BatchResult {
                 let text = text.trim().to_string();
                 if text.contains("://") {
                     rebuilt.push(text);
+                    decoded_any = true;
+                } else if looks_like_vmess_json(&text) {
+                    rebuilt.push(format!("vmess://{line}"));
                     decoded_any = true;
                 } else {
                     rebuilt.push((*line).to_string());
@@ -2488,6 +2770,9 @@ pub fn import_subscription_body(body: &str) -> BatchResult {
     // Single base64 blob of share links.
     match decode_b64_utf8(single) {
         Ok(text) if text.trim().contains("://") => import_text(&text),
+        // Ticket 42 (US-27): a blob that decodes to schemeless vmess JSON
+        // (one v2rayn line as the whole body) re-enters as a legacy blob.
+        Ok(text) if looks_like_vmess_json(&text) => import_text(&format!("vmess://{single}")),
         // Ticket 24 (M17): a blob that decodes to JSON (no `://`) is tried
         // as JSON before falling back to per-line link parsing.
         Ok(text) => match serde_json::from_str::<serde_json::Value>(text.trim()) {
@@ -2531,10 +2816,17 @@ fn has_clash_proxies(trimmed: &str) -> bool {
 fn import_clash_proxies(content: &str) -> BatchResult {
     fn clash_type(raw: &str) -> Result<String, ImportError> {
         let lower = raw.trim().to_ascii_lowercase();
+        // Ticket 42: ShadowsocksR has no sing-box mapping — per-item skip
+        // with guidance, never a bare unknown-type text.
+        if ["ssr", "shadowsocksr", "ssr-shadowsocks"].contains(&lower.as_str()) {
+            return Err(unknown_scheme(
+                "clash type 'ssr' has no sing-box mapping (ShadowsocksR is not served by sing-box 1.14.2)",
+            ));
+        }
         match lower.as_str() {
             "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-            | "wireguard" | "amneziawg" | "socks" | "anytls" | "ssh" | "noise" | "http"
-            | "https" | "naive" => Ok(lower),
+            | "wireguard" | "amneziawg" | "socks" | "snell" | "shadowtls" | "anytls" | "ssh"
+            | "noise" | "http" | "https" | "naive" => Ok(lower),
             "ss" => Ok("shadowsocks".to_string()),
             "socks5" => Ok("socks".to_string()),
             // Ticket 07: AWG aliases fold to the canonical stored form.
@@ -2543,6 +2835,8 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             "hy2" | "hysteria2+realm" => Ok("hysteria2".to_string()),
             "wg" => Ok("wireguard".to_string()),
             "naive+https" | "naive_https" => Ok("naive".to_string()),
+            // Ticket 42: shadowTLS hyphen spelling.
+            "shadow-tls" | "shadow_tls" => Ok("shadowtls".to_string()),
             // Ticket 08: same kind-preserving fold as the JSON path.
             "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Ok("xray".to_string()),
             "custom"
@@ -2609,10 +2903,31 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             let after = line.strip_prefix("- ").unwrap_or("").trim();
             let mut fields = Vec::new();
             if !after.is_empty() {
-                // `- {flow}` mappings are out of scope for the limited parser.
+                // Ticket 42 (US-27): `- {"name": …, "type": …}` inline-JSON
+                // entries land (parsed as JSON objects); anything else in
+                // flow braces stays a named per-item skip.
                 if after.starts_with('{') {
-                    let index = entries.len();
-                    entries.push((vec![("__flow__".to_string(), after.to_string())], index));
+                    match serde_json::from_str::<serde_json::Value>(after) {
+                        Ok(serde_json::Value::Object(map)) => {
+                            for (key, value) in &map {
+                                let value = match value {
+                                    serde_json::Value::String(text) => text.clone(),
+                                    serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                                        value.to_string()
+                                    }
+                                    _ => continue,
+                                };
+                                fields.push((key.to_ascii_lowercase(), clash_value(&value)));
+                            }
+                            let index = entries.len();
+                            entries.push((fields, index));
+                        }
+                        _ => {
+                            let index = entries.len();
+                            entries
+                                .push((vec![("__flow__".to_string(), after.to_string())], index));
+                        }
+                    }
                     continue;
                 }
                 if let Some(i) = after.find(':') {
@@ -2709,6 +3024,12 @@ fn import_clash_proxies(content: &str) -> BatchResult {
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| format!("{protocol}-{host}:{port}"));
             let mut params = base_params(&protocol, &host, port);
+            // Ticket 42: Clash/Meta spellings fold to sing-box names so the
+            // rows serve instead of dying in `check` (nested option blocks
+            // are ignored upstream, so anything they alone could provide —
+            // e.g. reality keys — fails loudly below via the credential
+            // check rather than at start).
+            let mut security_tls = false;
             for (key, value) in fields {
                 if key == "name" || key == "type" || key == "server" || key == "port" {
                     continue;
@@ -2716,8 +3037,33 @@ fn import_clash_proxies(content: &str) -> BatchResult {
                 // Ticket 24 (M5): Clash `cipher` is sing-box `method`, so
                 // Clash SS rows dedupe with link SS rows.
                 let key = if key == "cipher" { "method" } else { key };
+                let key = match key {
+                    "servername" => "sni",
+                    "client-fingerprint" => "fp",
+                    "alterid" => "alter_id",
+                    "private-key" => "private_key",
+                    "public-key" => "public_key",
+                    "allowed-ips" => "allowed_ips",
+                    "skip-cert-verify" => "allowInsecure",
+                    _ => key,
+                };
+                if key == "tls" {
+                    if matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    ) {
+                        security_tls = true;
+                    }
+                    continue;
+                }
                 insert_str(&mut params, key, value.clone());
             }
+            if security_tls && !params.contains_key("security") {
+                insert_str(&mut params, "security", "tls".to_string());
+            }
+            // Ticket 42: credential-needing types fail per-item here (never
+            // parse-ok/start-fail), mirroring the JSON path.
+            require_json_credentials(&protocol, &params)?;
             Ok(ImportedConfig {
                 name,
                 protocol,
@@ -2969,12 +3315,16 @@ mod tests {
         assert_eq!(omitted.protocol, "hysteria2");
     }
 
+    /// Ticket 42 (US-22): `hysteria2+realm://` rejects at import with
+    /// guidance (rendezvous has no link mapping) — never parse-ok/start-fail.
+    /// (Replaces the parse-ok expectation: the variant marker used to ride
+    /// into params and die at generate time.)
     #[test]
     fn hysteria2_realm_variant() {
-        let config = parse_link("hysteria2+realm://letmein@example.com:8443#r")
-            .expect("realm variant parses");
-        assert_eq!(config.protocol, "hysteria2");
-        assert_eq!(params_of(&config)["variant"], "realm");
+        let error = parse_link("hysteria2+realm://letmein@example.com:8443#r")
+            .expect_err("realm variant rejects at import");
+        assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+        assert!(error.message.contains("realm"), "names realm: {error}");
     }
 
     #[test]
@@ -4574,6 +4924,294 @@ mod tests {
         assert!(
             !error.message.contains("127.0.0.1"),
             "no host echo: {error}"
+        );
+    }
+
+    // -- Ticket 42: serve-everything intake --------------------------------
+    // New native protocols parse; schema-less protocols reject loudly at
+    // import (never parse-ok/start-fail); conf/URI parity; sub-payload gaps.
+
+    /// Ticket 42 (US-22): `hysteria2+realm://` rejects at import with
+    /// guidance (rendezvous has no link mapping) — never parse-ok/start-fail.
+    #[test]
+    fn t42_hy2_realm_rejects_at_import_with_guidance() {
+        let error = parse_link("hysteria2+realm://letmein@example.com:8443#r")
+            .expect_err("realm variant rejects at import");
+        assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+        assert!(error.message.contains("realm"), "names realm: {error}");
+    }
+
+    /// Ticket 42: `v2rayn://base64(json)` parses exactly like legacy vmess.
+    #[test]
+    fn t42_v2rayn_link_parses_as_vmess() {
+        let json = serde_json::json!({
+            "v": "2", "ps": "v2rayn-one", "add": "example.com", "port": "10086",
+            "id": UUID, "aid": "0", "scy": "auto", "net": "tcp",
+            "type": "none", "host": "", "path": "", "tls": ""
+        });
+        let config =
+            parse_link(&format!("v2rayn://{}", b64(&json.to_string()))).expect("v2rayn parses");
+        assert_eq!(config.protocol, "vmess");
+        assert_eq!(config.host, "example.com");
+        assert_eq!(config.port, 10086);
+        assert_eq!(config.name, "v2rayn-one");
+        assert_eq!(params_of(&config)["uuid"], UUID);
+    }
+
+    /// Ticket 42 (US-24): snell links parse (psk required, version defaults
+    /// to 4, bad versions reject at import — never start-fail).
+    #[test]
+    fn t42_snell_link_parses() {
+        let config =
+            parse_link("snell://psk-secret@example.com:8388#snell-one").expect("snell parses");
+        assert_eq!(config.protocol, "snell");
+        assert_eq!(config.host, "example.com");
+        assert_eq!(config.port, 8388);
+        let params = params_of(&config);
+        assert_eq!(params["psk"], "psk-secret");
+        assert_eq!(params["version"], "4");
+        let error = parse_link("snell://psk@example.com:8388?version=5#x")
+            .expect_err("bad snell version rejects");
+        assert_eq!(error.kind, ImportErrorKind::InvalidJson);
+        assert!(error.message.contains("version"), "names version: {error}");
+        let error = parse_link("snell://@example.com:8388#x").expect_err("missing psk rejects");
+        assert_eq!(error.kind, ImportErrorKind::MissingCredential);
+    }
+
+    /// Ticket 42 (US-24): shadowtls links parse (sni rides along, version
+    /// validated at import; v1 rows may omit the password).
+    #[test]
+    fn t42_shadowtls_link_parses() {
+        let config = parse_link("shadowtls://shadowpw@example.com:443?sni=example.com#st")
+            .expect("shadowtls parses");
+        assert_eq!(config.protocol, "shadowtls");
+        assert_eq!(params_of(&config)["sni"], "example.com");
+        let v1 = parse_link("shadowtls://@example.com:443?version=1#v1")
+            .expect("v1 without password parses");
+        assert_eq!(params_of(&v1)["version"], "1");
+        let error = parse_link("shadowtls://pw@example.com:443?version=9#x")
+            .expect_err("bad shadowtls version rejects");
+        assert_eq!(error.kind, ImportErrorKind::InvalidJson);
+    }
+
+    /// Ticket 42 (US-24): mieru/juicity have no upstream sing-box schema —
+    /// import fails loudly naming the gap, never at start.
+    #[test]
+    fn t42_mieru_juicity_reject_with_guidance() {
+        for link in [
+            "mieru://user:pass@example.com:1080#m",
+            "juicity://uuid:pass@example.com:23142#j",
+            "MIERU://user:pass@example.com:1080#m",
+        ] {
+            let error = parse_link(link).expect_err(&format!("{link} rejects"));
+            assert_eq!(error.kind, ImportErrorKind::UnknownScheme, "link {link}");
+            assert!(
+                error.message.contains("no sing-box"),
+                "names the schema gap: {error}"
+            );
+        }
+    }
+
+    /// Ticket 42 (US-24): endpoint-only / 1.15+-only protocols reject at
+    /// import with guidance (they are not 1.14.2 outbounds).
+    #[test]
+    fn t42_endpoint_protocols_reject_with_guidance() {
+        for link in [
+            "openvpn://user:pass@example.com:1194#o",
+            "masque://user@example.com:443#m",
+            "trusttunnel://x@example.com:443#t",
+        ] {
+            let error = parse_link(link).expect_err(&format!("{link} rejects"));
+            assert_eq!(error.kind, ImportErrorKind::UnknownScheme, "link {link}");
+            assert!(
+                error.message.contains("endpoint") || error.message.contains("1.14.2"),
+                "names the gap: {error}"
+            );
+        }
+    }
+
+    /// Ticket 42 (US-25): `.conf` key parity with URI intake — reserved and
+    /// every other mapped key survive identically on both paths.
+    #[test]
+    fn t42_wg_conf_key_parity_with_uri() {
+        let conf = "[Interface]\nPrivateKey = cHJpdmF0ZWtleQ\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\nPresharedKey = cHJlc2hhcmVk\nReserved = 1,2,3\nFwMark = 100\n";
+        let out = import_file_content("parity.conf", conf);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        let params = params_of(&out.configs[0]);
+        for key in [
+            "private_key",
+            "public_key",
+            "address",
+            "dns",
+            "mtu",
+            "allowed_ips",
+            "persistent_keepalive",
+            "pre_shared_key",
+            "reserved",
+            "fwmark",
+        ] {
+            assert!(
+                params.get(key).is_some_and(|v| {
+                    v.as_str().is_some_and(|s| !s.trim().is_empty()) || v.is_number()
+                }),
+                "conf key {key} survives: {params}"
+            );
+        }
+        // URI intake with the same extras carries the same key set.
+        let uri = parse_link("wireguard://cHJpdmF0ZWtleQ@203.0.113.1:51820?publickey=cHVia2V5&address=10.0.0.2%2F32&dns=1.1.1.1&mtu=1420&allowedips=0.0.0.0%2F0&reserved=1%2C2%2C3&fwmark=100#u")
+            .expect("uri parses");
+        let uri_params = params_of(&uri);
+        for key in ["address", "dns", "mtu", "reserved", "fwmark"] {
+            assert!(
+                uri_params.get(key).is_some(),
+                "uri key {key} survives: {uri_params}"
+            );
+        }
+    }
+
+    /// Ticket 42 (US-27): bare SIP008 server lists (typeless objects with
+    /// method+password) land as Shadowsocks rows instead of failing the
+    /// whole body.
+    #[test]
+    fn t42_bare_sip008_array_lands() {
+        let body = serde_json::json!([
+            {"server": "a.example.com", "server_port": 8388,
+             "method": "aes-128-gcm", "password": "pass1", "remarks": "bare-one"},
+            {"server": "b.example.com", "server_port": 8389,
+             "method": "chacha20-poly1305", "password": "pass2"},
+        ]);
+        let out = import_subscription_body(&body.to_string());
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+        assert_eq!(out.configs[0].protocol, "shadowsocks");
+        assert_eq!(out.configs[0].name, "bare-one");
+        assert_eq!(params_of(&out.configs[1])["method"], "chacha20-poly1305");
+    }
+
+    /// Ticket 42 (US-27): v2rayn subscription lines (per-line base64 of
+    /// vmess JSON, no scheme) land as vmess rows.
+    #[test]
+    fn t42_v2rayn_subscription_lines_land() {
+        let line = b64(
+            &serde_json::json!({"v": "2", "ps": "sub-one", "add": "sub.example.com",
+                "port": "10086", "id": UUID, "aid": "0"})
+            .to_string(),
+        );
+        let out = import_subscription_body(&format!("{line}\n{line}"));
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+        assert!(out.configs.iter().all(|c| c.protocol == "vmess"));
+        assert_eq!(out.configs[0].name, "sub-one");
+        assert_eq!(out.configs[1].name, "sub-one-2");
+    }
+
+    /// Ticket 42 (US-27): Clash inline-JSON entries land; Clash-native
+    /// snell/shadowtls types land; ssr and flow mappings skip per-item with
+    /// a named reason.
+    #[test]
+    fn t42_clash_inline_json_meta_and_skips() {
+        let body = "proxies:\n  - {\"name\": \"inline-one\", \"type\": \"vmess\", \"server\": \"i.example.com\", \"port\": 10086, \"uuid\": \"UUID\", \"alterId\": 0}\n  - name: snell-one\n    type: snell\n    server: s.example.com\n    port: 8388\n    psk: snellpsk\n    version: 4\n  - name: ssr-one\n    type: ssr\n    server: r.example.com\n    port: 8388\n    password: x\n  - {flow: bad}\n";
+        let body = body.replace("UUID", UUID);
+        let out = import_subscription_body(&body);
+        assert_eq!(
+            out.configs.len(),
+            2,
+            "inline + snell land: {:?}",
+            out.failures
+        );
+        assert!(
+            out.configs
+                .iter()
+                .any(|c| c.name == "inline-one" && c.protocol == "vmess"),
+            "inline JSON lands"
+        );
+        assert!(
+            out.configs
+                .iter()
+                .any(|c| c.name == "snell-one" && c.protocol == "snell"),
+            "Meta snell lands"
+        );
+        assert_eq!(out.failures.len(), 2, "ssr + flow skip: {:?}", out.failures);
+        assert!(
+            out.failures
+                .iter()
+                .any(|f| f.label == "ssr-one" && f.reason.contains("ssr")),
+            "ssr skip names the type: {:?}",
+            out.failures
+        );
+    }
+
+    /// Ticket 42 (US-27): Clash entries without credentials fail per-item at
+    /// import (never parse-ok/start-fail).
+    #[test]
+    fn t42_clash_missing_credentials_rejected_per_item() {
+        let body = "proxies:\n  - name: nouuid\n    type: vless\n    server: v.example.com\n    port: 443\n";
+        let out = import_subscription_body(body);
+        assert!(out.configs.is_empty());
+        assert_eq!(out.failures.len(), 1);
+        assert!(
+            out.failures[0].reason.contains("missing"),
+            "got {}",
+            out.failures[0].reason
+        );
+    }
+
+    /// Ticket 42 (US-20/US-24): the full import→commit→serve chain for the
+    /// new natives — parsed links commit to the store (save-gate accepts
+    /// them) and generate native outbounds (no parse-ok/commit-fail and no
+    /// parse-ok/start-fail).
+    #[test]
+    fn t42_new_natives_commit_and_serve() {
+        let body = [
+            "socks://user:pass@192.0.2.20:1080#socks-one",
+            "http://user:pass@192.0.2.21:8080#http-one",
+            "snell://psk-secret@192.0.2.23:8388?version=4#snell-one",
+            "shadowtls://shadowpw@192.0.2.24:443?sni=example.com&version=3#st-one",
+            "naive+https://user:pass@192.0.2.25:8443#naive-one",
+            "hysteria2://letmein@192.0.2.26:8443?sni=example.com#hy2-one",
+        ]
+        .join("\n");
+        let batch = import_text(&body);
+        assert!(batch.failures.is_empty(), "failures: {:?}", batch.failures);
+        assert_eq!(batch.configs.len(), 6);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let outcome = commit_batch(&mut store, batch, "t42").expect("batch commits");
+        assert_eq!(outcome.imported, 6, "all six commit");
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 6);
+        let generated = crate::engine::generate(&rows).expect("all six generate");
+        let outbounds = generated.value()["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .clone();
+        for want in ["socks", "http", "snell", "shadowtls", "naive", "hysteria2"] {
+            assert!(
+                outbounds.iter().any(|node| node["type"] == want),
+                "native {want} outbound present"
+            );
+        }
+        assert!(
+            !generated.json.contains("certificate_sha256"),
+            "no 1.15-only fields"
+        );
+    }
+
+    /// Ticket 42 (US-23): JSON rows with reality but no pbk reject at import
+    /// (mirrors the link grammar — never parse-ok/start-fail).
+    #[test]
+    fn t42_json_reality_without_pbk_rejected() {
+        let body = serde_json::json!([{
+            "type": "vless", "server": "a.example.com", "server_port": 443,
+            "uuid": UUID, "security": "reality", "sni": "a.example.com",
+        }]);
+        let out = import_text(&body.to_string());
+        assert!(out.configs.is_empty());
+        assert_eq!(out.failures.len(), 1);
+        assert!(
+            out.failures[0].reason.contains("pbk"),
+            "got {}",
+            out.failures[0].reason
         );
     }
 }

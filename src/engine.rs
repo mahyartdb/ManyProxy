@@ -390,9 +390,11 @@ fn owning_core_of(
 }
 
 /// Canonical sing-box outbound/endpoint type for the ticket-05 standard set
-/// plus ticket-27 natives (AnyTLS, SSH).
-/// Anything else (naive, socks, http, unknown) is an
-/// [`EngineError::UnsupportedProtocol`] owned by a later ticket.
+/// plus ticket-27 natives (AnyTLS, SSH) plus ticket-42 natives (socks, http,
+/// naive, snell, shadowtls — all 1.14.2 upstream schema members).
+/// Anything else (custom kinds, mieru/juicity-style schema-less protocols)
+/// is an [`EngineError::UnsupportedProtocol`] owned by import-time rejection
+/// or a later ticket.
 /// Ticket 28: kept parallel to the import/store/health tables — this maps
 /// to sing-box outbound types for codegen, the others to stored names,
 /// grammar acceptance, and probe capability.
@@ -409,6 +411,12 @@ fn canonical_type(protocol: &str) -> Option<&'static str> {
         // Ticket 27: native sing-box outbounds (stock sidecar, own endpoint).
         "anytls" => Some("anytls"),
         "ssh" => Some("ssh"),
+        // Ticket 42: native 1.14.2 outbounds (stock sidecar, own endpoint).
+        "socks" | "socks5" => Some("socks"),
+        "http" | "https" => Some("http"),
+        "naive" => Some("naive"),
+        "snell" => Some("snell"),
+        "shadowtls" | "shadow-tls" | "shadow_tls" => Some("shadowtls"),
         _ => None,
     }
 }
@@ -2441,13 +2449,24 @@ fn preset_rules_for(
             .get("action")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| bad(format!("rule {index}: field \"action\" is required")))?;
+        // Ticket 42: `warp` never serves (no endpoint to point at) — a
+        // guidance error here too, so a warp rule stored before the intake
+        // gate still fails loudly instead of serving preset-less.
+        if action == "warp" || action == "warp-bypass" {
+            return Err(bad(format!(
+                "rule {index}: action \"{action}\" is not servable (warp needs an endpoint design — no sing-box outbound to point at; use \"route\", \"proxy\", \"direct\", or \"reject\")"
+            )));
+        }
         if !crate::preset::VALID_PRESET_ACTIONS.contains(&action) {
             return Err(bad(format!(
                 "rule {index}: field \"action\" must be one of {}",
                 crate::preset::VALID_PRESET_ACTIONS.join(", ")
             )));
         }
-        if action == "route" {
+        // Ticket 42: `proxy` aliases `route` (both point at the row's
+        // serving tag); `block` already serves as `reject`.
+        let route_like = action == "route" || action == "proxy";
+        if route_like {
             if let Some(outbound) = obj.get("outbound") {
                 if !outbound.is_string() {
                     return Err(bad(format!(
@@ -2461,13 +2480,14 @@ fn preset_rules_for(
             )));
         }
         let mut merged = obj.clone();
-        // Normalize the served spelling (`block` → `reject`); route/direct
-        // spellings are already what the sidecar accepts.
+        // Normalize the served spelling (`block` → `reject`, `proxy` →
+        // `route`); direct/reject spellings are already what the sidecar
+        // accepts.
         merged.insert(
             "action".to_string(),
             serde_json::Value::String(crate::preset::served_action(action).to_string()),
         );
-        if action == "route" {
+        if route_like {
             merged.insert(
                 "outbound".to_string(),
                 serde_json::Value::String(serving_tag.to_string()),
@@ -2573,6 +2593,20 @@ fn build_standard_node(
             protocol: config.protocol.clone(),
         });
     };
+    // Ticket 42: stored `https` rows serve through the `http` outbound
+    // with TLS on — without an explicit marker the http arm would serve
+    // them plaintext. (Link intake already stores `security=tls`; this
+    // covers JSON rows typed `https`.)
+    if canonical == "http"
+        && config.protocol.trim().eq_ignore_ascii_case("https")
+        && !params.contains_key("security")
+        && !params.contains_key("tls")
+    {
+        params.insert(
+            "security".to_string(),
+            serde_json::Value::String("tls".to_string()),
+        );
+    }
     // Ticket 29: stock sing-box rejects ANY `encryption` key on vless
     // outbounds, so absent/blank/`"none"` drops the key here (stays stock).
     // A real value never reaches stock emission (routing sends it xray-ward)
@@ -2654,6 +2688,90 @@ fn take_flat(
     found
 }
 
+/// Ticket 42: true when any of `keys` holds a truthy flat spelling
+/// (`1`/`true`/`yes`/`on`, JSON bools/numbers included). Consumes ALL
+/// listed keys either way, so alias spellings never leak into the emission.
+fn take_truthy(params: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
+    let mut on = false;
+    for key in keys {
+        match params.remove(*key) {
+            Some(serde_json::Value::String(text)) => {
+                if matches!(
+                    text.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "enabled"
+                ) {
+                    on = true;
+                }
+            }
+            Some(serde_json::Value::Bool(flag)) => on |= flag,
+            Some(serde_json::Value::Number(number)) => {
+                on |= number.as_u64().is_some_and(|n| n != 0);
+            }
+            _ => {}
+        }
+    }
+    on
+}
+
+/// Ticket 42: fold ECH intake spellings into one native `tls.ech` block
+/// (or `None` for no ECH). A truthy `ech` mark enables with an empty
+/// config (HTTPS-record DNS lookup per docs); any other non-empty mark is
+/// the config itself; explicit `ech_config`/`ech_config_path` attach to
+/// either form.
+fn ech_block(
+    mark: Option<String>,
+    config: Option<String>,
+    config_path: Option<String>,
+) -> Option<serde_json::Value> {
+    fn truthy(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "enabled"
+        )
+    }
+    fn falsy(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "disabled"
+        )
+    }
+    let mut block = serde_json::Map::new();
+    let mut enabled = false;
+    if let Some(mark) = mark {
+        if truthy(&mark) {
+            enabled = true;
+        } else if !mark.trim().is_empty() && !falsy(&mark) {
+            enabled = true;
+            block.insert(
+                "config".to_string(),
+                serde_json::Value::String(mark.trim().to_string()),
+            );
+        }
+    }
+    if let Some(config) = config {
+        if !config.trim().is_empty() {
+            enabled = true;
+            block
+                .entry("config".to_string())
+                .or_insert(serde_json::Value::String(config.trim().to_string()));
+        }
+    }
+    if let Some(path) = config_path {
+        if !path.trim().is_empty() {
+            enabled = true;
+            block.insert(
+                "config_path".to_string(),
+                serde_json::Value::String(path.trim().to_string()),
+            );
+        }
+    }
+    if !enabled {
+        return None;
+    }
+    block.insert("enabled".to_string(), serde_json::Value::Bool(true));
+    Some(serde_json::Value::Object(block))
+}
+
 /// Ticket 32: `{"field": ...}` error naming the offending stored field
 /// (never values, keys, or tokens).
 fn bad_option(name: &str, field: &str, detail: &str) -> EngineError {
@@ -2682,14 +2800,19 @@ fn split_alpn(raw: Option<String>) -> Vec<serde_json::Value> {
 /// when the row sets one). The uTLS fingerprint lives in the `utls`
 /// object — live-probed: 1.14.2 strict-decodes and rejects a top-level
 /// `fingerprint` on the tls object.
+/// Ticket 42: `insecure` honors the trojan `allowInsecure` intake spelling
+/// (mapped, never passed through); `ech` carries the ECH client block
+/// (empty config → HTTPS-record DNS lookup per docs).
 fn tls_object(
     server: &str,
     server_name: Option<String>,
     fingerprint: Option<String>,
     alpn: Vec<serde_json::Value>,
     reality: Option<(String, Option<String>)>,
+    insecure: bool,
+    ech: Option<serde_json::Value>,
 ) -> serde_json::Value {
-    let mut tls = serde_json::Map::with_capacity(5);
+    let mut tls = serde_json::Map::with_capacity(7);
     tls.insert("enabled".to_string(), serde_json::Value::Bool(true));
     tls.insert(
         "server_name".to_string(),
@@ -2715,6 +2838,12 @@ fn tls_object(
             real.insert("short_id".to_string(), serde_json::Value::String(short_id));
         }
         tls.insert("reality".to_string(), serde_json::Value::Object(real));
+    }
+    if insecure {
+        tls.insert("insecure".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(ech) = ech {
+        tls.insert("ech".to_string(), ech);
     }
     serde_json::Value::Object(tls)
 }
@@ -2766,6 +2895,31 @@ fn apply_tls(
     let alpn = split_alpn(take_flat(params, &["alpn"]));
     let public_key = take_flat(params, &["pbk"]);
     let short_id = take_flat(params, &["sid"]);
+    // Ticket 42: trojan `allowInsecure` spellings (plus the bare `insecure`
+    // flat) fold into `tls.insecure` here, on every TLS-capable protocol —
+    // never a top-level passthrough `check` rejects cryptically.
+    let insecure = take_truthy(
+        params,
+        &[
+            "allowInsecure",
+            "allow_insecure",
+            "allowinsecure",
+            "insecure",
+        ],
+    );
+    // Ticket 42: ECH intake — a native `ech` object from JSON intake wins
+    // outright; a string/bool `ech` mark plus explicit config paths fold
+    // into a built block. Flats beside a native object are redundant intake
+    // spellings, not a second ECH block.
+    let (native_ech, ech_mark) = match params.remove("ech") {
+        Some(serde_json::Value::Object(map)) => (Some(serde_json::Value::Object(map)), None),
+        Some(serde_json::Value::String(text)) => (None, Some(text)),
+        Some(serde_json::Value::Bool(true)) => (None, Some("true".to_string())),
+        _ => (None, None),
+    };
+    let ech_config = take_flat(params, &["ech_config", "echconfig"]);
+    let ech_config_path = take_flat(params, &["ech_config_path", "echconfigpath"]);
+    let ech = native_ech.or_else(|| ech_block(ech_mark, ech_config, ech_config_path));
     match intent {
         TlsIntent::Off => {
             // No TLS: key material for it is meaningless here.
@@ -2774,7 +2928,7 @@ fn apply_tls(
         TlsIntent::On { reality: false } => {
             params.insert(
                 "tls".to_string(),
-                tls_object(server, server_name, fingerprint, alpn, None),
+                tls_object(server, server_name, fingerprint, alpn, None, insecure, ech),
             );
             Ok(())
         }
@@ -2791,9 +2945,119 @@ fn apply_tls(
                     fingerprint,
                     alpn,
                     Some((public_key, short_id)),
+                    insecure,
+                    ech,
                 ),
             );
             Ok(())
+        }
+    }
+}
+
+/// Ticket 42 (prohibited side effect): 1.15.0-only fields must never reach
+/// an emitted 1.14.2 config. `certificate_sha256` pinning is 1.15.0+
+/// (1.14.2 pins via `certificate_public_key_sha256`, which stays allowed);
+/// feeding it fails typed naming the field instead of emitting a config
+/// `check` rejects — or worse, silently ignoring a security pin.
+fn reject_115_fields(
+    name: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    if params.contains_key("certificate_sha256") {
+        return Err(bad_option(
+            name,
+            "certificate_sha256",
+            "certificate pinning is sing-box 1.15.0+ (1.14.2 pins via \"certificate_public_key_sha256\")",
+        ));
+    }
+    Ok(())
+}
+
+/// Ticket 42: sing-box Dial fields accepted verbatim beside every strict
+/// per-protocol allowlist (connection tuning, never protocol semantics).
+const DIAL_KEYS: &[&str] = &[
+    "bind_interface",
+    "routing_mark",
+    "reuse_addr",
+    "connect_timeout",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "udp_fragment",
+    "netns",
+    "domain_resolver",
+];
+
+/// Ticket 42: unknown params on strict protocols (hy2/tuic/snell/
+/// shadowtls/socks/http/naive) fail typed naming the field instead of
+/// dying inside `check`. `type`/`tag`/`server`/`server_port` are structural
+/// and always allowed; [`DIAL_KEYS`] ride along everywhere.
+fn reject_unknown_params(
+    name: &str,
+    canonical: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Result<(), EngineError> {
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        if ["type", "tag", "server", "server_port"].contains(&key.as_str()) {
+            continue;
+        }
+        if allowed.contains(&key.as_str()) || DIAL_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        return Err(bad_option(
+            name,
+            key,
+            &format!("\"{key}\" has no sing-box 1.14.2 mapping on {canonical}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Ticket 42: coerce an hysteria2 speed flat (any of the `up`/`down`
+/// spellings) to whole Mbps. JSON numbers pass through (`100` → 100);
+/// strings take a leading-number parse, so provider spellings like
+/// "100 Mbps" map. `None` means BBR-by-omission; anything else fails typed
+/// naming the Mbps field (never a silently dropped explicit speed).
+fn take_speed(
+    name: &str,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    field: &str,
+) -> Result<Option<u64>, EngineError> {
+    let bad = || {
+        bad_option(
+            name,
+            field,
+            &format!("hysteria2 \"{field}\" must be a number (Mbps)"),
+        )
+    };
+    let mut numeric: Option<Option<u64>> = None;
+    for key in keys {
+        if let Some(serde_json::Value::Number(number)) = params.get(*key) {
+            if numeric.is_none() {
+                numeric = Some(number.as_u64());
+            }
+        }
+    }
+    if let Some(number) = numeric {
+        take_flat(params, keys);
+        return number.map(Some).ok_or_else(bad);
+    }
+    let raw = take_flat(params, keys);
+    match raw {
+        None => Ok(None),
+        Some(text) => {
+            let digits: String = text
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if digits.is_empty() {
+                return Err(bad());
+            }
+            digits.parse::<u64>().map(Some).map_err(|_| bad())
         }
     }
 }
@@ -2840,6 +3104,14 @@ fn apply_transport(
     let method = take_flat(params, &["method"]);
     let transport = match network.to_ascii_lowercase().as_str() {
         "" | "tcp" | "raw" | "none" => None,
+        // Ticket 42 (US-23): V2Ray QUIC transport is `{"type":"quic"}` —
+        // no extra fields, no added encryption (docs: "basically duplicate
+        // encryption"). kcp stays a typed bad-option below (the ticket-42
+        // kcp decision: no stock sing-box mapping, fail named).
+        "quic" => {
+            let quic = serde_json::Map::with_capacity(1);
+            Some((serde_json::Value::String("quic".to_string()), quic))
+        }
         "ws" | "websocket" => {
             let mut ws = serde_json::Map::with_capacity(3);
             if let Some(path) = path {
@@ -2949,6 +3221,31 @@ fn drop_foreign_flats(params: &mut serde_json::Map<String, serde_json::Value>, k
         "method",
         "transport",
         "variant",
+        // Ticket 42: TLS-bypass/ECH/speed/obfs flats are meaningless on
+        // protocols without TLS or those shapes — drop them here so they
+        // never reach `check` as unknown fields (the TLS-capable and
+        // strict arms consume or judge their own copies first).
+        "allowInsecure",
+        "allow_insecure",
+        "allowinsecure",
+        "insecure",
+        "ech",
+        "ech_config",
+        "echconfig",
+        "ech_config_path",
+        "echconfigpath",
+        "up_mbps",
+        "down_mbps",
+        "upmbps",
+        "downmbps",
+        "up",
+        "down",
+        "obfs",
+        "obfs_password",
+        "obfs-password",
+        "obfs_host",
+        "obfs-host",
+        "psk",
     ] {
         if !keep.contains(&key) {
             params.remove(key);
@@ -2963,6 +3260,8 @@ fn translate_outbound(
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
+    // Ticket 42: 1.15.0-only fields never emit — fail typed up front.
+    reject_115_fields(name, params)?;
     let server = params
         .get("server")
         .and_then(serde_json::Value::as_str)
@@ -2990,7 +3289,7 @@ fn translate_outbound(
                     let alpn = split_alpn(take_flat(params, &["alpn"]));
                     params.insert(
                         "tls".to_string(),
-                        tls_object(&server, server_name, fingerprint, alpn, None),
+                        tls_object(&server, server_name, fingerprint, alpn, None, false, None),
                     );
                 }
                 // `security` stays: it is the sing-box packet cipher here.
@@ -3034,22 +3333,37 @@ fn translate_outbound(
             }
             apply_transport(name, params)?;
         }
-        "tuic" | "hysteria" | "hysteria2" | "anytls" => {
+        "tuic" | "hysteria" | "anytls" => {
             apply_tls(name, params, &server, true, true)?;
             // Stream transports don't exist on these protocols; the flats
-            // beside them are other protocols' intake spellings.
-            take_flat(
-                params,
-                &[
-                    "network",
-                    "path",
-                    "host",
-                    "headers",
-                    "serviceName",
-                    "service_name",
-                    "method",
-                ],
-            );
+            // beside them are other protocols' intake spellings. Ticket 42:
+            // tuic keeps its native `network` (tcp/udp); the rest drop.
+            if canonical == "tuic" {
+                take_flat(
+                    params,
+                    &[
+                        "path",
+                        "host",
+                        "headers",
+                        "serviceName",
+                        "service_name",
+                        "method",
+                    ],
+                );
+            } else {
+                take_flat(
+                    params,
+                    &[
+                        "network",
+                        "path",
+                        "host",
+                        "headers",
+                        "serviceName",
+                        "service_name",
+                        "method",
+                    ],
+                );
+            }
             if canonical == "hysteria" {
                 // sing-box holds the plaintext credential in `auth_str`;
                 // `auth` is base64 bytes there, never the link secret.
@@ -3079,15 +3393,384 @@ fn translate_outbound(
                     }
                 }
             }
-            if canonical == "hysteria2" {
-                if let Some(variant) = take_flat(params, &["variant"]) {
+            if canonical == "tuic" {
+                // Ticket 42 (US-26): tuic extras validate against the 1.14.2
+                // shape — wild keys fail typed naming the field instead of
+                // dying inside `check`.
+                reject_unknown_params(
+                    name,
+                    "tuic",
+                    params,
+                    &[
+                        "uuid",
+                        "password",
+                        "network",
+                        "congestion_control",
+                        "udp_relay_mode",
+                        "udp_over_stream",
+                        "zero_rtt_handshake",
+                        "heartbeat",
+                        "tls",
+                    ],
+                )?;
+            }
+        }
+        "hysteria2" => {
+            // Ticket 42 (US-21/US-26): TLS is mandatory; speeds omit to BBR
+            // when unset (never a zero default); obfs flats fold into the
+            // native block; wild extras fail typed.
+            apply_tls(name, params, &server, true, true)?;
+            if let Some(variant) = take_flat(params, &["variant"]) {
+                return Err(bad_option(
+                    name,
+                    "variant",
+                    &format!("hysteria2 variant \"{variant}\" has no stock sing-box mapping"),
+                ));
+            }
+            // JSON intake may carry `auth` where links carry `password`.
+            let auth = take_flat(params, &["auth"]);
+            if params.get("password").is_none() {
+                if let Some(auth) = auth {
+                    params.insert("password".to_string(), serde_json::Value::String(auth));
+                }
+            }
+            if str_field(params, "password").is_none() {
+                return Err(EngineError::BadParams {
+                    name: name.to_string(),
+                    field: "password",
+                });
+            }
+            if let Some(up) = take_speed(name, params, &["up_mbps", "upmbps", "up"], "up_mbps")? {
+                params.insert("up_mbps".to_string(), serde_json::Value::Number(up.into()));
+            }
+            if let Some(down) = take_speed(
+                name,
+                params,
+                &["down_mbps", "downmbps", "down"],
+                "down_mbps",
+            )? {
+                params.insert(
+                    "down_mbps".to_string(),
+                    serde_json::Value::Number(down.into()),
+                );
+            }
+            let obfs_raw = params.remove("obfs");
+            let obfs_pw = take_flat(params, &["obfs_password", "obfs-password"]);
+            match obfs_raw {
+                None => {
+                    if obfs_pw.is_some() {
+                        return Err(bad_option(
+                            name,
+                            "obfs",
+                            "hysteria2 obfs password without an obfs type (want \"salamander\" or \"gecko\")",
+                        ));
+                    }
+                }
+                Some(serde_json::Value::Object(map)) => {
+                    params.insert("obfs".to_string(), serde_json::Value::Object(map));
+                }
+                Some(serde_json::Value::String(kind)) => {
+                    match kind.trim().to_ascii_lowercase().as_str() {
+                        "" | "none" | "off" => {
+                            if obfs_pw.is_some() {
+                                return Err(bad_option(
+                                    name,
+                                    "obfs",
+                                    "hysteria2 obfs password without an obfs type (want \"salamander\" or \"gecko\")",
+                                ));
+                            }
+                        }
+                        "salamander" | "gecko" => {
+                            let mut obfs = serde_json::Map::with_capacity(2);
+                            obfs.insert(
+                                "type".to_string(),
+                                serde_json::Value::String(kind.trim().to_ascii_lowercase()),
+                            );
+                            if let Some(password) = obfs_pw {
+                                obfs.insert(
+                                    "password".to_string(),
+                                    serde_json::Value::String(password),
+                                );
+                            }
+                            params.insert("obfs".to_string(), serde_json::Value::Object(obfs));
+                        }
+                        other => {
+                            return Err(bad_option(
+                                name,
+                                "obfs",
+                                &format!(
+                                    "unknown hysteria2 obfs \"{other}\" (want \"salamander\" or \"gecko\")"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Some(_) => {
                     return Err(bad_option(
                         name,
-                        "variant",
-                        &format!("hysteria2 variant \"{variant}\" has no stock sing-box mapping"),
+                        "obfs",
+                        "hysteria2 obfs must be an object or a type name",
                     ));
                 }
             }
+            // hy2 has no stream transports, but `network` (tcp/udp) is
+            // native and survives; the rest are foreign intake spellings.
+            take_flat(
+                params,
+                &[
+                    "path",
+                    "host",
+                    "headers",
+                    "serviceName",
+                    "service_name",
+                    "method",
+                ],
+            );
+            reject_unknown_params(
+                name,
+                "hysteria2",
+                params,
+                &[
+                    "password",
+                    "up_mbps",
+                    "down_mbps",
+                    "obfs",
+                    "network",
+                    "server_ports",
+                    "hop_interval",
+                    "hop_interval_max",
+                    "bbr_profile",
+                    "disable_chrome_parrot",
+                    "realm",
+                    "tls",
+                ],
+            )?;
+        }
+        "socks" => {
+            // Ticket 42 (US-20): native `socks` outbound. `version` omits —
+            // the schema default is 5, which is what intake stores; any
+            // other version fails closed (wire format unverified for 1.14.2,
+            // never a guessed emission).
+            match params.remove("version") {
+                None => {}
+                Some(serde_json::Value::Number(number)) if number.as_u64() == Some(5) => {}
+                Some(serde_json::Value::String(version)) if version.trim() == "5" => {}
+                Some(serde_json::Value::String(version)) => {
+                    return Err(bad_option(
+                        name,
+                        "version",
+                        &format!(
+                            "socks version \"{}\" has no verified 1.14.2 mapping (stock serves version 5)",
+                            version.trim()
+                        ),
+                    ));
+                }
+                Some(_) => {
+                    return Err(bad_option(
+                        name,
+                        "version",
+                        "socks version must be 5 (stock serves version 5)",
+                    ));
+                }
+            }
+            if let Some(serde_json::Value::String(network)) = params.get("network") {
+                if !["tcp", "udp"].contains(&network.trim().to_ascii_lowercase().as_str()) {
+                    return Err(bad_option(
+                        name,
+                        "network",
+                        "socks network must be \"tcp\" or \"udp\"",
+                    ));
+                }
+            }
+            drop_foreign_flats(params, &["username", "password", "network", "udp_over_tcp"]);
+            reject_unknown_params(
+                name,
+                "socks",
+                params,
+                &["username", "password", "network", "udp_over_tcp"],
+            )?;
+        }
+        "http" => {
+            // Ticket 42 (US-20): native `http` outbound. `version` (and the
+            // HTTP2/QUIC serve options around it) are 1.15.0+ — reject
+            // loudly instead of emitting a config `check` refuses.
+            if params.contains_key("version") {
+                return Err(bad_option(
+                    name,
+                    "version",
+                    "http version selection is sing-box 1.15.0+ (1.14.2 serves its default)",
+                ));
+            }
+            match params.remove("tls") {
+                None => apply_tls(name, params, &server, false, false)?,
+                Some(serde_json::Value::Object(map)) => {
+                    // A native `tls` object wins; intake flats beside it
+                    // are redundant spellings, not a second TLS block.
+                    take_flat(
+                        params,
+                        &[
+                            "security",
+                            "sni",
+                            "peer",
+                            "fp",
+                            "fingerprint",
+                            "alpn",
+                            "pbk",
+                            "sid",
+                        ],
+                    );
+                    take_truthy(
+                        params,
+                        &[
+                            "allowInsecure",
+                            "allow_insecure",
+                            "allowinsecure",
+                            "insecure",
+                        ],
+                    );
+                    take_flat(params, &["ech", "ech_config", "echconfig"]);
+                    take_flat(params, &["ech_config_path", "echconfigpath"]);
+                    params.insert("tls".to_string(), serde_json::Value::Object(map));
+                }
+                Some(_) => {
+                    return Err(bad_option(name, "tls", "http tls must be an object"));
+                }
+            }
+            drop_foreign_flats(params, &["username", "password", "path", "headers", "tls"]);
+            reject_unknown_params(
+                name,
+                "http",
+                params,
+                &["username", "password", "path", "headers", "tls"],
+            )?;
+        }
+        "naive" => {
+            // Ticket 42: native `naive` outbound (upstream 1.14.2 table
+            // member). TLS is definitional here — always on, never optional.
+            for field in ["username", "password"] {
+                if str_field(params, field).is_none() {
+                    return Err(EngineError::BadParams {
+                        name: name.to_string(),
+                        field,
+                    });
+                }
+            }
+            apply_tls(name, params, &server, true, true)?;
+            drop_foreign_flats(params, &["username", "password", "network", "tls"]);
+            reject_unknown_params(
+                name,
+                "naive",
+                params,
+                &["username", "password", "network", "tls"],
+            )?;
+        }
+        "snell" => {
+            // Ticket 42 (US-24): native `snell` outbound (1.14.0+ schema).
+            // `version` coerces to a number (absent means 4, like links);
+            // anything outside 4|6 fails typed.
+            if str_field(params, "psk").is_none() {
+                return Err(EngineError::BadParams {
+                    name: name.to_string(),
+                    field: "psk",
+                });
+            }
+            let version = match params.remove("version") {
+                None => 4u64,
+                Some(serde_json::Value::Number(number)) => number
+                    .as_u64()
+                    .filter(|version| *version == 4 || *version == 6)
+                    .ok_or_else(|| bad_option(name, "version", "snell version must be 4 or 6"))?,
+                Some(serde_json::Value::String(text)) => match text.trim() {
+                    "4" => 4,
+                    "6" => 6,
+                    _ => {
+                        return Err(bad_option(name, "version", "snell version must be 4 or 6"));
+                    }
+                },
+                Some(_) => {
+                    return Err(bad_option(name, "version", "snell version must be 4 or 6"));
+                }
+            };
+            params.insert(
+                "version".to_string(),
+                serde_json::Value::Number(version.into()),
+            );
+            drop_foreign_flats(
+                params,
+                &[
+                    "psk",
+                    "version",
+                    "userkey",
+                    "reuse",
+                    "network",
+                    "obfs_mode",
+                    "obfs_host",
+                    "mode",
+                ],
+            );
+            reject_unknown_params(
+                name,
+                "snell",
+                params,
+                &[
+                    "psk",
+                    "version",
+                    "userkey",
+                    "reuse",
+                    "network",
+                    "obfs_mode",
+                    "obfs_host",
+                    "mode",
+                ],
+            )?;
+        }
+        "shadowtls" => {
+            // Ticket 42 (US-24): native `shadowtls` outbound. TLS is
+            // required (always on); `version` coerces to a number (absent
+            // takes the schema default 1); password is v2/v3-only and
+            // simply omits on v1 rows.
+            apply_tls(name, params, &server, true, true)?;
+            match params.remove("version") {
+                None => {}
+                Some(serde_json::Value::Number(number)) => {
+                    let valid = number
+                        .as_u64()
+                        .is_some_and(|version| (1..=3).contains(&version));
+                    if !valid {
+                        return Err(bad_option(
+                            name,
+                            "version",
+                            "shadowtls version must be 1, 2, or 3",
+                        ));
+                    }
+                    params.insert("version".to_string(), serde_json::Value::Number(number));
+                }
+                Some(serde_json::Value::String(text)) => match text.trim() {
+                    "1" | "2" | "3" => {
+                        let number: u64 = text.trim().parse().expect("1|2|3 parses");
+                        params.insert(
+                            "version".to_string(),
+                            serde_json::Value::Number(number.into()),
+                        );
+                    }
+                    _ => {
+                        return Err(bad_option(
+                            name,
+                            "version",
+                            "shadowtls version must be 1, 2, or 3",
+                        ));
+                    }
+                },
+                Some(_) => {
+                    return Err(bad_option(
+                        name,
+                        "version",
+                        "shadowtls version must be 1, 2, or 3",
+                    ));
+                }
+            }
+            drop_foreign_flats(params, &["version", "password", "tls"]);
+            reject_unknown_params(name, "shadowtls", params, &["version", "password", "tls"])?;
         }
         "ssh" => {
             // Live-probed: the stock `ssh` outbound names the login `user`;
@@ -3240,6 +3923,28 @@ fn reshape_wireguard_endpoint(
     params.remove("awg_version");
     // Client-side resolver setting from conf files: not an endpoint field.
     params.remove("dns");
+    // Ticket 42 (US-25): conf/URI intake keeps `reserved` bytes as a
+    // "1,2,3" string; the endpoint schema wants a number array, so coerce
+    // comma/space-separated bytes (a failed parse stays verbatim for
+    // `check` to name loudly — identical on both intake paths).
+    if let Some(reserved) = params.remove("reserved") {
+        let coerced = match reserved {
+            serde_json::Value::String(text) => text
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.parse::<u64>())
+                .collect::<Result<Vec<_>, _>>()
+                .map(|bytes| {
+                    serde_json::Value::Array(
+                        bytes.into_iter().map(serde_json::Value::from).collect(),
+                    )
+                })
+                .unwrap_or_else(|_| serde_json::Value::String(text)),
+            other => other,
+        };
+        params.insert("reserved".to_string(), coerced);
+    }
     // Ticket 32: stock endpoint numerics arrive as strings from conf/URI
     // intake (`mtu`); coerce, leaving failures verbatim for `check`.
     // (Peer keepalive is renamed + coerced at build time above; AWG
@@ -7657,20 +8362,22 @@ mod tests {
     /// Exotic protocols stay out of this slice with a named error.
     /// Ticket 27: AnyTLS/SSH/Noise are native now — the residual
     /// UnsupportedProtocol case is a genuinely unknown protocol.
+    /// Ticket 42: naive/socks/http/snell/shadowtls joined the natives —
+    /// the residual case is a schema-less protocol (e.g. mieru).
     #[test]
     fn unsupported_protocol_names_config_without_secrets() {
         let configs = vec![fixture(
             "9",
             "Odd",
-            "naive",
+            "mieru",
             json!({"server": "10.0.0.9", "server_port": 443, "username": "u", "password": "TOP-SECRET"}),
             "127.0.0.1",
             10809,
         )];
-        let error = generate(&configs).expect_err("naive is not standard");
+        let error = generate(&configs).expect_err("mieru is not standard");
         let text = error.to_string();
         assert!(text.contains("\"Odd\""), "names config: {text}");
-        assert!(text.contains("naive"), "names protocol: {text}");
+        assert!(text.contains("mieru"), "names protocol: {text}");
         assert!(!text.contains("TOP-SECRET"), "no secrets: {text}");
     }
 
@@ -11189,5 +11896,551 @@ Active Connections\r
         controller.stop_all();
         assert!(controller.clash_targets().is_empty(), "stop clears clash");
         assert_eq!(controller.status(), &EngineStatus::Stopped);
+    }
+
+    // -- Ticket 42: serve-everything -----------------------------------
+    // Every importable type serves natively where a 1.14.2 upstream schema
+    // exists; wild extras map or fail typed; 1.15.0-only fields never emit.
+
+    /// Find one row's outbound node by its serving tag.
+    fn t42_outbound(generated: &GeneratedConfig, id: &str) -> serde_json::Value {
+        let want = outbound_tag(id);
+        generated.value()["outbounds"]
+            .as_array()
+            .expect("outbounds array")
+            .iter()
+            .find(|node| node["tag"] == json!(want))
+            .unwrap_or_else(|| panic!("outbound {want} present"))
+            .clone()
+    }
+
+    /// Build one enabled row from a share link (import seam → engine seam).
+    fn t42_row_from_link(id: &str, link: &str, bind: &str, port: u16) -> ProxyConfig {
+        use crate::import::parse_link;
+        let imported = parse_link(link).unwrap_or_else(|error| panic!("link parses: {error}"));
+        ProxyConfig {
+            id: id.to_string(),
+            name: imported.name.clone(),
+            protocol: imported.protocol.clone(),
+            params: imported.params.clone(),
+            group: "t42".to_string(),
+            enabled: true,
+            bind_ip: bind.to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    /// Ticket 42 (US-20): socks share links serve as native sing-box
+    /// `socks` outbounds (no `version` key: the schema default is 5, which
+    /// is what intake stores).
+    #[test]
+    fn t42_socks_link_serves_native() {
+        let row = t42_row_from_link(
+            "s1",
+            "socks://user:pass@192.0.2.20:1080#socks-one",
+            "127.0.0.1",
+            10801,
+        );
+        assert_eq!(row.protocol, "socks");
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("socks generates"),
+            "s1",
+        );
+        assert_eq!(node["type"], json!("socks"));
+        assert_eq!(node["server"], json!("192.0.2.20"));
+        assert_eq!(node["server_port"], json!(1080));
+        assert_eq!(node["username"], json!("user"));
+        assert!(node.get("version").is_none(), "no 1.15-risk version key");
+    }
+
+    /// Ticket 42 (US-20): plain `http` serves without TLS; `https` serves
+    /// the same `http` outbound with TLS on.
+    #[test]
+    fn t42_http_and_https_serve_native() {
+        let plain = t42_row_from_link(
+            "h1",
+            "http://user:pass@192.0.2.21:8080#http-one",
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&plain)).expect("http generates"),
+            "h1",
+        );
+        assert_eq!(node["type"], json!("http"));
+        assert_eq!(node["server_port"], json!(8080));
+        assert_eq!(node["username"], json!("user"));
+        assert!(node.get("tls").is_none(), "plain http carries no tls");
+        assert!(node.get("version").is_none(), "no 1.15-only version key");
+
+        let secure = t42_row_from_link("h2", "https://192.0.2.22#https-one", "127.0.0.1", 10802);
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&secure)).expect("https generates"),
+            "h2",
+        );
+        assert_eq!(node["type"], json!("http"));
+        assert_eq!(node["tls"]["enabled"], json!(true));
+    }
+
+    /// Ticket 42 (US-24): snell links serve as native `snell` outbounds
+    /// with a numeric version (1.14.0+ schema).
+    #[test]
+    fn t42_snell_link_serves_native() {
+        let row = t42_row_from_link(
+            "sn1",
+            "snell://psk-secret@192.0.2.23:8388?version=4#snell-one",
+            "127.0.0.1",
+            10801,
+        );
+        assert_eq!(row.protocol, "snell");
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("snell generates"),
+            "sn1",
+        );
+        assert_eq!(node["type"], json!("snell"));
+        assert_eq!(node["version"], json!(4));
+        assert_eq!(node["psk"], json!("psk-secret"));
+    }
+
+    /// Ticket 42 (US-24): shadowtls links serve as native `shadowtls`
+    /// outbounds with mandatory TLS and a numeric version.
+    #[test]
+    fn t42_shadowtls_link_serves_native() {
+        let row = t42_row_from_link(
+            "st1",
+            "shadowtls://shadowpw@192.0.2.24:443?sni=example.com&version=3#st-one",
+            "127.0.0.1",
+            10801,
+        );
+        assert_eq!(row.protocol, "shadowtls");
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("shadowtls generates"),
+            "st1",
+        );
+        assert_eq!(node["type"], json!("shadowtls"));
+        assert_eq!(node["version"], json!(3));
+        assert_eq!(node["tls"]["enabled"], json!(true));
+        assert_eq!(node["tls"]["server_name"], json!("example.com"));
+    }
+
+    /// Ticket 42: naive links serve as native `naive` outbounds (upstream
+    /// 1.14.2 table member) with TLS always on.
+    #[test]
+    fn t42_naive_link_serves_native() {
+        let row = t42_row_from_link(
+            "n1",
+            "naive+https://user:pass@192.0.2.25:8443#naive-one",
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("naive generates"),
+            "n1",
+        );
+        assert_eq!(node["type"], json!("naive"));
+        assert_eq!(node["username"], json!("user"));
+        assert_eq!(node["tls"]["enabled"], json!(true));
+    }
+
+    /// Ticket 42 (US-21): hysteria2 without up/down omits both fields
+    /// (BBR congestion control per docs), never a zero default.
+    #[test]
+    fn t42_hy2_bbr_by_omission() {
+        let row = t42_row_from_link(
+            "hy1",
+            "hysteria2://letmein@192.0.2.26:8443?sni=example.com#hy2-bbr",
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("hy2 generates"),
+            "hy1",
+        );
+        assert_eq!(node["type"], json!("hysteria2"));
+        assert_eq!(node["password"], json!("letmein"));
+        assert_eq!(node["tls"]["enabled"], json!(true));
+        assert!(node.get("up_mbps").is_none(), "BBR: up omitted");
+        assert!(node.get("down_mbps").is_none(), "BBR: down omitted");
+    }
+
+    /// Ticket 42 (US-21/US-26): explicit up/down spellings coerce to
+    /// numeric `up_mbps`/`down_mbps` (leading-number parse: "100 Mbps"→100).
+    #[test]
+    fn t42_hy2_updown_coerced_to_numbers() {
+        let row = t42_row_from_link(
+            "hy2",
+            "hysteria2://letmein@192.0.2.26:8443?sni=example.com&up=100%20Mbps&down=50#hy2-speed",
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("hy2 generates"),
+            "hy2",
+        );
+        assert_eq!(node["up_mbps"], json!(100));
+        assert_eq!(node["down_mbps"], json!(50));
+    }
+
+    /// Ticket 42: JSON-number speeds pass through as numbers (never
+    /// silently dropped to BBR); non-numeric speeds fail typed.
+    #[test]
+    fn t42_hy2_numeric_and_bad_speeds() {
+        let row = fixture(
+            "hy4",
+            "Hy2Numeric",
+            "hysteria2",
+            json!({"type": "hysteria2", "server": "192.0.2.26", "server_port": 443,
+                   "password": "pw", "up_mbps": 200, "down_mbps": 100}),
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("numeric speeds generate"),
+            "hy4",
+        );
+        assert_eq!(node["up_mbps"], json!(200));
+        assert_eq!(node["down_mbps"], json!(100));
+        let bad = fixture(
+            "hy5",
+            "Hy2BadSpeed",
+            "hysteria2",
+            json!({"type": "hysteria2", "server": "192.0.2.26", "server_port": 443,
+                   "password": "pw", "up": "fast"}),
+            "127.0.0.1",
+            10802,
+        );
+        let error = generate(std::slice::from_ref(&bad)).expect_err("bad speed fails");
+        assert!(
+            error.to_string().contains("up_mbps"),
+            "names field: {error}"
+        );
+    }
+
+    /// Ticket 42: socks `version` 5 (string or number) omits to the schema
+    /// default; anything else fails typed.
+    #[test]
+    fn t42_socks_version_shapes() {
+        for (id, version) in [("sv1", json!("5")), ("sv2", json!(5))] {
+            let row = fixture(
+                id,
+                "SocksVersion",
+                "socks",
+                json!({"type": "socks", "server": "192.0.2.20", "server_port": 1080,
+                       "version": version}),
+                "127.0.0.1",
+                10801,
+            );
+            let node = t42_outbound(
+                &generate(std::slice::from_ref(&row)).expect("version 5 generates"),
+                id,
+            );
+            assert!(node.get("version").is_none(), "default omits");
+        }
+        let row = fixture(
+            "sv3",
+            "SocksV4",
+            "socks",
+            json!({"type": "socks", "server": "192.0.2.20", "server_port": 1080,
+                   "version": 4}),
+            "127.0.0.1",
+            10803,
+        );
+        let error = generate(std::slice::from_ref(&row)).expect_err("version 4 fails");
+        assert!(
+            error.to_string().contains("\"version\""),
+            "names field: {error}"
+        );
+    }
+
+    /// Ticket 42 (US-26): hy2 obfs flats fold into the native `obfs` block.
+    #[test]
+    fn t42_hy2_obfs_mapped() {
+        let row = t42_row_from_link(
+            "hy3",
+            "hysteria2://letmein@192.0.2.26:8443?sni=example.com&obfs=salamander&obfs-password=obfspw#hy2-obfs",
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("hy2 generates"),
+            "hy3",
+        );
+        assert_eq!(node["obfs"]["type"], json!("salamander"));
+        assert_eq!(node["obfs"]["password"], json!("obfspw"));
+    }
+
+    /// Ticket 42 (US-26): `allowInsecure` spellings map to `tls.insecure`
+    /// (never a top-level passthrough `check` rejects cryptically).
+    #[test]
+    fn t42_trojan_allowinsecure_maps_tls_insecure() {
+        for (id, query) in [
+            ("ti1", "allowInsecure=1"),
+            ("ti2", "allow_insecure=true"),
+            ("ti3", "insecure=1"),
+        ] {
+            let row = t42_row_from_link(
+                id,
+                &format!("trojan://secret@192.0.2.27:443?sni=example.com&{query}#tj-insecure"),
+                "127.0.0.1",
+                10801,
+            );
+            let node = t42_outbound(
+                &generate(std::slice::from_ref(&row)).expect("trojan generates"),
+                id,
+            );
+            assert_eq!(node["tls"]["insecure"], json!(true), "query {query}");
+            assert!(
+                node.get("allowInsecure").is_none(),
+                "mapped, not passed: {query}"
+            );
+            assert!(
+                node.get("allow_insecure").is_none(),
+                "mapped, not passed: {query}"
+            );
+            assert!(node.get("insecure").is_none(), "folded into tls: {query}");
+        }
+    }
+
+    /// Ticket 42 (US-23): quic transport emits `{"type":"quic"}` (V2Ray
+    /// transport shape, no extra fields).
+    #[test]
+    fn t42_quic_transport_emitted() {
+        let row = t42_row_from_link(
+            "q1",
+            "vless://11111111-2222-4333-8444-555555555555@192.0.2.28:443?encryption=none&security=tls&sni=example.com&type=quic#quic-one",
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("quic generates"),
+            "q1",
+        );
+        assert_eq!(node["transport"], json!({"type": "quic"}));
+    }
+
+    /// Ticket 42 (US-23, kcp decision): kcp has no stock sing-box mapping —
+    /// it fails typed naming `network`, never a silently wrong connection.
+    #[test]
+    fn t42_kcp_decision_is_typed_bad_option() {
+        let row = fixture(
+            "k1",
+            "VlessKcp",
+            "vless",
+            json!({"type": "vless", "server": "192.0.2.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "network": "kcp"}),
+            "127.0.0.1",
+            10801,
+        );
+        let error = generate(std::slice::from_ref(&row)).expect_err("kcp names its field");
+        assert!(
+            error.to_string().contains("\"network\""),
+            "names field: {error}"
+        );
+    }
+
+    /// Ticket 42 (US-23): ECH flats fold into the native `tls.ech` block
+    /// (empty config → HTTPS-record DNS lookup per docs).
+    #[test]
+    fn t42_ech_mapped_to_tls() {
+        let row = t42_row_from_link(
+            "e1",
+            "vless://11111111-2222-4333-8444-555555555555@192.0.2.29:443?encryption=none&security=tls&sni=example.com&ech=1#ech-one",
+            "127.0.0.1",
+            10801,
+        );
+        let node = t42_outbound(
+            &generate(std::slice::from_ref(&row)).expect("ech generates"),
+            "e1",
+        );
+        assert_eq!(node["tls"]["ech"]["enabled"], json!(true));
+        assert!(
+            node.get("ech").is_none(),
+            "folded into tls, not passed through"
+        );
+    }
+
+    /// Ticket 42 (US-26): wild hy2 extras fail typed naming the field
+    /// instead of dying inside `check`.
+    #[test]
+    fn t42_hy2_unknown_extra_is_typed_bad_option() {
+        let row = t42_row_from_link(
+            "hw1",
+            "hysteria2://letmein@192.0.2.26:8443?sni=example.com&bogus_xyz=1#hy2-wild",
+            "127.0.0.1",
+            10801,
+        );
+        let error = generate(std::slice::from_ref(&row)).expect_err("wild extra fails");
+        assert!(
+            matches!(error, EngineError::BadCustom { .. }),
+            "typed, got {error}"
+        );
+        assert!(
+            error.to_string().contains("bogus_xyz"),
+            "names field: {error}"
+        );
+    }
+
+    /// Ticket 42 (US-26): wild tuic extras fail typed naming the field.
+    #[test]
+    fn t42_tuic_unknown_extra_is_typed_bad_option() {
+        let row = t42_row_from_link(
+            "tw1",
+            "tuic://11111111-2222-4333-8444-555555555555:tuicpass@192.0.2.30:4433?bogus_xyz=1#tuic-wild",
+            "127.0.0.1",
+            10801,
+        );
+        let error = generate(std::slice::from_ref(&row)).expect_err("wild extra fails");
+        assert!(
+            matches!(error, EngineError::BadCustom { .. }),
+            "typed, got {error}"
+        );
+        assert!(
+            error.to_string().contains("bogus_xyz"),
+            "names field: {error}"
+        );
+    }
+
+    /// Ticket 42 (prohibited side effect): no emitted config ever carries
+    /// 1.15.0-only fields; feeding them fails typed at generate time.
+    #[test]
+    fn t42_no_115_fields_ever_emitted() {
+        let rows = vec![
+            t42_row_from_link(
+                "f1",
+                "socks://u:p@192.0.2.20:1080#f",
+                "127.0.0.1",
+                10801,
+            ),
+            t42_row_from_link(
+                "f2",
+                "http://u:p@192.0.2.21:8080#f",
+                "127.0.0.1",
+                10802,
+            ),
+            t42_row_from_link(
+                "f3",
+                "hysteria2://pw@192.0.2.26:8443?sni=example.com#f",
+                "127.0.0.1",
+                10803,
+            ),
+            t42_row_from_link(
+                "f4",
+                "vless://11111111-2222-4333-8444-555555555555@192.0.2.28:443?encryption=none&security=tls&sni=example.com&type=quic#f",
+                "127.0.0.1",
+                10804,
+            ),
+        ];
+        let generated = generate(&rows).expect("t42 set generates");
+        assert!(
+            !generated.json.contains("certificate_sha256"),
+            "no 1.15 pinning field"
+        );
+        let value = generated.value();
+        for node in value["outbounds"].as_array().expect("outbounds") {
+            if node["type"] == json!("http") {
+                assert!(node.get("version").is_none(), "no 1.15 http version");
+            }
+        }
+        // Feeding 1.15-only fields fails typed, never emits.
+        let pinned = fixture(
+            "p1",
+            "Pinned",
+            "vless",
+            json!({"type": "vless", "server": "192.0.2.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555",
+                   "security": "tls", "sni": "192.0.2.9",
+                   "certificate_sha256": "abc123"}),
+            "127.0.0.1",
+            10811,
+        );
+        let error = generate(std::slice::from_ref(&pinned)).expect_err("pinning names its field");
+        assert!(
+            error.to_string().contains("certificate_sha256"),
+            "names field: {error}"
+        );
+        let http_version = fixture(
+            "p2",
+            "HttpVersion",
+            "http",
+            json!({"type": "http", "server": "192.0.2.21", "server_port": 8080,
+                   "version": "2"}),
+            "127.0.0.1",
+            10812,
+        );
+        let error =
+            generate(std::slice::from_ref(&http_version)).expect_err("http version rejected");
+        assert!(
+            error.to_string().contains("\"version\""),
+            "names field: {error}"
+        );
+    }
+
+    /// Ticket 42 (US-29): a preset rule with the `proxy` alias merges as a
+    /// `route` rule pointing at the row's outbound.
+    #[test]
+    fn t42_proxy_preset_action_serves_as_route() {
+        use std::collections::HashMap;
+        let row = fixture(
+            "px1",
+            "ProxyRow",
+            "vless",
+            json!({"type": "vless", "server": "192.0.2.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555"}),
+            "127.0.0.1",
+            10801,
+        );
+        let mut row = row;
+        row.preset_id = Some("7".to_string());
+        let mut presets = HashMap::new();
+        presets.insert(
+            "7".to_string(),
+            vec![json!({"action": "proxy", "domain": ["example.com"]})],
+        );
+        let generated =
+            generate_with_presets(std::slice::from_ref(&row), &presets).expect("proxy merges");
+        let rules = generated.value()["route"]["rules"]
+            .as_array()
+            .expect("rules")
+            .clone();
+        assert!(
+            rules.iter().any(|rule| rule["action"] == json!("route")
+                && rule["outbound"] == json!(outbound_tag("px1"))),
+            "proxy alias serves as route: {rules:?}"
+        );
+        assert!(
+            rules.iter().all(|rule| rule["action"] != json!("proxy")),
+            "no raw proxy action reaches the sidecar"
+        );
+    }
+
+    /// Ticket 42 (US-29): a `warp` rule fails with a guidance error naming
+    /// the missing endpoint design (never a bare BadRule).
+    #[test]
+    fn t42_warp_preset_action_is_guidance_error() {
+        use std::collections::HashMap;
+        let row = fixture(
+            "w1",
+            "WarpRow",
+            "vless",
+            json!({"type": "vless", "server": "192.0.2.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555"}),
+            "127.0.0.1",
+            10801,
+        );
+        let mut row = row;
+        row.preset_id = Some("9".to_string());
+        let mut presets = HashMap::new();
+        presets.insert("9".to_string(), vec![json!({"action": "warp"})]);
+        let error =
+            generate_with_presets(std::slice::from_ref(&row), &presets).expect_err("warp fails");
+        let text = error.to_string();
+        assert!(text.contains("warp"), "names warp: {text}");
+        assert!(
+            text.contains("endpoint"),
+            "names the missing endpoint design: {text}"
+        );
     }
 }
