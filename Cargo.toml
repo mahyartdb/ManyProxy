@@ -12,6 +12,9 @@ futures = "0.3"
 tray-icon = "0.25"
 winreg = "0.55"
 raw-window-handle = "0.6"
+# Ticket 41 (spec-approved, research-first): 128-bit clash secrets.
+getrandom = "0.4"
+zeroize = "1.9"
 
 [dev-dependencies]
 gpui-kit = { version = "0.6", features = ["test-support"] }

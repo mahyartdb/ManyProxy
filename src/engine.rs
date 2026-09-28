@@ -76,6 +76,24 @@ pub const XRAY_BINARY_BASE: &str = "xray";
 pub const CLASH_PORT_START: u16 = 18501;
 pub const CLASH_PORT_END: u16 = 18999;
 
+/// Ticket 41: human names for the controller-reserved listen ranges.
+/// User rows must never bind inside either range: the clash controllers
+/// and the xray bridge listeners live there. Validation names the range
+/// before any spawn (and the save gate names it before any write).
+pub const CLASH_RESERVED_NAME: &str = "clash-controller range 18501-18999";
+pub const XRAY_RESERVED_NAME: &str = "xray-bridge range 11801-11999";
+
+/// Ticket 41: the reserved range containing `port`, if any.
+pub fn reserved_range_of(port: u16) -> Option<&'static str> {
+    if (CLASH_PORT_START..=CLASH_PORT_END).contains(&port) {
+        Some(CLASH_RESERVED_NAME)
+    } else if (XRAY_BRIDGE_PORT_START..=XRAY_BRIDGE_PORT_END).contains(&port) {
+        Some(XRAY_RESERVED_NAME)
+    } else {
+        None
+    }
+}
+
 /// Ticket 36: one clash controller identity per serving core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClashTarget {
@@ -84,28 +102,52 @@ pub struct ClashTarget {
     pub secret: String,
 }
 
-/// Ticket 36: loopback bearer secret (16 hex chars from pid + wall clock
-/// + an atomic nonce — never persisted, regenerated per start).
+/// Ticket 36: loopback bearer secret (32 hex chars = 128 bits, regenerated
+/// per start, in-memory only, never persisted).
+/// Ticket 41: 128-bit via `getrandom` (OS CSPRNG). A `getrandom` failure
+/// falls back to two domain-separated hashes (pid + wall clock + atomic
+/// nonce + core) — still 32 hex chars, still never panics, never logged.
 fn clash_secret(core: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut hasher = DefaultHasher::new();
-    (
-        std::process::id(),
-        std::time::SystemTime::now(),
-        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        core,
-    )
-        .hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now();
+        let mut first = DefaultHasher::new();
+        ("manyproxy-clash-v1", std::process::id(), now, n, core).hash(&mut first);
+        let mut second = DefaultHasher::new();
+        ("manyproxy-clash-v2", core, n, now, std::process::id()).hash(&mut second);
+        let (a, b) = (first.finish().to_be_bytes(), second.finish().to_be_bytes());
+        bytes[..8].copy_from_slice(&a);
+        bytes[8..].copy_from_slice(&b);
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
-/// Ticket 36: first free loopback port in the clash range (single-shot
-/// binds, no retry sleeps — the caller probe-binds the pick for real).
-fn find_clash_port() -> Option<u16> {
-    (CLASH_PORT_START..=CLASH_PORT_END)
-        .find(|port| std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_ok())
+/// Ticket 41: bind-and-hold one clash-controller port. The returned
+/// listener stays alive in `holds` until the sidecar has taken the port,
+/// so no sibling process can win the race between reservation and spawn
+/// (the old pick-then-probe sequence had that TOCTOU window). Iterates the
+/// whole range, so a transient holder just shifts the pick (retry by
+/// construction). `None` only when the range is truly exhausted.
+fn reserve_clash_port(holds: &mut Vec<std::net::TcpListener>) -> Option<u16> {
+    (CLASH_PORT_START..=CLASH_PORT_END).find(|port| {
+        match std::net::TcpListener::bind(format!("127.0.0.1:{port}")) {
+            Ok(listener) => {
+                holds.push(listener);
+                true
+            }
+            Err(_) => false,
+        }
+    })
 }
 
 /// Ticket 36: splice a loopback-only clash controller into a generated
@@ -114,6 +156,10 @@ fn find_clash_port() -> Option<u16> {
 /// called on user-owned custom JSON (generated cores only). No
 /// re-validation here: `generate()` already validated the pre-image and
 /// the added `experimental` block cannot affect route structure.
+/// Ticket 41: merge, never clobber — a generated config that already
+/// carries an `experimental` object keeps every existing key; only
+/// `clash_api` is (over)written. A non-object `experimental` is replaced
+/// (nothing mergeable to preserve).
 fn inject_clash_api(json: &str, port: u16, secret: &str) -> Result<String, EngineError> {
     let invalid = |detail: &str| EngineError::InvalidGenerated {
         detail: detail.to_string(),
@@ -123,13 +169,24 @@ fn inject_clash_api(json: &str, port: u16, secret: &str) -> Result<String, Engin
     let obj = document
         .as_object_mut()
         .ok_or_else(|| invalid("sidecar config is not an object (clash injection refused)"))?;
-    obj.insert(
-        "experimental".to_string(),
-        serde_json::json!({"clash_api": {
-            "external_controller": format!("127.0.0.1:{port}"),
-            "secret": secret,
-        }}),
-    );
+    let api = serde_json::json!({"clash_api": {
+        "external_controller": format!("127.0.0.1:{port}"),
+        "secret": secret,
+    }});
+    match obj.get_mut("experimental") {
+        Some(existing) if existing.is_object() => {
+            existing
+                .as_object_mut()
+                .expect("experimental is an object")
+                .insert(
+                    "clash_api".to_string(),
+                    api.get("clash_api").expect("clash_api present").clone(),
+                );
+        }
+        _ => {
+            obj.insert("experimental".to_string(), api);
+        }
+    }
     serde_json::to_string(&document)
         .map_err(|_| invalid("clash-injected config does not serialize"))
 }
@@ -137,11 +194,22 @@ fn inject_clash_api(json: &str, port: u16, secret: &str) -> Result<String, Engin
 /// Ticket 36: listen (bind, port) pairs served by a sidecar config, read
 /// best-effort for the re-apply probe skip. Garbage fails open to an
 /// empty set (probe everything — never skip on a guess).
+/// Ticket 41: also reads the xray inbound shape (`listen` + `port` — the
+/// bridge listeners never appeared here, so re-apply kept tripping
+/// PortUnavailable on its own bridge).
 fn served_listen_ports(json: &str) -> Vec<(String, u16)> {
+    custom_config_listens(
+        &serde_json::from_str::<serde_json::Value>(json).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// Ticket 41: best-effort listen extraction from any sidecar-shaped JSON
+/// document (generated stock/fork configs, xray configs, custom full-config
+/// replacements). Reads `inbounds[]` with sing-box `listen`/`listen_port`
+/// and xray `listen`/`port`. Garbage fails open to an empty set
+/// (allowlisted — probe everything, never skip on a guess).
+pub fn custom_config_listens(document: &serde_json::Value) -> Vec<(String, u16)> {
     let mut out = Vec::new();
-    let Ok(document) = serde_json::from_str::<serde_json::Value>(json) else {
-        return out;
-    };
     let Some(inbounds) = document
         .get("inbounds")
         .and_then(serde_json::Value::as_array)
@@ -151,6 +219,7 @@ fn served_listen_ports(json: &str) -> Vec<(String, u16)> {
     for node in inbounds {
         let port = node
             .get("listen_port")
+            .or_else(|| node.get("port"))
             .and_then(serde_json::Value::as_u64)
             .filter(|port| (1..=65_535).contains(port))
             .map(|port| port as u16);
@@ -481,6 +550,26 @@ pub enum EngineError {
     /// Ticket 23: a start would serve a non-loopback bind without an explicit
     /// LAN confirm. Names the rows + binds only — never secrets.
     LanConfirmRequired { names: String },
+    /// Ticket 41: a row claims a listen port inside a controller-reserved
+    /// range (clash 18501-18999, xray bridge 11801-11999). Names the row,
+    /// the port, and the range before any spawn (and before any save via
+    /// the save gate).
+    ReservedPort {
+        name: String,
+        port: u16,
+        range: &'static str,
+    },
+    /// Ticket 41: `bind_ip` is not a parseable IP address or `localhost`
+    /// (blank means the loopback default and stays valid). Names the row
+    /// and the bind before any spawn.
+    BadBind { name: String, bind: String },
+    /// Ticket 41: the row's local `port` cannot serve (0, or privileged
+    /// <1024 without elevation). Names the row with guidance, never secrets.
+    BadPort { name: String, detail: String },
+    /// Ticket 41: an egress `server` hostname failed to resolve at
+    /// validation. Names the row and the server: a DNS failure, never
+    /// confused with an egress (reachability) failure.
+    DnsFailure { name: String, server: String },
 }
 
 impl std::fmt::Display for EngineError {
@@ -613,6 +702,21 @@ impl std::fmt::Display for EngineError {
             EngineError::LanConfirmRequired { names } => write!(
                 f,
                 "LAN confirm required for {names} (confirm LAN exposure first)"
+            ),
+            EngineError::ReservedPort { name, port, range } => write!(
+                f,
+                "port {port} for \"{name}\" is inside the reserved {range} (pick a port outside it)"
+            ),
+            EngineError::BadBind { name, bind } => write!(
+                f,
+                "bad bind address for \"{name}\": \"{bind}\" (want an IP address or localhost)"
+            ),
+            EngineError::BadPort { name, detail } => {
+                write!(f, "bad local port for \"{name}\" ({detail})")
+            }
+            EngineError::DnsFailure { name, server } => write!(
+                f,
+                "cannot resolve egress server for \"{name}\": \"{server}\" (DNS failure — the name does not resolve, the egress was never reached)"
             ),
         }
     }
@@ -1833,6 +1937,14 @@ pub struct ActivationPlan {
     /// Custom full-config replacements (`(core, config json)`; at most one
     /// per core).
     pub replacements: Vec<(OwningCore, String)>,
+    /// Ticket 41: listens parsed out of the custom full-config replacements
+    /// (`(owner name, bind, port)`) — joined into the conflict set and the
+    /// pre-spawn probe gate so two replacements can never silently share a
+    /// port.
+    pub replacement_listens: Vec<(String, String, u16)>,
+    /// Ticket 41: non-fatal warnings from the plan (typo hints; emission
+    /// tables untouched). The UI surfaces these beside success toasts.
+    pub warnings: Vec<String>,
     /// Quoted row names per gate (fork/xray/extra binary resolution).
     pub fork_names: String,
     pub fork_xhttp: bool,
@@ -1888,6 +2000,13 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     let mut bridge_keys: Vec<String> = Vec::new();
     for config in configs {
         let params = params_object(config)?;
+        // Ticket 41: early listen gate — garbage binds, port 0, privileged
+        // ports, and reserved ranges fail typed before any spawn. Custom
+        // full-config rows are exempt (their row endpoint is documentation;
+        // their parsed replacement listens join the conflict set below).
+        if !is_custom_config_protocol(&config.protocol) {
+            validate_listen_for_start(&config.name, &config.bind_ip, config.port)?;
+        }
         if is_extra_core_protocol(&config.protocol) {
             validate_extra_row(config)?;
             extras.push(config.clone());
@@ -2083,6 +2202,46 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             }
         }
     }
+    // Ticket 41: custom full-config replacements parse their listens into
+    // the same conflict set — two replacements binding one port (or a
+    // replacement colliding with a served row) fail naming both parties.
+    // Unparseable documents fail open here (the schema gate above already
+    // rejected them; never double-report).
+    let mut replacement_listens: Vec<(String, String, u16)> = Vec::new();
+    for config in configs {
+        if !is_custom_config_protocol(&config.protocol) {
+            continue;
+        }
+        let Ok(params) = params_object(config) else {
+            continue;
+        };
+        let Ok((_, document)) = custom_full_config(&config.name, &params) else {
+            continue;
+        };
+        for (bind, port) in custom_config_listens(&document) {
+            let key = (normalize_bind_key(&bind), port);
+            if let Some(first) = taken.get(&key) {
+                return Err(EngineError::PortConflict {
+                    bind,
+                    port,
+                    first: (*first).to_string(),
+                    second: config.name.clone(),
+                });
+            }
+            taken.insert(key, config.name.as_str());
+            replacement_listens.push((config.name.clone(), bind, port));
+        }
+    }
+    // Ticket 41: typo hints ride the plan as warnings (never errors, never
+    // silent drops).
+    let mut warnings: Vec<String> = Vec::new();
+    for config in configs {
+        if let Ok(params) = params_object(config) {
+            warnings.extend(typo_hints_for(&config.name, &config.protocol, &params));
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
     let quoted = |rows: &[ProxyConfig]| {
         rows.iter()
             .map(|row| format!("\"{}\"", row.name))
@@ -2107,6 +2266,8 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         egresses,
         extras,
         replacements,
+        replacement_listens,
+        warnings,
         fork_names,
         fork_xhttp,
         xray_names,
@@ -3886,6 +4047,606 @@ pub fn strip_ansi_codes(text: &str) -> String {
     out
 }
 
+// -- Ticket 41: engine reliability core -------------------------------------
+// Crash-safe sidecar lifecycle: ours-only startup reaper + stale secret-temp
+// sweep, manual Restart + opt-in auto-restart (backoff, max retries),
+// served/clash drop on crash with stale totals, clash bind-and-hold
+// reservation, experimental merge, 128-bit secrets, serialized start/stop
+// with surfaced stop failures, single-apply start-all subset, egress DNS
+// validation with a DNS-vs-egress classifier, normalized probe attribution,
+// early bind/port validation, custom-config listen parsing, xray own-skip,
+// and typo hints. Pure helpers first (tested directly); the controller
+// consumes them below. Protocol emission tables are untouched (ticket 42).
+
+/// Ticket 41: stale secret-temp file prefix (`manyproxy-<stem>-<pid>-<n>.json`
+/// from [`unique_config_path`]). The sweep below only touches this prefix in
+/// the given directory (never a recursive scan, never another prefix).
+pub const STALE_TEMP_PREFIX: &str = "manyproxy-";
+
+/// Ticket 41: sidecar binary file names on this platform (bundled cores
+/// only — never the user's extra-core executables, never anything else).
+pub fn sidecar_binary_names() -> Vec<String> {
+    let exe = |base: &str| {
+        if cfg!(windows) {
+            format!("{base}.exe")
+        } else {
+            base.to_string()
+        }
+    };
+    vec![
+        exe(ENGINE_BINARY_BASE),
+        exe(FORK_BINARY_BASE),
+        exe(XRAY_BINARY_BASE),
+    ]
+}
+
+/// Ticket 41: true when `image` (a bare file name or a full path) is one of
+/// our bundled sidecar binaries (case-insensitive: Windows image names).
+fn is_ours_binary_name(image: &str) -> bool {
+    let base = image.rsplit(['/', '\\']).next().unwrap_or(image);
+    sidecar_binary_names()
+        .iter()
+        .any(|ours| base.eq_ignore_ascii_case(ours))
+}
+
+/// Ticket 41: ours-only reaper predicate — reap exactly when the process
+/// image is one of our sidecar binaries AND the port it holds is one of
+/// ours. Anything else (foreign image, foreign port) is never reaped.
+/// Pure: unit tests pin both the kill arm and the spare arm.
+pub fn should_reap_process(image: &str, port: u16, our_ports: &[u16]) -> bool {
+    our_ports.contains(&port) && is_ours_binary_name(image)
+}
+
+/// Ticket 41: our stale secret-temp files in `dir` (prefix-filtered,
+/// non-recursive). Pure listing — the caller decides removal.
+pub fn stale_temp_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(STALE_TEMP_PREFIX) && name.ends_with(".json") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Ticket 41: remove our stale secret-temp files in `dir` (best-effort per
+/// file). Returns the files actually removed.
+pub fn sweep_stale_temp_files(dir: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for path in stale_temp_files(dir) {
+        if std::fs::remove_file(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
+/// Ticket 41: parse `netstat -ano -p TCP` output into `(local port, pid)`
+/// pairs for LISTENING rows. Best-effort per line (headers, UDP rows, and
+/// unparseable lines are skipped, never fatal).
+pub fn parse_netstat_tcp_owners(output: &str) -> Vec<(u16, u32)> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [proto, local, _remote, _state, pid_raw] = fields.as_slice() else {
+            continue;
+        };
+        if !proto.eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        let Some(port) = local
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid_raw.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        out.push((port, pid));
+    }
+    out
+}
+
+/// Ticket 41: parse `tasklist /FO TABLE /NH` output into `(image, pid)`
+/// rows. Best-effort per line (the header and unparseable lines are skipped).
+pub fn parse_tasklist_table(output: &str) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [image, pid_raw, ..] = fields.as_slice() else {
+            continue;
+        };
+        if !image.contains('.') {
+            continue;
+        }
+        let Ok(pid) = pid_raw.replace(',', "").parse::<u32>() else {
+            continue;
+        };
+        out.push((image.to_string(), pid));
+    }
+    out
+}
+
+/// Ticket 41: outcome of the startup reaper (ours-only, best-effort, never
+/// panics, never touches the live DB).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReapReport {
+    /// Pids actually reaped (ours-only by [`should_reap_process`]).
+    pub reaped_pids: Vec<u32>,
+    /// Stale secret-temp files actually swept.
+    pub swept_files: Vec<PathBuf>,
+    /// Best-effort failures, named (never fatal).
+    pub errors: Vec<String>,
+}
+
+/// Ticket 41: startup reaper core over injected seams (tests stub
+/// `netstat_output`, `image_of`, and `kill` — no live processes).
+/// Reaps exactly the processes that are ours AND hold our ports; sweeps
+/// our stale secret-temp files. Never kills a non-matching process.
+pub fn startup_reap_and_sweep(
+    our_ports: &[u16],
+    temp_dir: &Path,
+    netstat_output: &str,
+    image_of: &dyn Fn(u32) -> Option<String>,
+    kill: &dyn Fn(u32) -> bool,
+) -> ReapReport {
+    let mut report = ReapReport::default();
+    if !our_ports.is_empty() {
+        let mut seen: HashSet<u32> = HashSet::new();
+        for (port, pid) in parse_netstat_tcp_owners(netstat_output) {
+            if !our_ports.contains(&port) || !seen.insert(pid) {
+                continue;
+            }
+            match image_of(pid) {
+                Some(image) if should_reap_process(&image, port, our_ports) => {
+                    if kill(pid) {
+                        report.reaped_pids.push(pid);
+                    } else {
+                        report
+                            .errors
+                            .push(format!("could not reap stale {image} (pid {pid})"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    report.swept_files = sweep_stale_temp_files(temp_dir);
+    report.reaped_pids.sort_unstable();
+    report
+}
+
+/// Ticket 41: production startup reaper — real `netstat`/`tasklist`/
+/// `taskkill` on Windows (best-effort, seconds at most), temp sweep on
+/// every platform. Non-Windows skips the process pass (no image lookup
+/// without new deps) but still sweeps. Never panics; failures land in
+/// `errors`, never in the user's face.
+pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
+    let netstat_output = if cfg!(windows) {
+        std::process::Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let image_of = |pid: u32| -> Option<String> {
+        if !cfg!(windows) {
+            return None;
+        }
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "TABLE", "/NH"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        parse_tasklist_table(&text)
+            .into_iter()
+            .find(|(_, found)| *found == pid)
+            .map(|(image, _)| image)
+    };
+    let kill = |pid: u32| -> bool {
+        if !cfg!(windows) {
+            return false;
+        }
+        // Ours-only by construction: `pid` passed this closure only after
+        // the image + port predicate above. Exact-pid kill, no image-wide
+        // kill, never a filter miss.
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    startup_reap_and_sweep(
+        our_ports,
+        &std::env::temp_dir(),
+        &netstat_output,
+        &image_of,
+        &kill,
+    )
+}
+
+/// Ticket 41: early listen validation shared by the save gate (concrete
+/// ports only — blank/auto flows through) and the start path.
+/// `allow_zero`: save allows port 0 (auto-assign resolves later); start
+/// refuses it typed before any spawn.
+fn validate_listen(
+    name: &str,
+    bind_ip: &str,
+    port: u16,
+    allow_zero: bool,
+) -> Result<(), EngineError> {
+    let bind = bind_ip.trim();
+    if !bind.is_empty()
+        && bind.parse::<std::net::IpAddr>().is_err()
+        && !bind.eq_ignore_ascii_case("localhost")
+    {
+        return Err(EngineError::BadBind {
+            name: name.to_string(),
+            bind: bind_ip.to_string(),
+        });
+    }
+    if port == 0 {
+        if allow_zero {
+            return Ok(());
+        }
+        return Err(EngineError::BadPort {
+            name: name.to_string(),
+            detail: "port 0 serves nothing (pick a concrete port or auto-assign before start)"
+                .to_string(),
+        });
+    }
+    if port < 1024 {
+        return Err(EngineError::BadPort {
+            name: name.to_string(),
+            detail: format!(
+                "port {port} is privileged (needs elevation); prefer the 10801-10999 auto range"
+            ),
+        });
+    }
+    if let Some(range) = reserved_range_of(port) {
+        return Err(EngineError::ReservedPort {
+            name: name.to_string(),
+            port,
+            range,
+        });
+    }
+    Ok(())
+}
+
+/// Ticket 41: save gate — a row with a port inside a reserved range (or a
+/// garbage bind) fails typed before any write. Port 0 (auto) flows
+/// through: auto-assign never picks a reserved port.
+pub fn validate_listen_for_save(name: &str, bind_ip: &str, port: u16) -> Result<(), EngineError> {
+    validate_listen(name, bind_ip, port, true)
+}
+
+/// Ticket 41: start gate — garbage binds, port 0, privileged ports, and
+/// reserved ranges all fail typed before any sidecar spawns.
+pub fn validate_listen_for_start(name: &str, bind_ip: &str, port: u16) -> Result<(), EngineError> {
+    validate_listen(name, bind_ip, port, false)
+}
+
+/// Ticket 41: resolve one egress `server` value. Numeric IPs never touch
+/// the network; hostnames go through `resolver` (production: real DNS;
+/// tests: stub). Empty servers flow through (schema validation owns the
+/// missing-field error — resolution must never double-report it).
+pub fn resolve_egress_host(
+    server: &str,
+    resolver: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let trimmed = server.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    resolver(trimmed)
+}
+
+/// Ticket 41: production egress resolver — one real DNS lookup via the
+/// platform resolver. `Ok` carries no addresses (callers only need
+/// resolve-vs-not); the `Err` text is redacted upstream into DnsFailure
+/// (never echoes resolver internals beyond the failure).
+pub fn default_egress_resolver(server: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs as _;
+    (server, 443)
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())
+        .and_then(|mut addrs| {
+            addrs
+                .next()
+                .map(|_| ())
+                .ok_or_else(|| "no addresses".to_string())
+        })
+}
+
+/// Ticket 41: egress servers claimed by one row's params (top-level
+/// `server`/`address` string fields). Chain rows carry no top-level
+/// server (their hops resolve at probe time under the cause classifier),
+/// and extra-core rows are opaque passthrough — both yield nothing here.
+fn egress_servers_of(params: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    ["server", "address"]
+        .into_iter()
+        .filter_map(|key| params.get(key).and_then(serde_json::Value::as_str))
+        .map(|server| server.trim().to_string())
+        .filter(|server| !server.is_empty())
+        .collect()
+}
+
+/// Ticket 41: resolve every egress server in `configs` before any spawn.
+/// The first unresolvable hostname fails typed ([`EngineError::DnsFailure`]
+/// naming the row and the server); resolver failures never echo secrets
+/// (servers are hostnames, and the error carries the name only).
+/// Custom full-config replacements and extra-core slots are opaque user
+/// JSON/passthrough — out of scope here (their failures surface at
+/// check/spawn and probe time).
+pub fn validate_egress_resolution_with(
+    configs: &[ProxyConfig],
+    resolver: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<(), EngineError> {
+    for config in configs {
+        if is_custom_config_protocol(&config.protocol)
+            || is_extra_core_protocol(&config.protocol)
+            || is_chain_protocol(&config.protocol)
+        {
+            continue;
+        }
+        let Ok(params) = params_object(config) else {
+            continue;
+        };
+        for server in egress_servers_of(&params) {
+            if resolve_egress_host(&server, resolver).is_err() {
+                return Err(EngineError::DnsFailure {
+                    name: config.name.clone(),
+                    server,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ticket 41: production egress-DNS gate over the real platform resolver.
+pub fn validate_egress_resolution(configs: &[ProxyConfig]) -> Result<(), EngineError> {
+    validate_egress_resolution_with(configs, &default_egress_resolver)
+}
+
+/// Ticket 41: known sing-box/row param keys (the union the validators and
+/// `translate_outbound` understand, plus the row-level selectors `core`,
+/// `config`, `exe`, `binary`, and `nodes`). Anything outside this table is
+/// a typo candidate — never silently dropped without a hint.
+const KNOWN_PARAM_KEYS: &[&str] = &[
+    "server",
+    "server_port",
+    "server_ports",
+    "address",
+    "port",
+    "uuid",
+    "password",
+    "method",
+    "type",
+    "tag",
+    "tls",
+    "security",
+    "encryption",
+    "sni",
+    "alpn",
+    "fp",
+    "fingerprint",
+    "network",
+    "transport",
+    "path",
+    "host",
+    "headers",
+    "header_type",
+    "service_name",
+    "servicename",
+    "flow",
+    "public_key",
+    "short_id",
+    "reality",
+    "ech",
+    "utls",
+    "obfs",
+    "obfs_host",
+    "obfs_mode",
+    "auth",
+    "auth_str",
+    "up",
+    "down",
+    "up_mbps",
+    "down_mbps",
+    "user",
+    "username",
+    "private_key",
+    "publickey",
+    "peer_public_key",
+    "reserved",
+    "keepalive",
+    "keep_alive",
+    "mtu",
+    "dns",
+    "version",
+    "psk",
+    "userkey",
+    "reuse",
+    "mode",
+    "alter_id",
+    "congestion",
+    "hop_interval",
+    "insecure",
+    "allow_insecure",
+    "allowinsecure",
+    "socks",
+    "http",
+    "core",
+    "config",
+    "exe",
+    "binary",
+    "nodes",
+    "name",
+    "protocol",
+    "local_address",
+    "privatekey",
+    "preshared_key",
+    "pre_shared_key",
+    "endpoint",
+    "persistent_keepalive",
+    "allowed_ips",
+    "allowedips",
+    "noise",
+    "pattern",
+    "payload",
+];
+
+/// Ticket 41: byte-wise edit distance over (ASCII) param keys.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, &ca) in a.iter().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, &cb) in b.iter().enumerate() {
+            current.push(
+                (prev[j] + usize::from(ca != cb))
+                    .min(prev[j + 1] + 1)
+                    .min(current[j] + 1),
+            );
+        }
+        prev = current;
+    }
+    prev[b.len()]
+}
+
+/// Ticket 41: closest known key within distance 2 (keys shorter than 4
+/// characters never hint — `up`/`ip`-shaped noise must not warn).
+/// Case-insensitive; exact (case-folded) matches yield nothing.
+pub fn suggest_param_key(key: &str) -> Option<&'static str> {
+    let lowered = key.to_ascii_lowercase();
+    if lowered.len() < 4 {
+        return None;
+    }
+    if KNOWN_PARAM_KEYS.contains(&lowered.as_str()) {
+        return None;
+    }
+    KNOWN_PARAM_KEYS
+        .iter()
+        .filter(|known| known.len() >= 4)
+        .map(|known| (*known, edit_distance(&lowered, known)))
+        .filter(|(_, distance)| *distance <= 2)
+        .min_by_key(|(known, distance)| (*distance, known.len()))
+        .map(|(known, _)| known)
+}
+
+/// Ticket 41: typo warnings for one row's params (`securty` → `security`).
+/// Standard/fork/xray-shaped rows only — custom/extra/chain rows carry
+/// foreign schemas where unknown keys are legitimate. Pure (the plan
+/// carries the warnings; emission tables are untouched).
+pub fn typo_hints_for(
+    name: &str,
+    protocol: &str,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    if is_custom_config_protocol(protocol)
+        || is_custom_outbound_protocol(protocol)
+        || is_extra_core_protocol(protocol)
+        || is_chain_protocol(protocol)
+    {
+        return Vec::new();
+    }
+    let mut hints = Vec::new();
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(suggestion) = suggest_param_key(key) {
+            hints.push(format!(
+                "unknown param \"{key}\" for \"{name}\" (did you mean \"{suggestion}\"?)"
+            ));
+        }
+    }
+    hints
+}
+
+/// Ticket 41: opt-in auto-restart policy (default: disabled — a crash never
+/// restarts anything silently). `max_retries` bounds the attempts;
+/// `base_backoff_secs` seeds the exponential backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoRestartConfig {
+    pub enabled: bool,
+    pub max_retries: u32,
+    pub base_backoff_secs: u64,
+}
+
+impl Default for AutoRestartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_retries: 3,
+            base_backoff_secs: 5,
+        }
+    }
+}
+
+/// Ticket 41: backoff before attempt `attempt` (0-based): `base * 2^attempt`,
+/// capped at 300s so a wedged sidecar never sleeps the day away. Pure.
+pub fn auto_restart_backoff_secs(base_secs: u64, attempt: u32) -> u64 {
+    base_secs.saturating_mul(1u64 << attempt.min(6)).min(300)
+}
+
+/// Ticket 41: engine-side row-local vs union-level split for start-all
+/// (mirrors the UI's `is_row_local_start_error`, extended with the ticket-41
+/// row-local variants). Row-local failures isolate to one broken row;
+/// union-level failures stay atomic.
+pub fn is_row_local_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::InvalidParamsJson { .. }
+            | EngineError::BadParams { .. }
+            | EngineError::UnsupportedProtocol { .. }
+            | EngineError::BadAwg { .. }
+            | EngineError::WrongLayer { .. }
+            | EngineError::BadCustom { .. }
+            | EngineError::BadExtra { .. }
+            | EngineError::BadPreset { .. }
+            | EngineError::ChainViolation { .. }
+            | EngineError::BadBind { .. }
+            | EngineError::BadPort { .. }
+            | EngineError::ReservedPort { .. }
+            | EngineError::DnsFailure { .. }
+    )
+}
+
+/// Ticket 41: single-apply start-all outcome — the maximal healthy subset
+/// applied exactly once, every excluded row named with its cause, plus an
+/// overall `error` when a union-level failure aborts the apply itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartAllOutcome {
+    /// Ids of the rows the single apply serves.
+    pub applied: Vec<String>,
+    /// `(row name, cause)` per excluded row (row-local and dropped-conflict).
+    pub failed: Vec<(String, String)>,
+    /// Typo/merge warnings from the applied plan.
+    pub warnings: Vec<String>,
+    /// Union-level abort (port exhaustion, missing binary, check/spawn,
+    /// LAN gate): nothing applied.
+    pub error: Option<String>,
+}
+
 // -- Ticket 23: lifecycle hardening -----------------------------------------
 // Sidecar lifecycle that cannot orphan processes, leak secret files, or
 // split-brain on partial failure. Pure helpers first (tested directly);
@@ -4698,7 +5459,29 @@ pub struct EngineController {
     /// In-memory only (regenerated per start, never persisted); cleared
     /// with the served snapshots whenever membership empties or a core
     /// serves a user-owned replacement (never mutated user JSON).
+    /// Ticket 41: secrets are zeroized on clear (see
+    /// [`EngineController::clear_clash_secrets`]).
     clash: Vec<ClashTarget>,
+    /// Ticket 41: start/stop serialization — bumped on every mutating entry
+    /// (start/stop/restart/apply). Ticks and the UI read it to order
+    /// interleaved operations; a stop landing mid-start sees the fence move
+    /// and never rolls back newer state.
+    generation: u64,
+    /// Ticket 41: shards with an observed, not-yet-recovered crash
+    /// (`stock`/`fork`/`xray`/`extra-<id>`). Traffic/reprobe ticks skip
+    /// these; manual Restart and opt-in auto-restart clear them.
+    crashed: HashSet<String>,
+    /// Ticket 41: set on any observed crash (served/clash dropped with it);
+    /// traffic totals from a dead core are stale until a restart recovers.
+    totals_stale: bool,
+    /// Ticket 41: opt-in auto-restart policy (default: disabled — no silent
+    /// restarts, ever).
+    auto_restart: AutoRestartConfig,
+    /// Ticket 41: consecutive auto-restart attempts since the last success
+    /// (bounded by `auto_restart.max_retries`).
+    restart_attempts: u32,
+    /// Ticket 41: last auto-restart attempt (the backoff fence).
+    last_restart_attempt: Option<Instant>,
 }
 
 /// Ticket 07: fill row names + the XHTTP note flag into a probe failure.
@@ -4764,6 +5547,12 @@ impl EngineController {
             last_error: None,
             last_config_json: None,
             clash: Vec::new(),
+            generation: 0,
+            crashed: HashSet::new(),
+            totals_stale: false,
+            auto_restart: AutoRestartConfig::default(),
+            restart_attempts: 0,
+            last_restart_attempt: None,
         }
     }
 
@@ -4843,6 +5632,12 @@ impl EngineController {
             last_error: None,
             last_config_json: None,
             clash: Vec::new(),
+            generation: 0,
+            crashed: HashSet::new(),
+            totals_stale: false,
+            auto_restart: AutoRestartConfig::default(),
+            restart_attempts: 0,
+            last_restart_attempt: None,
         };
         (controller, stock, fork, xray, extra)
     }
@@ -4894,6 +5689,354 @@ impl EngineController {
     /// directly). Empty means no row carries a preset.
     pub fn set_preset_rules(&mut self, presets: HashMap<String, Vec<serde_json::Value>>) {
         self.preset_rules = presets;
+    }
+
+    // -- Ticket 41: reliability accessors ---------------------------------
+
+    /// Ticket 41: start/stop serialization fence — bumped on every mutating
+    /// entry. Readers (ticks, UI) order interleaves against this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Ticket 41: shards with an observed, not-yet-recovered crash, sorted.
+    /// Production reader is the Restart entry point (test-only until the
+    /// crash-notice action lands); tests pin the set directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn crashed_shards(&self) -> Vec<String> {
+        let mut shards: Vec<String> = self.crashed.iter().cloned().collect();
+        shards.sort();
+        shards
+    }
+
+    /// Ticket 41: true when `core` (`stock`/`fork`/`xray`/`extra-<id>`) is
+    /// crashed and unrecovered — traffic/reprobe ticks skip these.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_shard_crashed(&self, core: &str) -> bool {
+        self.crashed.contains(core)
+    }
+
+    /// Ticket 41: the serving shard of one active row (`stock`/`fork`/
+    /// `xray`/`extra-<id>`) — the same routing [`EngineController::is_running`]
+    /// reports per row, so crash-drop and tick-skip always agree.
+    fn shard_of_row(&self, row: &ProxyConfig) -> String {
+        if is_extra_core_protocol(&row.protocol) {
+            return format!("extra-{}", row.id);
+        }
+        if is_custom_config_protocol(&row.protocol) {
+            let core = params_object(row)
+                .ok()
+                .and_then(|params| owning_core_of(&row.name, &params).ok())
+                .unwrap_or(OwningCore::Stock);
+            return core.as_str().to_string();
+        }
+        if needs_xray(row) {
+            return OwningCore::Xray.as_str().to_string();
+        }
+        if is_custom_outbound_protocol(&row.protocol) {
+            let core = params_object(row)
+                .ok()
+                .and_then(|params| owning_core_of(&row.name, &params).ok())
+                .unwrap_or(OwningCore::Stock);
+            return core.as_str().to_string();
+        }
+        if needs_fork(row) {
+            return OwningCore::Fork.as_str().to_string();
+        }
+        OwningCore::Stock.as_str().to_string()
+    }
+
+    /// Ticket 41: ids of active rows served by crashed shards — the traffic
+    /// tick marks exactly these stale (last totals kept, flagged, never
+    /// trusted fresh). Empty when nothing crashed.
+    pub fn ids_on_crashed_shards(&self) -> Vec<String> {
+        if self.crashed.is_empty() {
+            return Vec::new();
+        }
+        self.active
+            .iter()
+            .filter(|row| self.crashed.contains(&self.shard_of_row(row)))
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    /// Ticket 41: true once any crash drops served/clash — totals from a
+    /// dead core are stale until a restart recovers.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn totals_stale(&self) -> bool {
+        self.totals_stale
+    }
+
+    /// Ticket 41: clear the stale-totals marker (after the UI repaints from
+    /// a recovered poll).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn clear_totals_stale(&mut self) {
+        self.totals_stale = false;
+    }
+
+    /// Ticket 41: clash targets of live (non-crashed) cores only — the
+    /// traffic tick polls exactly these, so dead sockets are never trusted.
+    pub fn live_clash_targets(&self) -> Vec<ClashTarget> {
+        self.clash
+            .iter()
+            .filter(|target| !self.crashed.contains(&target.core))
+            .cloned()
+            .collect()
+    }
+
+    /// Ticket 41: replace the opt-in auto-restart policy (default: disabled).
+    /// Enabling is an explicit user action; disabling resets the attempt
+    /// counter so a later opt-in starts clean. Production writer is the
+    /// settings toggle (follow-up slice); tests pin the policy directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_auto_restart(&mut self, config: AutoRestartConfig) {
+        if !config.enabled {
+            self.restart_attempts = 0;
+            self.last_restart_attempt = None;
+        }
+        self.auto_restart = config;
+    }
+
+    /// Ticket 41: current auto-restart policy.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn auto_restart(&self) -> &AutoRestartConfig {
+        &self.auto_restart
+    }
+
+    /// Ticket 41: consecutive auto-restart attempts since the last success.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn restart_attempts(&self) -> u32 {
+        self.restart_attempts
+    }
+
+    /// Ticket 41: true when an auto-restart attempt is due now — opt-in AND
+    /// crashed shards pending AND under the retry bound AND past the
+    /// exponential backoff fence. Pure in `now` (tests pin the clock).
+    pub fn auto_restart_due(&self, now: Instant) -> bool {
+        if !self.auto_restart.enabled || self.crashed.is_empty() {
+            return false;
+        }
+        if self.restart_attempts >= self.auto_restart.max_retries {
+            return false;
+        }
+        match self.last_restart_attempt {
+            None => true,
+            Some(last) => {
+                now.duration_since(last)
+                    >= Duration::from_secs(auto_restart_backoff_secs(
+                        self.auto_restart.base_backoff_secs,
+                        self.restart_attempts,
+                    ))
+            }
+        }
+    }
+
+    /// Ticket 41: record one auto-restart attempt (bounds + backoff advance).
+    pub fn note_auto_restart_attempt(&mut self, now: Instant) {
+        self.restart_attempts = self.restart_attempts.saturating_add(1);
+        self.last_restart_attempt = Some(now);
+    }
+
+    /// Ticket 41: record a successful recovery — attempts reset, the stale
+    /// marker clears, crashed shards are forgotten.
+    pub fn note_restart_success(&mut self) {
+        self.restart_attempts = 0;
+        self.last_restart_attempt = None;
+        self.crashed.clear();
+        self.totals_stale = false;
+    }
+
+    /// Ticket 41: manual Restart — re-applies the full active set so every
+    /// crashed shard restarts beside its healthy siblings. No-op `Ok` when
+    /// nothing is crashed (still a full re-apply would flap healthy cores,
+    /// so an idle restart touches nothing). Success clears the crashed set
+    /// and the attempt counter via [`EngineController::note_restart_success`].
+    pub fn restart_crashed(&mut self) -> Result<(), EngineError> {
+        self.generation = self.generation.wrapping_add(1);
+        if self.crashed.is_empty() {
+            return Ok(());
+        }
+        match self.apply() {
+            Ok(()) => {
+                self.note_restart_success();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Ticket 41: zeroize live clash secrets, then drop the targets. Called
+    /// on teardown and on crash-drop so secrets never linger in freed
+    /// memory (128-bit bearer secrets, in-memory only, cleared on stop).
+    fn clear_clash_secrets(&mut self) {
+        use zeroize::Zeroize as _;
+        for target in self.clash.iter_mut() {
+            target.secret.zeroize();
+        }
+        self.clash.clear();
+    }
+
+    /// Ticket 41: drop one crashed shard's served snapshot by name
+    /// (`stock`/`fork`/`xray`/`extra-<id>` or `extra-<index>`).
+    fn drop_crashed_served(&mut self, shard: &str) {
+        const SHARDS: [&str; 3] = ["stock", "fork", "xray"];
+        if let Some(index) = SHARDS.iter().position(|name| *name == shard) {
+            self.served[index] = None;
+            return;
+        }
+        if let Some(id) = shard.strip_prefix("extra-") {
+            let extra_ids: Vec<String> = self
+                .active
+                .iter()
+                .filter(|row| is_extra_core_protocol(&row.protocol))
+                .map(|row| row.id.clone())
+                .collect();
+            // Row id first (the name `poll_shards` built), numeric index as
+            // the fallback for rows that are already gone.
+            let index = extra_ids
+                .iter()
+                .position(|known| known == id)
+                .or_else(|| id.parse::<usize>().ok());
+            if let Some(index) = index {
+                if index < self.served_extra.len() {
+                    self.served_extra[index] = None;
+                }
+            }
+        }
+    }
+
+    /// Ticket 41: stop one config with its apply outcome surfaced — `(was
+    /// a member, apply error)`. The bool still answers membership; the
+    /// `Option<EngineError>` replaces the old silent snapshot-restore so a
+    /// stop failure toasts instead of claiming false success.
+    pub fn stop_one_result(&mut self, id: &str) -> (bool, Option<EngineError>) {
+        self.generation = self.generation.wrapping_add(1);
+        let before = self.active.len();
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
+        self.active.retain(|row| row.id != id);
+        if self.active.len() == before {
+            return (false, None);
+        }
+        if let Err(error) = self.apply() {
+            self.active = prev;
+            self.status = prev_status;
+            self.prune_lan_confirmed();
+            return (true, Some(error));
+        }
+        self.prune_lan_confirmed();
+        (true, None)
+    }
+
+    /// Ticket 41: stop everything with the teardown outcome surfaced
+    /// (`Some` instead of a silent half-state).
+    pub fn stop_all_result(&mut self) -> Option<EngineError> {
+        self.generation = self.generation.wrapping_add(1);
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
+        self.active.clear();
+        if let Err(error) = self.apply() {
+            self.active = prev;
+            self.status = prev_status;
+            self.prune_lan_confirmed();
+            return Some(error);
+        }
+        self.prune_lan_confirmed();
+        None
+    }
+
+    /// Ticket 41: single-apply start-all — the maximal healthy subset is
+    /// computed purely (solo row-local gate, then one union validation),
+    /// then applied exactly once. Every excluded row is named with its
+    /// cause; the row-local vs union-level split is preserved
+    /// ([`is_row_local_error`]): row-local failures isolate per row, a
+    /// union-level failure aborts with nothing applied. The abort lands in
+    /// `error`.
+    pub fn start_all_subset(
+        &mut self,
+        configs: &[ProxyConfig],
+        confirmed: bool,
+    ) -> StartAllOutcome {
+        let mut outcome = StartAllOutcome::default();
+        if configs.is_empty() {
+            self.active.clear();
+            let result = self.apply();
+            self.prune_lan_confirmed();
+            if let Err(error) = result {
+                outcome.error = Some(error.to_string());
+            }
+            return outcome;
+        }
+        // Solo gate: rows that fail alone are row-local by construction.
+        let mut candidate: Vec<ProxyConfig> = Vec::with_capacity(configs.len());
+        for row in configs {
+            match validate_activation(std::slice::from_ref(row)) {
+                Ok(_) => candidate.push(row.clone()),
+                Err(error) => {
+                    outcome.failed.push((row.name.clone(), error.to_string()));
+                }
+            }
+        }
+        // Greedy union repair over pure validation (no sidecar touched):
+        // the row-local vs union-level split is preserved — only
+        // row-local failures isolate. A union-level failure (port
+        // conflicts, bridge skew, custom-core collisions) aborts the whole
+        // subset: nothing applied, every survivor named with the cause.
+        let mut plan_warnings = Vec::new();
+        let mut union_error: Option<EngineError> = None;
+        match validate_activation(&candidate) {
+            Ok(plan) => {
+                plan_warnings = plan.warnings.clone();
+            }
+            Err(error) => {
+                union_error = Some(error);
+            }
+        }
+        if let Some(error) = union_error {
+            // Union-level abort: nothing applied, every survivor named.
+            let text = error.to_string();
+            for row in &candidate {
+                outcome.failed.push((row.name.clone(), text.clone()));
+            }
+            outcome.error = Some(text);
+            return outcome;
+        }
+        if candidate.is_empty() {
+            return outcome;
+        }
+        outcome.warnings = plan_warnings;
+        // One apply of the maximal healthy subset.
+        let prev = self.active.clone();
+        let prev_status = self.status.clone();
+        self.generation = self.generation.wrapping_add(1);
+        self.active = candidate.clone();
+        if let Err(error) = self.enforce_lan_confirm(&candidate, confirmed) {
+            self.active = prev;
+            self.status = prev_status;
+            self.prune_lan_confirmed();
+            outcome.error = Some(error.to_string());
+            for row in &candidate {
+                outcome.failed.push((row.name.clone(), error.to_string()));
+            }
+            return outcome;
+        }
+        match self.apply() {
+            Ok(()) => {
+                self.prune_lan_confirmed();
+                outcome.applied = candidate.iter().map(|row| row.id.clone()).collect();
+            }
+            Err(error) => {
+                self.active = prev;
+                self.status = prev_status;
+                self.prune_lan_confirmed();
+                outcome.error = Some(error.to_string());
+                for row in &candidate {
+                    outcome.failed.push((row.name.clone(), error.to_string()));
+                }
+            }
+        }
+        outcome
     }
 
     /// Ticket 23: drop LAN confirms for rows that are no longer active (or
@@ -4971,8 +6114,10 @@ impl EngineController {
         // Ticket 23 HIGH: `active` commits only with a successful apply — a
         // failed apply restores the previous membership instead of claiming
         // rows nothing serves.
+        // Ticket 41: the serialization fence moves on every mutating entry.
         let prev = self.active.clone();
         let prev_status = self.status.clone();
+        self.generation = self.generation.wrapping_add(1);
         self.active = candidate;
         match self.apply() {
             Ok(()) => {
@@ -5027,20 +6172,16 @@ impl EngineController {
     /// [`EngineController::last_error`] — never a silent half-state. The
     /// bool answers membership (the row was active); the apply outcome is
     /// on the `last_error` seam, like the start paths.
+    /// Ticket 41: delegates to [`EngineController::stop_one_result`] — the
+    /// bool contract is unchanged; callers that need the failure itself
+    /// (stop-failure toasts) use the `_result` variant.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stop_one(&mut self, id: &str) -> bool {
-        let before = self.active.len();
-        let prev = self.active.clone();
-        let prev_status = self.status.clone();
-        self.active.retain(|row| row.id != id);
-        if self.active.len() == before {
-            return false;
+        let (removed, error) = self.stop_one_result(id);
+        if let Some(error) = error {
+            self.last_error = Some(error.to_string());
         }
-        if self.apply().is_err() {
-            self.active = prev;
-            self.status = prev_status;
-        }
-        self.prune_lan_confirmed();
-        true
+        removed
     }
 
     /// Replace the active set (start-all path); validates before touching the
@@ -5076,8 +6217,10 @@ impl EngineController {
         })?;
         self.enforce_lan_confirm(&candidate, confirmed)?;
         // Ticket 23 HIGH: `active` commits only with a successful apply.
+        // Ticket 41: the serialization fence moves on every mutating entry.
         let prev = self.active.clone();
         let prev_status = self.status.clone();
+        self.generation = self.generation.wrapping_add(1);
         self.active = candidate;
         match self.apply() {
             Ok(()) => {
@@ -5098,15 +6241,12 @@ impl EngineController {
     /// restores the membership snapshot instead of leaving a silent
     /// half-state (the empty-set apply cannot fail today; this is
     /// defense in depth for future fallible teardown).
+    /// Ticket 41: delegates to [`EngineController::stop_all_result`] so a
+    /// stop failure surfaces instead of reading as success.
     pub fn stop_all(&mut self) {
-        let prev = self.active.clone();
-        let prev_status = self.status.clone();
-        self.active.clear();
-        if self.apply().is_err() {
-            self.active = prev;
-            self.status = prev_status;
+        if let Some(error) = self.stop_all_result() {
+            self.last_error = Some(error.to_string());
         }
-        self.prune_lan_confirmed();
     }
 
     fn apply(&mut self) -> Result<(), EngineError> {
@@ -5124,6 +6264,9 @@ impl EngineController {
             for served in self.served_extra.iter_mut() {
                 *served = None;
             }
+            // Ticket 41: secrets never survive teardown — zeroized, not just
+            // forgotten.
+            self.clear_clash_secrets();
             self.status = EngineStatus::Stopped;
             self.last_config_json = None;
             return Ok(());
@@ -5134,6 +6277,13 @@ impl EngineController {
         let plan = validate_activation(&self.active).inspect_err(|error| {
             self.last_error = Some(error.to_string());
         })?;
+        // Ticket 41: egress DNS resolves before any spawn — a bad hostname
+        // fails typed here (DNS failure, never confused with egress
+        // failure), while rollback is still free.
+        if let Err(error) = validate_egress_resolution(&self.active) {
+            self.last_error = Some(error.to_string());
+            return Err(error);
+        }
         // Binary gates before touching anything: a missing sidecar binary
         // fails only its own rows; the other sidecars keep serving. Ticket
         // 23: the stock gate is typed too (was: wrapped as CheckFailed deep
@@ -5240,6 +6390,11 @@ impl EngineController {
         // (user-owned replacements are never mutated — those cores stay
         // untracked). Exhaustion and injection failures are typed here,
         // before anything stops, like every other apply gate.
+        // Ticket 41: bind-and-hold reservation — each controller port stays
+        // bound in `clash_holds` until the sidecars have taken their ports,
+        // so no sibling process wins the old pick-then-probe race (TOCTOU).
+        // The holds drop when this apply returns, either way.
+        let mut clash_holds: Vec<std::net::TcpListener> = Vec::new();
         let mut clash: Vec<ClashTarget> = Vec::new();
         for (core, gen, rows_present) in [
             ("stock", &mut stock_gen, !plan.main_rows.is_empty()),
@@ -5255,7 +6410,7 @@ impl EngineController {
             if !generated {
                 continue;
             }
-            let port = find_clash_port().ok_or_else(|| {
+            let port = reserve_clash_port(&mut clash_holds).ok_or_else(|| {
                 let error = EngineError::PortUnavailable {
                     bind: "127.0.0.1".to_string(),
                     port: CLASH_PORT_START,
@@ -5402,6 +6557,11 @@ impl EngineController {
                 ));
             }
             // Ticket 36: clash controllers join the same probe gate.
+            // Ticket 41: our own just-reserved holds are skipped outright —
+            // the ports are bound by us by construction (probing them would
+            // always fail closed on our own reservation).
+            let held: std::collections::HashSet<u16> =
+                clash.iter().map(|target| target.port).collect();
             for target in &clash {
                 endpoints.push((
                     format!("clash controller ({})", target.core),
@@ -5409,8 +6569,21 @@ impl EngineController {
                     target.port,
                 ));
             }
+            // Ticket 41: custom full-config replacement listens join the
+            // probe gate (parsed, never guessed — unparseable documents were
+            // allowlisted at plan time).
+            for (owner, bind, port) in &plan.replacement_listens {
+                endpoints.push((
+                    format!("custom full-config (\"{owner}\")"),
+                    bind.clone(),
+                    *port,
+                ));
+            }
             for (name, bind, port) in &endpoints {
                 if own.contains(&(bind.clone(), *port)) {
+                    continue;
+                }
+                if name.starts_with("clash controller (") && held.contains(port) {
                     continue;
                 }
                 if probe_bind_available(bind, *port).is_err() {
@@ -5665,6 +6838,16 @@ impl EngineController {
         if crashes.is_empty() || self.active.is_empty() {
             return crashes;
         }
+        // Ticket 41: a crashed shard is dropped from served[] and the clash
+        // set (dead sockets are never trusted again) and its totals go
+        // stale. Old clash secrets are zeroized before the rebuild.
+        for (shard, _) in &crashes {
+            self.drop_crashed_served(shard);
+            self.crashed.insert(shard.clone());
+        }
+        self.totals_stale = true;
+        self.clear_clash_secrets();
+        self.sync_clash_from_served();
         let cause = if crashes.len() == 1 {
             crashes.first().expect("one crash").1.clone()
         } else {
@@ -5741,6 +6924,9 @@ impl EngineController {
     /// Ticket 36: live clash controllers per serving core (port + secret)
     /// for the traffic poll tick. Empty when nothing generated serves
     /// (stopped cores, user-owned replacements, extra slots).
+    /// Ticket 41: the tick polls [`EngineController::live_clash_targets`]
+    /// (crashed cores skipped); this stays as the full-set seam for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clash_targets(&self) -> &[ClashTarget] {
         &self.clash
     }
@@ -8887,7 +10073,7 @@ mod tests {
     /// key must never reach the stock config.
     #[test]
     fn t29_vless_encryption_none_drops_key_stays_stock() {
-        let row = t29_vless_row("t29a", "VlessNone", json!("none"), 18921);
+        let row = t29_vless_row("t29a", "VlessNone", json!("none"), 19921);
         assert!(!needs_xray(&row), "none stays stock");
         assert!(!needs_fork(&row), "none needs no fork");
         let plan = validate_activation(std::slice::from_ref(&row)).expect("none plans");
@@ -8917,7 +10103,7 @@ mod tests {
             json!({"type": "vless", "server": "198.51.100.9", "server_port": 443,
                    "uuid": "11111111-2222-4333-8444-555555555555"}),
             "127.0.0.1",
-            18922,
+            19922,
         );
         assert!(!needs_xray(&row), "plain vless stays stock");
         let generated = generate(std::slice::from_ref(&row)).expect("plain generates");
@@ -8938,7 +10124,7 @@ mod tests {
             ("t29d", json!(" NONE ")),
             ("t29e", json!("")),
         ] {
-            let row = t29_vless_row(id, "VlessFold", value, 18923);
+            let row = t29_vless_row(id, "VlessFold", value, 19923);
             assert!(!needs_xray(&row), "{id} stays stock");
             let generated = generate(std::slice::from_ref(&row)).expect("stock generates");
             assert!(!generated.requires_xray, "{id} served by stock");
@@ -8955,7 +10141,7 @@ mod tests {
     /// the xray `users[]` entry). Synthetic value only — never key material.
     #[test]
     fn t29_vless_real_encryption_routes_xray_bridge() {
-        let row = t29_vless_row("t29x", "VlessEnc", json!("synthetic-t29-encryption"), 18924);
+        let row = t29_vless_row("t29x", "VlessEnc", json!("synthetic-t29-encryption"), 19924);
         assert!(needs_xray(&row), "real value needs xray");
         assert!(!needs_fork(&row), "xray, not fork");
         let plan = validate_activation(std::slice::from_ref(&row)).expect("xray plans");
@@ -9006,7 +10192,7 @@ mod tests {
                    "network": "ws", "packetEncoding": "packet",
                    "path": "/ws", "host": "example.com"}),
             "127.0.0.1",
-            18925,
+            19925,
         );
         let plan = validate_activation(std::slice::from_ref(&row)).expect("plans");
         assert_eq!(plan.egresses.len(), 1, "one bridge leg");
@@ -9034,7 +10220,7 @@ mod tests {
     /// sidecar — never a stock `unknown field` at check time, never values.
     #[test]
     fn t29_vless_encryption_nonstring_is_typed_error() {
-        let row = t29_vless_row("t29z", "VlessBad", json!(42), 18926);
+        let row = t29_vless_row("t29z", "VlessBad", json!(42), 19926);
         let error = validate_activation(std::slice::from_ref(&row)).expect_err("typed");
         assert!(
             matches!(error, EngineError::BadCustom { .. }),
@@ -9053,7 +10239,7 @@ mod tests {
             "t29w",
             "VlessSidecar",
             json!("synthetic-t29-encryption"),
-            18927,
+            19927,
         );
         let (mut controller, stock, _fork, xray, _extra) = EngineController::fake_quartet();
         controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
@@ -9134,7 +10320,7 @@ mod tests {
             json!({"type": "shadowsocks", "server": "203.0.113.7",
                    "server_port": 8388, "method": "aes-128-gcm", "password": "pass1"}),
             "127.0.0.1",
-            18928,
+            19928,
         );
         let (mut controller, stock) = EngineController::fake();
         stock.fail_check(&t29_ansi("[ESC][31;1mFATAL[ESC][0m outbounds[0]: boom"));
@@ -9369,5 +10555,639 @@ mod tests {
             "PROBE preset: sing-box check EXIT 0, stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    // -- Ticket 41: engine reliability core (TDD at the FakeEngineBackend seam) --
+
+    /// Reserved ranges fail typed at save and at start, naming the range.
+    #[test]
+    fn t41_reserved_ports_rejected_at_save_and_start() {
+        for port in [CLASH_PORT_START, 18755, CLASH_PORT_END] {
+            let error = validate_listen_for_save("Row", "127.0.0.1", port)
+                .expect_err("clash range rejected at save");
+            assert!(
+                matches!(error, EngineError::ReservedPort { .. }),
+                "typed, got {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("clash-controller range 18501-18999"),
+                "names the range: {error}"
+            );
+        }
+        for port in [XRAY_BRIDGE_PORT_START, 11850, XRAY_BRIDGE_PORT_END] {
+            let error = validate_listen_for_save("Row", "127.0.0.1", port)
+                .expect_err("bridge range rejected at save");
+            assert!(matches!(error, EngineError::ReservedPort { .. }));
+            assert!(
+                error.to_string().contains("xray-bridge range 11801-11999"),
+                "names the range: {error}"
+            );
+        }
+        // Ordinary + auto ports flow through the save gate.
+        for port in [0, 10801, 10999, 18081, 10921] {
+            validate_listen_for_save("Row", "127.0.0.1", port).expect("save allows it");
+        }
+        // The start gate rejects reserved ranges before any spawn.
+        let (mut controller, stock) = EngineController::fake();
+        let bad = fixture(
+            "9",
+            "ClashSquatter",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            18501,
+        );
+        let error = controller
+            .start_one(&bad)
+            .expect_err("reserved port fails at start");
+        assert!(matches!(error, EngineError::ReservedPort { .. }));
+        assert!(!stock.is_running(), "nothing spawned");
+        assert_eq!(controller.running_count(), 0);
+    }
+
+    /// Garbage binds, port 0, and privileged ports fail typed at start with
+    /// nothing spawned.
+    #[test]
+    fn t41_bad_bind_port_zero_privileged_fail_before_spawn() {
+        let (mut controller, stock) = EngineController::fake();
+        let garbage = fixture(
+            "9",
+            "GarbageBind",
+            "shadowsocks",
+            ss_params("pass1"),
+            "999.999.0.1",
+            10809,
+        );
+        let error = controller
+            .start_one(&garbage)
+            .expect_err("garbage bind fails");
+        assert!(matches!(error, EngineError::BadBind { .. }), "got {error}");
+        let zero = fixture(
+            "9",
+            "ZeroPort",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            0,
+        );
+        let error = controller.start_one(&zero).expect_err("port 0 fails");
+        assert!(matches!(error, EngineError::BadPort { .. }), "got {error}");
+        let privy = fixture(
+            "9",
+            "Privileged",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            443,
+        );
+        let error = controller
+            .start_one(&privy)
+            .expect_err("privileged port fails with guidance");
+        assert!(matches!(error, EngineError::BadPort { .. }), "got {error}");
+        assert!(error.to_string().contains("10801-10999"), "guides: {error}");
+        assert!(!stock.is_running(), "nothing spawned");
+        // Blank binds still mean the loopback default.
+        validate_listen_for_start("Row", "", 10801).expect("blank bind is loopback");
+        validate_listen_for_start("Row", "localhost", 10801).expect("localhost ok");
+    }
+
+    /// Ours-only reaper: kills exactly the matching binary holding our port;
+    /// sweeps our stale temp files and nothing else.
+    #[test]
+    fn t41_startup_reaper_kills_only_matching() {
+        assert!(should_reap_process("sing-box.exe", 10801, &[10801]));
+        assert!(should_reap_process("SING-BOX-AWG.EXE", 10801, &[10801]));
+        assert!(should_reap_process("xray.exe", 11850, &[11850]));
+        assert!(should_reap_process(
+            "C:\\Apps\\ManyProxy\\sing-box.exe",
+            10801,
+            &[10801]
+        ));
+        // Prohibited side effects: foreign image, foreign port, both.
+        assert!(!should_reap_process("chrome.exe", 10801, &[10801]));
+        assert!(!should_reap_process("sing-box.exe", 9999, &[10801]));
+        assert!(!should_reap_process("my-sing-box.exe", 10801, &[10801]));
+        assert!(!should_reap_process("", 10801, &[10801]));
+
+        let netstat = "\
+Active Connections\r
+\r
+  Proto  Local Address          Foreign Address        State           PID\r
+  TCP    127.0.0.1:10801        0.0.0.0:0              LISTENING       111\r
+  TCP    127.0.0.1:10801        0.0.0.0:0              LISTENING       222\r
+  TCP    127.0.0.1:9999         0.0.0.0:0              LISTENING       333\r
+  UDP    127.0.0.1:10801        *:*                                    444\r
+";
+        let image_of = |pid: u32| match pid {
+            111 => Some("sing-box.exe".to_string()),
+            222 => Some("chrome.exe".to_string()),
+            333 => Some("sing-box.exe".to_string()),
+            _ => None,
+        };
+        let reaped = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reaped_in = reaped.clone();
+        let kill = move |pid: u32| {
+            reaped_in.borrow_mut().push(pid);
+            true
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t41-reap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::write(dir.join("manyproxy-singbox-111-0.json"), "{}").expect("stale temp");
+        std::fs::write(dir.join("notes.txt"), "keep").expect("other file");
+        std::fs::write(dir.join("manyproxy-old.txt"), "keep").expect("wrong suffix kept");
+        let report = startup_reap_and_sweep(&[10801], &dir, netstat, &image_of, &kill);
+        assert_eq!(report.reaped_pids, vec![111], "only ours: {report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.swept_files.len(), 1, "{report:?}");
+        assert!(!dir.join("manyproxy-singbox-111-0.json").exists(), "swept");
+        assert!(dir.join("notes.txt").exists(), "foreign file kept");
+        assert!(dir.join("manyproxy-old.txt").exists(), "wrong suffix kept");
+        assert_eq!(*reaped.borrow(), vec![111]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// netstat/tasklist parsers skip headers, UDP rows, and garbage lines.
+    #[test]
+    fn t41_netstat_tasklist_parsers() {
+        let owners = parse_netstat_tcp_owners(
+            "Active Connections\r\n  TCP    127.0.0.1:18501   0.0.0.0:0  LISTENING  42\r\n\
+             garbage line\r\n  UDP    127.0.0.1:53  *:*  7\r\n",
+        );
+        assert_eq!(owners, vec![(18501, 42)]);
+        let table = parse_tasklist_table(
+            "Image Name                     PID Session#      Mem Usage\r\n\
+             sing-box.exe                 42 Console          5,012 K\r\n\
+             chrome.exe                  777 Console        250,000 K\r\n",
+        );
+        assert_eq!(
+            table,
+            vec![
+                ("sing-box.exe".to_string(), 42),
+                ("chrome.exe".to_string(), 777)
+            ]
+        );
+        assert!(parse_netstat_tcp_owners("").is_empty());
+        assert!(parse_tasklist_table("").is_empty());
+    }
+
+    /// One crashed shard drops served/clash, marks totals stale, and skips
+    /// ticks (live targets exclude it); manual Restart recovers everything.
+    #[test]
+    fn t41_crash_drops_served_clash_marks_stale_and_restart_recovers() {
+        let (mut controller, _stock, fork) = EngineController::fake_pair();
+        controller.set_fork_probe(|| Ok(PathBuf::from("test-fork-bin")));
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            awg_fixture("7", "AwgOne", awg_params("2.0", json!({"jc": 2})), 10807),
+        ];
+        controller.start_all(&rows).expect("mixed set starts");
+        assert_eq!(controller.clash_targets().len(), 2, "both cores tracked");
+        assert!(!controller.totals_stale());
+
+        fork.inject_crash("signal: segmentation fault");
+        let crashes = controller.poll_shards();
+        assert_eq!(crashes.len(), 1);
+        assert_eq!(crashes[0].0, "fork");
+        assert_eq!(controller.crashed_shards(), vec!["fork".to_string()]);
+        assert!(controller.is_shard_crashed("fork"));
+        assert!(!controller.is_shard_crashed("stock"));
+        assert!(controller.totals_stale(), "totals stale after crash");
+        controller.clear_totals_stale();
+        assert!(!controller.totals_stale(), "marker clears");
+        assert_eq!(controller.clash_targets().len(), 1, "dead core dropped");
+        assert_eq!(controller.clash_targets()[0].core, "stock");
+        assert_eq!(controller.live_clash_targets().len(), 1);
+        assert_eq!(controller.ids_on_crashed_shards(), vec!["7".to_string()]);
+        assert!(matches!(controller.status(), EngineStatus::Crashed { .. }));
+
+        controller
+            .restart_crashed()
+            .expect("manual Restart recovers");
+        assert!(controller.crashed_shards().is_empty());
+        assert!(!controller.totals_stale());
+        assert_eq!(controller.clash_targets().len(), 2, "both cores back");
+        assert_eq!(controller.restart_attempts(), 0);
+        assert!(matches!(controller.status(), EngineStatus::Running));
+    }
+
+    /// Idle Restart touches nothing (no flap of healthy cores).
+    #[test]
+    fn t41_restart_idle_is_noop() {
+        let (mut controller, stock) = EngineController::fake();
+        controller.start_all(&three_standard()).expect("starts");
+        let checks = stock.check_calls();
+        controller.restart_crashed().expect("idle restart ok");
+        assert_eq!(stock.check_calls(), checks, "no re-apply when idle");
+    }
+
+    /// Auto-restart is opt-in (default off), bounded, and backoff-fenced.
+    #[test]
+    fn t41_auto_restart_opt_in_backoff_bounds() {
+        use std::time::{Duration, Instant};
+        assert_eq!(auto_restart_backoff_secs(5, 0), 5);
+        assert_eq!(auto_restart_backoff_secs(5, 1), 10);
+        assert_eq!(auto_restart_backoff_secs(5, 2), 20);
+        assert_eq!(auto_restart_backoff_secs(5, 10), 300, "capped");
+
+        let (mut controller, stock) = EngineController::fake();
+        controller.start_all(&three_standard()).expect("starts");
+        stock.inject_crash("boom");
+        assert!(!controller.poll_shards().is_empty());
+        let now = Instant::now();
+        // Default policy: disabled — never due, no silent restart.
+        assert!(!controller.auto_restart_due(now));
+        assert!(!controller.auto_restart().enabled);
+
+        controller.set_auto_restart(AutoRestartConfig {
+            enabled: true,
+            max_retries: 2,
+            base_backoff_secs: 5,
+        });
+        assert!(controller.auto_restart_due(now), "first attempt immediate");
+        controller.note_auto_restart_attempt(now);
+        assert_eq!(controller.restart_attempts(), 1);
+        assert!(!controller.auto_restart_due(now + Duration::from_secs(9)));
+        assert!(controller.auto_restart_due(now + Duration::from_secs(10)));
+        controller.note_auto_restart_attempt(now + Duration::from_secs(10));
+        assert!(
+            !controller.auto_restart_due(now + Duration::from_secs(10_000)),
+            "retry bound holds"
+        );
+        controller.note_restart_success();
+        assert_eq!(controller.restart_attempts(), 0);
+        assert!(!controller.auto_restart_due(now), "recovered: nothing due");
+        controller.set_auto_restart(AutoRestartConfig::default());
+        assert_eq!(controller.restart_attempts(), 0, "disable resets");
+    }
+
+    /// `experimental` merges: existing keys survive the clash inject.
+    #[test]
+    fn t41_experimental_merge_preserves_keys() {
+        let doc = serde_json::json!({
+            "inbounds": [], "outbounds": [],
+            "experimental": {"telemetry": {"enabled": true}},
+        });
+        let out = inject_clash_api(&doc.to_string(), 18501, "s3cret").expect("injects");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("stays JSON");
+        assert_eq!(
+            parsed["experimental"]["telemetry"],
+            serde_json::json!({"enabled": true}),
+            "existing keys survive"
+        );
+        assert_eq!(
+            parsed["experimental"]["clash_api"]["external_controller"],
+            serde_json::json!("127.0.0.1:18501")
+        );
+        // No pre-existing block: created, not crashed on.
+        let bare = serde_json::json!({"inbounds": [], "outbounds": []});
+        let out = inject_clash_api(&bare.to_string(), 18501, "s3cret").expect("injects");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(
+            parsed["experimental"]["clash_api"]["secret"],
+            serde_json::json!("s3cret")
+        );
+    }
+
+    /// Clash secrets are 128-bit hex, unique per start.
+    #[test]
+    fn t41_clash_secret_is_128bit_unique() {
+        for core in ["stock", "fork"] {
+            let secret = clash_secret(core);
+            assert_eq!(secret.len(), 32, "128-bit hex: {secret}");
+            assert!(
+                secret.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "hex only: {secret}"
+            );
+        }
+        assert_ne!(clash_secret("stock"), clash_secret("stock"), "unique");
+    }
+
+    /// Bind-and-hold reservation: two reservations differ, the held port
+    /// reads busy, release frees it.
+    #[test]
+    fn t41_clash_reservation_holds_ports() {
+        let mut holds = Vec::new();
+        let first = reserve_clash_port(&mut holds).expect("range has room");
+        assert!((CLASH_PORT_START..=CLASH_PORT_END).contains(&first));
+        let second = reserve_clash_port(&mut holds).expect("second pick");
+        assert_ne!(first, second, "no double reservation");
+        assert!(
+            std::net::TcpListener::bind(format!("127.0.0.1:{first}")).is_err(),
+            "held port reads busy"
+        );
+        drop(holds);
+        assert!(
+            std::net::TcpListener::bind(format!("127.0.0.1:{first}")).is_ok(),
+            "release frees the port"
+        );
+    }
+
+    /// Stop failures surface (membership + error) instead of false success.
+    #[test]
+    fn t41_stop_failure_surfaced_not_silent() {
+        let (mut controller, stock) = EngineController::fake();
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10802),
+        ];
+        controller.start_all(&rows).expect("starts");
+        let (removed, missing) = controller.stop_one_result("missing");
+        assert!(!removed);
+        assert!(missing.is_none());
+        stock.fail_check("re-gen broke");
+        let (removed, error) = controller.stop_one_result("2");
+        assert!(removed, "membership answers first");
+        let error = error.expect("apply failure surfaces");
+        assert!(
+            matches!(error, EngineError::CheckFailed { .. }),
+            "got {error}"
+        );
+        assert_eq!(controller.running_count(), 2, "snapshot restored");
+        assert!(controller.last_error().is_some());
+        stock.clear_failures();
+        let (removed, error) = controller.stop_one_result("2");
+        assert!(removed);
+        assert!(error.is_none());
+        assert_eq!(controller.running_count(), 1);
+        let generations = controller.generation();
+        assert!(generations >= 3, "fence moved on every mutation");
+        assert!(controller.stop_all_result().is_none());
+        assert_eq!(controller.running_count(), 0);
+        assert!(
+            controller.clash_targets().is_empty(),
+            "secrets cleared on stop"
+        );
+    }
+
+    /// Start-all computes the maximal healthy subset and applies once.
+    #[test]
+    fn t41_start_all_subset_single_apply() {
+        let (mut controller, stock) = EngineController::fake();
+        let mut rows = three_standard();
+        rows.push(fixture(
+            "9",
+            "Broken",
+            "vless",
+            json!({}),
+            "127.0.0.1",
+            10809,
+        ));
+        let outcome = controller.start_all_subset(&rows, true);
+        assert!(outcome.error.is_none(), "no union abort: {outcome:?}");
+        assert_eq!(outcome.applied, vec!["1", "2", "3"]);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, "Broken");
+        assert_eq!(stock.check_calls(), 1, "single apply, no per-row flap");
+        assert_eq!(controller.running_count(), 3);
+        // Union-level abort (two rows, one endpoint): nothing applied.
+        let mut controller = EngineController::fake().0;
+        let dupe = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10801),
+        ];
+        let outcome = controller.start_all_subset(&dupe, true);
+        assert!(
+            outcome.applied.is_empty(),
+            "conflict stays atomic: {outcome:?}"
+        );
+        assert!(outcome.error.is_some(), "union abort named: {outcome:?}");
+        assert_eq!(outcome.failed.len(), 2, "every survivor named: {outcome:?}");
+        assert_eq!(controller.running_count(), 0);
+    }
+
+    /// Bad egress hostnames fail typed before spawn; numeric IPs never
+    /// trigger a lookup.
+    #[test]
+    fn t41_dns_failure_typed_before_spawn() {
+        let hostile = fixture(
+            "9",
+            "BadHost",
+            "shadowsocks",
+            json!({"type": "shadowsocks", "server": "no-such-host.invalid",
+                   "server_port": 8388, "method": "aes-128-gcm", "password": "x"}),
+            "127.0.0.1",
+            10809,
+        );
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let calls_in = calls.clone();
+        let resolver = move |server: &str| {
+            calls_in.borrow_mut().push(server.to_string());
+            if server == "no-such-host.invalid" {
+                return Err("nxdomain".to_string());
+            }
+            Ok(())
+        };
+        let error = validate_egress_resolution_with(std::slice::from_ref(&hostile), &resolver)
+            .expect_err("bad hostname fails");
+        assert!(
+            matches!(error, EngineError::DnsFailure { .. }),
+            "typed, got {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("\"BadHost\""), "names row: {text}");
+        assert!(
+            text.contains("no-such-host.invalid"),
+            "names server: {text}"
+        );
+        assert!(text.contains("DNS failure"), "kind named: {text}");
+        // Numeric IPs never reach the resolver.
+        calls.borrow_mut().clear();
+        validate_egress_resolution_with(&three_standard(), &resolver).expect("IPs pass");
+        assert!(calls.borrow().is_empty(), "no lookup for IPs");
+        // And the apply path refuses before any spawn (real DNS agrees the
+        // invalid TLD never resolves, offline or on).
+        let (mut controller, stock) = EngineController::fake();
+        let error = controller
+            .start_one(&hostile)
+            .expect_err("apply gate refuses");
+        assert!(
+            matches!(error, EngineError::DnsFailure { .. }),
+            "got {error}"
+        );
+        assert!(!stock.is_running());
+    }
+
+    /// Row-local vs union-level split covers the new variants.
+    #[test]
+    fn t41_row_local_split_covers_new_variants() {
+        for error in [
+            EngineError::BadBind {
+                name: "R".to_string(),
+                bind: "bogus".to_string(),
+            },
+            EngineError::BadPort {
+                name: "R".to_string(),
+                detail: "port 0".to_string(),
+            },
+            EngineError::ReservedPort {
+                name: "R".to_string(),
+                port: 18501,
+                range: CLASH_RESERVED_NAME,
+            },
+            EngineError::DnsFailure {
+                name: "R".to_string(),
+                server: "bad.invalid".to_string(),
+            },
+            EngineError::BadExtra {
+                name: "R".to_string(),
+                field: "exe".to_string(),
+                detail: "missing".to_string(),
+            },
+        ] {
+            assert!(is_row_local_error(&error), "row-local: {error}");
+        }
+        for error in [
+            EngineError::PortConflict {
+                bind: "127.0.0.1".to_string(),
+                port: 10801,
+                first: "A".to_string(),
+                second: "B".to_string(),
+            },
+            EngineError::MissingBinary {
+                searched: "dir".to_string(),
+            },
+            EngineError::LanConfirmRequired {
+                names: "A".to_string(),
+            },
+        ] {
+            assert!(!is_row_local_error(&error), "union-level: {error}");
+        }
+    }
+
+    /// Misspelled params warn with the likely key; exact and foreign-schema
+    /// keys stay quiet; the plan carries the warnings.
+    #[test]
+    fn t41_typo_hints_name_likely_key() {
+        assert_eq!(suggest_param_key("securty"), Some("security"));
+        assert_eq!(suggest_param_key("server"), None, "exact keys quiet");
+        assert_eq!(suggest_param_key("up"), None, "short keys quiet");
+        assert_eq!(suggest_param_key("fingerprint"), None);
+        let mut params = vless_params();
+        params
+            .as_object_mut()
+            .expect("object")
+            .insert("securty".to_string(), json!("tls"));
+        let hints = typo_hints_for("Typo", "vless", params.as_object().expect("object"));
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert!(hints[0].contains("securty"), "{hints:?}");
+        assert!(hints[0].contains("security"), "{hints:?}");
+        // Custom rows carry foreign schemas — never hinted.
+        let custom = json!({"type": "vless", "securty": "tls"})
+            .as_object()
+            .expect("object")
+            .clone();
+        assert!(typo_hints_for("C", "custom-outbound", &custom).is_empty());
+        // The plan surfaces them as warnings, not errors.
+        let row = fixture("1", "Typo", "vless", params, "127.0.0.1", 10801);
+        let plan = validate_activation(std::slice::from_ref(&row)).expect("warns, not fails");
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    }
+
+    /// Two custom replacements binding one port conflict naming both.
+    #[test]
+    fn t41_custom_listens_conflict_names_both() {
+        fn replacement(name: &str, core: &str, port: u16) -> ProxyConfig {
+            fixture(
+                name,
+                name,
+                "custom-config",
+                json!({
+                    "core": core,
+                    "config": {
+                        "outbounds": [{"type": "direct", "tag": "direct"}],
+                        "inbounds": [
+                            {"type": "mixed", "tag": "in-x",
+                             "listen": "127.0.0.1", "listen_port": port}
+                        ],
+                    }
+                }),
+                "127.0.0.1",
+                10801,
+            )
+        }
+        let rows = vec![
+            replacement("CustomA", "stock", 10991),
+            replacement("CustomB", "fork", 10991),
+        ];
+        let error = validate_activation(&rows).expect_err("shared port conflicts");
+        assert!(
+            matches!(error, EngineError::PortConflict { .. }),
+            "got {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("CustomA"), "names both: {text}");
+        assert!(text.contains("CustomB"), "names both: {text}");
+        assert!(text.contains("10991"), "names port: {text}");
+        // Distinct ports validate clean.
+        let rows = vec![
+            replacement("CustomA", "stock", 10991),
+            replacement("CustomB", "fork", 10992),
+        ];
+        let plan = validate_activation(&rows).expect("distinct ports validate");
+        assert_eq!(plan.replacement_listens.len(), 2);
+    }
+
+    /// Xray-shaped listens (`listen` + `port`) parse for the own-skip set.
+    #[test]
+    fn t41_xray_served_ports_parsed_for_own_skip() {
+        let doc = serde_json::json!({
+            "inbounds": [
+                {"protocol": "vless", "listen": "127.0.0.1", "port": 11801},
+                {"protocol": "vless", "listen": "127.0.0.1", "port": 0},
+                {"protocol": "vless"},
+            ],
+        });
+        assert_eq!(
+            served_listen_ports(&doc.to_string()),
+            vec![("127.0.0.1".to_string(), 11801)]
+        );
+        assert!(served_listen_ports("not json").is_empty(), "fails open");
+    }
+
+    /// Crash and stop clear the clash set (secrets never linger past use).
+    #[test]
+    fn t41_crash_and_stop_clear_clash() {
+        let (mut controller, stock) = EngineController::fake();
+        controller.start_all(&three_standard()).expect("starts");
+        assert_eq!(controller.clash_targets().len(), 1);
+        stock.inject_crash("boom");
+        assert!(!controller.poll_shards().is_empty());
+        assert!(controller.clash_targets().is_empty(), "crash drops clash");
+        assert!(controller.live_clash_targets().is_empty());
+        controller.restart_crashed().expect("recovers");
+        assert_eq!(controller.clash_targets().len(), 1);
+        controller.stop_all();
+        assert!(controller.clash_targets().is_empty(), "stop clears clash");
+        assert_eq!(controller.status(), &EngineStatus::Stopped);
     }
 }

@@ -4253,6 +4253,7 @@ dependencies = [
  "base64 0.22.1",
  "embed-resource",
  "futures",
+ "getrandom 0.4.3",
  "gpui-kit",
  "png 0.18.1",
  "raw-window-handle",
@@ -4260,6 +4261,7 @@ dependencies = [
  "serde_json",
  "tray-icon",
  "winreg",
+ "zeroize",
 ]
 
 [[package]]
