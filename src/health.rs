@@ -498,6 +498,18 @@ pub fn truncate(text: &str, limit: usize) -> String {
     kept
 }
 
+/// Ticket 45: sparkline series from oldest-first `(at, latency)` history —
+/// the newest `limit` successful samples, oldest-first for the chart.
+/// Error samples never plot as zero (they are dropped); empty in means
+/// empty out (the detail pane shows a text fallback instead).
+pub fn sparkline_latencies(samples: &[(i64, Option<u64>)], limit: usize) -> Vec<u64> {
+    let mut latencies: Vec<u64> = samples.iter().filter_map(|(_, latency)| *latency).collect();
+    if latencies.len() > limit.max(1) {
+        latencies = latencies.split_off(latencies.len() - limit.max(1));
+    }
+    latencies
+}
+
 /// Ticket 36: parse a clash-API `/connections` body into
 /// `(download_total, upload_total)`. Live shape (stock sing-box 1.14.2):
 /// `{"connections":[],"downloadTotal":1048782,"memory":4497408,
@@ -1168,7 +1180,7 @@ impl HealthStore {
 }
 
 /// Sidecar log severity.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Ticket 45: production type behind the logs level filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -1184,6 +1196,19 @@ impl LogLevel {
             LogLevel::Info => "info",
             LogLevel::Warn => "warn",
             LogLevel::Error => "error",
+        }
+    }
+
+    /// Ticket 45: parse a level-filter label (`None` = the `all` position,
+    /// unknown labels also read as `all` so a corrupt pick never hides
+    /// everything silently — the UI only offers known labels anyway).
+    pub fn from_label(label: &str) -> Option<LogLevel> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "debug" => Some(LogLevel::Debug),
+            "info" => Some(LogLevel::Info),
+            "warn" => Some(LogLevel::Warn),
+            "error" => Some(LogLevel::Error),
+            _ => None,
         }
     }
 }
@@ -2237,6 +2262,37 @@ mod tests {
             logs.all().iter().any(|record| record.config_id.is_none()),
             "untagged lines stay engine-global"
         );
+    }
+
+    /// Ticket 45: sparkline latencies take the newest successful samples
+    /// (oldest-first for the chart), capped — errors never plot as zero.
+    #[test]
+    fn t45_sparkline_latencies_newest_capped() {
+        let samples: Vec<(i64, Option<u64>)> = vec![
+            (1, Some(100)),
+            (2, None),
+            (3, Some(200)),
+            (4, Some(300)),
+            (5, None),
+            (6, Some(400)),
+        ];
+        assert_eq!(sparkline_latencies(&samples, 10), vec![100, 200, 300, 400]);
+        assert_eq!(sparkline_latencies(&samples, 2), vec![300, 400]);
+        assert!(sparkline_latencies(&[], 10).is_empty());
+        let errors: Vec<(i64, Option<u64>)> = vec![(1, None), (2, None)];
+        assert!(sparkline_latencies(&errors, 10).is_empty());
+    }
+
+    /// Ticket 45: log levels round-trip through labels for the level filter.
+    #[test]
+    fn t45_log_level_labels() {
+        assert_eq!(LogLevel::Debug.as_str(), "debug");
+        assert_eq!(LogLevel::Info.as_str(), "info");
+        assert_eq!(LogLevel::Warn.as_str(), "warn");
+        assert_eq!(LogLevel::Error.as_str(), "error");
+        assert_eq!(LogLevel::from_label("warn"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::from_label("all"), None);
+        assert_eq!(LogLevel::from_label("bogus"), None);
     }
 
     /// Redaction covers key forms, bearer tokens, userinfo, and queries.

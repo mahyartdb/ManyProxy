@@ -633,7 +633,7 @@ pub struct QuarantinedRow {
 /// Ticket 40 (v5): one append-only health-history sample. `health_snapshots`
 /// keeps the latest-fast-path untouched; history serves per-row charts and
 /// range deletes via `idx_health_history_config_at`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Ticket 45: production type behind the detail sparkline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthHistoryEntry {
     pub config_id: String,
@@ -3013,7 +3013,7 @@ impl Store {
     /// Ticket 40 (v5): set a subscription's auto-refresh interval. Values
     /// `<= 0` mean always-due (matches [`due_for_refresh`]); absurdly large
     /// values saturate at `i64::MAX` via the column type (never wrap).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Ticket 45: production seam behind the per-sub interval picker.
     pub fn set_subscription_interval(
         &mut self,
         id: &str,
@@ -3684,6 +3684,25 @@ impl Store {
         PathBuf::from("manyproxy-export.json")
     }
 
+    /// Ticket 45: default visible-logs destination — `MANYPROXY_LOGS`
+    /// overrides; otherwise a `manyproxy-logs.txt` sibling of the library
+    /// file (same export-path pattern as [`Store::default_export_path`]:
+    /// explicit user action writes here, nothing automatic ever does).
+    pub fn default_logs_path() -> PathBuf {
+        if let Ok(path) = std::env::var("MANYPROXY_LOGS") {
+            if !path.trim().is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+        let sibling = Self::default_path();
+        if let Some(parent) = sibling.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("manyproxy-logs.txt");
+            }
+        }
+        PathBuf::from("manyproxy-logs.txt")
+    }
+
     /// Serialize the library (configs + subscriptions, no health samples)
     /// for the user-owned export path. The payload round-trips through the
     /// ticket-03 import grammar ([`crate::import::import_text`]): `outbounds`
@@ -3817,7 +3836,11 @@ impl Store {
         // table without code changes, but only these restore).
         {
             let mut meta = serde_json::Map::new();
-            for key in [Self::META_RESTORE_RUNNING, Self::META_RUNNING_IDS] {
+            for key in [
+                Self::META_RESTORE_RUNNING,
+                Self::META_RUNNING_IDS,
+                Self::META_SUBS_AUTO_REFRESH,
+            ] {
                 if let Some(v) = self.get_meta(key)? {
                     meta.insert(key.to_string(), serde_json::Value::String(v));
                 }
@@ -4159,7 +4182,11 @@ impl Store {
         }
         // Validate meta values are strings (never secrets in errors).
         let mut meta_rows: Vec<(String, String)> = Vec::new();
-        for key in [Self::META_RESTORE_RUNNING, Self::META_RUNNING_IDS] {
+        for key in [
+            Self::META_RESTORE_RUNNING,
+            Self::META_RUNNING_IDS,
+            Self::META_SUBS_AUTO_REFRESH,
+        ] {
             if let Some(v) = meta_json.get(key).and_then(|v| v.as_str()) {
                 // running_ids must parse as an array of strings when present;
                 // corrupt snapshots fail loudly (never a guessed row).
@@ -4168,6 +4195,11 @@ impl Store {
                         Ok(serde_json::Value::Array(_)) => {}
                         _ => return Err(invalid("meta.running_ids is corrupt".to_string())),
                     }
+                }
+                // Ticket 45: the kill-switch restores only as an explicit
+                // on/off bit; anything else fails loudly (never a guess).
+                if key == Self::META_SUBS_AUTO_REFRESH && v != "0" && v != "1" {
+                    return Err(invalid("meta.subs_auto_refresh is corrupt".to_string()));
                 }
                 meta_rows.push((key.to_string(), v.to_string()));
             }
@@ -4406,9 +4438,17 @@ impl Store {
     /// Ticket 43: zero one row's data-plane totals (per-row reset, behind a
     /// confirm in the UI). `NotFound` for ghost rows — never a silent no-op.
     pub fn reset_traffic(&mut self, id: &str) -> Result<(), StoreError> {
-        let rowid: i64 = id
-            .parse()
-            .map_err(|_| StoreError::NotFound(id.to_string()))?;
+        self.reset_traffic_counters(id)
+    }
+
+    /// Ticket 45: zero one row's persisted usage counters (the confirm gate
+    /// lives in the UI; this seam never zeros silently — unknown ids are
+    /// `NotFound`, never a silent no-op).
+    pub fn reset_traffic_counters(&mut self, id: &str) -> Result<(), StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
         let changed = self.conn.execute(
             "UPDATE proxy_configs SET traffic_rx = 0, traffic_tx = 0 WHERE id = ?1",
             params![rowid],
@@ -4437,8 +4477,6 @@ impl Store {
     }
 
     // -- Ticket 12: health snapshot persistence ------------------------------
-
-    /// Persist one config's latest sample (upsert keyed by `config_id`).
     /// Called after every recorded probe outcome; restart rehydrates from
     /// [`Store::load_health_snapshots`]. Error text here is a probe cause
     /// (already redacted at the health seam), never raw secrets.
@@ -4548,7 +4586,8 @@ impl Store {
 
     /// Ticket 40: history for one config, oldest first, optionally since a
     /// cutoff (`at >= since`). Serves the detail sparkline.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Ticket 45: production seam behind the detail sparkline (bounded by
+    /// the caller, never the latest-snapshot fast path).
     pub fn load_health_history(
         &self,
         config_id: &str,
@@ -4652,6 +4691,26 @@ impl Store {
     /// Persist the session-restore opt-in (explicit Settings checkbox only).
     pub fn set_restore_running(&mut self, on: bool) -> Result<(), StoreError> {
         self.set_meta(Self::META_RESTORE_RUNNING, if on { "1" } else { "0" })
+    }
+
+    /// Ticket 45: meta key behind the global subscription auto-refresh
+    /// kill-switch (`"1"` = on). Unset means on (existing libraries keep
+    /// their behavior); explicit off gates the automatic due pass only —
+    /// manual Refresh-all-due is explicit consent and always runs.
+    pub const META_SUBS_AUTO_REFRESH: &str = "subs_auto_refresh";
+
+    /// True unless the user explicitly killed subscription auto-refresh. A
+    /// broken read fails closed (no automatic network), never open.
+    pub fn subs_auto_refresh_enabled(&self) -> bool {
+        self.get_meta(Self::META_SUBS_AUTO_REFRESH)
+            .map(|value| value.as_deref() != Some("0"))
+            .unwrap_or(true)
+    }
+
+    /// Persist the global auto-refresh kill-switch (explicit subs-dialog
+    /// toggle only — never flipped by ticks).
+    pub fn set_subs_auto_refresh_enabled(&mut self, on: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_SUBS_AUTO_REFRESH, if on { "1" } else { "0" })
     }
 
     /// Persist the currently running set for a later restore. Best-effort
@@ -8347,6 +8406,160 @@ mod tests {
                 }])
                 .is_err(),
             "bad kind rejected"
+        );
+    }
+
+    /// Ticket 45: per-sub interval is honored by `due_for_refresh_for` and
+    /// rows expose `last_refresh_at` for display.
+    #[test]
+    fn t45_sub_interval_honored_by_due() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        assert_eq!(sub.interval_secs, DEFAULT_AUTO_REFRESH_SECS);
+        assert_eq!(sub.last_refresh_at, None);
+        let now = 1_700_000_000;
+        // A 1h interval set on the row is honored: fresh stamp → not due.
+        let hourly = store
+            .set_subscription_interval(&sub.id, 3_600)
+            .expect("interval sets");
+        assert_eq!(hourly.interval_secs, 3_600);
+        let fresh = Subscription {
+            last_refresh_at: Some(now - 100),
+            ..hourly.clone()
+        };
+        assert!(
+            !due_for_refresh_for(&fresh, now),
+            "fresh hourly sub not due"
+        );
+        let stale = Subscription {
+            last_refresh_at: Some(now - 7_200),
+            ..hourly
+        };
+        assert!(due_for_refresh_for(&stale, now), "stale hourly sub due");
+        // Unknown ids never silently succeed.
+        assert!(
+            store.set_subscription_interval("9999", 60).is_err(),
+            "unknown id fails loudly"
+        );
+    }
+
+    /// Ticket 45: the global auto-refresh kill-switch defaults on (unset
+    /// means on) and persists off across reads.
+    #[test]
+    fn t45_global_kill_switch_defaults_on_and_persists() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        assert!(
+            store.subs_auto_refresh_enabled(),
+            "unset kill-switch defaults on"
+        );
+        store
+            .set_subs_auto_refresh_enabled(false)
+            .expect("kill-switch writes");
+        assert!(
+            !store.subs_auto_refresh_enabled(),
+            "kill-switch persists off"
+        );
+        store
+            .set_subs_auto_refresh_enabled(true)
+            .expect("kill-switch writes");
+        assert!(
+            store.subs_auto_refresh_enabled(),
+            "kill-switch flips back on"
+        );
+    }
+
+    /// Ticket 45: usage reset zeroes both counters; unknown ids are
+    /// `NotFound`, never a silent no-op.
+    #[test]
+    fn t45_reset_traffic_zeroes_counters() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("row seeds");
+        store
+            .add_traffic_batch(&[(row.id.clone(), 1_000, 500)])
+            .expect("traffic accrues");
+        store.reset_traffic_counters(&row.id).expect("reset zeroes");
+        let totals = store.traffic_totals().expect("totals read");
+        assert_eq!(totals.get(&row.id), Some(&(0, 0)));
+        assert!(
+            store.reset_traffic_counters("9999").is_err(),
+            "unknown id fails loudly"
+        );
+    }
+
+    /// Ticket 45: the 30d retention window keeps recent history and prunes
+    /// old samples in one tx; the latest-snapshot fast path is a separate
+    /// table and never pays the history scan.
+    #[test]
+    fn t45_history_retention_window_keeps_recent() {
+        let mut store = Store::open_in_memory().expect("in-memory opens");
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("row seeds");
+        let now: i64 = 1_700_000_000;
+        let day: i64 = 86_400;
+        for at in [now - 100 * day, now - 40 * day, now - 10 * day, now] {
+            store
+                .append_health_history(&[HealthHistoryEntry {
+                    config_id: row.id.clone(),
+                    at,
+                    kind: "url-test".to_string(),
+                    latency_ms: Some(50),
+                    error: None,
+                }])
+                .expect("append works");
+        }
+        let pruned = store
+            .gc_health_history(30, now)
+            .expect("retention gc works");
+        assert_eq!(pruned, 2, "100d + 40d samples pruned");
+        let kept = store
+            .load_health_history(&row.id, None)
+            .expect("history loads");
+        assert_eq!(kept.len(), 2, "10d + now samples kept");
+        assert!(kept.iter().all(|entry| entry.at >= now - 30 * day));
+        // Latest-fast-path reads only `health_snapshots` (no history scan):
+        // a snapshot round-trips while history holds rows.
+        store
+            .save_health_snapshot(&HealthSnapshot {
+                config_id: row.id.clone(),
+                at: now,
+                kind: "url-test".to_string(),
+                latency_ms: Some(50),
+                error: None,
+            })
+            .expect("snapshot works");
+        let snaps = store.load_health_snapshots().expect("snapshots load");
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].config_id, row.id);
+    }
+
+    /// Ticket 45: logs leave through the export-path pattern — a stable file
+    /// name beside the library.
+    #[test]
+    fn t45_logs_path_pattern() {
+        let path = Store::default_logs_path();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("manyproxy-logs.txt"),
+            "logs file name is stable"
         );
     }
 
