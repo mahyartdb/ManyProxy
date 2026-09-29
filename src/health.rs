@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 /// Ticket 26: the fake prober crosses threads (health probes run on the
@@ -109,20 +110,23 @@ pub trait HealthProber {
         true
     }
     /// GET `url` through the HTTP-proxy face of `bind:port`.
+    /// Ticket 47: `&self` (was `&mut self`) — probes run concurrently on
+    /// scoped threads behind [`test_all`]/[`ping_all`], so drivers share
+    /// through the reference (`RealHealthProber` is stateless; the fake
+    /// already synchronizes through `Arc<Mutex<…>>`). Outcomes (order,
+    /// content, per-egress routing) are unchanged.
     fn url_test(
-        &mut self,
+        &self,
         config: &ProxyConfig,
         bind: &str,
         port: u16,
         url: &str,
     ) -> Result<ProbeSuccess, String>;
     /// Time one TCP dial to `bind:port` (endpoint liveness).
-    fn tcp_ping(
-        &mut self,
-        config: &ProxyConfig,
-        bind: &str,
-        port: u16,
-    ) -> Result<ProbeSuccess, String>;
+    /// Ticket 47: `&self` like [`HealthProber::url_test`] (shared across
+    /// probe threads; semantics unchanged).
+    fn tcp_ping(&self, config: &ProxyConfig, bind: &str, port: u16)
+        -> Result<ProbeSuccess, String>;
 }
 
 /// Protocols measurable in this slice. Mirrors the ticket-05 standard set
@@ -249,7 +253,7 @@ impl HealthProber for RealHealthProber {
     }
 
     fn url_test(
-        &mut self,
+        &self,
         _config: &ProxyConfig,
         bind: &str,
         port: u16,
@@ -310,7 +314,7 @@ impl HealthProber for RealHealthProber {
     }
 
     fn tcp_ping(
-        &mut self,
+        &self,
         _config: &ProxyConfig,
         bind: &str,
         port: u16,
@@ -335,12 +339,71 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
 
 /// Ticket 28: shared runner behind [`test_all`] and [`ping_all`] (one
 /// skip/probe/failure shape; only the kind, verb, and probe call differ).
-type ProbeFn =
-    fn(&mut dyn HealthProber, &ProxyConfig, &str, u16, &str) -> Result<ProbeSuccess, String>;
+/// Ticket 47: shared through `&` (probes run concurrently).
+type ProbeFn = fn(&dyn HealthProber, &ProxyConfig, &str, u16, &str) -> Result<ProbeSuccess, String>;
+
+/// Ticket 47: max probe threads per round. Test-all on N rows overlaps at
+/// most this many blocking dials; outcomes still land in input order, so
+/// probe semantics (per-egress routing, skip/failure shapes) are unchanged.
+pub const MAX_PROBE_CONCURRENCY: usize = 8;
+
+/// Ticket 47: one probe of one config (the per-row body shared by the
+/// sequential and concurrent runners — one skip/probe/failure shape).
+fn run_one(
+    config: &ProxyConfig,
+    prober: &dyn HealthProber,
+    kind: HealthKind,
+    verb: &str,
+    probe: ProbeFn,
+    url: &str,
+) -> TestOutcome {
+    let at = now_unix();
+    if !prober.supports(config) {
+        return TestOutcome {
+            sample: HealthSample {
+                config_id: config.id.clone(),
+                at,
+                kind,
+                latency_ms: None,
+                error: Some(format!(
+                    "unsupported protocol \"{}\" for \"{}\" (no health probe for this protocol yet)",
+                    config.protocol, config.name
+                )),
+            },
+            success: None,
+        };
+    }
+    match probe(prober, config, &config.bind_ip, config.port, url) {
+        Ok(success) => TestOutcome {
+            sample: HealthSample {
+                config_id: config.id.clone(),
+                at,
+                kind,
+                latency_ms: Some(success.latency_ms),
+                error: None,
+            },
+            success: Some(success),
+        },
+        Err(cause) => TestOutcome {
+            sample: HealthSample {
+                config_id: config.id.clone(),
+                at,
+                kind,
+                latency_ms: None,
+                error: Some(format!(
+                    "{verb} failed for \"{}\": {}",
+                    config.name,
+                    redact_secrets(&cause)
+                )),
+            },
+            success: None,
+        },
+    }
+}
 
 fn run_all(
     configs: &[ProxyConfig],
-    prober: &mut dyn HealthProber,
+    prober: &dyn HealthProber,
     kind: HealthKind,
     verb: &str,
     probe: ProbeFn,
@@ -348,55 +411,56 @@ fn run_all(
 ) -> Vec<TestOutcome> {
     configs
         .iter()
-        .map(|config| {
-            let at = now_unix();
-            if !prober.supports(config) {
-                return TestOutcome {
-                    sample: HealthSample {
-                        config_id: config.id.clone(),
-                        at,
-                        kind,
-                        latency_ms: None,
-                        error: Some(format!(
-                            "unsupported protocol \"{}\" for \"{}\" (no health probe for this protocol yet)",
-                            config.protocol, config.name
-                        )),
-                    },
-                    success: None,
-                };
-            }
-            match probe(prober, config, &config.bind_ip, config.port, url) {
-                Ok(success) => TestOutcome {
-                    sample: HealthSample {
-                        config_id: config.id.clone(),
-                        at,
-                        kind,
-                        latency_ms: Some(success.latency_ms),
-                        error: None,
-                    },
-                    success: Some(success),
-                },
-                Err(cause) => TestOutcome {
-                    sample: HealthSample {
-                        config_id: config.id.clone(),
-                        at,
-                        kind,
-                        latency_ms: None,
-                        error: Some(format!(
-                            "{verb} failed for \"{}\": {}",
-                            config.name,
-                            redact_secrets(&cause)
-                        )),
-                    },
-                    success: None,
-                },
-            }
-        })
+        .map(|config| run_one(config, prober, kind, verb, probe, url))
         .collect()
 }
 
+/// Ticket 47: bounded concurrent runner — at most [`MAX_PROBE_CONCURRENCY`]
+/// workers pull row indices off an atomic counter (scoped threads, joined
+/// before return; no tasks leak past the round). Outcomes are re-sorted
+/// into input order, so callers observe exactly the sequential contract.
+/// `prober` is shared (`&(dyn HealthProber + Sync)`); drivers must be
+/// `Sync` (the real driver is stateless, the fake is `Arc<Mutex>`).
+fn run_all_concurrent(
+    configs: &[ProxyConfig],
+    prober: &(dyn HealthProber + Sync),
+    kind: HealthKind,
+    verb: &str,
+    probe: ProbeFn,
+    url: &str,
+) -> Vec<TestOutcome> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if configs.is_empty() {
+        return Vec::new();
+    }
+    if configs.len() == 1 {
+        // Single-row fast path: no thread overhead for one blocking dial.
+        return run_all(configs, prober, kind, verb, probe, url);
+    }
+    let next = AtomicUsize::new(0);
+    let done = std::sync::Mutex::new(Vec::with_capacity(configs.len()));
+    let workers = configs.len().clamp(1, MAX_PROBE_CONCURRENCY);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::SeqCst);
+                let Some(config) = configs.get(index) else {
+                    break;
+                };
+                let outcome = run_one(config, prober, kind, verb, probe, url);
+                done.lock()
+                    .expect("probe slot lock held")
+                    .push((index, outcome));
+            });
+        }
+    });
+    let mut done = done.into_inner().expect("probe slots readable");
+    done.sort_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, outcome)| outcome).collect()
+}
+
 fn url_probe(
-    prober: &mut dyn HealthProber,
+    prober: &dyn HealthProber,
     config: &ProxyConfig,
     bind: &str,
     port: u16,
@@ -406,7 +470,7 @@ fn url_probe(
 }
 
 fn ping_probe(
-    prober: &mut dyn HealthProber,
+    prober: &dyn HealthProber,
     config: &ProxyConfig,
     bind: &str,
     port: u16,
@@ -417,12 +481,23 @@ fn ping_probe(
 
 /// Run one URL test per config through each config's own endpoint. Order of
 /// the returned outcomes matches `configs`.
+/// Ticket 47: probes overlap (bounded [`MAX_PROBE_CONCURRENCY`]-way via
+/// [`test_all_concurrent`]) instead of serializing one 5s bound per row.
 pub fn test_all(
     configs: &[ProxyConfig],
     url: &str,
-    prober: &mut dyn HealthProber,
+    prober: &(dyn HealthProber + Sync),
 ) -> Vec<TestOutcome> {
-    run_all(
+    test_all_concurrent(configs, url, prober)
+}
+
+/// Ticket 47: the concurrent URL-test runner (also the `test_all` engine).
+pub fn test_all_concurrent(
+    configs: &[ProxyConfig],
+    url: &str,
+    prober: &(dyn HealthProber + Sync),
+) -> Vec<TestOutcome> {
+    run_all_concurrent(
         configs,
         prober,
         HealthKind::UrlTest,
@@ -433,8 +508,17 @@ pub fn test_all(
 }
 
 /// Time one TCP dial per config to its own endpoint.
-pub fn ping_all(configs: &[ProxyConfig], prober: &mut dyn HealthProber) -> Vec<TestOutcome> {
-    run_all(
+/// Ticket 47: bounded-concurrent like [`test_all`].
+pub fn ping_all(configs: &[ProxyConfig], prober: &(dyn HealthProber + Sync)) -> Vec<TestOutcome> {
+    ping_all_concurrent(configs, prober)
+}
+
+/// Ticket 47: the concurrent TCP-ping runner (also the `ping_all` engine).
+pub fn ping_all_concurrent(
+    configs: &[ProxyConfig],
+    prober: &(dyn HealthProber + Sync),
+) -> Vec<TestOutcome> {
+    run_all_concurrent(
         configs,
         prober,
         HealthKind::TcpPing,
@@ -867,10 +951,205 @@ pub fn poll_clash_entries(
     parse_clash_entries(&fetch_clash_body(port, secret, timeout)?)
 }
 
+/// Ticket 47: per-core clash poll ceiling (1–2s — one slow controller never
+/// stalls the traffic tick past this).
+pub const CLASH_PER_CORE_TIMEOUT_SECS: u64 = 2;
+/// Ticket 47: cap for the traffic last-seen map (`core/conn-id` entries).
+/// Churny short connections never grow it past this.
+pub const MAX_TRAFFIC_SEEN_ENTRIES: usize = 20_000;
+/// Ticket 47: time-to-live for last-seen entries of dead/removed cores.
+/// Entries of live targets with failed polls never expire (dropping them
+/// would double-count on recovery); entries whose core is gone entirely
+/// expire so crash churn never grows the map.
+pub const TRAFFIC_SEEN_TTL_SECS: i64 = 600;
+
+/// Ticket 47: bounded last-seen clash connection bytes (`core/conn-id` →
+/// cumulative rx/tx + last-refresh stamp). The traffic tick diffs live
+/// readings against this map to persist per-row deltas; the sweep drops
+/// closed connections on healthy cores and TTLs dead-core entries while
+/// keeping failed-live-core ids (a failed poll must never look like a mass
+/// close — that would double-count on recovery).
+#[derive(Debug, Clone)]
+pub struct TrafficSeenMap {
+    inner: HashMap<String, (u64, u64, i64)>,
+    cap: usize,
+    ttl_secs: i64,
+}
+
+impl Default for TrafficSeenMap {
+    /// Production bound ([`MAX_TRAFFIC_SEEN_ENTRIES`] + [`TRAFFIC_SEEN_TTL_SECS`]).
+    fn default() -> Self {
+        Self::bounded()
+    }
+}
+
+impl TrafficSeenMap {
+    /// Production bound ([`MAX_TRAFFIC_SEEN_ENTRIES`] + [`TRAFFIC_SEEN_TTL_SECS`]).
+    pub fn bounded() -> Self {
+        Self {
+            inner: HashMap::new(),
+            cap: MAX_TRAFFIC_SEEN_ENTRIES,
+            ttl_secs: TRAFFIC_SEEN_TTL_SECS,
+        }
+    }
+
+    /// Last reading for one connection, if tracked.
+    pub fn get(&self, key: &str) -> Option<(u64, u64)> {
+        self.inner.get(key).map(|(rx, tx, _)| (*rx, *tx))
+    }
+
+    /// Record one live reading. Cap enforcement happens in [`sweep`] (with
+    /// failed-live protection), never here, so an insert burst mid-tick
+    /// cannot evict the high-water marks the sweep still needs.
+    pub fn insert(&mut self, key: String, rx: u64, tx: u64, now: i64) {
+        self.inner.insert(key, (rx, tx, now));
+    }
+
+    /// Tracked connection count (bounded by [`sweep`]).
+    /// Ticket 47: test seam (production bounds via [`sweep`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// True when nothing is tracked.
+    /// Ticket 47: test seam (production bounds via [`sweep`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn core_of(id: &str) -> &str {
+        id.split('/').next().unwrap_or("")
+    }
+
+    /// One tick-end sweep: drop closed connections on healthy cores, TTL
+    /// dead-core entries, keep failed-live-core ids and everything `seen`
+    /// this round, then enforce the cap (oldest first, never evicting
+    /// failed-live holds except when the whole map is holds).
+    pub fn sweep(
+        &mut self,
+        now: i64,
+        ok_cores: &HashSet<String>,
+        seen: &HashSet<String>,
+        live_cores: &HashSet<String>,
+    ) {
+        self.inner.retain(|id, (_, _, at)| {
+            if seen.contains(id) {
+                return true;
+            }
+            let core = Self::core_of(id);
+            if live_cores.contains(core) {
+                // Live target: a failed poll keeps ids (never a mass
+                // close); a healthy poll drops unseen ids (closed).
+                return !ok_cores.contains(core);
+            }
+            // Dead/removed core: TTL'd so crash churn stays bounded. A
+            // restarted core resets its counters, so treating its next
+            // reading as a fresh epoch is correct, never a double count.
+            now.saturating_sub(*at) <= self.ttl_secs
+        });
+        let protected: HashSet<String> = self
+            .inner
+            .keys()
+            .filter(|id| {
+                let core = Self::core_of(id);
+                live_cores.contains(core) && !ok_cores.contains(core)
+            })
+            .cloned()
+            .collect();
+        while self.inner.len() > self.cap {
+            let victim = self
+                .inner
+                .iter()
+                .filter(|(id, _)| !protected.contains(id.as_str()))
+                .min_by_key(|(_, (_, _, at))| *at)
+                .map(|(id, _)| id.clone())
+                .or_else(|| {
+                    self.inner
+                        .iter()
+                        .min_by_key(|(_, (_, _, at))| *at)
+                        .map(|(id, _)| id.clone())
+                });
+            let Some(victim) = victim else {
+                break;
+            };
+            self.inner.remove(&victim);
+        }
+    }
+}
+/// Ticket 47: per-core timeout as a [`Duration`] (single source; the tick
+/// passes this, never a second literal).
+pub const CLASH_PER_CORE_TIMEOUT: Duration = Duration::from_secs(CLASH_PER_CORE_TIMEOUT_SECS);
+/// Ticket 47: total deadline for one traffic-tick poll round across all
+/// cores (bounds the tick even when every controller is slow).
+pub const CLASH_TOTAL_DEADLINE_SECS: u64 = 8;
+/// Ticket 47: total deadline as a [`Duration`].
+pub const CLASH_TOTAL_DEADLINE: Duration = Duration::from_secs(CLASH_TOTAL_DEADLINE_SECS);
+
+/// Ticket 47: poll every clash target concurrently (one thread per live
+/// core — bounded by the live-core count, which is bounded by the running
+/// sidecar count), each poll capped by `per_core`. Results landing after
+/// `total` are reported as deadline errors instead of stalling the tick;
+/// late threads are detached and exit on their own within `per_core`
+/// (bounded, never leaked past one timeout). Secrets travel only into the
+/// polling threads (never into error strings or logs — error text names
+/// core/port only). Result order matches `targets` order.
+pub fn poll_clash_targets(
+    targets: &[crate::engine::ClashTarget],
+    per_core: Duration,
+    total: Duration,
+) -> Vec<(crate::engine::ClashTarget, Result<Vec<ClashConn>, String>)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, Result<Vec<ClashConn>, String>)>();
+    for (index, target) in targets.iter().enumerate() {
+        let done_tx = done_tx.clone();
+        let port = target.port;
+        let secret = target.secret.clone();
+        std::thread::spawn(move || {
+            let result = poll_clash_entries(port, &secret, per_core);
+            let _ = done_tx.send((index, result));
+        });
+    }
+    drop(done_tx);
+    let mut slots: Vec<Option<Result<Vec<ClashConn>, String>>> =
+        (0..targets.len()).map(|_| None).collect();
+    let deadline = Instant::now() + total;
+    for _ in 0..targets.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match done_rx.recv_timeout(remaining) {
+            Ok((index, result)) => slots[index] = Some(result),
+            Err(_) => break,
+        }
+    }
+    targets
+        .iter()
+        .zip(slots)
+        .map(|(target, slot)| {
+            let result = slot.unwrap_or_else(|| {
+                Err(format!(
+                    "clash poll {} (127.0.0.1:{}): total deadline exceeded",
+                    target.core, target.port
+                ))
+            });
+            (target.clone(), result)
+        })
+        .collect()
+}
+
 /// Append-only samples + per-config traffic accumulation.
 #[derive(Debug, Default)]
 pub struct HealthStore {
-    samples: Vec<HealthSample>,
+    samples: VecDeque<HealthSample>,
+    /// Ticket 47: O(1) latest-sample index — the last-pushed sample of any
+    /// kind per config, plus the last-pushed sample per (config, kind).
+    /// Maintained on every push, ring-cap eviction, and stale prune, so
+    /// [`HealthStore::latest`]/[`latest_of`] never scan the ring. Clones are
+    /// bounded (one per config per slot), never per sample.
+    latest_any: HashMap<String, HealthSample>,
+    latest_kind: HashMap<String, [Option<HealthSample>; 2]>,
     traffic: HashMap<String, TrafficStats>,
     /// Ticket 36: data-plane totals per config, mirrored from the store
     /// (persisted) after every clash poll. Present means the row is
@@ -885,11 +1164,110 @@ pub struct HealthStore {
 impl HealthStore {
     /// Ticket 28: one bounded push for [`record_outcome`] and [`hydrate`]
     /// (the ring cap is not per-caller policy).
+    /// Ticket 47: the ring is a [`VecDeque`] (O(1) front eviction) and every
+    /// push refreshes the O(1) latest-sample index.
     fn push_sample(&mut self, sample: HealthSample) {
         if self.samples.len() >= MAX_SAMPLES {
-            self.samples.remove(0);
+            if let Some(evicted) = self.samples.pop_front() {
+                self.reindex_evicted(&evicted);
+            }
         }
-        self.samples.push(sample);
+        let slot = Self::kind_slot(sample.kind);
+        let id = sample.config_id.clone();
+        self.samples.push_back(sample.clone());
+        self.latest_any.insert(id.clone(), sample.clone());
+        self.latest_kind.entry(id).or_insert([None, None])[slot] = Some(sample);
+    }
+
+    /// Ticket 47: index slot for one probe kind.
+    fn kind_slot(kind: HealthKind) -> usize {
+        match kind {
+            HealthKind::UrlTest => 0,
+            HealthKind::TcpPing => 1,
+        }
+    }
+
+    /// Latest sample of one kind for one config.
+    pub fn latest_of(&self, config_id: &str, kind: HealthKind) -> Option<&HealthSample> {
+        self.latest_filtered(config_id, Some(kind))
+    }
+
+    fn latest_filtered(&self, config_id: &str, kind: Option<HealthKind>) -> Option<&HealthSample> {
+        match kind {
+            None => self.latest_any.get(config_id),
+            Some(kind) => self
+                .latest_kind
+                .get(config_id)
+                .and_then(|slots| slots[Self::kind_slot(kind)].as_ref()),
+        }
+    }
+
+    /// Ticket 47: repair the index after a ring-cap eviction. Only the
+    /// evicted config is ever rescanned (and only when the evicted sample
+    /// was its indexed latest); every other config stays O(1).
+    fn reindex_evicted(&mut self, evicted: &HealthSample) {
+        let id = &evicted.config_id;
+        if self.latest_any.get(id) == Some(evicted) {
+            match self
+                .samples
+                .iter()
+                .rev()
+                .find(|sample| &sample.config_id == id)
+                .cloned()
+            {
+                Some(newest) => {
+                    self.latest_any.insert(id.clone(), newest);
+                }
+                None => {
+                    self.latest_any.remove(id);
+                }
+            }
+        }
+        let slot = Self::kind_slot(evicted.kind);
+        let indexed = self
+            .latest_kind
+            .get(id)
+            .and_then(|slots| slots[slot].as_ref())
+            == Some(evicted);
+        if indexed {
+            let newest = self
+                .samples
+                .iter()
+                .rev()
+                .find(|sample| &sample.config_id == id && sample.kind == evicted.kind)
+                .cloned();
+            match newest {
+                Some(newest) => {
+                    if let Some(slots) = self.latest_kind.get_mut(id) {
+                        slots[slot] = Some(newest);
+                    }
+                }
+                None => {
+                    let mut drop_row = false;
+                    if let Some(slots) = self.latest_kind.get_mut(id) {
+                        slots[slot] = None;
+                        drop_row = slots.iter().all(Option::is_none);
+                    }
+                    if drop_row {
+                        self.latest_kind.remove(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ticket 47: rebuild the whole index front-to-back (later pushes win —
+    /// the same answer a reverse scan gives). Only the prune path pays O(n).
+    fn rebuild_latest_index(&mut self) {
+        self.latest_any.clear();
+        self.latest_kind.clear();
+        for sample in &self.samples {
+            self.latest_any
+                .insert(sample.config_id.clone(), sample.clone());
+            self.latest_kind
+                .entry(sample.config_id.clone())
+                .or_insert([None, None])[Self::kind_slot(sample.kind)] = Some(sample.clone());
+        }
     }
 
     /// Append one outcome: sample always, traffic only on success.
@@ -931,20 +1309,11 @@ impl HealthStore {
     /// Ticket 28: shares the reverse scan with [`latest_of`].
     /// Ticket 32: no longer behind [`HealthStore::status`] (worst-kind-wins
     /// reads per-kind); kept as the public latest-sample accessor.
+    /// Ticket 47: served O(1) from the latest-sample index (see
+    /// [`HealthStore::push_sample`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn latest(&self, config_id: &str) -> Option<&HealthSample> {
         self.latest_filtered(config_id, None)
-    }
-
-    /// Latest sample of one kind for one config.
-    pub fn latest_of(&self, config_id: &str, kind: HealthKind) -> Option<&HealthSample> {
-        self.latest_filtered(config_id, Some(kind))
-    }
-
-    fn latest_filtered(&self, config_id: &str, kind: Option<HealthKind>) -> Option<&HealthSample> {
-        self.samples.iter().rev().find(|sample| {
-            sample.config_id == config_id && kind.is_none_or(|kind| sample.kind == kind)
-        })
     }
 
     /// Liveness across kinds (ticket 32: worst-kind-wins): the latest sample
@@ -988,10 +1357,12 @@ impl HealthStore {
     /// Ticket 32: drop samples older than `max_age_secs` relative to `now`
     /// (stale samples expire instead of haunting a row forever).
     /// Future-dated samples (clock skew) are kept, never pruned.
+    /// Ticket 47: the latest-sample index rebuilds from the survivors.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn prune_stale(&mut self, now: i64, max_age_secs: i64) {
         self.samples
             .retain(|sample| now.saturating_sub(sample.at) <= max_age_secs);
+        self.rebuild_latest_index();
     }
 
     /// Accumulated traffic (zeroed when nothing succeeded yet).
@@ -1204,37 +1575,95 @@ fn parse_level(line: &str) -> LogLevel {
 
 /// One redacted sidecar line (data-model `LogRecord`). `config_id` is `None`
 /// for engine-global lines no tag claimed.
+/// Ticket 47: `message` is ANSI-stripped at ingest (render paths never strip
+/// again) and `search` is the cached lowercase `"[level] message"` blob the
+/// Logs dialog filters on (zero per-render allocs, zero per-keystroke case
+/// folding).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRecord {
     pub at: i64,
     pub config_id: Option<String>,
     pub level: LogLevel,
     pub message: String,
+    pub search: String,
+}
+
+/// Ticket 47: precomputed log-tag index — the `in-{id}`/`out-{id}` tag
+/// strings built ONCE per ingest batch (not once per config per line), in
+/// config order so first-config-wins matches the per-line scan exactly.
+/// (A real multi-pattern automaton like aho-corasick would only pay off
+/// past hundreds of patterns; at ≤2×rows needles the precomputed strings
+/// remove the per-line allocs that dominated. No new dep.)
+#[derive(Debug, Clone, Default)]
+pub struct LogTagIndex {
+    tags: Vec<(String, String)>,
+}
+
+impl LogTagIndex {
+    /// Build the index for one ingest batch (one build per batch, not per line).
+    pub fn build(active: &[ProxyConfig]) -> Self {
+        let mut tags = Vec::with_capacity(active.len() * 2);
+        for config in active {
+            tags.push((inbound_tag(&config.id), config.id.clone()));
+            tags.push((outbound_tag(&config.id), config.id.clone()));
+        }
+        Self { tags }
+    }
+
+    /// Claim a line for the first config whose tag it contains.
+    pub fn tag_for(&self, line: &str) -> Option<String> {
+        for (tag, id) in &self.tags {
+            if line.contains(tag) {
+                return Some(id.clone());
+            }
+        }
+        None
+    }
 }
 
 /// Redacted, tagged sidecar lines with a per-config filter.
+/// Ticket 47: the ring is a [`VecDeque`] (O(1) front eviction) with
+/// crash-cause lines pinned past normal-line eviction.
 #[derive(Debug, Default)]
 pub struct LogStore {
-    records: Vec<LogRecord>,
+    records: VecDeque<LogRecord>,
 }
 
 impl LogStore {
-    /// Ingest one raw sidecar line: tag by config where possible, redact
-    /// secrets, classify severity.
-    pub fn push_raw(&mut self, line: &str, active: &[ProxyConfig]) {
+    /// Ingest one raw sidecar line: strip ANSI, tag by config via the
+    /// precomputed index, redact secrets, classify severity, cache the
+    /// search blob.
+    pub fn push_raw(&mut self, line: &str, tags: &LogTagIndex) {
+        let stripped = crate::engine::strip_ansi_codes(line);
+        let message = redact_secrets(&stripped);
+        let level = parse_level(&stripped);
+        let search = format!("[{}] {}", level.as_str(), message).to_lowercase();
         self.push(LogRecord {
             at: now_unix(),
-            config_id: tag_for_line(line, active),
-            level: parse_level(line),
-            message: redact_secrets(line),
+            config_id: tags.tag_for(&stripped),
+            level,
+            search,
+            message,
         });
     }
 
     fn push(&mut self, record: LogRecord) {
         if self.records.len() >= MAX_LOG_RECORDS {
-            self.records.remove(0);
+            // Pin crash-cause lines: evict the oldest NORMAL line so a
+            // sustained spam burst never flushes the evidence; when every
+            // line is pinned, evict the oldest anyway (the ring stays
+            // bounded no matter what).
+            if let Some(position) = self
+                .records
+                .iter()
+                .position(|record| !is_crash_cause_line(&record.message))
+            {
+                self.records.remove(position);
+            } else {
+                self.records.pop_front();
+            }
         }
-        self.records.push(record);
+        self.records.push_back(record);
     }
 
     /// Only lines tagged to this config (per-config filter).
@@ -1246,22 +1675,28 @@ impl LogStore {
     }
 
     /// All stored lines, oldest first.
-    pub fn all(&self) -> &[LogRecord] {
+    pub fn all(&self) -> &VecDeque<LogRecord> {
         &self.records
     }
 }
 
-/// Claim a sidecar line for a config when it names that config's endpoint:
-/// either the `in-{id}`/`out-{id}` tag. Raw ids are deliberately NOT
-/// substring-matched (numeric rowids like `1` would claim every line
-/// containing the digit). Anything untagged stays engine-global (`None`).
+/// Ticket 47: crash-cause lines survive ring eviction (case-insensitive
+/// `panic`/`fatal`/`crash` — sing-box fatal errors, Go panics, and our own
+/// crash vocabulary).
+fn is_crash_cause_line(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["panic", "fatal", "crash"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Claim a sidecar line for a config when it names that config's endpoint.
+/// Ticket 47: one-shot build + tag (same first-config-wins answer as
+/// [`LogTagIndex::tag_for`]); batch ingest builds the index once via
+/// [`LogTagIndex::build`] instead. Kept as the parity oracle for the index.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tag_for_line(line: &str, active: &[ProxyConfig]) -> Option<String> {
-    for config in active {
-        if line.contains(&inbound_tag(&config.id)) || line.contains(&outbound_tag(&config.id)) {
-            return Some(config.id.clone());
-        }
-    }
-    None
+    LogTagIndex::build(active).tag_for(line)
 }
 
 const SECRET_KEYS: &[&str] = &[
@@ -1564,7 +1999,7 @@ impl HealthProber for FakeHealthProber {
     }
 
     fn url_test(
-        &mut self,
+        &self,
         config: &ProxyConfig,
         bind: &str,
         port: u16,
@@ -1581,7 +2016,7 @@ impl HealthProber for FakeHealthProber {
     }
 
     fn tcp_ping(
-        &mut self,
+        &self,
         config: &ProxyConfig,
         bind: &str,
         port: u16,
@@ -1625,8 +2060,8 @@ mod tests {
             fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
             fixture("2", "Beta", "vless", "127.0.0.1", 10802),
         ];
-        let (mut prober, handle) = FakeHealthProber::shared();
-        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        let (prober, handle) = FakeHealthProber::shared();
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &prober);
         assert_eq!(outcomes.len(), 2);
         for (config, outcome) in configs.iter().zip(outcomes.iter()) {
             let calls = handle.calls_for(&config.id);
@@ -1652,12 +2087,12 @@ mod tests {
                 )
             })
             .collect();
-        let (mut prober, handle) = FakeHealthProber::shared();
+        let (prober, handle) = FakeHealthProber::shared();
         for (i, config) in configs.iter().enumerate() {
             handle.script_latency(&config.id, 20 + i as u64 * 10);
         }
         handle.script_failure("c3", "upstream refused");
-        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &prober);
         assert_eq!(outcomes.len(), 5);
         let mut store = HealthStore::default();
         for outcome in &outcomes {
@@ -1690,15 +2125,15 @@ mod tests {
             fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
             fixture("2", "Beta", "vless", "127.0.0.1", 10802),
         ];
-        let (mut prober, handle) = FakeHealthProber::shared();
+        let (prober, handle) = FakeHealthProber::shared();
         handle.script_latency("1", 30);
         handle.script_latency("2", 40);
         let mut store = HealthStore::default();
-        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
             store.record_outcome(&outcome);
         }
         handle.script_failure("2", "connection reset");
-        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
             store.record_outcome(&outcome);
         }
         let alpha = store.status("1");
@@ -1890,9 +2325,9 @@ mod tests {
         assert_eq!(HealthKind::UrlTest.as_str(), "url-test");
         assert_eq!(HealthKind::TcpPing.as_str(), "tcp-ping");
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
-        let (mut prober, handle) = FakeHealthProber::shared();
+        let (prober, handle) = FakeHealthProber::shared();
         handle.script_latency("1", 7);
-        let outcomes = ping_all(&configs, &mut prober);
+        let outcomes = ping_all(&configs, &prober);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].sample.kind, HealthKind::TcpPing);
         assert_eq!(outcomes[0].sample.latency_ms, Some(7));
@@ -1909,9 +2344,9 @@ mod tests {
             fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
             fixture("9", "Odd", "naive", "127.0.0.1", 10809),
         ];
-        let (mut prober, handle) = FakeHealthProber::shared();
+        let (prober, handle) = FakeHealthProber::shared();
         handle.deny_protocol("naive");
-        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &prober);
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes[0].sample.error.is_none());
         let skip = outcomes[1].sample.error.as_deref().expect("named skip");
@@ -1942,9 +2377,9 @@ mod tests {
             fixture("7", "AwgOne", "amneziawg", "127.0.0.1", 10807),
             fixture("9", "Odd", "naive", "127.0.0.1", 10809),
         ];
-        let (mut prober, handle) = FakeHealthProber::shared();
+        let (prober, handle) = FakeHealthProber::shared();
         handle.deny_protocol("naive");
-        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &prober);
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes[0].sample.error.is_none());
         assert!(outcomes[1].sample.error.is_some());
@@ -1984,8 +2419,8 @@ mod tests {
             fixture("5", "Slot", "extra-core", "127.0.0.1", 10805),
             fixture("8", "ChainAB", "chain", "127.0.0.1", 10808),
         ];
-        let (mut prober, handle) = FakeHealthProber::shared();
-        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        let (prober, handle) = FakeHealthProber::shared();
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &prober);
         assert_eq!(outcomes.len(), 4);
         for (config, outcome) in configs.iter().zip(outcomes.iter()) {
             assert!(
@@ -2019,8 +2454,8 @@ mod tests {
             fixture("9", "AnyOne", "anytls", "127.0.0.1", 10809),
             fixture("3", "NoiseOne", "noise", "127.0.0.1", 10803),
         ];
-        let (mut prober, handle) = FakeHealthProber::shared();
-        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &mut prober);
+        let (prober, handle) = FakeHealthProber::shared();
+        let outcomes = test_all(&configs, DEFAULT_TEST_URL, &prober);
         assert_eq!(outcomes.len(), 3);
         let mut store = HealthStore::default();
         for (config, outcome) in configs.iter().zip(outcomes.iter()) {
@@ -2057,12 +2492,12 @@ mod tests {
     #[test]
     fn traffic_stats_accumulate_per_config() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
-        let (mut prober, _) = FakeHealthProber::shared();
+        let (prober, _) = FakeHealthProber::shared();
         let mut store = HealthStore::default();
-        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
             store.record_outcome(&outcome);
         }
-        for outcome in ping_all(&configs, &mut prober) {
+        for outcome in ping_all(&configs, &prober) {
             store.record_outcome(&outcome);
         }
         let stats = store.traffic("1");
@@ -2079,13 +2514,13 @@ mod tests {
     #[test]
     fn traffic_text_is_labeled_probe() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
-        let (mut prober, _) = FakeHealthProber::shared();
+        let (prober, _) = FakeHealthProber::shared();
         let mut store = HealthStore::default();
         assert!(
             store.detail_line("1") == "health: not tested",
             "untested row names the state"
         );
-        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
             store.record_outcome(&outcome);
         }
         let line = store.detail_line("1");
@@ -2117,9 +2552,9 @@ mod tests {
     #[test]
     fn ticket36_traffic_text_prefers_data_plane() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
-        let (mut prober, _) = FakeHealthProber::shared();
+        let (prober, _) = FakeHealthProber::shared();
         let mut store = HealthStore::default();
-        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
             store.record_outcome(&outcome);
         }
         store.set_data_traffic("1", 1_048_782, 88);
@@ -2207,12 +2642,13 @@ mod tests {
             fixture("2", "Beta", "vless", "127.0.0.1", 10802),
         ];
         let mut logs = LogStore::default();
+        let tags = LogTagIndex::build(&active);
         logs.push_raw(
             "warn out-1: dial failed password=hunter2 uuid=11111111-2222-4333-8444-555555555555",
-            &active,
+            &tags,
         );
-        logs.push_raw("error in-2: upstream reset", &active);
-        logs.push_raw("info engine listening on 127.0.0.1:10801", &active);
+        logs.push_raw("error in-2: upstream reset", &tags);
+        logs.push_raw("info engine listening on 127.0.0.1:10801", &tags);
         let alpha = logs.for_config("1");
         assert_eq!(alpha.len(), 1, "only its lines show");
         assert_eq!(alpha[0].config_id.as_deref(), Some("1"));
@@ -2454,9 +2890,9 @@ mod tests {
     #[test]
     fn t41_stale_markers_flag_and_clear() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
-        let (mut prober, _) = FakeHealthProber::shared();
+        let (prober, _) = FakeHealthProber::shared();
         let mut store = HealthStore::default();
-        for outcome in test_all(&configs, DEFAULT_TEST_URL, &mut prober) {
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
             store.record_outcome(&outcome);
         }
         store.set_data_traffic("1", 1_048_782, 88);
@@ -2472,5 +2908,526 @@ mod tests {
         store.clear_stale("1");
         assert!(!store.is_stale("1"));
         assert!(!store.detail_line("1").contains("stale"));
+    }
+
+    /// Ticket 47 (RED): bounded concurrent probes — 16 slow probes finish in
+    /// ~2 waves (8-way) with at most 8 in flight, outcomes in input order.
+    #[test]
+    fn t47_concurrent_probes_bounded_and_ordered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingProber {
+            delay: std::time::Duration,
+            live: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
+        }
+        impl HealthProber for CountingProber {
+            fn url_test(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+                _url: &str,
+            ) -> Result<ProbeSuccess, String> {
+                let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok(ProbeSuccess {
+                    latency_ms: 7,
+                    bytes_rx: 1,
+                    bytes_tx: 1,
+                })
+            }
+            fn tcp_ping(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+            ) -> Result<ProbeSuccess, String> {
+                let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Ok(ProbeSuccess {
+                    latency_ms: 7,
+                    bytes_rx: 0,
+                    bytes_tx: 0,
+                })
+            }
+        }
+
+        assert_eq!(MAX_PROBE_CONCURRENCY, 8, "bound pinned");
+        let configs: Vec<ProxyConfig> = (0..16)
+            .map(|i| {
+                fixture(
+                    &i.to_string(),
+                    &format!("Row{i}"),
+                    "vless",
+                    "127.0.0.1",
+                    10801,
+                )
+            })
+            .collect();
+        let live = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let prober = CountingProber {
+            delay: std::time::Duration::from_millis(100),
+            live: live.clone(),
+            max: max.clone(),
+        };
+        let started = std::time::Instant::now();
+        let outcomes = test_all_concurrent(&configs, DEFAULT_TEST_URL, &prober);
+        let wall = started.elapsed();
+        assert_eq!(outcomes.len(), 16, "one outcome per row");
+        for (i, outcome) in outcomes.iter().enumerate() {
+            assert_eq!(outcome.sample.config_id, i.to_string(), "input order kept");
+            assert_eq!(outcome.sample.latency_ms, Some(7));
+        }
+        let peak = max.load(Ordering::SeqCst);
+        assert!(peak >= 2, "probes overlap, peak was {peak}");
+        assert!(
+            peak <= MAX_PROBE_CONCURRENCY,
+            "bounded at 8-way, peak was {peak}"
+        );
+        assert!(
+            wall < std::time::Duration::from_millis(800),
+            "16x100ms in ~2 waves, took {wall:?}"
+        );
+    }
+
+    /// Ticket 47 (RED): concurrent clash polls — fast cores return entries
+    /// while a slow core fails closed on the per-core timeout, and the whole
+    /// round lands well under the serial sum (parallel, not sequential).
+    #[test]
+    fn t47_clash_polls_concurrent_with_per_core_timeout() {
+        use std::io::{Read as _, Write as _};
+        use std::time::{Duration, Instant};
+
+        assert!(
+            (1..=2).contains(&CLASH_PER_CORE_TIMEOUT_SECS),
+            "per-core timeout 1-2s"
+        );
+        assert!(
+            CLASH_TOTAL_DEADLINE.as_secs() >= CLASH_PER_CORE_TIMEOUT.as_secs(),
+            "total deadline covers one per-core timeout"
+        );
+
+        fn fast_stub(entries: &str) -> (u16, std::thread::JoinHandle<()>) {
+            let body = entries.to_string();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+            let port = listener.local_addr().expect("addr works").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept works");
+                let mut head = [0u8; 2048];
+                let _ = stream.read(&mut head);
+                let payload = body.clone();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("reply works");
+            });
+            (port, server)
+        }
+        fn slow_stub(delay: Duration) -> (u16, std::thread::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+            let port = listener.local_addr().expect("addr works").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept works");
+                let mut head = [0u8; 2048];
+                let _ = stream.read(&mut head);
+                std::thread::sleep(delay);
+                let payload = r#"{"connections":[]}"#.to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+            });
+            (port, server)
+        }
+
+        let entry_body = r#"{"connections":[
+            {"download": 100, "id": "c1",
+             "metadata": {"host": "example.com", "type": "mixed/in-7"},
+             "upload": 10}]}"#;
+        let (fast1, srv1) = fast_stub(entry_body);
+        let (fast2, srv2) = fast_stub(entry_body);
+        let (slow, srv_slow) = slow_stub(Duration::from_secs(3));
+        let targets = vec![
+            crate::engine::ClashTarget {
+                core: "a".to_string(),
+                port: fast1,
+                secret: "s".to_string(),
+            },
+            crate::engine::ClashTarget {
+                core: "b".to_string(),
+                port: fast2,
+                secret: "s".to_string(),
+            },
+            crate::engine::ClashTarget {
+                core: "slow".to_string(),
+                port: slow,
+                secret: "s".to_string(),
+            },
+        ];
+        let started = Instant::now();
+        let mut results =
+            poll_clash_targets(&targets, Duration::from_secs(1), Duration::from_secs(4));
+        results.sort_by(|a, b| a.0.core.cmp(&b.0.core));
+        let wall = started.elapsed();
+        assert_eq!(results.len(), 3, "one result per target");
+        for (target, result) in &results {
+            if target.core == "slow" {
+                assert!(result.is_err(), "slow core fails closed, got {result:?}");
+            } else {
+                let entries = result.as_ref().expect("fast core answers");
+                assert_eq!(entries.len(), 1, "entries parsed");
+                assert_eq!(entries[0].row_id.as_deref(), Some("7"));
+            }
+        }
+        assert!(
+            wall < Duration::from_millis(2500),
+            "parallel round beats the serial sum, took {wall:?}"
+        );
+        srv1.join().expect("fast stub drains");
+        srv2.join().expect("fast stub drains");
+        srv_slow.join().expect("slow stub drains");
+    }
+
+    /// Ticket 47 (RED): the total deadline cuts a round of all-slow cores —
+    /// every result is a deadline error and the round returns promptly.
+    #[test]
+    fn t47_clash_polls_total_deadline_caps_all_slow() {
+        use std::io::Read as _;
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept works");
+                let mut head = [0u8; 2048];
+                let _ = stream.read(&mut head);
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+        let targets = vec![
+            crate::engine::ClashTarget {
+                core: "s1".to_string(),
+                port,
+                secret: "s".to_string(),
+            },
+            crate::engine::ClashTarget {
+                core: "s2".to_string(),
+                port,
+                secret: "s".to_string(),
+            },
+        ];
+        let started = Instant::now();
+        let results = poll_clash_targets(&targets, Duration::from_secs(10), Duration::from_secs(1));
+        let wall = started.elapsed();
+        assert_eq!(results.len(), 2);
+        for (target, result) in &results {
+            assert!(
+                result.is_err(),
+                "{} fails closed on the total deadline, got {result:?}",
+                target.core
+            );
+        }
+        assert!(
+            wall < Duration::from_secs(3),
+            "total deadline caps the round, took {wall:?}"
+        );
+        let _ = server;
+    }
+
+    /// Ticket 47 (RED): ingest strips ANSI once and caches the lowercase
+    /// search blob — stored records carry no escapes.
+    #[test]
+    fn t47_log_ingest_strips_ansi_and_caches_search() {
+        let tags = LogTagIndex::build(&[]);
+        let mut logs = LogStore::default();
+        let esc = char::from(27u8);
+        logs.push_raw(&format!("{esc}[31mERROR{esc}[0m dial failed"), &tags);
+        let all = logs.all();
+        assert_eq!(all.len(), 1);
+        assert!(
+            !all[0].message.contains('\u{1b}'),
+            "stripped at ingest: {:?}",
+            all[0].message
+        );
+        assert!(all[0].message.contains("ERROR"), "text kept");
+        assert_eq!(all[0].level, LogLevel::Error);
+        assert_eq!(
+            all[0].search,
+            format!("[{}] {}", all[0].level.as_str(), all[0].message).to_lowercase(),
+            "search blob cached at ingest"
+        );
+    }
+
+    /// Ticket 47 (RED): the precomputed tag index answers exactly like the
+    /// per-line scan — including overlapping numeric ids (first-config-wins).
+    #[test]
+    fn t47_log_tag_index_matches_scan() {
+        let active = vec![
+            fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
+            fixture("12", "Dozen", "vless", "127.0.0.1", 10802),
+            fixture("2", "Beta", "vless", "127.0.0.1", 10803),
+        ];
+        let index = LogTagIndex::build(&active);
+        for line in [
+            "warn in-1: dial failed",
+            "error out-12: upstream reset",
+            "info in-12 trailing in-1: overlap",
+            "debug out-2: closed",
+            "info engine listening on 127.0.0.1:10801",
+            "in- deeper prefix",
+            "warn out-1 then out-12: first wins",
+        ] {
+            assert_eq!(
+                index.tag_for(line),
+                tag_for_line(line, &active),
+                "index parity for {line:?}"
+            );
+        }
+        assert_eq!(index.tag_for("warn in-1: x").as_deref(), Some("1"));
+        // Substring-overlap quirk (pre-existing, preserved): "out-12"
+        // contains "out-1", so first-config-wins claims it for "1" — parity,
+        // never longest-match.
+        assert_eq!(index.tag_for("error out-12: y").as_deref(), Some("1"));
+        assert_eq!(index.tag_for("info engine started"), None);
+        // Without the overlapping id, 12 wins its own tag.
+        let index12 = LogTagIndex::build(&active[1..]);
+        assert_eq!(index12.tag_for("error out-12: y").as_deref(), Some("12"));
+    }
+
+    /// Ticket 47 (RED): the log ring stays capped and crash-cause lines
+    /// survive churn (pinned past normal-line eviction).
+    #[test]
+    fn t47_log_ring_pins_crash_lines() {
+        let tags = LogTagIndex::build(&[]);
+        let mut logs = LogStore::default();
+        logs.push_raw("panic: runtime error in sidecar", &tags);
+        logs.push_raw("FATAL: core dumped", &tags);
+        logs.push_raw("warn sidecar crashed hard", &tags);
+        for i in 0..(MAX_LOG_RECORDS + 500) {
+            logs.push_raw(&format!("info heartbeat {i}"), &tags);
+        }
+        assert_eq!(logs.all().len(), MAX_LOG_RECORDS, "ring capped");
+        let messages: Vec<&str> = logs
+            .all()
+            .iter()
+            .map(|record| record.message.as_str())
+            .collect();
+        assert!(messages.iter().any(|m| m.contains("panic")), "panic pinned");
+        assert!(messages.iter().any(|m| m.contains("FATAL")), "fatal pinned");
+        assert!(
+            messages.iter().any(|m| m.contains("crashed")),
+            "crash pinned"
+        );
+    }
+
+    /// Ticket 47 (RED): the latest-health index answers O(1) and always
+    /// agrees with a reverse scan — across interleaved kinds, ring-cap
+    /// eviction, and stale pruning.
+    #[test]
+    fn t47_latest_health_index_matches_scan() {
+        let mut store = HealthStore::default();
+        let mut model: Vec<HealthSample> = Vec::new();
+        let kinds = [HealthKind::UrlTest, HealthKind::TcpPing];
+        for i in 0..600 {
+            let config = format!("cfg{}", i % 3);
+            let kind = kinds[(i / 3) % 2];
+            let sample = HealthSample {
+                config_id: config.clone(),
+                at: 1_700_000_000 + i as i64,
+                kind,
+                latency_ms: Some(i as u64),
+                error: None,
+            };
+            store.push_sample(sample.clone());
+            model.push(sample);
+            if model.len() > MAX_SAMPLES {
+                model.remove(0);
+            }
+        }
+        for cfg in ["cfg0", "cfg1", "cfg2"] {
+            let expect_any = model.iter().rev().find(|s| s.config_id == cfg);
+            assert_eq!(store.latest(cfg), expect_any, "latest {cfg}");
+            for kind in kinds {
+                let expect = model
+                    .iter()
+                    .rev()
+                    .find(|s| s.config_id == cfg && s.kind == kind);
+                assert_eq!(
+                    store.latest_of(cfg, kind),
+                    expect,
+                    "latest {cfg:?}/{kind:?}"
+                );
+            }
+        }
+        assert!(store.samples.len() <= MAX_SAMPLES, "ring capped");
+        // Eviction under pressure: newest index entries survive a full churn.
+        for i in 0..(MAX_SAMPLES + 50) {
+            let sample = HealthSample {
+                config_id: "churn".to_string(),
+                at: 1_800_000_000 + i as i64,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(i as u64),
+                error: None,
+            };
+            store.push_sample(sample.clone());
+            model.push(sample);
+            if model.len() > MAX_SAMPLES {
+                model.remove(0);
+            }
+        }
+        assert!(
+            store.samples.len() <= MAX_SAMPLES,
+            "ring capped after churn"
+        );
+        let expect = model.iter().rev().find(|s| s.config_id == "churn");
+        assert_eq!(store.latest("churn"), expect, "newest survives eviction");
+        // Prune rebuilds the index identically.
+        let now = 1_800_000_000 + MAX_SAMPLES as i64 + 100;
+        store.prune_stale(now, 90);
+        model.retain(|s| now.saturating_sub(s.at) <= 90);
+        for cfg in ["cfg0", "cfg1", "cfg2", "churn"] {
+            let expect_any = model.iter().rev().find(|s| s.config_id == cfg);
+            assert_eq!(store.latest(cfg), expect_any, "latest {cfg} after prune");
+            for kind in kinds {
+                let expect = model
+                    .iter()
+                    .rev()
+                    .find(|s| s.config_id == cfg && s.kind == kind);
+                assert_eq!(
+                    store.latest_of(cfg, kind),
+                    expect,
+                    "latest {cfg:?}/{kind:?} after prune"
+                );
+            }
+        }
+    }
+
+    /// Ticket 47 (RED): the traffic last-seen map stays bounded (cap + TTL)
+    /// while never dropping failed-live-core ids (no double-count on
+    /// recovery) and dropping closed connections on healthy cores.
+    #[test]
+    fn t47_traffic_seen_map_bounds_and_sweep() {
+        use std::collections::HashSet;
+        let mut map = TrafficSeenMap::default();
+        assert!(map.is_empty(), "fresh map tracks nothing");
+        let now = 1_700_000_000i64;
+        map.insert("core-a/c1".to_string(), 100, 10, now);
+        assert!(!map.is_empty(), "insert tracks");
+        assert_eq!(map.get("core-a/c1"), Some((100, 10)));
+        // Closed on a healthy core: dropped by the sweep.
+        let ok: HashSet<String> = ["core-a".to_string()].into_iter().collect();
+        let live = ok.clone();
+        map.sweep(now + 1, &ok, &HashSet::new(), &live);
+        assert_eq!(map.get("core-a/c1"), None, "closed conn dropped");
+        // Failed poll on a live core: kept across sweeps (never a mass
+        // close, never TTL'd while live).
+        map.insert("core-a/c2".to_string(), 50, 5, now);
+        let ok_empty: HashSet<String> = HashSet::new();
+        map.sweep(now + 1, &ok_empty, &HashSet::new(), &live);
+        assert_eq!(map.get("core-a/c2"), Some((50, 5)), "failed-live kept");
+        map.sweep(
+            now + TRAFFIC_SEEN_TTL_SECS + 10,
+            &ok_empty,
+            &HashSet::new(),
+            &live,
+        );
+        assert_eq!(
+            map.get("core-a/c2"),
+            Some((50, 5)),
+            "live entries ignore TTL"
+        );
+        // Dead core (crashed/removed): TTL'd out so the map never grows
+        // without bound across restarts.
+        map.insert("dead/c9".to_string(), 7, 7, now);
+        let live_only_a = live.clone();
+        map.sweep(
+            now + TRAFFIC_SEEN_TTL_SECS + 10,
+            &ok_empty,
+            &HashSet::new(),
+            &live_only_a,
+        );
+        assert_eq!(map.get("dead/c9"), None, "dead-core entry TTL'd");
+        // Cap: overflow evicts oldest evictable, never failed-live ids.
+        let mut big = TrafficSeenMap::default();
+        big.insert("core-a/keep".to_string(), 1, 1, now);
+        for i in 0..(MAX_TRAFFIC_SEEN_ENTRIES + 100) {
+            big.insert(format!("gone-{i}/c"), i as u64, 0, now + 1 + i as i64);
+        }
+        big.sweep(now + 2, &ok_empty, &HashSet::new(), &HashSet::new());
+        assert!(
+            big.len() <= MAX_TRAFFIC_SEEN_ENTRIES,
+            "map capped, len={}",
+            big.len()
+        );
+        assert_eq!(
+            big.get("core-a/keep"),
+            None,
+            "non-live overflow entries evict (core-a not live here)"
+        );
+    }
+
+    /// Ticket 47: concurrent runner matches the sequential runner
+    /// outcome-for-outcome (ignoring `at` stamps) for both kinds.
+    #[test]
+    fn t47_concurrent_matches_sequential() {
+        let configs = vec![
+            fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
+            fixture("2", "Beta", "vless", "127.0.0.1", 10802),
+            fixture("3", "Gamma", "vless", "127.0.0.1", 10803),
+        ];
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_failure("2", "boom");
+        let seq_url = run_all(
+            &configs,
+            &prober,
+            HealthKind::UrlTest,
+            "url test",
+            url_probe,
+            DEFAULT_TEST_URL,
+        );
+        let par_url = test_all_concurrent(&configs, DEFAULT_TEST_URL, &prober);
+        assert_eq!(strip_at(seq_url), strip_at(par_url), "url-test parity");
+        let seq_ping = run_all(
+            &configs,
+            &prober,
+            HealthKind::TcpPing,
+            "tcp ping",
+            ping_probe,
+            "",
+        );
+        let par_ping = ping_all_concurrent(&configs, &prober);
+        assert_eq!(strip_at(seq_ping), strip_at(par_ping), "tcp-ping parity");
+
+        fn strip_at(
+            outcomes: Vec<TestOutcome>,
+        ) -> Vec<(String, HealthKind, Option<u64>, Option<String>)> {
+            outcomes
+                .into_iter()
+                .map(|o| {
+                    (
+                        o.sample.config_id,
+                        o.sample.kind,
+                        o.sample.latency_ms,
+                        o.sample.error,
+                    )
+                })
+                .collect()
+        }
     }
 }
