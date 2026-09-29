@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::button::Button;
+use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
@@ -34,8 +35,8 @@ use engine::{
     LAN_CONFIRM_TITLE,
 };
 use health::{
-    ping_all, redact_secrets, test_all, truncate, HealthProber, HealthStore, LogStore,
-    RealHealthProber, TestOutcome, DEFAULT_TEST_URL,
+    format_bytes, ping_all, redact_secrets, sparkline_latencies, test_all, truncate, HealthProber,
+    HealthStore, LogLevel, LogStore, RealHealthProber, TestOutcome, DEFAULT_TEST_URL,
 };
 use import::{
     commit_batch, effective_hint_for_text, format_import_failures, import_file_content,
@@ -1365,6 +1366,94 @@ async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Resu
     String::from_utf8(buf).map_err(|_| "subscription body is not UTF-8".to_string())
 }
 
+/// Ticket 45: per-subscription interval presets (seconds) behind the
+/// interval picker. `0` means always-due (matches
+/// [`store::due_for_refresh`]); the default stays daily.
+pub const INTERVAL_PRESETS: &[i64] = &[0, 3_600, 21_600, 43_200, 86_400, 604_800];
+
+/// Ticket 45: display copy for an interval value (`0`/`<= 0` = always).
+pub fn format_interval_secs(secs: i64) -> String {
+    if secs <= 0 {
+        return "always".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3_600 {
+        return format!("{}m", secs / 60);
+    }
+    if secs < 604_800 {
+        return format!("{}h", secs / 3_600);
+    }
+    format!("{}d", secs / 86_400)
+}
+
+/// Ticket 45: display copy for a subscription's last successful refresh
+/// (`None` = never — rendered honestly, never blank).
+pub fn format_last_refresh(last_refresh_at: Option<i64>, now: i64) -> String {
+    match last_refresh_at {
+        None => "never refreshed".to_string(),
+        Some(last) => {
+            let delta = now.saturating_sub(last);
+            if delta < 60 {
+                "just now".to_string()
+            } else if delta < 3_600 {
+                format!("{}m ago", delta / 60)
+            } else if delta < 86_400 {
+                format!("{}h ago", delta / 3_600)
+            } else {
+                format!("{}d ago", delta / 86_400)
+            }
+        }
+    }
+}
+
+/// Ticket 45: summed data-plane totals across all rows for the status bar
+/// (`None` when the store is unreadable — the bar then shows no totals
+/// rather than a lying zero).
+pub fn summed_traffic_text(store: &Store) -> Option<String> {
+    let totals = store.traffic_totals().ok()?;
+    let (mut rx, mut tx) = (0u64, 0u64);
+    for (row_rx, row_tx) in totals.values() {
+        rx = rx.saturating_add(*row_rx);
+        tx = tx.saturating_add(*row_tx);
+    }
+    Some(format!("↓ {} · ↑ {}", format_bytes(rx), format_bytes(tx)))
+}
+
+/// Ticket 45: one interval-picker row — preset buttons writing the shared
+/// `interval_secs` cell (the dialog commit reads it, like the
+/// auto-refresh switch). The current preset reads back in brackets.
+fn interval_picker_row(id_prefix: &str, interval_secs: Rc<RefCell<i64>>) -> impl IntoElement {
+    let current = *interval_secs.borrow();
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(Label::new(format!(
+            "Refresh every {}",
+            format_interval_secs(current)
+        )));
+    for preset in INTERVAL_PRESETS {
+        let cell = interval_secs.clone();
+        let secs = *preset;
+        let label = if secs == current {
+            format!("[{}]", format_interval_secs(secs))
+        } else {
+            format_interval_secs(secs)
+        };
+        row = row.child(
+            Button::new(format!("{id_prefix}-{secs}"))
+                .label(label)
+                .on_click(move |_, _, _| {
+                    *cell.borrow_mut() = secs;
+                }),
+        );
+    }
+    row
+}
+
 /// Handles to the subscription add form inside the subscriptions dialog.
 /// Ticket 17: `auto_refresh` is the add-form checkbox state (default on —
 /// no more create-then-toggle). A shared cell (not an entity): the dialog
@@ -1376,6 +1465,8 @@ struct SubForm {
     url: Entity<InputState>,
     group: Entity<InputState>,
     auto_refresh: Rc<RefCell<bool>>,
+    /// Ticket 45: per-subscription interval picker state (default daily).
+    interval_secs: Rc<RefCell<i64>>,
 }
 
 impl SubForm {
@@ -1389,6 +1480,7 @@ impl SubForm {
         url: &str,
         group: &str,
         auto_refresh: bool,
+        interval_secs: i64,
     ) -> Self {
         Self {
             label: cx.new(|cx| {
@@ -1407,6 +1499,7 @@ impl SubForm {
                     .default_value(group.to_string())
             }),
             auto_refresh: Rc::new(RefCell::new(auto_refresh)),
+            interval_secs: Rc::new(RefCell::new(interval_secs)),
         }
     }
 
@@ -1434,6 +1527,14 @@ impl SubForm {
                             *auto.borrow_mut() = *next;
                         }),
                 ),
+            )
+            // Ticket 45: per-subscription interval picker (preset buttons
+            // write the shared cell; OK commits it).
+            .child(
+                div()
+                    .id("field-sub-interval")
+                    .test_support()
+                    .child(interval_picker_row("sub-interval-add", self.interval_secs)),
             );
         if let Some(warning) = http_subscription_warning(&url) {
             col = col.child(
@@ -1452,6 +1553,9 @@ impl SubForm {
 /// Remove actions. Refresh re-reads the record so a stale snapshot cannot
 /// fetch a removed subscription.
 /// Ticket 31: plus an Edit action opening the label/url/group editor.
+/// Ticket 45: plus the visible last-refresh time and per-sub interval
+/// (the controllable-subscriptions surface: picker in the add/edit forms,
+// kill-switch + Refresh-all-due in the dialog header).
 fn subscription_row(
     view: Entity<AppView>,
     sub: ProxySubscription,
@@ -1468,7 +1572,19 @@ fn subscription_row(
             redact_subscription_url(&sub.url),
             sub.group,
             if sub.auto_refresh { "on" } else { "off" }
-        ));
+        ))
+        // Ticket 45: last-refresh + interval are always visible (never a
+        // hidden auto-update).
+        .child(
+            div()
+                .id(format!("sub-meta-{}", sub.id))
+                .test_support()
+                .child(format!(
+                    "last refresh: {} · every {}",
+                    format_last_refresh(sub.last_refresh_at, now_unix()),
+                    format_interval_secs(sub.interval_secs)
+                )),
+        );
     if let Some(error) = sub.last_error.as_deref() {
         row = row.child(format!("last error: {error}"));
     }
@@ -1727,6 +1843,14 @@ struct AppView {
     health_store: HealthStore,
     logs: LogStore,
     log_filter: String,
+    /// Ticket 45: logs level filter (`None` = all) + tail toggle (true =
+    /// follow the newest, false = paused at the head).
+    log_level: Option<LogLevel>,
+    log_tail: bool,
+    /// Ticket 45: true while the logs dialog owns the screen (cleared by
+    /// every dismiss path via `.on_close`, so level/tail toggles never
+    /// touch a foreign dialog — the ticket-26 subs-form precedent).
+    logs_open: bool,
     /// Ticket 36: last-seen clash connection bytes (`core/conn-id` → (rx,
     /// tx)) for the traffic tick. Keyed per connection (not per row) so a
     /// connection that closes between polls cannot double-count the bytes
@@ -1841,6 +1965,9 @@ impl AppView {
             health_store: HealthStore::default(),
             logs: LogStore::default(),
             log_filter: String::new(),
+            log_level: None,
+            log_tail: true,
+            logs_open: false,
             traffic_last_seen: HashMap::new(),
             prober: Box::new(RealHealthProber::default()),
             ticks_enabled: true,
@@ -3502,32 +3629,99 @@ impl AppView {
     /// `[31m`/`[38;5;…`); the Logs dialog renders them stripped via the
     /// shared `strip_ansi_codes` helper. Stored records stay verbatim so
     /// filtering and any future export see the original bytes.
-    fn log_lines(&self, cx: &App) -> Vec<String> {
+    /// Ticket 45: the level filter (`log_level`) applies first; the tail
+    /// toggle picks the newest 200 (tail on) or the oldest 200 (tail off,
+    /// paused at the head). This is the single source behind the dialog,
+    /// Save-visible, and Copy-all — all three always agree.
+    fn visible_log_lines(&self, cx: &App) -> Vec<String> {
         let selected = self.selected_config(cx).map(|config| config.id);
         let filter = self.log_filter.trim().to_lowercase();
+        let level = self.log_level;
         let render =
             |level: &str, message: &str| format!("[{}] {}", level, strip_ansi_codes(message));
-        let mut lines: Vec<String> = match selected.as_deref() {
-            Some(id) => self
-                .logs
-                .for_config(id)
-                .iter()
-                .map(|record| render(record.level.as_str(), &record.message))
-                .collect(),
-            None => self
-                .logs
-                .all()
-                .iter()
-                .map(|record| render(record.level.as_str(), &record.message))
-                .collect(),
+        let records: Vec<&crate::health::LogRecord> = match selected.as_deref() {
+            Some(id) => self.logs.for_config(id),
+            None => self.logs.all().iter().collect(),
         };
+        let mut lines: Vec<String> = records
+            .iter()
+            .filter(|record| level.is_none_or(|want| record.level == want))
+            .map(|record| render(record.level.as_str(), &record.message))
+            .collect();
         if !filter.is_empty() {
             lines.retain(|line| line.to_lowercase().contains(&filter));
         }
         if lines.len() > 200 {
-            lines = lines.split_off(lines.len() - 200);
+            if self.log_tail {
+                lines = lines.split_off(lines.len() - 200);
+            } else {
+                lines.truncate(200);
+            }
         }
         lines
+    }
+
+    /// Ticket 45: write exactly the visible lines to `path` (Save-visible).
+    /// Atomic like the library export (temp sibling + rename), so a crash
+    /// mid-save never leaves a half file. Returns the path for the toast.
+    fn write_visible_logs_to(&self, path: &std::path::Path, cx: &App) -> Result<(), String> {
+        let body = self.visible_log_lines(cx).join("\n");
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, body).map_err(|error| format!("Cannot save logs: {error}"))?;
+        std::fs::rename(&tmp, path).map_err(|error| format!("Cannot save logs: {error}"))?;
+        Ok(())
+    }
+
+    /// Ticket 45: Save-visible commit — writes to
+    /// [`Store::default_logs_path`] (the export-path pattern) and toasts the
+    /// path; failures toast instead of silently dropping evidence.
+    fn save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = Store::default_logs_path();
+        match self.write_visible_logs_to(&path, cx) {
+            Ok(()) => window.push_notification(
+                Notification::success(format!("Logs saved to {}", path.display())),
+                cx,
+            ),
+            Err(error) => window.push_notification(Notification::error(error), cx),
+        }
+    }
+
+    /// Ticket 45: Copy-all commit — the visible lines reach the clipboard
+    /// verbatim (already redacted at ingest, stripped of ANSI).
+    fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.visible_log_lines(cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        window.push_notification(
+            Notification::success(format!("Copied {} log line(s)", lines.len())),
+            cx,
+        );
+    }
+
+    /// Ticket 45: cycle the logs level filter (all → error → warn → info →
+    /// debug → all). Pure state — the dialog reopens to show the result
+    /// (snapshot-at-open semantics, ticket 26 L4).
+    fn cycle_log_level(&mut self) {
+        let label = match self.log_level {
+            None => "all",
+            Some(level) => level.as_str(),
+        };
+        let order = ["all", "error", "warn", "info", "debug"];
+        let next = order
+            .iter()
+            .cycle()
+            .skip_while(|candidate| **candidate != label)
+            .nth(1)
+            .copied()
+            .unwrap_or("all");
+        self.log_level = LogLevel::from_label(next);
+    }
+
+    /// Ticket 45: level-filter label for the cycle button.
+    fn log_level_label(&self) -> String {
+        match self.log_level {
+            None => "Level: all".to_string(),
+            Some(level) => format!("Level: {}", level.as_str()),
+        }
     }
 
     /// Ticket 06: per-config log dialog with a filter field. OK applies the
@@ -3536,6 +3730,7 @@ impl AppView {
     /// need a reopen. Live re-rendering an open dialog on every engine tick
     /// would fight the user's scroll position and filter typing.
     fn open_logs_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.logs_open = true;
         let current = self.log_filter.clone();
         let filter_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -3544,7 +3739,7 @@ impl AppView {
         });
         let view = cx.entity();
         let reader = filter_state.clone();
-        let lines = self.log_lines(cx);
+        let lines = self.visible_log_lines(cx);
         let title = match self.selected_config(cx) {
             Some(config) => format!("Logs — {}", config.name),
             None => "Logs".to_string(),
@@ -3555,23 +3750,79 @@ impl AppView {
         // lets the key path (framework) and the mouse path (footer) each
         // close exactly once. The previous explicit `close_all_dialogs` here
         // double-closed on the mouse path.
+        let commit_view = view.clone();
         let commit: DialogCommit = Rc::new(move |_window, cx| {
             let filter = reader.read(cx).value().to_string();
-            view.update(cx, |view, cx| {
+            commit_view.update(cx, |view, cx| {
                 view.log_filter = filter;
                 cx.notify();
             });
             true
         });
         let commit_key = commit.clone();
+        let level_label = self.log_level_label();
+        let tail_on = self.log_tail;
+        let level_view = view.clone();
+        let tail_view = view.clone();
+        let save_view = view.clone();
+        let copy_view = view.clone();
+        let close_view = view.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
+            let level_buttons = level_view.clone();
+            let tail_buttons = tail_view.clone();
+            let save_buttons = save_view.clone();
+            let copy_buttons = copy_view.clone();
+            let close_inner = close_view.clone();
             let mut body = div().flex().flex_col().gap_2().child(dialog_field(
                 "field-log-filter",
                 "Filter",
                 filter_state.clone(),
             ));
+            // Ticket 45: level filter + tail toggle + Save-visible +
+            // Copy-all (the evidence-leaves-the-app row).
+            let tail_now = tail_on;
+            let controls = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("logs-level")
+                        .label(level_label.clone())
+                        .on_click(move |_, window, cx| {
+                            level_buttons.update(cx, |view, cx| {
+                                view.cycle_log_level_and_reopen(window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("logs-tail")
+                        .label(if tail_now { "Tail: on" } else { "Tail: off" })
+                        .on_click(move |_, window, cx| {
+                            tail_buttons.update(cx, |view, cx| {
+                                view.toggle_log_tail_and_reopen(window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("logs-save")
+                        .label("Save")
+                        .on_click(move |_, window, cx| {
+                            save_buttons.update(cx, |view, cx| {
+                                view.save_visible_logs(window, cx);
+                            });
+                        }),
+                )
+                .child(Button::new("logs-copy").label("Copy all").on_click(
+                    move |_, window, cx| {
+                        copy_buttons.update(cx, |view, cx| {
+                            view.copy_visible_logs(window, cx);
+                        });
+                    },
+                ));
+            body = body.child(controls);
             let mut list = div()
                 .id("log-lines")
                 .test_support()
@@ -3593,12 +3844,42 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
+                .on_close(move |_, _, cx| {
+                    close_inner.update(cx, |view, _| {
+                        view.logs_open = false;
+                    });
+                })
                 .footer(dialog_footer(
                     "logs-dialog-ok",
                     "logs-dialog-cancel",
                     commit_click,
                 ))
         });
+    }
+
+    /// Ticket 45: re-render the logs dialog after a level/tail action, but
+    /// only if the logs dialog itself still owns the screen (the
+    /// ticket-26 subs-form precedent — never touch a foreign dialog).
+    fn reopen_logs_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.has_active_dialog(cx) || !self.logs_open {
+            return;
+        }
+        window.close_all_dialogs(cx);
+        self.open_logs_dialog(window, cx);
+    }
+
+    /// Ticket 45: level-cycle behind the logs dialog button.
+    fn cycle_log_level_and_reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_log_level();
+        self.reopen_logs_if_open(window, cx);
+    }
+
+    /// Ticket 45: tail toggle behind the logs dialog button (tail off =
+    /// paused at the head; the snapshot-at-open list then shows the first
+    /// 200 instead of the newest 200).
+    fn toggle_log_tail_and_reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.log_tail = !self.log_tail;
+        self.reopen_logs_if_open(window, cx);
     }
 
     /// Ticket 11: user-owned JSON export behind the plaintext-secret
@@ -3941,6 +4222,53 @@ impl AppView {
                     true
                 })
         });
+    }
+
+    /// Ticket 45: confirm resetting one row's usage counters (explicit
+    /// second gate — one click never zeroes silently).
+    fn open_usage_reset_confirm(
+        &mut self,
+        config: ProxyConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let id = config.id.clone();
+        let name = config.name.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let id = id.clone();
+            alert
+                .confirm()
+                .title("Reset usage counters")
+                .description(format!(
+                    "Reset usage counters for \"{name}\" to zero? This cannot be undone."
+                ))
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_usage_reset(&id, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Ticket 45: zero one row's persisted usage counters after the confirm
+    /// gate. Unknown rows warn; store failures name the error.
+    fn commit_usage_reset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.reset_traffic_counters(id) {
+            Ok(()) => {
+                self.reload(window, cx);
+                window.push_notification(Notification::success("Usage counters reset to zero"), cx);
+            }
+            Err(StoreError::NotFound(_)) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot reset usage: {error}")),
+                    cx,
+                );
+            }
+        }
     }
 
     /// Ticket 03: paste/clipboard entry point. The batch commits through the
@@ -4346,6 +4674,7 @@ impl AppView {
             request.url,
             dialog_group.to_string(),
             true,
+            store::DEFAULT_AUTO_REFRESH_SECS,
             window,
             cx,
         )
@@ -4358,12 +4687,16 @@ impl AppView {
     /// create-then-toggle).
     /// Ticket 31: an already-subscribed URL takes the friendly path — a
     /// warning naming the existing label, no double row, dialog stays open.
+    /// Ticket 45: the add-form interval picker lands here too (applied
+    /// right after the insert; a set failure toasts but keeps the row).
+    #[allow(clippy::too_many_arguments)]
     fn commit_subscription_add(
         &mut self,
         label: String,
         url: String,
         group: String,
         auto_refresh: bool,
+        interval_secs: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -4381,6 +4714,12 @@ impl AppView {
             .add_subscription(&label, &url, &group, auto_refresh)
         {
             Ok(sub) => {
+                if let Err(error) = self.store.set_subscription_interval(&sub.id, interval_secs) {
+                    window.push_notification(
+                        Notification::error(format!("Cannot set refresh interval: {error}")),
+                        cx,
+                    );
+                }
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::success(format!(
@@ -4405,17 +4744,27 @@ impl AppView {
     /// [`AppView::reopen_subscriptions_if_open`]). A row removed mid-edit
     /// warns and closes; validation failures keep the dialog open with the
     /// error (retryable).
+    /// Ticket 45: the edit-dialog interval picker lands here too (applied
+    /// right after the update; a set failure toasts but keeps the edit).
+    #[allow(clippy::too_many_arguments)]
     fn commit_subscription_edit(
         &mut self,
         id: &str,
         label: String,
         url: String,
         group: String,
+        interval_secs: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         match self.store.update_subscription(id, &label, &url, &group) {
             Ok(updated) => {
+                if let Err(error) = self.store.set_subscription_interval(id, interval_secs) {
+                    window.push_notification(
+                        Notification::error(format!("Cannot set refresh interval: {error}")),
+                        cx,
+                    );
+                }
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::success(format!("Updated \"{}\"", updated.label)),
@@ -4906,8 +5255,9 @@ impl AppView {
         let url = form.url.read(cx).value().to_string();
         let group = form.group.read(cx).value().to_string();
         let auto = *form.auto_refresh.borrow();
+        let interval = *form.interval_secs.borrow();
         window.close_all_dialogs(cx);
-        self.open_subscriptions_dialog_restored(&label, &url, &group, auto, window, cx);
+        self.open_subscriptions_dialog_restored(&label, &url, &group, auto, interval, window, cx);
     }
 
     // -- Ticket 37: routing presets -------------------------------------
@@ -5604,7 +5954,15 @@ impl AppView {
     /// through [`AppView::open_subscriptions_dialog_restored`] (carries
     /// in-progress text).
     fn open_subscriptions_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_subscriptions_dialog_restored("", "", DEFAULT_GROUP, true, window, cx);
+        self.open_subscriptions_dialog_restored(
+            "",
+            "",
+            DEFAULT_GROUP,
+            true,
+            store::DEFAULT_AUTO_REFRESH_SECS,
+            window,
+            cx,
+        );
     }
 
     /// Ticket 26: subscriptions dialog with a prefilled add form (the
@@ -5613,6 +5971,8 @@ impl AppView {
     /// (empty close or committed add) clears the stash, and Cancel/close
     /// leftovers are dropped by
     /// [`AppView::reopen_subscriptions_if_open`] when no dialog is open.
+    /// Ticket 45: the add-form interval picker rides the same stash, and the
+    /// header carries the global kill-switch + Refresh-all-due.
     #[allow(clippy::too_many_arguments)]
     fn open_subscriptions_dialog_restored(
         &mut self,
@@ -5620,10 +5980,11 @@ impl AppView {
         url: &str,
         group: &str,
         auto: bool,
+        interval_secs: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = SubForm::restored(window, cx, label, url, group, auto);
+        let form = SubForm::restored(window, cx, label, url, group, auto, interval_secs);
         self.subs_form = Some(form.clone());
         let view = cx.entity();
         let reader = form.clone();
@@ -5665,14 +6026,25 @@ impl AppView {
             let url = reader.url.read(cx).value().to_string();
             let group = reader.group.read(cx).value().to_string();
             let auto = *reader.auto_refresh.borrow();
+            let interval = *reader.interval_secs.borrow();
             if label.trim().is_empty() && url.trim().is_empty() {
                 return true;
             }
             commit_view.update(cx, |view, cx| {
-                view.commit_subscription_add(label, url, group, auto, window, cx)
+                view.commit_subscription_add(label, url, group, auto, interval, window, cx)
             })
         });
         let commit_key = commit.clone();
+        // Ticket 45: header state snapshots — the global kill-switch position
+        // and the manual due count (explicit consent, ignores the switch).
+        let auto_all = self.store.subs_auto_refresh_enabled();
+        let now = now_unix();
+        let due_count = subs
+            .iter()
+            .filter(|sub| due_for_refresh_for(sub, now))
+            .count();
+        let kill_view = view.clone();
+        let due_view = view.clone();
         // Ticket 26: every dismiss path (OK-close, Cancel, Escape,
         // backdrop/X) clears the stashed form through `.on_close`, so a
         // later foreign dialog can never be mistaken for this one.
@@ -5681,8 +6053,42 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let view_for_rows = view.clone();
-            let close_view = close_view.clone();
+            let close_subs = close_view.clone();
+            let kill_buttons = kill_view.clone();
+            let due_buttons = due_view.clone();
             let mut body = div().flex().flex_col().gap_2();
+            // Ticket 45: controllable auto-update — the kill-switch gates
+            // the automatic pass only; Refresh-all-due is explicit consent.
+            let kill_now = auto_all;
+            body = body.child(
+                div()
+                    .id("subs-auto-header")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Switch::new("subs-auto-all")
+                            .checked(kill_now)
+                            .label("Auto-refresh all")
+                            .on_change(move |next: &bool, window, cx| {
+                                let next = *next;
+                                kill_buttons.update(cx, |view, cx| {
+                                    view.commit_subs_global_auto(next, window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("subs-refresh-all-due")
+                            .label(format!("Refresh all due ({due_count})"))
+                            .on_click(move |_, window, cx| {
+                                due_buttons.update(cx, |view, cx| {
+                                    view.refresh_all_due(window, cx);
+                                });
+                            }),
+                    ),
+            );
             if subs.is_empty() {
                 body = body.child("No subscriptions yet — paste a subscription URL below");
             }
@@ -5703,7 +6109,7 @@ impl AppView {
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
                 .on_close(move |_, _, cx| {
-                    close_view.update(cx, |view, _| {
+                    close_subs.update(cx, |view, _| {
                         view.subs_form = None;
                     });
                 })
@@ -5775,14 +6181,20 @@ impl AppView {
         let read_label = label_state.clone();
         let read_url = url_state.clone();
         let read_group = group_state.clone();
+        // Ticket 45: the edit-dialog interval picker (same presets as the
+        // add form, prefilled from the row).
+        let interval_cell: Rc<RefCell<i64>> = Rc::new(RefCell::new(sub.interval_secs));
+        let read_interval = interval_cell.clone();
+        let edit_interval = interval_cell.clone();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let label = read_label.read(cx).value().to_string();
             let url = read_url.read(cx).value().to_string();
             let group = read_group.read(cx).value().to_string();
+            let interval = *read_interval.borrow();
             view.update(cx, |view, cx| {
-                view.commit_subscription_edit(&id, label, url, group, window, cx)
+                view.commit_subscription_edit(&id, label, url, group, interval, window, cx)
             })
         });
         let commit_key = commit.clone();
@@ -5807,6 +6219,9 @@ impl AppView {
                     "field-sub-edit-group",
                     "Group",
                     group_state.clone(),
+                ))
+                .child(div().id("field-sub-edit-interval").test_support().child(
+                    interval_picker_row("sub-interval-edit", edit_interval.clone()),
                 ));
             // Ticket 31: live plaintext warning for the URL being typed.
             let url_now = url_state.read(cx).value().to_string();
@@ -5881,7 +6296,21 @@ impl AppView {
     /// Ticket 26: window-less by necessity (ticks and startup have no window
     /// to notify through), so a database error yields no due subs — the pass
     /// starts nothing instead of acting on a lie (ticket-14 precedent).
+    /// Ticket 45: the global kill-switch gates this automatic selection
+    /// (fail closed on a broken read — no automatic network without
+    /// consent). Manual refreshes use [`AppView::due_for_manual_refresh`].
     fn due_subscriptions(&self) -> Vec<ProxySubscription> {
+        if !self.store.subs_auto_refresh_enabled() {
+            return Vec::new();
+        }
+        self.due_for_manual_refresh()
+    }
+
+    /// Ticket 45: due subscriptions ignoring the global kill-switch — the
+    /// manual Refresh-all-due selection (explicit consent, so the switch
+    /// never blocks it). Each entry still honors its own per-sub interval
+    /// and auto flag via [`due_for_refresh_for`].
+    fn due_for_manual_refresh(&self) -> Vec<ProxySubscription> {
         let now = now_unix();
         self.store
             .list_subscriptions()
@@ -5891,6 +6320,43 @@ impl AppView {
             // `interval_secs`, never the global daily).
             .filter(|sub| due_for_refresh_for(sub, now))
             .collect()
+    }
+
+    /// Ticket 45: manual Refresh-all-due — starts one fetch per due
+    /// subscription (explicit consent, so the kill-switch never blocks it).
+    /// Returns the number of fetches started; an empty due set toasts
+    /// instead of dead-clicking.
+    fn refresh_all_due(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        let due = self.due_for_manual_refresh();
+        if due.is_empty() {
+            window.push_notification(
+                Notification::success("No subscriptions due for refresh"),
+                cx,
+            );
+            return 0;
+        }
+        let ids: Vec<String> = due.iter().map(|sub| sub.id.clone()).collect();
+        self.begin_refresh_batch(&ids);
+        let mut started = 0;
+        for sub in due {
+            if self.start_subscription_refresh(sub, cx) {
+                started += 1;
+            }
+        }
+        self.reopen_subscriptions_if_open(window, cx);
+        started
+    }
+
+    /// Ticket 45: the global auto-refresh kill-switch commit. Persists the
+    /// explicit toggle (ticks never flip it) and re-renders the manager.
+    fn commit_subs_global_auto(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.store.set_subs_auto_refresh_enabled(on) {
+            window.push_notification(
+                Notification::error(format!("Cannot change auto-refresh: {error}")),
+                cx,
+            );
+        }
+        self.reopen_subscriptions_if_open(window, cx);
     }
 
     /// Stop the background ticks (each tick also no-ops once stopped, so a
@@ -6113,6 +6579,56 @@ impl AppView {
         });
     }
 
+    /// Ticket 45: one row's persisted usage buckets (down/up) for the
+    /// detail pane. A broken read renders honestly, never a lying zero.
+    fn usage_line(&self, config_id: &str) -> String {
+        match self.store.traffic_totals() {
+            Ok(totals) => match totals.get(config_id) {
+                Some((rx, tx)) => format!(
+                    "usage down {} · up {}",
+                    format_bytes(*rx),
+                    format_bytes(*tx)
+                ),
+                None => "usage unavailable".to_string(),
+            },
+            Err(_) => "usage unavailable".to_string(),
+        }
+    }
+
+    /// Ticket 45: bounded history line for the detail pane — the newest 120
+    /// successful samples as a native sparkline. Under two points (fresh
+    /// rows) it renders nothing — progressive disclosure, so the detail
+    /// pane stays short and the virtual list keeps its rows (see
+    /// `library_mutations_repaint_and_keep_selection`). A broken read
+    /// renders honestly, never a lying chart.
+    fn history_line(&self, config_id: &str) -> AnyElement {
+        let since = now_unix().saturating_sub(90 * 86_400);
+        let entries = match self.store.load_health_history(config_id, Some(since)) {
+            Ok(entries) => entries,
+            Err(_) => return div().child("history unavailable").into_any_element(),
+        };
+        let samples: Vec<(i64, Option<u64>)> = entries
+            .iter()
+            .map(|entry| (entry.at, entry.latency_ms))
+            .collect();
+        let latencies = sparkline_latencies(&samples, 120);
+        if latencies.len() < 2 {
+            return div().into_any_element();
+        }
+        let latest = latencies.last().copied().unwrap_or(0);
+        // Compact single row (text + mini chart side by side): the
+        // vertical shell gives the list `flex_1`, so the detail pane
+        // must stay short — every extra row squeezes painted list rows.
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(format!("{} samples · latest {}ms", latencies.len(), latest))
+            .child(Self::latency_sparkline(&latencies))
+            .into_any_element()
+    }
+
     fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
             return div()
@@ -6208,6 +6724,39 @@ impl AppView {
                         }
                     })),
             )
+            // Ticket 45: manageable usage — persisted down/up buckets with
+            // an explicit reset (confirm-gated, never silent).
+            .child(
+                div()
+                    .id("config-usage")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(self.usage_line(&config.id))
+                    .child(
+                        Button::new("usage-reset")
+                            .label("Reset usage")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_usage_reset_confirm(config, window, cx);
+                                }
+                            })),
+                    ),
+            )
+            // Ticket 45: trend-visible health — bounded history sparkline
+            // (native LineChart; 90d retention window served from
+            // `health_history`, never the latest-snapshot fast path).
+            .child(
+                div()
+                    .id("config-history")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(self.history_line(&config.id)),
+            )
             .child(
                 div()
                     .flex()
@@ -6294,25 +6843,56 @@ impl AppView {
             .into_any_element()
     }
 
+    /// Ticket 45: one detail-pane latency sparkline from bounded history —
+    /// gpui-kit native [`LineChart`] (zero new deps; the research spike
+    /// confirmed `chart::LineChart` in gpui-component 0.6.6 with `f64`
+    /// values). Callers guarantee at least two points; errors never plot
+    /// (see [`sparkline_latencies`]).
+    fn latency_sparkline(latencies: &[u64]) -> impl IntoElement {
+        struct SparkPoint {
+            x: String,
+            y: f64,
+        }
+        let points: Vec<SparkPoint> = latencies
+            .iter()
+            .enumerate()
+            .map(|(index, ms)| SparkPoint {
+                x: index.to_string(),
+                y: *ms as f64,
+            })
+            .collect();
+        div().w(px(160.)).h(px(32.)).child(
+            LineChart::new(points)
+                .x(|point: &SparkPoint| point.x.clone())
+                .y(|point: &SparkPoint| point.y)
+                .x_axis(false)
+                .grid(false),
+        )
+    }
+
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let (total, enabled) = self.libraries.read(cx).delegate().counts();
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
-        StatusBar::new().left(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .id("status-count")
-                        .test_support()
-                        .child(format!("{total} configurations · {enabled} enabled")),
-                )
-                .child(div().id("engine-status").test_support().child(engine_text))
-                .child(div().id("health-status").test_support().child(health_text)),
-        )
+        // Ticket 45: summed usage totals ride the status bar (absent on a
+        // broken read — never a lying zero).
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("status-count")
+                    .test_support()
+                    .child(format!("{total} configurations · {enabled} enabled")),
+            )
+            .child(div().id("engine-status").test_support().child(engine_text))
+            .child(div().id("health-status").test_support().child(health_text));
+        if let Some(totals) = summed_traffic_text(&self.store) {
+            bar = bar.child(div().id("traffic-status").test_support().child(totals));
+        }
+        StatusBar::new().left(bar)
     }
 
     /// Ticket 30: `N of M` search count above the list (visible while a
@@ -6758,7 +7338,7 @@ mod tests {
             "stored record stays verbatim, got {:?}",
             stored[0]
         );
-        let lines = cx.update(|_, cx| view.update(cx, |view, cx| view.log_lines(cx)));
+        let lines = cx.update(|_, cx| view.update(cx, |view, cx| view.visible_log_lines(cx)));
         assert_eq!(lines.len(), 1);
         assert!(
             !lines[0].contains('\u{1b}'),
@@ -8157,6 +8737,207 @@ mod tests {
         assert!(text.contains("bad-host"), "original kind kept, got {text}");
     }
 
+    /// Ticket 45: interval picker + last-refresh display copy.
+    #[test]
+    fn t45_interval_and_last_refresh_format() {
+        use crate::{format_interval_secs, format_last_refresh, INTERVAL_PRESETS};
+        assert_eq!(format_interval_secs(0), "always");
+        assert_eq!(format_interval_secs(-5), "always");
+        assert_eq!(format_interval_secs(3_600), "1h");
+        assert_eq!(format_interval_secs(86_400), "24h");
+        assert_eq!(format_interval_secs(604_800), "7d");
+        assert!(INTERVAL_PRESETS.contains(&86_400));
+        assert_eq!(format_last_refresh(None, 1_700_000_000), "never refreshed");
+        assert_eq!(
+            format_last_refresh(Some(1_699_999_940), 1_700_000_000),
+            "1m ago"
+        );
+        assert_eq!(
+            format_last_refresh(Some(1_699_996_400), 1_700_000_000),
+            "1h ago"
+        );
+        assert_eq!(
+            format_last_refresh(Some(1_699_913_600), 1_700_000_000),
+            "1d ago"
+        );
+    }
+
+    /// Ticket 45: the kill-switch gates automatic due selection but never a
+    /// manual refresh-all-due (explicit consent); only due subs are listed.
+    #[gpui_kit::test]
+    fn t45_kill_switch_gates_auto_not_manual(cx: &mut TestAppContext) {
+        use crate::store::now_unix;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let due = store
+            .add_subscription("Due", "https://example.com/due.txt", "g", true)
+            .expect("seed works");
+        let _fresh = store
+            .add_subscription("Fresh", "https://example.com/fresh.txt", "g", true)
+            .expect("seed works");
+        // Fresh succeeds now → not due; Due never refreshed → due.
+        let now = now_unix();
+        store
+            .refresh_with_body(
+                &_fresh.id,
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one",
+                now,
+            )
+            .expect("refresh stamps");
+        let (view, cx) = mount_view(store, cx);
+        let (auto, manual) = view.read_with(cx, |view, _| {
+            (
+                view.due_subscriptions()
+                    .iter()
+                    .map(|sub| sub.id.clone())
+                    .collect::<Vec<_>>(),
+                view.due_for_manual_refresh()
+                    .iter()
+                    .map(|sub| sub.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(auto, vec![due.id.clone()]);
+        assert_eq!(manual, vec![due.id.clone()]);
+        // Kill-switch off: automatic pass finds nothing, manual still lists.
+        view.update(cx, |view, _| {
+            view.store
+                .set_subs_auto_refresh_enabled(false)
+                .expect("kill writes");
+        });
+        let (auto, manual) = view.read_with(cx, |view, _| {
+            (
+                view.due_subscriptions().len(),
+                view.due_for_manual_refresh()
+                    .iter()
+                    .map(|sub| sub.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(auto, 0, "kill-switch gates the automatic pass");
+        assert_eq!(manual, vec![due.id.clone()], "manual still lists due");
+    }
+
+    /// Ticket 45: usage reset zeroes persisted counters and notifies; the
+    /// status totals helper sums rows.
+    #[gpui_kit::test]
+    fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
+        use crate::store::NewConfig;
+        use crate::summed_traffic_text;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(NewConfig {
+                name: "R".to_string(),
+                protocol: "vless".to_string(),
+                params: String::new(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("row seeds");
+        store
+            .add_traffic_batch(&[(row.id.clone(), 2_048, 1_024)])
+            .expect("traffic accrues");
+        let (view, cx) = mount_view(store, cx);
+        let before = view.read_with(cx, |view, _| summed_traffic_text(&view.store));
+        assert!(before.is_some(), "totals render while rows exist");
+        let text = before.expect("totals render");
+        assert!(text.contains("2.0KB"), "down sums: {text}");
+        assert!(text.contains("1.0KB"), "up sums: {text}");
+        let row_id = row.id.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_usage_reset(&row_id, window, cx));
+        });
+        let after = view.read_with(cx, |view, _| {
+            (
+                view.store
+                    .traffic_totals()
+                    .expect("totals read")
+                    .get(&row_id)
+                    .copied(),
+                summed_traffic_text(&view.store),
+            )
+        });
+        assert_eq!(after.0, Some((0, 0)), "counters zeroed");
+        assert_eq!(notification_count(cx), 1, "reset notifies");
+    }
+
+    /// Ticket 45: saved logs match the visible lines (level + text filter +
+    /// tail); copy-all carries the same text.
+    #[gpui_kit::test]
+    fn t45_logs_save_matches_visible(cx: &mut TestAppContext) {
+        use crate::health::LogLevel;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.logs.push_raw("error boom one", &[]);
+                view.logs.push_raw("info chatter", &[]);
+                view.logs.push_raw("warn boom two", &[]);
+                view.log_tail = true;
+            });
+        });
+        // Level filter narrows to errors; tail keeps the newest cap.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.log_level = Some(LogLevel::Error);
+                let visible = view.visible_log_lines(cx);
+                assert_eq!(visible, vec!["[error] error boom one".to_string()]);
+            });
+        });
+        // Tail off shows the head instead of the newest.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.log_level = None;
+                view.log_tail = false;
+                view.log_filter = "boom".to_string();
+                let visible = view.visible_log_lines(cx);
+                assert_eq!(
+                    visible,
+                    vec![
+                        "[error] error boom one".to_string(),
+                        "[warn] warn boom two".to_string(),
+                    ]
+                );
+                let dir =
+                    std::env::temp_dir().join(format!("manyproxy-45-logs-{}", std::process::id()));
+                std::fs::create_dir_all(&dir).expect("temp dir creates");
+                let path = dir.join("visible.txt");
+                view.write_visible_logs_to(&path, cx).expect("save works");
+                let saved = std::fs::read_to_string(&path).expect("saved file reads");
+                assert_eq!(saved, visible.join("\n"), "file matches visible lines");
+                std::fs::remove_dir_all(&dir).expect("temp dir cleans");
+            });
+        });
+    }
+
+    /// Ticket 45: the level cycle walks all → error → warn → info →
+    /// debug → all with matching button labels.
+    #[gpui_kit::test]
+    fn t45_log_level_cycles_with_labels(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let mut labels = Vec::new();
+        for _ in 0..6 {
+            view.update(cx, |view, _| view.cycle_log_level());
+            labels.push(view.read_with(cx, |view, _| view.log_level_label()));
+        }
+        assert_eq!(
+            labels,
+            vec![
+                "Level: error",
+                "Level: warn",
+                "Level: info",
+                "Level: debug",
+                "Level: all",
+                "Level: error",
+            ]
+        );
+    }
+
     /// Scenario: paste with all-invalid items → dialog stays open (false),
     /// one notification, nothing stored.
     #[gpui_kit::test]
@@ -8768,21 +9549,34 @@ mod tests {
 
     /// Scenario: subscription add form → auto-refresh checkbox present and
     /// default on.
+    /// Ticket 45: the interval picker defaults to daily.
     #[gpui_kit::test]
     fn sub_add_form_auto_defaults_on(cx: &mut TestAppContext) {
-        use crate::store::DEFAULT_GROUP;
+        use crate::store::{DEFAULT_AUTO_REFRESH_SECS, DEFAULT_GROUP};
         use crate::SubForm;
         cx.update(gpui_kit::init);
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
-        let auto = cx.update(|window, cx| {
+        let (auto, interval) = cx.update(|window, cx| {
             view.update(cx, |_, cx| {
-                SubForm::restored(window, cx, "", "", DEFAULT_GROUP, true)
-                    .auto_refresh
-                    .clone()
+                let form = SubForm::restored(
+                    window,
+                    cx,
+                    "",
+                    "",
+                    DEFAULT_GROUP,
+                    true,
+                    DEFAULT_AUTO_REFRESH_SECS,
+                );
+                (form.auto_refresh.clone(), form.interval_secs.clone())
             })
         });
         assert!(*auto.borrow(), "auto-refresh defaults on");
+        assert_eq!(
+            *interval.borrow(),
+            DEFAULT_AUTO_REFRESH_SECS,
+            "interval defaults daily"
+        );
     }
 
     /// Scenario: background tick refreshes 3 subs → at most one coalesced
@@ -11189,6 +11983,7 @@ mod tests {
                     "  https://example.com/a.txt  ".to_string(),
                     "g".to_string(),
                     true,
+                    crate::store::DEFAULT_AUTO_REFRESH_SECS,
                     window,
                     cx,
                 )
@@ -11221,6 +12016,7 @@ mod tests {
                     "Daily".to_string(),
                     "https://example.com/b.txt".to_string(),
                     "g2".to_string(),
+                    3_600,
                     window,
                     cx,
                 )
@@ -11235,6 +12031,7 @@ mod tests {
         assert_eq!(subs[0].label, "Daily");
         assert_eq!(subs[0].url, "https://example.com/b.txt");
         assert_eq!(subs[0].group, "g2");
+        assert_eq!(subs[0].interval_secs, 3_600, "edit commits the interval");
         let ghost = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.commit_subscription_edit(
@@ -11242,6 +12039,7 @@ mod tests {
                     "x".to_string(),
                     "https://example.com/x.txt".to_string(),
                     "g".to_string(),
+                    3_600,
                     window,
                     cx,
                 )
