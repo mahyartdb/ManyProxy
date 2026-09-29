@@ -4482,6 +4482,9 @@ impl Store {
     /// (already redacted at the health seam), never raw secrets.
     /// Ticket 25: absurd latencies saturate at `i64::MAX` (never wrap);
     /// implemented on [`Store::save_health_snapshots`].
+    /// Ticket 47: probe rounds persist batched ([`record_and_persist`] uses
+    /// [`Store::save_health_snapshots`]); kept for single-row callers.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn save_health_snapshot(&mut self, snapshot: &HealthSnapshot) -> Result<(), StoreError> {
         self.save_health_snapshots(std::slice::from_ref(snapshot))
     }

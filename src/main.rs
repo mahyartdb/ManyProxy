@@ -36,7 +36,8 @@ use engine::{
 };
 use health::{
     ping_all, redact_secrets, sparkline_latencies, test_all, truncate, HealthProber, HealthStore,
-    LogLevel, LogStore, RealHealthProber, TestOutcome, DEFAULT_TEST_URL,
+    LogLevel, LogStore, LogTagIndex, RealHealthProber, TestOutcome, TrafficSeenMap,
+    DEFAULT_TEST_URL,
 };
 use import::{
     commit_batch, effective_hint_for_text, format_import_failures, import_file_content,
@@ -91,9 +92,15 @@ pub const ENGINE_POLL_TICK_SECS: u64 = 5;
 pub const DUE_SUBSCRIPTION_TICK_SECS: u64 = 300;
 pub const REPROBE_TICK_SECS: u64 = 60;
 /// Ticket 36: data-plane traffic cadence. Each pass polls every serving
-/// core's loopback clash controller (fast refuse-or-reply, 5s bound per
+/// core's loopback clash controller (fast refuse-or-reply, 2s bound per
 /// core like the probe bound above) and persists per-row deltas.
 pub const TRAFFIC_TICK_SECS: u64 = 5;
+/// Ticket 47: tray event-pump cadence (menu actions + left-click toggle).
+/// 500ms stays responsive to clicks without the old 150ms idle wakeups.
+pub const TRAY_PUMP_MILLIS: u64 = 500;
+/// Ticket 47: seconds after window open before due subscriptions refresh —
+/// first paint always precedes refresh work.
+pub const STARTUP_REFRESH_DEFER_SECS: u64 = 3;
 
 /// Ticket 21: single branding seam — the OS window title and the TitleBar
 /// caption both read this name (the exe icon is `assets/icon.ico`, wired
@@ -191,8 +198,13 @@ fn about_body(
 /// Ticket 02: renders stored rows with stable domain ids
 /// (`library-row-{config.id}`), no entity per row. Selection is mirrored here
 /// so the detail bar can follow it; search filters the visible rows.
+/// Ticket 47: `search_index` + `upstream_cache` are built once per
+/// `set_rows` (row data changes are rare; keystrokes and frames are
+/// frequent) so filter + render never parse per-row JSON.
 struct LibraryDelegate {
     rows: Vec<ProxyConfig>,
+    search_index: Vec<RowSearchIndex>,
+    upstream_cache: HashMap<String, String>,
     visible: Vec<usize>,
     query: String,
     selected: Option<IndexPath>,
@@ -211,10 +223,148 @@ struct LibraryDelegate {
     preset_names: HashMap<String, String>,
 }
 
+/// Ticket 47: precomputed per-row search fields (lowercased once in
+/// `set_rows`, never per keystroke). `host_server`/`host_address` stay
+/// SEPARATE so the index answers exactly like [`library_row_matches`]
+/// (server-then-address, never a cross-field span).
+/// Ticket 43-extended (47 merge): the context words (subscription label,
+/// preset name, enabled/disabled, running/stopped, health text) ride the
+/// same index so the extended matcher
+/// ([`library_row_matches_full`]) holds without per-keystroke maps.
+/// Refreshed by [`LibraryDelegate::refresh_search_words`] whenever rows or
+/// context change; empty maps reproduce the base matcher exactly.
+struct RowSearchIndex {
+    name: String,
+    protocol: String,
+    group: String,
+    bind: String,
+    port: String,
+    host_server: String,
+    host_address: String,
+    sub_label: String,
+    preset_name: String,
+    state_word: String,
+    serve_word: String,
+    health_text: String,
+}
+
+impl RowSearchIndex {
+    fn of(row: &ProxyConfig) -> Self {
+        let (host_server, host_address) = search_hosts(&row.params);
+        Self {
+            name: row.name.to_lowercase(),
+            protocol: row.protocol.to_lowercase(),
+            group: row.group.to_lowercase(),
+            bind: row.bind_ip.to_lowercase(),
+            port: row.port.to_string(),
+            host_server,
+            host_address,
+            sub_label: String::new(),
+            preset_name: String::new(),
+            state_word: if row.enabled {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            },
+            serve_word: "stopped".to_string(),
+            health_text: String::new(),
+        }
+    }
+
+    /// Fill the context words for one row (id-keyed maps owned by the
+    /// delegate). Mirrors [`library_row_matches_full`] field for field —
+    /// any drift breaks `t47_search_index_matches_full_with_context`.
+    fn enrich(
+        &mut self,
+        row: &ProxyConfig,
+        sub_labels: &HashMap<String, String>,
+        preset_names: &HashMap<String, String>,
+        running: &HashSet<String>,
+        health: &HashMap<String, String>,
+    ) {
+        self.sub_label = row
+            .subscription_id
+            .as_deref()
+            .and_then(|id| sub_labels.get(id))
+            .map(|label| label.to_lowercase())
+            .unwrap_or_default();
+        self.preset_name = row
+            .preset_id
+            .as_deref()
+            .and_then(|id| preset_names.get(id))
+            .map(|name| name.to_lowercase())
+            .unwrap_or_default();
+        self.serve_word = if running.contains(&row.id) {
+            "running".to_string()
+        } else {
+            "stopped".to_string()
+        };
+        self.health_text = health
+            .get(&row.id)
+            .map(|summary| summary.trim().to_lowercase())
+            .unwrap_or_default();
+    }
+
+    /// Mirror of [`library_row_matches_full`] over a pre-lowered query (the
+    /// delegate lowercases once per filter, not once per row per keystroke).
+    /// Base half mirrors [`library_row_matches`]; context half mirrors the
+    /// `_full` extension (sub label, preset name, state, serving, health).
+    fn matches_lowered(&self, lowered: &str) -> bool {
+        if lowered.is_empty() {
+            return true;
+        }
+        if self.name.contains(lowered)
+            || self.protocol.contains(lowered)
+            || self.group.contains(lowered)
+            || self.bind.contains(lowered)
+            || self.port.contains(lowered)
+            || self.host_server.contains(lowered)
+            || self.host_address.contains(lowered)
+            || self.sub_label.contains(lowered)
+            || self.preset_name.contains(lowered)
+            || self.state_word.contains(lowered)
+            || self.serve_word.contains(lowered)
+        {
+            return true;
+        }
+        if self.health_text.is_empty() {
+            return "untested".contains(lowered);
+        }
+        if self.health_text.contains(lowered) {
+            return true;
+        }
+        let health_word = if self.health_text == "dead" {
+            "dead"
+        } else {
+            "live"
+        };
+        health_word.contains(lowered)
+    }
+}
+
+/// Ticket 47: the `server`/`address` string hosts for the search index —
+/// the same keys and the same string-only rule as [`library_row_matches`]
+/// (parsed once per `set_rows`, never per keystroke).
+fn search_hosts(params: &str) -> (String, String) {
+    let mut server = String::new();
+    let mut address = String::new();
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(params) {
+        if let Some(serde_json::Value::String(host)) = map.get("server") {
+            server = host.to_lowercase();
+        }
+        if let Some(serde_json::Value::String(host)) = map.get("address") {
+            address = host.to_lowercase();
+        }
+    }
+    (server, address)
+}
+
 impl LibraryDelegate {
     fn new() -> Self {
         Self {
             rows: Vec::new(),
+            search_index: Vec::new(),
+            upstream_cache: HashMap::new(),
             visible: Vec::new(),
             query: String::new(),
             selected: None,
@@ -227,9 +377,22 @@ impl LibraryDelegate {
     }
 
     /// Replace all rows, preserving the selection by config id when possible.
+    /// Ticket 47: rebuilds the search index + upstream cache (the only
+    /// per-row JSON parses — never at filter/render time).
     fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
         let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.search_index = rows.iter().map(RowSearchIndex::of).collect();
+        self.upstream_cache = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    upstream_host_port(row).unwrap_or_else(|| "no upstream".to_string()),
+                )
+            })
+            .collect();
         self.rows = rows;
+        self.refresh_search_words();
         self.apply_filter();
         self.selected = selected_id.and_then(|id| {
             self.visible
@@ -239,28 +402,26 @@ impl LibraryDelegate {
         });
     }
 
+    /// Cached upstream display for one row (no JSON parse on the render
+    /// path). `None` for rows missing from the cache (never a wrong
+    /// "no upstream" — callers fall back to a live parse).
+    fn upstream_for(&self, id: &str) -> Option<&str> {
+        self.upstream_cache.get(id).map(String::as_str)
+    }
+
     fn apply_filter(&mut self) {
         // Ticket 26: re-derive the selection by config id (the `set_rows`
         // pattern), never by stale index. A narrowed filter clears a
         // filtered-out selection instead of landing actions on the wrong row.
+        // Ticket 47: one contains per row over the precomputed index — zero
+        // parses, zero per-row allocs per keystroke.
         let selected_id = self.selected_row().map(|row| row.id.clone());
-        let query = self.query.clone();
-        // Ticket 43: the extended matcher (sub label, preset name, state,
-        // serving, and health words) over a reload-built context — no store
-        // reads per keystroke (see [`MatchContext`]).
-        let ctx = MatchContext {
-            sub_labels: self.sub_labels.clone(),
-            preset_names: self.preset_names.clone(),
-            running: self.running.clone(),
-            health: self.health.clone(),
-        };
+        let lowered = self.query.trim().to_lowercase();
         self.visible = self
-            .rows
+            .search_index
             .iter()
             .enumerate()
-            // Ticket 17: search covers host/bind/port, not just
-            // name/protocol/group (see [`library_row_matches`]).
-            .filter(|(_, row)| library_row_matches_full(row, &query, &ctx))
+            .filter(|(_, blob)| blob.matches_lowered(&lowered))
             .map(|(index, _)| index)
             .collect();
         self.selected = selected_id.and_then(|id| {
@@ -290,12 +451,14 @@ impl LibraryDelegate {
     /// so row replacement never misattributes a latency).
     fn set_health(&mut self, health: HashMap<String, String>) {
         self.health = health;
+        self.refresh_search_words();
     }
 
     /// Ticket 30: replace the serving set (`config_id`s currently running).
     /// Badges render from this — never from the enabled flag.
     fn set_running(&mut self, ids: Vec<String>) {
         self.running = ids.into_iter().collect();
+        self.refresh_search_words();
     }
 
     /// Ticket 43: replace the per-row traffic totals (persisted store
@@ -313,6 +476,23 @@ impl LibraryDelegate {
     ) {
         self.sub_labels = sub_labels;
         self.preset_names = preset_names;
+        self.refresh_search_words();
+    }
+
+    /// Rebuild the index context words from the current rows + maps (rows,
+    /// health, serving set, labels). Called after every context mutation so
+    /// the precomputed index never goes stale; per-keystroke filtering stays
+    /// allocation-free. Traffic is not searched, so `set_traffic` skips this.
+    fn refresh_search_words(&mut self) {
+        for (row, entry) in self.rows.iter().zip(self.search_index.iter_mut()) {
+            entry.enrich(
+                row,
+                &self.sub_labels,
+                &self.preset_names,
+                &self.running,
+                &self.health,
+            );
+        }
     }
 
     /// (total rows, enabled rows) for the status bar.
@@ -380,6 +560,8 @@ impl ListDelegate for LibraryDelegate {
         // tested [`library_row_lines`] seam — one child per line, stable
         // domain id, no entity per row.
         // Ticket 30: the badge reads the serving set, never the enabled flag.
+        // Ticket 47: the upstream string comes from the set_rows cache —
+        // zero JSON parses on the render path.
         let health = self
             .health
             .get(&row.id)
@@ -388,8 +570,12 @@ impl ListDelegate for LibraryDelegate {
         let is_running = self.running.contains(&row.id);
         // Ticket 43: per-row persisted traffic totals ride into the row.
         let traffic = self.traffic.get(&row.id).copied();
+        let upstream = self
+            .upstream_for(&row.id)
+            .unwrap_or("no upstream")
+            .to_string();
         let mut item = ListItem::new(format!("library-row-{}", row.id)).selected(selected);
-        for line in library_row_lines(&row, health, is_running, traffic) {
+        for line in library_row_lines_with_upstream(&row, &upstream, health, is_running, traffic) {
             item = item.child(line);
         }
         Some(item)
@@ -1444,6 +1630,12 @@ fn upstream_host_port(row: &ProxyConfig) -> Option<String> {
 /// [`LibraryDelegate::render_item`] maps each line to a child.
 /// Ticket 43: `traffic` appends a fifth `↓rx ↑tx` line, but only when bytes
 /// have actually flowed (idle rows keep the four-line shape).
+/// Ticket 43: `traffic` appends a fifth `↓rx ↑tx` line, but only when bytes
+/// have actually flowed (idle rows keep the four-line shape).
+/// Ticket 47 merge: production renders through
+/// `library_row_lines_with_upstream`; this parsing form stays pinned by
+/// tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn library_row_lines(
     row: &ProxyConfig,
     health: Option<&str>,
@@ -1468,12 +1660,44 @@ fn library_row_lines(
     }
     lines
 }
+/// Ticket 47: row lines over a precomputed upstream string (the delegate
+/// cache) — zero JSON parses on the render path. [`library_row_lines`]
+/// stays as the parsing wrapper (tests + single-row callers); rendered
+/// strings are identical either way.
+fn library_row_lines_with_upstream(
+    row: &ProxyConfig,
+    upstream: &str,
+    health: Option<&str>,
+    is_running: bool,
+    traffic: Option<(u64, u64)>,
+) -> Vec<String> {
+    let state = if row.enabled { "enabled" } else { "disabled" };
+    let mut lines = vec![
+        row.name.clone(),
+        format!("{} · {upstream}", row.protocol),
+        format!(
+            "{} · bind {}:{} · {state}",
+            row.group, row.bind_ip, row.port
+        ),
+        serving_badge(is_running, row.port, health),
+    ];
+    if let Some((rx, tx)) = traffic {
+        if let Some(summary) = traffic_summary_text(rx, tx) {
+            lines.push(summary);
+        }
+    }
+    lines
+}
 
 /// Ticket 17: a library row matches the search query by name, protocol,
 /// group, bind address, port, or upstream host (the `server`/`address` inside
 /// params — never credential fields).
 /// Ticket 43: kept as the pinned base-matcher seam (the delegate filters
 /// through [`library_row_matches_full`); tests pin both.
+/// Ticket 47: kept as the semantic oracle for the delegate search index
+/// ([`RowSearchIndex::matches_lowered`] must agree on every input — see
+/// `t47_search_index_matches_scan_parity`); production filtering runs on
+/// the index, never here.
 #[cfg_attr(not(test), allow(dead_code))]
 fn library_row_matches(row: &ProxyConfig, query: &str) -> bool {
     library_row_matches_full(row, query, &MatchContext::empty())
@@ -1718,6 +1942,8 @@ fn export_overwrite_confirm_description(path: &str) -> String {
 
 /// Ticket 43: log severity filter — `None` shows everything, `Some` keeps
 /// exactly that level.
+/// Ticket 47 merge: render paths filter inline; kept pinned by tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn log_level_matches(level: LogLevel, filter: Option<LogLevel>) -> bool {
     match filter {
         None => true,
@@ -2356,40 +2582,36 @@ fn preset_row(
 /// Ticket 12: run one background tick loop: sleep `secs`, run one bounded
 /// pass, then exit when ticks are stopped or the view is released (fail
 /// closed: a released view ends its loops instead of updating dead state).
-/// Ticket 26: the sleep runs in 1s slices with a stop/release check per
-/// slice, so stopping ticks (or closing the window) cancels promptly instead
-/// of lingering up to a full 300s due-subscription interval.
+/// Ticket 47: ONE timer per interval — the sleep is a single background
+/// timer, never 1s slices — so idle wakeups match the longest interval.
+/// Stopping ticks ends each loop after its current sleep; process exit
+/// drops the loops outright, so nothing lingers past quit.
 fn spawn_tick(
     cx: &mut Context<AppView>,
     secs: u64,
     tick: impl Fn(&mut AppView, &mut Context<AppView>) + 'static,
 ) {
     let weak = cx.entity().downgrade();
-    cx.spawn(async move |_entity, cx| {
-        let mut elapsed = 0u64;
-        loop {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            let live = cx.update(|cx| {
-                weak.update(cx, |view, _| view.ticks_enabled)
-                    .unwrap_or(false)
-            });
-            if !live {
-                break;
-            }
-            elapsed += 1;
-            if elapsed >= secs.max(1) {
-                elapsed = 0;
-                let ran = cx.update(|cx| {
-                    weak.update(cx, |view, cx| {
-                        tick(view, cx);
-                        true
-                    })
-                    .unwrap_or(false)
-                });
-                if !ran {
-                    break;
-                }
-            }
+    cx.spawn(async move |_entity, cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_secs(secs.max(1)))
+            .await;
+        let live = cx.update(|cx| {
+            weak.update(cx, |view, _| view.ticks_enabled)
+                .unwrap_or(false)
+        });
+        if !live {
+            break;
+        }
+        let ran = cx.update(|cx| {
+            weak.update(cx, |view, cx| {
+                tick(view, cx);
+                true
+            })
+            .unwrap_or(false)
+        });
+        if !ran {
+            break;
         }
     })
     .detach();
@@ -2436,10 +2658,19 @@ struct AppView {
     /// connection that closes between polls cannot double-count the bytes
     /// of the connections still open. In-memory only (rebuilt per poll;
     /// the persisted totals in the store are the source of truth).
-    traffic_last_seen: HashMap<String, (u64, u64)>,
+    /// Ticket 47: bounded ([`TrafficSeenMap`]: cap + TTL + sweep) so churny
+    /// short connections never grow the map without bound.
+    traffic_last_seen: TrafficSeenMap,
+    /// Ticket 47: a traffic poll is running off-thread ([`spawn_traffic_poll`]).
+    /// A second tick while set is SKIPPED (returns 0), never queued.
+    traffic_tick_in_flight: bool,
+    /// Ticket 47: the display mirror hydrated from persisted totals yet
+    /// ([`ensure_traffic_mirror`] runs once, on the first traffic tick —
+    /// startup never scans).
+    traffic_mirror_hydrated: bool,
     /// Ticket 26: `Send` so blocking probes can move to the background
     /// executor ([`AppView::spawn_probe`]); the fake stays API-identical.
-    prober: Box<dyn HealthProber + Send>,
+    prober: Box<dyn HealthProber + Send + Sync>,
     ticks_enabled: bool,
     /// Ticket 17: background-refresh toast coalescing. `refresh_batch_members`
     /// holds the in-flight background member ids; completions for members
@@ -2462,7 +2693,12 @@ struct AppView {
     /// Ticket 26: a health probe (URL test or ping) is running off-thread.
     /// A second probe request toasts instead of stacking (the placeholder
     /// prober swap in [`AppView::spawn_probe`] is never observable).
-    probe_in_flight: bool,
+    /// Ticket 47: per-kind flags (URL-test vs TCP-ping) — the 60s re-probe
+    /// tick holds only the URL-test flag, so a manual ping is never blocked
+    /// by the tick (manual work has priority: the tick skips when its kind
+    /// is busy and retries next round).
+    probe_url_in_flight: bool,
+    probe_ping_in_flight: bool,
     /// Ticket 26: the live subscriptions-dialog add form, stashed on open so
     /// a genuine reopen (background refresh completion) can carry
     /// in-progress text across instead of rebuilding a blank form. `None`
@@ -2491,6 +2727,11 @@ struct AppView {
     /// second Start while set is ignored with an info toast (no second
     /// apply); the detail Start button reads `Starting…` while set.
     start_in_flight: bool,
+    /// Ticket 47: sidecar presence lines (About dialog), resolved ONCE at
+    /// startup — every About open reuses the cache instead of re-probing
+    /// the filesystem. (The DB/export paths shown beside them are pure
+    /// path computations, never filesystem reads.)
+    sidecar_presence: Vec<String>,
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
@@ -2537,6 +2778,16 @@ impl AppView {
                 .unwrap_or_default();
             crate::engine::production_startup_reap(&our_ports);
         }
+        // Ticket 47: resolve sidecar presence once (three cheap stats beside
+        // the exe) — the About dialog reuses this cache on every open.
+        let sidecar_presence = [
+            (engine_binary_file_name(), resolve_engine_binary().is_ok()),
+            (fork_binary_file_name(), resolve_fork_binary().is_ok()),
+            (xray_binary_file_name(), resolve_xray_binary().is_ok()),
+        ]
+        .into_iter()
+        .map(|(file, found)| sidecar_presence_line(&file, found))
+        .collect::<Vec<_>>();
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
@@ -2550,7 +2801,9 @@ impl AppView {
             logs_open: false,
             logs_seen: 0,
             expanded_subs: HashSet::new(),
-            traffic_last_seen: HashMap::new(),
+            traffic_last_seen: TrafficSeenMap::default(),
+            traffic_tick_in_flight: false,
+            traffic_mirror_hydrated: false,
             prober: Box::new(RealHealthProber::default()),
             ticks_enabled: true,
             refresh_batch_total: 0,
@@ -2562,7 +2815,8 @@ impl AppView {
             refresh_batch_conflicts: 0,
             refresh_generation: 0,
             inflight_refreshes: HashSet::new(),
-            probe_in_flight: false,
+            probe_url_in_flight: false,
+            probe_ping_in_flight: false,
             subs_form: None,
             preset_form: None,
             import_parse_in_flight: false,
@@ -2570,6 +2824,7 @@ impl AppView {
             tray: None,
             last_snapshot,
             start_in_flight: false,
+            sidecar_presence,
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
@@ -2599,17 +2854,10 @@ impl AppView {
                 .filter(|snapshot| known.contains(&snapshot.config_id))
                 .collect();
             view.health_store.hydrate(&kept);
-            // Ticket 36: resume data-plane counters from persisted totals
-            // (never zeroed). Only known rows hydrate, and only nonzero
-            // totals flip the display — untracked rows keep the probe-byte
-            // display, and removed configs never resurrect.
-            if let Ok(totals) = view.store.traffic_totals() {
-                for (id, (rx, tx)) in &totals {
-                    if (*rx, *tx) != (0, 0) && known.contains(id) {
-                        view.health_store.set_data_traffic(id, *rx, *tx);
-                    }
-                }
-            }
+            // Ticket 47: data-plane counters hydrate LAZILY on the first
+            // traffic tick ([`AppView::ensure_traffic_mirror`]) — startup
+            // never scans the traffic table, so first paint is never gated
+            // on totals. Restart still resumes counters (never zeroed).
         }
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
@@ -2631,6 +2879,20 @@ impl AppView {
 
     fn selected_config(&self, cx: &App) -> Option<ProxyConfig> {
         self.libraries.read(cx).delegate().selected_row()
+    }
+
+    /// Ticket 47: cached upstream display for one row (no JSON parse on the
+    /// render path); falls back to a live parse for rows missing from the
+    /// cache (never a wrong "no upstream").
+    fn cached_upstream(&self, cx: &App, config: &ProxyConfig) -> String {
+        self.libraries
+            .read(cx)
+            .delegate()
+            .upstream_for(&config.id)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                upstream_host_port(config).unwrap_or_else(|| "no upstream".to_string())
+            })
     }
 
     /// Reload rows from the store, keeping the selection by id. A list
@@ -2671,9 +2933,13 @@ impl AppView {
     }
 
     fn reload_inner(&mut self, cx: &mut Context<Self>) -> Result<(), StoreError> {
-        self.drain_engine_logs();
-        self.poll_engine();
+        // Ticket 47: one store list per reload — log ingest reuses these
+        // rows (never a second list). A broken database returns early with
+        // the last-good rows and old log lines kept (never a lying empty
+        // set — ticket-14 precedent).
         let rows = self.store.list()?;
+        self.drain_engine_logs(&rows);
+        self.poll_engine();
         let health = self.health_map();
         let running = self.engine.running_ids();
         // Ticket 38: persist the running set on change (session-restore
@@ -4563,15 +4829,10 @@ impl AppView {
 
     /// Ticket 33: About dialog — version + git hash + sidecar presence +
     /// data paths + shortcuts list. Informational only; OK just closes.
+    /// Ticket 47: presence lines come from the startup cache (no
+    /// filesystem re-probe per open).
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sidecars = [
-            (engine_binary_file_name(), resolve_engine_binary().is_ok()),
-            (fork_binary_file_name(), resolve_fork_binary().is_ok()),
-            (xray_binary_file_name(), resolve_xray_binary().is_ok()),
-        ]
-        .into_iter()
-        .map(|(file, found)| sidecar_presence_line(&file, found))
-        .collect::<Vec<_>>();
+        let sidecars = self.sidecar_presence.clone();
         let body = about_body(
             APP_VERSION,
             GIT_HASH,
@@ -4618,17 +4879,32 @@ impl AppView {
     /// each row's latest sample (+ dead flag) for restart. Traffic stays
     /// session-only; logs are never persisted. Persistence failures are
     /// ignored (a full disk must not break the health view).
+    /// Ticket 47: one transaction per probe round (batched snapshots via
+    /// [`Store::save_health_snapshots`]) instead of one tx per outcome.
     fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
+        let mut snapshots = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
             self.health_store.record_outcome(outcome);
-            let snapshot = HealthSnapshot {
+            snapshots.push(HealthSnapshot {
                 config_id: outcome.sample.config_id.clone(),
                 at: outcome.sample.at,
                 kind: outcome.sample.kind.as_str().to_string(),
                 latency_ms: outcome.sample.latency_ms,
                 error: outcome.sample.error.clone(),
-            };
-            let _ = self.store.save_health_snapshot(&snapshot);
+            });
+        }
+        if !snapshots.is_empty() {
+            let _ = self.store.save_health_snapshots(&snapshots);
+        }
+    }
+
+    /// Ticket 47: true when a probe of the `ping` kind (TCP-ping) — or the
+    /// URL-test kind when `ping` is false — is already running off-thread.
+    fn probe_kind_in_flight(&self, ping: bool) -> bool {
+        if ping {
+            self.probe_ping_in_flight
+        } else {
+            self.probe_url_in_flight
         }
     }
 
@@ -4648,7 +4924,7 @@ impl AppView {
             window.push_notification(Notification::warning("No running endpoints to test"), cx);
             return 0;
         }
-        if self.probe_in_flight {
+        if self.probe_kind_in_flight(false) {
             window.push_notification(Notification::info("A health test is already running"), cx);
             return 0;
         }
@@ -4672,7 +4948,7 @@ impl AppView {
             );
             return;
         }
-        if self.probe_in_flight {
+        if self.probe_kind_in_flight(false) {
             window.push_notification(Notification::info("A health test is already running"), cx);
             return;
         }
@@ -4694,7 +4970,7 @@ impl AppView {
             );
             return;
         }
-        if self.probe_in_flight {
+        if self.probe_kind_in_flight(true) {
             window.push_notification(Notification::info("A health test is already running"), cx);
             return;
         }
@@ -4715,7 +4991,7 @@ impl AppView {
 
     /// Ticket 26 (ticket-25 consumer): run `test_all`/`ping_all` off the UI
     /// thread. The boxed prober moves into the background task (a default
-    /// stands in, guarded by `probe_in_flight` so it is never observable);
+    /// stands in, guarded by the per-kind in-flight flags so it is never observable);
     /// completion restores the prober and records on the main thread via
     /// [`AppView::finish_probe`]. `toast` selects the manual-test summary
     /// (the captured window) versus the silent tick record. A released view
@@ -4734,7 +5010,7 @@ impl AppView {
         window: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) -> usize {
-        if rows.is_empty() || self.probe_in_flight {
+        if rows.is_empty() || self.probe_kind_in_flight(ping) {
             return 0;
         }
         let count = rows.len();
@@ -4743,7 +5019,11 @@ impl AppView {
             .iter()
             .map(|row| (row.id.clone(), row.name.clone()))
             .collect();
-        self.probe_in_flight = true;
+        if ping {
+            self.probe_ping_in_flight = true;
+        } else {
+            self.probe_url_in_flight = true;
+        }
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
         let weak = cx.entity().downgrade();
         // `ping` moves into the background task below; the toast half keeps
@@ -4753,11 +5033,11 @@ impl AppView {
             let (outcomes, prober) = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut prober = prober;
+                    let prober = prober;
                     let outcomes = if ping {
-                        ping_all(&rows, &mut *prober)
+                        ping_all(&rows, &*prober)
                     } else {
-                        test_all(&rows, &url, &mut *prober)
+                        test_all(&rows, &url, &*prober)
                     };
                     (outcomes, prober)
                 })
@@ -4768,7 +5048,11 @@ impl AppView {
                 // cleanly (never update-while-updating).
                 let recorded = weak.update(cx, |view, _| {
                     view.prober = prober;
-                    view.probe_in_flight = false;
+                    if ping {
+                        view.probe_ping_in_flight = false;
+                    } else {
+                        view.probe_url_in_flight = false;
+                    }
                     view.record_and_persist(&outcomes);
                     (view.health_counts(), outcomes.len())
                 });
@@ -4825,59 +5109,28 @@ impl AppView {
     /// every reload, so live lines appear without user clicks and the exit
     /// note path stays silent-free. Logs stay session-only (never
     /// persisted).
-    fn drain_engine_logs(&mut self) {
+    /// Ticket 47: tags against the caller's rows (no second store list per
+    /// reload — `reload_inner` lists once and reuses it here).
+    fn drain_engine_logs(&mut self, active: &[ProxyConfig]) {
         let lines = self.engine.drain_log_lines();
         if lines.is_empty() {
             return;
         }
-        // Ticket 26: a broken database skips ingest (keeps old lines) instead
-        // of tagging against a lying empty row set.
-        let Ok(active) = self.store.list() else {
-            return;
-        };
+        // Ticket 47: the tag index builds once per batch (not once per
+        // config per line); ingest strips ANSI + caches the search blob.
+        let tags = LogTagIndex::build(active);
         for line in &lines {
-            self.logs.push_raw(line, &active);
+            self.logs.push_raw(line, &tags);
         }
     }
 
     /// Ticket 06: visible log lines for the dialog — the selected config's
     /// lines when a row is selected, else engine-global + all — further
     /// narrowed by the `log_filter` substring. Newest last, capped.
-    /// Ticket 34: sidecar stderr carries ANSI color escapes (sing-box
-    /// `[31m`/`[38;5;…`); the Logs dialog renders them stripped via the
-    /// shared `strip_ansi_codes` helper. Stored records stay verbatim so
-    /// filtering and any future export see the original bytes.
     /// Ticket 43: the severity filter (`log_level`) applies on top — `None`
     /// shows every level.
     fn log_lines(&self, cx: &App) -> Vec<String> {
-        let selected = self.selected_config(cx).map(|config| config.id);
-        let filter = self.log_filter.trim().to_lowercase();
-        let level = self.log_level;
-        let render =
-            |level: &str, message: &str| format!("[{}] {}", level, strip_ansi_codes(message));
-        let mut lines: Vec<String> = match selected.as_deref() {
-            Some(id) => self
-                .logs
-                .for_config(id)
-                .iter()
-                .filter(|record| log_level_matches(record.level, level))
-                .map(|record| render(record.level.as_str(), &record.message))
-                .collect(),
-            None => self
-                .logs
-                .all()
-                .iter()
-                .filter(|record| log_level_matches(record.level, level))
-                .map(|record| render(record.level.as_str(), &record.message))
-                .collect(),
-        };
-        if !filter.is_empty() {
-            lines.retain(|line| line.to_lowercase().contains(&filter));
-        }
-        if lines.len() > 200 {
-            lines = lines.split_off(lines.len() - 200);
-        }
-        lines
+        self.visible_log_lines(cx)
     }
 
     /// Ticket 45: the level filter (`log_level`) applies first; the tail
@@ -7968,10 +8221,31 @@ impl AppView {
     /// scheduling hook evaluation). Never called by tests, so no headless
     /// test ever touches the network.
     /// Ticket 12: delegates to [`AppView::due_subscriptions`].
+    /// Ticket 47: production calls the deferred wrapper (first paint
+    /// precedes refresh work); this stays as the immediate seam.
     fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
         for sub in self.due_subscriptions() {
             self.start_subscription_refresh(sub, cx);
         }
+    }
+
+    /// Ticket 47: startup refresh after first paint — waits
+    /// [`STARTUP_REFRESH_DEFER_SECS`], then runs the due pass unless ticks
+    /// were stopped or the view released (fail-closed, never a dead update).
+    fn refresh_due_on_startup_deferred(&mut self, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(STARTUP_REFRESH_DEFER_SECS))
+                .await;
+            cx.update(|cx| {
+                weak.update(cx, |view, cx| {
+                    view.refresh_due_on_startup(cx);
+                })
+                .ok();
+            });
+        })
+        .detach();
     }
 
     // -- Ticket 12: background ticks (bounded, stoppable) --------------------
@@ -8140,6 +8414,34 @@ impl AppView {
         self.spawn_probe(rows, false, false, None, cx)
     }
 
+    /// Ticket 47: lazy traffic totals — hydrate the display mirror from
+    /// persisted counters ONCE (first traffic tick), over the rows already
+    /// in the delegate (no extra store list). Only known rows hydrate, and
+    /// only nonzero totals flip the display — untracked rows keep the
+    /// probe-byte display, and removed configs never resurrect.
+    fn ensure_traffic_mirror(&mut self, cx: &mut Context<Self>) {
+        if self.traffic_mirror_hydrated {
+            return;
+        }
+        self.traffic_mirror_hydrated = true;
+        let Ok(totals) = self.store.traffic_totals() else {
+            return;
+        };
+        let known: HashSet<String> = self
+            .libraries
+            .read(cx)
+            .delegate()
+            .rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        for (id, (rx, tx)) in &totals {
+            if (*rx, *tx) != (0, 0) && known.contains(id) {
+                self.health_store.set_data_traffic(id, *rx, *tx);
+            }
+        }
+    }
+
     /// Ticket 36: one data-plane traffic pass over every serving core's
     /// clash controller: poll live entries, diff per-connection bytes
     /// against the last-seen map, persist per-row deltas, mirror persisted
@@ -8150,41 +8452,110 @@ impl AppView {
     /// Ticket 41: crashed cores are skipped via `live_clash_targets` (dead
     /// sockets are never trusted), and probe attribution normalizes
     /// (lowercase, no port, no trailing dot) plus the resolved-IP leg.
+    /// Ticket 47: cores poll concurrently (bounded, per-core timeout +
+    /// total deadline via [`poll_clash_targets`]); production ticks run
+    /// this fetch off the UI thread ([`spawn_traffic_poll`]) — this method
+    /// stays as the headless/test seam.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
+            return 0;
+        }
+        self.ensure_traffic_mirror(cx);
+        let targets = self.engine.live_clash_targets();
+        if targets.is_empty() {
+            return 0;
+        }
+        let results = crate::health::poll_clash_targets(
+            &targets,
+            crate::health::CLASH_PER_CORE_TIMEOUT,
+            crate::health::CLASH_TOTAL_DEADLINE,
+        );
+        let probe = crate::health::probe_host();
+        let probe_ips = crate::health::resolve_probe_ips(&probe);
+        self.apply_traffic_results(results, &probe, &probe_ips, cx)
+    }
+
+    /// Ticket 47: off-UI traffic tick (the [`spawn_probe`] pattern:
+    /// in-flight guard + owned inputs into `background_executor` + weak
+    /// commit via `cx.update` + detach). A second tick while one is in
+    /// flight is SKIPPED (returns 0), never queued — slow controllers can
+    /// never stack ticks. Returns 1 when a poll started. DNS resolution of
+    /// the probe host also runs off-thread (never a UI stall).
+    fn spawn_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
+        if !self.ticks_enabled || self.traffic_tick_in_flight {
             return 0;
         }
         let targets = self.engine.live_clash_targets();
         if targets.is_empty() {
             return 0;
         }
-        let probe = crate::health::probe_host();
-        let probe_ips = crate::health::resolve_probe_ips(&probe);
-        let timeout = std::time::Duration::from_secs(5);
+        self.ensure_traffic_mirror(cx);
+        self.traffic_tick_in_flight = true;
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let (results, probe, probe_ips) = cx
+                .background_executor()
+                .spawn(async move {
+                    let results = crate::health::poll_clash_targets(
+                        &targets,
+                        crate::health::CLASH_PER_CORE_TIMEOUT,
+                        crate::health::CLASH_TOTAL_DEADLINE,
+                    );
+                    let probe = crate::health::probe_host();
+                    let probe_ips = crate::health::resolve_probe_ips(&probe);
+                    (results, probe, probe_ips)
+                })
+                .await;
+            cx.update(|cx| {
+                weak.update(cx, |view, cx| {
+                    view.traffic_tick_in_flight = false;
+                    view.apply_traffic_results(results, &probe, &probe_ips, cx);
+                })
+                .ok();
+            });
+        })
+        .detach();
+        1
+    }
+
+    /// Ticket 47: commit one round of clash poll results (pure commit — no
+    /// I/O of its own): diff per-connection bytes against the bounded
+    /// last-seen map, persist per-row deltas in one transaction, mirror
+    /// absolutes for display, repaint. Returns the number of rows with new
+    /// bytes. Shared by the headless tick and the off-UI completion.
+    fn apply_traffic_results(
+        &mut self,
+        results: Vec<(
+            crate::engine::ClashTarget,
+            Result<Vec<crate::health::ClashConn>, String>,
+        )>,
+        probe: &str,
+        probe_ips: &[std::net::IpAddr],
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let now = now_unix();
         let mut deltas: HashMap<String, (u64, u64)> = HashMap::new();
-        let mut seen: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut ok_cores: HashSet<String> = HashSet::new();
         // Ticket 41: rows freshly polled on live cores (clears stale below).
         let mut fresh_rows: HashSet<String> = HashSet::new();
-        for target in &targets {
-            let Ok(entries) =
-                crate::health::poll_clash_entries(target.port, &target.secret, timeout)
-            else {
+        for (target, result) in &results {
+            let Ok(entries) = result else {
                 continue;
             };
             ok_cores.insert(target.core.clone());
-            for entry in &entries {
+            for entry in entries {
                 let Some(row) = entry.row_id.as_deref() else {
                     continue;
                 };
-                if crate::health::is_probe_destination_with_ips(&entry.dest, &probe, &probe_ips) {
+                if crate::health::is_probe_destination_with_ips(&entry.dest, probe, probe_ips) {
                     continue;
                 }
                 fresh_rows.insert(row.to_string());
                 let key = format!("{}/{}", target.core, entry.id);
                 let (rx, tx) = (entry.rx_bytes, entry.tx_bytes);
-                let (last_rx, last_tx) =
-                    self.traffic_last_seen.get(&key).copied().unwrap_or((0, 0));
+                let (last_rx, last_tx) = self.traffic_last_seen.get(&key).unwrap_or((0, 0));
                 let (delta_rx, delta_tx) = if (rx, tx) >= (last_rx, last_tx) {
                     (rx - last_rx, tx - last_tx)
                 } else {
@@ -8192,7 +8563,8 @@ impl AppView {
                     // current reading is the delta.
                     (rx, tx)
                 };
-                seen.insert(key, (rx, tx));
+                self.traffic_last_seen.insert(key.clone(), rx, tx, now);
+                seen.insert(key);
                 if delta_rx > 0 || delta_tx > 0 {
                     let slot = deltas.entry(row.to_string()).or_insert((0, 0));
                     slot.0 = slot.0.saturating_add(delta_rx);
@@ -8200,17 +8572,17 @@ impl AppView {
                 }
             }
         }
-        // Connections closed since the last poll leave the map (their bytes
-        // were already persisted as deltas while they lived). Cores whose
-        // poll failed keep their ids — a failed poll must never look like a
-        // mass close (that would double-count on recovery).
-        self.traffic_last_seen.retain(|id, _| {
-            let core = id.split('/').next().unwrap_or("");
-            !ok_cores.contains(core) || seen.contains_key(id)
-        });
-        for (id, pair) in &seen {
-            self.traffic_last_seen.insert(id.clone(), *pair);
-        }
+        // Bounded sweep: connections closed since the last poll leave the
+        // map (their bytes were already persisted as deltas while they
+        // lived); cores whose poll failed keep their ids — a failed poll
+        // must never look like a mass close (that would double-count on
+        // recovery). Dead-core entries TTL out; the cap holds absolutely.
+        let live_cores: HashSet<String> = results
+            .iter()
+            .map(|(target, _)| target.core.clone())
+            .collect();
+        self.traffic_last_seen
+            .sweep(now, &ok_cores, &seen, &live_cores);
         let mut updated = 0;
         // Ticket 40: one transaction per tick (batched, saturating
         // single-statement UPDATEs). Unknown ids skip (a row removed mid-tick
@@ -8221,7 +8593,21 @@ impl AppView {
                 .map(|(row, (rx, tx))| (row.clone(), *rx, *tx))
                 .collect();
             match self.store.add_traffic_batch(&batch) {
-                Ok(count) => updated = count,
+                Ok(count) => {
+                    updated = count;
+                    // Ticket 47: mirror previous + delta (no second
+                    // full-table scan per tick — exact while counters stay
+                    // under i64::MAX, i.e. always in practice).
+                    for (row, (rx, tx)) in &deltas {
+                        let (prev_rx, prev_tx) =
+                            self.health_store.data_traffic(row).unwrap_or((0, 0));
+                        self.health_store.set_data_traffic(
+                            row,
+                            prev_rx.saturating_add(*rx),
+                            prev_tx.saturating_add(*tx),
+                        );
+                    }
+                }
                 Err(error) => eprintln!("traffic tick failed: {error}"),
             }
         }
@@ -8234,13 +8620,6 @@ impl AppView {
             self.health_store.clear_stale(row);
         }
         if updated > 0 {
-            if let Ok(totals) = self.store.traffic_totals() {
-                for row in deltas.keys() {
-                    if let Some((rx, tx)) = totals.get(row) {
-                        self.health_store.set_data_traffic(row, *rx, *tx);
-                    }
-                }
-            }
             self.reload_quiet(cx);
         }
         updated
@@ -8261,7 +8640,7 @@ impl AppView {
             view.tick_reprobe_running(cx);
         });
         spawn_tick(cx, TRAFFIC_TICK_SECS, |view, cx| {
-            view.tick_traffic_poll(cx);
+            view.spawn_traffic_poll(cx);
         });
     }
 
@@ -8335,7 +8714,9 @@ impl AppView {
         // gone). The Start button reads `Starting…` while a start is in
         // flight (second clicks are ignored, never double-applied).
         let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
-        let upstream = upstream_host_port(&config).unwrap_or_else(|| "no upstream".to_string());
+        // Ticket 47: the detail upstream reads the same set_rows cache as
+        // the list rows (one HashMap lookup per frame, never a JSON parse).
+        let upstream = self.cached_upstream(cx, &config);
         let is_running = self.engine.is_running(&config.id);
         let badge = if is_running {
             let summary = self.health_store.row_summary(&config.id);
@@ -8897,7 +9278,7 @@ fn main() {
             cx.open_window(app_window_options(), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 view.update(cx, |view, cx| {
-                    view.refresh_due_on_startup(cx);
+                    view.refresh_due_on_startup_deferred(cx);
                     view.start_background_ticks(cx);
                 });
                 // Ticket 38: tray presence + session restore, both on the
@@ -8917,7 +9298,7 @@ fn main() {
                 cx.spawn(async move |cx| {
                     loop {
                         cx.background_executor()
-                            .timer(Duration::from_millis(150))
+                            .timer(Duration::from_millis(TRAY_PUMP_MILLIS))
                             .await;
                         // `Err` when the window or app is gone: the pump
                         // ends with it. `Ok(true)` is a tray Quit.
@@ -9086,9 +9467,9 @@ mod tests {
         );
     }
 
-    /// Ticket 34: the Logs dialog strips sidecar ANSI colors at render
-    /// (live-proven: sing-box `[31m`/`[38;5;…` escapes reached the dialog);
-    /// stored records stay verbatim.
+    /// Ticket 47: the Logs dialog shows ingest-stripped lines (sidecar ANSI
+    /// colors never reach storage or render — stripping moved from render
+    /// to ingest; stored records carry no escapes).
     #[gpui_kit::test]
     fn logs_dialog_strips_sidecar_ansi(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -9098,7 +9479,7 @@ mod tests {
             view.update(cx, |view, _| {
                 view.logs.push_raw(
                     "\u{1b}[31mERROR\u{1b}[0m[0033] dial tcp 127.0.0.1:8388: refused",
-                    &[],
+                    &crate::health::LogTagIndex::default(),
                 );
             });
         });
@@ -9113,8 +9494,8 @@ mod tests {
         });
         assert_eq!(stored.len(), 1);
         assert!(
-            stored[0].contains('\u{1b}'),
-            "stored record stays verbatim, got {:?}",
+            !stored[0].contains('\u{1b}'),
+            "stored record stripped at ingest, got {:?}",
             stored[0]
         );
         let lines = cx.update(|_, cx| view.update(cx, |view, cx| view.visible_log_lines(cx)));
@@ -9850,8 +10231,84 @@ mod tests {
         server.join().expect("stub drains");
     }
 
+    /// Ticket 47: the off-UI traffic tick polls concurrently off-thread and
+    /// commits on the main thread — deltas persist, the mirror tracks, and
+    /// a second tick while one is in flight is skipped, never queued.
+    #[gpui_kit::test]
+    fn t47_spawn_traffic_poll_off_ui_and_skips_in_flight(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10858"))
+            .expect("seed works");
+
+        let (port, server) = stub_clash_server(vec![traffic_body(&alpha.id, 1000, 50)], "s3cret");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (mut engine, _) = EngineController::fake();
+                engine.set_clash_targets(vec![ClashTarget {
+                    core: "stock".to_string(),
+                    port,
+                    secret: "s3cret".to_string(),
+                }]);
+                view.engine = engine;
+            });
+        });
+
+        // Guard first: a tick already in flight is skipped, never queued.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.traffic_tick_in_flight = true);
+        });
+        let skipped = cx.update(|_, cx| view.update(cx, |view, cx| view.spawn_traffic_poll(cx)));
+        assert_eq!(skipped, 0, "in-flight tick skipped");
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.traffic_tick_in_flight = false);
+        });
+
+        let started = cx.update(|_, cx| view.update(cx, |view, cx| view.spawn_traffic_poll(cx)));
+        assert_eq!(started, 1, "poll started off-thread");
+        let dup = cx.update(|_, cx| view.update(cx, |view, cx| view.spawn_traffic_poll(cx)));
+        assert_eq!(dup, 0, "second tick skipped while one runs");
+        // Off-thread completion lands on the main thread.
+        cx.run_until_parked();
+        let totals = view.read_with(cx, |view, _| {
+            view.store.traffic_totals().expect("totals read")
+        });
+        assert_eq!(
+            totals.get(&alpha.id),
+            Some(&(1000, 50)),
+            "probe bytes never reach the traffic columns"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.data_traffic(&alpha.id)),
+            Some((1000, 50)),
+            "mirror tracks persisted absolutes"
+        );
+        assert!(
+            !view.read_with(cx, |view, _| view.traffic_tick_in_flight),
+            "flag clears on completion"
+        );
+        server.join().expect("stub drains");
+    }
+
     /// Ticket 36: restart resumes data-plane counters from persisted
     /// totals (never zeroed) with no new polling.
+    /// Ticket 47: totals hydrate LAZILY — the fresh view shows no mirror
+    /// until the first traffic tick (startup never scans); the first tick
+    /// (even with zero targets) restores the counters.
     #[gpui_kit::test]
     fn restart_restores_traffic_mirror(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -9884,8 +10341,15 @@ mod tests {
 
         assert_eq!(
             restarted.read_with(cx, |view, _| view.health_store.data_traffic(&alpha_id)),
+            None,
+            "lazy totals: no mirror before the first tick"
+        );
+        let ticked = cx.update(|_, cx| restarted.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(ticked, 0, "no targets, no rows updated");
+        assert_eq!(
+            restarted.read_with(cx, |view, _| view.health_store.data_traffic(&alpha_id)),
             Some((1_048_782, 88)),
-            "counters resume from persisted totals"
+            "counters resume from persisted totals on first tick"
         );
         // TEMP files auto-removed: swap the view's store for an empty
         // in-memory one (direct field assignment, the fake-engine
@@ -9942,7 +10406,11 @@ mod tests {
         stock.emit_log("info engine listening on 127.0.0.1:10801");
 
         cx.update(|_, cx| {
-            view.update(cx, |view, _| view.drain_engine_logs());
+            view.update(cx, |view, _| {
+                // Ticket 47: ingest reuses one store list (no second scan).
+                let rows = view.store.list().expect("seeded rows list");
+                view.drain_engine_logs(&rows);
+            });
         });
 
         let (alpha_lines, beta_lines) = view.read_with(cx, |view, _| {
@@ -10254,14 +10722,15 @@ mod tests {
                     state.delegate_mut().selected = Some(IndexPath::new(0));
                 });
                 let rows = vec![config.clone()];
+                let tags = crate::health::LogTagIndex::build(&rows);
                 view.logs.push_raw(
                     &format!(
                         "warn {}: dial failed password=hunter2",
                         inbound_tag(&config.id)
                     ),
-                    &rows,
+                    &tags,
                 );
-                view.logs.push_raw("info engine started", &rows);
+                view.logs.push_raw("info engine started", &tags);
             });
         });
 
@@ -10652,9 +11121,12 @@ mod tests {
         let (view, cx) = mount_view(store, cx);
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
-                view.logs.push_raw("error boom one", &[]);
-                view.logs.push_raw("info chatter", &[]);
-                view.logs.push_raw("warn boom two", &[]);
+                view.logs
+                    .push_raw("error boom one", &crate::health::LogTagIndex::default());
+                view.logs
+                    .push_raw("info chatter", &crate::health::LogTagIndex::default());
+                view.logs
+                    .push_raw("warn boom two", &crate::health::LogTagIndex::default());
                 view.log_tail = true;
             });
         });
@@ -12190,8 +12662,14 @@ mod tests {
         let (view, cx) = mount_view(store, cx);
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
-                view.logs.push_raw("panic: sidecar blew up", &[]);
-                view.logs.push_raw("listening on 127.0.0.1:10861", &[]);
+                view.logs.push_raw(
+                    "panic: sidecar blew up",
+                    &crate::health::LogTagIndex::default(),
+                );
+                view.logs.push_raw(
+                    "listening on 127.0.0.1:10861",
+                    &crate::health::LogTagIndex::default(),
+                );
             });
         });
         cx.update(|window, cx| {
@@ -12408,6 +12886,243 @@ mod tests {
         delegate.query = String::new();
         delegate.apply_filter();
         assert_eq!(delegate.visible.len(), 2, "empty query shows all");
+    }
+
+    /// Ticket 47 (RED): the delegate search index answers exactly like the
+    /// per-row scan across nasty inputs — identical filter semantics
+    /// (ticket 44 owns the semantics; this only caches them).
+    #[test]
+    fn t47_search_index_matches_scan_parity() {
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        fn row(
+            id: &str,
+            name: &str,
+            protocol: &str,
+            params: &str,
+            group: &str,
+            bind: &str,
+            port: u16,
+        ) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: group.to_string(),
+                enabled: true,
+                bind_ip: bind.to_string(),
+                port,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let rows = vec![
+            row(
+                "1",
+                "Alpha",
+                "vless",
+                r#"{"server":"a.example.com","server_port":443}"#,
+                "g1",
+                "127.0.0.1",
+                10801,
+            ),
+            row(
+                "2",
+                "Beta",
+                "trojan",
+                r#"{"address":"10.0.0.9","port":"8443"}"#,
+                "G2",
+                "::1",
+                10802,
+            ),
+            row(
+                "3",
+                "Gamma Ray",
+                "WIREGUARD",
+                "not json{{{",
+                "",
+                "0.0.0.0",
+                10803,
+            ),
+            row(
+                "4",
+                "Unicodae",
+                "ss",
+                r#"{"server":"X.EXAMPLE.COM","server_port":8388,"password":"s3cret"}"#,
+                "vpn",
+                "192.168.1.2",
+                10804,
+            ),
+            row(
+                "5",
+                "both-hosts",
+                "vless",
+                r#"{"server":"nomatch.invalid","address":"matchme.invalid"}"#,
+                "g1",
+                "127.0.0.1",
+                10805,
+            ),
+            row(
+                "6",
+                "numport",
+                "tuic",
+                r#"{"server":"h.example.com","server_port":12345}"#,
+                "g3",
+                "127.0.0.1",
+                10806,
+            ),
+        ];
+        for query in [
+            "",
+            "  ",
+            "ALPHA",
+            "vless",
+            "WIREGUARD",
+            "a.example.com",
+            "X.EXAMPLE",
+            "1080",
+            "8443",
+            "g1",
+            "G2",
+            "::1",
+            "0.0.0.0",
+            "gamma ray",
+            "matchme",
+            "nomatch",
+            "s3cret",
+            "nope",
+            "alpha vless",
+            "8388",
+        ] {
+            let mut delegate = LibraryDelegate::new();
+            delegate.set_rows(rows.clone());
+            delegate.query = query.to_string();
+            delegate.apply_filter();
+            let cached: Vec<String> = delegate
+                .visible
+                .iter()
+                .map(|&i| delegate.rows[i].id.clone())
+                .collect();
+            let expected: Vec<String> = rows
+                .iter()
+                .filter(|r| crate::library_row_matches(r, query))
+                .map(|r| r.id.clone())
+                .collect();
+            assert_eq!(cached, expected, "index parity for query {query:?}");
+        }
+    }
+
+    /// Ticket 47 merge: the extended index agrees with
+    /// [`library_row_matches_full`] under a non-empty context (labels,
+    /// serving set, health summaries, mixed enabled flags).
+    #[test]
+    fn t47_search_index_matches_full_with_context() {
+        use crate::store::ProxyConfig;
+        use crate::{library_row_matches_full, LibraryDelegate, MatchContext};
+        fn row(id: &str, name: &str, enabled: bool, sub: Option<&str>) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: r#"{"server":"a.example.com","server_port":443}"#.to_string(),
+                group: "g".to_string(),
+                enabled,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: sub.map(str::to_string),
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let rows = vec![
+            row("1", "Alpha", true, Some("s1")),
+            row("2", "Beta", false, None),
+        ];
+        let mut ctx = MatchContext::default();
+        ctx.sub_labels
+            .insert("s1".to_string(), "Nightly Sub".to_string());
+        ctx.running.insert("1".to_string());
+        ctx.health.insert("1".to_string(), "87ms".to_string());
+        ctx.health.insert("2".to_string(), "dead".to_string());
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(rows.clone());
+        delegate.set_running(vec!["1".to_string()]);
+        delegate.set_health(ctx.health.clone());
+        delegate.set_search_context(ctx.sub_labels.clone(), ctx.preset_names.clone());
+        for query in [
+            "nightly",
+            "sub",
+            "enabled",
+            "disabled",
+            "running",
+            "stopped",
+            "live",
+            "dead",
+            "87ms",
+            "untested",
+            "alpha",
+            "zzz-no-match",
+        ] {
+            delegate.query = query.to_string();
+            delegate.apply_filter();
+            let cached: Vec<String> = delegate
+                .visible
+                .iter()
+                .map(|&i| delegate.rows[i].id.clone())
+                .collect();
+            let expected: Vec<String> = rows
+                .iter()
+                .filter(|r| library_row_matches_full(r, query, &ctx))
+                .map(|r| r.id.clone())
+                .collect();
+            assert_eq!(cached, expected, "index/full parity for {query:?}");
+        }
+    }
+
+    /// Ticket 47 (RED): filter + render serve from the set_rows caches -
+    /// poisoning params after set_rows changes neither (zero per-row parses
+    /// at filter/render time).
+    #[test]
+    fn t47_delegate_caches_survive_params_poison() {
+        use crate::store::ProxyConfig;
+        use crate::{library_row_matches, upstream_host_port, LibraryDelegate};
+        let row = ProxyConfig {
+            id: "1".to_string(),
+            name: "Alpha".to_string(),
+            protocol: "vless".to_string(),
+            params: r#"{"server":"a.example.com","server_port":443}"#.to_string(),
+            group: "g".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![row]);
+        let before = delegate.upstream_for("1").map(str::to_string);
+        assert_eq!(before.as_deref(), Some("a.example.com:443"));
+        // Poison the stored params: any live parse at filter/render time
+        // would now give a different answer.
+        delegate.rows[0].params = "not json{{{".to_string();
+        delegate.query = "a.example.com".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            delegate.visible.len(),
+            1,
+            "filter served from the index, not a live parse"
+        );
+        assert_eq!(
+            delegate.upstream_for("1").map(str::to_string),
+            before,
+            "render served from the cache, not a live parse"
+        );
+        // The oracle confirms the poison worked (a live scan disagrees).
+        assert!(!library_row_matches(&delegate.rows[0], "a.example.com"));
+        assert_eq!(upstream_host_port(&delegate.rows[0]), None);
     }
 
     /// Scenario: add/edit with a non-loopback bind → inline hint that
@@ -13818,9 +14533,84 @@ mod tests {
         // Info (already running) + success (completion) = two new notices.
         assert_eq!(notification_count(cx) - before, 2, "dedupe explains itself");
         assert!(
-            !view.read_with(cx, |view, _| view.probe_in_flight),
-            "flag clears on completion"
+            !view.read_with(cx, |view, _| view.probe_kind_in_flight(false)),
+            "url flag clears on completion"
         );
+    }
+
+    /// Ticket 47: per-kind probe flags — an in-flight URL-test probe blocks
+    /// a second URL test but never a TCP ping (and vice versa), so the 60s
+    /// re-probe tick cannot block a manual ping.
+    #[gpui_kit::test]
+    fn t47_probe_flags_isolate_kinds(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let config = store
+            .add(t26_engine_seed("Work", "10999"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, _) = FakeHealthProber::shared();
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        // Start a URL-test probe (manual test-all path).
+        let started =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
+        assert_eq!(started, 1, "url probe starts");
+        // Same kind dedupes while in flight…
+        let dup =
+            cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
+        assert_eq!(dup, 0, "second url probe dedupes");
+        // …but the other kind is free: a ping spawn succeeds mid-flight.
+        let ping = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.spawn_probe(vec![config.clone()], true, false, None, cx)
+            })
+        });
+        assert_eq!(ping, 1, "ping not blocked by the url tick");
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |view, _| view.probe_kind_in_flight(false)),
+            "url flag clears"
+        );
+        assert!(
+            !view.read_with(cx, |view, _| view.probe_kind_in_flight(true)),
+            "ping flag clears"
+        );
+    }
+
+    /// Ticket 47: idle cadences stay minimal — tray pump 500–1000ms, one
+    /// timer per interval (tick constants unchanged, single-sleep loops),
+    /// startup refresh deferred a few seconds past first paint.
+    #[test]
+    fn t47_idle_cadences_minimal() {
+        use crate::{STARTUP_REFRESH_DEFER_SECS, TRAY_PUMP_MILLIS};
+        assert!(
+            (500..=1000).contains(&TRAY_PUMP_MILLIS),
+            "tray pump idle-cheap, got {TRAY_PUMP_MILLIS}ms"
+        );
+        assert!(
+            (1..=10).contains(&STARTUP_REFRESH_DEFER_SECS),
+            "refresh deferred past first paint, got {STARTUP_REFRESH_DEFER_SECS}s"
+        );
+        // One timer per interval: every tick cadence is a single sleep.
+        for (name, secs) in [
+            ("engine", crate::ENGINE_POLL_TICK_SECS),
+            ("traffic", crate::TRAFFIC_TICK_SECS),
+            ("reprobe", crate::REPROBE_TICK_SECS),
+            ("subs", crate::DUE_SUBSCRIPTION_TICK_SECS),
+        ] {
+            assert!(secs >= 1, "{name} tick is a single whole-interval sleep");
+        }
     }
 
     // -- Ticket 30: list + engine feedback -----------------------------------
