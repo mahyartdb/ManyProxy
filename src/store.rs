@@ -7926,6 +7926,227 @@ mod tests {
             .expect("preset survives restore");
         assert_eq!(kept.rules().expect("rules decode").len(), 3);
     }
+    // -- Ticket 48: DPAPI failure injection + preset integration --------
+
+    /// Ticket 48 (US-60): DPAPI-down writes abort loudly with nothing
+    /// written — a single add and a sealing subscription refresh both
+    /// roll back (version and rows untouched, next open retries).
+    #[test]
+    fn t48_dpapi_down_aborts_writes_without_side_effects() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("baseline refresh works");
+        assert_eq!(store.list().expect("list works").len(), 2);
+        crate::dpapi::set_fail_for_test(true);
+        let add_result = store.add(NewConfig {
+            name: "Doomed".to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"a\":1}".to_string(),
+            group: String::new(),
+            bind_ip: String::new(),
+            port: String::new(),
+        });
+        let grown_body = format!("{}\ntrojan://pw3@c.example.com:443#three", sub_body_two());
+        let refresh_result = store.refresh_with_body(&sub.id, &grown_body, 200);
+        crate::dpapi::set_fail_for_test(false);
+        for error in [
+            add_result.expect_err("DPAPI-down add aborts"),
+            refresh_result.expect_err("DPAPI-down refresh aborts"),
+        ] {
+            assert!(
+                error.to_string().contains("dpapi"),
+                "loud dpapi cause, got {error}"
+            );
+        }
+        assert_eq!(
+            store.list().expect("list works").len(),
+            2,
+            "aborted writes leave no rows"
+        );
+        let kept = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub kept");
+        assert_eq!(
+            kept.last_refresh_at,
+            Some(100),
+            "aborted refresh leaves the watermark"
+        );
+    }
+
+    /// Ticket 48 (US-60): a foreign DPAPI blob (sealed under another
+    /// profile) fails strict reads loudly, quarantines on tolerant reads
+    /// instead of poisoning the list, and is skipped (named) by export.
+    #[test]
+    fn t48_foreign_blob_reads_quarantine() {
+        use base64::Engine as _;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let good = store
+            .add(NewConfig {
+                name: "Good".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"a\":1}".to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let foreign = format!(
+            "dpapi1:{}",
+            base64::engine::general_purpose::STANDARD.encode([0xabu8; 64])
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO proxy_configs (name, protocol, params, grp, enabled, bind_ip, port)
+                 VALUES ('Foreign','vless',?1,'default',0,'127.0.0.1',10899)",
+                rusqlite::params![foreign],
+            )
+            .expect("foreign blob plants");
+        let bad_id = store.conn.last_insert_rowid().to_string();
+        let error = store.list().expect_err("strict list fails loud");
+        assert!(
+            error.to_string().contains("dpapi"),
+            "loud dpapi cause, got {error}"
+        );
+        let (rows, quarantined) = store.list_with_quarantine().expect("tolerant list works");
+        assert_eq!(rows.len(), 1, "good rows load");
+        assert_eq!(rows[0].id, good.id);
+        assert_eq!(quarantined.len(), 1, "one bad row named");
+        assert_eq!(quarantined[0].id, bad_id);
+        let (_payload, skipped) = store
+            .export_library_json_with_quarantine()
+            .expect("tolerant export works");
+        assert_eq!(skipped, vec![bad_id], "export names the skip");
+    }
+
+    /// Ticket 48 (US-65): a corrupt sync baseline fails the refresh loudly
+    /// (never a silent revert, never a guessed compare); rows stay intact.
+    #[test]
+    fn t48_refresh_corrupt_baseline_fails_loud() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("baseline works");
+        let row = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "one")
+            .expect("member one");
+        store
+            .conn
+            .execute(
+                "UPDATE proxy_configs SET synced_params = 'dpapi1:!!!' WHERE id = ?1",
+                rusqlite::params![row.id.parse::<i64>().expect("numeric id")],
+            )
+            .expect("corrupt works");
+        let error = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 200)
+            .expect_err("corrupt baseline fails loud");
+        assert!(
+            error.to_string().contains("dpapi"),
+            "loud dpapi cause, got {error}"
+        );
+        assert_eq!(store.list().expect("list works").len(), 2, "rows intact");
+    }
+
+    fn t48_seed_vless(store: &mut Store, name: &str) -> ProxyConfig {
+        store
+            .add(NewConfig {
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                    \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: "127.0.0.1".to_string(),
+                port: "10801".to_string(),
+            })
+            .expect("seed row saves")
+    }
+
+    /// Ticket 48 (US-65): preset attach → generate (rules merge ahead of
+    /// the isolation rule) → delete paths → deleted id refused at
+    /// attach-time → cross-DB-style dangling reference swept by the
+    /// orphan banner path, generation honest again afterwards.
+    #[test]
+    fn t48_preset_attach_generate_deleted_id_integration() {
+        use crate::engine::{generate_with_presets, inbound_tag, outbound_tag};
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = t48_seed_vless(&mut store, "Row");
+        let preset = store
+            .create_preset("ads", "manual", None, &t37_rules_json())
+            .expect("create works");
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works");
+        let rows = store.list().expect("list works");
+        let map = store.preset_rules_map().expect("rules map works");
+        let generated = generate_with_presets(&rows, &map).expect("attached set generates");
+        let rules = generated.value()["route"]["rules"]
+            .as_array()
+            .expect("rules array")
+            .clone();
+        assert_eq!(
+            rules.len(),
+            t37_rules_json().len() + 1,
+            "preset rules plus the isolation rule"
+        );
+        assert_eq!(
+            rules[0]["domain"],
+            serde_json::json!(["example.com"]),
+            "preset rule merges first"
+        );
+        assert_eq!(
+            rules[0]["inbound"],
+            serde_json::json!([inbound_tag(&row.id)]),
+            "preset rule scoped to the row"
+        );
+        assert_eq!(
+            rules[0]["outbound"],
+            serde_json::json!(outbound_tag(&row.id)),
+            "preset route serves the row"
+        );
+        assert!(
+            store.delete_preset(&preset.id).is_err(),
+            "attached delete refused"
+        );
+        assert!(store
+            .delete_preset_detaching(&preset.id)
+            .expect("explicit delete works"));
+        assert!(
+            matches!(
+                store.set_config_preset(&row.id, Some(&preset.id)),
+                Err(StoreError::NotFound(_))
+            ),
+            "deleted id refused at attach-time"
+        );
+        // Cross-DB-style dangling reference (restore races): the orphan
+        // scan names it, the sweep clears it, generation is honest again.
+        store
+            .conn
+            .execute(
+                "UPDATE proxy_configs SET preset_id = '9999' WHERE id = ?1",
+                rusqlite::params![row.id.parse::<i64>().expect("numeric id")],
+            )
+            .expect("dangle works");
+        let orphans = store
+            .find_orphaned_preset_rows()
+            .expect("orphan scan works");
+        assert_eq!(orphans.len(), 1, "one dangling row");
+        assert_eq!(orphans[0].id, row.id);
+        assert_eq!(store.detach_orphaned_presets().expect("sweep works"), 1);
+        let rows = store.list().expect("list works");
+        assert_eq!(rows[0].preset_id, None, "swept clean");
+        let map = store.preset_rules_map().expect("rules map works");
+        generate_with_presets(&rows, &map).expect("swept set generates");
+    }
+
     /// Ticket 38: restore opt-in defaults off and round-trips (explicit
     /// checkbox only — nothing enables it silently).
     #[test]

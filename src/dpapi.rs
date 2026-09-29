@@ -5,18 +5,22 @@
 //! marker lives in [`seal_params`]/[`unseal_params`]. Errors name the
 //! operation only (never secret bytes, never lengths that leak shape).
 
+#[cfg(windows)]
 use std::ffi::c_void;
 
+#[cfg(windows)]
 const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
 /// Storage marker: `dpapi1:<base64(ciphertext)>`.
 pub const MARKER: &str = "dpapi1:";
 
+#[cfg(windows)]
 #[repr(C)]
 struct DataBlob {
     cb_data: u32,
     pb_data: *mut u8,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct ProtectPrompt {
     cb_size: u32,
@@ -25,6 +29,7 @@ struct ProtectPrompt {
     sz_prompt: *const u16,
 }
 
+#[cfg(windows)]
 #[link(name = "crypt32")]
 unsafe extern "system" {
     fn CryptProtectData(
@@ -47,6 +52,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetLastError() -> u32;
@@ -55,10 +61,17 @@ unsafe extern "system" {
 
 /// Encrypt `plaintext` for the current Windows user. Fails loudly when
 /// DPAPI is unavailable (never silently returns plaintext).
+/// Ticket 48: off Windows this is a loud stub — secrets at rest need
+/// Windows DPAPI, so the app is documented Windows-only (see README).
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     if fail_for_test() {
         return Err("dpapi protect failed (injected for test)".to_string());
     }
+    protect_platform(plaintext)
+}
+
+#[cfg(windows)]
+fn protect_platform(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     // SAFETY: in-blob borrows the caller's slice for the duration of the
     // call; all pointers are null except the input; UI is forbidden so the
     // call never blocks on a dialog. The out-blob is copied then freed.
@@ -89,8 +102,23 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Ticket 48: non-Windows loud stub (documented Windows-only). Never
+/// returns plaintext, never succeeds without the OS key.
+#[cfg(not(windows))]
+fn protect_platform(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Err(
+        "dpapi protect unavailable: secrets at rest need Windows DPAPI (Windows-only build)"
+            .to_string(),
+    )
+}
+
 /// Decrypt a blob from [`protect`]. Tampered or foreign blobs fail loudly.
 pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
+    unprotect_platform(blob)
+}
+
+#[cfg(windows)]
+fn unprotect_platform(blob: &[u8]) -> Result<Vec<u8>, String> {
     // SAFETY: same contract as [`protect`].
     unsafe {
         let input = DataBlob {
@@ -121,6 +149,15 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
         LocalFree(output.pb_data as *mut c_void);
         Ok(bytes)
     }
+}
+
+/// Ticket 48: non-Windows loud stub (documented Windows-only).
+#[cfg(not(windows))]
+fn unprotect_platform(_blob: &[u8]) -> Result<Vec<u8>, String> {
+    Err(
+        "dpapi unprotect unavailable: secrets at rest need Windows DPAPI (Windows-only build)"
+            .to_string(),
+    )
 }
 
 /// Seal a params string for storage: `dpapi1:<base64>`.
@@ -168,4 +205,150 @@ pub fn set_fail_for_test(fail: bool) {
 
 fn fail_for_test() -> bool {
     FAIL_FOR_TEST.with(|flag| flag.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reset the fail seam on drop so a panicking assertion never poisons
+    /// a later test sharing this thread.
+    struct FailGuard;
+
+    impl FailGuard {
+        fn on() -> Self {
+            set_fail_for_test(true);
+            Self
+        }
+    }
+
+    impl Drop for FailGuard {
+        fn drop(&mut self) {
+            set_fail_for_test(false);
+        }
+    }
+
+    /// Ticket 48 (US-60): bytes round-trip, including empty and unicode.
+    #[cfg(windows)]
+    #[test]
+    fn t48_protect_roundtrip() {
+        for plaintext in [
+            b"".as_slice(),
+            b"{}".as_slice(),
+            b"{\"password\":\"hunter2\"}".as_slice(),
+            "ünïcodé-☃".as_bytes(),
+        ] {
+            let blob = protect(plaintext).expect("protect works");
+            assert!(!blob.is_empty() || plaintext.is_empty());
+            assert_ne!(blob, plaintext, "ciphertext differs from plaintext");
+            assert_eq!(unprotect(&blob).expect("unprotect works"), plaintext);
+        }
+    }
+
+    /// Ticket 48 (US-60): sealed storage round-trips with the marker shape.
+    #[cfg(windows)]
+    #[test]
+    fn t48_seal_roundtrip() {
+        let sealed = seal_params("{\"a\":1}").expect("seal works");
+        assert!(sealed.starts_with(MARKER), "marker shape, got {sealed}");
+        assert_eq!(unseal_params(&sealed).expect("unseal works"), "{\"a\":1}");
+    }
+
+    /// Ticket 48 (US-60): rejection table — every bad shape fails loudly
+    /// with a named cause, never silent plaintext, never a guess.
+    #[cfg(windows)]
+    #[test]
+    fn t48_unseal_rejection_table() {
+        // Tampered blob: still valid base64, but DPAPI integrity fails.
+        // The flip lands near the tail inside the encrypted payload:
+        // DPAPI MACs the payload, not the header, so a header flip (or
+        // a last-char flip that only appends a tolerated zero byte when
+        // it replaces padding) still decrypts.
+        let sealed = seal_params("{\"a\":1}").expect("seal works");
+        let mut tampered = sealed.clone();
+        let at = tampered.len() - 8;
+        tampered.replace_range(
+            at..at + 1,
+            if &tampered[at..at + 1] == "A" {
+                "B"
+            } else {
+                "A"
+            },
+        );
+        assert!(
+            unseal_params(&tampered).is_err(),
+            "tampered blob fails loudly"
+        );
+        // Random bytes are no DPAPI blob either (foreign-blob class).
+        {
+            use base64::Engine as _;
+            let foreign = format!(
+                "{MARKER}{}",
+                base64::engine::general_purpose::STANDARD.encode([0xabu8; 64])
+            );
+            assert!(
+                unseal_params(&foreign).is_err(),
+                "foreign blob fails loudly"
+            );
+        }
+        // NOTE: the non-UTF8 arm needs DPAPI itself to decrypt to
+        // non-UTF8 bytes, which no same-profile ciphertext can produce;
+        // the foreign-blob arms above pin loud failure for that class.
+        for (stored, needle) in [
+            (format!("{MARKER}!!!"), "base64"),
+            (MARKER.to_string(), "dpapi"),
+            ("v2:abc".to_string(), "unknown params storage marker"),
+            ("plaintext".to_string(), "unknown params storage marker"),
+            ("".to_string(), "unknown params storage marker"),
+        ] {
+            let error = unseal_params(&stored).expect_err(&format!("{stored:?} must fail"));
+            assert!(
+                error.contains(needle),
+                "named cause ({needle}), got {error}"
+            );
+        }
+        // Legacy migration-window plaintext passes through verbatim.
+        for legacy in ["{\"a\":1}", "   {\"a\":1}  "] {
+            assert_eq!(
+                unseal_params(legacy).expect("legacy passes through"),
+                legacy
+            );
+        }
+    }
+
+    /// Ticket 48 (US-60): the injected DPAPI outage fails writes loudly.
+    #[test]
+    fn t48_fail_seam_aborts_writes_loudly() {
+        let _guard = FailGuard::on();
+        for error in [
+            protect(b"x").expect_err("protect aborts"),
+            seal_params("{\"a\":1}").expect_err("seal aborts"),
+        ] {
+            assert!(error.contains("dpapi"), "loud dpapi cause, got {error}");
+        }
+    }
+
+    /// Ticket 48 (US-66): off Windows every DPAPI op is a loud stub —
+    /// never silent plaintext, never a success without the OS key. Legacy
+    /// plaintext still passes through (there is nothing to seal with).
+    #[cfg(not(windows))]
+    #[test]
+    fn t48_non_windows_dpapi_is_a_loud_stub() {
+        for error in [
+            protect(b"x").expect_err("protect is a stub"),
+            seal_params("{\"a\":1}").expect_err("seal is a stub"),
+            unprotect(b"blob").expect_err("unprotect is a stub"),
+            unseal_params(&format!("{MARKER}QUJD")).expect_err("sealed open is a stub"),
+        ] {
+            assert!(error.contains("Windows"), "Windows-only cause, got {error}");
+        }
+        assert_eq!(
+            unseal_params("{\"a\":1}").expect("legacy passes through"),
+            "{\"a\":1}"
+        );
+        assert!(
+            unseal_params("v2:abc").is_err(),
+            "unknown markers still refused"
+        );
+    }
 }

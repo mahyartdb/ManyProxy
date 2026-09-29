@@ -1,0 +1,64 @@
+# Ticket 48: opt-in live sidecar proofs (pinned sing-box, default off).
+#
+# The default suite (`cargo test`) is hermetic: the live tests below
+# return immediately unless their gate env vars are set, so normal CI
+# and local runs never download anything or spawn real sidecars.
+# This workflow is the ONLY place that sets the gates. It runs only on
+# manual dispatch (workflow_dispatch) — never on push/PR — with a
+# pinned sing-box version (default 1.14.2, the version the generator
+# targets; see the 1.14.2 schema contract in the research brief).
+#
+# Gates (see engine.rs live tests):
+# - MANYPROXY_LIVE_CHECK=1   — stock sing-box `check` over every
+#   generated row shape (TEMP config files only, removed afterwards).
+# - MANYPROXY_LIVE_TRAFFIC=1 — real sidecar run + clash-controller
+#   totals/Auth/totals-move proof (loopback + TEMP files only; the
+#   sidecar is killed before the test returns).
+# - MANYPROXY_SINGBOX_BIN    — the pinned binary under test.
+
+name: live
+
+on:
+  workflow_dispatch:
+    inputs:
+      singbox_version:
+        description: "Pinned sing-box version (generator target)"
+        required: true
+        default: "1.14.2"
+
+env:
+  SINGBOX_VERSION: ${{ inputs.singbox_version }}
+
+jobs:
+  live-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch pinned sing-box (no silent downloads in the app itself)
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.singbox_version }}"
+          $zip = "sing-box-$version-windows-amd64.zip"
+          $url = "https://github.com/SagerNet/sing-box/releases/download/v$version/$zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\$zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64"
+          Expand-Archive -Path "$env:RUNNER_TEMP\$zip" -DestinationPath "$env:RUNNER_TEMP"
+          Copy-Item "$dir\sing-box.exe" -Destination "target\debug\sing-box.exe" -Force
+          & "target\debug\sing-box.exe" version
+
+      - name: Live proofs (gated; hermetic suite runs first un-gated)
+        shell: pwsh
+        env:
+          MANYPROXY_LIVE_CHECK: "1"
+          MANYPROXY_LIVE_TRAFFIC: "1"
+          MANYPROXY_SINGBOX_BIN: "target\\debug\\sing-box.exe"
+        run: |
+          cargo test --locked
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings

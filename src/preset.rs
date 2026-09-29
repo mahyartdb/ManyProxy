@@ -277,7 +277,7 @@ pub fn parse_preset_json(text: &str, default_name: &str) -> Result<PresetImport,
 /// `library`) — a full sing-box config has `outbounds` and stays on the
 /// endpoint path.
 pub fn looks_like_preset_json(text: &str) -> bool {
-    let trimmed = text.trim();
+    let trimmed = strip_preset_bom(text.trim()).trim();
     if !trimmed.starts_with('{') {
         return false;
     }
@@ -795,5 +795,29 @@ mod tests {
             crate::store::subscription_fetch_policy("http://127.0.0.1/p.json"),
             crate::store::SubscriptionFetchPolicy::Block { .. }
         ));
+    }
+
+    /// Ticket 48 (US-66): BOM-prefixed preset bodies parse (object, bare
+    /// array, doubled BOM); `looks_like` spots the shape through the BOM.
+    /// (Single-object BOM parsing itself is ticket-42 covered above.)
+    #[test]
+    fn t48_bom_prefixed_preset_json_parses() {
+        let object = "\u{FEFF}{\"name\":\"bom\",\"rules\":[{\"action\":\"direct\"}]}";
+        let parsed = parse_preset_json(object, "").expect("BOM object parses");
+        assert_eq!(parsed.name, "bom");
+        assert_eq!(parsed.rules.len(), 1);
+        let array = "\u{FEFF}[{\"action\":\"direct\"}]";
+        let parsed = parse_preset_json(array, "file-stem").expect("BOM array parses");
+        assert_eq!(parsed.name, "file-stem");
+        let doubled = "\u{FEFF}\u{FEFF}{\"name\":\"bom\",\"rules\":[]}";
+        assert!(
+            parse_preset_json(doubled, "").is_ok(),
+            "stacked BOMs collapse"
+        );
+        assert!(
+            looks_like_preset_json(object),
+            "shape spotted through the BOM"
+        );
+        assert!(!looks_like_preset_json("\u{FEFF}vless://u@h:1"));
     }
 }
