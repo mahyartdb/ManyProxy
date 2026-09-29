@@ -5061,6 +5061,14 @@ pub fn resolve_egress_host(
     if trimmed.parse::<std::net::IpAddr>().is_ok() {
         return Ok(());
     }
+    // A `host/prefix` value is a local interface assignment in CIDR form
+    // (WireGuard `address`), never a DNS name: when the head parses as an
+    // IP literal there is nothing to resolve.
+    if let Some((head, _)) = trimmed.split_once('/') {
+        if head.trim().parse::<std::net::IpAddr>().is_ok() {
+            return Ok(());
+        }
+    }
     resolver(trimmed)
 }
 
@@ -5082,7 +5090,10 @@ pub fn default_egress_resolver(server: &str) -> Result<(), String> {
 }
 
 /// Ticket 41: egress servers claimed by one row's params (top-level
-/// `server`/`address` string fields). Chain rows carry no top-level
+/// `server`/`address` string fields). A value carrying `/` is a local
+/// interface assignment in CIDR form (WireGuard `address`), never an
+/// egress hostname, so it is skipped here (and is IP-accepted anyway by
+/// [`resolve_egress_host`]). Chain rows carry no top-level
 /// server (their hops resolve at probe time under the cause classifier),
 /// and extra-core rows are opaque passthrough — both yield nothing here.
 fn egress_servers_of(params: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
@@ -5090,7 +5101,7 @@ fn egress_servers_of(params: &serde_json::Map<String, serde_json::Value>) -> Vec
         .into_iter()
         .filter_map(|key| params.get(key).and_then(serde_json::Value::as_str))
         .map(|server| server.trim().to_string())
-        .filter(|server| !server.is_empty())
+        .filter(|server| !server.is_empty() && !server.contains('/'))
         .collect()
 }
 
@@ -11742,6 +11753,38 @@ Active Connections\r
             "got {error}"
         );
         assert!(!stock.is_running());
+    }
+
+    /// Interface addresses in CIDR form (`address: 100.64.9.141/32`) are
+    /// local tunnel assignments, never egress hostnames — the DNS gate
+    /// skips them without consulting the resolver (regression: AmneziaWG
+    /// rows were refused at start).
+    #[test]
+    fn t41_dns_gate_skips_cidr_interface_address() {
+        let wg = fixture(
+            "10",
+            "WG",
+            "amneziawg",
+            json!({"type": "wireguard", "server": "203.0.113.7",
+                   "server_port": 51820, "address": "100.64.9.141/32"}),
+            "127.0.0.1",
+            10810,
+        );
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let calls_in = calls.clone();
+        let resolver = move |server: &str| {
+            calls_in.borrow_mut().push(server.to_string());
+            Err("must not be consulted".to_string())
+        };
+        validate_egress_resolution_with(std::slice::from_ref(&wg), &resolver)
+            .expect("CIDR address + literal server pass with no lookup");
+        assert!(calls.borrow().is_empty(), "no lookup at all");
+        // Belt-and-braces: a bare CIDR reaching the host check directly is
+        // still an IP literal, never a DNS name.
+        assert!(
+            resolve_egress_host("10.0.0.2/32", &resolver).is_ok(),
+            "CIDR literal passes"
+        );
     }
 
     /// Row-local vs union-level split covers the new variants.
