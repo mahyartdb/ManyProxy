@@ -2393,6 +2393,91 @@ impl Store {
         Ok(removed > 0)
     }
 
+    /// Ticket 44: per-group row counts for the facet picker and the group
+    /// manager (ordered by group name). Groups are free-text labels, not a
+    /// table — this is the only group inventory.
+    pub fn group_counts(&self) -> Result<Vec<(String, usize)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT grp, COUNT(*) FROM proxy_configs GROUP BY grp ORDER BY grp")?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut out = Vec::new();
+        for row in mapped {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Ticket 44: rename a group label across every row that carries it.
+    /// Returns the rows moved. An empty new name is rejected (nothing
+    /// written); renaming a missing group moves zero rows.
+    pub fn rename_group(&mut self, old: &str, new: &str) -> Result<usize, StoreError> {
+        let new = new.trim();
+        if new.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "group",
+                "Group name cannot be empty",
+            )]));
+        }
+        let changed = self.conn.execute(
+            "UPDATE proxy_configs SET grp = ?1 WHERE grp = ?2",
+            params![new, old],
+        )?;
+        Ok(changed)
+    }
+
+    /// Ticket 44: move rows into a group by id. Unknown ids are skipped
+    /// (bulk semantics — already-removed rows are not failures); returns
+    /// the rows actually moved. An empty group name is rejected.
+    pub fn move_to_group(&mut self, ids: &[String], group: &str) -> Result<usize, StoreError> {
+        let group = group.trim();
+        if group.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "group",
+                "Group name cannot be empty",
+            )]));
+        }
+        let rowids: Vec<i64> = ids.iter().filter_map(|id| id.parse::<i64>().ok()).collect();
+        if rowids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders: Vec<String> = rowids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect();
+        let sql = format!(
+            "UPDATE proxy_configs SET grp = ?1 WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let changed = stmt.execute(rusqlite::params_from_iter(
+            std::iter::once(group.to_string()).chain(rowids.iter().map(|id| id.to_string())),
+        ))?;
+        Ok(changed)
+    }
+
+    /// Ticket 44: delete a group label. Refuses loudly while rows still
+    /// carry it (names the count so the manager can offer move-first);
+    /// deleting an already-empty group is a no-op success. The default
+    /// group label itself is never special-cased here — emptiness decides.
+    pub fn delete_group(&mut self, name: &str) -> Result<(), StoreError> {
+        let remaining: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM proxy_configs WHERE grp = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        if remaining > 0 {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "group",
+                format!("Group \"{name}\" still holds {remaining} row(s); move them first"),
+            )]));
+        }
+        Ok(())
+    }
+
     /// Flip the enabled flag.
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<ProxyConfig, StoreError> {
         let rowid: i64 = match id.parse() {
@@ -4949,6 +5034,109 @@ mod tests {
             bind_ip: String::new(),
             port: String::new(),
         }
+    }
+
+    /// Ticket 44: group rename moves every row carrying the old label;
+    /// empty names refuse with nothing written.
+    #[test]
+    fn t44_rename_group_moves_rows_and_rejects_empty() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut a = valid_input("A");
+        a.group = "g1".to_string();
+        let mut b = valid_input("B");
+        b.group = "g1".to_string();
+        let mut c = valid_input("C");
+        c.group = "g2".to_string();
+        store.add_batch(vec![a, b, c]).expect("adds work");
+        assert_eq!(store.rename_group("g1", "team").expect("rename works"), 2);
+        let groups: std::collections::HashMap<String, usize> = store
+            .group_counts()
+            .expect("counts work")
+            .into_iter()
+            .collect();
+        assert_eq!(groups.get("team"), Some(&2));
+        assert_eq!(groups.get("g2"), Some(&1));
+        assert!(!groups.contains_key("g1"));
+        assert_eq!(
+            store
+                .rename_group("missing", "x")
+                .expect("missing renames zero"),
+            0
+        );
+        let error = store
+            .rename_group("team", "   ")
+            .expect_err("empty rename must fail");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error}");
+        };
+        assert!(fields.iter().any(|e| e.field == "group"));
+        assert_eq!(
+            store
+                .list()
+                .expect("list works")
+                .iter()
+                .filter(|r| r.group == "team")
+                .count(),
+            2,
+            "failed rename writes nothing"
+        );
+    }
+
+    /// Ticket 44: bulk move lands the checked ids in the target group;
+    /// unknown ids skip silently; group counts inventory the labels.
+    #[test]
+    fn t44_move_to_group_and_counts() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut a = valid_input("A");
+        a.group = "g1".to_string();
+        let mut b = valid_input("B");
+        b.group = "g1".to_string();
+        let created = store.add_batch(vec![a, b]).expect("adds work");
+        let ids: Vec<String> = created.iter().map(|r| r.id.clone()).collect();
+        let mut targets = vec![ids[0].clone(), "99999".to_string()];
+        assert_eq!(
+            store.move_to_group(&targets, "team").expect("move works"),
+            1
+        );
+        targets[0] = ids[1].clone();
+        assert_eq!(
+            store
+                .move_to_group(&targets, "  team  ")
+                .expect("move trims"),
+            1
+        );
+        let counts = store.group_counts().expect("counts work");
+        assert_eq!(counts, vec![("team".to_string(), 2)]);
+        let error = store
+            .move_to_group(&ids, "")
+            .expect_err("empty group must fail");
+        let StoreError::Invalid(_) = error else {
+            panic!("expected Invalid, got {error}");
+        };
+    }
+
+    /// Ticket 44: deleting a group with rows refuses loudly (names the
+    /// count); empty groups delete clean.
+    #[test]
+    fn t44_delete_group_refuses_while_rows_remain() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut a = valid_input("A");
+        a.group = "g1".to_string();
+        store.add(a).expect("add works");
+        let error = store
+            .delete_group("g1")
+            .expect_err("non-empty delete refuses");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error}");
+        };
+        assert!(
+            fields.iter().any(|e| e.message.contains('1')),
+            "refusal names the count: {fields:?}"
+        );
+        store
+            .delete_group("empty-label")
+            .expect("empty group deletes clean");
+        assert_eq!(store.list().expect("list works").len(), 1);
     }
 
     /// Issue 02, scenario 1: empty library + add with loopback bind and auto

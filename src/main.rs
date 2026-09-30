@@ -221,6 +221,85 @@ struct LibraryDelegate {
     /// the extended search never reads the store per keystroke.
     sub_labels: HashMap<String, String>,
     preset_names: HashMap<String, String>,
+    /// Ticket 44: id-keyed multi-select (config ids, never indices — a
+    /// reload or filter never re-targets the set). Pruned by [`set_rows`];
+    /// bulk actions run over exactly this set.
+    checked: HashSet<String>,
+    /// Ticket 44: group/protocol/status facets ANDed with the text query in
+    /// [`apply_filter`]. `None` means no constraint on that facet.
+    facet_group: Option<String>,
+    facet_protocol: Option<String>,
+    facet_status: Option<FacetStatus>,
+}
+
+/// Ticket 44: status facet over row state + serving set + health summaries —
+/// exact predicates (never substring), so `Live` cannot match a stray
+/// "delivered" and `Stopped` cannot match a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FacetStatus {
+    Enabled,
+    Disabled,
+    Running,
+    Stopped,
+    Live,
+    Dead,
+    Untested,
+}
+
+impl FacetStatus {
+    const ALL: [FacetStatus; 7] = [
+        FacetStatus::Enabled,
+        FacetStatus::Disabled,
+        FacetStatus::Running,
+        FacetStatus::Stopped,
+        FacetStatus::Live,
+        FacetStatus::Dead,
+        FacetStatus::Untested,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            FacetStatus::Enabled => "Enabled",
+            FacetStatus::Disabled => "Disabled",
+            FacetStatus::Running => "Running",
+            FacetStatus::Stopped => "Stopped",
+            FacetStatus::Live => "Live",
+            FacetStatus::Dead => "Dead",
+            FacetStatus::Untested => "Untested",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<FacetStatus> {
+        Self::ALL.into_iter().find(|status| status.label() == label)
+    }
+
+    /// Mirror of the `_full` health words: a present non-`dead` summary is
+    /// live; missing/blank is untested.
+    fn matches(
+        self,
+        row: &ProxyConfig,
+        running: &HashSet<String>,
+        health: &HashMap<String, String>,
+    ) -> bool {
+        match self {
+            FacetStatus::Enabled => row.enabled,
+            FacetStatus::Disabled => !row.enabled,
+            FacetStatus::Running => running.contains(&row.id),
+            FacetStatus::Stopped => !running.contains(&row.id),
+            FacetStatus::Live => health
+                .get(&row.id)
+                .map(|summary| !summary.trim().is_empty() && summary.trim() != "dead")
+                .unwrap_or(false),
+            FacetStatus::Dead => health
+                .get(&row.id)
+                .map(|s| s.trim() == "dead")
+                .unwrap_or(false),
+            FacetStatus::Untested => health
+                .get(&row.id)
+                .map(|summary| summary.trim().is_empty())
+                .unwrap_or(true),
+        }
+    }
 }
 
 /// Ticket 47: precomputed per-row search fields (lowercased once in
@@ -373,12 +452,18 @@ impl LibraryDelegate {
             traffic: HashMap::new(),
             sub_labels: HashMap::new(),
             preset_names: HashMap::new(),
+            checked: HashSet::new(),
+            facet_group: None,
+            facet_protocol: None,
+            facet_status: None,
         }
     }
 
     /// Replace all rows, preserving the selection by config id when possible.
     /// Ticket 47: rebuilds the search index + upstream cache (the only
     /// per-row JSON parses — never at filter/render time).
+    /// Ticket 44: prunes checked ids that vanished (bulk never acts on
+    /// ghosts), then re-filters (facets may now match differently).
     fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.search_index = rows.iter().map(RowSearchIndex::of).collect();
@@ -392,6 +477,10 @@ impl LibraryDelegate {
             })
             .collect();
         self.rows = rows;
+        // Ticket 44: drop checked ids with no row left (deleted elsewhere —
+        // the bulk bar label recomputes from this set, never stale).
+        let live: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        self.checked.retain(|id| live.contains(id.as_str()));
         self.refresh_search_words();
         self.apply_filter();
         self.selected = selected_id.and_then(|id| {
@@ -415,21 +504,158 @@ impl LibraryDelegate {
         // filtered-out selection instead of landing actions on the wrong row.
         // Ticket 47: one contains per row over the precomputed index — zero
         // parses, zero per-row allocs per keystroke.
+        // Ticket 44: facets AND with the text query (group/protocol/status
+        // read straight off the row + maps — no JSON parses either).
         let selected_id = self.selected_row().map(|row| row.id.clone());
         let lowered = self.query.trim().to_lowercase();
-        self.visible = self
-            .search_index
-            .iter()
-            .enumerate()
-            .filter(|(_, blob)| blob.matches_lowered(&lowered))
-            .map(|(index, _)| index)
-            .collect();
+        let mut visible = Vec::new();
+        for (index, blob) in self.search_index.iter().enumerate() {
+            if !blob.matches_lowered(&lowered) {
+                continue;
+            }
+            if !self.row_matches_facets(index) {
+                continue;
+            }
+            visible.push(index);
+        }
+        self.visible = visible;
         self.selected = selected_id.and_then(|id| {
             self.visible
                 .iter()
                 .position(|&index| self.rows[index].id == id)
                 .map(IndexPath::new)
         });
+    }
+
+    /// Ticket 44: one row against the three facets (`None` = unconstrained).
+    /// Protocol compares lowercased (stored values vary in case); group is
+    /// an exact label match (no free-text typos — pickers only offer real
+    /// labels).
+    fn row_matches_facets(&self, index: usize) -> bool {
+        let Some(row) = self.rows.get(index) else {
+            return false;
+        };
+        if let Some(group) = &self.facet_group {
+            if &row.group != group {
+                return false;
+            }
+        }
+        if let Some(protocol) = &self.facet_protocol {
+            if row.protocol.to_lowercase() != *protocol {
+                return false;
+            }
+        }
+        if let Some(status) = &self.facet_status {
+            if !status.matches(row, &self.running, &self.health) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Ticket 44: true while any facet constrains the list (drives the
+    /// `(M visible)` honesty arm of the bulk label + the Clear-facets CTA).
+    fn facets_active(&self) -> bool {
+        self.facet_group.is_some() || self.facet_protocol.is_some() || self.facet_status.is_some()
+    }
+
+    /// Ticket 44: honest bulk-bar label. The bulk set is the primitive
+    /// (actions run over the full set, never just the visible slice), so a
+    /// filtered view names both counts; an unfiltered view shows the set
+    /// alone. Empty when nothing is checked (the bar hides with it).
+    fn bulk_label(&self) -> String {
+        if self.checked.is_empty() {
+            return String::new();
+        }
+        if self.query.trim().is_empty() && !self.facets_active() {
+            return format!("{} selected", self.checked.len());
+        }
+        format!(
+            "{} selected ({} visible)",
+            self.checked.len(),
+            self.visible.len()
+        )
+    }
+
+    /// Ticket 44: the checked rows in library order (bulk actions iterate
+    /// this; filter-hiding never shrinks it).
+    fn checked_rows(&self) -> Vec<ProxyConfig> {
+        self.rows
+            .iter()
+            .filter(|row| self.checked.contains(&row.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Ticket 44: distinct group labels with row counts for the facet picker
+    /// + group manager (ordered by label; counts cover ALL rows, not just
+    /// the visible slice).
+    fn group_options(&self) -> Vec<(String, usize)> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for row in &self.rows {
+            *counts.entry(row.group.as_str()).or_default() += 1;
+        }
+        let mut options: Vec<(String, usize)> = counts
+            .into_iter()
+            .map(|(group, count)| (group.to_string(), count))
+            .collect();
+        options.sort();
+        options
+    }
+
+    /// Ticket 44: distinct lowercased protocols for the facet picker.
+    fn protocol_options(&self) -> Vec<String> {
+        let mut options: Vec<String> = self
+            .rows
+            .iter()
+            .map(|row| row.protocol.to_lowercase())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        options.sort();
+        options
+    }
+
+    /// Ticket 44: facet setters (each re-filters; the picker calls these).
+    /// Clearing one facet never touches the others or the text query.
+    fn set_facet_group(&mut self, group: Option<String>) {
+        self.facet_group = group;
+        self.apply_filter();
+    }
+
+    fn set_facet_protocol(&mut self, protocol: Option<String>) {
+        self.facet_protocol = protocol.map(|p| p.to_lowercase());
+        self.apply_filter();
+    }
+
+    fn set_facet_status(&mut self, status: Option<FacetStatus>) {
+        self.facet_status = status;
+        self.apply_filter();
+    }
+
+    fn clear_facets(&mut self) {
+        self.facet_group = None;
+        self.facet_protocol = None;
+        self.facet_status = None;
+        self.apply_filter();
+    }
+
+    /// Ticket 44: toggle one id in the multi-select set (checkbox taps +
+    /// keyboard call this). Unknown ids are ignored (never a ghost check).
+    fn toggle_checked(&mut self, id: &str) {
+        if self.checked.contains(id) {
+            self.checked.remove(id);
+            return;
+        }
+        if self.rows.iter().any(|row| row.id == id) {
+            self.checked.insert(id.to_string());
+        }
+    }
+
+    /// Ticket 44: empty the multi-select set (bulk Clear + Esc with no
+    /// dialog open call this).
+    fn clear_checked(&mut self) {
+        self.checked.clear();
     }
 
     fn row_at(&self, index: IndexPath) -> Option<ProxyConfig> {
@@ -449,16 +675,20 @@ impl LibraryDelegate {
 
     /// Ticket 06: replace the per-row health summaries (keyed by config id
     /// so row replacement never misattributes a latency).
+    /// Ticket 44: re-filters too (status facets read health).
     fn set_health(&mut self, health: HashMap<String, String>) {
         self.health = health;
         self.refresh_search_words();
+        self.apply_filter();
     }
 
     /// Ticket 30: replace the serving set (`config_id`s currently running).
     /// Badges render from this — never from the enabled flag.
+    /// Ticket 44: re-filters too (status facets read the serving set).
     fn set_running(&mut self, ids: Vec<String>) {
         self.running = ids.into_iter().collect();
         self.refresh_search_words();
+        self.apply_filter();
     }
 
     /// Ticket 43: replace the per-row traffic totals (persisted store
@@ -469,6 +699,8 @@ impl LibraryDelegate {
 
     /// Ticket 43: replace the search context maps (subscription labels and
     /// preset names by id). Set on reload; filters never touch the store.
+    /// Ticket 44: re-filters too (context words feed the text index, so a
+    /// label change can match differently under the live query).
     fn set_search_context(
         &mut self,
         sub_labels: HashMap<String, String>,
@@ -477,6 +709,7 @@ impl LibraryDelegate {
         self.sub_labels = sub_labels;
         self.preset_names = preset_names;
         self.refresh_search_words();
+        self.apply_filter();
     }
 
     /// Rebuild the index context words from the current rows + maps (rows,
@@ -13152,6 +13385,219 @@ mod tests {
                 .collect();
             assert_eq!(cached, expected, "index/full parity for {query:?}");
         }
+    }
+
+    /// Ticket 44: group + status + protocol facets AND with the text query;
+    /// visible rows satisfy every predicate at once.
+    #[test]
+    fn t44_facets_and_with_text_query() {
+        use crate::store::ProxyConfig;
+        use crate::{FacetStatus, LibraryDelegate};
+        fn row(id: &str, name: &str, protocol: &str, group: &str, enabled: bool) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: protocol.to_string(),
+                params: r#"{"server":"a.example.com","server_port":443}"#.to_string(),
+                group: group.to_string(),
+                enabled,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let rows = vec![
+            row("1", "Alpha", "vless", "team", true),
+            row("2", "Beta", "vmess", "team", false),
+            row("3", "Gamma", "vless", "lab", true),
+        ];
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(rows);
+        delegate.set_running(vec!["1".to_string()]);
+        let mut health = std::collections::HashMap::new();
+        health.insert("1".to_string(), "87ms".to_string());
+        health.insert("3".to_string(), "dead".to_string());
+        delegate.set_health(health);
+        // Text alone matches two vless rows.
+        delegate.query = "vless".to_string();
+        delegate.apply_filter();
+        assert_eq!(delegate.visible.len(), 2);
+        // Group facet narrows to the team vless row only.
+        delegate.set_facet_group(Some("team".to_string()));
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["1".to_string()]);
+        // Status facet ANDs further: Stopped excludes running row 1.
+        delegate.set_facet_status(Some(FacetStatus::Stopped));
+        assert!(delegate.visible.is_empty(), "all predicates must hold");
+        delegate.set_facet_status(Some(FacetStatus::Running));
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["1".to_string()]);
+        // Protocol facet is exact, not substring: "VLES" matches no
+        // protocol even though every vless row contains it.
+        delegate.query = String::new();
+        delegate.set_facet_status(None);
+        delegate.set_facet_protocol(Some("VLES".to_string()));
+        assert!(
+            delegate.visible.is_empty(),
+            "protocol is exact, not substring"
+        );
+        delegate.set_facet_protocol(Some("VMESS".to_string()));
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["2".to_string()]);
+        delegate.set_facet_group(None);
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["2".to_string()]);
+        // Live/Dead/Untested/Enabled/Disabled arms.
+        delegate.query = String::new();
+        delegate.set_facet_protocol(None);
+        delegate.set_facet_status(Some(FacetStatus::Live));
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["1".to_string()]);
+        delegate.set_facet_status(Some(FacetStatus::Dead));
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["3".to_string()]);
+        delegate.set_facet_status(Some(FacetStatus::Untested));
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["2".to_string()]);
+        delegate.set_facet_status(Some(FacetStatus::Disabled));
+        let shown: Vec<String> = delegate
+            .visible
+            .iter()
+            .map(|&i| delegate.rows[i].id.clone())
+            .collect();
+        assert_eq!(shown, vec!["2".to_string()]);
+        // Clearing restores the full list; query untouched by facet clears.
+        delegate.query = "a".to_string();
+        delegate.clear_facets();
+        assert_eq!(delegate.visible.len(), 3);
+        assert_eq!(delegate.query, "a");
+    }
+
+    /// Ticket 44: the bulk set survives filtering (hidden members stay
+    /// checked), the label names both counts under a filter, and `set_rows`
+    /// prunes vanished ids.
+    #[test]
+    fn t44_checked_set_honest_label_and_prune() {
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        fn row(id: &str, name: &str, group: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: r#"{"server":"a.example.com"}"#.to_string(),
+                group: group.to_string(),
+                enabled: true,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            row("1", "Alpha", "g"),
+            row("2", "Beta", "g"),
+            row("3", "Gamma", "g"),
+        ]);
+        assert_eq!(delegate.bulk_label(), "");
+        delegate.toggle_checked("1");
+        delegate.toggle_checked("3");
+        delegate.toggle_checked("ghost");
+        assert_eq!(delegate.checked.len(), 2, "unknown ids never check");
+        assert_eq!(delegate.bulk_label(), "2 selected");
+        // Filter hides a member: set intact, label honest, rows in order.
+        delegate.query = "alpha".to_string();
+        delegate.apply_filter();
+        assert_eq!(delegate.checked.len(), 2);
+        assert_eq!(delegate.bulk_label(), "2 selected (1 visible)");
+        let checked: Vec<String> = delegate
+            .checked_rows()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        assert_eq!(checked, vec!["1".to_string(), "3".to_string()]);
+        // Facets also drive the `(M visible)` arm.
+        delegate.query = String::new();
+        delegate.set_facet_group(Some("nope".to_string()));
+        assert_eq!(delegate.bulk_label(), "2 selected (0 visible)");
+        delegate.clear_facets();
+        // Reload without row 3 prunes it; toggle twice round-trips.
+        delegate.set_rows(vec![row("1", "Alpha", "g"), row("2", "Beta", "g")]);
+        assert_eq!(delegate.checked.len(), 1);
+        assert_eq!(delegate.bulk_label(), "1 selected");
+        delegate.toggle_checked("1");
+        assert_eq!(delegate.bulk_label(), "");
+        delegate.clear_checked();
+        assert_eq!(delegate.bulk_label(), "");
+    }
+
+    /// Ticket 44: facet pickers inventory the real rows (labels + counts,
+    /// protocols), never free text.
+    #[test]
+    fn t44_facet_options_inventory_rows() {
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        fn row(id: &str, protocol: &str, group: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: format!("n{id}"),
+                protocol: protocol.to_string(),
+                params: "{}".to_string(),
+                group: group.to_string(),
+                enabled: true,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            row("1", "VLESS", "team"),
+            row("2", "vmess", "team"),
+            row("3", "vless", "lab"),
+        ]);
+        assert_eq!(
+            delegate.group_options(),
+            vec![("lab".to_string(), 1), ("team".to_string(), 2)]
+        );
+        assert_eq!(
+            delegate.protocol_options(),
+            vec!["vless".to_string(), "vmess".to_string()]
+        );
     }
 
     /// Ticket 47 (RED): filter + render serve from the set_rows caches -
