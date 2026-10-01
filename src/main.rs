@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::chart::LineChart;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
@@ -23,6 +24,7 @@ use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListSta
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
@@ -588,7 +590,7 @@ impl LibraryDelegate {
     }
 
     /// Ticket 44: distinct group labels with row counts for the facet picker
-    /// + group manager (ordered by label; counts cover ALL rows, not just
+    /// and group manager (ordered by label; counts cover ALL rows, not just
     /// the visible slice).
     fn group_options(&self) -> Vec<(String, usize)> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -656,6 +658,15 @@ impl LibraryDelegate {
     /// dialog open call this).
     fn clear_checked(&mut self) {
         self.checked.clear();
+    }
+
+    /// Ticket 44: visible rows in library order (select-visible + bulk
+    /// honesty read this, never the full row set).
+    fn visible_rows(&self) -> Vec<ProxyConfig> {
+        self.visible
+            .iter()
+            .filter_map(|&index| self.rows.get(index).cloned())
+            .collect()
     }
 
     fn row_at(&self, index: IndexPath) -> Option<ProxyConfig> {
@@ -807,8 +818,44 @@ impl ListDelegate for LibraryDelegate {
             .upstream_for(&row.id)
             .unwrap_or("no upstream")
             .to_string();
+        // Ticket 44: id-keyed multi-select checkbox. Stable domain id
+        // (`check-<id>`, never an index), controlled from `checked`.
+        // The toggle runs through the list entity so the delegate stays the
+        // single owner of the set. The box rides in the header row beside the
+        // name (horizontal, not a new vertical line) so row height stays
+        // paint-compatible with the ticket-19 three-row frame.
+        let row_id = row.id.clone();
+        let list_view = _cx.entity();
+        let is_checked = self.checked.contains(&row_id);
+        let toggle_id = row_id.clone();
+        let checkbox = Checkbox::new(format!("check-{}", row_id))
+            .small()
+            .checked(is_checked)
+            .on_change(move |_, _, cx| {
+                let toggle_id = toggle_id.clone();
+                list_view.update(cx, |state, cx| {
+                    state.delegate_mut().toggle_checked(&toggle_id);
+                    cx.notify();
+                });
+            });
         let mut item = ListItem::new(format!("library-row-{}", row.id)).selected(selected);
-        for line in library_row_lines_with_upstream(&row, &upstream, health, is_running, traffic) {
+        let mut lines =
+            library_row_lines_with_upstream(&row, &upstream, health, is_running, traffic)
+                .into_iter();
+        if let Some(first) = lines.next() {
+            item = item.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(checkbox)
+                    .child(first),
+            );
+        } else {
+            item = item.child(checkbox);
+        }
+        for line in lines {
             item = item.child(line);
         }
         Some(item)
@@ -9381,6 +9428,869 @@ impl AppView {
             )
             .into_any_element()
     }
+
+    /// Ticket 44: facet filter bar. Shows the three facet pickers with the
+    /// current choice in the label, plus a clear action while any facet is
+    /// active. Pickers open dialogs (no SelectState retained — options are
+    /// derived live from rows, so the dialog always lists real labels).
+    fn render_facet_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (group_label, protocol_label, status_label, has_facets) = {
+            let delegate = self.libraries.read(cx).delegate();
+            let group_label = delegate
+                .facet_group
+                .clone()
+                .map(|group| format!("Group: {group}"))
+                .unwrap_or_else(|| "Group: All".to_string());
+            let protocol_label = delegate
+                .facet_protocol
+                .clone()
+                .map(|protocol| format!("Protocol: {protocol}"))
+                .unwrap_or_else(|| "Protocol: All".to_string());
+            let status_label = delegate
+                .facet_status
+                .map(|status| format!("Status: {}", status.label()))
+                .unwrap_or_else(|| "Status: All".to_string());
+            let has_facets = delegate.facets_active();
+            (group_label, protocol_label, status_label, has_facets)
+        };
+        div()
+            .id("facet-bar")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .child(
+                Button::new("facet-group")
+                    .small()
+                    .label(group_label)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_facet_group_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("facet-protocol")
+                    .small()
+                    .label(protocol_label)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_facet_protocol_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("facet-status")
+                    .small()
+                    .label(status_label)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_facet_status_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("groups-dialog")
+                    .small()
+                    .label("Groups")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_groups_dialog(window, cx);
+                    })),
+            )
+            .child(if has_facets {
+                Button::new("clear-facets")
+                    .small()
+                    .label("Clear filters")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.clear_facets(window, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                div().id("facets-idle").test_support().into_any_element()
+            })
+            .into_any_element()
+    }
+
+    /// Ticket 44: honest bulk bar. Hidden while nothing is checked. The label
+    /// comes from `bulk_label` (names both counts under a filter), so the bar
+    /// can never claim the visible slice is the bulk set.
+    fn render_bulk_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self.libraries.read(cx).delegate().bulk_label();
+        if label.is_empty() {
+            return div().id("bulk-bar").test_support().into_any_element();
+        }
+        div()
+            .id("bulk-bar")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .child(div().id("bulk-label").test_support().child(label))
+            .child(
+                Button::new("bulk-start")
+                    .small()
+                    .label("Start")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.commit_bulk_start(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-stop")
+                    .small()
+                    .label("Stop")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.commit_bulk_stop(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-enable")
+                    .small()
+                    .label("Enable")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.commit_bulk_enable(true, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-disable")
+                    .small()
+                    .label("Disable")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.commit_bulk_enable(false, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-move")
+                    .small()
+                    .label("Move to group")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_bulk_move_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-delete")
+                    .small()
+                    .label("Delete")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_bulk_delete_confirm(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-clear")
+                    .small()
+                    .label("Clear selection")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.clear_checked(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-select-visible")
+                    .small()
+                    .label("Select visible")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.select_visible_checked(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Ticket 44: clear all three facets (text query untouched).
+    fn clear_facets(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().clear_facets();
+            list_cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Ticket 44: empty the multi-select set.
+    fn clear_checked(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().clear_checked();
+            list_cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Ticket 44: check every visible row (filter-aware select-all).
+    fn select_visible_checked(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.libraries.update(cx, |state, list_cx| {
+            let ids: Vec<String> = state
+                .delegate()
+                .visible_rows()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect();
+            let delegate = state.delegate_mut();
+            for id in ids {
+                if !delegate.checked.contains(&id) {
+                    delegate.toggle_checked(&id);
+                }
+            }
+            list_cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Ticket 44: group facet picker. Options come from live rows with counts
+    /// (`group_options` covers all rows, never just the visible slice).
+    fn open_facet_group_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let options = self.libraries.read(cx).delegate().group_options();
+        let commit: DialogCommit = Rc::new(|_, _| true);
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let mut body = div().flex().flex_col().gap_2();
+            {
+                let pick_view = view.clone();
+                body = body.child(Button::new("facet-group-all").label("All groups").on_click(
+                    move |_, window, cx| {
+                        pick_view.update(cx, |view, cx| {
+                            view.libraries.update(cx, |state, list_cx| {
+                                state.delegate_mut().set_facet_group(None);
+                                list_cx.notify();
+                            });
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ));
+            }
+            for (group, count) in &options {
+                let pick_view = view.clone();
+                let pick_group = group.clone();
+                let label = format!("{group} ({count})");
+                let id = format!("facet-group-{}", group);
+                body = body.child(Button::new(id).label(label).on_click(move |_, window, cx| {
+                    let group = pick_group.clone();
+                    pick_view.update(cx, |view, cx| {
+                        view.libraries.update(cx, |state, list_cx| {
+                            state.delegate_mut().set_facet_group(Some(group));
+                            list_cx.notify();
+                        });
+                        cx.notify();
+                    });
+                    window.close_all_dialogs(cx);
+                }));
+            }
+            dialog
+                .title("Filter by group")
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "facet-group-ok",
+                    "facet-group-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 44: protocol facet picker (exact match, lowercased).
+    fn open_facet_protocol_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let options = self.libraries.read(cx).delegate().protocol_options();
+        let commit: DialogCommit = Rc::new(|_, _| true);
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let mut body = div().flex().flex_col().gap_2();
+            {
+                let pick_view = view.clone();
+                body = body.child(
+                    Button::new("facet-protocol-all")
+                        .label("All protocols")
+                        .on_click(move |_, window, cx| {
+                            pick_view.update(cx, |view, cx| {
+                                view.libraries.update(cx, |state, list_cx| {
+                                    state.delegate_mut().set_facet_protocol(None);
+                                    list_cx.notify();
+                                });
+                                cx.notify();
+                            });
+                            window.close_all_dialogs(cx);
+                        }),
+                );
+            }
+            for protocol in &options {
+                let pick_view = view.clone();
+                let pick_protocol = protocol.clone();
+                let id = format!("facet-protocol-{}", protocol);
+                let label = protocol.clone();
+                body = body.child(Button::new(id).label(label).on_click(move |_, window, cx| {
+                    let protocol = pick_protocol.clone();
+                    pick_view.update(cx, |view, cx| {
+                        view.libraries.update(cx, |state, list_cx| {
+                            state.delegate_mut().set_facet_protocol(Some(protocol));
+                            list_cx.notify();
+                        });
+                        cx.notify();
+                    });
+                    window.close_all_dialogs(cx);
+                }));
+            }
+            dialog
+                .title("Filter by protocol")
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "facet-protocol-ok",
+                    "facet-protocol-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 44: status facet picker (exact predicates, never substring).
+    fn open_facet_status_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let commit: DialogCommit = Rc::new(|_, _| true);
+        let commit_key = commit.clone();
+        // Ticket 44: labels round-trip through `from_label` so the picker can
+        // never offer a status the filter cannot parse.
+        let labels: Vec<String> = FacetStatus::ALL
+            .iter()
+            .map(|status| status.label().to_string())
+            .collect();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let mut body = div().flex().flex_col().gap_2();
+            {
+                let pick_view = view.clone();
+                body = body.child(
+                    Button::new("facet-status-all")
+                        .label("All statuses")
+                        .on_click(move |_, window, cx| {
+                            pick_view.update(cx, |view, cx| {
+                                view.libraries.update(cx, |state, list_cx| {
+                                    state.delegate_mut().set_facet_status(None);
+                                    list_cx.notify();
+                                });
+                                cx.notify();
+                            });
+                            window.close_all_dialogs(cx);
+                        }),
+                );
+            }
+            for label in &labels {
+                let pick_view = view.clone();
+                let pick_label = label.clone();
+                let id = format!("facet-status-{label}");
+                let button_label = label.clone();
+                body = body.child(Button::new(id).label(button_label).on_click(
+                    move |_, window, cx| {
+                        let status = FacetStatus::from_label(&pick_label);
+                        pick_view.update(cx, |view, cx| {
+                            view.libraries.update(cx, |state, list_cx| {
+                                state.delegate_mut().set_facet_status(status);
+                                list_cx.notify();
+                            });
+                            cx.notify();
+                        });
+                        window.close_all_dialogs(cx);
+                    },
+                ));
+            }
+            dialog
+                .title("Filter by status")
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "facet-status-ok",
+                    "facet-status-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 44: bulk enable/disable over the checked set. One reload, one
+    /// honest toast. Ghost ids prune on the next reload via `set_rows`.
+    fn commit_bulk_enable(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .libraries
+            .read(cx)
+            .delegate()
+            .checked_rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        for id in &ids {
+            match self.store.set_enabled(id, enabled) {
+                Ok(_) => ok += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        self.reload(window, cx);
+        let verb = if enabled { "Enabled" } else { "Disabled" };
+        if failed == 0 {
+            window.push_notification(
+                Notification::success(format!("{verb} {ok} configuration(s)")),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                Notification::warning(format!("{verb} {ok}, {failed} failed")),
+                cx,
+            );
+        }
+    }
+
+    /// Ticket 44: bulk start over the checked set. Loops the single-row
+    /// engine path (correctness first — one combined regen per row is the
+    /// existing atomic unit), then reloads once. LAN-bound rows stop at the
+    /// same confirm gate as start-all.
+    fn commit_bulk_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.libraries.read(cx).delegate().checked_rows();
+        if rows.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        if self.start_in_flight {
+            window.push_notification(Notification::info(start_busy_message()), cx);
+            return;
+        }
+        let lan: Vec<(String, String)> = rows
+            .iter()
+            .filter(|row| requires_lan_confirm(&row.bind_ip))
+            .map(|row| (row.name.clone(), row.bind_ip.clone()))
+            .collect();
+        if !lan.is_empty() {
+            let view = cx.entity();
+            let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+            let description = lan_confirm_description(&lan);
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let view = view.clone();
+                let ids = ids.clone();
+                let description = description.clone();
+                alert
+                    .confirm()
+                    .title(LAN_CONFIRM_TITLE)
+                    .description(description)
+                    .on_ok(move |_, window, cx| {
+                        let ids = ids.clone();
+                        view.update(cx, |view, cx| view.commit_bulk_start_ids(&ids, window, cx));
+                        true
+                    })
+            });
+            return;
+        }
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        self.commit_bulk_start_ids(&ids, window, cx);
+    }
+
+    /// Ticket 44: bulk start for an explicit id set (post-gate).
+    fn commit_bulk_start_ids(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.start_in_flight {
+            window.push_notification(Notification::info(start_busy_message()), cx);
+            return;
+        }
+        self.start_in_flight = true;
+        if let Err(reason) = self.sync_presets_to_engine() {
+            self.start_in_flight = false;
+            window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
+            return;
+        }
+        let mut started = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for id in ids {
+            let Ok(Some(config)) = self.store.get(id) else {
+                continue;
+            };
+            if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
+                window.push_notification(Notification::warning(warning), cx);
+            }
+            match self.engine.start_one_confirmed(&config) {
+                Ok(()) => {
+                    if self.store.set_enabled(id, true).is_ok() {
+                        started += 1;
+                    }
+                }
+                Err(error) => {
+                    failed.push(format!(
+                        "{}: {}",
+                        config.name,
+                        redact_secrets(&error.to_string())
+                    ));
+                }
+            }
+        }
+        self.start_in_flight = false;
+        self.reload(window, cx);
+        if failed.is_empty() {
+            window.push_notification(
+                Notification::success(format!("Started {started} configuration(s)")),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                Notification::error(format!(
+                    "Started {started}, {} failed: {}",
+                    failed.len(),
+                    failed.join("; ")
+                )),
+                cx,
+            );
+        }
+    }
+
+    /// Ticket 44: bulk stop over the checked set. One reload, one toast.
+    fn commit_bulk_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .libraries
+            .read(cx)
+            .delegate()
+            .checked_rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        let mut stopped = 0usize;
+        for id in &ids {
+            let (removed, _) = self.engine.stop_one_result(id);
+            if removed {
+                stopped += 1;
+            }
+            let _ = self.store.set_enabled(id, false);
+        }
+        self.reload(window, cx);
+        if stopped == 0 {
+            window.push_notification(
+                Notification::info("Nothing to stop — no checked endpoints are running"),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                Notification::success(format!("Stopped {stopped} configuration(s)")),
+                cx,
+            );
+        }
+    }
+
+    /// Ticket 44: bulk delete confirm (AlertDialog — irreversible, names the
+    /// count). Running rows stop first via the same stop-one path as single
+    /// delete.
+    fn open_bulk_delete_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.libraries.read(cx).delegate().checked_rows();
+        if rows.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        let view = cx.entity();
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        let count = ids.len();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let ids = ids.clone();
+            alert
+                .confirm()
+                .title(format!("Delete {count} configurations?"))
+                .description(format!(
+                    "Delete {count} checked configuration(s)? Running endpoints stop first. This cannot be undone."
+                ))
+                .on_ok(move |_, window, cx| {
+                    let ids = ids.clone();
+                    view.update(cx, |view, cx| view.commit_bulk_delete(&ids, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Ticket 44: bulk delete for an explicit id set (post-confirm).
+    fn commit_bulk_delete(&mut self, ids: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        let mut removed = 0usize;
+        for id in ids {
+            let _ = self.engine.stop_one(id);
+            if matches!(self.store.remove(id), Ok(true)) {
+                removed += 1;
+            }
+        }
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().clear_checked();
+            list_cx.notify();
+        });
+        self.reload(window, cx);
+        window.push_notification(
+            Notification::success(format!("Removed {removed} configuration(s)")),
+            cx,
+        );
+    }
+
+    /// Ticket 44: bulk move dialog. One Input for the target group; OK moves
+    /// the checked ids via `move_to_group` (unknown ids skip, empty names
+    /// refuse with the dialog kept open).
+    fn open_bulk_move_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .libraries
+            .read(cx)
+            .delegate()
+            .checked_rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        if ids.is_empty() {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        }
+        let group_state = cx.new(|cx| InputState::new(window, cx).placeholder("Group"));
+        let view = cx.entity();
+        let reader = group_state.clone();
+        let ids_for_commit = ids.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let group = reader.read(cx).value().to_string();
+            view.update(cx, |view, cx| {
+                view.commit_bulk_move(&ids_for_commit, &group, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        let count = ids.len();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
+                .title(format!("Move {count} configuration(s) to group"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Label::new("Group"))
+                        .child(Input::new(&group_state)),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "bulk-move-ok",
+                    "bulk-move-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 44: bulk move commit. Returns false (keeps the dialog open) on
+    /// empty-group validation so the user can fix it in place.
+    fn commit_bulk_move(
+        &mut self,
+        ids: &[String],
+        group: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.move_to_group(ids, group) {
+            Ok(moved) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Moved {moved} configuration(s) to \"{}\"",
+                        group.trim()
+                    )),
+                    cx,
+                );
+                true
+            }
+            Err(error) => {
+                window.push_notification(Notification::error(format!("Cannot move: {error}")), cx);
+                false
+            }
+        }
+    }
+
+    /// Ticket 44: group manager. Lists live groups with counts, plus rename
+    /// (dialog) and delete (empty-only, refuses loudly while rows remain).
+    fn open_groups_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let groups = self.store.group_counts().unwrap_or_default();
+        let commit: DialogCommit = Rc::new(|_, _| true);
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let mut body = div().flex().flex_col().gap_2();
+            if groups.is_empty() {
+                body = body.child("No groups yet — groups appear when rows use them");
+            }
+            for (group, count) in &groups {
+                let rename_view = view.clone();
+                let delete_view = view.clone();
+                let rename_group = group.clone();
+                let delete_group = group.clone();
+                let line = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new(format!("{group} ({count})")))
+                    .child(
+                        Button::new(format!("group-rename-{}", group))
+                            .label("Rename")
+                            .on_click(move |_, window, cx| {
+                                let group = rename_group.clone();
+                                rename_view.update(cx, |view, cx| {
+                                    view.open_group_rename_dialog(&group, window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new(format!("group-delete-{}", group))
+                            .label("Delete")
+                            .on_click(move |_, window, cx| {
+                                let group = delete_group.clone();
+                                delete_view.update(cx, |view, cx| {
+                                    view.commit_delete_group(&group, window, cx);
+                                });
+                            }),
+                    );
+                body = body.child(line);
+            }
+            dialog
+                .title("Groups")
+                .child(body)
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "groups-dialog-ok",
+                    "groups-dialog-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 44: rename-group dialog. Empty names refuse with the dialog kept
+    /// open; missing groups move zero rows with an honest toast.
+    fn open_group_rename_dialog(&mut self, old: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let old_name = old.to_string();
+        let name_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("New group name")
+                .default_value(old_name.clone())
+        });
+        let view = cx.entity();
+        let reader = name_state.clone();
+        let old_for_commit = old_name.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let new_name = reader.read(cx).value().to_string();
+            view.update(cx, |view, cx| {
+                view.commit_rename_group(&old_for_commit, &new_name, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _cx| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
+                .title(format!("Rename group \"{old_name}\""))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Label::new("New group name"))
+                        .child(Input::new(&name_state)),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "group-rename-ok",
+                    "group-rename-cancel",
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 44: rename-group commit. False keeps the dialog open on empty
+    /// names; zero-move toasts honestly.
+    fn commit_rename_group(
+        &mut self,
+        old: &str,
+        new: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.rename_group(old, new) {
+            Ok(0) => {
+                window.push_notification(
+                    Notification::warning(format!("Group \"{old}\" holds no rows")),
+                    cx,
+                );
+                true
+            }
+            Ok(moved) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Renamed \"{old}\" to \"{}\" ({moved} row(s))",
+                        new.trim()
+                    )),
+                    cx,
+                );
+                window.close_all_dialogs(cx);
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot rename group: {error}")),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    /// Ticket 44: delete-group commit. Non-empty groups refuse loudly (names
+    /// the count so the manager can offer move-first); empty groups close
+    /// clean.
+    fn commit_delete_group(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.delete_group(name) {
+            Ok(()) => {
+                window.push_notification(
+                    Notification::success(format!("Deleted empty group \"{name}\"")),
+                    cx,
+                );
+                window.close_all_dialogs(cx);
+                self.open_groups_dialog(window, cx);
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot delete group: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
 }
 
 impl Render for AppView {
@@ -9561,6 +10471,8 @@ impl Render for AppView {
                         .test_support()
                         .flex_1()
                         .child(self.render_search_count(cx))
+                        .child(self.render_facet_bar(cx))
+                        .child(self.render_bulk_bar(cx))
                         .child(
                             List::new(&self.libraries).search_placeholder("Search configurations"),
                         )
@@ -13598,6 +14510,288 @@ mod tests {
             delegate.protocol_options(),
             vec!["vless".to_string(), "vmess".to_string()]
         );
+    }
+
+    /// Ticket 44 UI: facet bar, bulk bar, and row checkboxes paint with stable
+    /// domain ids. The bulk label stays honest under a filter.
+    #[gpui_kit::test]
+    fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "facet-bar");
+        assert_painted(cx, "facet-group");
+        assert_painted(cx, "facet-protocol");
+        assert_painted(cx, "facet-status");
+        assert_painted(cx, "groups-dialog");
+        assert_painted(cx, &format!("check-{}", first.id));
+        assert_painted(cx, &format!("check-{}", second.id));
+        // Check one row: the bulk bar names the set honestly.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().toggle_checked(&first.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "bulk-bar");
+        assert_painted(cx, "bulk-label");
+        assert_painted(cx, "bulk-start");
+        assert_painted(cx, "bulk-stop");
+        assert_painted(cx, "bulk-enable");
+        assert_painted(cx, "bulk-disable");
+        assert_painted(cx, "bulk-move");
+        assert_painted(cx, "bulk-delete");
+        assert_painted(cx, "bulk-clear");
+        assert_painted(cx, "bulk-select-visible");
+        let label = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().bulk_label()
+        });
+        assert_eq!(label, "1 selected");
+        // Filter to the other row: the set stays, the label names both counts.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "home".to_string();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        let label = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().bulk_label()
+        });
+        assert_eq!(label, "1 selected (1 visible)");
+        // Select-visible checks the visible row too; clear empties the set.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.select_visible_checked(window, cx));
+        });
+        let label = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().bulk_label()
+        });
+        assert_eq!(label, "2 selected (1 visible)");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.clear_checked(window, cx));
+        });
+        let label = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().bulk_label()
+        });
+        assert_eq!(label, "");
+    }
+
+    /// Ticket 44 UI: bulk enable/disable writes every checked row with one
+    /// reload and one honest toast; empty sets explain themselves.
+    #[gpui_kit::test]
+    fn t44_ui_bulk_enable_commits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10811"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10812"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        // Empty set explains itself, never a silent no-op.
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_bulk_enable(true, window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 1);
+        // Check both, enable, then disable.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().toggle_checked(&first.id);
+                    state.delegate_mut().toggle_checked(&second.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_bulk_enable(true, window, cx));
+        });
+        let enabled: Vec<bool> = view.read_with(cx, |view, _| {
+            view.store
+                .list()
+                .expect("list works")
+                .iter()
+                .map(|row| row.enabled)
+                .collect()
+        });
+        assert!(enabled.iter().all(|&flag| flag), "both enabled");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_bulk_enable(false, window, cx));
+        });
+        let enabled: Vec<bool> = view.read_with(cx, |view, _| {
+            view.store
+                .list()
+                .expect("list works")
+                .iter()
+                .map(|row| row.enabled)
+                .collect()
+        });
+        assert!(enabled.iter().all(|&flag| !flag), "both disabled");
+    }
+
+    /// Ticket 44 UI: bulk move lands rows in the target group; rename moves
+    /// the label; delete refuses while rows remain and clears empty labels.
+    #[gpui_kit::test]
+    fn t44_ui_bulk_move_and_group_manager(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10821"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10822"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().toggle_checked(&first.id);
+                    state.delegate_mut().toggle_checked(&second.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        let moved = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_bulk_move(&[first.id.clone(), second.id.clone()], "team", window, cx)
+            })
+        });
+        assert!(moved, "move commits and closes");
+        let groups = view.read_with(cx, |view, _| {
+            view.store.group_counts().expect("counts work")
+        });
+        assert_eq!(groups, vec![("team".to_string(), 2)]);
+        // Empty names keep the dialog open for a fix.
+        let single = [first.id.clone()];
+        let kept = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_bulk_move(&single, "   ", window, cx)
+            })
+        });
+        assert!(!kept, "empty group keeps the dialog open");
+        // Rename the label; delete refuses while rows remain.
+        let renamed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_rename_group("team", "crew", window, cx)
+            })
+        });
+        assert!(renamed, "rename commits");
+        let groups = view.read_with(cx, |view, _| {
+            view.store.group_counts().expect("counts work")
+        });
+        assert_eq!(groups, vec![("crew".to_string(), 2)]);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_delete_group("crew", window, cx));
+        });
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "non-empty delete refuses loudly"
+        );
+        // Empty labels delete clean.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_delete_group("ghost-label", window, cx)
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.store.list().expect("list works").len()
+            }),
+            2,
+            "refused delete removes nothing"
+        );
+    }
+
+    /// Ticket 44 UI: facet pickers narrow the visible list; clear restores it.
+    #[gpui_kit::test]
+    fn t44_ui_facets_filter_and_clear(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10831"))
+            .expect("seed works");
+        store
+            .add(row19_seed("Home", "b.example.com", "10832"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        // Group facet narrows to the travel rows (both seeds share it), then
+        // a missing label empties the view without losing rows.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state
+                        .delegate_mut()
+                        .set_facet_group(Some("travel".to_string()));
+                    list_cx.notify();
+                });
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| {
+                view.libraries.read(cx).delegate().visible.len()
+            }),
+            2
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state
+                        .delegate_mut()
+                        .set_facet_group(Some("nope".to_string()));
+                    list_cx.notify();
+                });
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| {
+                view.libraries.read(cx).delegate().visible.len()
+            }),
+            0
+        );
+        assert!(
+            view.read_with(cx, |view, cx| {
+                view.libraries.read(cx).delegate().facets_active()
+            }),
+            "missing label still counts as active"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.clear_facets(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| {
+                view.libraries.read(cx).delegate().visible.len()
+            }),
+            2
+        );
+        // Status round-trips through the label parser.
+        for status in crate::FacetStatus::ALL {
+            let parsed = crate::FacetStatus::from_label(status.label());
+            assert_eq!(parsed, Some(status), "label round-trips");
+        }
+        assert_eq!(crate::FacetStatus::from_label("Nope"), None);
     }
 
     /// Ticket 47 (RED): filter + render serve from the set_rows caches -
