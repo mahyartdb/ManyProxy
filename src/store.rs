@@ -78,15 +78,14 @@ pub fn is_auto_port(port: u16) -> bool {
         || (AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END).contains(&port)
 }
 
-/// Ticket 27: secrets-at-rest note. v1 encrypts nothing: the library DB and
-/// sidecar config files hold private keys/tokens/passwords and are protected
-/// by user-only file permissions ([`harden_file_permissions`], applied to the
-/// DB file on open and to every sidecar config on write). OS-keychain/DPAPI
-/// credential encryption is an explicit BACKLOG non-goal (spec R6): no
-/// keychain/DPAPI code ships in v1; when it lands, this note and the export
-/// warning are its entry points.
+/// Ticket 27: secrets-at-rest note. Row params are DPAPI-sealed at rest
+/// (user scope, `dpapi1:` marker, `src/dpapi.rs`, opened in [`map_row`]);
+/// the library DB file and every sidecar config additionally get user-only
+/// file permissions ([`harden_file_permissions`]). OS-keychain portability
+/// beyond DPAPI user scope stays an explicit BACKLOG non-goal: when it
+/// lands, this note and the export warning are its entry points.
 #[cfg_attr(not(test), allow(dead_code))]
-pub const SECRETS_AT_REST_NOTE: &str = "secrets at rest: user-only file permissions (0600/ACL); OS-keychain/DPAPI encryption is backlog, not v1";
+pub const SECRETS_AT_REST_NOTE: &str = "secrets at rest: row params DPAPI-sealed (user scope) plus user-only file permissions (0600/ACL); OS-keychain portability beyond DPAPI user scope is backlog";
 
 /// Ticket 27: best-effort user-only permissions for a secrets-bearing file
 /// (library DB, sidecar configs). Unix sets 0600; Windows strips inherited

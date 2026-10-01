@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
@@ -23,6 +23,7 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::separator::Separator;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
@@ -9058,7 +9059,36 @@ impl AppView {
                 .id("config-detail")
                 .test_support()
                 .p_2()
-                .child("Select a configuration")
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child("Select a configuration to inspect its endpoint, health, and usage")
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            Button::new("detail-add")
+                                .label("Add configuration")
+                                .tooltip("Add a proxy configuration")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.open_add_dialog(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("detail-import")
+                                .label("Import configurations")
+                                .tooltip("Import share links or files")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                                })),
+                        ),
+                )
                 .into_any_element();
         };
         let switch_id = format!("enabled-{}", config.id);
@@ -9217,6 +9247,7 @@ impl AppView {
                     )
                     .child(
                         Button::new("delete-config")
+                            .danger()
                             .label("Delete")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(config) = view.selected_config(cx) {
@@ -9329,7 +9360,8 @@ impl AppView {
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
         // Ticket 45: summed usage totals ride the status bar (absent on a
-        // broken read — never a lying zero).
+        // broken read — never a lying zero). Separators split the four
+        // segments so counts, engine, health, and usage read as one strip.
         let mut bar = div()
             .flex()
             .flex_row()
@@ -9341,10 +9373,14 @@ impl AppView {
                     .test_support()
                     .child(format!("{total} configurations · {enabled} enabled")),
             )
+            .child(Separator::vertical())
             .child(div().id("engine-status").test_support().child(engine_text))
+            .child(Separator::vertical())
             .child(div().id("health-status").test_support().child(health_text));
         if let Some(totals) = summed_traffic_text(&self.store) {
-            bar = bar.child(div().id("traffic-status").test_support().child(totals));
+            bar = bar
+                .child(Separator::vertical())
+                .child(div().id("traffic-status").test_support().child(totals));
         }
         StatusBar::new().left(bar)
     }
@@ -9420,6 +9456,7 @@ impl AppView {
             .child(
                 Button::new("empty-add")
                     .label("Add configuration")
+                    .tooltip("Add a proxy configuration")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_add_dialog(window, cx);
                     })),
@@ -9427,6 +9464,7 @@ impl AppView {
             .child(
                 Button::new("empty-import")
                     .label("Import configurations")
+                    .tooltip("Import share links or files")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
                     })),
@@ -9470,6 +9508,7 @@ impl AppView {
                 Button::new("facet-group")
                     .small()
                     .label(group_label)
+                    .tooltip("Filter by group")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_facet_group_dialog(window, cx);
                     })),
@@ -9478,6 +9517,7 @@ impl AppView {
                 Button::new("facet-protocol")
                     .small()
                     .label(protocol_label)
+                    .tooltip("Filter by protocol")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_facet_protocol_dialog(window, cx);
                     })),
@@ -9486,6 +9526,7 @@ impl AppView {
                 Button::new("facet-status")
                     .small()
                     .label(status_label)
+                    .tooltip("Filter by status")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_facet_status_dialog(window, cx);
                     })),
@@ -9494,6 +9535,7 @@ impl AppView {
                 Button::new("groups-dialog")
                     .small()
                     .label("Groups")
+                    .tooltip("Rename or merge groups")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_groups_dialog(window, cx);
                     })),
@@ -9502,6 +9544,7 @@ impl AppView {
                 Button::new("clear-facets")
                     .small()
                     .label("Clear filters")
+                    .tooltip("Clear every filter")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.clear_facets(window, cx);
                     }))
@@ -9533,6 +9576,7 @@ impl AppView {
                 Button::new("bulk-start")
                     .small()
                     .label("Start")
+                    .tooltip("Start every selected endpoint")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_start(window, cx);
                     })),
@@ -9541,6 +9585,7 @@ impl AppView {
                 Button::new("bulk-stop")
                     .small()
                     .label("Stop")
+                    .tooltip("Stop every selected endpoint")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_stop(window, cx);
                     })),
@@ -9549,6 +9594,7 @@ impl AppView {
                 Button::new("bulk-enable")
                     .small()
                     .label("Enable")
+                    .tooltip("Enable every selected row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_enable(true, window, cx);
                     })),
@@ -9557,6 +9603,7 @@ impl AppView {
                 Button::new("bulk-disable")
                     .small()
                     .label("Disable")
+                    .tooltip("Disable every selected row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_enable(false, window, cx);
                     })),
@@ -9565,14 +9612,17 @@ impl AppView {
                 Button::new("bulk-move")
                     .small()
                     .label("Move to group")
+                    .tooltip("Move every selected row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_bulk_move_dialog(window, cx);
                     })),
             )
             .child(
                 Button::new("bulk-delete")
+                    .danger()
                     .small()
                     .label("Delete")
+                    .tooltip("Delete every selected row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_bulk_delete_confirm(window, cx);
                     })),
@@ -9590,6 +9640,7 @@ impl AppView {
                 Button::new("bulk-select-visible")
                     .small()
                     .label("Select visible")
+                    .tooltip("Select every visible row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.select_visible_checked(window, cx);
                     })),
@@ -10368,15 +10419,19 @@ impl Render for AppView {
                     .id("manyproxy-toolbar")
                     .flex()
                     .flex_row()
+                    .items_center()
                     .gap_2()
                     .p_2()
                     // Ticket 33: shortcut hints ride in the labels (F5/Shift-F5/
                     // Ctrl-T/Ctrl-N/Ctrl-O) so the bindings in [`bind_app_keys`]
                     // are visible without opening About. Button ids are
-                    // unchanged.
+                    // unchanged. Separators group Library / Manage / Engine /
+                    // Health / Help; tooltips name each action.
                     .child(
                         Button::new("add-config")
+                            .primary()
                             .label("Add (Ctrl-N)")
+                            .tooltip("Add a proxy configuration")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_add_dialog(window, cx);
                             })),
@@ -10384,6 +10439,7 @@ impl Render for AppView {
                     .child(
                         Button::new("import-config")
                             .label("Import (Ctrl-O)")
+                            .tooltip("Import share links or files")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
                             })),
@@ -10391,6 +10447,7 @@ impl Render for AppView {
                     .child(
                         Button::new("import-clipboard")
                             .label("From clipboard")
+                            .tooltip("Import from clipboard text")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_import_from_clipboard(window, cx);
                             })),
@@ -10398,13 +10455,16 @@ impl Render for AppView {
                     .child(
                         Button::new("export-library")
                             .label("Export")
+                            .tooltip("Export library to JSON")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_export_dialog(window, cx);
                             })),
                     )
+                    .child(Separator::vertical())
                     .child(
                         Button::new("subscriptions")
                             .label("Subscriptions")
+                            .tooltip("Manage subscription lists")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_subscriptions_dialog(window, cx);
                             })),
@@ -10412,22 +10472,29 @@ impl Render for AppView {
                     .child(
                         Button::new("routing-presets")
                             .label("Presets")
+                            .tooltip("Manage routing presets")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_presets_dialog(window, cx);
                             })),
                     )
-                    .child(Button::new("engine-start-all").label("Start all").on_click(
-                        cx.listener(|view, _, window, cx| {
-                            view.start_all_engines(window, cx);
-                        }),
-                    ))
+                    .child(Separator::vertical())
+                    .child(
+                        Button::new("engine-start-all")
+                            .label("Start all")
+                            .tooltip("Start every configuration")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.start_all_engines(window, cx);
+                            })),
+                    )
                     // Ticket 43: the F5 key starts the SELECTED row (see
                     // [`bind_app_keys`]) — the old "Start all (F5)" label
                     // lied. Selected actions carry their key hints; bulk
                     // actions carry none.
                     .child(
                         Button::new("start-selected")
+                            .primary()
                             .label("Start selected (F5)")
+                            .tooltip("Start the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.start_selected_engine(window, cx);
                             })),
@@ -10435,6 +10502,7 @@ impl Render for AppView {
                     .child(
                         Button::new("engine-stop-all")
                             .label("Stop all")
+                            .tooltip("Stop every endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_all_engines(window, cx);
                             })),
@@ -10442,13 +10510,16 @@ impl Render for AppView {
                     .child(
                         Button::new("stop-selected")
                             .label("Stop selected (Shift-F5)")
+                            .tooltip("Stop the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_selected_engine(window, cx);
                             })),
                     )
+                    .child(Separator::vertical())
                     .child(
                         Button::new("health-test-all")
                             .label("Test all")
+                            .tooltip("Test every running endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_all_health(window, cx);
                             })),
@@ -10456,13 +10527,16 @@ impl Render for AppView {
                     .child(
                         Button::new("test-selected")
                             .label("Test selected (Ctrl-T)")
+                            .tooltip("Test the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_selected_health(window, cx);
                             })),
                     )
+                    .child(Separator::vertical())
                     .child(
                         Button::new("about-dialog")
                             .label("About")
+                            .tooltip("Version, sidecars, shortcuts")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_about_dialog(window, cx);
                             })),
@@ -10470,6 +10544,7 @@ impl Render for AppView {
                     .child(
                         Button::new("settings-dialog")
                             .label("Settings")
+                            .tooltip("Autostart, restore, test URL")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_settings_dialog(window, cx);
                             })),
