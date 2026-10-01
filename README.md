@@ -2,7 +2,7 @@
 
 Local-only proxy library: store configs, import share links, refresh subscriptions, and serve each config on its own `127.0.0.1:<port>` endpoint (SOCKS5 + HTTP). No system proxy, TUN, DNS, or routing changes — ever.
 
-> Screenshots: [app window with library list] · [Add dialog] · [Import dialog with preview] · [Subscriptions dialog] _(placeholders — fill in live)_.
+> Screenshots: ![library list](assets/screenshots/library.png) · ![Add dialog](assets/screenshots/add-dialog.png) · ![Import dialog with preview](assets/screenshots/import-dialog.png) · ![Subscriptions dialog](assets/screenshots/subscriptions-dialog.png) — live captures via `cargo run` (empty library).
 
 ## Install / run
 
