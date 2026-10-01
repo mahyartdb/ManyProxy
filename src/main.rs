@@ -57,6 +57,7 @@ use store::{
 // [`bind_app_keys`]; the shell div handles them via `.on_action(...)`.
 // Every handler is a no-op while any dialog is open, so shortcut keys never
 // steal dialog input (the dialog keeps its own Confirm/Cancel keys).
+// Ticket 44: `ClearChecked` lets Escape empty the multi-select set.
 actions!(
     manyproxy,
     [
@@ -64,17 +65,19 @@ actions!(
         ImportConfigs,
         StartSelected,
         StopSelected,
-        TestSelected
+        TestSelected,
+        ClearChecked
     ]
 );
 
-/// Ticket 26: key context owning the five app shortcuts (was the bare
+/// Ticket 26: key context owning the app shortcuts (was the bare
 /// `"manyproxy-library"` literal with no bindings — a dead context).
 pub const APP_KEY_CONTEXT: &str = "manyproxy-library";
 
 /// Ticket 26: register the app shortcuts under [`APP_KEY_CONTEXT`].
 /// Modifier-only chords (never printable characters) so list search typing
 /// is unaffected; dialogs are guarded at the handler, not the binding.
+/// Ticket 44: Escape clears the multi-select set (same guard).
 pub fn bind_app_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-n", AddConfig, Some(APP_KEY_CONTEXT)),
@@ -82,6 +85,7 @@ pub fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("f5", StartSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("shift-f5", StopSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-t", TestSelected, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("escape", ClearChecked, Some(APP_KEY_CONTEXT)),
     ]);
 }
 
@@ -9609,6 +9613,17 @@ impl AppView {
         cx.notify();
     }
 
+    /// Ticket 44: Escape path for the multi-select set. False while any
+    /// dialog is open (the set is preserved — the dialog keeps Escape for
+    /// its own dismiss); otherwise clears and returns true.
+    fn clear_checked_unless_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if window.has_active_dialog(cx) {
+            return false;
+        }
+        self.clear_checked(window, cx);
+        true
+    }
+
     /// Ticket 44: check every visible row (filter-aware select-all).
     fn select_visible_checked(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
@@ -10306,6 +10321,7 @@ impl Render for AppView {
             // Ticket 26: app shortcuts (Add/Import/Start/Stop/Test). Each
             // handler no-ops while any dialog is open, so shortcut keys
             // never steal dialog input.
+            // Ticket 44: Escape clears the checked set through the same guard.
             .on_action(cx.listener(|view, _: &AddConfig, window, cx| {
                 if window.has_active_dialog(cx) {
                     return;
@@ -10335,6 +10351,9 @@ impl Render for AppView {
                     return;
                 }
                 view.test_selected_health(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
+                view.clear_checked_unless_dialog(window, cx);
             }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
@@ -14589,6 +14608,63 @@ mod tests {
             view.libraries.read(cx).delegate().bulk_label()
         });
         assert_eq!(label, "");
+    }
+
+    /// Ticket 44 UI: Escape clears the checked set with no dialog open and
+    /// preserves it while a dialog owns Escape for its own dismiss.
+    #[gpui_kit::test]
+    fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10841"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().toggle_checked(&first.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        // No dialog open: clears and reports true.
+        let cleared = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.clear_checked_unless_dialog(window, cx))
+        });
+        assert!(cleared, "escape clears with no dialog open");
+        assert_eq!(
+            view.read_with(cx, |view, cx| {
+                view.libraries.read(cx).delegate().bulk_label()
+            }),
+            ""
+        );
+        // Dialog open: preserves the set and reports false.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().toggle_checked(&first.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            window.open_dialog(cx, |dialog: Dialog, _, _| dialog.title("Guard probe"));
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        let cleared = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.clear_checked_unless_dialog(window, cx))
+        });
+        assert!(!cleared, "escape keeps the set while a dialog is open");
+        assert_eq!(
+            view.read_with(cx, |view, cx| {
+                view.libraries.read(cx).delegate().bulk_label()
+            }),
+            "1 selected"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Ticket 44 UI: bulk enable/disable writes every checked row with one
