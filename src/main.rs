@@ -832,9 +832,10 @@ impl ListDelegate for LibraryDelegate {
         let list_view = _cx.entity();
         let is_checked = self.checked.contains(&row_id);
         let toggle_id = row_id.clone();
-        let checkbox = Checkbox::new(format!("check-{}", row_id))
+        let checkbox = Checkbox::new(format!("check-{row_id}"))
             .small()
             .checked(is_checked)
+            .accessibility_label(format!("Select {}", row.name))
             .on_change(move |_, _, cx| {
                 let toggle_id = toggle_id.clone();
                 list_view.update(cx, |state, cx| {
@@ -9580,6 +9581,7 @@ impl AppView {
                 Button::new("bulk-clear")
                     .small()
                     .label("Clear selection")
+                    .tooltip("Clear selection (Esc)")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.clear_checked(window, cx);
                     })),
