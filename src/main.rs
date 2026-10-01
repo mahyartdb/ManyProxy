@@ -22,8 +22,8 @@ use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, Tex
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
@@ -1721,6 +1721,47 @@ fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
     match health.map(str::trim).filter(|summary| !summary.is_empty()) {
         Some(summary) => format!("● Running :{port} · {summary}"),
         None => format!("● Running :{port}"),
+    }
+}
+
+/// W1: row lifecycle state machine — stopped → starting → running, with
+/// failed for serving rows whose sidecar died or whose health reads dead.
+/// Derived per render from (serving truth, start-in-flight, failed evidence)
+/// and never stored, so it cannot go stale. Precedence is Starting > Failed >
+/// Running > Stopped: a second Start while one is in flight is ignored (see
+/// [`start_busy_message`]) so Starting dominates, and a dead endpoint never
+/// paints as healthy-running. Failed keeps the existing dead-suffixed running
+/// badge copy ([`serving_badge`] with a `dead` summary) — the phase names the
+/// lifecycle, the badge keeps its pinned strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowPhase {
+    Stopped,
+    Starting,
+    Running,
+    Failed,
+}
+
+impl RowPhase {
+    fn of(is_running: bool, starting: bool, failed: bool) -> Self {
+        if starting {
+            Self::Starting
+        } else if failed {
+            Self::Failed
+        } else if is_running {
+            Self::Running
+        } else {
+            Self::Stopped
+        }
+    }
+
+    /// Detail Start-button copy for this phase. Only Starting differs — every
+    /// other phase offers the same `Start` (a failed row restarts like a
+    /// stopped one, through the same re-apply path).
+    fn start_label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting…",
+            Self::Stopped | Self::Running | Self::Failed => "Start",
+        }
     }
 }
 
@@ -8754,18 +8795,26 @@ impl AppView {
     /// Ticket 26: off-thread via [`AppView::spawn_probe`]. Returns the number
     /// of probes started (outcomes land on completion).
     /// Ticket 41: rows on crashed shards are skipped (their sidecar is
-    /// down — probing a dead socket only manufactures errors).
+    /// down — probing a dead socket only manufactures errors). The skip reads
+    /// the crashed-shard set explicitly (the same source the traffic tick
+    /// polls via `live_clash_targets`), so the guarantee holds by
+    /// construction instead of incidentally through backend liveness alone.
     fn tick_reprobe_running(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
         }
         let running = self.engine.running_ids();
+        let crashed: HashSet<String> = self.engine.ids_on_crashed_shards().into_iter().collect();
         let Ok(rows) = self.store.list() else {
             return 0;
         };
         let rows: Vec<ProxyConfig> = rows
             .into_iter()
-            .filter(|row| running.contains(&row.id) && self.engine.is_running(&row.id))
+            .filter(|row| {
+                running.contains(&row.id)
+                    && self.engine.is_running(&row.id)
+                    && !crashed.contains(&row.id)
+            })
             .collect();
         if rows.is_empty() {
             return 0;
@@ -9121,11 +9170,13 @@ impl AppView {
         } else {
             serving_badge(false, config.port, None)
         };
-        let start_label = if self.start_in_flight {
-            "Starting…"
-        } else {
-            "Start"
-        };
+        // W1: the selected row's lifecycle phase. Failed evidence is a
+        // crashed sidecar shard or a `dead` health summary on a serving row;
+        // the Start copy derives from the phase (same strings as before —
+        // Starting… while a start is in flight, Start otherwise).
+        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
+            || self.health_store.row_summary(&config.id).trim() == "dead";
+        let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
         div()
             .id("config-detail")
             .test_support()
@@ -9172,7 +9223,11 @@ impl AppView {
             ))
             .child(
                 Button::new("preset-open")
+                    // Ticket 44: small + tooltip (detail-bar density for the
+                    // 1000x700 paint frame; tooltips name every action).
+                    .small()
                     .label("Preset")
+                    .tooltip("Attach a routing preset")
                     .on_click(cx.listener(|view, _, window, cx| {
                         if let Some(config) = view.selected_config(cx) {
                             view.open_preset_attach_dialog(config, window, cx);
@@ -9192,7 +9247,10 @@ impl AppView {
                     .child(self.usage_line(&config.id))
                     .child(
                         Button::new("usage-reset")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
                             .label("Reset usage")
+                            .tooltip("Reset this row's usage counters")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(config) = view.selected_config(cx) {
                                     view.open_usage_reset_confirm(config, window, cx);
@@ -9238,7 +9296,11 @@ impl AppView {
                     )
                     .child(
                         Button::new("edit-config")
+                            // Ticket 44: small + tooltip (detail-bar density for the
+                            // 1000x700 paint frame; tooltips name every action).
+                            .small()
                             .label("Edit")
+                            .tooltip("Edit the selected configuration")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(config) = view.selected_config(cx) {
                                     view.open_edit_dialog(config, window, cx);
@@ -9248,7 +9310,10 @@ impl AppView {
                     .child(
                         Button::new("delete-config")
                             .danger()
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
                             .label("Delete")
+                            .tooltip("Delete the selected configuration")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(config) = view.selected_config(cx) {
                                     view.open_remove_confirm(config, window, cx);
@@ -9258,21 +9323,28 @@ impl AppView {
                     // Ticket 43: one-click duplicate (disabled copy, fresh
                     // auto port) plus per-row traffic reset (confirm names
                     // the row + current totals).
-                    .child(Button::new("duplicate-config").label("Duplicate").on_click(
-                        cx.listener(|view, _, window, cx| {
-                            if let Some(config) = view.selected_config(cx) {
-                                view.commit_duplicate(&config.id, window, cx);
-                            } else {
-                                window.push_notification(
-                                    Notification::info(no_selection_message()),
-                                    cx,
-                                );
-                            }
-                        }),
-                    ))
+                    .child(
+                        Button::new("duplicate-config")
+                            .small()
+                            .label("Duplicate")
+                            .tooltip("Duplicate the selected row (disabled copy)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.commit_duplicate(&config.id, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
                     .child(
                         Button::new("reset-traffic")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
                             .label("Reset traffic")
+                            .tooltip("Reset this row's traffic counters")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(config) = view.selected_config(cx) {
                                     view.open_traffic_reset_confirm(config, window, cx);
@@ -9286,44 +9358,64 @@ impl AppView {
                     )
                     .child(
                         Button::new("copy-urls")
+                            // Ticket 44: small + tooltip; clipboard carries bind
+                            // + port only (never params or secrets).
+                            .small()
                             .label("Copy URLs")
+                            .tooltip("Copy bind endpoints (no secrets)")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.copy_selected_urls(window, cx);
                             })),
                     )
                     .child(
                         Button::new("engine-start")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
                             .label(start_label)
+                            .tooltip("Start the selected endpoint (F5)")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.start_selected_engine(window, cx);
                             })),
                     )
                     .child(
                         Button::new("engine-stop")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
                             .label("Stop (Shift-F5)")
+                            .tooltip("Stop the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_selected_engine(window, cx);
                             })),
                     )
                     .child(
                         Button::new("health-test")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
                             .label("Test (Ctrl-T)")
+                            .tooltip("Test the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_selected_health(window, cx);
                             })),
                     )
                     .child(
                         Button::new("health-ping")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
                             .label("Ping")
+                            .tooltip("TCP-ping the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.ping_selected(window, cx);
                             })),
                     )
-                    .child(Button::new("logs-open").label("Logs").on_click(cx.listener(
-                        |view, _, window, cx| {
-                            view.open_logs_dialog(window, cx);
-                        },
-                    ))),
+                    .child(
+                        Button::new("logs-open")
+                            .small()
+                            .label("Logs")
+                            .tooltip("Open logs for the selection")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_logs_dialog(window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -11262,6 +11354,91 @@ mod tests {
             view.store.load_health_snapshots().expect("snapshots load")
         });
         assert_eq!(snaps.len(), 2, "latest samples persisted");
+    }
+
+    /// W2: the re-probe tick never dials rows on crashed shards. After a
+    /// crash is observed by the engine poll, the reprobe pass starts nothing
+    /// for the crashed rows (no manufactured errors, no health writes), while
+    /// surviving siblings keep probing.
+    #[gpui_kit::test]
+    fn tick_reprobe_skips_rows_on_crashed_shards(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10861"))
+            .expect("seed works");
+        let beta = store.add(tick12_seed("Beta", "10862")).expect("seed works");
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        let (prober, handle) = FakeHealthProber::shared();
+        let stock = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, stock, _fork) = EngineController::fake_pair();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+                stock
+            })
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.engine.is_running(&alpha.id)),
+            "rows run before the crash"
+        );
+
+        // One crash on the shared stock sidecar; the engine poll observes it
+        // (marking the shard crashed) before the next reprobe runs.
+        stock.inject_crash("signal: segmentation fault");
+        let poll = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_engine_poll(cx)));
+        assert!(poll.is_some(), "the crash is reported once");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.ids_on_crashed_shards().len()),
+            2,
+            "both stock rows sit on the crashed shard"
+        );
+
+        let reprobed = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_reprobe_running(cx)));
+        assert_eq!(reprobed, 0, "crashed rows are never re-probed");
+        cx.run_until_parked();
+        assert!(
+            handle.calls_for(&alpha.id).is_empty() && handle.calls_for(&beta.id).is_empty(),
+            "no probe ever dials a dead socket"
+        );
+        let untouched = view.read_with(cx, |view, _| {
+            (
+                view.health_store.status(&alpha.id),
+                view.health_store.status(&beta.id),
+            )
+        });
+        assert!(
+            matches!(
+                untouched,
+                (
+                    crate::health::RowHealth {
+                        state: crate::health::RowState::Unknown,
+                        ..
+                    },
+                    crate::health::RowHealth {
+                        state: crate::health::RowState::Unknown,
+                        ..
+                    },
+                )
+            ),
+            "no manufactured samples for crashed rows: {untouched:?}"
+        );
     }
 
     /// Restart restores last latencies + dead flags (file-backed store,
@@ -14945,6 +15122,159 @@ mod tests {
             assert_eq!(parsed, Some(status), "label round-trips");
         }
         assert_eq!(crate::FacetStatus::from_label("Nope"), None);
+    }
+
+    /// Ticket 44: search never matches credential fields. A row whose params
+    /// carry a password/uuid/token matches its upstream host but never the
+    /// secret values — across the base matcher, the extended matcher, and
+    /// the precomputed [`crate::RowSearchIndex`] path (delegate filter).
+    #[test]
+    fn w1_search_never_matches_credentials() {
+        use crate::store::ProxyConfig;
+        use crate::{library_row_matches, library_row_matches_full, LibraryDelegate, MatchContext};
+        let row = ProxyConfig {
+            id: "1".to_string(),
+            name: "Work".to_string(),
+            protocol: "vless".to_string(),
+            params: r#"{"server":"a.example.com","server_port":443,"password":"hunter2","uuid":"SECRET-UUID","token":"abc123"}"#.to_string(),
+            group: "travel".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        // The upstream host is searchable (acceptance: name/protocol/group/
+        // bind/port/upstream-server).
+        assert!(library_row_matches(&row, "a.example.com"));
+        assert!(library_row_matches(&row, "10801"));
+        let ctx = MatchContext::default();
+        assert!(library_row_matches_full(&row, "a.example.com", &ctx));
+        // Credential values never match on any path.
+        for secret in ["hunter2", "SECRET-UUID", "abc123", "HUNTER2"] {
+            assert!(
+                !library_row_matches(&row, secret),
+                "base matcher leaks {secret}"
+            );
+            assert!(
+                !library_row_matches_full(&row, secret, &ctx),
+                "extended matcher leaks {secret}"
+            );
+        }
+        // The delegate index agrees (production filter path, not just the
+        // oracle functions).
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![row]);
+        for secret in ["hunter2", "SECRET-UUID", "abc123"] {
+            delegate.query = secret.to_string();
+            delegate.apply_filter();
+            assert!(
+                delegate.visible.is_empty(),
+                "index leaks {secret}: {:?}",
+                delegate.visible
+            );
+        }
+        delegate.query = "a.example.com".to_string();
+        delegate.apply_filter();
+        assert_eq!(delegate.visible.len(), 1, "upstream still searchable");
+    }
+
+    /// Ticket 44: the virtualized library holds 50 rows at the 1000x700
+    /// desktop frame — counts stay exact, the list + status bar paint, and
+    /// search narrows without a rebuild.
+    #[gpui_kit::test]
+    fn w1_library_fifty_rows_paint_and_filter(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut ids = Vec::new();
+        for index in 0..50 {
+            let row = store
+                .add(seed_input(&format!("row-{index:02}")))
+                .expect("seed works");
+            ids.push(row.id);
+        }
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 50);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .visible
+                .len()),
+            50
+        );
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "config-list");
+        assert_painted(cx, "status-count");
+        assert_painted(cx, &format!("library-row-{}", ids[0]));
+        // Search narrows the painted set; clearing restores all 50.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "row-01".to_string();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .visible
+                .len()),
+            1
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = String::new();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .visible
+                .len()),
+            50
+        );
+    }
+
+    /// W1: the row lifecycle state machine — stopped → starting → running,
+    /// with failed for serving rows whose sidecar died or whose health reads
+    /// dead. Starting dominates (a second Start is ignored, never
+    /// double-applied); Failed dominates Running so a dead endpoint never
+    /// counts as healthy-running; only Starting changes the Start copy.
+    #[test]
+    fn w1_row_phase_precedence_and_start_copy() {
+        use crate::RowPhase;
+        assert_eq!(RowPhase::of(false, false, false), RowPhase::Stopped);
+        assert_eq!(RowPhase::of(true, false, false), RowPhase::Running);
+        assert_eq!(RowPhase::of(true, false, true), RowPhase::Failed);
+        // Failed evidence on a non-serving row still reports Failed (the row
+        // needs attention), but the Start copy is identical either way.
+        assert_eq!(RowPhase::of(false, false, true), RowPhase::Failed);
+        // Starting dominates everything (the in-flight guard is global).
+        assert_eq!(RowPhase::of(false, true, false), RowPhase::Starting);
+        assert_eq!(RowPhase::of(true, true, false), RowPhase::Starting);
+        assert_eq!(RowPhase::of(true, true, true), RowPhase::Starting);
+        assert_eq!(RowPhase::Stopped.start_label(), "Start");
+        assert_eq!(RowPhase::Running.start_label(), "Start");
+        assert_eq!(RowPhase::Failed.start_label(), "Start");
+        assert_eq!(RowPhase::Starting.start_label(), "Starting…");
     }
 
     /// Ticket 47 (RED): filter + render serve from the set_rows caches -

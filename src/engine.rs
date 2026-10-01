@@ -494,7 +494,7 @@ pub enum EngineError {
     InvalidGenerated { detail: String },
     /// The engine's own `check` rejected the generated config.
     CheckFailed { detail: String },
-    /// No `sing-box` binary in the app dir or `PATH` (never downloads).
+    /// No `sing-box` binary in the app dir (never `PATH`, never downloads).
     MissingBinary { searched: String },
     /// Ticket 07: no fork-core binary for exotic rows (names the rows and
     /// the expected binary; stock rows are unaffected).
