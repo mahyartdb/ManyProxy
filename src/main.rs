@@ -18409,29 +18409,23 @@ mod tests {
             Ok(())
         );
         assert_eq!(crate::save_listen_gate("Row", "127.0.0.1", "0"), Ok(()));
-        assert_eq!(
-            crate::save_listen_gate("Row", "127.0.0.1", "10801"),
-            Ok(())
-        );
+        assert_eq!(crate::save_listen_gate("Row", "127.0.0.1", "10801"), Ok(()));
         assert_eq!(crate::save_listen_gate("Row", "", "10801"), Ok(()));
-        let err = crate::save_listen_gate("Row", "127.0.0.1", "18501")
-            .expect_err("clash range refused");
+        let err =
+            crate::save_listen_gate("Row", "127.0.0.1", "18501").expect_err("clash range refused");
         assert!(
             err.contains("clash-controller range 18501-18999"),
             "names range, got {err}"
         );
-        let err = crate::save_listen_gate("Row", "127.0.0.1", "11801")
-            .expect_err("bridge range refused");
+        let err =
+            crate::save_listen_gate("Row", "127.0.0.1", "11801").expect_err("bridge range refused");
         assert!(
             err.contains("xray-bridge range 11801-11999"),
             "names range, got {err}"
         );
         let err = crate::save_listen_gate("Row", "999.999.0.1", "10801")
             .expect_err("garbage bind refused");
-        assert!(
-            err.contains("bad bind address"),
-            "names bind, got {err}"
-        );
+        assert!(err.contains("bad bind address"), "names bind, got {err}");
     }
 
     /// Ticket 48: redirect-resolution edges — trims whitespace, preserves

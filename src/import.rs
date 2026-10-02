@@ -5219,11 +5219,7 @@ mod tests {
     /// payload names the link, a decoded-but-blank payload names the payload.
     #[test]
     fn addsub_empty_payload_rejects_as_empty() {
-        for link in [
-            "throne://addsub",
-            "throne://addsub/",
-            "throne://addsub/   ",
-        ] {
+        for link in ["throne://addsub", "throne://addsub/", "throne://addsub/   "] {
             let error = parse_addsub_link(link).expect_err(&format!("{link} rejects"));
             assert_eq!(error.kind, ImportErrorKind::Empty);
             assert_eq!(error.message, "throne link is missing its payload");

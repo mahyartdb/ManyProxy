@@ -437,10 +437,7 @@ mod tests {
         assert!(!inner.is_empty(), "exe path inside quotes");
         assert_eq!(
             command,
-            format!(
-                "\"{}\"",
-                std::env::current_exe().expect("exe").display()
-            )
+            format!("\"{}\"", std::env::current_exe().expect("exe").display())
         );
     }
 
