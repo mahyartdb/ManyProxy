@@ -18396,6 +18396,86 @@ mod tests {
         }
     }
 
+    /// Ticket 41: save-gate passthrough vs refusal — blank, whitespace-only,
+    /// unparseable, and auto ports flow through Ok (store validation owns
+    /// those errors); reserved ports and garbage binds fail with the named
+    /// reason before any write.
+    #[test]
+    fn t41_save_listen_gate_passthrough_and_refusal() {
+        assert_eq!(crate::save_listen_gate("Row", "127.0.0.1", ""), Ok(()));
+        assert_eq!(crate::save_listen_gate("Row", "127.0.0.1", "   "), Ok(()));
+        assert_eq!(
+            crate::save_listen_gate("Row", "127.0.0.1", "not-a-port"),
+            Ok(())
+        );
+        assert_eq!(crate::save_listen_gate("Row", "127.0.0.1", "0"), Ok(()));
+        assert_eq!(
+            crate::save_listen_gate("Row", "127.0.0.1", "10801"),
+            Ok(())
+        );
+        assert_eq!(crate::save_listen_gate("Row", "", "10801"), Ok(()));
+        let err = crate::save_listen_gate("Row", "127.0.0.1", "18501")
+            .expect_err("clash range refused");
+        assert!(
+            err.contains("clash-controller range 18501-18999"),
+            "names range, got {err}"
+        );
+        let err = crate::save_listen_gate("Row", "127.0.0.1", "11801")
+            .expect_err("bridge range refused");
+        assert!(
+            err.contains("xray-bridge range 11801-11999"),
+            "names range, got {err}"
+        );
+        let err = crate::save_listen_gate("Row", "999.999.0.1", "10801")
+            .expect_err("garbage bind refused");
+        assert!(
+            err.contains("bad bind address"),
+            "names bind, got {err}"
+        );
+    }
+
+    /// Ticket 48: redirect-resolution edges — trims whitespace, preserves
+    /// absolute casing verbatim, keeps the query on origin-absolute hops,
+    /// keeps protocol-relative targets same-origin, refuses single-slash
+    /// and script targets; non-redirect statuses never follow.
+    #[test]
+    fn t48_resolve_fetch_redirect_edges() {
+        use crate::{is_fetch_redirect, resolve_fetch_redirect};
+        use gpui_kit::http_client::http::StatusCode;
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a/sub.txt", "  /b/sub.txt  "),
+            Some("https://example.com/b/sub.txt".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a", "HTTPS://cdn.example.com/sub.txt"),
+            Some("HTTPS://cdn.example.com/sub.txt".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com:8443/a/b?x=1", "/c?y=2"),
+            Some("https://example.com:8443/c?y=2".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a", "//evil.com/x"),
+            Some("https://example.com//evil.com/x".to_string())
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a", "https:/cdn.example.com/x"),
+            None
+        );
+        assert_eq!(
+            resolve_fetch_redirect("https://example.com/a", "javascript:alert(1)"),
+            None
+        );
+        assert!(
+            !is_fetch_redirect(StatusCode::from_u16(304).expect("status builds")),
+            "304 is not followed"
+        );
+        assert!(
+            !is_fetch_redirect(StatusCode::from_u16(300).expect("status builds")),
+            "300 is not followed"
+        );
+    }
+
     /// Stub `HttpClient` recording every fetched URL in order (shared
     /// across the `Fn` handler).
     fn t48_recording_client(

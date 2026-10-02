@@ -11488,6 +11488,62 @@ Active Connections\r
         assert!(parse_tasklist_table("").is_empty());
     }
 
+    /// Stale-temp sweep lists only ours (prefix + `.json`, sorted, files
+    /// only) and removes exactly those; missing dirs sweep to empty.
+    #[test]
+    fn t41_stale_temp_sweep_only_ours_sorted() {
+        let missing = std::env::temp_dir().join(format!(
+            "manyproxy-t41-sweep-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(stale_temp_files(&missing).is_empty());
+        assert!(sweep_stale_temp_files(&missing).is_empty());
+
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t41-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::write(dir.join("manyproxy-b.json"), "{}").expect("stale temp");
+        std::fs::write(dir.join("manyproxy-a.json"), "{}").expect("stale temp");
+        std::fs::write(dir.join("manyproxy-old.txt"), "keep").expect("wrong suffix kept");
+        std::fs::write(dir.join("notes.txt"), "keep").expect("foreign file kept");
+        std::fs::write(dir.join("manyproxy-x.json.bak"), "keep").expect("wrong suffix kept");
+        std::fs::create_dir_all(dir.join("manyproxy-nested.json")).expect("nested dir kept");
+        assert_eq!(
+            stale_temp_files(&dir),
+            vec![dir.join("manyproxy-a.json"), dir.join("manyproxy-b.json")]
+        );
+        assert_eq!(
+            sweep_stale_temp_files(&dir),
+            vec![dir.join("manyproxy-a.json"), dir.join("manyproxy-b.json")]
+        );
+        assert!(!dir.join("manyproxy-a.json").exists(), "swept");
+        assert!(!dir.join("manyproxy-b.json").exists(), "swept");
+        assert!(dir.join("notes.txt").exists(), "foreign file kept");
+        assert!(dir.join("manyproxy-old.txt").exists(), "wrong suffix kept");
+        assert!(
+            dir.join("manyproxy-x.json.bak").exists(),
+            "wrong suffix kept"
+        );
+        assert!(
+            dir.join("manyproxy-nested.json").is_dir(),
+            "directories never swept"
+        );
+        assert!(stale_temp_files(&dir).is_empty());
+        assert!(sweep_stale_temp_files(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// One crashed shard drops served/clash, marks totals stale, and skips
     /// ticks (live targets exclude it); manual Restart recovers everything.
     #[test]
