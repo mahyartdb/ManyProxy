@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::component::badge::Badge;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
@@ -25,6 +26,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tag::Tag;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
@@ -891,8 +893,38 @@ impl ListDelegate for LibraryDelegate {
         } else {
             card = card.child(checkbox);
         }
-        for line in lines {
-            card = card.child(line);
+        // T02: the serving badge is seam line 4 of [`library_row_lines`]
+        // (index 3). A serving row paints the colored status dot beside it as
+        // a sibling element — the pinned badge string itself never changes.
+        // Dead health on a serving row reads as danger, matching the detail
+        // pane's Failed evidence.
+        const SERVING_BADGE_LINE: usize = 3;
+        for (offset, line) in lines.enumerate() {
+            if offset + 1 == SERVING_BADGE_LINE && is_running {
+                let dot_color = if health.map(str::trim) == Some("dead") {
+                    cx.theme().danger
+                } else {
+                    cx.theme().success
+                };
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id(format!("row-dot-{row_id}"))
+                                .test_support()
+                                .size_1p5()
+                                .rounded_full()
+                                .bg(dot_color),
+                        )
+                        .child(line),
+                );
+            } else {
+                card = card.child(line);
+            }
         }
         Some(item.child(card))
     }
@@ -9221,11 +9253,29 @@ impl AppView {
                     .items_center()
                     .gap_2()
                     .child(Label::new(config.name.clone()))
-                    .child(format!(
-                        "{} · {} · {}:{}",
-                        config.protocol, config.group, config.bind_ip, config.port
-                    ))
-                    .child(div().id("detail-serving").test_support().child(badge)),
+                    // T02: protocol and group ride as Tag chips; the bind
+                    // endpoint stays plain text (id/text presence asserted).
+                    .child(Tag::new().child(config.protocol.clone()))
+                    .child(Tag::new().child(config.group.clone()))
+                    .child(format!("{}:{}", config.bind_ip, config.port))
+                    .child(
+                        div().id("detail-serving").test_support().child(
+                            // T02: the serving line is a Badge — the pinned
+                            // copy is the child, the dot names the state
+                            // (danger on Failed evidence, success while
+                            // serving, secondary when stopped).
+                            Badge::new()
+                                .dot()
+                                .color(if failed {
+                                    cx.theme().danger
+                                } else if is_running {
+                                    cx.theme().success
+                                } else {
+                                    cx.theme().secondary
+                                })
+                                .child(badge),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -15750,6 +15800,52 @@ mod tests {
         assert!(
             second_bounds.origin.y > first_bounds.origin.y + first_bounds.size.height,
             "row cards keep a gap: first {first_bounds:?}, second {second_bounds:?}"
+        );
+    }
+
+    /// T02 red-first: a serving row paints the inline status dot beside the
+    /// serving line; a stopped row paints no dot. The pinned badge string
+    /// ([`serving_badge`]) never changes — the dot is a sibling element.
+    #[gpui_kit::test]
+    fn library_row_dot_present_iff_serving(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+
+        // Serving: the row joins the running set before the first frame.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().running.insert(seeded.id.clone());
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, &format!("row-dot-{}", seeded.id));
+
+        // Stopped: the dot leaves with the running set.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().running.remove(&seeded.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, _| window.try_find(format!("row-dot-{}", seeded.id)).is_none()),
+            "a stopped row paints no status dot"
         );
     }
 
