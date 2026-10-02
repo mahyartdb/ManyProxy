@@ -30,6 +30,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
@@ -9738,46 +9739,95 @@ impl AppView {
                                 view.copy_selected_urls(window, cx);
                             })),
                     )
-                    .child(
-                        Button::new("engine-start")
+                    .child({
+                        // T06: loading state + inline spinner while a start
+                        // is in flight (the label already reads `Starting…`
+                        // via `RowPhase::start_label`).
+                        let mut start = Button::new("engine-start")
                             // Ticket 44: small + tooltip (detail-bar density).
                             .small()
                             .label(start_label)
                             .tooltip("Start the selected endpoint (F5)")
+                            .loading(self.start_in_flight)
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.start_selected_engine(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("engine-stop")
+                            }));
+                        if self.start_in_flight {
+                            start = start.child(
+                                div()
+                                    .id("engine-start-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        start
+                    })
+                    .child({
+                        // T06: loading state + inline spinner while a start
+                        // is in flight (stop waits on the same fence).
+                        let mut stop = Button::new("engine-stop")
                             // Ticket 44: small + tooltip (detail-bar density).
                             .small()
                             .label("Stop (Shift-F5)")
                             .tooltip("Stop the selected endpoint")
+                            .loading(self.start_in_flight)
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_selected_engine(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("health-test")
+                            }));
+                        if self.start_in_flight {
+                            stop = stop.child(
+                                div()
+                                    .id("engine-stop-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        stop
+                    })
+                    .child({
+                        // T06: loading state + inline spinner while a
+                        // URL-test probe is in flight.
+                        let mut test = Button::new("health-test")
                             // Ticket 44: small + tooltip (detail-bar density).
                             .small()
                             .label("Test (Ctrl-T)")
                             .tooltip("Test the selected endpoint")
+                            .loading(self.probe_kind_in_flight(false))
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_selected_health(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("health-ping")
+                            }));
+                        if self.probe_kind_in_flight(false) {
+                            test = test.child(
+                                div()
+                                    .id("health-test-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        test
+                    })
+                    .child({
+                        // T06: loading state + inline spinner while a
+                        // TCP-ping probe is in flight.
+                        let mut ping = Button::new("health-ping")
                             // Ticket 44: small + tooltip (detail-bar density).
                             .small()
                             .label("Ping")
                             .tooltip("TCP-ping the selected endpoint")
+                            .loading(self.probe_kind_in_flight(true))
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.ping_selected(window, cx);
-                            })),
-                    )
+                            }));
+                        if self.probe_kind_in_flight(true) {
+                            ping = ping.child(
+                                div()
+                                    .id("health-ping-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        ping
+                    })
                     .child(
                         Button::new("logs-open")
                             .small()
@@ -16229,6 +16279,111 @@ mod tests {
         paint_frame(cx);
         assert_painted(cx, "config-health");
         assert_absent(cx, "config-health-alert".to_string());
+    }
+
+    /// T06 red-first: in-flight flags surface as loading spinners on the
+    /// four action buttons. Presence ⟺ in-flight: the buttons sit below
+    /// the fold of the scrolling inspector, so presence (not paint) is the
+    /// assertion here, and no sleeps are involved — the flags flip directly
+    /// through the existing seams.
+    #[gpui_kit::test]
+    fn in_flight_flags_show_button_spinners(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the row so the detail action buttons render.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let has_spinner = |cx: &mut VisualTestContext, id: &str| {
+            cx.update(|window, _| window.try_find(id.to_string()).is_some())
+        };
+        // Start in-flight: both engine buttons load, probes do not.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.start_in_flight = true;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            has_spinner(cx, "engine-start-spinner"),
+            "start shows loading"
+        );
+        assert!(has_spinner(cx, "engine-stop-spinner"), "stop shows loading");
+        assert!(
+            !has_spinner(cx, "health-test-spinner"),
+            "no probe running, no test spinner"
+        );
+        // URL-test probe in-flight: only the Test button loads.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.start_in_flight = false;
+                view.probe_url_in_flight = true;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !has_spinner(cx, "engine-start-spinner"),
+            "start flag cleared"
+        );
+        assert!(has_spinner(cx, "health-test-spinner"), "test shows loading");
+        assert!(
+            !has_spinner(cx, "health-ping-spinner"),
+            "ping is a separate kind"
+        );
+        // TCP-ping probe in-flight: only the Ping button loads.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.probe_url_in_flight = false;
+                view.probe_ping_in_flight = true;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !has_spinner(cx, "health-test-spinner"),
+            "url-test flag cleared"
+        );
+        assert!(has_spinner(cx, "health-ping-spinner"), "ping shows loading");
+        // All clear: no spinner anywhere.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.probe_ping_in_flight = false;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "engine-start-spinner",
+            "engine-stop-spinner",
+            "health-test-spinner",
+            "health-ping-spinner",
+        ] {
+            assert!(!has_spinner(cx, id), "{id} leaves with the flag");
+        }
     }
 
     /// Scenario: empty store → the empty state actually paints (asserted via
