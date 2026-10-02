@@ -820,4 +820,24 @@ mod tests {
         );
         assert!(!looks_like_preset_json("\u{FEFF}vless://u@h:1"));
     }
+
+    /// Overlong preset names truncate to 256 chars at intake.
+    #[test]
+    fn long_preset_name_truncates_to_256_chars() {
+        let long = "a".repeat(300);
+        let text = format!(r#"{{"name":"{long}","rules":[]}}"#);
+        let parsed = parse_preset_json(&text, "").expect("long name parses");
+        assert_eq!(parsed.name, "a".repeat(256));
+        assert_eq!(parsed.name.chars().count(), 256);
+    }
+
+    /// A remote-route link without `#name` falls back to the URL host.
+    #[test]
+    fn remote_route_link_without_name_falls_back_to_host() {
+        let payload = b64("https://example.com/preset.json");
+        let request = decode_remote_route_link(&format!("throne://remoteroute/{payload}"))
+            .expect("remote link decodes");
+        assert_eq!(request.url, "https://example.com/preset.json");
+        assert_eq!(request.name, "example.com");
+    }
 }

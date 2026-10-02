@@ -3596,4 +3596,39 @@ mod tests {
         // Case and trailing-dot variants of an exact probe still match.
         assert!(is_probe_destination("EXAMPLE.COM.", probe));
     }
+
+    /// `counts` reports (live, dead) with untested ids as neither.
+    #[test]
+    fn health_store_counts_live_dead_and_untested() {
+        fn outcome(id: &str, error: Option<&str>) -> TestOutcome {
+            TestOutcome {
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at: now_unix(),
+                    kind: HealthKind::UrlTest,
+                    latency_ms: if error.is_none() { Some(11) } else { None },
+                    error: error.map(str::to_string),
+                },
+                success: None,
+            }
+        }
+        let mut store = HealthStore::default();
+        store.record_outcome(&outcome("live", None));
+        store.record_outcome(&outcome("dead", Some("connection refused")));
+        assert_eq!(
+            store.counts(&[
+                "live".to_string(),
+                "dead".to_string(),
+                "missing".to_string()
+            ]),
+            (1, 1)
+        );
+        assert_eq!(store.counts(&["missing".to_string()]), (0, 0));
+    }
+
+    /// An unresolvable probe host resolves to no IPs (fail-open).
+    #[test]
+    fn resolve_probe_ips_unresolvable_is_empty() {
+        assert!(resolve_probe_ips("no-such-host.invalid").is_empty());
+    }
 }
