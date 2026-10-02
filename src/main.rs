@@ -23,6 +23,8 @@ use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, Tex
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
@@ -3081,6 +3083,222 @@ fn spawn_tick(
 
 /// Root view of the ManyProxy window: title bar, toolbar, virtualized
 /// configuration list, detail bar, status bar, plus overlay layers.
+/// T03: one facet menu (group / protocol / status) rendered as a kit
+/// `Select` with an inline dropdown (a deferred popover — the old dialogs
+/// never open). Options derive live from the delegate each frame, so the
+/// menu always lists real labels with counts, exactly like the dialog did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FacetMenu {
+    Group,
+    Protocol,
+    Status,
+}
+
+/// T03: one row of a facet menu. `title` is the dropdown row (with counts,
+/// like the old dialog buttons); `display` is the trigger text (the exact
+/// `Group: X` labels the old buttons showed); `value` is the committed
+/// facet (`None` = All). `id` is the stable element id
+/// (`facet-group-travel`, …, `facet-group-all`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FacetChoice {
+    id: String,
+    title: String,
+    display: String,
+    value: Option<String>,
+}
+
+impl SearchableListItem for FacetChoice {
+    type Value = Option<String>;
+
+    fn title(&self) -> SharedString {
+        self.title.clone().into()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(self.display.clone().into_any_element())
+    }
+
+    fn value(&self) -> &Option<String> {
+        &self.value
+    }
+}
+
+/// T03: the item data behind one facet `Select`. A dedicated delegate (not
+/// `SearchableVec`) so option rows render with stable observed ids that
+/// headless tests can click.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FacetChoiceList(Vec<FacetChoice>);
+
+impl SearchableListDelegate for FacetChoiceList {
+    type Item = FacetChoice;
+
+    fn items_count(&self, _section: usize) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&FacetChoice> {
+        self.0.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        FacetChoice: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0
+            .iter()
+            .position(|choice| choice.value() == value)
+            .map(IndexPath::new)
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &FacetChoice,
+        _checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .id(item.id.clone())
+                .test_support()
+                .child(item.title.clone())
+                .into_any_element(),
+        )
+    }
+}
+
+impl FacetMenu {
+    const ALL: [FacetMenu; 3] = [FacetMenu::Group, FacetMenu::Protocol, FacetMenu::Status];
+
+    /// Live options plus the currently committed value for this menu.
+    fn choices(&self, delegate: &LibraryDelegate) -> (Vec<FacetChoice>, Option<String>) {
+        match self {
+            FacetMenu::Group => (
+                std::iter::once(FacetChoice {
+                    id: "facet-group-all".to_string(),
+                    title: "All groups".to_string(),
+                    display: "Group: All".to_string(),
+                    value: None,
+                })
+                .chain(
+                    delegate
+                        .group_options()
+                        .into_iter()
+                        .map(|(group, count)| FacetChoice {
+                            id: format!("facet-group-{group}"),
+                            title: format!("{group} ({count})"),
+                            display: format!("Group: {group}"),
+                            value: Some(group),
+                        }),
+                )
+                .collect(),
+                delegate.facet_group.clone(),
+            ),
+            FacetMenu::Protocol => (
+                std::iter::once(FacetChoice {
+                    id: "facet-protocol-all".to_string(),
+                    title: "All protocols".to_string(),
+                    display: "Protocol: All".to_string(),
+                    value: None,
+                })
+                .chain(
+                    delegate
+                        .protocol_options()
+                        .into_iter()
+                        .map(|protocol| FacetChoice {
+                            id: format!("facet-protocol-{protocol}"),
+                            title: protocol.clone(),
+                            display: format!("Protocol: {protocol}"),
+                            value: Some(protocol),
+                        }),
+                )
+                .collect(),
+                delegate.facet_protocol.clone(),
+            ),
+            FacetMenu::Status => (
+                std::iter::once(FacetChoice {
+                    id: "facet-status-all".to_string(),
+                    title: "All statuses".to_string(),
+                    display: "Status: All".to_string(),
+                    value: None,
+                })
+                .chain(FacetStatus::ALL.iter().map(|status| {
+                    let label = status.label().to_string();
+                    FacetChoice {
+                        id: format!("facet-status-{label}"),
+                        title: label.clone(),
+                        display: format!("Status: {label}"),
+                        value: Some(label),
+                    }
+                }))
+                .collect(),
+                delegate
+                    .facet_status
+                    .map(|status| status.label().to_string()),
+            ),
+        }
+    }
+
+    /// Commit a picked value through the existing delegate seams (the same
+    /// setters the dialog buttons called, with the same notifications).
+    fn apply(&self, view: &mut AppView, value: Option<String>, cx: &mut Context<AppView>) {
+        view.libraries.update(cx, |state, list_cx| {
+            let delegate = state.delegate_mut();
+            match self {
+                FacetMenu::Group => delegate.set_facet_group(value),
+                FacetMenu::Protocol => delegate.set_facet_protocol(value),
+                FacetMenu::Status => {
+                    delegate
+                        .set_facet_status(value.and_then(|label| FacetStatus::from_label(&label)));
+                }
+            }
+            list_cx.notify();
+        });
+        cx.notify();
+    }
+}
+
+/// T03: one facet `Select` — its state entity (created once, never in
+/// render), the last-synced options, and the retained confirm subscription.
+struct FacetPicker {
+    state: Entity<SelectState<FacetChoiceList>>,
+    synced: Vec<FacetChoice>,
+    _subscription: Subscription,
+}
+
+impl FacetPicker {
+    fn new(
+        menu: FacetMenu,
+        choices: Vec<FacetChoice>,
+        current: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) -> Self {
+        let selected = choices
+            .iter()
+            .position(|choice| choice.value == current)
+            .map(IndexPath::new);
+        let state =
+            cx.new(|cx| SelectState::new(FacetChoiceList(choices.clone()), selected, window, cx));
+        let subscription = cx.subscribe(
+            &state,
+            move |view, _state, event: &SelectEvent<FacetChoiceList>, cx| {
+                let SelectEvent::Confirm(choice) = event;
+                if let Some(value) = choice {
+                    menu.apply(view, value.clone(), cx);
+                }
+            },
+        );
+        Self {
+            state,
+            synced: choices,
+            _subscription: subscription,
+        }
+    }
+}
+
 struct AppView {
     focus: FocusHandle,
     libraries: Entity<ListState<LibraryDelegate>>,
@@ -3197,6 +3415,11 @@ struct AppView {
     /// Retained list subscription: dropping it would stop detail-bar
     /// refreshes on selection/search events.
     _libraries_subscription: Subscription,
+    /// T03: facet pickers as inline `Select` popovers (replacing the
+    /// `open_facet_*_dialog` triad). Entities live here, never in render.
+    facet_group: FacetPicker,
+    facet_protocol: FacetPicker,
+    facet_status: FacetPicker,
 }
 
 impl AppView {
@@ -3224,6 +3447,29 @@ impl AppView {
                 .searchable(true)
                 .selectable(true)
         });
+        // T03: facet pickers — entities created once here (never in render).
+        // Rows load below, so these start with the All-only options and sync
+        // on the first frame via `sync_facet_pickers`.
+        let empty_delegate = LibraryDelegate::new();
+        let (group_choices, group_current) = FacetMenu::Group.choices(&empty_delegate);
+        let facet_group =
+            FacetPicker::new(FacetMenu::Group, group_choices, group_current, window, cx);
+        let (protocol_choices, protocol_current) = FacetMenu::Protocol.choices(&empty_delegate);
+        let facet_protocol = FacetPicker::new(
+            FacetMenu::Protocol,
+            protocol_choices,
+            protocol_current,
+            window,
+            cx,
+        );
+        let (status_choices, status_current) = FacetMenu::Status.choices(&empty_delegate);
+        let facet_status = FacetPicker::new(
+            FacetMenu::Status,
+            status_choices,
+            status_current,
+            window,
+            cx,
+        );
         // Ticket 38: seed the snapshot guard from the stored set so the
         // first reload does not rewrite an unchanged snapshot.
         let last_snapshot = store.load_running_snapshot();
@@ -3293,6 +3539,9 @@ impl AppView {
                     cx.notify();
                 },
             ),
+            facet_group,
+            facet_protocol,
+            facet_status,
         };
         let mut view = view;
         let rows = match view.store.list() {
@@ -3329,6 +3578,8 @@ impl AppView {
             // parent notify below never reaches it.
             list_cx.notify();
         });
+        // T03: rows are in — the pickers inventory them on this first sync.
+        view.sync_facet_pickers(window, cx);
         cx.notify();
         view
     }
@@ -9644,30 +9895,56 @@ impl AppView {
             .into_any_element()
     }
 
+    /// T03: refresh the three pickers from the live delegate. Guarded twice
+    /// (options equal + selection equal ⇒ no entity update), so a stable
+    /// frame never notifies and the sync cannot drive a render loop.
+    fn sync_facet_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for menu in FacetMenu::ALL {
+            let (choices, current) = menu.choices(self.libraries.read(cx).delegate());
+            let picker = match menu {
+                FacetMenu::Group => &mut self.facet_group,
+                FacetMenu::Protocol => &mut self.facet_protocol,
+                FacetMenu::Status => &mut self.facet_status,
+            };
+            Self::sync_facet_picker(picker, choices, current, window, cx);
+        }
+    }
+
+    fn sync_facet_picker(
+        picker: &mut FacetPicker,
+        choices: Vec<FacetChoice>,
+        current: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) {
+        if picker.synced != choices {
+            picker.synced = choices.clone();
+            picker.state.update(cx, |state, cx| {
+                state.set_items(FacetChoiceList(choices.clone()), window, cx);
+                state.set_selected_value(&current, window, cx);
+            });
+            return;
+        }
+        let selected = picker.state.read(cx).selected_value().cloned().flatten();
+        if selected != current {
+            picker.state.update(cx, |state, cx| {
+                state.set_selected_value(&current, window, cx);
+            });
+        }
+    }
+
     /// Ticket 44: facet filter bar. Shows the three facet pickers with the
     /// current choice in the label, plus a clear action while any facet is
-    /// active. Pickers open dialogs (no SelectState retained — options are
-    /// derived live from rows, so the dialog always lists real labels).
-    fn render_facet_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (group_label, protocol_label, status_label, has_facets) = {
-            let delegate = self.libraries.read(cx).delegate();
-            let group_label = delegate
-                .facet_group
-                .clone()
-                .map(|group| format!("Group: {group}"))
-                .unwrap_or_else(|| "Group: All".to_string());
-            let protocol_label = delegate
-                .facet_protocol
-                .clone()
-                .map(|protocol| format!("Protocol: {protocol}"))
-                .unwrap_or_else(|| "Protocol: All".to_string());
-            let status_label = delegate
-                .facet_status
-                .map(|status| format!("Status: {}", status.label()))
-                .unwrap_or_else(|| "Status: All".to_string());
-            let has_facets = delegate.facets_active();
-            (group_label, protocol_label, status_label, has_facets)
-        };
+    /// active. T03: pickers are inline `Select` popovers (no dialogs, no
+    /// `SelectState` in render — options refresh through the guarded
+    /// [`AppView::sync_facet_pickers`]).
+    fn render_facet_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.sync_facet_pickers(window, cx);
+        let has_facets = self.libraries.read(cx).delegate().facets_active();
         div()
             .id("facet-bar")
             .test_support()
@@ -9681,31 +9958,22 @@ impl AppView {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                Button::new("facet-group")
+                Select::new(&self.facet_group.state)
+                    .id("facet-group")
                     .small()
-                    .label(group_label)
-                    .tooltip("Filter by group")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_facet_group_dialog(window, cx);
-                    })),
+                    .accessibility_label("Filter by group"),
             )
             .child(
-                Button::new("facet-protocol")
+                Select::new(&self.facet_protocol.state)
+                    .id("facet-protocol")
                     .small()
-                    .label(protocol_label)
-                    .tooltip("Filter by protocol")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_facet_protocol_dialog(window, cx);
-                    })),
+                    .accessibility_label("Filter by protocol"),
             )
             .child(
-                Button::new("facet-status")
+                Select::new(&self.facet_status.state)
+                    .id("facet-status")
                     .small()
-                    .label(status_label)
-                    .tooltip("Filter by status")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_facet_status_dialog(window, cx);
-                    })),
+                    .accessibility_label("Filter by status"),
             )
             .child(
                 Button::new("groups-dialog")
@@ -9876,192 +10144,6 @@ impl AppView {
             list_cx.notify();
         });
         cx.notify();
-    }
-
-    /// Ticket 44: group facet picker. Options come from live rows with counts
-    /// (`group_options` covers all rows, never just the visible slice).
-    fn open_facet_group_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.entity();
-        let options = self.libraries.read(cx).delegate().group_options();
-        let commit: DialogCommit = Rc::new(|_, _| true);
-        let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            let commit_key = commit_key.clone();
-            let commit_click = commit.clone();
-            let mut body = div().flex().flex_col().gap_2();
-            {
-                let pick_view = view.clone();
-                body = body.child(Button::new("facet-group-all").label("All groups").on_click(
-                    move |_, window, cx| {
-                        pick_view.update(cx, |view, cx| {
-                            view.libraries.update(cx, |state, list_cx| {
-                                state.delegate_mut().set_facet_group(None);
-                                list_cx.notify();
-                            });
-                            cx.notify();
-                        });
-                        window.close_all_dialogs(cx);
-                    },
-                ));
-            }
-            for (group, count) in &options {
-                let pick_view = view.clone();
-                let pick_group = group.clone();
-                let label = format!("{group} ({count})");
-                let id = format!("facet-group-{}", group);
-                body = body.child(Button::new(id).label(label).on_click(move |_, window, cx| {
-                    let group = pick_group.clone();
-                    pick_view.update(cx, |view, cx| {
-                        view.libraries.update(cx, |state, list_cx| {
-                            state.delegate_mut().set_facet_group(Some(group));
-                            list_cx.notify();
-                        });
-                        cx.notify();
-                    });
-                    window.close_all_dialogs(cx);
-                }));
-            }
-            dialog
-                .title("Filter by group")
-                .child(body)
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
-                .footer(dialog_footer(
-                    "facet-group-ok",
-                    "facet-group-cancel",
-                    commit_click,
-                ))
-        });
-    }
-
-    /// Ticket 44: protocol facet picker (exact match, lowercased).
-    fn open_facet_protocol_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.entity();
-        let options = self.libraries.read(cx).delegate().protocol_options();
-        let commit: DialogCommit = Rc::new(|_, _| true);
-        let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            let commit_key = commit_key.clone();
-            let commit_click = commit.clone();
-            let mut body = div().flex().flex_col().gap_2();
-            {
-                let pick_view = view.clone();
-                body = body.child(
-                    Button::new("facet-protocol-all")
-                        .label("All protocols")
-                        .on_click(move |_, window, cx| {
-                            pick_view.update(cx, |view, cx| {
-                                view.libraries.update(cx, |state, list_cx| {
-                                    state.delegate_mut().set_facet_protocol(None);
-                                    list_cx.notify();
-                                });
-                                cx.notify();
-                            });
-                            window.close_all_dialogs(cx);
-                        }),
-                );
-            }
-            for protocol in &options {
-                let pick_view = view.clone();
-                let pick_protocol = protocol.clone();
-                let id = format!("facet-protocol-{}", protocol);
-                let label = protocol.clone();
-                body = body.child(Button::new(id).label(label).on_click(move |_, window, cx| {
-                    let protocol = pick_protocol.clone();
-                    pick_view.update(cx, |view, cx| {
-                        view.libraries.update(cx, |state, list_cx| {
-                            state.delegate_mut().set_facet_protocol(Some(protocol));
-                            list_cx.notify();
-                        });
-                        cx.notify();
-                    });
-                    window.close_all_dialogs(cx);
-                }));
-            }
-            dialog
-                .title("Filter by protocol")
-                .child(body)
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
-                .footer(dialog_footer(
-                    "facet-protocol-ok",
-                    "facet-protocol-cancel",
-                    commit_click,
-                ))
-        });
-    }
-
-    /// Ticket 44: status facet picker (exact predicates, never substring).
-    fn open_facet_status_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.entity();
-        let commit: DialogCommit = Rc::new(|_, _| true);
-        let commit_key = commit.clone();
-        // Ticket 44: labels round-trip through `from_label` so the picker can
-        // never offer a status the filter cannot parse.
-        let labels: Vec<String> = FacetStatus::ALL
-            .iter()
-            .map(|status| status.label().to_string())
-            .collect();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            let commit_key = commit_key.clone();
-            let commit_click = commit.clone();
-            let mut body = div().flex().flex_col().gap_2();
-            {
-                let pick_view = view.clone();
-                body = body.child(
-                    Button::new("facet-status-all")
-                        .label("All statuses")
-                        .on_click(move |_, window, cx| {
-                            pick_view.update(cx, |view, cx| {
-                                view.libraries.update(cx, |state, list_cx| {
-                                    state.delegate_mut().set_facet_status(None);
-                                    list_cx.notify();
-                                });
-                                cx.notify();
-                            });
-                            window.close_all_dialogs(cx);
-                        }),
-                );
-            }
-            for label in &labels {
-                let pick_view = view.clone();
-                let pick_label = label.clone();
-                let id = format!("facet-status-{label}");
-                let button_label = label.clone();
-                body = body.child(Button::new(id).label(button_label).on_click(
-                    move |_, window, cx| {
-                        let status = FacetStatus::from_label(&pick_label);
-                        pick_view.update(cx, |view, cx| {
-                            view.libraries.update(cx, |state, list_cx| {
-                                state.delegate_mut().set_facet_status(status);
-                                list_cx.notify();
-                            });
-                            cx.notify();
-                        });
-                        window.close_all_dialogs(cx);
-                    },
-                ));
-            }
-            dialog
-                .title("Filter by status")
-                .child(body)
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
-                .footer(dialog_footer(
-                    "facet-status-ok",
-                    "facet-status-cancel",
-                    commit_click,
-                ))
-        });
     }
 
     /// Ticket 44: bulk enable/disable over the checked set. One reload, one
@@ -10753,7 +10835,7 @@ impl Render for AppView {
                         .test_support()
                         .flex_1()
                         .child(self.render_search_count(cx))
-                        .child(self.render_facet_bar(cx))
+                        .child(self.render_facet_bar(window, cx))
                         .child(self.render_bulk_bar(cx))
                         .child(
                             List::new(&self.libraries).search_placeholder("Search configurations"),
@@ -15846,6 +15928,196 @@ mod tests {
         assert!(
             cx.update(|window, _| window.try_find(format!("row-dot-{}", seeded.id)).is_none()),
             "a stopped row paints no status dot"
+        );
+    }
+
+    /// T03: facet picker seeds with a non-default group/protocol.
+    fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            params: format!(
+                "{{\"type\":\"{protocol}\",\"server\":\"seed.example.com\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\"}}"
+            ),
+            group: group.to_string(),
+            bind_ip: "127.0.0.1".to_string(),
+            port: port.to_string(),
+        }
+    }
+
+    /// T03 tests-first: the group picker opens inline (never a dialog);
+    /// picking an option applies the facet to the visible rows; Clear
+    /// restores. RED while the pickers open dialogs.
+    #[gpui_kit::test]
+    fn facet_group_picker_selects_without_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let travel = store
+            .add(facet_seed("Work", "vless", "travel", "10801"))
+            .expect("seed works");
+        let team = store
+            .add(facet_seed("Office", "vless", "team", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_painted(cx, "facet-group");
+        cx.update(|window, cx| {
+            window.click("facet-group", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the group picker opens inline, never as a dialog"
+        );
+        assert_painted(cx, "facet-group-travel");
+        assert_painted(cx, "facet-group-team");
+        cx.update(|window, cx| {
+            window.click("facet-group-travel", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .facet_group
+                .clone()),
+            Some("travel".to_string()),
+            "picking applies the group facet"
+        );
+        assert_painted(cx, &format!("library-row-{}", travel.id));
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("library-row-{}", team.id))
+                .is_none()),
+            "the team row filters out of the visible list"
+        );
+        cx.update(|window, cx| {
+            window.click("clear-facets", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .facet_group
+                .clone()),
+            None,
+            "Clear restores the unfiltered library"
+        );
+        assert_painted(cx, &format!("library-row-{}", team.id));
+    }
+
+    /// T03 tests-first: the protocol picker opens inline; picking applies
+    /// the protocol facet to the visible rows. RED while dialogs open.
+    #[gpui_kit::test]
+    fn facet_protocol_picker_selects_without_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let vless = store
+            .add(facet_seed("Work", "vless", "travel", "10801"))
+            .expect("seed works");
+        let vmess = store
+            .add(facet_seed("Office", "vmess", "travel", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_painted(cx, "facet-protocol");
+        cx.update(|window, cx| {
+            window.click("facet-protocol", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the protocol picker opens inline, never as a dialog"
+        );
+        assert_painted(cx, "facet-protocol-vless");
+        assert_painted(cx, "facet-protocol-vmess");
+        cx.update(|window, cx| {
+            window.click("facet-protocol-vmess", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .facet_protocol
+                .clone()),
+            Some("vmess".to_string()),
+            "picking applies the protocol facet"
+        );
+        assert_painted(cx, &format!("library-row-{}", vmess.id));
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("library-row-{}", vless.id))
+                .is_none()),
+            "the vless row filters out of the visible list"
+        );
+    }
+
+    /// T03 tests-first: the status picker opens inline; picking applies the
+    /// status facet. RED while the pickers open dialogs.
+    #[gpui_kit::test]
+    fn facet_status_picker_selects_without_dialog(cx: &mut TestAppContext) {
+        use crate::FacetStatus;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(facet_seed("Work", "vless", "travel", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_painted(cx, "facet-status");
+        cx.update(|window, cx| {
+            window.click("facet-status", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the status picker opens inline, never as a dialog"
+        );
+        assert_painted(cx, "facet-status-all");
+        assert_painted(cx, "facet-status-Stopped");
+        cx.update(|window, cx| {
+            window.click("facet-status-Stopped", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .facet_status),
+            Some(FacetStatus::Stopped),
+            "picking applies the status facet"
         );
     }
 
