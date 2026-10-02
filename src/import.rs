@@ -5214,4 +5214,53 @@ mod tests {
             out.failures[0].reason
         );
     }
+
+    /// Empty addsub payloads reject as `Empty` with stable copy: a missing
+    /// payload names the link, a decoded-but-blank payload names the payload.
+    #[test]
+    fn addsub_empty_payload_rejects_as_empty() {
+        for link in [
+            "throne://addsub",
+            "throne://addsub/",
+            "throne://addsub/   ",
+        ] {
+            let error = parse_addsub_link(link).expect_err(&format!("{link} rejects"));
+            assert_eq!(error.kind, ImportErrorKind::Empty);
+            assert_eq!(error.message, "throne link is missing its payload");
+        }
+        let link = format!("throne://addsub/{}", b64_standard("   "));
+        let error = parse_addsub_link(&link).expect_err("blank inner rejects");
+        assert_eq!(error.kind, ImportErrorKind::Empty);
+        assert_eq!(error.message, "addsub payload is empty");
+    }
+
+    /// Mixed multi-file drops keep configs plus offset failures;
+    /// re-committing the same files is all-duplicate and writes nothing.
+    #[test]
+    fn commit_all_duplicates_writes_nothing_and_multi_file_mixes_results() {
+        let good_a = format!("vless://{UUID}@a.example.com:443#one");
+        let files = [
+            ("a.txt", good_a.as_str()),
+            ("b.txt", "trojan://pw@b.example.com:443#two"),
+            ("bad.txt", "not a link"),
+        ];
+        let mixed = import_multi_file_contents(&files);
+        assert_eq!(mixed.configs.len(), 2);
+        assert_eq!(mixed.failures.len(), 1);
+        assert_eq!(mixed.failures[0].index, 2);
+        let mut store = Store::open_in_memory().expect("store opens");
+        let first = commit_batch(&mut store, mixed, "mixed").expect("commit works");
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.duplicates, 0);
+        assert_eq!(first.failures.len(), 1);
+        assert_eq!(first.failures[0].index, 2);
+        assert_eq!(store.list().expect("list works").len(), 2);
+        let retry = import_multi_file_contents(&files);
+        let second = commit_batch(&mut store, retry, "mixed").expect("recommit works");
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.duplicates, 2);
+        assert_eq!(second.failures.len(), 1);
+        assert_eq!(second.failures[0].index, 2);
+        assert_eq!(store.list().expect("list works").len(), 2);
+    }
 }

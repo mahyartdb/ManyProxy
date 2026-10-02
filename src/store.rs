@@ -9366,4 +9366,29 @@ mod tests {
             "snapshots cleared"
         );
     }
+
+    /// Port field trims padding and reports the literal 1-65535 range.
+    #[test]
+    fn port_field_trims_and_reports_literal_range() {
+        assert_eq!(
+            parse_port_field("  10801  ").expect("padded digits trim"),
+            Some(10801)
+        );
+        assert_eq!(
+            parse_port_field("  AUTO  ").expect("padded auto trims"),
+            None
+        );
+        for (raw, want) in [
+            ("0", "port must be 1-65535, got '0'"),
+            ("99999", "port must be 1-65535, got '99999'"),
+            ("abc", "port must be 1-65535, got 'abc'"),
+        ] {
+            let error = parse_port_field(raw).expect_err(&format!("{raw} rejects"));
+            assert_eq!(error.field, "port");
+            assert_eq!(error.message, want);
+        }
+        let padded = parse_port_field("  abc  ").expect_err("padded word rejects");
+        assert_eq!(padded.field, "port");
+        assert_eq!(padded.message, "port must be 1-65535, got 'abc'");
+    }
 }
