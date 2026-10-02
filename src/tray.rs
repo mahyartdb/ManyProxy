@@ -423,4 +423,73 @@ mod tests {
         assert!(!hide_window_handle(0));
         assert!(!show_window_handle(0));
     }
+
+    /// Autostart command is the quoted current-exe path (the exact value
+    /// the Settings checkbox writes to the Run key).
+    #[test]
+    fn autostart_command_is_quoted_exe_path() {
+        let command = autostart_command().expect("current exe is known");
+        assert!(
+            command.starts_with('"') && command.ends_with('"'),
+            "quoted command, got {command}"
+        );
+        let inner = &command[1..command.len() - 1];
+        assert!(!inner.is_empty(), "exe path inside quotes");
+        assert_eq!(
+            command,
+            format!(
+                "\"{}\"",
+                std::env::current_exe().expect("exe").display()
+            )
+        );
+    }
+
+    /// A stale Run value (moved exe) never reads as on: it differs from
+    /// this exe's command, so the equality behind `autostart_enabled`
+    /// reports off.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_stale_value_reads_as_off() {
+        let key = format!(r"Software\ManyProxyTrayTest\stale-{}", std::process::id());
+        let stale = "\"C:\\old\\location\\manyproxy.exe\"";
+        set_autostart_at(&key, stale).expect("temp key writes");
+        let stored = read_autostart_at(&key).expect("temp key reads");
+        assert_eq!(stored, "\"C:\\old\\location\\manyproxy.exe\"");
+        let command = autostart_command().expect("current exe is known");
+        assert_ne!(stored, command, "stale differs from this exe");
+        assert_ne!(
+            read_autostart_at(&key),
+            autostart_command(),
+            "stale mismatch reads as off"
+        );
+        #[cfg(windows)]
+        {
+            use winreg::enums::HKEY_CURRENT_USER;
+            use winreg::RegKey;
+            let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&key);
+        }
+    }
+
+    /// Null HWND plus tray build is headless-safe: null never applies,
+    /// build either yields an icon whose tooltip refresh never panics or
+    /// fails loudly with a tray cause.
+    #[test]
+    fn tray_build_and_null_hwnd_are_headless_safe() {
+        assert!(!hide_window_handle(0));
+        assert!(!show_window_handle(0));
+        match TrayHandle::build() {
+            Ok(handle) => {
+                handle.set_running(0);
+                handle.set_running(3);
+                assert_eq!(tray_tooltip(3), "ManyProxy · 3 running");
+            }
+            Err(error) => {
+                assert!(!error.is_empty(), "loud failure");
+                assert!(
+                    error.to_lowercase().contains("tray"),
+                    "tray cause, got {error}"
+                );
+            }
+        }
+    }
 }

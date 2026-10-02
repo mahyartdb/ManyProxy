@@ -328,6 +328,37 @@ mod tests {
         }
     }
 
+    /// Sealed values tolerate trailing whitespace (copy/paste with a
+    /// newline still opens to the same params).
+    #[cfg(windows)]
+    #[test]
+    fn unseal_tolerates_trailing_whitespace() {
+        let sealed = seal_params("{\"a\":1}").expect("seal works");
+        assert!(sealed.starts_with(MARKER));
+        for padded in [
+            format!("{sealed} "),
+            format!("{sealed}\n"),
+            format!("{sealed}  \r\n"),
+        ] {
+            assert_eq!(
+                unseal_params(&padded).expect("trailing whitespace tolerated"),
+                "{\"a\":1}"
+            );
+        }
+    }
+
+    /// An empty blob is no DPAPI ciphertext: it fails loudly, never
+    /// silent plaintext, never an empty success.
+    #[test]
+    fn unprotect_empty_blob_fails_loud() {
+        let error = unprotect(&[]).expect_err("empty blob must fail");
+        assert!(!error.is_empty(), "loud failure");
+        assert!(
+            error.contains("dpapi") || error.contains("Windows"),
+            "loud dpapi cause, got {error}"
+        );
+    }
+
     /// Ticket 48 (US-66): off Windows every DPAPI op is a loud stub —
     /// never silent plaintext, never a success without the OS key. Legacy
     /// plaintext still passes through (there is nothing to seal with).
