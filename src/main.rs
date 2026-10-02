@@ -939,13 +939,16 @@ impl ListDelegate for LibraryDelegate {
     fn render_empty(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
         // Ticket 30: a query with no hits is not an empty library. No-hits
-        // shows `No matches — Clear search` + `N of M` (the user clears via
-        // the search box); a truly empty library shows the Add/Import CTAs.
+        // shows `No matches — Clear search` + `N of M`; a truly empty
+        // library shows the Add/Import CTAs.
         // T04: both arms render through the kit `Empty` (header/content
         // slots); ids and pinned strings are unchanged.
+        // T07: the no-hits hint is a working Button (same delegate seam the
+        // checkbox uses) — it clears the query in place.
+        let list_view = cx.entity();
         if !self.query.trim().is_empty() && !self.rows.is_empty() {
             let (visible, total) = (self.visible.len(), self.rows.len());
             return div().id("library-empty").test_support().size_full().child(
@@ -957,27 +960,24 @@ impl ListDelegate for LibraryDelegate {
                                 EmptyDescription::new().child(search_count_text(visible, total)),
                             ),
                     )
-                    .content(
-                        EmptyContent::new().child(
-                            div()
-                                .id("clear-search-hint")
-                                .test_support()
-                                .child("Clear search"),
-                        ),
-                    ),
+                    .content(EmptyContent::new().child({
+                        let hint_view = list_view.clone();
+                        Button::new("clear-search-hint")
+                            .label("Clear search")
+                            .on_click(move |_, _, cx| {
+                                hint_view.update(cx, |state, list_cx| {
+                                    let delegate = state.delegate_mut();
+                                    delegate.query = String::new();
+                                    delegate.apply_filter();
+                                    list_cx.notify();
+                                });
+                            })
+                    })),
             );
         }
         div().id("library-empty").test_support().size_full().child(
             Empty::new()
-                .header(EmptyHeader::new().title(EmptyTitle::new().child(empty_library_text())))
-                .content(
-                    EmptyContent::new().child(
-                        div()
-                            .id("empty-library-ctas")
-                            .test_support()
-                            .child("Add or Import"),
-                    ),
-                ),
+                .header(EmptyHeader::new().title(EmptyTitle::new().child(empty_library_text()))),
         )
     }
 }
@@ -9966,21 +9966,34 @@ impl AppView {
             .items_center()
             .justify_center()
             .gap_2()
+            // T07: the empty-library CTA id folds in the real working
+            // buttons (previously static text duplicating them from inside
+            // the list) — Add opens the add dialog, Import the import one.
             .child(
-                Button::new("empty-add")
-                    .label("Add configuration")
-                    .tooltip("Add a proxy configuration")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_add_dialog(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("empty-import")
-                    .label("Import configurations")
-                    .tooltip("Import share links or files")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                    })),
+                div()
+                    .id("empty-library-ctas")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        Button::new("empty-add")
+                            .label("Add configuration")
+                            .tooltip("Add a proxy configuration")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_add_dialog(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("empty-import")
+                            .label("Import configurations")
+                            .tooltip("Import share links or files")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -16384,6 +16397,115 @@ mod tests {
         ] {
             assert!(!has_spinner(cx, id), "{id} leaves with the flag");
         }
+    }
+
+    /// T07 red-first: the no-hits hint is a working control — clicking it
+    /// clears the query in place and the rows repaint (previously static
+    /// text duplicating the `clear-search` button).
+    #[gpui_kit::test]
+    fn clear_search_hint_clears_query(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Narrow to no hits.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "zzz-no-hit".to_string();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "clear-search-hint");
+        cx.update(|window, cx| {
+            window.click("clear-search-hint", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .query
+                .clone()),
+            String::new(),
+            "hint click clears the query"
+        );
+        assert_painted(cx, &format!("library-row-{}", seeded.id));
+    }
+
+    /// T07 red-first: the empty-library CTAs are the real working buttons
+    /// folded under the `empty-library-ctas` id — Add opens the add dialog,
+    /// Import opens the import dialog (previously static text duplicating
+    /// them from inside the list).
+    #[gpui_kit::test]
+    fn empty_library_ctas_open_add_and_import(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "library-empty");
+        // The CTA id folds in the working buttons (not a duplicate).
+        let (outer, add, import) = cx.update(|window, _| {
+            let outer = window
+                .try_find("empty-library-ctas".to_string())
+                .expect("ctas present")
+                .bounds();
+            let add = window
+                .try_find("empty-add".to_string())
+                .expect("add present")
+                .bounds();
+            let import = window
+                .try_find("empty-import".to_string())
+                .expect("import present")
+                .bounds();
+            (outer, add, import)
+        });
+        for (id, inner) in [("empty-add", add), ("empty-import", import)] {
+            assert!(
+                outer.origin.x <= inner.origin.x
+                    && outer.origin.y <= inner.origin.y
+                    && outer.origin.x + outer.size.width >= inner.origin.x + inner.size.width
+                    && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height,
+                "{id} sits inside empty-library-ctas: outer {outer:?}, inner {inner:?}"
+            );
+        }
+        cx.update(|window, cx| {
+            window.click("empty-add", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Add opens the add dialog"
+        );
+        cx.update(|window, cx| {
+            window.close_all_dialogs(cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("empty-import", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Import opens the import dialog"
+        );
     }
 
     /// Scenario: empty store → the empty state actually paints (asserted via
