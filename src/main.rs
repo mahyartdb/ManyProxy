@@ -24,6 +24,7 @@ use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::group_box::GroupBox;
 use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::notification::Notification;
@@ -979,6 +980,18 @@ impl ListDelegate for LibraryDelegate {
             Empty::new()
                 .header(EmptyHeader::new().title(EmptyTitle::new().child(empty_library_text()))),
         )
+    }
+}
+
+/// T08: the `Kbd` chip for a `Name (Key)` shortcut button. `keystroke` is
+/// the [`Keystroke::parse`] form (`"ctrl-n"`); on parse failure the
+/// parenthesized fallback preserves today's look exactly instead of
+/// dropping the hint. Callers keep the exact pinned `Name (Key)` string on
+/// `accessibility_label` — the chip only changes the visual.
+fn shortcut_kbd(keystroke: &str, fallback: &str) -> AnyElement {
+    match Keystroke::parse(keystroke) {
+        Ok(stroke) => Kbd::new(stroke).into_any_element(),
+        Err(_) => fallback.to_string().into_any_element(),
     }
 }
 
@@ -9768,7 +9781,11 @@ impl AppView {
                         let mut stop = Button::new("engine-stop")
                             // Ticket 44: small + tooltip (detail-bar density).
                             .small()
-                            .label("Stop (Shift-F5)")
+                            // T08: keystroke rides as a `Kbd` chip; the
+                            // pinned string stays on the accessible name.
+                            .label("Stop")
+                            .accessibility_label("Stop (Shift-F5)")
+                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
                             .tooltip("Stop the selected endpoint")
                             .loading(self.start_in_flight)
                             .on_click(cx.listener(|view, _, window, cx| {
@@ -9790,7 +9807,11 @@ impl AppView {
                         let mut test = Button::new("health-test")
                             // Ticket 44: small + tooltip (detail-bar density).
                             .small()
-                            .label("Test (Ctrl-T)")
+                            // T08: keystroke rides as a `Kbd` chip; the
+                            // pinned string stays on the accessible name.
+                            .label("Test")
+                            .accessibility_label("Test (Ctrl-T)")
+                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
                             .tooltip("Test the selected endpoint")
                             .loading(self.probe_kind_in_flight(false))
                             .on_click(cx.listener(|view, _, window, cx| {
@@ -10800,7 +10821,11 @@ impl Render for AppView {
                     .child(
                         Button::new("add-config")
                             .primary()
-                            .label("Add (Ctrl-N)")
+                            // T08: keystroke rides as a `Kbd` chip; the
+                            // pinned string stays on the accessible name.
+                            .label("Add")
+                            .accessibility_label("Add (Ctrl-N)")
+                            .child(shortcut_kbd("ctrl-n", "(Ctrl-N)"))
                             .tooltip("Add a proxy configuration")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_add_dialog(window, cx);
@@ -10808,7 +10833,9 @@ impl Render for AppView {
                     )
                     .child(
                         Button::new("import-config")
-                            .label("Import (Ctrl-O)")
+                            .label("Import")
+                            .accessibility_label("Import (Ctrl-O)")
+                            .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
                             .tooltip("Import share links or files")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
@@ -10863,7 +10890,9 @@ impl Render for AppView {
                     .child(
                         Button::new("start-selected")
                             .primary()
-                            .label("Start selected (F5)")
+                            .label("Start selected")
+                            .accessibility_label("Start selected (F5)")
+                            .child(shortcut_kbd("f5", "(F5)"))
                             .tooltip("Start the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.start_selected_engine(window, cx);
@@ -10879,7 +10908,9 @@ impl Render for AppView {
                     )
                     .child(
                         Button::new("stop-selected")
-                            .label("Stop selected (Shift-F5)")
+                            .label("Stop selected")
+                            .accessibility_label("Stop selected (Shift-F5)")
+                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
                             .tooltip("Stop the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.stop_selected_engine(window, cx);
@@ -10896,7 +10927,9 @@ impl Render for AppView {
                     )
                     .child(
                         Button::new("test-selected")
-                            .label("Test selected (Ctrl-T)")
+                            .label("Test selected")
+                            .accessibility_label("Test selected (Ctrl-T)")
+                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
                             .tooltip("Test the selected endpoint")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.test_selected_health(window, cx);
@@ -16396,6 +16429,55 @@ mod tests {
             "health-ping-spinner",
         ] {
             assert!(!has_spinner(cx, id), "{id} leaves with the flag");
+        }
+    }
+
+    /// T08: shortcut buttons keep their exact pinned accessible strings even
+    /// though the keystroke renders as a `Kbd` chip beside the name (the
+    /// accessible name — what tests and assistive tech read — never changes).
+    #[gpui_kit::test]
+    fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the row so the detail action buttons render too.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for (id, pinned) in [
+            ("add-config", "Add (Ctrl-N)"),
+            ("import-config", "Import (Ctrl-O)"),
+            ("start-selected", "Start selected (F5)"),
+            ("stop-selected", "Stop selected (Shift-F5)"),
+            ("test-selected", "Test selected (Ctrl-T)"),
+            ("engine-stop", "Stop (Shift-F5)"),
+            ("health-test", "Test (Ctrl-T)"),
+        ] {
+            let label = cx.update(|window, _| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .label()
+                    .map(str::to_string)
+            });
+            assert_eq!(
+                label.as_deref(),
+                Some(pinned),
+                "{id} keeps its pinned accessible label"
+            );
         }
     }
 
