@@ -19,6 +19,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
+use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
@@ -939,42 +940,41 @@ impl ListDelegate for LibraryDelegate {
         // Ticket 30: a query with no hits is not an empty library. No-hits
         // shows `No matches — Clear search` + `N of M` (the user clears via
         // the search box); a truly empty library shows the Add/Import CTAs.
+        // T04: both arms render through the kit `Empty` (header/content
+        // slots); ids and pinned strings are unchanged.
         if !self.query.trim().is_empty() && !self.rows.is_empty() {
             let (visible, total) = (self.visible.len(), self.rows.len());
-            return div()
-                .id("library-empty")
-                .test_support()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .child(no_matches_text())
-                .child(search_count_text(visible, total))
-                .child(
-                    div()
-                        .id("clear-search-hint")
-                        .test_support()
-                        .child("Clear search"),
-                );
+            return div().id("library-empty").test_support().size_full().child(
+                Empty::new()
+                    .header(
+                        EmptyHeader::new()
+                            .title(EmptyTitle::new().child(no_matches_text()))
+                            .description(
+                                EmptyDescription::new().child(search_count_text(visible, total)),
+                            ),
+                    )
+                    .content(
+                        EmptyContent::new().child(
+                            div()
+                                .id("clear-search-hint")
+                                .test_support()
+                                .child("Clear search"),
+                        ),
+                    ),
+            );
         }
-        div()
-            .id("library-empty")
-            .test_support()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .child(empty_library_text())
-            .child(
-                div()
-                    .id("empty-library-ctas")
-                    .test_support()
-                    .child("Add or Import"),
-            )
+        div().id("library-empty").test_support().size_full().child(
+            Empty::new()
+                .header(EmptyHeader::new().title(EmptyTitle::new().child(empty_library_text())))
+                .content(
+                    EmptyContent::new().child(
+                        div()
+                            .id("empty-library-ctas")
+                            .test_support()
+                            .child("Add or Import"),
+                    ),
+                ),
+        )
     }
 }
 
@@ -9417,38 +9417,48 @@ impl AppView {
 
     fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
+            // T04: the unselected detail is a kit `Empty` — the prompt is the
+            // header title, the Add/Import CTAs stay real Buttons.
             return div()
                 .id("config-detail")
                 .test_support()
                 .p_2()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child("Select a configuration to inspect its endpoint, health, and usage")
                 .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .child(
-                            Button::new("detail-add")
-                                .label("Add configuration")
-                                .tooltip("Add a proxy configuration")
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.open_add_dialog(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("detail-import")
-                                .label("Import configurations")
-                                .tooltip("Import share links or files")
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                                })),
+                    Empty::new()
+                        .header(EmptyHeader::new().title(EmptyTitle::new().child(
+                            "Select a configuration to inspect its endpoint, health, and usage",
+                        )))
+                        .content(
+                            EmptyContent::new().child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("detail-add")
+                                            .label("Add configuration")
+                                            .tooltip("Add a proxy configuration")
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.open_add_dialog(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("detail-import")
+                                            .label("Import configurations")
+                                            .tooltip("Import share links or files")
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.open_import_dialog(
+                                                    "",
+                                                    DEFAULT_GROUP,
+                                                    None,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
+                            ),
                         ),
                 )
                 .into_any_element();
