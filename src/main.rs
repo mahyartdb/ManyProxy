@@ -14,12 +14,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::component::alert::Alert;
 use gpui_kit::component::badge::Badge;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::description_list::{DescriptionItem, DescriptionList};
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
+use gpui_kit::component::group_box::GroupBox;
 use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
@@ -9506,7 +9509,15 @@ impl AppView {
             .p_2()
             .flex()
             .flex_col()
-            .gap_2()
+            // T05: tight section rhythm (gap_1) so the titled sections,
+            // the action rows, and three library rows share the 700px test
+            // frame without clipping the list.
+            .gap_1()
+            // T05: the inspector scrolls inside a capped box instead of
+            // squeezing the list: 240px keeps three rows painted in the
+            // 700px frame while the list keeps the flex_1 remainder.
+            .max_h(px(240.))
+            .overflow_y_scroll()
             .child(
                 div()
                     .flex()
@@ -9539,21 +9550,39 @@ impl AppView {
                     ),
             )
             .child(
-                div()
-                    .id("config-endpoints")
-                    .test_support()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(format!("upstream {upstream}"))
-                    .child(format!("{socks_url} · {http_url}")),
+                // T05: endpoints read as labeled rows (each URL names its
+                // scheme now, instead of one run-on line).
+                div().id("config-endpoints").test_support().child(
+                    GroupBox::new().title("Endpoints").gap_2().child(
+                        DescriptionList::vertical()
+                            .child(DescriptionItem::new("upstream").value(upstream))
+                            .child(DescriptionItem::new("SOCKS").value(socks_url))
+                            .child(DescriptionItem::new("HTTP").value(http_url)),
+                    ),
+                ),
             )
-            .child(
-                div()
-                    .id("config-health")
-                    .test_support()
-                    .child(self.health_store.detail_line(&config.id)),
-            )
+            .child(div().id("config-health").test_support().child(
+                GroupBox::new().title("Health").gap_2().child(
+                    // T05: a dead/crashed row renders the same pinned
+                    // health copy inside an error Alert; healthy rows keep
+                    // the plain line (no Alert element at all).
+                    if failed {
+                        div()
+                            .id("config-health-alert")
+                            .test_support()
+                            .child(
+                                Alert::error(
+                                    "config-health-alert-box",
+                                    self.health_store.detail_line(&config.id),
+                                )
+                                .title("Endpoint failed"),
+                            )
+                            .into_any_element()
+                    } else {
+                        self.health_store.detail_line(&config.id).into_any_element()
+                    },
+                ),
+            ))
             // Ticket 37: attached routing preset (name only — rules live in
             // the presets manager) plus the picker entry point.
             .child(div().id("config-preset").test_support().child(
@@ -9578,38 +9607,39 @@ impl AppView {
             // Ticket 45: manageable usage — persisted down/up buckets with
             // an explicit reset (confirm-gated, never silent).
             .child(
-                div()
-                    .id("config-usage")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(self.usage_line(&config.id))
-                    .child(
-                        Button::new("usage-reset")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Reset usage")
-                            .tooltip("Reset this row's usage counters")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_usage_reset_confirm(config, window, cx);
-                                }
-                            })),
+                div().id("config-usage").test_support().child(
+                    GroupBox::new().title("Usage").gap_2().child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(self.usage_line(&config.id))
+                            .child(
+                                Button::new("usage-reset")
+                                    // Ticket 44: small + tooltip (detail-bar density).
+                                    .small()
+                                    .label("Reset usage")
+                                    .tooltip("Reset this row's usage counters")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        if let Some(config) = view.selected_config(cx) {
+                                            view.open_usage_reset_confirm(config, window, cx);
+                                        }
+                                    })),
+                            ),
                     ),
+                ),
             )
             // Ticket 45: trend-visible health — bounded history sparkline
             // (native LineChart; 90d retention window served from
             // `health_history`, never the latest-snapshot fast path).
             .child(
-                div()
-                    .id("config-history")
-                    .test_support()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(self.history_line(&config.id)),
+                div().id("config-history").test_support().child(
+                    GroupBox::new()
+                        .title("History")
+                        .gap_2()
+                        .child(self.history_line(&config.id)),
+                ),
             )
             .child(
                 div()
@@ -16129,6 +16159,76 @@ mod tests {
             Some(FacetStatus::Stopped),
             "picking applies the status facet"
         );
+    }
+
+    /// T05 red-first: a dead row's health section renders the failure Alert
+    /// (same pinned copy, new container); once the row tests live again the
+    /// Alert leaves with the failure.
+    #[gpui_kit::test]
+    fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the row so the detail pane renders it.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        // Dead outcome: errored sample, no success.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _cx| {
+                view.health_store.record_outcome(&TestOutcome {
+                    sample: HealthSample {
+                        config_id: seeded.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: None,
+                        error: Some("timeout".to_string()),
+                    },
+                    success: None,
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "config-health");
+        assert_painted(cx, "config-health-alert");
+        // Live again: the Alert leaves with the failure.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _cx| {
+                view.health_store.record_outcome(&TestOutcome {
+                    sample: HealthSample {
+                        config_id: seeded.id.clone(),
+                        at: 2,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: Some(12),
+                        error: None,
+                    },
+                    success: Some(ProbeSuccess {
+                        latency_ms: 12,
+                        bytes_rx: 0,
+                        bytes_tx: 0,
+                    }),
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "config-health");
+        assert_absent(cx, "config-health-alert".to_string());
     }
 
     /// Scenario: empty store → the empty state actually paints (asserted via
