@@ -25,6 +25,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
@@ -797,7 +798,7 @@ impl ListDelegate for LibraryDelegate {
         &mut self,
         index: IndexPath,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
         let row = self.row_at(index)?;
         let selected = self
@@ -830,7 +831,7 @@ impl ListDelegate for LibraryDelegate {
         // name (horizontal, not a new vertical line) so row height stays
         // paint-compatible with the ticket-19 three-row frame.
         let row_id = row.id.clone();
-        let list_view = _cx.entity();
+        let list_view = cx.entity();
         let is_checked = self.checked.contains(&row_id);
         let toggle_id = row_id.clone();
         let checkbox = Checkbox::new(format!("check-{row_id}"))
@@ -844,12 +845,41 @@ impl ListDelegate for LibraryDelegate {
                     cx.notify();
                 });
             });
-        let mut item = ListItem::new(format!("library-row-{}", row.id)).selected(selected);
+        // T01: the row keeps only a narrow gutter (px_1) — the card owns the
+        // text padding (px_2) so the pre-card text inset (12px) is unchanged.
+        let item = ListItem::new(format!("library-row-{}", row.id))
+            .selected(selected)
+            .px_1();
+        // T01: themed row card — surface, hairline, radius, hover and the
+        // selected highlight ride on the card (theme tokens only). The states
+        // mirror the ListItem's own selection formula so the row rim and the
+        // card read as one highlight.
+        let selected_bg = if cx.theme().list.active_highlight {
+            cx.theme().list_active
+        } else {
+            cx.theme().accent
+        };
+        let mut card = div()
+            .id(format!("row-card-{row_id}"))
+            .test_support()
+            .px_2()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(if selected {
+                selected_bg
+            } else {
+                cx.theme().group_box
+            });
+        if !selected {
+            card = card.hover(|this| this.bg(cx.theme().list_hover));
+        }
         let mut lines =
             library_row_lines_with_upstream(&row, &upstream, health, is_running, traffic)
                 .into_iter();
         if let Some(first) = lines.next() {
-            item = item.child(
+            card = card.child(
                 div()
                     .flex()
                     .flex_row()
@@ -859,12 +889,12 @@ impl ListDelegate for LibraryDelegate {
                     .child(first),
             );
         } else {
-            item = item.child(checkbox);
+            card = card.child(checkbox);
         }
         for line in lines {
-            item = item.child(line);
+            card = card.child(line);
         }
-        Some(item)
+        Some(item.child(card))
     }
 
     fn render_empty(
@@ -9596,6 +9626,10 @@ impl AppView {
             .items_center()
             .gap_2()
             .px_2()
+            // T01: hairline under the filter row separates filters from the
+            // card list below.
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(
                 Button::new("facet-group")
                     .small()
@@ -9663,6 +9697,11 @@ impl AppView {
             .items_center()
             .gap_2()
             .px_2()
+            // T01: the selection band is a bounded surface on the same tokens
+            // as the row cards; the empty branch stays bare (no stray hairline).
+            .bg(cx.theme().group_box)
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(div().id("bulk-label").test_support().child(label))
             .child(
                 Button::new("bulk-start")
@@ -10514,6 +10553,10 @@ impl Render for AppView {
                     .items_center()
                     .gap_2()
                     .p_2()
+                    // T01: hairline under the toolbar — the chrome reads as a
+                    // band on the same theme tokens as the rest of the shell.
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     // Ticket 33: shortcut hints ride in the labels (F5/Shift-F5/
                     // Ctrl-T/Ctrl-N/Ctrl-O) so the bindings in [`bind_app_keys`]
                     // are visible without opening About. Button ids are
@@ -10650,6 +10693,7 @@ impl Render for AppView {
                     .id("drop-hint")
                     .test_support()
                     .px_2()
+                    .text_color(cx.theme().muted_foreground)
                     .child("Drop .conf / .json / .txt files here to import"),
             )
             .child(
@@ -15666,6 +15710,47 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
         assert_painted(cx, &format!("library-row-{}", first.id));
         assert_painted(cx, &format!("library-row-{}", second.id));
+    }
+
+    /// T01 red-first: every row wraps its lines in a themed card container —
+    /// `row-card-<id>` paints with non-zero bounds, and adjacent cards keep a
+    /// visible gap (surface/border/radius live on the card, separation lives
+    /// in the row padding, not in the shell).
+    #[gpui_kit::test]
+    fn library_row_cards_paint_with_gap(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        let first_card = format!("row-card-{}", first.id);
+        let second_card = format!("row-card-{}", second.id);
+        assert_painted(cx, &first_card);
+        assert_painted(cx, &second_card);
+        let (first_bounds, second_bounds) = cx.update(|window, _| {
+            let first = window
+                .try_find(first_card)
+                .expect("first row card finds")
+                .bounds();
+            let second = window
+                .try_find(second_card)
+                .expect("second row card finds")
+                .bounds();
+            (first, second)
+        });
+        assert!(
+            second_bounds.origin.y > first_bounds.origin.y + first_bounds.size.height,
+            "row cards keep a gap: first {first_bounds:?}, second {second_bounds:?}"
+        );
     }
 
     /// Scenario: empty store → the empty state actually paints (asserted via
