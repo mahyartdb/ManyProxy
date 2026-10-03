@@ -35,6 +35,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
@@ -9561,6 +9562,14 @@ impl AppView {
             .into_any_element()
     }
 
+    /// W1/failed evidence shared by the detail builders: a crashed sidecar
+    /// shard or a `dead` health summary. One helper so the call sites
+    /// cannot diverge.
+    fn detail_failed(&self, config: &ProxyConfig) -> bool {
+        self.engine.ids_on_crashed_shards().contains(&config.id)
+            || self.health_store.row_summary(&config.id).trim() == "dead"
+    }
+
     /// Detail header: name, protocol/group tags, bind endpoint, serving badge.
     fn render_detail_header(
         &self,
@@ -9570,7 +9579,7 @@ impl AppView {
         // Ticket 30: the header carries the same serving badge as the list
         // row (`● Running :port · health` / `○ Stopped`); the enabled flag
         // stays secondary (Switch only — the duplicate Enable button is
-        // gone). The Start button reads `Starting…` while a start is in
+        // gone). The Start button reads `Starting.` while a start is in
         // flight (second clicks are ignored, never double-applied).
         let is_running = self.engine.is_running(&config.id);
         let badge = if is_running {
@@ -9588,8 +9597,7 @@ impl AppView {
         } else {
             serving_badge(false, config.port, None)
         };
-        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
-            || self.health_store.row_summary(&config.id).trim() == "dead";
+        let failed = self.detail_failed(config);
         div()
             .flex()
             .flex_row()
@@ -9627,13 +9635,8 @@ impl AppView {
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
-        // Ticket 19: complete detail pane — endpoint URLs (bind + port only,
-        // never params or secrets) plus the upstream host:port when known.
-        // Ticket 30: the header carries the same serving badge as the list
-        // row (`● Running :port · health` / `○ Stopped`); the enabled flag
-        // stays secondary (Switch only — the duplicate Enable button is
-        // gone). The Start button reads `Starting…` while a start is in
-        // flight (second clicks are ignored, never double-applied).
+        // Ticket 19: endpoint URLs (bind + port only, never params or
+        // secrets) plus the upstream host:port when known.
         let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
         // Ticket 47: the detail upstream reads the same set_rows cache as
         // the list rows (one HashMap lookup per frame, never a JSON parse).
@@ -9652,8 +9655,7 @@ impl AppView {
 
     /// Detail health section (failed rows render the error Alert).
     fn render_detail_health(&self, config: &ProxyConfig) -> impl IntoElement {
-        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
-            || self.health_store.row_summary(&config.id).trim() == "dead";
+        let failed = self.detail_failed(config);
         div().id("config-health").test_support().child(
             GroupBox::new().title("Health").gap_2().child(
                 // T05: a dead/crashed row renders the same pinned
@@ -9732,13 +9734,12 @@ impl AppView {
         let switch_id = format!("enabled-{}", config.id);
         let switch_view = cx.entity();
         let switch_id_for_handler = config.id.clone();
-        // W1: the selected row's lifecycle phase. Failed evidence is a
-        // crashed sidecar shard or a `dead` health summary on a serving row;
-        // the Start copy derives from the phase (same strings as before —
-        // Starting… while a start is in flight, Start otherwise).
+        // W1: the selected row's lifecycle phase (see [`detail_failed`]
+        // for the evidence rule); the Start copy derives from the phase
+        // (same strings as before — `Starting.` while a start is in
+        // flight, `Start` otherwise).
         let is_running = self.engine.is_running(&config.id);
-        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
-            || self.health_store.row_summary(&config.id).trim() == "dead";
+        let failed = self.detail_failed(config);
         let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
         div()
             .flex()
@@ -9834,7 +9835,7 @@ impl AppView {
             )
             .child({
                 // T06: loading state + inline spinner while a start
-                // is in flight (the label already reads `Starting…`
+                // is in flight (the label already reads `Starting.`
                 // via `RowPhase::start_label`).
                 let mut start = Button::new("engine-start")
                     // Ticket 44: small + tooltip (detail-bar density).
@@ -10160,22 +10161,43 @@ impl AppView {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                Select::new(&self.facet_group.state)
-                    .id("facet-group")
-                    .small()
-                    .accessibility_label("Filter by group"),
+                // Kit `Select` has no tooltip slot of its own, so the
+                // filter name rides on a hover wrapper (same copy the
+                // old dialog triggers carried).
+                div()
+                    .id("facet-group-tip")
+                    .test_support()
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new("Filter by group")).into())
+                    .child(
+                        Select::new(&self.facet_group.state)
+                            .id("facet-group")
+                            .small()
+                            .accessibility_label("Filter by group"),
+                    ),
             )
             .child(
-                Select::new(&self.facet_protocol.state)
-                    .id("facet-protocol")
-                    .small()
-                    .accessibility_label("Filter by protocol"),
+                div()
+                    .id("facet-protocol-tip")
+                    .test_support()
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new("Filter by protocol")).into())
+                    .child(
+                        Select::new(&self.facet_protocol.state)
+                            .id("facet-protocol")
+                            .small()
+                            .accessibility_label("Filter by protocol"),
+                    ),
             )
             .child(
-                Select::new(&self.facet_status.state)
-                    .id("facet-status")
-                    .small()
-                    .accessibility_label("Filter by status"),
+                div()
+                    .id("facet-status-tip")
+                    .test_support()
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new("Filter by status")).into())
+                    .child(
+                        Select::new(&self.facet_status.state)
+                            .id("facet-status")
+                            .small()
+                            .accessibility_label("Filter by status"),
+                    ),
             )
             .child(
                 Button::new("groups-dialog")
@@ -15216,6 +15238,12 @@ mod tests {
         assert_painted(cx, "facet-group");
         assert_painted(cx, "facet-protocol");
         assert_painted(cx, "facet-status");
+        // Review follow-up: kit `Select` has no tooltip slot, so each
+        // picker rides in a hover wrapper — the wrappers must paint too,
+        // or the facet tooltips silently vanish again.
+        assert_painted(cx, "facet-group-tip");
+        assert_painted(cx, "facet-protocol-tip");
+        assert_painted(cx, "facet-status-tip");
         assert_painted(cx, "groups-dialog");
         assert_painted(cx, &format!("check-{}", first.id));
         assert_painted(cx, &format!("check-{}", second.id));
