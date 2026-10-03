@@ -9432,94 +9432,93 @@ impl AppView {
             .into_any_element()
     }
 
+    /// Startup-stack split: `render_detail` was one ~450-line builder chain whose
+    /// unoptimized debug frame alone approached half a megabyte on the 1 MB
+    /// main-thread stack at startup (see
+    /// .planning/follow-ups/startup-stack-overflow.md). It now dispatches to
+    /// small per-section builders; content (ids, strings, handlers, the 240px
+    /// scroll cap) is unchanged.
     fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
-            // T04: the unselected detail is a kit `Empty` — the prompt is the
-            // header title, the Add/Import CTAs stay real Buttons.
-            return div()
-                .id("config-detail")
-                .test_support()
-                .p_2()
-                .child(
-                    Empty::new()
-                        .header(EmptyHeader::new().title(EmptyTitle::new().child(
-                            "Select a configuration to inspect its endpoint, health, and usage",
-                        )))
-                        .content(
-                            EmptyContent::new().child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("detail-add")
-                                            .label("Add configuration")
-                                            .tooltip("Add a proxy configuration")
-                                            .on_click(cx.listener(|view, _, window, cx| {
-                                                view.open_add_dialog(window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("detail-import")
-                                            .label("Import configurations")
-                                            .tooltip("Import share links or files")
-                                            .on_click(cx.listener(|view, _, window, cx| {
-                                                view.open_import_dialog(
-                                                    "",
-                                                    DEFAULT_GROUP,
-                                                    None,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    ),
-                            ),
-                        ),
-                )
-                .into_any_element();
+            // Empty library: the list already paints the empty text plus the
+            // working Add/Import CTAs (`render_empty_ctas`). Painting the
+            // no-selection `Empty` as well stacks a second title + button row
+            // into the same footer strip and the rows visually collide, while
+            // "select a configuration" is nonsense with zero rows. Keep the
+            // stable id as a zero-height placeholder instead.
+            if self.config_count(cx) == 0 {
+                return div().id("config-detail").test_support().into_any_element();
+            }
+            return self.render_detail_empty(cx).into_any_element();
         };
-        let switch_id = format!("enabled-{}", config.id);
-        let switch_view = cx.entity();
-        let switch_id_for_handler = config.id.clone();
-        // Ticket 19: complete detail pane — endpoint URLs (bind + port only,
-        // never params or secrets) plus the upstream host:port when known.
-        // Ticket 30: the header carries the same serving badge as the list
-        // row (`● Running :port · health` / `○ Stopped`); the enabled flag
-        // stays secondary (Switch only — the duplicate Enable button is
-        // gone). The Start button reads `Starting…` while a start is in
-        // flight (second clicks are ignored, never double-applied).
-        let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
-        // Ticket 47: the detail upstream reads the same set_rows cache as
-        // the list rows (one HashMap lookup per frame, never a JSON parse).
-        let upstream = self.cached_upstream(cx, &config);
-        let is_running = self.engine.is_running(&config.id);
-        let badge = if is_running {
-            let summary = self.health_store.row_summary(&config.id);
-            let summary = summary.trim();
-            serving_badge(
-                true,
-                config.port,
-                if summary.is_empty() {
-                    None
-                } else {
-                    Some(summary)
-                },
-            )
-        } else {
-            serving_badge(false, config.port, None)
-        };
-        // W1: the selected row's lifecycle phase. Failed evidence is a
-        // crashed sidecar shard or a `dead` health summary on a serving row;
-        // the Start copy derives from the phase (same strings as before —
-        // Starting… while a start is in flight, Start otherwise).
-        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
-            || self.health_store.row_summary(&config.id).trim() == "dead";
-        let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
+        self.render_detail_selected(cx, &config).into_any_element()
+    }
+
+    /// Detail pane with no selection (unchanged Empty + Add/Import CTAs).
+    fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("config-detail")
             .test_support()
+            // Hairline separates the pane from the list above: without it the
+            // clipped last row reads as broken layout, not a scroll edge.
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .p_2()
+            .child(
+                Empty::new()
+                    .header(EmptyHeader::new().title(EmptyTitle::new().child(
+                        "Select a configuration to inspect its endpoint, health, and usage",
+                    )))
+                    .content(
+                        EmptyContent::new().child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("detail-add")
+                                        .label("Add configuration")
+                                        .tooltip("Add a proxy configuration")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.open_add_dialog(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("detail-import")
+                                        .label("Import configurations")
+                                        .tooltip("Import share links or files")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            view.open_import_dialog(
+                                                "",
+                                                DEFAULT_GROUP,
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                ),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Detail pane for the selected row: capped scroll box assembling the
+    /// per-section builders below.
+    fn render_detail_selected(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        div()
+            .id("config-detail")
+            .test_support()
+            // Hairline separates the pane from the list above (same rule as
+            // the no-selection pane).
+            .border_t_1()
+            .border_color(cx.theme().border)
             .p_2()
             .flex()
             .flex_col()
@@ -9532,71 +9531,9 @@ impl AppView {
             // 700px frame while the list keeps the flex_1 remainder.
             .max_h(px(240.))
             .overflow_y_scroll()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(Label::new(config.name.clone()))
-                    // T02: protocol and group ride as Tag chips; the bind
-                    // endpoint stays plain text (id/text presence asserted).
-                    .child(Tag::new().child(config.protocol.clone()))
-                    .child(Tag::new().child(config.group.clone()))
-                    .child(format!("{}:{}", config.bind_ip, config.port))
-                    .child(
-                        div().id("detail-serving").test_support().child(
-                            // T02: the serving line is a Badge — the pinned
-                            // copy is the child, the dot names the state
-                            // (danger on Failed evidence, success while
-                            // serving, secondary when stopped).
-                            Badge::new()
-                                .dot()
-                                .color(if failed {
-                                    cx.theme().danger
-                                } else if is_running {
-                                    cx.theme().success
-                                } else {
-                                    cx.theme().secondary
-                                })
-                                .child(badge),
-                        ),
-                    ),
-            )
-            .child(
-                // T05: endpoints read as labeled rows (each URL names its
-                // scheme now, instead of one run-on line).
-                div().id("config-endpoints").test_support().child(
-                    GroupBox::new().title("Endpoints").gap_2().child(
-                        DescriptionList::vertical()
-                            .child(DescriptionItem::new("upstream").value(upstream))
-                            .child(DescriptionItem::new("SOCKS").value(socks_url))
-                            .child(DescriptionItem::new("HTTP").value(http_url)),
-                    ),
-                ),
-            )
-            .child(div().id("config-health").test_support().child(
-                GroupBox::new().title("Health").gap_2().child(
-                    // T05: a dead/crashed row renders the same pinned
-                    // health copy inside an error Alert; healthy rows keep
-                    // the plain line (no Alert element at all).
-                    if failed {
-                        div()
-                            .id("config-health-alert")
-                            .test_support()
-                            .child(
-                                Alert::error(
-                                    "config-health-alert-box",
-                                    self.health_store.detail_line(&config.id),
-                                )
-                                .title("Endpoint failed"),
-                            )
-                            .into_any_element()
-                    } else {
-                        self.health_store.detail_line(&config.id).into_any_element()
-                    },
-                ),
-            ))
+            .child(self.render_detail_header(cx, config))
+            .child(self.render_detail_endpoints(cx, config))
+            .child(self.render_detail_health(config))
             // Ticket 37: attached routing preset (name only — rules live in
             // the presets manager) plus the picker entry point.
             .child(div().id("config-preset").test_support().child(
@@ -9618,248 +9555,389 @@ impl AppView {
                         }
                     })),
             )
-            // Ticket 45: manageable usage — persisted down/up buckets with
-            // an explicit reset (confirm-gated, never silent).
+            .child(self.render_detail_usage(cx, config))
+            .child(self.render_detail_history(config))
+            .child(self.render_detail_actions(cx, config))
+            .into_any_element()
+    }
+
+    /// Detail header: name, protocol/group tags, bind endpoint, serving badge.
+    fn render_detail_header(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        // Ticket 30: the header carries the same serving badge as the list
+        // row (`● Running :port · health` / `○ Stopped`); the enabled flag
+        // stays secondary (Switch only — the duplicate Enable button is
+        // gone). The Start button reads `Starting…` while a start is in
+        // flight (second clicks are ignored, never double-applied).
+        let is_running = self.engine.is_running(&config.id);
+        let badge = if is_running {
+            let summary = self.health_store.row_summary(&config.id);
+            let summary = summary.trim();
+            serving_badge(
+                true,
+                config.port,
+                if summary.is_empty() {
+                    None
+                } else {
+                    Some(summary)
+                },
+            )
+        } else {
+            serving_badge(false, config.port, None)
+        };
+        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
+            || self.health_store.row_summary(&config.id).trim() == "dead";
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(Label::new(config.name.clone()))
+            // T02: protocol and group ride as Tag chips; the bind
+            // endpoint stays plain text (id/text presence asserted).
+            .child(Tag::new().child(config.protocol.clone()))
+            .child(Tag::new().child(config.group.clone()))
+            .child(format!("{}:{}", config.bind_ip, config.port))
             .child(
-                div().id("config-usage").test_support().child(
-                    GroupBox::new().title("Usage").gap_2().child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(self.usage_line(&config.id))
-                            .child(
-                                Button::new("usage-reset")
-                                    // Ticket 44: small + tooltip (detail-bar density).
-                                    .small()
-                                    .label("Reset usage")
-                                    .tooltip("Reset this row's usage counters")
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        if let Some(config) = view.selected_config(cx) {
-                                            view.open_usage_reset_confirm(config, window, cx);
-                                        }
-                                    })),
-                            ),
-                    ),
+                div().id("detail-serving").test_support().child(
+                    // T02: the serving line is a Badge — the pinned
+                    // copy is the child, the dot names the state
+                    // (danger on Failed evidence, success while
+                    // serving, secondary when stopped).
+                    Badge::new()
+                        .dot()
+                        .color(if failed {
+                            cx.theme().danger
+                        } else if is_running {
+                            cx.theme().success
+                        } else {
+                            cx.theme().secondary
+                        })
+                        .child(badge),
                 ),
             )
-            // Ticket 45: trend-visible health — bounded history sparkline
-            // (native LineChart; 90d retention window served from
-            // `health_history`, never the latest-snapshot fast path).
-            .child(
-                div().id("config-history").test_support().child(
-                    GroupBox::new()
-                        .title("History")
-                        .gap_2()
-                        .child(self.history_line(&config.id)),
-                ),
-            )
-            .child(
+    }
+
+    /// Detail endpoints section (bind + port only, upstream host:port).
+    fn render_detail_endpoints(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        // Ticket 19: complete detail pane — endpoint URLs (bind + port only,
+        // never params or secrets) plus the upstream host:port when known.
+        // Ticket 30: the header carries the same serving badge as the list
+        // row (`● Running :port · health` / `○ Stopped`); the enabled flag
+        // stays secondary (Switch only — the duplicate Enable button is
+        // gone). The Start button reads `Starting…` while a start is in
+        // flight (second clicks are ignored, never double-applied).
+        let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
+        // Ticket 47: the detail upstream reads the same set_rows cache as
+        // the list rows (one HashMap lookup per frame, never a JSON parse).
+        let upstream = self.cached_upstream(cx, config);
+        // T05: endpoints read as labeled rows (each URL names its
+        // scheme now, instead of one run-on line).
+        div().id("config-endpoints").test_support().child(
+            GroupBox::new().title("Endpoints").gap_2().child(
+                DescriptionList::vertical()
+                    .child(DescriptionItem::new("upstream").value(upstream))
+                    .child(DescriptionItem::new("SOCKS").value(socks_url))
+                    .child(DescriptionItem::new("HTTP").value(http_url)),
+            ),
+        )
+    }
+
+    /// Detail health section (failed rows render the error Alert).
+    fn render_detail_health(&self, config: &ProxyConfig) -> impl IntoElement {
+        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
+            || self.health_store.row_summary(&config.id).trim() == "dead";
+        div().id("config-health").test_support().child(
+            GroupBox::new().title("Health").gap_2().child(
+                // T05: a dead/crashed row renders the same pinned
+                // health copy inside an error Alert; healthy rows keep
+                // the plain line (no Alert element at all).
+                if failed {
+                    div()
+                        .id("config-health-alert")
+                        .test_support()
+                        .child(
+                            Alert::error(
+                                "config-health-alert-box",
+                                self.health_store.detail_line(&config.id),
+                            )
+                            .title("Endpoint failed"),
+                        )
+                        .into_any_element()
+                } else {
+                    self.health_store.detail_line(&config.id).into_any_element()
+                },
+            ),
+        )
+    }
+
+    /// Detail usage section (persisted down/up buckets + reset).
+    fn render_detail_usage(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        // Ticket 45: manageable usage — persisted down/up buckets with
+        // an explicit reset (confirm-gated, never silent).
+        div().id("config-usage").test_support().child(
+            GroupBox::new().title("Usage").gap_2().child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .child(self.usage_line(&config.id))
                     .child(
-                        Switch::new(switch_id)
-                            .checked(config.enabled)
-                            .label("Enabled")
-                            .on_change(move |enabled: &bool, window, cx| {
-                                let enabled = *enabled;
-                                let id = switch_id_for_handler.clone();
-                                switch_view.update(cx, |view, cx| {
-                                    // Ticket 26: one flag semantic — the
-                                    // switch writes the stored flag only (see
-                                    // [`AppView::commit_enabled_flag`]);
-                                    // starting/stopping stays on Start/Stop.
-                                    // Ticket 30: the Switch is the only
-                                    // enabled control (no duplicate button).
-                                    view.commit_enabled_flag(&id, enabled, window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("edit-config")
-                            // Ticket 44: small + tooltip (detail-bar density for the
-                            // 1000x700 paint frame; tooltips name every action).
+                        Button::new("usage-reset")
+                            // Ticket 44: small + tooltip (detail-bar density).
                             .small()
-                            .label("Edit")
-                            .tooltip("Edit the selected configuration")
+                            .label("Reset usage")
+                            .tooltip("Reset this row's usage counters")
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(config) = view.selected_config(cx) {
-                                    view.open_edit_dialog(config, window, cx);
+                                    view.open_usage_reset_confirm(config, window, cx);
                                 }
-                            })),
-                    )
-                    .child(
-                        Button::new("delete-config")
-                            .danger()
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Delete")
-                            .tooltip("Delete the selected configuration")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_remove_confirm(config, window, cx);
-                                }
-                            })),
-                    )
-                    // Ticket 43: one-click duplicate (disabled copy, fresh
-                    // auto port) plus per-row traffic reset (confirm names
-                    // the row + current totals).
-                    .child(
-                        Button::new("duplicate-config")
-                            .small()
-                            .label("Duplicate")
-                            .tooltip("Duplicate the selected row (disabled copy)")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.commit_duplicate(&config.id, window, cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::info(no_selection_message()),
-                                        cx,
-                                    );
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("reset-traffic")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Reset traffic")
-                            .tooltip("Reset this row's traffic counters")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_traffic_reset_confirm(config, window, cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::info(no_selection_message()),
-                                        cx,
-                                    );
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("copy-urls")
-                            // Ticket 44: small + tooltip; clipboard carries bind
-                            // + port only (never params or secrets).
-                            .small()
-                            .label("Copy URLs")
-                            .tooltip("Copy bind endpoints (no secrets)")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.copy_selected_urls(window, cx);
-                            })),
-                    )
-                    .child({
-                        // T06: loading state + inline spinner while a start
-                        // is in flight (the label already reads `Starting…`
-                        // via `RowPhase::start_label`).
-                        let mut start = Button::new("engine-start")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label(start_label)
-                            .tooltip("Start the selected endpoint (F5)")
-                            .loading(self.start_in_flight)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_selected_engine(window, cx);
-                            }));
-                        if self.start_in_flight {
-                            start = start.child(
-                                div()
-                                    .id("engine-start-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        start
-                    })
-                    .child({
-                        // T06: loading state + inline spinner while a start
-                        // is in flight (stop waits on the same fence).
-                        let mut stop = Button::new("engine-stop")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            // T08: keystroke rides as a `Kbd` chip; the
-                            // pinned string stays on the accessible name.
-                            .label("Stop")
-                            .accessibility_label("Stop (Shift-F5)")
-                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-                            .tooltip("Stop the selected endpoint")
-                            .loading(self.start_in_flight)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.stop_selected_engine(window, cx);
-                            }));
-                        if self.start_in_flight {
-                            stop = stop.child(
-                                div()
-                                    .id("engine-stop-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        stop
-                    })
-                    .child({
-                        // T06: loading state + inline spinner while a
-                        // URL-test probe is in flight.
-                        let mut test = Button::new("health-test")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            // T08: keystroke rides as a `Kbd` chip; the
-                            // pinned string stays on the accessible name.
-                            .label("Test")
-                            .accessibility_label("Test (Ctrl-T)")
-                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-                            .tooltip("Test the selected endpoint")
-                            .loading(self.probe_kind_in_flight(false))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.test_selected_health(window, cx);
-                            }));
-                        if self.probe_kind_in_flight(false) {
-                            test = test.child(
-                                div()
-                                    .id("health-test-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        test
-                    })
-                    .child({
-                        // T06: loading state + inline spinner while a
-                        // TCP-ping probe is in flight.
-                        let mut ping = Button::new("health-ping")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Ping")
-                            .tooltip("TCP-ping the selected endpoint")
-                            .loading(self.probe_kind_in_flight(true))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.ping_selected(window, cx);
-                            }));
-                        if self.probe_kind_in_flight(true) {
-                            ping = ping.child(
-                                div()
-                                    .id("health-ping-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        ping
-                    })
-                    .child(
-                        Button::new("logs-open")
-                            .small()
-                            .label("Logs")
-                            .tooltip("Open logs for the selection")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_logs_dialog(window, cx);
                             })),
                     ),
+            ),
+        )
+    }
+
+    /// Detail history section (bounded latency sparkline).
+    fn render_detail_history(&self, config: &ProxyConfig) -> impl IntoElement {
+        // Ticket 45: trend-visible health — bounded history sparkline
+        // (native LineChart; 90d retention window served from
+        // `health_history`, never the latest-snapshot fast path).
+        div().id("config-history").test_support().child(
+            GroupBox::new()
+                .title("History")
+                .gap_2()
+                .child(self.history_line(&config.id)),
+        )
+    }
+
+    /// Detail action row (enable switch, manage/engine/health buttons).
+    fn render_detail_actions(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        let switch_id = format!("enabled-{}", config.id);
+        let switch_view = cx.entity();
+        let switch_id_for_handler = config.id.clone();
+        // W1: the selected row's lifecycle phase. Failed evidence is a
+        // crashed sidecar shard or a `dead` health summary on a serving row;
+        // the Start copy derives from the phase (same strings as before —
+        // Starting… while a start is in flight, Start otherwise).
+        let is_running = self.engine.is_running(&config.id);
+        let failed = self.engine.ids_on_crashed_shards().contains(&config.id)
+            || self.health_store.row_summary(&config.id).trim() == "dead";
+        let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                Switch::new(switch_id)
+                    .checked(config.enabled)
+                    .label("Enabled")
+                    .on_change(move |enabled: &bool, window, cx| {
+                        let enabled = *enabled;
+                        let id = switch_id_for_handler.clone();
+                        switch_view.update(cx, |view, cx| {
+                            // Ticket 26: one flag semantic — the
+                            // switch writes the stored flag only (see
+                            // [`AppView::commit_enabled_flag`]);
+                            // starting/stopping stays on Start/Stop.
+                            // Ticket 30: the Switch is the only
+                            // enabled control (no duplicate button).
+                            view.commit_enabled_flag(&id, enabled, window, cx);
+                        });
+                    }),
             )
-            .into_any_element()
+            .child(
+                Button::new("edit-config")
+                    // Ticket 44: small + tooltip (detail-bar density for the
+                    // 1000x700 paint frame; tooltips name every action).
+                    .small()
+                    .label("Edit")
+                    .tooltip("Edit the selected configuration")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        if let Some(config) = view.selected_config(cx) {
+                            view.open_edit_dialog(config, window, cx);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("delete-config")
+                    .danger()
+                    // Ticket 44: small + tooltip (detail-bar density).
+                    .small()
+                    .label("Delete")
+                    .tooltip("Delete the selected configuration")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        if let Some(config) = view.selected_config(cx) {
+                            view.open_remove_confirm(config, window, cx);
+                        }
+                    })),
+            )
+            // Ticket 43: one-click duplicate (disabled copy, fresh
+            // auto port) plus per-row traffic reset (confirm names
+            // the row + current totals).
+            .child(
+                Button::new("duplicate-config")
+                    .small()
+                    .label("Duplicate")
+                    .tooltip("Duplicate the selected row (disabled copy)")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        if let Some(config) = view.selected_config(cx) {
+                            view.commit_duplicate(&config.id, window, cx);
+                        } else {
+                            window
+                                .push_notification(Notification::info(no_selection_message()), cx);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("reset-traffic")
+                    // Ticket 44: small + tooltip (detail-bar density).
+                    .small()
+                    .label("Reset traffic")
+                    .tooltip("Reset this row's traffic counters")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        if let Some(config) = view.selected_config(cx) {
+                            view.open_traffic_reset_confirm(config, window, cx);
+                        } else {
+                            window
+                                .push_notification(Notification::info(no_selection_message()), cx);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("copy-urls")
+                    // Ticket 44: small + tooltip; clipboard carries bind
+                    // + port only (never params or secrets).
+                    .small()
+                    .label("Copy URLs")
+                    .tooltip("Copy bind endpoints (no secrets)")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.copy_selected_urls(window, cx);
+                    })),
+            )
+            .child({
+                // T06: loading state + inline spinner while a start
+                // is in flight (the label already reads `Starting…`
+                // via `RowPhase::start_label`).
+                let mut start = Button::new("engine-start")
+                    // Ticket 44: small + tooltip (detail-bar density).
+                    .small()
+                    .label(start_label)
+                    .tooltip("Start the selected endpoint (F5)")
+                    .loading(self.start_in_flight)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.start_selected_engine(window, cx);
+                    }));
+                if self.start_in_flight {
+                    start = start.child(
+                        div()
+                            .id("engine-start-spinner")
+                            .test_support()
+                            .child(Spinner::new().small()),
+                    );
+                }
+                start
+            })
+            .child({
+                // T06: loading state + inline spinner while a start
+                // is in flight (stop waits on the same fence).
+                let mut stop = Button::new("engine-stop")
+                    // Ticket 44: small + tooltip (detail-bar density).
+                    .small()
+                    // T08: keystroke rides as a `Kbd` chip; the
+                    // pinned string stays on the accessible name.
+                    .label("Stop")
+                    .accessibility_label("Stop (Shift-F5)")
+                    .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
+                    .tooltip("Stop the selected endpoint")
+                    .loading(self.start_in_flight)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.stop_selected_engine(window, cx);
+                    }));
+                if self.start_in_flight {
+                    stop = stop.child(
+                        div()
+                            .id("engine-stop-spinner")
+                            .test_support()
+                            .child(Spinner::new().small()),
+                    );
+                }
+                stop
+            })
+            .child({
+                // T06: loading state + inline spinner while a
+                // URL-test probe is in flight.
+                let mut test = Button::new("health-test")
+                    // Ticket 44: small + tooltip (detail-bar density).
+                    .small()
+                    // T08: keystroke rides as a `Kbd` chip; the
+                    // pinned string stays on the accessible name.
+                    .label("Test")
+                    .accessibility_label("Test (Ctrl-T)")
+                    .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
+                    .tooltip("Test the selected endpoint")
+                    .loading(self.probe_kind_in_flight(false))
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.test_selected_health(window, cx);
+                    }));
+                if self.probe_kind_in_flight(false) {
+                    test = test.child(
+                        div()
+                            .id("health-test-spinner")
+                            .test_support()
+                            .child(Spinner::new().small()),
+                    );
+                }
+                test
+            })
+            .child({
+                // T06: loading state + inline spinner while a
+                // TCP-ping probe is in flight.
+                let mut ping = Button::new("health-ping")
+                    // Ticket 44: small + tooltip (detail-bar density).
+                    .small()
+                    .label("Ping")
+                    .tooltip("TCP-ping the selected endpoint")
+                    .loading(self.probe_kind_in_flight(true))
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.ping_selected(window, cx);
+                    }));
+                if self.probe_kind_in_flight(true) {
+                    ping = ping.child(
+                        div()
+                            .id("health-ping-spinner")
+                            .test_support()
+                            .child(Spinner::new().small()),
+                    );
+                }
+                ping
+            })
+            .child(
+                Button::new("logs-open")
+                    .small()
+                    .label("Logs")
+                    .tooltip("Open logs for the selection")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_logs_dialog(window, cx);
+                    })),
+            )
     }
 
     /// Ticket 45: one detail-pane latency sparkline from bounded history —
@@ -10746,10 +10824,11 @@ impl AppView {
             }
         }
     }
-}
 
-impl Render for AppView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Startup-stack split (same cause as [AppView::render_toolbar]): the shell
+    /// chrome (focus, key context, app actions, file drop) builds in its own frame
+    /// instead of inside [Render::render]'s chain. Content is unchanged.
+    fn render_shell(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let drop_view = cx.entity();
         div()
             .id("manyproxy-shell")
@@ -10800,159 +10879,172 @@ impl Render for AppView {
                     view.import_dropped_files(paths, window, cx);
                 });
             })
-            .child(TitleBar::new().child(APP_TITLE))
+    }
+
+    /// Startup-stack split: the toolbar builds in its own frame instead of
+    /// inside [Render::render]'s single builder chain, so a debug first frame no
+    /// longer nests the whole window tree in one function frame (main-thread stack
+    /// overflow at startup - see .planning/follow-ups/startup-stack-overflow.md).
+    /// Content is unchanged: same ids, labels, tooltips, and handlers.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("manyproxy-toolbar")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .p_2()
+            // T01: hairline under the toolbar — the chrome reads as a
+            // band on the same theme tokens as the rest of the shell.
+            .border_b_1()
+            .border_color(cx.theme().border)
+            // Ticket 33: shortcut hints ride in the labels (F5/Shift-F5/
+            // Ctrl-T/Ctrl-N/Ctrl-O) so the bindings in [`bind_app_keys`]
+            // are visible without opening About. Button ids are
+            // unchanged. Separators group Library / Manage / Engine /
+            // Health / Help; tooltips name each action.
             .child(
-                div()
-                    .id("manyproxy-toolbar")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .p_2()
-                    // T01: hairline under the toolbar — the chrome reads as a
-                    // band on the same theme tokens as the rest of the shell.
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    // Ticket 33: shortcut hints ride in the labels (F5/Shift-F5/
-                    // Ctrl-T/Ctrl-N/Ctrl-O) so the bindings in [`bind_app_keys`]
-                    // are visible without opening About. Button ids are
-                    // unchanged. Separators group Library / Manage / Engine /
-                    // Health / Help; tooltips name each action.
-                    .child(
-                        Button::new("add-config")
-                            .primary()
-                            // T08: keystroke rides as a `Kbd` chip; the
-                            // pinned string stays on the accessible name.
-                            .label("Add")
-                            .accessibility_label("Add (Ctrl-N)")
-                            .child(shortcut_kbd("ctrl-n", "(Ctrl-N)"))
-                            .tooltip("Add a proxy configuration")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_add_dialog(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("import-config")
-                            .label("Import")
-                            .accessibility_label("Import (Ctrl-O)")
-                            .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
-                            .tooltip("Import share links or files")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("import-clipboard")
-                            .label("From clipboard")
-                            .tooltip("Import from clipboard text")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_import_from_clipboard(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("export-library")
-                            .label("Export")
-                            .tooltip("Export library to JSON")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_export_dialog(window, cx);
-                            })),
-                    )
-                    .child(Separator::vertical())
-                    .child(
-                        Button::new("subscriptions")
-                            .label("Subscriptions")
-                            .tooltip("Manage subscription lists")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_subscriptions_dialog(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("routing-presets")
-                            .label("Presets")
-                            .tooltip("Manage routing presets")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_presets_dialog(window, cx);
-                            })),
-                    )
-                    .child(Separator::vertical())
-                    .child(
-                        Button::new("engine-start-all")
-                            .label("Start all")
-                            .tooltip("Start every configuration")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_all_engines(window, cx);
-                            })),
-                    )
-                    // Ticket 43: the F5 key starts the SELECTED row (see
-                    // [`bind_app_keys`]) — the old "Start all (F5)" label
-                    // lied. Selected actions carry their key hints; bulk
-                    // actions carry none.
-                    .child(
-                        Button::new("start-selected")
-                            .primary()
-                            .label("Start selected")
-                            .accessibility_label("Start selected (F5)")
-                            .child(shortcut_kbd("f5", "(F5)"))
-                            .tooltip("Start the selected endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_selected_engine(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("engine-stop-all")
-                            .label("Stop all")
-                            .tooltip("Stop every endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.stop_all_engines(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("stop-selected")
-                            .label("Stop selected")
-                            .accessibility_label("Stop selected (Shift-F5)")
-                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-                            .tooltip("Stop the selected endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.stop_selected_engine(window, cx);
-                            })),
-                    )
-                    .child(Separator::vertical())
-                    .child(
-                        Button::new("health-test-all")
-                            .label("Test all")
-                            .tooltip("Test every running endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.test_all_health(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("test-selected")
-                            .label("Test selected")
-                            .accessibility_label("Test selected (Ctrl-T)")
-                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-                            .tooltip("Test the selected endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.test_selected_health(window, cx);
-                            })),
-                    )
-                    .child(Separator::vertical())
-                    .child(
-                        Button::new("about-dialog")
-                            .label("About")
-                            .tooltip("Version, sidecars, shortcuts")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_about_dialog(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-dialog")
-                            .label("Settings")
-                            .tooltip("Autostart, restore, test URL")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_settings_dialog(window, cx);
-                            })),
-                    ),
+                Button::new("add-config")
+                    .primary()
+                    // T08: keystroke rides as a `Kbd` chip; the
+                    // pinned string stays on the accessible name.
+                    .label("Add")
+                    .accessibility_label("Add (Ctrl-N)")
+                    .child(shortcut_kbd("ctrl-n", "(Ctrl-N)"))
+                    .tooltip("Add a proxy configuration")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_add_dialog(window, cx);
+                    })),
             )
+            .child(
+                Button::new("import-config")
+                    .label("Import")
+                    .accessibility_label("Import (Ctrl-O)")
+                    .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
+                    .tooltip("Import share links or files")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("import-clipboard")
+                    .label("From clipboard")
+                    .tooltip("Import from clipboard text")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_import_from_clipboard(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("export-library")
+                    .label("Export")
+                    .tooltip("Export library to JSON")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_export_dialog(window, cx);
+                    })),
+            )
+            .child(Separator::vertical())
+            .child(
+                Button::new("subscriptions")
+                    .label("Subscriptions")
+                    .tooltip("Manage subscription lists")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_subscriptions_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("routing-presets")
+                    .label("Presets")
+                    .tooltip("Manage routing presets")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_presets_dialog(window, cx);
+                    })),
+            )
+            .child(Separator::vertical())
+            .child(
+                Button::new("engine-start-all")
+                    .label("Start all")
+                    .tooltip("Start every configuration")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.start_all_engines(window, cx);
+                    })),
+            )
+            // Ticket 43: the F5 key starts the SELECTED row (see
+            // [`bind_app_keys`]) — the old "Start all (F5)" label
+            // lied. Selected actions carry their key hints; bulk
+            // actions carry none.
+            .child(
+                Button::new("start-selected")
+                    .primary()
+                    .label("Start selected")
+                    .accessibility_label("Start selected (F5)")
+                    .child(shortcut_kbd("f5", "(F5)"))
+                    .tooltip("Start the selected endpoint")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.start_selected_engine(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("engine-stop-all")
+                    .label("Stop all")
+                    .tooltip("Stop every endpoint")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.stop_all_engines(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("stop-selected")
+                    .label("Stop selected")
+                    .accessibility_label("Stop selected (Shift-F5)")
+                    .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
+                    .tooltip("Stop the selected endpoint")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.stop_selected_engine(window, cx);
+                    })),
+            )
+            .child(Separator::vertical())
+            .child(
+                Button::new("health-test-all")
+                    .label("Test all")
+                    .tooltip("Test every running endpoint")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.test_all_health(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("test-selected")
+                    .label("Test selected")
+                    .accessibility_label("Test selected (Ctrl-T)")
+                    .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
+                    .tooltip("Test the selected endpoint")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.test_selected_health(window, cx);
+                    })),
+            )
+            .child(Separator::vertical())
+            .child(
+                Button::new("about-dialog")
+                    .label("About")
+                    .tooltip("Version, sidecars, shortcuts")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_about_dialog(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("settings-dialog")
+                    .label("Settings")
+                    .tooltip("Autostart, restore, test URL")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_settings_dialog(window, cx);
+                    })),
+            )
+    }
+}
+
+impl Render for AppView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_shell(cx)
+            .child(TitleBar::new().child(APP_TITLE))
+            .child(self.render_toolbar(cx))
             // Ticket 17: visible drop affordance (the shell has no
             // hover-during-drag event, so the hint stays visible instead of
             // appearing only on hover).
@@ -10969,12 +11061,20 @@ impl Render for AppView {
                     div()
                         .id("config-list")
                         .test_support()
+                        .flex()
+                        .flex_col()
                         .flex_1()
                         .child(self.render_search_count(cx))
                         .child(self.render_facet_bar(window, cx))
                         .child(self.render_bulk_bar(cx))
+                        // The list absorbs the slack so the empty-CTA strip
+                        // stays pinned inside the pane: block-stacked children
+                        // overflowed the pane bottom and the CTA buttons
+                        // rendered below the window edge.
                         .child(
-                            List::new(&self.libraries).search_placeholder("Search configurations"),
+                            List::new(&self.libraries)
+                                .search_placeholder("Search configurations")
+                                .flex_1(),
                         )
                         .child(self.render_empty_ctas(cx)),
                 ),
