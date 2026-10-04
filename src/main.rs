@@ -28,12 +28,17 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::table::{
+    Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
+};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
@@ -777,6 +782,178 @@ impl LibraryDelegate {
     }
 }
 
+// Ticket 07: read-through table spike over the committed dense `List`.
+// `DenseTableDelegate` owns no filter or sort state — rows, health, serving
+// and traffic all read through `libraries` (`visible` order), so the table
+// can never fork the list. Behind `AppView::table_spike` (default off); the
+// `List` stays mounted and is the only path when the flag is off.
+//
+// Row snapshot: config + cached upstream + health summary + traffic totals +
+// checked flag. Aliased so the tuple never trips `type_complexity`.
+type DenseRowSnapshot = (ProxyConfig, String, String, Option<(u64, u64)>, bool);
+struct DenseTableDelegate {
+    libraries: Entity<ListState<LibraryDelegate>>,
+    columns: Vec<Column>,
+}
+
+impl DenseTableDelegate {
+    // Ticket 07: eight spike columns via `Column::new(key, name).sortable().width()`.
+    fn new(libraries: Entity<ListState<LibraryDelegate>>) -> Self {
+        Self {
+            libraries,
+            columns: vec![
+                Column::new("check", "").sortable().width(px(36.)),
+                Column::new("name", "Name").sortable().width(px(140.)),
+                Column::new("proto", "Proto").sortable().width(px(70.)),
+                Column::new("group", "Group").sortable().width(px(90.)),
+                Column::new("upstream", "Upstream")
+                    .sortable()
+                    .width(px(140.)),
+                Column::new("bind", "Bind").sortable().width(px(110.)),
+                Column::new("health", "Health").sortable().width(px(80.)),
+                Column::new("traffic", "Traffic").sortable().width(px(90.)),
+            ],
+        }
+    }
+
+    // Ticket 07: one read-through snapshot (row + the same strings the dense
+    // list renders). `None` when the table row has no library row (filter
+    // narrowed between frames) — callers paint an empty cell, never a wrong row.
+    fn snapshot_for(&self, row_ix: usize, cx: &App) -> Option<DenseRowSnapshot> {
+        let state = self.libraries.read(cx);
+        let delegate = state.delegate();
+        let visible_ix = *delegate.visible.get(row_ix)?;
+        let row = delegate.rows.get(visible_ix)?.clone();
+        let upstream = delegate
+            .upstream_for(&row.id)
+            .unwrap_or("no upstream")
+            .to_string();
+        let health = delegate.health.get(&row.id).cloned().unwrap_or_default();
+        let traffic = delegate.traffic.get(&row.id).copied();
+        let checked = delegate.checked.contains(&row.id);
+        Some((row, upstream, health, traffic, checked))
+    }
+
+    // Ticket 07: cell text reusing the dense summary strings (name / proto /
+    // group / upstream / bind / health summary / traffic summary). Checkbox
+    // column reports the `checked` set, never an index.
+    fn cell_string(&self, row_ix: usize, col_ix: usize, cx: &App) -> String {
+        let key = self
+            .columns
+            .get(col_ix)
+            .map(|column| column.key.to_string())
+            .unwrap_or_default();
+        let Some((row, upstream, health, traffic, checked)) = self.snapshot_for(row_ix, cx) else {
+            return String::new();
+        };
+        match key.as_str() {
+            "check" => {
+                if checked {
+                    "checked".to_string()
+                } else {
+                    String::new()
+                }
+            }
+            "name" => row.name.clone(),
+            "proto" => row.protocol.clone(),
+            "group" => row.group.clone(),
+            "upstream" => upstream,
+            "bind" => format!("{}:{}", row.bind_ip, row.port),
+            "health" => health,
+            "traffic" => traffic
+                .and_then(|(rx, tx)| traffic_summary_text(rx, tx))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+}
+
+impl TableDelegate for DenseTableDelegate {
+    fn columns_count(&self, _cx: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, cx: &App) -> usize {
+        self.libraries.read(cx).delegate().visible.len()
+    }
+
+    fn column(&self, col_ix: usize, _cx: &App) -> Column {
+        self.columns
+            .get(col_ix)
+            .cloned()
+            .unwrap_or_else(|| Column::new("unknown", ""))
+    }
+
+    // Ticket 07: no forked sort state — the `List` filter/sort stays the single
+    // owner, so header clicks intentionally do nothing in the spike.
+    fn perform_sort(
+        &mut self,
+        _col_ix: usize,
+        _sort: ColumnSort,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let key = self
+            .columns
+            .get(col_ix)
+            .map(|column| column.key.to_string())
+            .unwrap_or_default();
+        // Ticket 07: read-through snapshot; same strings as
+        // `library_row_dense_lines_with_upstream`, same `check-<id>` domain id.
+        let Some((row, upstream, health, traffic, checked)) = self.snapshot_for(row_ix, cx) else {
+            return div().into_any_element();
+        };
+        if key == "check" {
+            // Ticket 07: checkbox cell reuses `toggle_checked` on the id (never
+            // an index) through the committed `List` entity.
+            let libraries = self.libraries.clone();
+            let toggle_id = row.id.clone();
+            let row_name = row.name.clone();
+            let row_id = row.id.clone();
+            return Checkbox::new(format!("check-{row_id}"))
+                .small()
+                .checked(checked)
+                .accessibility_label(format!("Select {row_name}"))
+                .on_change(move |_, _, cx| {
+                    let toggle_id = toggle_id.clone();
+                    libraries.update(cx, |state, list_cx| {
+                        state.delegate_mut().toggle_checked(&toggle_id);
+                        list_cx.notify();
+                    });
+                })
+                .into_any_element();
+        }
+        let text = match key.as_str() {
+            "name" => row.name.clone(),
+            "proto" => row.protocol.clone(),
+            "group" => row.group.clone(),
+            "upstream" => upstream,
+            "bind" => format!("{}:{}", row.bind_ip, row.port),
+            "health" => health,
+            "traffic" => traffic
+                .and_then(|(rx, tx)| traffic_summary_text(rx, tx))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        // Ticket 07: compact text cell (inherited table theme tokens only;
+        // small text keeps rows dense like the `List`).
+        div().text_sm().child(text).into_any_element()
+    }
+
+    fn cell_text(&self, row_ix: usize, col_ix: usize, cx: &App) -> String {
+        self.cell_string(row_ix, col_ix, cx)
+    }
+}
+
 impl ListDelegate for LibraryDelegate {
     type Item = ListItem;
 
@@ -887,53 +1064,42 @@ impl ListDelegate for LibraryDelegate {
             card = card.hover(|this| this.bg(cx.theme().list_hover));
         }
         let mut lines =
-            library_row_lines_with_upstream(&row, &upstream, health, is_running, traffic)
+            library_row_dense_lines_with_upstream(&row, &upstream, health, is_running, traffic)
                 .into_iter();
         if let Some(first) = lines.next() {
-            card = card.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(checkbox)
-                    .child(first),
-            );
-        } else {
-            card = card.child(checkbox);
-        }
-        // T02: the serving badge is seam line 4 of [`library_row_lines`]
-        // (index 3). A serving row paints the colored status dot beside it as
-        // a sibling element — the pinned badge string itself never changes.
-        // Dead health on a serving row reads as danger, matching the detail
-        // pane's Failed evidence.
-        const SERVING_BADGE_LINE: usize = 3;
-        for (offset, line) in lines.enumerate() {
-            if offset + 1 == SERVING_BADGE_LINE && is_running {
+            // Dense header: checkbox + name + serving dot when running, so
+            // state reads on line one without a separate badge row.
+            let mut header = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(checkbox)
+                .child(first);
+            if is_running {
                 let dot_color = if health.map(str::trim) == Some("dead") {
                     cx.theme().danger
                 } else {
                     cx.theme().success
                 };
-                card = card.child(
+                header = header.child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .id(format!("row-dot-{row_id}"))
-                                .test_support()
-                                .size_1p5()
-                                .rounded_full()
-                                .bg(dot_color),
-                        )
-                        .child(line),
+                        .id(format!("row-dot-{row_id}"))
+                        .test_support()
+                        .size_1p5()
+                        .rounded_full()
+                        .bg(dot_color),
                 );
-            } else {
-                card = card.child(line);
             }
+            card = card.child(header);
+        } else {
+            card = card.child(checkbox);
+        }
+        // Dense body: meta line then badge-plus-traffic line. The serving
+        // badge is dense line 3 (index 2) — the pinned badge string itself
+        // never changes, only its row position.
+        for line in lines {
+            card = card.child(line);
         }
         Some(item.child(card))
     }
@@ -2073,6 +2239,7 @@ fn library_row_lines(
 /// cache) — zero JSON parses on the render path. [`library_row_lines`]
 /// stays as the parsing wrapper (tests + single-row callers); rendered
 /// strings are identical either way.
+#[allow(dead_code)]
 fn library_row_lines_with_upstream(
     row: &ProxyConfig,
     upstream: &str,
@@ -2096,6 +2263,31 @@ fn library_row_lines_with_upstream(
         }
     }
     lines
+}
+/// Ticket 01 (throne-density): dense row lines over the same inputs as
+/// [`library_row_lines_with_upstream`] — three lines max: name, merged
+/// meta (`proto · upstream · group · bind:port · state`), badge plus
+/// optional traffic (`badge · ↓rx ↑tx`). Same strings, fewer children, so
+/// the 1000x700 frame paints more rows with no new secrets surface.
+fn library_row_dense_lines_with_upstream(
+    row: &ProxyConfig,
+    upstream: &str,
+    health: Option<&str>,
+    is_running: bool,
+    traffic: Option<(u64, u64)>,
+) -> Vec<String> {
+    let state = if row.enabled { "enabled" } else { "disabled" };
+    let meta = format!(
+        "{} · {upstream} · {} · bind {}:{} · {state}",
+        row.protocol, row.group, row.bind_ip, row.port
+    );
+    let mut badge = serving_badge(is_running, row.port, health);
+    if let Some((rx, tx)) = traffic {
+        if let Some(summary) = traffic_summary_text(rx, tx) {
+            badge = format!("{badge} · {summary}");
+        }
+    }
+    vec![row.name.clone(), meta, badge]
 }
 
 /// Ticket 17: a library row matches the search query by name, protocol,
@@ -3187,6 +3379,29 @@ impl SearchableListDelegate for FacetChoiceList {
     }
 }
 
+/// Ticket 44: group labels are free text (slashes, spaces, dots) but element
+/// ids must stay id-safe. Display/title/labels keep the verbatim label —
+/// only the `id` is slugged. Identity for plain names (`travel` stays
+/// `travel`) so existing facet/manager ids never shift.
+fn slugify_group_id(group: &str) -> String {
+    let mut slug = String::with_capacity(group.len());
+    for ch in group.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "group".to_string()
+    } else {
+        slug
+    }
+}
+
 impl FacetMenu {
     const ALL: [FacetMenu; 3] = [FacetMenu::Group, FacetMenu::Protocol, FacetMenu::Status];
 
@@ -3205,9 +3420,12 @@ impl FacetMenu {
                         .group_options()
                         .into_iter()
                         .map(|(group, count)| FacetChoice {
-                            id: format!("facet-group-{group}"),
+                            // Ticket 44: the id slugs the label (slashes
+                            // never reach an element id); title/display stay
+                            // verbatim with counts.
+                            id: format!("facet-group-{}", slugify_group_id(&group)),
                             title: format!("{group} ({count})"),
-                            display: format!("Group: {group}"),
+                            display: format!("Group: {group} ({count})"),
                             value: Some(group),
                         }),
                 )
@@ -3313,6 +3531,35 @@ impl FacetPicker {
             state,
             synced: choices,
             _subscription: subscription,
+        }
+    }
+}
+
+/// Ticket 05: bottom-inspector tab over the existing detail builders.
+/// `Details` is the default overview; `Health` surfaces health + history
+/// with the row ops; `Presets` carries the attached routing preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum InspectorTab {
+    #[default]
+    Details,
+    Health,
+    Presets,
+}
+
+impl InspectorTab {
+    fn index(self) -> usize {
+        match self {
+            InspectorTab::Details => 0,
+            InspectorTab::Health => 1,
+            InspectorTab::Presets => 2,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => InspectorTab::Health,
+            2 => InspectorTab::Presets,
+            _ => InspectorTab::Details,
         }
     }
 }
@@ -3438,6 +3685,17 @@ struct AppView {
     facet_group: FacetPicker,
     facet_protocol: FacetPicker,
     facet_status: FacetPicker,
+    /// Ticket 05: active bottom-inspector tab (default Details). Plain
+    /// `Copy` field — the `TabBar` is `RenderOnce`, so it is rebuilt from
+    /// this every frame; no entity is created in render.
+    inspector_tab: InspectorTab,
+    /// Ticket 07: read-through DataTable spike (default off). `table_state`
+    /// renders `visible` order with no filter/sort of its own; the `List`
+    /// stays mounted and is the only path when `table_spike` is false.
+    table_spike: bool,
+    table_state: Entity<TableState<DenseTableDelegate>>,
+    _table_libraries_subscription: Subscription,
+    _table_select_subscription: Subscription,
 }
 
 impl AppView {
@@ -3488,6 +3746,14 @@ impl AppView {
             window,
             cx,
         );
+        // Ticket 07: read-through table state over `libraries` (no rows of its
+        // own, no filter/sort). Created once here, never in render.
+        let table_state = cx.new(|cx| {
+            TableState::new(DenseTableDelegate::new(libraries.clone()), window, cx)
+                .row_selectable(true)
+                .col_selectable(false)
+                .cell_selectable(false)
+        });
         // Ticket 38: seed the snapshot guard from the stored set so the
         // first reload does not rewrite an unchanged snapshot.
         let last_snapshot = store.load_running_snapshot();
@@ -3557,9 +3823,66 @@ impl AppView {
                     cx.notify();
                 },
             ),
+            // Ticket 07: `List` event mirrors the table selection by config id
+            // (read-through, never an index). Guards live in the sync helper.
+            _table_libraries_subscription: cx.subscribe(
+                &libraries,
+                |view: &mut Self, _state, _event: &ListEvent, cx| {
+                    view.sync_table_selection(cx);
+                },
+            ),
+            // Ticket 07: table row click mirrors the `List` selection by config
+            // id (never a blind index — the visible order may have shifted).
+            _table_select_subscription: cx.subscribe(
+                &table_state,
+                |view: &mut Self, _state, event: &TableEvent, cx| {
+                    let TableEvent::SelectRow(row_ix) = event else {
+                        return;
+                    };
+                    let row_ix = *row_ix;
+                    let (id_opt, current_id) = {
+                        let libs = view.libraries.read(cx);
+                        let delegate = libs.delegate();
+                        let id = delegate
+                            .visible
+                            .get(row_ix)
+                            .and_then(|&visible_ix| delegate.rows.get(visible_ix))
+                            .map(|row| row.id.clone());
+                        let current = delegate.selected_row().map(|row| row.id.clone());
+                        (id, current)
+                    };
+                    let Some(id) = id_opt else {
+                        return;
+                    };
+                    if current_id == Some(id.clone()) {
+                        return;
+                    }
+                    let pos = {
+                        let libs = view.libraries.read(cx);
+                        let delegate = libs.delegate();
+                        delegate.visible.iter().position(|&visible_ix| {
+                            delegate
+                                .rows
+                                .get(visible_ix)
+                                .map(|row| row.id == id)
+                                .unwrap_or(false)
+                        })
+                    };
+                    if let Some(pos) = pos {
+                        view.libraries.update(cx, |list_state, list_cx| {
+                            list_state.delegate_mut().selected = Some(IndexPath::new(pos));
+                            list_cx.notify();
+                        });
+                        view.sync_table_selection(cx);
+                    }
+                },
+            ),
             facet_group,
             facet_protocol,
             facet_status,
+            inspector_tab: InspectorTab::Details,
+            table_spike: false,
+            table_state: table_state.clone(),
         };
         let mut view = view;
         let rows = match view.store.list() {
@@ -3610,6 +3933,44 @@ impl AppView {
 
     fn selected_config(&self, cx: &App) -> Option<ProxyConfig> {
         self.libraries.read(cx).delegate().selected_row()
+    }
+
+    // Ticket 07: mirror the `List` selection into the spike table by config id
+    // (never an index). No-ops when both already agree, so the table event
+    // echo cannot loop. Called from the `List` subscription and from render
+    // when the flag is on (covers filter/set_rows paths that emit no event).
+    fn sync_table_selection(&self, cx: &mut Context<Self>) {
+        let (selected_id, visible_ids) = {
+            let libs = self.libraries.read(cx);
+            let delegate = libs.delegate();
+            let selected = delegate.selected_row().map(|row| row.id.clone());
+            let ids: Vec<String> = delegate
+                .visible
+                .iter()
+                .filter_map(|&visible_ix| delegate.rows.get(visible_ix))
+                .map(|row| row.id.clone())
+                .collect();
+            (selected, ids)
+        };
+        let table_ix = self.table_state.read(cx).selected_row();
+        let table_id = table_ix.and_then(|ix| visible_ids.get(ix).cloned());
+        if selected_id == table_id {
+            return;
+        }
+        match selected_id.and_then(|id| visible_ids.iter().position(|other| other == &id)) {
+            Some(pos) => {
+                self.table_state.update(cx, |state, table_cx| {
+                    state.set_selected_row(pos, table_cx);
+                });
+            }
+            None => {
+                if table_ix.is_some() {
+                    self.table_state.update(cx, |state, table_cx| {
+                        state.clear_selection(table_cx);
+                    });
+                }
+            }
+        }
     }
 
     /// Ticket 47: cached upstream display for one row (no JSON parse on the
@@ -9506,8 +9867,10 @@ impl AppView {
             .into_any_element()
     }
 
-    /// Detail pane for the selected row: capped scroll box assembling the
-    /// per-section builders below.
+    /// Detail pane for the selected row: capped scroll box with the Ticket
+    /// 05 inspector tabs driving the per-section builders below.
+    /// `config-detail` id, 240px cap, internal scroll, and the resizable
+    /// 240..480 range are unchanged.
     fn render_detail_selected(
         &self,
         cx: &mut Context<Self>,
@@ -9527,14 +9890,113 @@ impl AppView {
             // the action rows, and three library rows share the 700px test
             // frame without clipping the list.
             .gap_1()
-            // T05: the inspector scrolls inside a capped box instead of
-            // squeezing the list: 240px keeps three rows painted in the
-            // 700px frame while the list keeps the flex_1 remainder.
+            // The vertical split owns the height now (the detail
+            // `resizable_panel` starts at 240px, range 240..480): the pane
+            // keeps its 240px cap and scrolls inside it, so dragging the
+            // divider grows real inspector space up to the range end.
             .max_h(px(240.))
             .overflow_y_scroll()
+            .child(self.render_inspector_tabs(cx))
+            .child(match self.inspector_tab {
+                InspectorTab::Details => {
+                    self.render_inspector_details(cx, config).into_any_element()
+                }
+                InspectorTab::Health => self.render_inspector_health(cx, config).into_any_element(),
+                InspectorTab::Presets => {
+                    self.render_inspector_presets(cx, config).into_any_element()
+                }
+            })
+            .into_any_element()
+    }
+
+    /// Ticket 05: `Details / Health / Presets` segmented bar over the
+    /// existing detail builders. Stable per-tab ids ride as zero-size marker
+    /// children (the `Tab` element id is owned by the bar's index), tabs
+    /// carry aria labels, and selection lives in
+    /// [`AppView::inspector_tab`] — the bar is `RenderOnce`, so it is
+    /// rebuilt from the field each frame; no entity is created in render.
+    fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        // Kit `TabBar::new` owns the id for state keys only — it never lands
+        // on the rendered element — so the stable test anchor rides on this
+        // wrapper (same convention as the `facet-*-tip` hover wrappers).
+        div().id("inspector-tabs").test_support().child(
+            TabBar::new("inspector-tabs")
+                .segmented()
+                .small()
+                .selected_index(self.inspector_tab.index())
+                .on_click(move |index, _, cx| {
+                    view.update(cx, |view, _| {
+                        view.inspector_tab = InspectorTab::from_index(*index);
+                    });
+                })
+                .child(
+                    Tab::new()
+                        .label("Details")
+                        .aria_label("Inspector Details tab")
+                        .child(div().id("inspector-tab-details").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Health")
+                        .aria_label("Inspector Health tab")
+                        .child(div().id("inspector-tab-health").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Presets")
+                        .aria_label("Inspector Presets tab")
+                        .child(div().id("inspector-tab-presets").test_support()),
+                ),
+        )
+    }
+
+    /// Ticket 05: Details pane — header + endpoints + usage + the full
+    /// action row. Health/history/preset sections own the other panes.
+    fn render_inspector_details(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
             .child(self.render_detail_header(cx, config))
             .child(self.render_detail_endpoints(cx, config))
+            .child(self.render_detail_usage(cx, config))
+            .child(self.render_detail_actions(cx, config))
+    }
+
+    /// Ticket 05: Health pane — health + history plus the engine/probe/log
+    /// actions operating on the same row (same handlers, ids, and loading
+    /// states as the Details row; only one pane renders per frame, so the
+    /// ids never collide). Logs open in the dialog — no inline tail.
+    fn render_inspector_health(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
             .child(self.render_detail_health(config))
+            .child(self.render_detail_history(config))
+            .child(self.render_health_actions(cx, config))
+    }
+
+    /// Ticket 05: Presets pane — attached routing preset plus the attach
+    /// picker entry point (same dialog as before).
+    fn render_inspector_presets(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
             // Ticket 37: attached routing preset (name only — rules live in
             // the presets manager) plus the picker entry point.
             .child(div().id("config-preset").test_support().child(
@@ -9556,10 +10018,6 @@ impl AppView {
                         }
                     })),
             )
-            .child(self.render_detail_usage(cx, config))
-            .child(self.render_detail_history(config))
-            .child(self.render_detail_actions(cx, config))
-            .into_any_element()
     }
 
     /// W1/failed evidence shared by the detail builders: a crashed sidecar
@@ -9741,98 +10199,248 @@ impl AppView {
         let is_running = self.engine.is_running(&config.id);
         let failed = self.detail_failed(config);
         let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
+        // Eleven controls in one row exceed the 1000px test frame (the detail
+        // pane stretched to 1037px, and GPUI has no flex-wrap) — two rows,
+        // manage then operate, so the pane keeps the frame width and every
+        // action stays reachable with no horizontal scroll.
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Switch::new(switch_id)
+                            .checked(config.enabled)
+                            .label("Enabled")
+                            .on_change(move |enabled: &bool, window, cx| {
+                                let enabled = *enabled;
+                                let id = switch_id_for_handler.clone();
+                                switch_view.update(cx, |view, cx| {
+                                    // Ticket 26: one flag semantic — the
+                                    // switch writes the stored flag only (see
+                                    // [`AppView::commit_enabled_flag`]);
+                                    // starting/stopping stays on Start/Stop.
+                                    // Ticket 30: the Switch is the only
+                                    // enabled control (no duplicate button).
+                                    view.commit_enabled_flag(&id, enabled, window, cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("edit-config")
+                            // Ticket 44: small + tooltip (detail-bar density for the
+                            // 1000x700 paint frame; tooltips name every action).
+                            .small()
+                            .label("Edit")
+                            .tooltip("Edit the selected configuration")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_edit_dialog(config, window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("delete-config")
+                            .danger()
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
+                            .label("Delete")
+                            .tooltip("Delete the selected configuration")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_remove_confirm(config, window, cx);
+                                }
+                            })),
+                    )
+                    // Ticket 43: one-click duplicate (disabled copy, fresh
+                    // auto port) plus per-row traffic reset (confirm names
+                    // the row + current totals).
+                    .child(
+                        Button::new("duplicate-config")
+                            .small()
+                            .label("Duplicate")
+                            .tooltip("Duplicate the selected row (disabled copy)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.commit_duplicate(&config.id, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("reset-traffic")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
+                            .label("Reset traffic")
+                            .tooltip("Reset this row's traffic counters")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_traffic_reset_confirm(config, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("copy-urls")
+                            // Ticket 44: small + tooltip; clipboard carries bind
+                            // + port only (never params or secrets).
+                            .small()
+                            .label("Copy URLs")
+                            .tooltip("Copy bind endpoints (no secrets)")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.copy_selected_urls(window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child({
+                        // T06: loading state + inline spinner while a start
+                        // is in flight (the label already reads `Starting.`
+                        // via `RowPhase::start_label`).
+                        let mut start = Button::new("engine-start")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
+                            .label(start_label)
+                            .tooltip("Start the selected endpoint (F5)")
+                            .loading(self.start_in_flight)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.start_selected_engine(window, cx);
+                            }));
+                        if self.start_in_flight {
+                            start = start.child(
+                                div()
+                                    .id("engine-start-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        start
+                    })
+                    .child({
+                        // T06: loading state + inline spinner while a start
+                        // is in flight (stop waits on the same fence).
+                        let mut stop = Button::new("engine-stop")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
+                            // T08: keystroke rides as a `Kbd` chip; the
+                            // pinned string stays on the accessible name.
+                            .label("Stop")
+                            .accessibility_label("Stop (Shift-F5)")
+                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
+                            .tooltip("Stop the selected endpoint")
+                            .loading(self.start_in_flight)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.stop_selected_engine(window, cx);
+                            }));
+                        if self.start_in_flight {
+                            stop = stop.child(
+                                div()
+                                    .id("engine-stop-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        stop
+                    })
+                    .child({
+                        // T06: loading state + inline spinner while a
+                        // URL-test probe is in flight.
+                        let mut test = Button::new("health-test")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
+                            // T08: keystroke rides as a `Kbd` chip; the
+                            // pinned string stays on the accessible name.
+                            .label("Test")
+                            .accessibility_label("Test (Ctrl-T)")
+                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
+                            .tooltip("Test the selected endpoint")
+                            .loading(self.probe_kind_in_flight(false))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.test_selected_health(window, cx);
+                            }));
+                        if self.probe_kind_in_flight(false) {
+                            test = test.child(
+                                div()
+                                    .id("health-test-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        test
+                    })
+                    .child({
+                        // T06: loading state + inline spinner while a
+                        // TCP-ping probe is in flight.
+                        let mut ping = Button::new("health-ping")
+                            // Ticket 44: small + tooltip (detail-bar density).
+                            .small()
+                            .label("Ping")
+                            .tooltip("TCP-ping the selected endpoint")
+                            .loading(self.probe_kind_in_flight(true))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.ping_selected(window, cx);
+                            }));
+                        if self.probe_kind_in_flight(true) {
+                            ping = ping.child(
+                                div()
+                                    .id("health-ping-spinner")
+                                    .test_support()
+                                    .child(Spinner::new().small()),
+                            );
+                        }
+                        ping
+                    })
+                    .child(
+                        Button::new("logs-open")
+                            .small()
+                            .label("Logs")
+                            .tooltip("Open logs for the selection")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_logs_dialog(window, cx);
+                            })),
+                    ),
+            )
+    }
+
+    /// Ticket 05: Health-pane ops row — Start/Stop, Test, Ping, Logs on the
+    /// same row (same handlers, ids, tooltips, and loading states as the
+    /// Details row above; only one pane renders per frame, so the ids never
+    /// collide). Logs open in the dialog — no inline tail.
+    fn render_health_actions(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        // W1: the selected row's lifecycle phase (see [`detail_failed`]
+        // for the evidence rule); the Start copy derives from the phase
+        // (same strings as before — `Starting.` while a start is in
+        // flight, `Start` otherwise).
+        let is_running = self.engine.is_running(&config.id);
+        let failed = self.detail_failed(config);
+        let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .child(
-                Switch::new(switch_id)
-                    .checked(config.enabled)
-                    .label("Enabled")
-                    .on_change(move |enabled: &bool, window, cx| {
-                        let enabled = *enabled;
-                        let id = switch_id_for_handler.clone();
-                        switch_view.update(cx, |view, cx| {
-                            // Ticket 26: one flag semantic — the
-                            // switch writes the stored flag only (see
-                            // [`AppView::commit_enabled_flag`]);
-                            // starting/stopping stays on Start/Stop.
-                            // Ticket 30: the Switch is the only
-                            // enabled control (no duplicate button).
-                            view.commit_enabled_flag(&id, enabled, window, cx);
-                        });
-                    }),
-            )
-            .child(
-                Button::new("edit-config")
-                    // Ticket 44: small + tooltip (detail-bar density for the
-                    // 1000x700 paint frame; tooltips name every action).
-                    .small()
-                    .label("Edit")
-                    .tooltip("Edit the selected configuration")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        if let Some(config) = view.selected_config(cx) {
-                            view.open_edit_dialog(config, window, cx);
-                        }
-                    })),
-            )
-            .child(
-                Button::new("delete-config")
-                    .danger()
-                    // Ticket 44: small + tooltip (detail-bar density).
-                    .small()
-                    .label("Delete")
-                    .tooltip("Delete the selected configuration")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        if let Some(config) = view.selected_config(cx) {
-                            view.open_remove_confirm(config, window, cx);
-                        }
-                    })),
-            )
-            // Ticket 43: one-click duplicate (disabled copy, fresh
-            // auto port) plus per-row traffic reset (confirm names
-            // the row + current totals).
-            .child(
-                Button::new("duplicate-config")
-                    .small()
-                    .label("Duplicate")
-                    .tooltip("Duplicate the selected row (disabled copy)")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        if let Some(config) = view.selected_config(cx) {
-                            view.commit_duplicate(&config.id, window, cx);
-                        } else {
-                            window
-                                .push_notification(Notification::info(no_selection_message()), cx);
-                        }
-                    })),
-            )
-            .child(
-                Button::new("reset-traffic")
-                    // Ticket 44: small + tooltip (detail-bar density).
-                    .small()
-                    .label("Reset traffic")
-                    .tooltip("Reset this row's traffic counters")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        if let Some(config) = view.selected_config(cx) {
-                            view.open_traffic_reset_confirm(config, window, cx);
-                        } else {
-                            window
-                                .push_notification(Notification::info(no_selection_message()), cx);
-                        }
-                    })),
-            )
-            .child(
-                Button::new("copy-urls")
-                    // Ticket 44: small + tooltip; clipboard carries bind
-                    // + port only (never params or secrets).
-                    .small()
-                    .label("Copy URLs")
-                    .tooltip("Copy bind endpoints (no secrets)")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.copy_selected_urls(window, cx);
-                    })),
-            )
             .child({
                 // T06: loading state + inline spinner while a start
                 // is in flight (the label already reads `Starting.`
@@ -9972,10 +10580,18 @@ impl AppView {
         let (total, enabled) = self.libraries.read(cx).delegate().counts();
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
-        // Ticket 45: summed usage totals ride the status bar (absent on a
-        // broken read — never a lying zero). Separators split the four
-        // segments so counts, engine, health, and usage read as one strip.
-        let mut bar = div()
+        // throne-density 04: three regions inside the single `left()` slot
+        // (kit `StatusBar` pins only `left`/`right` — with just `left`, its
+        // center end-aligns, so the spread lives here). `flex_1` spacers
+        // push `status-left` (stored + enabled counts) / `status-center`
+        // (engine + health) / `status-right` (usage totals) across the
+        // strip. Separators split the regions so the segments still read
+        // as one strip.
+        // Ticket 45: summed usage totals ride the right region (absent on
+        // a broken read — never a lying zero).
+        let left = div()
+            .id("status-left")
+            .test_support()
             .flex()
             .flex_row()
             .items_center()
@@ -9985,16 +10601,41 @@ impl AppView {
                     .id("status-count")
                     .test_support()
                     .child(format!("{total} configurations · {enabled} enabled")),
-            )
-            .child(Separator::vertical())
+            );
+        let center = div()
+            .id("status-center")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
             .child(div().id("engine-status").test_support().child(engine_text))
             .child(Separator::vertical())
             .child(div().id("health-status").test_support().child(health_text));
+        let mut right = div()
+            .id("status-right")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2();
         if let Some(totals) = summed_traffic_text(&self.store) {
-            bar = bar
+            right = right
                 .child(Separator::vertical())
                 .child(div().id("traffic-status").test_support().child(totals));
         }
+        let bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .child(left)
+            .child(Separator::vertical())
+            .child(div().flex_1())
+            .child(center)
+            .child(div().flex_1())
+            .child(right);
         StatusBar::new().left(bar)
     }
 
@@ -10662,6 +11303,9 @@ impl AppView {
         match self.store.move_to_group(ids, group) {
             Ok(moved) => {
                 self.reload(window, cx);
+                // Ticket 44: facet counts + inspector follow the move through
+                // the existing reload + picker sync (no picker-local state).
+                self.sync_facet_pickers(window, cx);
                 window.push_notification(
                     Notification::success(format!(
                         "Moved {moved} configuration(s) to \"{}\"",
@@ -10704,7 +11348,9 @@ impl AppView {
                     .gap_2()
                     .child(Label::new(format!("{group} ({count})")))
                     .child(
-                        Button::new(format!("group-rename-{}", group))
+                        // Ticket 44: manager ids slug the label (slashes never
+                        // reach an element id); the row label stays verbatim.
+                        Button::new(format!("group-rename-{}", slugify_group_id(group)))
                             .label("Rename")
                             .on_click(move |_, window, cx| {
                                 let group = rename_group.clone();
@@ -10714,7 +11360,9 @@ impl AppView {
                             }),
                     )
                     .child(
-                        Button::new(format!("group-delete-{}", group))
+                        // Ticket 44: manager ids slug the label (slashes never
+                        // reach an element id); the row label stays verbatim.
+                        Button::new(format!("group-delete-{}", slugify_group_id(group)))
                             .label("Delete")
                             .on_click(move |_, window, cx| {
                                 let group = delete_group.clone();
@@ -10804,11 +11452,23 @@ impl AppView {
                 true
             }
             Ok(moved) => {
+                let renamed = new.trim().to_string();
                 self.reload(window, cx);
+                // Ticket 44: a facet pinned to the old label follows the rename
+                // (otherwise the list empties under a stale filter); counts +
+                // inspector refresh via the existing reload + picker sync.
+                self.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    if delegate.facet_group.as_deref() == Some(old) {
+                        delegate.set_facet_group(Some(renamed.clone()));
+                    }
+                    list_cx.notify();
+                });
+                self.sync_facet_pickers(window, cx);
                 window.push_notification(
                     Notification::success(format!(
                         "Renamed \"{old}\" to \"{}\" ({moved} row(s))",
-                        new.trim()
+                        renamed
                     )),
                     cx,
                 );
@@ -10831,6 +11491,19 @@ impl AppView {
     fn commit_delete_group(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_group(name) {
             Ok(()) => {
+                // Ticket 44: rows are unchanged (empty-only delete) but the
+                // group inventory shrank — reload + picker sync refresh facet
+                // counts and the inspector; a facet pinned to the removed
+                // label clears instead of filtering to nothing.
+                self.reload(window, cx);
+                self.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    if delegate.facet_group.as_deref() == Some(name) {
+                        delegate.set_facet_group(None);
+                    }
+                    list_cx.notify();
+                });
+                self.sync_facet_pickers(window, cx);
                 window.push_notification(
                     Notification::success(format!("Deleted empty group \"{name}\"")),
                     cx,
@@ -11064,6 +11737,54 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The sketch: fixed top bar (TitleBar + toolbar + drop hint),
+        // then a vertical split — middle list over bottom info bar — then a
+        // fixed status strip. Only the middle/bottom split resizes; the top
+        // bar never takes a divider. `config-list` keeps its id and the
+        // detail pane keeps `config-detail` inside its panel, so selection,
+        // search, and scroll ownership are unchanged.
+        let show_detail = self.config_count(cx) != 0;
+        // Ticket 07: spike flag (default off). The `List` stays mounted and is
+        // the only path when off — nothing below may change that arm.
+        let show_table = self.table_spike;
+        if show_table {
+            self.sync_table_selection(cx);
+        }
+        let search_count = self.render_search_count(cx);
+        let facet_bar = self.render_facet_bar(window, cx);
+        let bulk_bar = self.render_bulk_bar(cx);
+        let empty_ctas = self.render_empty_ctas(cx);
+        let mut list_pane = div()
+            .id("config-list")
+            .test_support()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(search_count)
+            .child(facet_bar)
+            .child(bulk_bar)
+            // The list absorbs the slack so the empty-CTA strip
+            // stays pinned inside the pane: block-stacked children
+            // overflowed the pane bottom and the CTA buttons
+            // rendered below the window edge.
+            .child(
+                List::new(&self.libraries)
+                    .search_placeholder("Search configurations")
+                    .flex_1(),
+            );
+        // Ticket 07: spike table below the `List` (never instead of it).
+        // Default-off, so the paint path above is byte-identical when off.
+        if show_table {
+            list_pane = list_pane.child(
+                div()
+                    .id("dense-table-spike")
+                    .test_support()
+                    .h(px(200.))
+                    .child(DataTable::new(&self.table_state).small()),
+            );
+        }
+        list_pane = list_pane.child(empty_ctas);
         self.render_shell(cx)
             .child(TitleBar::new().child(APP_TITLE))
             .child(self.render_toolbar(cx))
@@ -11079,29 +11800,34 @@ impl Render for AppView {
                     .child("Drop .conf / .json / .txt files here to import"),
             )
             .child(
-                div().flex().flex_col().flex_1().child(
-                    div()
-                        .id("config-list")
-                        .test_support()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .child(self.render_search_count(cx))
-                        .child(self.render_facet_bar(window, cx))
-                        .child(self.render_bulk_bar(cx))
-                        // The list absorbs the slack so the empty-CTA strip
-                        // stays pinned inside the pane: block-stacked children
-                        // overflowed the pane bottom and the CTA buttons
-                        // rendered below the window edge.
-                        .child(
-                            List::new(&self.libraries)
-                                .search_placeholder("Search configurations")
-                                .flex_1(),
-                        )
-                        .child(self.render_empty_ctas(cx)),
-                ),
+                div()
+                    .id("main-content")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_resizable("main-split")
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(120.)..px(10000.))
+                                    .child(list_pane),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .visible(show_detail)
+                                    .size(px(240.))
+                                    // Min 240 keeps the failed-row evidence
+                                    // (`config-health-alert` ends at ~234px
+                                    // in the 1000x700 frame) painted after a
+                                    // proportional settle; the divider still
+                                    // grows the inspector to 480.
+                                    .size_range(px(240.)..px(480.))
+                                    .child(self.render_detail(cx)),
+                            ),
+                    ),
             )
-            .child(self.render_detail(cx))
             .child(self.render_status_bar(cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
@@ -14620,6 +15346,39 @@ mod tests {
         assert!(clip.contains("panic"), "clipboard carries visible lines");
     }
 
+    /// Ticket 03 (throne-density): the consolidated command strip keeps
+    /// every command reachable from one row with unchanged ids/handlers.
+    /// Presence (not paint) is asserted — the strip overflows at test width.
+    #[gpui_kit::test]
+    fn command_strip_all_ids_present(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        for id in [
+            "add-config",
+            "import-config",
+            "import-clipboard",
+            "export-library",
+            "subscriptions",
+            "routing-presets",
+            "engine-start-all",
+            "start-selected",
+            "engine-stop-all",
+            "stop-selected",
+            "health-test-all",
+            "test-selected",
+            "about-dialog",
+            "settings-dialog",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} renders in the command strip"
+            );
+        }
+    }
+
     /// Scenario: subscription expand flips + toolbar/empty/params/import/
     /// settings chrome paints (US-2/4/9/10/13/16/19 paint halves).
     #[gpui_kit::test]
@@ -15217,6 +15976,19 @@ mod tests {
             delegate.protocol_options(),
             vec!["vless".to_string(), "vmess".to_string()]
         );
+        // Ticket 02 (throne-density): the closed picker label carries the
+        // live count too, so the count reads without opening the menu.
+        use crate::FacetMenu;
+        let (group_choices, _) = FacetMenu::Group.choices(&delegate);
+        let team = group_choices
+            .iter()
+            .find(|choice| choice.value.as_deref() == Some("team"))
+            .expect("team choice exists");
+        assert!(
+            team.display.contains("(2)"),
+            "closed label shows count: {}",
+            team.display
+        );
     }
 
     /// Ticket 44 UI: facet bar, bulk bar, and row checkboxes paint with stable
@@ -15491,6 +16263,144 @@ mod tests {
             2,
             "refused delete removes nothing"
         );
+    }
+
+    /// Ticket 44 (06 parity): renaming `home` → `cabin` refreshes facet
+    /// options and the synced picker (new name with correct counts, old name
+    /// gone) and the inspector follows the selected row into the new label.
+    #[gpui_kit::test]
+    fn t44_ui_rename_group_refreshes_facets_and_inspector(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(facet_seed("One", "vless", "home", "10841"))
+            .expect("seed works");
+        store
+            .add(facet_seed("Two", "vless", "home", "10842"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        // Pin the selection so the inspector has a row to follow.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let renamed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_rename_group("home", "cabin", window, cx)
+            })
+        });
+        assert!(renamed, "rename commits");
+        // Facet options carry the new name with the moved count; the old
+        // label is gone from options and from the synced picker.
+        let options = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().group_options()
+        });
+        assert_eq!(options, vec![("cabin".to_string(), 2)]);
+        let (choices, _) = view.read_with(cx, |view, cx| {
+            crate::FacetMenu::Group.choices(view.libraries.read(cx).delegate())
+        });
+        assert!(
+            choices.iter().any(|choice| choice.title == "cabin (2)"),
+            "picker shows the new name with counts"
+        );
+        assert!(
+            !choices.iter().any(|choice| choice.title.contains("home")),
+            "old name leaves the picker"
+        );
+        let synced: Vec<String> = view.read_with(cx, |view, _| {
+            view.facet_group
+                .synced
+                .iter()
+                .map(|choice| choice.id.clone())
+                .collect()
+        });
+        assert!(
+            synced.iter().any(|id| id == "facet-group-cabin"),
+            "synced picker ids follow the rename: {synced:?}"
+        );
+        // Inspector follows the selected row into the new label.
+        let selected = view.read_with(cx, |view, cx| view.selected_config(cx));
+        assert_eq!(
+            selected.map(|row| row.group),
+            Some("cabin".to_string()),
+            "inspector row carries the renamed group"
+        );
+    }
+
+    /// Ticket 44 (06 parity): deleting a group that still holds rows refuses
+    /// loudly (existing store copy names the count), deletes nothing, and
+    /// keeps the rows; a slashed label slugifies to a safe element id while
+    /// display stays verbatim.
+    #[gpui_kit::test]
+    fn t44_ui_delete_group_refuses_while_rows_remain(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(facet_seed("One", "vless", "site/east", "10843"))
+            .expect("seed works");
+        store
+            .add(facet_seed("Two", "vless", "site/east", "10844"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_delete_group("site/east", window, cx)
+            });
+        });
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "non-empty delete refuses loudly"
+        );
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert_eq!(rows.len(), 2, "refused delete removes nothing");
+        assert!(
+            rows.iter().all(|row| row.group == "site/east"),
+            "rows keep the verbatim label"
+        );
+        // The slashed label never reaches an element id raw: the facet id
+        // slugs the slash away while the title stays verbatim with counts.
+        let (choices, _) = view.read_with(cx, |view, cx| {
+            crate::FacetMenu::Group.choices(view.libraries.read(cx).delegate())
+        });
+        let slashed = choices
+            .iter()
+            .find(|choice| choice.value.as_deref() == Some("site/east"))
+            .expect("slashed group stays a real choice");
+        assert_eq!(
+            slashed.id, "facet-group-site-east",
+            "slash slugified: {}",
+            slashed.id
+        );
+        assert_eq!(
+            slashed.title, "site/east (2)",
+            "display verbatim: {}",
+            slashed.title
+        );
+        assert!(!slashed.id.contains('/'), "no raw slash in element ids");
+    }
+
+    /// Ticket 44 (06 parity): group-label slug keeps plain names stable
+    /// (existing `facet-group-travel` ids never shift) and maps every other
+    /// byte to a dash (slashes/spaces never reach an element id).
+    #[test]
+    fn t44_slugify_group_id_keeps_plain_names_stable() {
+        assert_eq!(crate::slugify_group_id("travel"), "travel");
+        assert_eq!(crate::slugify_group_id("team"), "team");
+        assert_eq!(crate::slugify_group_id("site/east"), "site-east");
+        assert_eq!(crate::slugify_group_id("my group"), "my-group");
+        assert_eq!(crate::slugify_group_id("a/b/c"), "a-b-c");
+        assert!(!crate::slugify_group_id("a/b").contains('/'));
+        assert_eq!(crate::slugify_group_id(""), "group");
     }
 
     /// Ticket 44 UI: facet pickers narrow the visible list; clear restores it.
@@ -16407,6 +17317,14 @@ mod tests {
                 });
             });
         });
+        // Ticket 05: health lives in the Health pane — open it before
+        // asserting the section.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector_tab = crate::InspectorTab::Health;
+                cx.notify();
+            });
+        });
         // Dead outcome: errored sample, no success.
         cx.update(|_, cx| {
             view.update(cx, |view, _cx| {
@@ -16453,6 +17371,86 @@ mod tests {
         paint_frame(cx);
         assert_painted(cx, "config-health");
         assert_absent(cx, "config-health-alert".to_string());
+    }
+
+    /// Ticket 05: failed row → Health pane carries the named failure plus
+    /// Start/Stop, Test, Ping, and Logs operating on the same row, while
+    /// the Details-only sections leave with the pane switch.
+    #[gpui_kit::test]
+    fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the row and open the Health pane.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+                view.inspector_tab = crate::InspectorTab::Health;
+                cx.notify();
+            });
+        });
+        // Dead outcome: errored sample, no success.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _cx| {
+                view.health_store.record_outcome(&TestOutcome {
+                    sample: HealthSample {
+                        config_id: seeded.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: None,
+                        error: Some("timeout".to_string()),
+                    },
+                    success: None,
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        // The tab bar and its tabs render with stable ids.
+        assert!(
+            cx.update(|window, _| window.try_find("inspector-tabs".to_string()).is_some()),
+            "inspector tab bar renders"
+        );
+        for id in [
+            "inspector-tab-details",
+            "inspector-tab-health",
+            "inspector-tab-presets",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders"
+            );
+        }
+        // Named failure paints in the Health pane...
+        assert_painted(cx, "config-health");
+        assert_painted(cx, "config-health-alert");
+        assert_painted(cx, "config-history");
+        // ...with the row ops present on the same row...
+        for id in [
+            "engine-start",
+            "engine-stop",
+            "health-test",
+            "health-ping",
+            "logs-open",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} operates on the Health pane row"
+            );
+        }
+        // ...while the Details-only sections leave with the pane switch.
+        assert_absent(cx, "config-endpoints".to_string());
+        assert_absent(cx, "config-preset".to_string());
     }
 
     /// T06 red-first: in-flight flags surface as loading spinners on the
@@ -16994,6 +17992,54 @@ mod tests {
             5,
             "flowing traffic appends its line"
         );
+    }
+
+    /// Ticket 01 (throne-density): dense lines merge meta and fold traffic
+    /// into the badge — 3 lines max, same visible facts, no secrets.
+    #[test]
+    fn library_row_dense_lines_merge_meta_and_badge() {
+        use crate::library_row_dense_lines_with_upstream;
+        use crate::store::ProxyConfig;
+        let row = ProxyConfig {
+            id: "7".to_string(),
+            name: "Work".to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"server\":\"a.example.com\",\"server_port\":443,\"password\":\"s3cret\"}"
+                .to_string(),
+            group: "travel".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let dense = library_row_dense_lines_with_upstream(
+            &row,
+            "a.example.com:443",
+            Some("87ms"),
+            true,
+            Some((1_048_782, 88)),
+        );
+        assert_eq!(dense.len(), 3, "dense rows are 3 lines max");
+        let full = dense.join("\n");
+        for want in [
+            "Work",
+            "vless",
+            "a.example.com:443",
+            "travel",
+            "127.0.0.1:10801",
+            "enabled",
+            "Running",
+            "87ms",
+            "1.0 MB",
+        ] {
+            assert!(full.contains(want), "{want} visible in:\n{full}");
+        }
+        assert!(!full.contains("s3cret"), "no secrets in dense rows");
+        let idle = library_row_dense_lines_with_upstream(&row, "no upstream", None, false, None);
+        assert_eq!(idle.len(), 3, "idle dense rows keep badge line");
+        assert!(idle[2].contains("Stopped"), "idle badge honest");
     }
 
     /// Upstream extraction reads host/port keys only — credentials in params
@@ -19653,5 +20699,633 @@ mod tests {
         ))
         .expect_err("location-less redirect fails");
         assert!(error.contains("bad redirect"), "loud cause, got {error}");
+    }
+
+    // -- Ticket 08: density lock + keyboard + secrets audit ------------------
+
+    /// Ticket 08: frame containment for one painted anchor — the element
+    /// paints (see [`assert_painted`]) AND its far edge stays inside the
+    /// 1000x700 frame (1px rounding epsilon). Presence alone never proves
+    /// "without clipping".
+    fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {
+        let bounds = cx
+            .update(|window, _| window.try_find(id.to_owned()))
+            .unwrap_or_else(|| panic!("{id} renders: missing element in completed frame"))
+            .bounds();
+        assert!(
+            bounds.origin.x >= px(0.) && bounds.origin.y >= px(0.),
+            "{id} starts inside the frame: {bounds:?}"
+        );
+        assert!(
+            bounds.origin.x + bounds.size.width <= px(1000.) + px(1.),
+            "{id} ends inside the frame width: {bounds:?}"
+        );
+        assert!(
+            bounds.origin.y + bounds.size.height <= px(700.) + px(1.),
+            "{id} ends inside the frame height: {bounds:?}"
+        );
+    }
+
+    /// Ticket 08 (a): density lock at the 1000x700 desktop frame — the
+    /// command strip, facet bar, three dense rows, inspector, and status
+    /// strip all paint inside the frame (no clipping). Command reachability
+    /// pins every id by presence (the strip overflows at test width per
+    /// `command_strip_all_ids_present`, so buttons pin presence while the
+    /// leading `add-config` — never the clipped end — pins paint);
+    /// below-the-fold inspector actions pin presence for the same reason.
+    #[gpui_kit::test]
+    fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let third = store
+            .add(row19_seed("Cabin", "c.example.com", "10803"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the first row so the inspector has a row to render.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        // Command strip: the leading action paints inside the frame (the
+        // strip container carries no test anchor and the strip overflows
+        // at test width per `command_strip_all_ids_present`, so every
+        // command pins reachability by presence while `add-config` — the
+        // first child, never the clipped end — pins paint).
+        assert_painted(cx, "add-config");
+        assert_within_frame(cx, "add-config");
+        for id in [
+            "add-config",
+            "import-config",
+            "import-clipboard",
+            "export-library",
+            "subscriptions",
+            "routing-presets",
+            "engine-start-all",
+            "start-selected",
+            "engine-stop-all",
+            "stop-selected",
+            "health-test-all",
+            "test-selected",
+            "about-dialog",
+            "settings-dialog",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} renders in the command strip"
+            );
+        }
+        // Facet bar + pickers paint inside the frame.
+        for id in ["facet-bar", "facet-group", "facet-protocol", "facet-status"] {
+            assert_painted(cx, id);
+            assert_within_frame(cx, id);
+        }
+        // Three dense rows paint, stacked top-to-bottom, inside the frame.
+        for id in [&first.id, &second.id, &third.id] {
+            let row = format!("library-row-{id}");
+            assert_painted(cx, &row);
+            assert_within_frame(cx, &row);
+        }
+        let tops = cx.update(|window, _| {
+            [&first.id, &second.id, &third.id]
+                .iter()
+                .map(|id| {
+                    window
+                        .try_find(format!("library-row-{id}"))
+                        .expect("dense row paints")
+                        .bounds()
+                        .origin
+                        .y
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            tops[1] > tops[0] && tops[2] > tops[1],
+            "dense rows stack without overlap: {tops:?}"
+        );
+        // Inspector paints inside the frame; its tab markers stay stable
+        // (presence — they ride as zero-size markers, see the health-pane
+        // test) and the row ops stay reachable below the fold.
+        assert_painted(cx, "config-detail");
+        assert_within_frame(cx, "config-detail");
+        assert_painted(cx, "config-endpoints");
+        assert_within_frame(cx, "config-endpoints");
+        for id in [
+            "inspector-tabs",
+            "inspector-tab-details",
+            "inspector-tab-health",
+            "inspector-tab-presets",
+            "copy-urls",
+            "engine-start",
+            "engine-stop",
+            "health-test",
+            "health-ping",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders in the inspector"
+            );
+        }
+        // Status strip paints inside the frame.
+        assert_painted(cx, "status-count");
+        assert_within_frame(cx, "status-count");
+        assert_painted(cx, "status-left");
+        assert_within_frame(cx, "status-left");
+        for id in [
+            "status-center",
+            "status-right",
+            "engine-status",
+            "health-status",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders in the status strip"
+            );
+        }
+    }
+
+    /// Ticket 08 (b): keyboard-only Add -> Start -> Copy-URLs completes
+    /// pointer-free — this test issues zero `window.click` calls by
+    /// construction. Ctrl-N opens Add (the store commit runs through the
+    /// exact shared `DialogCommit` target the Confirm key path calls;
+    /// headless typing is not feasible, so the form fill is programmatic),
+    /// F5 starts the row, the copy handler fills the clipboard with both
+    /// bind+port URL forms, Shift-F5 stops it, Ctrl-T explains itself with
+    /// nothing running, Escape clears checks (never the selection), and
+    /// arrows pass through the app layer untouched (no dialog, no toast, no
+    /// selection/check change — list navigation keeps its keys).
+    #[gpui_kit::test]
+    fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        // The visible hints never drift from the bindings above.
+        let expected = [
+            ("Add configuration", "Ctrl-N"),
+            ("Import configurations", "Ctrl-O"),
+            ("Start selected", "F5"),
+            ("Stop selected", "Shift-F5"),
+            ("Test selected", "Ctrl-T"),
+        ];
+        assert_eq!(crate::SHORTCUT_LINES.len(), expected.len());
+        for (line, want) in crate::SHORTCUT_LINES.iter().zip(expected) {
+            assert_eq!(*line, want);
+        }
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        // Fake engine + prober: starts complete headless with no network.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                use crate::engine::EngineController;
+                use crate::health::FakeHealthProber;
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, _) = FakeHealthProber::shared();
+                view.prober = Box::new(prober);
+            });
+        });
+        // Focus the shell so the library key context matches (existing
+        // keyboard-test pattern).
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let press = |cx: &mut VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+        };
+        // Ctrl-N opens Add (pointer-free); the dialog carries its fields.
+        press(cx, "ctrl-n");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Ctrl-N opens Add"
+        );
+        assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
+        let added = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_add(t26_engine_seed("Keyflow", "10981"), window, cx)
+            })
+        });
+        assert!(added, "shared add commit stores the row");
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        // Select the new row, then F5 starts it (fake engine, loopback).
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let before = notification_count(cx);
+        press(cx, "f5");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "F5 starts the selected row"
+        );
+        assert_eq!(notification_count(cx), before + 1, "start toasts once");
+        // Copy URLs through the button's exact handler (no mouse): both
+        // bind+port forms land — never params, uuids, or upstream hosts.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        let (bind, port) = view.read_with(cx, |view, cx| {
+            let row = view.selected_config(cx).expect("selected");
+            (row.bind_ip.clone(), row.port)
+        });
+        let (socks, http) = crate::store::proxy_urls(&bind, port);
+        assert_eq!(clip, format!("{socks}\n{http}"));
+        assert!(clip.contains("socks5://") && clip.contains("\nhttp://"));
+        assert!(
+            !clip.contains("198.51.100.9") && !clip.contains("11111111"),
+            "clipboard carries bind+port only: {clip}"
+        );
+        // Shift-F5 stops it again.
+        let before = notification_count(cx);
+        press(cx, "shift-f5");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "Shift-F5 stops the selected row"
+        );
+        assert_eq!(notification_count(cx), before + 1, "stop toasts once");
+        // Ctrl-T with nothing running explains itself (never a dead key).
+        let before = notification_count(cx);
+        press(cx, "ctrl-t");
+        cx.run_until_parked();
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "Ctrl-T routes with nothing running"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts"
+        );
+        // Escape clears the checked set through the keybinding — silently,
+        // and never the selection.
+        let id = view.read_with(cx, |view, cx| {
+            view.selected_config(cx).expect("selected").id
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().toggle_checked(&id);
+                    list_cx.notify();
+                });
+            });
+        });
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let before = notification_count(cx);
+        press(cx, "escape");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .bulk_label()),
+            "",
+            "Escape clears the checked set"
+        );
+        assert_eq!(notification_count(cx), before, "Escape clear is silent");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id)),
+            Some(id.clone()),
+            "Escape never eats the selection"
+        );
+        // While a dialog owns Escape, the guarded path preserves the set
+        // (existing `clear_checked_unless_dialog` pattern — direct call, so
+        // the dialog's own dismiss never interferes headless).
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().toggle_checked(&id);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            window.open_dialog(cx, |dialog: Dialog, _, _| dialog.title("Guard probe"));
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        let kept = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.clear_checked_unless_dialog(window, cx))
+        });
+        assert!(!kept, "escape keeps the set while a dialog is open");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .bulk_label()),
+            "1 selected"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        // Arrows pass through the app layer untouched: no dialog, no toast,
+        // selection and checks unchanged.
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let before = notification_count(cx);
+        press(cx, "down");
+        press(cx, "up");
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "arrows open nothing"
+        );
+        assert_eq!(notification_count(cx), before, "arrows toast nothing");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id)),
+            Some(id.clone()),
+            "arrows keep the selection"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .bulk_label()),
+            "1 selected",
+            "arrows keep the checks"
+        );
+    }
+
+    /// Ticket 08 (c): secrets audit — the table, inspector, clipboard, logs,
+    /// and status/export-preview surfaces carry bind+port only (no keys,
+    /// tokens, or passwords). The export payload file itself stays
+    /// plaintext by design (the store round-trip pins it), so the audit
+    /// pins the gate instead: the verbatim plaintext warning plus confirm,
+    /// with nothing written until confirm.
+    #[gpui_kit::test]
+    fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        fn secret_seed(name: &str, port: &str) -> NewConfig {
+            NewConfig {
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                // Ticket 41: documentation IPs on started rows — the start
+                // path resolves egress hostnames before spawn. Secret fields
+                // ride alongside the proven startable shape.
+                params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                    \"uuid\":\"SECRET-UUID-08\",\"encryption\":\"none\",\
+                    \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\",\
+                    \"password\":\"hunter2\",\"token\":\"tok-abc123-08\"}"
+                    .to_string(),
+                group: "travel".to_string(),
+                bind_ip: "127.0.0.1".to_string(),
+                port: port.to_string(),
+            }
+        }
+        const CANARIES: &[&str] = &["hunter2", "SECRET-UUID-08", "tok-abc123-08"];
+        fn assert_no_canaries(text: &str, surface: &str) {
+            for &canary in CANARIES {
+                assert!(
+                    !text.contains(canary),
+                    "{surface} surfaces {canary}: {text}"
+                );
+            }
+        }
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store.add(secret_seed("Work", "10982")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let row = view.read_with(cx, |view, cx| view.selected_config(cx).expect("selected"));
+        assert_eq!(row.id, seeded.id);
+        // Pure row surfaces: bind+port, upstream host, badge — never params.
+        let (socks, http) = crate::store::proxy_urls(&row.bind_ip, row.port);
+        assert_eq!(socks, "socks5://127.0.0.1:10982");
+        assert_eq!(http, "http://127.0.0.1:10982");
+        assert_no_canaries(&socks, "proxy_urls socks");
+        assert_no_canaries(&http, "proxy_urls http");
+        let upstream = crate::upstream_host_port(&row).expect("upstream reads");
+        assert_eq!(upstream, "198.51.100.9:443");
+        assert_no_canaries(&upstream, "upstream");
+        let dense =
+            crate::library_row_dense_lines_with_upstream(&row, &upstream, Some("87ms"), true, None)
+                .join("\n");
+        assert!(
+            dense.contains("127.0.0.1:10982"),
+            "bind+port visible: {dense}"
+        );
+        assert_no_canaries(&dense, "dense row");
+        let base = crate::library_row_lines(&row, Some("87ms"), true, None).join("\n");
+        assert_no_canaries(&base, "base row");
+        let badge = crate::serving_badge(true, row.port, Some("87ms"));
+        assert_no_canaries(&badge, "serving badge");
+        assert_no_canaries(
+            &crate::health::redact_secrets(
+                "dial tcp 127.0.0.1:10982: password=hunter2 uuid=SECRET-UUID-08 token=tok-abc123-08",
+            ),
+            "redact_secrets",
+        );
+        // Table: all eight spike cells read through the same strings.
+        let cells: Vec<String> = view.read_with(cx, |view, cx| {
+            use gpui_kit::component::table::TableDelegate;
+            let table = crate::DenseTableDelegate::new(view.libraries.clone());
+            assert_eq!(table.columns_count(cx), 8, "spike keeps eight columns");
+            (0..table.columns_count(cx))
+                .map(|col| table.cell_string(0, col, cx))
+                .collect()
+        });
+        for (col, text) in cells.iter().enumerate() {
+            assert_no_canaries(text, &format!("table col {col}"));
+        }
+        // Inspector inputs: the cached upstream plus the endpoint pair.
+        let cached = view.read_with(cx, |view, cx| {
+            let row = view.selected_config(cx).expect("selected");
+            view.cached_upstream(cx, &row)
+        });
+        assert_eq!(cached, "198.51.100.9:443");
+        assert_no_canaries(&cached, "inspector upstream");
+        // Clipboard: the copy handler writes bind+port only — not even the
+        // upstream host.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(clip, format!("{socks}\n{http}"));
+        assert_no_canaries(&clip, "clipboard");
+        assert!(
+            !clip.contains("198.51.100.9"),
+            "clipboard carries bind+port only: {clip}"
+        );
+        // Logs: ingest redacts secrets but keeps the bind+port evidence.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.logs.push_raw(
+                    "dial tcp 127.0.0.1:10982: password=hunter2 uuid=SECRET-UUID-08 token=tok-abc123-08",
+                    &crate::health::LogTagIndex::default(),
+                );
+            });
+        });
+        let (stored, visible) = view.read_with(cx, |view, cx| {
+            let stored = view
+                .logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>();
+            (stored, view.log_lines(cx))
+        });
+        assert_eq!(stored.len(), 1);
+        assert_no_canaries(&stored[0], "stored log");
+        assert!(
+            stored[0].contains("127.0.0.1:10982"),
+            "bind+port survives redaction: {}",
+            stored[0]
+        );
+        for line in &visible {
+            assert_no_canaries(line, "visible log");
+        }
+        // Status: counts and byte totals only.
+        let status = view.read_with(cx, |view, _| {
+            (
+                view.health_status_text(),
+                crate::summed_traffic_text(&view.store).unwrap_or_default(),
+                view.engine.status_text(),
+            )
+        });
+        assert_no_canaries(&status.0, "health status");
+        assert_no_canaries(&status.1, "traffic status");
+        assert_no_canaries(&status.2, "engine status");
+        // Probe failures redact through the production path (fake prober
+        // scripts a secret-bearing cause; `run_one` redacts at
+        // construction, so the delegate summary and the inspector
+        // detail line stay clean).
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                use crate::engine::EngineController;
+                use crate::health::FakeHealthProber;
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, handle) = FakeHealthProber::shared();
+                handle.script_failure(
+                    &seeded.id,
+                    "dial tcp 127.0.0.1:10982: password=hunter2 uuid=SECRET-UUID-08 token=tok-abc123-08",
+                );
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_selected_engine(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "probe target runs"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.test_selected_health(window, cx));
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (summary, detail) = view.read_with(cx, |view, cx| {
+            let summary = view
+                .libraries
+                .read(cx)
+                .delegate()
+                .health
+                .get(&seeded.id)
+                .cloned()
+                .unwrap_or_default();
+            (summary, view.health_store.detail_line(&seeded.id))
+        });
+        assert!(summary.contains("dead"), "failure recorded: {summary}");
+        assert_no_canaries(&summary, "row health");
+        assert_no_canaries(&detail, "inspector health");
+        // Export gate: the warning names every secret class, the confirm
+        // description is the warning verbatim, previews name counts+path
+        // only, and nothing is written until confirm.
+        use crate::store::{export_confirm_description, export_warning_text};
+        assert_eq!(export_confirm_description(), export_warning_text());
+        for class in ["private keys", "tokens", "passwords", "plaintext"] {
+            assert!(
+                export_warning_text().contains(class),
+                "warning names {class}: {}",
+                export_warning_text()
+            );
+        }
+        let preview =
+            crate::export_preview_description(1, 1, "/tmp/manyproxy-t08-export.json", false);
+        assert!(preview.contains('1'), "preview counts: {preview}");
+        assert_no_canaries(&preview, "export preview");
+        let overwrite =
+            crate::export_overwrite_confirm_description("/tmp/manyproxy-t08-export.json");
+        assert!(
+            overwrite.contains("/tmp/manyproxy-t08-export.json"),
+            "overwrite names the path: {overwrite}"
+        );
+        assert_no_canaries(&overwrite, "export overwrite");
+        let target =
+            std::env::temp_dir().join(format!("manyproxy-t08-export-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&target);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_export_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(
+            cx.update(|window, _| window.try_find("export-warning").is_some()),
+            "verbatim warning paints in the dialog"
+        );
+        assert!(!target.exists(), "nothing is written until confirm");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_export_write_to(&target.display().to_string(), window, cx)
+            });
+        });
+        let body = std::fs::read_to_string(&target).expect("export file written");
+        assert!(body.contains("library"), "payload has library section");
+        let _ = std::fs::remove_file(&target);
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 }
