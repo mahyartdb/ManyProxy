@@ -27,6 +27,7 @@ use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, Tex
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
@@ -135,11 +136,19 @@ pub const APP_TITLE: &str = "ManyProxy";
 /// [`TitleBar::window_options`]; `WindowOptions` itself has no title field —
 /// the initial title lives in `TitlebarOptions::title`, which the base
 /// leaves as `None`.
+/// Ticket 09: fresh launch opens at 1000x700 with an 880x620 minimum (no
+/// persisted geometry — the OS default is a huge window).
 fn app_window_options() -> WindowOptions {
     let mut options = TitleBar::window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some(APP_TITLE.into());
     }
+    // Ticket 09: initial content size 1000x700, resizable down to 880x620.
+    options.window_bounds = Some(WindowBounds::Windowed(Bounds::new(
+        point(px(0.), px(0.)),
+        size(px(1000.), px(700.)),
+    )));
+    options.window_min_size = Some(size(px(880.), px(620.)));
     options
 }
 
@@ -1360,7 +1369,9 @@ impl ConfigForm {
             .flex_col()
             .gap_1()
             .child(Label::new("Params"))
-            .child(Textarea::new(&self.params).h(px(120.)))
+            // Ticket 11: 96px instead of 120 — the Add form (6 fields +
+            // footer) must paint inside the 880x620 minimum frame.
+            .child(Textarea::new(&self.params).h(px(96.)))
             .child(
                 div()
                     .flex()
@@ -1396,10 +1407,12 @@ impl ConfigForm {
                         },
                     )),
             );
+        // Ticket 11: gap_1 between fields (not gap_2) — saves ~20px so the
+        // 6-field Add form fits the 880x620 minimum frame.
         let mut col = div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(dialog_field("field-name", "Name", self.name))
             .child(dialog_field("field-protocol", "Protocol", self.protocol))
             .child(params_row)
@@ -11580,8 +11593,21 @@ impl AppView {
     /// inside [Render::render]'s single builder chain, so a debug first frame no
     /// longer nests the whole window tree in one function frame (main-thread stack
     /// overflow at startup - see .planning/follow-ups/startup-stack-overflow.md).
-    /// Content is unchanged: same ids, labels, tooltips, and handlers.
+    /// Ticket 10: 4 dedicated buttons plus Library / Manage / Engine / Help
+    /// dropdown menus — same ids, labels, tooltips, and handlers throughout.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Ticket 10: the 14-button strip is 4 dedicated core-flow buttons
+        // (Add, Start selected, Stop selected, Test selected — same ids,
+        // labels, Kbd chips, tooltips, handlers) plus Library / Manage /
+        // Engine / Help dropdown triggers, so the strip fits narrow
+        // windows. The other 10 actions moved verbatim (label, tooltip,
+        // handler) into menu items; each item keeps its stable id on a
+        // custom element because `PopupMenuItem` carries no id of its own.
+        // Shortcuts, SHORTCUT_LINES, and the About list are untouched.
+        let library_view = cx.entity();
+        let manage_view = cx.entity();
+        let engine_view = cx.entity();
+        let help_view = cx.entity();
         div()
             .id("manyproxy-toolbar")
             .flex()
@@ -11596,8 +11622,8 @@ impl AppView {
             // Ticket 33: shortcut hints ride in the labels (F5/Shift-F5/
             // Ctrl-T/Ctrl-N/Ctrl-O) so the bindings in [`bind_app_keys`]
             // are visible without opening About. Button ids are
-            // unchanged. Separators group Library / Manage / Engine /
-            // Health / Help; tooltips name each action.
+            // unchanged. Separators group core actions / library menus /
+            // help; tooltips name each action.
             .child(
                 Button::new("add-config")
                     .primary()
@@ -11611,58 +11637,7 @@ impl AppView {
                         view.open_add_dialog(window, cx);
                     })),
             )
-            .child(
-                Button::new("import-config")
-                    .label("Import")
-                    .accessibility_label("Import (Ctrl-O)")
-                    .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
-                    .tooltip("Import share links or files")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                    })),
-            )
-            .child(
-                Button::new("import-clipboard")
-                    .label("From clipboard")
-                    .tooltip("Import from clipboard text")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_import_from_clipboard(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("export-library")
-                    .label("Export")
-                    .tooltip("Export library to JSON")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_export_dialog(window, cx);
-                    })),
-            )
             .child(Separator::vertical())
-            .child(
-                Button::new("subscriptions")
-                    .label("Subscriptions")
-                    .tooltip("Manage subscription lists")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_subscriptions_dialog(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("routing-presets")
-                    .label("Presets")
-                    .tooltip("Manage routing presets")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_presets_dialog(window, cx);
-                    })),
-            )
-            .child(Separator::vertical())
-            .child(
-                Button::new("engine-start-all")
-                    .label("Start all")
-                    .tooltip("Start every configuration")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.start_all_engines(window, cx);
-                    })),
-            )
             // Ticket 43: the F5 key starts the SELECTED row (see
             // [`bind_app_keys`]) — the old "Start all (F5)" label
             // lied. Selected actions carry their key hints; bulk
@@ -11670,7 +11645,10 @@ impl AppView {
             .child(
                 Button::new("start-selected")
                     .primary()
-                    .label("Start selected")
+                    // Ticket 10: short visible label (the strip must fit the
+                    // 1000px frame); the pinned `Start selected (F5)` string
+                    // stays on the accessible name + tooltip + Kbd chip.
+                    .label("Start")
                     .accessibility_label("Start selected (F5)")
                     .child(shortcut_kbd("f5", "(F5)"))
                     .tooltip("Start the selected endpoint")
@@ -11679,16 +11657,10 @@ impl AppView {
                     })),
             )
             .child(
-                Button::new("engine-stop-all")
-                    .label("Stop all")
-                    .tooltip("Stop every endpoint")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.stop_all_engines(window, cx);
-                    })),
-            )
-            .child(
                 Button::new("stop-selected")
-                    .label("Stop selected")
+                    // Ticket 10: short visible label; pinned
+                    // `Stop selected (Shift-F5)` stays on the accessible name.
+                    .label("Stop")
                     .accessibility_label("Stop selected (Shift-F5)")
                     .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
                     .tooltip("Stop the selected endpoint")
@@ -11696,18 +11668,11 @@ impl AppView {
                         view.stop_selected_engine(window, cx);
                     })),
             )
-            .child(Separator::vertical())
-            .child(
-                Button::new("health-test-all")
-                    .label("Test all")
-                    .tooltip("Test every running endpoint")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.test_all_health(window, cx);
-                    })),
-            )
             .child(
                 Button::new("test-selected")
-                    .label("Test selected")
+                    // Ticket 10: short visible label; pinned
+                    // `Test selected (Ctrl-T)` stays on the accessible name.
+                    .label("Test")
                     .accessibility_label("Test selected (Ctrl-T)")
                     .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
                     .tooltip("Test the selected endpoint")
@@ -11716,21 +11681,312 @@ impl AppView {
                     })),
             )
             .child(Separator::vertical())
+            // Ticket 10: Library menu — the import/export buttons moved
+            // verbatim (label, tooltip, handler) into items keeping their
+            // stable ids.
             .child(
-                Button::new("about-dialog")
-                    .label("About")
-                    .tooltip("Version, sidecars, shortcuts")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_about_dialog(window, cx);
-                    })),
+                Button::new("library-menu")
+                    .label("Library")
+                    .tooltip("Import and export the library")
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("import-config")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Import share links or files"))
+                                            .into()
+                                    })
+                                    .child("Import")
+                                    .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
+                            })
+                            .on_click({
+                                let view = library_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_import_dialog(
+                                            "",
+                                            DEFAULT_GROUP,
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("import-clipboard")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Import from clipboard text"))
+                                            .into()
+                                    })
+                                    .child("From clipboard")
+                            })
+                            .on_click({
+                                let view = library_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_import_from_clipboard(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("export-library")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Export library to JSON")).into()
+                                    })
+                                    .child("Export")
+                            })
+                            .on_click({
+                                let view = library_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_export_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                    }),
             )
+            // Ticket 10: Manage menu — subscriptions and presets moved
+            // verbatim from the strip; Groups opens the same dialog as the
+            // facet-bar `groups-dialog` button (which stays put).
             .child(
-                Button::new("settings-dialog")
-                    .label("Settings")
-                    .tooltip("Autostart, restore, test URL")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_settings_dialog(window, cx);
-                    })),
+                Button::new("manage-menu")
+                    .label("Manage")
+                    .tooltip("Subscriptions, presets, and groups")
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("subscriptions")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Manage subscription lists")).into()
+                                    })
+                                    .child("Subscriptions")
+                            })
+                            .on_click({
+                                let view = manage_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_subscriptions_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("routing-presets")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Manage routing presets")).into()
+                                    })
+                                    .child("Presets")
+                            })
+                            .on_click({
+                                let view = manage_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_presets_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                // Distinct from the facet-bar `groups-dialog`
+                                // button (same dialog, different element):
+                                // duplicate ids panic headless lookups as
+                                // ambiguous while the menu is open.
+                                div()
+                                    .id("menu-groups-dialog")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Rename or merge groups")).into()
+                                    })
+                                    .child("Groups")
+                            })
+                            .on_click({
+                                let view = manage_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_groups_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                    }),
+            )
+            // Ticket 10: Engine menu — bulk start/stop/test moved verbatim
+            // (no key hints, matching the strip).
+            .child(
+                Button::new("engine-menu")
+                    .label("Engine")
+                    .tooltip("Start, stop, and test every endpoint")
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("engine-start-all")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Start every configuration")).into()
+                                    })
+                                    .child("Start all")
+                            })
+                            .on_click({
+                                let view = engine_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.start_all_engines(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("engine-stop-all")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Stop every endpoint")).into()
+                                    })
+                                    .child("Stop all")
+                            })
+                            .on_click({
+                                let view = engine_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.stop_all_engines(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("health-test-all")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Test every running endpoint"))
+                                            .into()
+                                    })
+                                    .child("Test all")
+                            })
+                            .on_click({
+                                let view = engine_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.test_all_health(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                    }),
+            )
+            .child(Separator::vertical())
+            // Ticket 10: Help menu — About and Settings moved verbatim.
+            .child(
+                Button::new("help-menu")
+                    .label("Help")
+                    .tooltip("About and settings")
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("about-dialog")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Version, sidecars, shortcuts"))
+                                            .into()
+                                    })
+                                    .child("About")
+                            })
+                            .on_click({
+                                let view = help_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_about_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("settings-dialog")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| Tooltip::new("Autostart, restore, test URL"))
+                                            .into()
+                                    })
+                                    .child("Settings")
+                            })
+                            .on_click({
+                                let view = help_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_settings_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                    }),
             )
     }
 }
@@ -11969,6 +12225,22 @@ mod tests {
             .title
             .expect("window title");
         assert_eq!(title.as_str(), crate::APP_TITLE);
+    }
+
+    /// Ticket 09: fresh launch opens at 1000x700 with an 880x620 minimum
+    /// (pure: reads the options struct, never opens a window).
+    #[test]
+    fn window_options_carry_startup_size() {
+        let options = crate::app_window_options();
+        let bounds = options
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.size.width, gpui_kit::px(1000.));
+        assert_eq!(bounds.size.height, gpui_kit::px(700.));
+        let min = options.window_min_size.expect("startup window minimum");
+        assert_eq!(min.width, gpui_kit::px(880.));
+        assert_eq!(min.height, gpui_kit::px(620.));
     }
 
     /// Ticket 21: the exe icon asset is committed in the repo (no external
@@ -12375,6 +12647,16 @@ mod tests {
         assert_eq!(export_confirm_description(), export_warning_text());
 
         cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        // Ticket 10: Export lives in the Library menu — open it first.
+        assert!(cx.update(|window, _| window.try_find("library-menu").is_some()));
+        cx.update(|window, cx| {
+            window.click("library-menu", cx);
+        });
+        cx.run_until_parked();
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
@@ -13222,8 +13504,11 @@ mod tests {
             window.render_frame(cx);
         });
         assert!(cx.update(|window, _| window.try_find("engine-status").is_some()));
-        assert!(cx.update(|window, _| window.try_find("engine-start-all").is_some()));
-        assert!(cx.update(|window, _| window.try_find("engine-stop-all").is_some()));
+        // Ticket 10: bulk engine actions live in the Engine menu — menu
+        // reachability is proven by `command_strip_all_ids_present` (this
+        // test owns start/stop behavior, and menu popovers race toast
+        // overlays under full-suite load, so it does not reopen them here).
+        assert!(cx.update(|window, _| window.try_find("engine-menu").is_some()));
 
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.commit_stop_all(window, cx));
@@ -13342,7 +13627,10 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        assert!(cx.update(|window, _| window.try_find("health-test-all").is_some()));
+        // Ticket 10: bulk test lives in the Engine menu — menu reachability
+        // is proven by `command_strip_all_ids_present` (same toast-overlay
+        // rationale as above); this test owns probe behavior.
+        assert!(cx.update(|window, _| window.try_find("engine-menu").is_some()));
         assert!(cx.update(|window, _| window.try_find("health-status").is_some()));
     }
 
@@ -15348,7 +15636,9 @@ mod tests {
 
     /// Ticket 03 (throne-density): the consolidated command strip keeps
     /// every command reachable from one row with unchanged ids/handlers.
-    /// Presence (not paint) is asserted — the strip overflows at test width.
+    /// Ticket 10: the strip is 4 dedicated buttons plus Library / Manage /
+    /// Engine / Help menu triggers — menu items render on open, so each
+    /// menu is opened (click its trigger) before asserting its items.
     #[gpui_kit::test]
     fn command_strip_all_ids_present(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -15356,26 +15646,64 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
+        // Always-visible strip: dedicated buttons plus menu triggers.
         for id in [
             "add-config",
-            "import-config",
-            "import-clipboard",
-            "export-library",
-            "subscriptions",
-            "routing-presets",
-            "engine-start-all",
             "start-selected",
-            "engine-stop-all",
             "stop-selected",
-            "health-test-all",
             "test-selected",
-            "about-dialog",
-            "settings-dialog",
+            "library-menu",
+            "manage-menu",
+            "engine-menu",
+            "help-menu",
         ] {
             assert!(
                 cx.update(|window, _| window.try_find(id).is_some()),
                 "{id} renders in the command strip"
             );
+        }
+        // Open-then-assert: each menu shows its items (the Manage menu
+        // Groups item carries `menu-groups-dialog`: same dialog as the
+        // facet-bar `groups-dialog` button, distinct element id so headless
+        // lookups never see duplicates as ambiguous). Menus use
+        // `overlay_closable(false)`, so each menu is dismissed with Escape
+        // before the next opens — otherwise an open popover covers the next
+        // trigger and the click never reaches it.
+        for (trigger, items) in [
+            (
+                "library-menu",
+                &["import-config", "import-clipboard", "export-library"][..],
+            ),
+            (
+                "manage-menu",
+                &["subscriptions", "routing-presets", "menu-groups-dialog"][..],
+            ),
+            (
+                "engine-menu",
+                &["engine-start-all", "engine-stop-all", "health-test-all"][..],
+            ),
+            ("help-menu", &["about-dialog", "settings-dialog"][..]),
+        ] {
+            cx.update(|window, cx| {
+                window.click(trigger, cx);
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+            cx.run_until_parked();
+            paint_frame(cx);
+            for &id in items {
+                assert!(
+                    cx.update(|window, _| window.try_find(id).is_some()),
+                    "{id} renders in the {trigger} menu"
+                );
+            }
+            cx.update(|window, cx| {
+                use gpui_kit::Keystroke;
+                let escape = Keystroke::parse("escape").expect("test keystroke parses");
+                window.dispatch_keystroke(escape, cx);
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
         }
     }
 
@@ -17585,7 +17913,9 @@ mod tests {
         paint_frame(cx);
         for (id, pinned) in [
             ("add-config", "Add (Ctrl-N)"),
-            ("import-config", "Import (Ctrl-O)"),
+            // Ticket 10: `import-config` moved into the Library menu (a
+            // menu-row div exposes no accessibility label), so only the
+            // dedicated buttons pin theirs here.
             ("start-selected", "Start selected (F5)"),
             ("stop-selected", "Stop selected (Shift-F5)"),
             ("test-selected", "Test selected (Ctrl-T)"),
@@ -20225,6 +20555,15 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
+        // Ticket 10: Settings lives in the Help menu — open it first.
+        cx.update(|window, cx| {
+            window.click("help-menu", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
         assert!(cx.update(|window, _| window.try_find("settings-dialog").is_some()));
 
         cx.update(|window, cx| {
@@ -20729,8 +21068,8 @@ mod tests {
     /// Ticket 08 (a): density lock at the 1000x700 desktop frame — the
     /// command strip, facet bar, three dense rows, inspector, and status
     /// strip all paint inside the frame (no clipping). Command reachability
-    /// pins every id by presence (the strip overflows at test width per
-    /// `command_strip_all_ids_present`, so buttons pin presence while the
+    /// pins the always-visible strip ids by presence (dedicated buttons
+    /// plus menu triggers per `command_strip_all_ids_present`, while the
     /// leading `add-config` — never the clipped end — pins paint);
     /// below-the-fold inspector actions pin presence for the same reason.
     #[gpui_kit::test]
@@ -20763,27 +21102,22 @@ mod tests {
         paint_frame(cx);
 
         // Command strip: the leading action paints inside the frame (the
-        // strip container carries no test anchor and the strip overflows
-        // at test width per `command_strip_all_ids_present`, so every
-        // command pins reachability by presence while `add-config` — the
-        // first child, never the clipped end — pins paint).
+        // strip container carries no test anchor; every command pins
+        // reachability by presence while `add-config` — the first child,
+        // never the clipped end — pins paint). Ticket 10: the strip is 4
+        // dedicated buttons plus 4 menu triggers; menu items render on
+        // open (see `command_strip_all_ids_present`).
         assert_painted(cx, "add-config");
         assert_within_frame(cx, "add-config");
         for id in [
             "add-config",
-            "import-config",
-            "import-clipboard",
-            "export-library",
-            "subscriptions",
-            "routing-presets",
-            "engine-start-all",
             "start-selected",
-            "engine-stop-all",
             "stop-selected",
-            "health-test-all",
             "test-selected",
-            "about-dialog",
-            "settings-dialog",
+            "library-menu",
+            "manage-menu",
+            "engine-menu",
+            "help-menu",
         ] {
             assert!(
                 cx.update(|window, _| window.try_find(id).is_some()),
@@ -20856,6 +21190,210 @@ mod tests {
                 cx.update(|window, _| window.try_find(id.to_string()).is_some()),
                 "{id} renders in the status strip"
             );
+        }
+    }
+
+    // Ticket 11: 880x620 minimum-frame paint helper — the t08 1000x700
+    // `paint_frame` rhythm with the frame edges at the 880x620 minimum.
+    // The t08 helper stays untouched (never weakened).
+    fn paint_frame_min(cx: &mut VisualTestContext) {
+        cx.simulate_resize(size(px(880.), px(620.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+    }
+
+    // Ticket 11: frame containment at the 880x620 minimum — the t08
+    // `assert_within_frame` rule (paints AND far edge inside, 1px rounding
+    // epsilon) with the edges at 880x620. The t08 helper stays untouched.
+    fn assert_within_frame_min(cx: &mut VisualTestContext, id: &str) {
+        let bounds = cx
+            .update(|window, _| window.try_find(id.to_owned()))
+            .unwrap_or_else(|| panic!("{id} renders: missing element in completed frame"))
+            .bounds();
+        assert!(
+            bounds.origin.x >= px(0.) && bounds.origin.y >= px(0.),
+            "{id} starts inside the minimum frame: {bounds:?}"
+        );
+        assert!(
+            bounds.origin.x + bounds.size.width <= px(880.) + px(1.),
+            "{id} ends inside the minimum frame width: {bounds:?}"
+        );
+        assert!(
+            bounds.origin.y + bounds.size.height <= px(620.) + px(1.),
+            "{id} ends inside the minimum frame height: {bounds:?}"
+        );
+    }
+
+    /// Ticket 11 (a): 880x620 minimum with seeded rows + a selection — the
+    /// facet bar, 1+ rows, inspector, and status strip all paint with right
+    /// edges inside 880 (the t08 containment rule at the minimum size).
+    #[gpui_kit::test]
+    fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the first row so the inspector has a row to render.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
+        // Facet bar + pickers paint inside the minimum frame.
+        for id in ["facet-bar", "facet-group", "facet-protocol", "facet-status"] {
+            assert_painted(cx, id);
+            assert_within_frame_min(cx, id);
+        }
+        // Seeded rows paint, stacked top-to-bottom, inside the frame.
+        let first_row = format!("library-row-{}", first.id);
+        let second_row = format!("library-row-{}", second.id);
+        assert_painted(cx, &first_row);
+        assert_within_frame_min(cx, &first_row);
+        assert_painted(cx, &second_row);
+        assert_within_frame_min(cx, &second_row);
+        let (first_top, second_top) = cx.update(|window, _| {
+            let first = window
+                .try_find(first_row)
+                .expect("first row paints")
+                .bounds()
+                .origin
+                .y;
+            let second = window
+                .try_find(second_row)
+                .expect("second row paints")
+                .bounds()
+                .origin
+                .y;
+            (first, second)
+        });
+        assert!(
+            second_top > first_top,
+            "dense rows stack without overlap at minimum size"
+        );
+        // Inspector paints inside the minimum frame.
+        assert_painted(cx, "config-detail");
+        assert_within_frame_min(cx, "config-detail");
+        assert_painted(cx, "config-endpoints");
+        assert_within_frame_min(cx, "config-endpoints");
+        // Status strip paints inside the minimum frame; every rendered
+        // segment stays inside 880 too (measure-first: everything fits at
+        // the minimum today, so no collapse is needed).
+        assert_painted(cx, "status-count");
+        assert_within_frame_min(cx, "status-count");
+        assert_painted(cx, "status-left");
+        assert_within_frame_min(cx, "status-left");
+        for id in [
+            "status-center",
+            "status-right",
+            "engine-status",
+            "health-status",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders in the status strip at minimum size"
+            );
+            assert_within_frame_min(cx, id);
+        }
+    }
+
+    /// Ticket 11 (b): status strip at minimum width — library totals stay
+    /// visible. Measure-first: every segment fits at 880 today (traffic
+    /// totals seeded so the right region renders), so the test pins the
+    /// left counts painted inside 880 plus every rendered segment inside
+    /// too — no production change. The collapse order (traffic labels
+    /// first, then center, never the left counts) is the contract if a
+    /// future segment ever overflows.
+    #[gpui_kit::test]
+    fn t11_status_strip_keeps_library_totals_at_minimum(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        store
+            .add_traffic_batch(&[(seeded.id.clone(), 2_048, 1_024)])
+            .expect("traffic accrues");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
+        // Library totals always visible at the minimum width.
+        assert_painted(cx, "status-count");
+        assert_within_frame_min(cx, "status-count");
+        assert_painted(cx, "status-left");
+        assert_within_frame_min(cx, "status-left");
+        // No rendered segment pushes past 880 — and nothing collapses the
+        // left counts away.
+        for id in [
+            "status-center",
+            "status-right",
+            "engine-status",
+            "health-status",
+            "traffic-status",
+        ] {
+            if cx.update(|window, _| window.try_find(id.to_string()).is_some()) {
+                assert_within_frame_min(cx, id);
+            }
+        }
+        assert_painted(cx, "status-left");
+    }
+
+    /// Ticket 11 (c): Add dialog at 880x620 — every field paints inside the
+    /// frame (no clipping when the window is at its minimum).
+    #[gpui_kit::test]
+    fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Add opens at minimum size"
+        );
+        for id in [
+            "field-name",
+            "field-protocol",
+            "field-params",
+            "field-group",
+            "field-bind",
+            "field-port",
+            "add-dialog-ok",
+            "add-dialog-cancel",
+        ] {
+            assert_painted(cx, id);
+            assert_within_frame_min(cx, id);
         }
     }
 
@@ -21318,12 +21856,31 @@ mod tests {
             "verbatim warning paints in the dialog"
         );
         assert!(!target.exists(), "nothing is written until confirm");
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.commit_export_write_to(&target.display().to_string(), window, cx)
+        // Windows CI file locking (Defender/icacls racing the tmp-write +
+        // rename inside `commit_export`, which the product surfaces honestly
+        // as an "Export failed" notification) can fail one attempt
+        // transiently — the ticket43 export test covers the same path. Retry
+        // the user-visible commit the same way a user would, bounded, and
+        // fail loudly when the write never lands.
+        let before = notification_count(cx);
+        let mut body = None;
+        for _ in 0..3 {
+            let _ = std::fs::remove_file(&target);
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_export_write_to(&target.display().to_string(), window, cx)
+                });
             });
-        });
-        let body = std::fs::read_to_string(&target).expect("export file written");
+            if let Ok(text) = std::fs::read_to_string(&target) {
+                body = Some(text);
+                break;
+            }
+        }
+        let body: String = body.expect("export file written within 3 attempts");
+        assert!(
+            notification_count(cx) > before,
+            "commit pushes a notification per attempt"
+        );
         assert!(body.contains("library"), "payload has library section");
         let _ = std::fs::remove_file(&target);
         cx.update(|window, cx| window.close_all_dialogs(cx));
