@@ -12565,16 +12565,22 @@ impl Render for AppView {
             // appearing only on hover). Signal-box 03: the copy stays
             // honest about blocked drops — a drop while any dialog is open
             // is refused (see [`AppView::import_dropped_files`]), so the
-            // hint names that precondition up front. Dimming the hint
-            // while blocked belongs to the ticket-06 token pass.
-            .child(
-                div()
+            // hint names that precondition up front. Signal-box 06: the hint
+            // dims while drops are blocked (any dialog open) — theme
+            // opacity, no new color; id, copy, and the refusal itself are
+            // unchanged.
+            .child({
+                let mut hint = div()
                     .id("drop-hint")
                     .test_support()
                     .px_2()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Drop .conf / .json / .txt files here to import (not while a dialog is open)"),
-            )
+                    .child("Drop .conf / .json / .txt files here to import (not while a dialog is open)");
+                if window.has_active_dialog(cx) {
+                    hint = hint.opacity(0.45);
+                }
+                hint
+            })
             .child(
                 div()
                     .id("main-content")
@@ -15172,6 +15178,25 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
+        assert!(cx.update(|window, _| window.try_find("drop-hint").is_some()));
+    }
+
+    /// Signal-box 06: the drop hint stays painted while drops are blocked
+    /// (dialog open) — the dim is a theme-opacity restyle on the same id
+    /// and copy, so presence in both states is the headless assertion and
+    /// the look itself is manual UX review per the ticket.
+    #[gpui_kit::test]
+    fn t06_drop_hint_paints_while_dialog_open(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("drop-hint").is_some()));
     }
 
