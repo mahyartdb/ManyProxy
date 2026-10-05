@@ -1486,8 +1486,8 @@ impl HealthStore {
         }
     }
 
-    /// Detail-bar line: url latency + tcp-ping latency + traffic, or the
-    /// named dead cause.
+    /// Detail-bar line: url latency + tcp-ping latency + traffic, the
+    /// named dead cause, or the never-tested line with its next step.
     pub fn detail_line(&self, config_id: &str) -> String {
         let url_ms = self
             .latest_of(config_id, HealthKind::UrlTest)
@@ -1500,7 +1500,7 @@ impl HealthStore {
             RowHealth {
                 state: RowState::Unknown,
                 ..
-            } => "health: not tested".to_string(),
+            } => "health: never tested — press Test to check".to_string(),
             RowHealth {
                 state: RowState::Live,
                 latency_ms: Some(ms),
@@ -2536,7 +2536,10 @@ mod tests {
         assert_eq!(stats.tx_bytes, 600);
         assert_eq!(store.traffic("missing"), TrafficStats::default());
         assert!(store.detail_line("1").contains("↑"), "traffic shown");
-        assert_eq!(store.detail_line("missing"), "health: not tested");
+        assert_eq!(
+            store.detail_line("missing"),
+            "health: never tested — press Test to check"
+        );
     }
 
     /// Ticket 33: probe-byte counters are labeled `probe:` (never bare
@@ -2547,8 +2550,8 @@ mod tests {
         let (prober, _) = FakeHealthProber::shared();
         let mut store = HealthStore::default();
         assert!(
-            store.detail_line("1") == "health: not tested",
-            "untested row names the state"
+            store.detail_line("1") == "health: never tested — press Test to check",
+            "untested row names the state plus its next step"
         );
         for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
             store.record_outcome(&outcome);
@@ -2595,7 +2598,7 @@ mod tests {
             "probe bytes no longer the source, got {line}"
         );
         let untracked = store.detail_line("9");
-        assert_eq!(untracked, "health: not tested");
+        assert_eq!(untracked, "health: never tested — press Test to check");
     }
 
     /// Ticket 36: the clash poller reads totals off a live controller
