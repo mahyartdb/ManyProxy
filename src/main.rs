@@ -18339,6 +18339,150 @@ mod tests {
         assert_absent(cx, "config-preset".to_string());
     }
 
+    /// Signal-box 04: the detail pane is a block shelf — the Endpoints
+    /// module paints above a single operate row (Start, Stop, Test, Ping,
+    /// Logs, Copy URLs inline) with the manage actions (Edit, Delete,
+    /// Duplicate, resets) behind one `row-menu` trigger, and the Health
+    /// pane carries the failure alert with the same operate row on the
+    /// same row. The 240px cap keeps the evidence painted.
+    #[gpui_kit::test]
+    fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the row so the detail pane renders it (Details tab default).
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        // The Acting-on echo rides the module header, naming the row.
+        assert_painted(cx, "detail-acting-on");
+        // Endpoints module above the fold, above the single operate row.
+        // (`detail-operate` is a transparent packing row, so presence +
+        // geometry — not paint — is the assertion, same as the command
+        // strip container.)
+        assert_painted(cx, "config-endpoints");
+        assert_within_frame(cx, "config-endpoints");
+        assert!(
+            cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
+            "detail-operate renders the single operate row"
+        );
+        // No horizontal scroll: the row's right edge stays inside the
+        // 1000px frame width (vertical placement is the scrolling pane's
+        // job — the t08 contract keeps ops reachable below the fold).
+        let operate_bounds = cx.update(|window, _| {
+            window
+                .try_find("detail-operate".to_string())
+                .expect("operate row renders")
+                .bounds()
+        });
+        assert!(
+            operate_bounds.origin.x >= px(0.)
+                && operate_bounds.origin.x + operate_bounds.size.width <= px(1000.) + px(1.),
+            "operate row fits the frame width: {operate_bounds:?}"
+        );
+        let (endpoints_bottom, operate_top) = cx.update(|window, _| {
+            let endpoints = window
+                .try_find("config-endpoints".to_string())
+                .expect("endpoints paints")
+                .bounds();
+            let operate = window
+                .try_find("detail-operate".to_string())
+                .expect("operate row paints")
+                .bounds();
+            (
+                endpoints.origin.y + endpoints.size.height,
+                operate.origin.y,
+            )
+        });
+        assert!(
+            endpoints_bottom <= operate_top,
+            "endpoints sit above the operate row: {endpoints_bottom:?} <= {operate_top:?}"
+        );
+        // The six inline ops render in the single operate row...
+        for id in [
+            "engine-start",
+            "engine-stop",
+            "health-test",
+            "health-ping",
+            "logs-open",
+            "copy-urls",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} rides the operate row"
+            );
+        }
+        // The row-menu trigger rides the same operate row (presence —
+        // opening it needs a visible click, and the headless harness has
+        // no scroll seam to bring below-fold triggers into view: no test
+        // anywhere in the suite clicks inside the scrolling inspector,
+        // and scenario 1 verifies by manual UX review per the ticket).
+        // The menu items carry the same ids, labels, tooltips, and
+        // handlers the manage row and Usage module carried (see Ruling).
+        assert!(
+            cx.update(|window, _| window.try_find("row-menu".to_string()).is_some()),
+            "row-menu trigger rides the operate row"
+        );
+        // Failed row → Health pane: the failure alert renders in place
+        // with the same operate row on the same row.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector_tab = crate::InspectorTab::Health;
+                cx.notify();
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, _cx| {
+                view.health_store.record_outcome(&TestOutcome {
+                    sample: HealthSample {
+                        config_id: seeded.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: None,
+                        error: Some("timeout".to_string()),
+                    },
+                    success: None,
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "config-health");
+        assert_painted(cx, "config-health-alert");
+        assert!(
+            cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
+            "detail-operate renders on the Health pane row"
+        );
+        for id in [
+            "engine-start",
+            "health-test",
+            "logs-open",
+            "copy-urls",
+            "row-menu",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} operates on the Health pane row"
+            );
+        }
+    }
+
     /// T06 red-first: in-flight flags surface as loading spinners on the
     /// four action buttons. Presence ⟺ in-flight: the buttons sit below
     /// the fold of the scrolling inspector, so presence (not paint) is the
