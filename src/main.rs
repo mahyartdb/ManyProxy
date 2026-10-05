@@ -6662,6 +6662,10 @@ impl AppView {
     /// default) — gate one names the path and offers the choice; when the
     /// chosen file already exists, gate two names it again and demands an
     /// explicit overwrite confirm. No silent clobber, ever.
+    /// Ticket 05 (signal-box): the warning rides the kit error Alert (red
+    /// caution border on theme tokens) with the secrets text verbatim, plus
+    /// a visible safer path (Copy URLs never carries secrets). Cancel
+    /// closes with no write and no toast.
     fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         // Ticket 26: a broken database errors instead of previewing counts
@@ -6702,10 +6706,18 @@ impl AppView {
                         .flex_col()
                         .gap_2()
                         .child(
+                            div().id("export-warning").test_support().child(
+                                Alert::error("export-warning-box", warning.clone())
+                                    .title("Secrets leave in plaintext"),
+                            ),
+                        )
+                        .child(
                             div()
-                                .id("export-warning")
+                                .id("export-safer-path")
                                 .test_support()
-                                .child(warning.clone()),
+                                .child(
+                                    "Safer: share one endpoint with Copy URLs — it never carries secrets.",
+                                ),
                         )
                         .child(
                             div()
@@ -17564,6 +17576,7 @@ mod tests {
             ("add", "add-dialog-ok", "add-dialog-cancel"),
             ("edit", "edit-dialog-ok", "edit-dialog-cancel"),
             ("import", "import-dialog-ok", "import-dialog-cancel"),
+            ("export", "export-dialog-ok", "export-dialog-cancel"),
             (
                 "subscriptions",
                 "subscriptions-dialog-ok",
@@ -17578,6 +17591,9 @@ mod tests {
                     "add" => view.open_add_dialog(window, cx),
                     "edit" => view.open_edit_dialog(target, window, cx),
                     "import" => view.open_import_dialog("vless://x", "travel", None, window, cx),
+                    // Ticket 05: export rides the same shared commit path
+                    // (footer OK + Confirm key through one closure).
+                    "export" => view.open_export_dialog(window, cx),
                     "subscriptions" => view.open_subscriptions_dialog(window, cx),
                     "presets" => view.open_presets_dialog(window, cx),
                     _ => view.open_logs_dialog(window, cx),
@@ -17655,6 +17671,47 @@ mod tests {
             "loopback stays quiet"
         );
         assert!(lan_hint_for_bind("").is_none(), "blank stays quiet");
+    }
+
+    /// Ticket 05: export stays a red-bordered caution order — the verbatim
+    /// warning plus a visible safer path — and Cancel writes nothing.
+    #[gpui_kit::test]
+    fn t05_export_caution_offers_safer_path_and_cancel_writes_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_export_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_painted(cx, "export-warning");
+        assert!(
+            cx.update(|window, _| window.try_find("export-safer-path").is_some()),
+            "safer path paints"
+        );
+        assert_painted(cx, "export-preview");
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("export-dialog-cancel", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Cancel closes the dialog"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before,
+            "Cancel fires no toast and writes nothing"
+        );
     }
 
     // -- Ticket 19: library list paints stored rows --------------------------
