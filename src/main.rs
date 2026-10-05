@@ -587,24 +587,23 @@ impl LibraryDelegate {
     }
 
     /// Ticket 44: true while any facet constrains the list (drives the
-    /// `(M visible)` honesty arm of the bulk label + the Clear-facets CTA).
+    /// bulk label's visible count + the Clear-facets CTA).
     fn facets_active(&self) -> bool {
         self.facet_group.is_some() || self.facet_protocol.is_some() || self.facet_status.is_some()
     }
 
     /// Ticket 44: honest bulk-bar label. The bulk set is the primitive
-    /// (actions run over the full set, never just the visible slice), so a
-    /// filtered view names both counts; an unfiltered view shows the set
-    /// alone. Empty when nothing is checked (the bar hides with it).
+    /// (actions run over the full set, never just the visible slice).
+    /// Ticket 01: the bar always reads `N checked (of M visible)` — both
+    /// counts even unfiltered, so the checked acting set (rim + chip) can
+    /// never be confused with the selected row (wash). Empty when nothing
+    /// is checked (the bar hides with it).
     fn bulk_label(&self) -> String {
         if self.checked.is_empty() {
             return String::new();
         }
-        if self.query.trim().is_empty() && !self.facets_active() {
-            return format!("{} selected", self.checked.len());
-        }
         format!(
-            "{} selected ({} visible)",
+            "{} checked (of {} visible)",
             self.checked.len(),
             self.visible.len()
         )
@@ -1075,6 +1074,17 @@ impl ListDelegate for LibraryDelegate {
         let mut lines =
             library_row_dense_lines_with_upstream(&row, &upstream, health, is_running, traffic)
                 .into_iter();
+        // Operate polish: name at base weight via Label, meta + badge at
+        // small size. Meta rides muted; the badge rides the serving color
+        // (danger on dead, success while running, muted when stopped).
+        // Pinned strings unchanged — only the wrappers carry style.
+        let badge_color = if health.map(str::trim) == Some("dead") {
+            cx.theme().danger
+        } else if is_running {
+            cx.theme().success
+        } else {
+            cx.theme().muted_foreground
+        };
         if let Some(first) = lines.next() {
             // Dense header: checkbox + name + serving dot when running, so
             // state reads on line one without a separate badge row.
@@ -1084,7 +1094,7 @@ impl ListDelegate for LibraryDelegate {
                 .items_center()
                 .gap_2()
                 .child(checkbox)
-                .child(first);
+                .child(Label::new(first));
             if is_running {
                 let dot_color = if health.map(str::trim) == Some("dead") {
                     cx.theme().danger
@@ -1106,9 +1116,19 @@ impl ListDelegate for LibraryDelegate {
         }
         // Dense body: meta line then badge-plus-traffic line. The serving
         // badge is dense line 3 (index 2) — the pinned badge string itself
-        // never changes, only its row position.
-        for line in lines {
-            card = card.child(line);
+        // never changes, only its row position. Meta reads muted, the badge
+        // reads the serving color, both at small size under the base name.
+        for (index, line) in lines.enumerate() {
+            if index == 0 {
+                card = card.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(line),
+                );
+            } else {
+                card = card.child(div().text_sm().text_color(badge_color).child(line));
+            }
         }
         Some(item.child(card))
     }
@@ -16242,12 +16262,12 @@ mod tests {
         delegate.toggle_checked("3");
         delegate.toggle_checked("ghost");
         assert_eq!(delegate.checked.len(), 2, "unknown ids never check");
-        assert_eq!(delegate.bulk_label(), "2 selected");
+        assert_eq!(delegate.bulk_label(), "2 checked (of 3 visible)");
         // Filter hides a member: set intact, label honest, rows in order.
         delegate.query = "alpha".to_string();
         delegate.apply_filter();
         assert_eq!(delegate.checked.len(), 2);
-        assert_eq!(delegate.bulk_label(), "2 selected (1 visible)");
+        assert_eq!(delegate.bulk_label(), "2 checked (of 1 visible)");
         let checked: Vec<String> = delegate
             .checked_rows()
             .iter()
@@ -16257,12 +16277,12 @@ mod tests {
         // Facets also drive the `(M visible)` arm.
         delegate.query = String::new();
         delegate.set_facet_group(Some("nope".to_string()));
-        assert_eq!(delegate.bulk_label(), "2 selected (0 visible)");
+        assert_eq!(delegate.bulk_label(), "2 checked (of 0 visible)");
         delegate.clear_facets();
         // Reload without row 3 prunes it; toggle twice round-trips.
         delegate.set_rows(vec![row("1", "Alpha", "g"), row("2", "Beta", "g")]);
         assert_eq!(delegate.checked.len(), 1);
-        assert_eq!(delegate.bulk_label(), "1 selected");
+        assert_eq!(delegate.bulk_label(), "1 checked (of 2 visible)");
         delegate.toggle_checked("1");
         assert_eq!(delegate.bulk_label(), "");
         delegate.clear_checked();
@@ -16371,7 +16391,7 @@ mod tests {
         let label = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         });
-        assert_eq!(label, "1 selected");
+        assert_eq!(label, "1 checked (of 2 visible)");
         // Filter to the other row: the set stays, the label names both counts.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
@@ -16386,7 +16406,7 @@ mod tests {
         let label = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         });
-        assert_eq!(label, "1 selected (1 visible)");
+        assert_eq!(label, "1 checked (of 1 visible)");
         // Select-visible checks the visible row too; clear empties the set.
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.select_visible_checked(window, cx));
@@ -16394,7 +16414,7 @@ mod tests {
         let label = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         });
-        assert_eq!(label, "2 selected (1 visible)");
+        assert_eq!(label, "2 checked (of 1 visible)");
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.clear_checked(window, cx));
         });
@@ -16456,7 +16476,7 @@ mod tests {
             view.read_with(cx, |view, cx| {
                 view.libraries.read(cx).delegate().bulk_label()
             }),
-            "1 selected"
+            "1 checked (of 1 visible)"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
@@ -21590,7 +21610,7 @@ mod tests {
                 .read(cx)
                 .delegate()
                 .bulk_label()),
-            "1 selected"
+            "1 checked (of 1 visible)"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
@@ -21618,7 +21638,7 @@ mod tests {
                 .read(cx)
                 .delegate()
                 .bulk_label()),
-            "1 selected",
+            "1 checked (of 1 visible)",
             "arrows keep the checks"
         );
     }
