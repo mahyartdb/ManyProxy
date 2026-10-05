@@ -690,6 +690,17 @@ impl LibraryDelegate {
         self.checked.clear();
     }
 
+    /// Ticket 01: 1-based position of one id in the checked set (library
+    /// order). Drives the checked-row count chip — a text numeral, so the
+    /// checked set reads without color.
+    fn checked_position(&self, id: &str) -> Option<usize> {
+        self.rows
+            .iter()
+            .filter(|row| self.checked.contains(&row.id))
+            .position(|row| row.id == id)
+            .map(|position| position + 1)
+    }
+
     /// Ticket 44: visible rows in library order (select-visible + bulk
     /// honesty read this, never the full row set).
     fn visible_rows(&self) -> Vec<ProxyConfig> {
@@ -930,7 +941,13 @@ impl TableDelegate for DenseTableDelegate {
             return Checkbox::new(format!("check-{row_id}"))
                 .small()
                 .checked(checked)
-                .accessibility_label(format!("Select {row_name}"))
+                // Ticket 01: same bulk-set wording as the list checkbox —
+                // the table spike never forks the grammar.
+                .accessibility_label(if checked {
+                    format!("Checked {row_name} (bulk action target)")
+                } else {
+                    format!("Check {row_name} for bulk actions")
+                })
                 .on_change(move |_, _, cx| {
                     let toggle_id = toggle_id.clone();
                     libraries.update(cx, |state, list_cx| {
@@ -1033,7 +1050,13 @@ impl ListDelegate for LibraryDelegate {
         let checkbox = Checkbox::new(format!("check-{row_id}"))
             .small()
             .checked(is_checked)
-            .accessibility_label(format!("Select {}", row.name))
+            // Ticket 01: the checkbox names the bulk set, never selection —
+            // screen readers hear checked-vs-selected as text, not hue.
+            .accessibility_label(if is_checked {
+                format!("Checked {} (bulk action target)", row.name)
+            } else {
+                format!("Check {} for bulk actions", row.name)
+            })
             .on_change(move |_, _, cx| {
                 let toggle_id = toggle_id.clone();
                 list_view.update(cx, |state, cx| {
@@ -1050,6 +1073,10 @@ impl ListDelegate for LibraryDelegate {
         // selected highlight ride on the card (theme tokens only). The states
         // mirror the ListItem's own selection formula so the row rim and the
         // card read as one highlight.
+        // Ticket 01: one selection grammar — the blue wash marks the
+        // selected row and nothing else; a checked row carries an accent
+        // rim (2px, so shape differs without color) plus a numeral count
+        // chip. A row both checked and selected shows both.
         let selected_bg = if cx.theme().list.active_highlight {
             cx.theme().list_active
         } else {
@@ -1061,13 +1088,16 @@ impl ListDelegate for LibraryDelegate {
             .px_2()
             .py_1()
             .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border)
             .bg(if selected {
                 selected_bg
             } else {
                 cx.theme().group_box
             });
+        if is_checked {
+            card = card.border_2().border_color(cx.theme().accent);
+        } else {
+            card = card.border_1().border_color(cx.theme().border);
+        }
         if !selected {
             card = card.hover(|this| this.bg(cx.theme().list_hover));
         }
@@ -1088,6 +1118,9 @@ impl ListDelegate for LibraryDelegate {
         if let Some(first) = lines.next() {
             // Dense header: checkbox + name + serving dot when running, so
             // state reads on line one without a separate badge row.
+            // Ticket 01: a checked row carries its count-chip numeral here
+            // (1-based position in the checked set — text, not hue).
+            let check_chip = self.checked_position(&row_id);
             let mut header = div()
                 .flex()
                 .flex_row()
@@ -1095,6 +1128,20 @@ impl ListDelegate for LibraryDelegate {
                 .gap_2()
                 .child(checkbox)
                 .child(Label::new(first));
+            if let Some(position) = check_chip {
+                header = header.child(
+                    div()
+                        .id(format!("row-check-chip-{row_id}"))
+                        .test_support()
+                        .text_sm()
+                        .px_1()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(cx.theme().accent)
+                        .text_color(cx.theme().accent)
+                        .child(format!("{position}")),
+                );
+            }
             if is_running {
                 let dot_color = if health.map(str::trim) == Some("dead") {
                     cx.theme().danger
@@ -16289,6 +16336,69 @@ mod tests {
         assert_eq!(delegate.bulk_label(), "");
     }
 
+    /// Ticket 01: selection grammar at the delegate seam — checked rows
+    /// carry 1-based count-chip positions in library order while the wash
+    /// (selection) names a different row; the bulk label names both
+    /// counts; selection and checks never retarget each other.
+    #[test]
+    fn t01_checked_positions_and_selection_stay_distinct() {
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        use gpui_kit::component::IndexPath;
+        fn row(id: &str, name: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: r#"{"server":"a.example.com"}"#.to_string(),
+                group: "g".to_string(),
+                enabled: true,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta"), row("3", "Gamma")]);
+        delegate.toggle_checked("1");
+        delegate.toggle_checked("3");
+        delegate.selected = Some(IndexPath::new(2));
+        assert_eq!(delegate.checked_position("1"), Some(1));
+        assert_eq!(delegate.checked_position("3"), Some(2));
+        assert_eq!(
+            delegate.checked_position("2"),
+            None,
+            "the selected-only row carries no chip"
+        );
+        assert_eq!(delegate.bulk_label(), "2 checked (of 3 visible)");
+        assert_eq!(
+            delegate.selected_row().map(|row| row.name),
+            Some("Gamma".to_string()),
+            "the wash names the selected row"
+        );
+        assert_eq!(
+            delegate
+                .checked_rows()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["1".to_string(), "3".to_string()],
+            "bulk acts on the checked set, never the selection"
+        );
+        // Unchecking re-numbers the chips; clearing selection keeps checks.
+        delegate.toggle_checked("1");
+        assert_eq!(delegate.checked_position("3"), Some(1));
+        assert_eq!(delegate.bulk_label(), "1 checked (of 3 visible)");
+        delegate.clear_selection();
+        assert_eq!(
+            delegate.checked.len(),
+            1,
+            "checks survive a selection clear"
+        );
+    }
+
     /// Ticket 44: facet pickers inventory the real rows (labels + counts,
     /// protocols), never free text.
     #[test]
@@ -16422,6 +16532,48 @@ mod tests {
             view.libraries.read(cx).delegate().bulk_label()
         });
         assert_eq!(label, "");
+    }
+
+    /// Ticket 01 UI: two rows checked plus a third selected — the checked
+    /// rows paint count chips, the selected-only row paints none, and the
+    /// bulk bar names both counts.
+    #[gpui_kit::test]
+    fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let third = store
+            .add(row19_seed("Lab", "c.example.com", "10803"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.toggle_checked(&first.id);
+                    delegate.toggle_checked(&second.id);
+                    delegate.selected = Some(IndexPath::new(2));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, &format!("row-check-chip-{}", first.id));
+        assert_painted(cx, &format!("row-check-chip-{}", second.id));
+        assert_absent(cx, format!("row-check-chip-{}", third.id));
+        assert_painted(cx, "bulk-bar");
+        assert_painted(cx, "bulk-label");
+        let label = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().bulk_label()
+        });
+        assert_eq!(label, "2 checked (of 3 visible)");
     }
 
     /// Ticket 44 UI: Escape clears the checked set with no dialog open and
