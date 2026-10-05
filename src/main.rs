@@ -7257,6 +7257,19 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Signal-box 03: drops never stack import dialogs — while any
+        // dialog is open the drop is refused with an honest toast (the
+        // drop hint names the same precondition), never silently
+        // swallowed and never stacked.
+        if window.has_active_dialog(cx) {
+            window.push_notification(
+                Notification::warning(
+                    "Close the open dialog first — dropped files were not imported",
+                ),
+                cx,
+            );
+            return;
+        }
         let mut merged = String::new();
         let mut names: Vec<String> = Vec::new();
         let mut files: Vec<(String, String)> = Vec::new();
@@ -12195,14 +12208,18 @@ impl Render for AppView {
             .child(self.render_toolbar(cx))
             // Ticket 17: visible drop affordance (the shell has no
             // hover-during-drag event, so the hint stays visible instead of
-            // appearing only on hover).
+            // appearing only on hover). Signal-box 03: the copy stays
+            // honest about blocked drops — a drop while any dialog is open
+            // is refused (see [`AppView::import_dropped_files`]), so the
+            // hint names that precondition up front. Dimming the hint
+            // while blocked belongs to the ticket-06 token pass.
             .child(
                 div()
                     .id("drop-hint")
                     .test_support()
                     .px_2()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Drop .conf / .json / .txt files here to import"),
+                    .child("Drop .conf / .json / .txt files here to import (not while a dialog is open)"),
             )
             .child(
                 div()
@@ -15924,6 +15941,38 @@ mod tests {
             query_focused,
             "Search button focuses the library search field"
         );
+    }
+
+    /// Signal-box 03: a file drop while a dialog is open refuses honestly —
+    /// no stacked import dialog, one toast naming the block (the drop hint
+    /// names the same precondition).
+    #[gpui_kit::test]
+    fn t03_drop_while_dialog_open_refuses_honestly(cx: &mut TestAppContext) {
+        use gpui_kit::ExternalPaths;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        let before = notification_count(cx);
+        let paths =
+            ExternalPaths(vec![std::path::PathBuf::from("E:\\x\\a.conf")].into());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.import_dropped_files(&paths, window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "blocked drop toasts honestly"
+        );
+        // Still exactly the Add dialog — no stacked import dialog.
+        assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
+        assert!(cx.update(|window, _| window.try_find("import-dialog-ok").is_none()));
     }
 
     /// Scenario: subscription expand flips + toolbar/empty/params/import/
