@@ -81,7 +81,7 @@ Ink, paper, signal: a monochrome working surface where color is information, nev
 - **Working Ink** ({colors.ink}): body foreground on paper.
 - **Quiet Surface** ({colors.quiet-surface}): row cards and lever-frame plate (`group_box`), list hover ground (`list_hover`), tab bar background.
 - **Hairline** ({colors.hairline}): every 1px separator (`border`) — toolbar base, facet-bar base, card rims, plate rim, title/status bar edges.
-- **Muted Ink** ({colors.muted-ink}): secondary text (`muted_foreground`, `description_list_label_foreground`) — row metadata, stopped badges, endpoint labels, drop hint, search context, the `Acting on:` echo.
+- **Muted Ink** ({colors.muted-ink}): secondary text (`muted_foreground`, `description_list_label_foreground`) — row metadata, stopped badges, endpoint labels, search context, the `Acting on:` echo.
 - **Chrome Band** ({colors.chrome-band}): title bar and status bar bands, edged with hairlines.
 
 ### Selection and signal
@@ -117,9 +117,9 @@ Ink, paper, signal: a monochrome working surface where color is information, nev
 
 ## Layout
 
-A fixed top band (title bar, lever-frame toolbar, drop hint), a vertical split with the card list on top (`flex_1`) and the inspector below (capped at 240px, resizable 240–480px), and a fixed status strip with three regions — counts left (`status-left`), engine + health center (`status-center`), usage totals right (`status-right`) — split by separators. Filters stack as thin bands above the list: search-with-count plus a visible search-focus button, facet pickers, then the bulk bar only while rows are checked. Spacing runs on two steps throughout: tight 4px groups ({spacing.sm}: card text padding, header gaps, dialog field stacks) separated by generous 8px rhythms ({spacing.md}: toolbar padding, section gaps, dialog bodies).
+A fixed top band (title bar, lever-frame toolbar), a vertical split with the card list on top (`flex_1`) and the inspector below (filling its resizable panel: 240px start, 240–480px range, internal scroll only past the panel height), and a fixed status strip with three regions — counts left (`status-left`), engine + health center (`status-center`), usage totals right (`status-right`) — split by separators. Filters stack as thin bands above the list: search-with-count plus a visible search-focus button, facet pickers, then the bulk bar only while rows are checked. Spacing runs on two steps throughout: tight 4px groups ({spacing.sm}: card text padding, header gaps, dialog field stacks) separated by generous 8px rhythms ({spacing.md}: toolbar padding, section gaps, dialog bodies).
 
-The detail pane packs modules above one operate row: Endpoints, Health, Usage, History as GroupBox instruments, then a single `detail-operate` row (Enabled switch + Start/Stop/Test/Ping/Logs/Copy URLs + `row-menu` trigger). Eight small controls fit the 1000px frame in that one row, so endpoints stay above the fold with no horizontal scroll.
+The detail pane packs modules above one operate row: Endpoints, Health, Usage, History as GroupBox instruments, then a single `detail-operate` row (Enabled switch + Start/Stop/Test/Ping/Logs/Copy URLs + `row-menu` trigger). Eight small controls fit the 1000px frame in that one row, so endpoints stay above the fold with no horizontal scroll; at narrower widths the row wraps to a second line (never sideways scroll). The detail header names the row once via `Acting on: <name>` plus protocol/group Tags, bind endpoint, and serving Badge.
 
 The window opens at 1000x700 with an 880x620 minimum; toolbar, detail, dialogs, and every status segment paint inside the minimum frame (pinned by containment tests).
 
@@ -131,7 +131,7 @@ The window opens at 1000x700 with an 880x620 minimum; toolbar, detail, dialogs, 
 
 ## Elevation & Depth
 
-Flat, always, with hairlines doing the separation work: 1px borders in hairline color under the toolbar, under filter bands, around row cards, around the lever-frame plate, and between list and inspector. Tonal bands (chrome title/status bars, quiet-surface cards and plate on paper) supply the rest of the depth. No shadows exist in app code. Dialog and menu elevation belongs to the kit chrome, not to this system. The blocked-drop hint dims to 0.45 theme opacity while a dialog is open — opacity, never a new color.
+Flat, always, with hairlines doing the separation work: 1px borders in hairline color under the toolbar, under filter bands, around row cards, around the lever-frame plate, and between list and inspector. Tonal bands (chrome title/status bars, quiet-surface cards and plate on paper) supply the rest of the depth. No shadows exist in app code. Dialog and menu elevation belongs to the kit chrome, not to this system.
 
 ### Named Rules
 
@@ -195,13 +195,13 @@ Occupancy lamp (`row-dot-<id>`, fixed leading cell, flat fill) plus checkbox plu
 
 ### Endpoints module
 
-Labeled rows in the vertical description language (description-label token over each value): upstream display-only, then SOCKS and HTTP values each with its own small Copy button beside it (`copy-socks` / `copy-http`, bind + port only, `Copied SOCKS/HTTP URL` toast). Copy URLs keeps the all-at-once path; per-row copy closes the all-or-nothing gap.
+Compact one-line rows (fixed small muted label in the description-label token, truncating value, trailing small Copy): upstream display-only, then SOCKS and HTTP values each with its own small Copy button at the row end (`copy-socks` / `copy-http`, bind + port only, `Copied SOCKS/HTTP URL` toast). Copy URLs keeps the all-at-once path; per-row copy closes the all-or-nothing gap.
 
 ### Health and empty states
 
 - **Health:** detail line reads `health: never tested — press Test to check` until the first probe; dead rows render the same pinned copy inside an error Alert titled `Endpoint failed`, with the same operate row inline beside it. The status bar keeps the short `health: never tested` describer.
 - **Empty library:** empty copy with working Add (`empty-add`) and Import (`empty-import`) buttons beside it; counts read (0,0); usage is absent-or-zero, never nonzero.
-- **Drop hint:** always visible (`Drop .conf / .json / .txt files here to import (not while a dialog is open)`); dims to 0.45 opacity while any dialog blocks drops, and a blocked drop toasts `Close the open dialog first — dropped files were not imported` instead of stacking.
+- **File drops:** no persistent hint band — drops land anywhere on the shell, and a blocked drop (dialog open) toasts `Close the open dialog first — dropped files were not imported` instead of stacking.
 
 ### Dialogs
 

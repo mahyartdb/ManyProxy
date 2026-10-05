@@ -10332,12 +10332,16 @@ impl AppView {
             // the action rows, and three library rows share the 700px test
             // frame without clipping the list.
             .gap_1()
-            // The vertical split owns the height now (the detail
+            // The vertical split owns the height (the detail
             // `resizable_panel` starts at 240px, range 240..480): the pane
-            // keeps its 240px cap and scrolls inside it, so dragging the
+            // fills its panel and scrolls inside it, so dragging the
             // divider grows real inspector space up to the range end.
-            .max_h(px(240.))
+            // Never a fixed max_h here — a fixed cap desyncs from the grown
+            // panel and paints empty space below a still-scrolling box.
+            .h_full()
+            .min_h_0()
             .overflow_y_scroll()
+            .overflow_x_hidden()
             .child(self.render_inspector_tabs(cx))
             .child(match self.inspector_tab {
                 InspectorTab::Details => {
@@ -10501,10 +10505,13 @@ impl AppView {
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap_2()
+            .w_full()
             // Ticket 01: the header echoes the acting row — the same
-            // selected row F5 and the detail Start touch.
+            // selected row F5 and the detail Start touch. The name renders
+            // once via `detail-acting-on` (no second copy beside it).
             .child(
                 div()
                     .id("detail-acting-on")
@@ -10513,7 +10520,6 @@ impl AppView {
                     .text_color(cx.theme().muted_foreground)
                     .child(acting_on_label(config)),
             )
-            .child(Label::new(config.name.clone()))
             // T02: protocol and group ride as Tag chips; the bind
             // endpoint stays plain text (id/text presence asserted).
             .child(Tag::new().child(config.protocol.clone()))
@@ -10539,8 +10545,8 @@ impl AppView {
             )
     }
 
-    /// Detail endpoints section: labeled rows in the vertical
-    /// description language (label token + value), each bind endpoint
+    /// Detail endpoints section: compact one-line rows (fixed small muted
+    /// label, truncating value, trailing per-row Copy), each bind endpoint
     /// with its own Copy.
     fn render_detail_endpoints(
         &self,
@@ -10559,11 +10565,11 @@ impl AppView {
         // description label token and buttons are kit small with tooltips,
         // so focus, tab order, and density match the operate row below.
         div().id("config-endpoints").test_support().child(
-            GroupBox::new().title("Endpoints").gap_2().child(
+            GroupBox::new().title("Endpoints").gap_1().child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_1()
                     .child(Self::endpoint_row(cx, "upstream", upstream, None))
                     .child(Self::endpoint_row(
                         cx,
@@ -10581,16 +10587,25 @@ impl AppView {
         )
     }
 
-    /// Signal-box 06: one labeled endpoint row — description-label token
-    /// over the value, with an optional per-row Copy button beside it.
+    /// Signal-box 06: one compact endpoint row — fixed small muted label,
+    /// truncating value, and an optional trailing per-row Copy button.
     /// `label` is a static scheme name; `which` wires the copy target.
+    /// One line per endpoint (label | value | copy) keeps all three rows
+    /// above the fold inside the inspector height.
     fn endpoint_row(
         cx: &mut Context<Self>,
         label: &'static str,
         value: String,
         which: Option<EndpointUrl>,
     ) -> impl IntoElement {
-        let mut value_row = div().flex().flex_row().items_center().gap_2().child(value);
+        let mut value_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_1()
+            .min_w_0()
+            .child(div().flex_1().min_w_0().truncate().child(value));
         if let Some(which) = which {
             let (id, button_label, tip, a11y) = match which {
                 EndpointUrl::Socks => (
@@ -10607,21 +10622,28 @@ impl AppView {
                 ),
             };
             value_row = value_row.child(
-                Button::new(id)
-                    .small()
-                    .label(button_label)
-                    .accessibility_label(a11y)
-                    .tooltip(tip)
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.copy_single_endpoint_url(which, window, cx);
-                    })),
+                div().flex_shrink_0().child(
+                    Button::new(id)
+                        .small()
+                        .label(button_label)
+                        .accessibility_label(a11y)
+                        .tooltip(tip)
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.copy_single_endpoint_url(which, window, cx);
+                        })),
+                ),
             );
         }
         div()
             .flex()
-            .flex_col()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
             .child(
                 div()
+                    .w(px(72.))
+                    .flex_shrink_0()
                     .text_sm()
                     .text_color(cx.theme().description_list_label_foreground)
                     .child(label),
@@ -10707,14 +10729,17 @@ impl AppView {
         // Signal-box 04: one operate row — the switch, the six inline
         // ops, and the row menu trigger. Eight small controls fit the
         // 1000px frame in a single row, so the Endpoints module stays
-        // above the fold with no horizontal scroll.
+        // above the fold with no horizontal scroll. The row wraps to a
+        // second line (never sideways scroll) at narrower widths.
         div()
             .id("detail-operate")
             .test_support()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap_2()
+            .w_full()
             .child(
                 Switch::new(switch_id)
                     .checked(config.enabled)
@@ -12557,30 +12582,12 @@ impl Render for AppView {
             );
         }
         list_pane = list_pane.child(empty_ctas);
+        // File drops land anywhere on the shell via on_drop (see
+        // [`AppView::import_dropped_files`]); a drop while any dialog is
+        // open is refused with an honest toast — no persistent hint band.
         self.render_shell(cx)
             .child(TitleBar::new().child(APP_TITLE))
             .child(self.render_toolbar(cx))
-            // Ticket 17: visible drop affordance (the shell has no
-            // hover-during-drag event, so the hint stays visible instead of
-            // appearing only on hover). Signal-box 03: the copy stays
-            // honest about blocked drops — a drop while any dialog is open
-            // is refused (see [`AppView::import_dropped_files`]), so the
-            // hint names that precondition up front. Signal-box 06: the hint
-            // dims while drops are blocked (any dialog open) — theme
-            // opacity, no new color; id, copy, and the refusal itself are
-            // unchanged.
-            .child({
-                let mut hint = div()
-                    .id("drop-hint")
-                    .test_support()
-                    .px_2()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Drop .conf / .json / .txt files here to import (not while a dialog is open)");
-                if window.has_active_dialog(cx) {
-                    hint = hint.opacity(0.45);
-                }
-                hint
-            })
             .child(
                 div()
                     .id("main-content")
@@ -15167,9 +15174,11 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("import-files").is_some()));
     }
 
-    /// Scenario: drag files over shell → visible drop hint.
+    /// Polish: no persistent drop-hint band — file drops land anywhere on
+    /// the shell (see `t03_drop_while_dialog_open_refuses_honestly` for the
+    /// blocked-drop toast); the top strip stays TitleBar + toolbar only.
     #[gpui_kit::test]
-    fn shell_renders_drop_hint(cx: &mut TestAppContext) {
+    fn no_persistent_drop_hint_band(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_, cx) = mount_view(store, cx);
@@ -15178,26 +15187,7 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        assert!(cx.update(|window, _| window.try_find("drop-hint").is_some()));
-    }
-
-    /// Signal-box 06: the drop hint stays painted while drops are blocked
-    /// (dialog open) — the dim is a theme-opacity restyle on the same id
-    /// and copy, so presence in both states is the headless assertion and
-    /// the look itself is manual UX review per the ticket.
-    #[gpui_kit::test]
-    fn t06_drop_hint_paints_while_dialog_open(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
-        let store = Store::open_in_memory().expect("in-memory store opens");
-        let (view, cx) = mount_view(store, cx);
-        cx.simulate_resize(size(px(1000.), px(700.)));
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
-        });
-        cx.run_until_parked();
-        paint_dialog_open(cx);
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        assert!(cx.update(|window, _| window.try_find("drop-hint").is_some()));
+        assert!(cx.update(|window, _| window.try_find("drop-hint").is_none()));
     }
 
     /// Scenario: export dialog → row counts + destination path + overwrite
@@ -16323,8 +16313,8 @@ mod tests {
     }
 
     /// Signal-box 03: a file drop while a dialog is open refuses honestly —
-    /// no stacked import dialog, one toast naming the block (the drop hint
-    /// names the same precondition).
+    /// no stacked import dialog, one toast naming the block (refusal is
+    /// toast-only; no persistent hint band).
     #[gpui_kit::test]
     fn t03_drop_while_dialog_open_refuses_honestly(cx: &mut TestAppContext) {
         use gpui_kit::ExternalPaths;
@@ -21468,7 +21458,7 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "library-empty");
-        for id in ["empty-add", "empty-import", "drop-hint"] {
+        for id in ["empty-add", "empty-import"] {
             assert!(
                 cx.update(|window, _| window.try_find(id.to_string()).is_some()),
                 "{id} offers the next step"
