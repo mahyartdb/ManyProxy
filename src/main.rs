@@ -17664,6 +17664,116 @@ mod tests {
         assert_painted(cx, &format!("row-dot-{}", seeded.id));
     }
 
+    /// Signal-box ticket 02 scenario 1: mixed running, stopped, and dead
+    /// rows render one exact anatomy — lamp, name, meta, badge in fixed
+    /// positions with identical geometry, every row carrying its port,
+    /// endpoint, and (where it exists) health numbers. Pinned badge strings
+    /// never change: only the wrappers carry style.
+    #[gpui_kit::test]
+    fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
+        use crate::library_row_dense_lines_with_upstream;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let running = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let stopped = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let dead = store
+            .add(row19_seed("Lab", "c.example.com", "10803"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.running.insert(running.id.clone());
+                    delegate.running.insert(dead.id.clone());
+                    delegate
+                        .health
+                        .insert(running.id.clone(), "87ms".to_string());
+                    delegate.health.insert(dead.id.clone(), "dead".to_string());
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        // Every row paints the full anatomy: card, lamp, checkbox.
+        for row in [&running, &stopped, &dead] {
+            assert_painted(cx, &format!("row-card-{}", row.id));
+            assert_painted(cx, &format!("row-dot-{}", row.id));
+            assert_painted(cx, &format!("check-{}", row.id));
+        }
+        // Fixed cells: lamps share one x origin, cards share one height.
+        let (lamp_x, card_h): (Vec<_>, Vec<_>) = cx
+            .update(|window, _| {
+                [&running, &stopped, &dead]
+                    .iter()
+                    .map(|row| {
+                        let lamp = window
+                            .try_find(format!("row-dot-{}", row.id))
+                            .expect("lamp finds")
+                            .bounds();
+                        let card = window
+                            .try_find(format!("row-card-{}", row.id))
+                            .expect("card finds")
+                            .bounds();
+                        (lamp.origin.x, card.size.height)
+                    })
+                    .unzip()
+            })
+            .into();
+        assert!(
+            lamp_x.windows(2).all(|pair| pair[0] == pair[1]),
+            "lamps align in one column: {lamp_x:?}"
+        );
+        assert!(
+            card_h.windows(2).all(|pair| pair[0] == pair[1]),
+            "cards share one height: {card_h:?}"
+        );
+        // No numberless rows: meta always carries port + bind endpoint +
+        // upstream; the badge adds port + health while serving (pinned
+        // strings — a stopped row honestly shows `○ Stopped`, never a
+        // fabricated latency).
+        for (row, upstream, health, serving) in [
+            (&running, "a.example.com:443", Some("87ms"), true),
+            (&stopped, "b.example.com:443", None, false),
+            (&dead, "c.example.com:443", Some("dead"), true),
+        ] {
+            let text = library_row_dense_lines_with_upstream(
+                row, upstream, health, serving, None,
+            )
+            .join("\n");
+            let port = format!(":{}", row.port);
+            assert!(text.contains(&port), "port in row:\n{text}");
+            assert!(
+                text.contains(&format!("127.0.0.1:{0}", row.port)),
+                "bind endpoint in row:\n{text}"
+            );
+            assert!(text.contains(upstream), "upstream in row:\n{text}");
+        }
+        let live = library_row_dense_lines_with_upstream(
+            &running,
+            "a.example.com:443",
+            Some("87ms"),
+            true,
+            None,
+        )
+        .join("\n");
+        assert!(live.contains("87ms"), "health number rides running row:\n{live}");
+        let idle = library_row_dense_lines_with_upstream(&stopped, "b.example.com:443", None, false, None)
+            .join("\n");
+        assert!(
+            idle.contains("○ Stopped"),
+            "stopped badge stays pinned:\n{idle}"
+        );
+    }
+
     /// T03: facet picker seeds with a non-default group/protocol.
     fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig {
         NewConfig {
