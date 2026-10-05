@@ -17774,6 +17774,98 @@ mod tests {
         );
     }
 
+    /// Signal-box ticket 02 scenario 2: a 50-row stress library stays
+    /// uniform and scannable — every painted card shares one width, one
+    /// height, and one lamp column, before and after a filter narrows the
+    /// visible window. (No `ListState` scroll seam is used anywhere in this
+    /// codebase, so the filter drives the visible-window change — the same
+    /// repaint-uniformity property a scroll would exercise.)
+    #[gpui_kit::test]
+    fn t02_row_anatomy_stress_stays_uniform(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut ids = Vec::new();
+        for i in 0..50 {
+            let row = store
+                .add(row19_seed(
+                    &format!("node-{i}"),
+                    &format!("h{i}.example.com"),
+                    &format!("{}", 11_000 + i),
+                ))
+                .expect("seed works");
+            ids.push(row.id.clone());
+            let _ = row;
+        }
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    for (i, id) in ids.iter().enumerate() {
+                        if i % 3 == 0 {
+                            delegate.running.insert(id.clone());
+                            delegate.health.insert(
+                                id.clone(),
+                                if i == 21 { "dead".to_string() } else { "12ms".to_string() },
+                            );
+                        }
+                    }
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        fn painted_cards(cx: &mut VisualTestContext, ids: &[String]) -> Vec<(String, String)> {
+            cx.update(|window, _| {
+                ids.iter()
+                    .filter_map(|id| window.try_find(format!("row-card-{id}")))
+                    .map(|snapshot| {
+                        let bounds = snapshot.bounds();
+                        (format!("{:?}", bounds.origin.x), format!("{:?}", bounds.size))
+                    })
+                    .collect()
+            })
+        }
+        fn assert_column(label: &str, cx: &mut VisualTestContext, ids: &[String]) {
+            let cards = painted_cards(cx, ids);
+            assert!(cards.len() >= 2, "{label}: a window of rows paints");
+            assert!(
+                cards.windows(2).all(|pair| pair[0] == pair[1]),
+                "{label}: no ragged cards or overflow: {cards:?}"
+            );
+            let lamps = cx.update(|window, _| {
+                ids.iter()
+                    .filter(|id| window.try_find(format!("row-card-{id}")).is_some())
+                    .filter(|id| window.try_find(format!("row-dot-{id}")).is_some())
+                    .count()
+            });
+            assert_eq!(lamps, cards.len(), "{label}: every card keeps its lamp");
+        }
+        assert_column("full library", cx, &ids);
+
+        // Filter to the `node-4` window (node-4, node-40..49): a different
+        // painted subset must hold the same geometry.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "node-4".to_string();
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_column("filtered library", cx, &ids);
+    }
+
     /// T03: facet picker seeds with a non-default group/protocol.
     fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig {
         NewConfig {
