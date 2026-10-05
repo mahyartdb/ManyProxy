@@ -1729,10 +1729,10 @@ impl ConfigForm {
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
         fold_guided_into_params(
             &params,
-            &self.guided_server.read(cx).value().to_string(),
-            &self.guided_port.read(cx).value().to_string(),
+            self.guided_server.read(cx).value().as_ref(),
+            self.guided_port.read(cx).value().as_ref(),
             identity,
-            &self.guided_identity.read(cx).value().to_string(),
+            self.guided_identity.read(cx).value().as_ref(),
         )
     }
 
@@ -1747,10 +1747,10 @@ impl ConfigForm {
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
         let merged = fold_guided_into_params(
             &box_text,
-            &self.guided_server.read(cx).value().to_string(),
-            &self.guided_port.read(cx).value().to_string(),
+            self.guided_server.read(cx).value().as_ref(),
+            self.guided_port.read(cx).value().as_ref(),
             identity,
-            &self.guided_identity.read(cx).value().to_string(),
+            self.guided_identity.read(cx).value().as_ref(),
         );
         let parseable = merged.trim().is_empty()
             || serde_json::from_str::<serde_json::Value>(&merged)
@@ -18655,24 +18655,22 @@ mod tests {
             assert_painted(cx, &format!("check-{}", row.id));
         }
         // Fixed cells: lamps share one x origin, cards share one height.
-        let (lamp_x, card_h): (Vec<_>, Vec<_>) = cx
-            .update(|window, _| {
-                [&running, &stopped, &dead]
-                    .iter()
-                    .map(|row| {
-                        let lamp = window
-                            .try_find(format!("row-dot-{}", row.id))
-                            .expect("lamp finds")
-                            .bounds();
-                        let card = window
-                            .try_find(format!("row-card-{}", row.id))
-                            .expect("card finds")
-                            .bounds();
-                        (lamp.origin.x, card.size.height)
-                    })
-                    .unzip()
-            })
-            .into();
+        let (lamp_x, card_h): (Vec<_>, Vec<_>) = cx.update(|window, _| {
+            [&running, &stopped, &dead]
+                .iter()
+                .map(|row| {
+                    let lamp = window
+                        .try_find(format!("row-dot-{}", row.id))
+                        .expect("lamp finds")
+                        .bounds();
+                    let card = window
+                        .try_find(format!("row-card-{}", row.id))
+                        .expect("card finds")
+                        .bounds();
+                    (lamp.origin.x, card.size.height)
+                })
+                .unzip()
+        });
         assert!(
             lamp_x.windows(2).all(|pair| pair[0] == pair[1]),
             "lamps align in one column: {lamp_x:?}"
