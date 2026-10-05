@@ -821,6 +821,201 @@ pub fn protocol_params_template(protocol: &str) -> String {
     serde_json::Value::Object(params).to_string()
 }
 
+/// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
+/// `None` means unknown protocol (the commit names it through the normal
+/// validation path). `key = None` means a known protocol with no link
+/// secret — the Identity input hides while Server + Server port still fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuidedIdentity {
+    /// Params key the Identity input fills (`None` = no secret).
+    pub key: Option<&'static str>,
+    /// Alias keys for prefill/compare (first entry is `key` when set).
+    pub read_keys: &'static [&'static str],
+    /// Human credential list for the guided hint line.
+    pub needs: &'static str,
+}
+
+/// Ticket 05: primary identity key + read aliases + needs-label per
+/// protocol. Key sets mirror [`validate_protocol_params`] exactly (same
+/// credential per protocol) so the mini-form can never disagree with the
+/// commit gate about what a row needs.
+pub fn guided_identity_fields(protocol: &str) -> Option<GuidedIdentity> {
+    let canonical = canonical_protocol(protocol)?;
+    let guided = match canonical.as_str() {
+        "vless" | "xray" | "vmess" => GuidedIdentity {
+            key: Some("uuid"),
+            read_keys: &["uuid", "id"],
+            needs: "uuid",
+        },
+        "trojan" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password"],
+            needs: "password",
+        },
+        "shadowsocks" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password"],
+            needs: "method and password",
+        },
+        "hysteria2" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password", "auth"],
+            needs: "password",
+        },
+        "hysteria" => GuidedIdentity {
+            key: Some("auth"),
+            read_keys: &["auth", "password"],
+            needs: "auth",
+        },
+        "tuic" => GuidedIdentity {
+            key: Some("uuid"),
+            read_keys: &["uuid", "id"],
+            needs: "uuid and password",
+        },
+        "wireguard" | "amneziawg" => GuidedIdentity {
+            key: Some("private_key"),
+            read_keys: &["private_key", "privatekey"],
+            needs: "private_key and public_key",
+        },
+        "anytls" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password"],
+            needs: "password",
+        },
+        "naive" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password"],
+            needs: "username and password",
+        },
+        "ssh" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password", "private_key", "privatekey"],
+            needs: "username and a password or private_key",
+        },
+        "noise" => GuidedIdentity {
+            key: Some("key"),
+            read_keys: &["key", "password"],
+            needs: "password or key",
+        },
+        "snell" => GuidedIdentity {
+            key: Some("psk"),
+            read_keys: &["psk"],
+            needs: "psk",
+        },
+        "socks" | "http" | "https" | "shadowtls" => GuidedIdentity {
+            key: None,
+            read_keys: &[],
+            needs: "no secret",
+        },
+        "custom-outbound" | "custom-config" | "extra-core" | "chain" => GuidedIdentity {
+            key: None,
+            read_keys: &[],
+            needs: "custom JSON",
+        },
+        _ => return None,
+    };
+    Some(guided)
+}
+
+/// Ticket 05: prefill one guided mini-form value from a params JSON object
+/// (case-insensitive across `keys`; numbers stringify). Blank for
+/// unparseable JSON or missing keys — the JSON stays the source of truth,
+/// the mini-form only echoes it.
+pub fn guided_prefill_value(params_raw: &str, keys: &[&str]) -> String {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    match obj {
+        Some(obj) => lookup_case_insensitive(&obj, keys).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// Ticket 05: fold non-blank guided mini-form values into the params JSON
+/// text. Blank guided inputs leave the JSON byte-identical (the
+/// template/typed JSON stands, and untouched edit fields stay silent — no
+/// spurious patches from reserialization). Unparseable or non-object JSON
+/// returns unchanged so validation names that error. A non-blank server
+/// port outside 1-65535 (or unparseable) is written as a string so
+/// validation fails naming server_port instead of silently keeping the
+/// JSON's port. `identity` is `(key, read_aliases)`: the value compares
+/// across every alias but writes to `key` only.
+pub fn fold_guided_into_params(
+    params_raw: &str,
+    server: &str,
+    server_port: &str,
+    identity: Option<(&str, &[&str])>,
+    identity_value: &str,
+) -> String {
+    let server = server.trim();
+    let port = server_port.trim();
+    let identity_value = identity_value.trim();
+    let identity_active = identity.is_some_and(|(_, _)| !identity_value.is_empty());
+    if server.is_empty() && port.is_empty() && !identity_active {
+        return params_raw.to_string();
+    }
+    const SERVER_KEYS: &[&str] = &["server", "address"];
+    const PORT_KEYS: &[&str] = &["server_port", "port", "serverPort"];
+    let base = if params_raw.trim().is_empty() {
+        "{}"
+    } else {
+        params_raw
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(base) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    // Reads borrow per call (never held across an insert — NLL ends each
+    // borrow before the mutation below).
+    let mut changed = false;
+    if !server.is_empty() && lookup_case_insensitive(obj, SERVER_KEYS).as_deref() != Some(server) {
+        obj.insert(
+            "server".to_string(),
+            serde_json::Value::String(server.to_string()),
+        );
+        changed = true;
+    }
+    if !port.is_empty() {
+        let valid = port
+            .parse::<u64>()
+            .ok()
+            .filter(|port| (1..=65_535).contains(port));
+        let same = match (lookup_case_insensitive(obj, PORT_KEYS), valid) {
+            (Some(text), Some(number)) => text.parse::<u64>().ok() == Some(number),
+            (Some(text), None) => text == port,
+            (None, _) => false,
+        };
+        if !same {
+            let value = match valid {
+                Some(number) => serde_json::Value::from(number),
+                None => serde_json::Value::String(port.to_string()),
+            };
+            obj.insert("server_port".to_string(), value);
+            changed = true;
+        }
+    }
+    if let Some((key, read_keys)) = identity {
+        if !identity_value.is_empty()
+            && lookup_case_insensitive(obj, read_keys).as_deref() != Some(identity_value)
+        {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::String(identity_value.to_string()),
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
 /// Ticket 16: true when a params JSON object carries the import shape
 /// (`type`/`protocol` + `server`/`address` + `server_port`/`port`). Same
 /// predicate as [`export_payload`]: only these rows round-trip through the
@@ -7715,6 +7910,100 @@ mod tests {
             fallback.contains("server"),
             "fallback still guides, got {fallback}"
         );
+    }
+
+    /// Ticket 05: guided identity mapping mirrors the commit gate (same
+    /// credential per protocol); aliases canonicalize; secret-free and
+    /// custom protocols hide Identity; unknown stays unknown.
+    #[test]
+    fn t05_guided_identity_fields_mirror_validation() {
+        let vless = guided_identity_fields("vless").expect("vless maps");
+        assert_eq!(vless.key, Some("uuid"));
+        assert_eq!(vless.needs, "uuid");
+        let trojan = guided_identity_fields("trojan").expect("trojan maps");
+        assert_eq!(trojan.key, Some("password"));
+        // Aliases canonicalize through the same gate as validation.
+        assert_eq!(
+            guided_identity_fields("ss").expect("ss maps").key,
+            Some("password"),
+            "shadowsocks alias"
+        );
+        assert_eq!(
+            guided_identity_fields("wg").expect("wg maps").key,
+            Some("private_key"),
+            "wireguard alias"
+        );
+        let socks = guided_identity_fields("socks").expect("socks maps");
+        assert_eq!(socks.key, None, "no secret for socks");
+        let custom = guided_identity_fields("custom-outbound").expect("custom maps");
+        assert_eq!(custom.key, None, "custom JSON fills Identity nowhere");
+        assert!(
+            guided_identity_fields("bogus").is_none(),
+            "unknown stays unknown"
+        );
+    }
+
+    /// Ticket 05: guided prefill echoes the JSON (aliases, numbers) and
+    /// stays blank on garbage — the JSON is the source of truth.
+    #[test]
+    fn t05_guided_prefill_echoes_json_blank_on_garbage() {
+        let params = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\"}";
+        assert_eq!(guided_prefill_value(params, &["server", "address"]), "a.example.com");
+        assert_eq!(guided_prefill_value(params, &["server_port", "port"]), "443");
+        assert_eq!(
+            guided_prefill_value(params, &["uuid", "id"]),
+            "11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(guided_prefill_value(params, &["password"]), "");
+        assert_eq!(guided_prefill_value("not json", &["server"]), "");
+        assert_eq!(guided_prefill_value("", &["server"]), "");
+    }
+
+    /// Ticket 05: blank guided inputs leave the JSON byte-identical;
+    /// non-blank values fold in; garbage ports fail loudly at validation
+    /// (written as strings, never silently kept).
+    #[test]
+    fn t05_fold_guided_leaves_blank_untouched_and_merges_touched() {
+        let template = protocol_params_template("vless");
+        // All blank → byte-identical (untouched template still names uuid).
+        assert_eq!(
+            fold_guided_into_params(&template, "", "", Some(("uuid", &["uuid", "id"])), ""),
+            template
+        );
+        // Guided identity + server fold into the blank template.
+        let merged = fold_guided_into_params(
+            &template,
+            "a.example.com",
+            "",
+            Some(("uuid", &["uuid", "id"])),
+            "11111111-2222-4333-8444-555555555555",
+        );
+        let value: serde_json::Value = serde_json::from_str(&merged).expect("merged is JSON");
+        assert_eq!(value["server"], "a.example.com");
+        assert_eq!(value["uuid"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(value["server_port"], 443, "template port stands");
+        // Untouched values never reserialize (no spurious edit patches).
+        let shaped = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\"}";
+        assert_eq!(
+            fold_guided_into_params(
+                shaped,
+                "a.example.com",
+                "443",
+                Some(("uuid", &["uuid", "id"])),
+                "11111111-2222-4333-8444-555555555555"
+            ),
+            shaped
+        );
+        // Garbage port is written as a string — validation names it.
+        let bad_port = fold_guided_into_params(shaped, "", "abc", None, "");
+        assert!(
+            bad_port.contains("\"server_port\":\"abc\""),
+            "loud for validation, got {bad_port}"
+        );
+        // Unparseable JSON returns unchanged (validation names that error).
+        assert_eq!(fold_guided_into_params("{{{", "a.example.com", "", None, ""), "{{{");
     }
 
     /// Ticket 31: edit a subscription's label/url/group — persists in place,
