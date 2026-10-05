@@ -2052,6 +2052,12 @@ fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
     }
 }
 
+/// Ticket 01: detail-header acting-row line — names the F5/detail-Start
+/// target so the selected row can never be confused with the checked set.
+fn acting_on_label(config: &ProxyConfig) -> String {
+    format!("Acting on: {}", config.name)
+}
+
 /// W1: row lifecycle state machine — stopped → starting → running, with
 /// failed for serving rows whose sidecar died or whose health reads dead.
 /// Derived per render from (serving truth, start-in-flight, failed evidence)
@@ -10141,6 +10147,16 @@ impl AppView {
             .flex_row()
             .items_center()
             .gap_2()
+            // Ticket 01: the header echoes the acting row — the same
+            // selected row F5 and the detail Start touch.
+            .child(
+                div()
+                    .id("detail-acting-on")
+                    .test_support()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(acting_on_label(config)),
+            )
             .child(Label::new(config.name.clone()))
             // T02: protocol and group ride as Tag chips; the bind
             // endpoint stays plain text (id/text presence asserted).
@@ -16399,6 +16415,43 @@ mod tests {
         );
     }
 
+    /// Ticket 01: the detail header names the acting row — the selected
+    /// row, which is also the F5/detail-Start target (`selected_config`).
+    /// The checked set stays a different target.
+    #[test]
+    fn t01_detail_header_names_acting_row() {
+        use crate::acting_on_label;
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        use gpui_kit::component::IndexPath;
+        fn row(id: &str, name: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: "vless".to_string(),
+                params: r#"{"server":"a.example.com"}"#.to_string(),
+                group: "g".to_string(),
+                enabled: true,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![row("1", "Alpha"), row("2", "Beta")]);
+        delegate.toggle_checked("1");
+        delegate.selected = Some(IndexPath::new(1));
+        let acting = delegate.selected_row().expect("a row is selected");
+        assert_eq!(acting_on_label(&acting), "Acting on: Beta");
+        assert!(
+            delegate.checked.contains("1"),
+            "the bulk set is untouched by selection"
+        );
+        assert_ne!(acting.id, "1", "header names the selection, not a check");
+    }
+
     /// Ticket 44: facet pickers inventory the real rows (labels + counts,
     /// protocols), never free text.
     #[test]
@@ -16570,6 +16623,9 @@ mod tests {
         assert_absent(cx, format!("row-check-chip-{}", third.id));
         assert_painted(cx, "bulk-bar");
         assert_painted(cx, "bulk-label");
+        // The third row is selected: the detail header echoes it as the
+        // acting row (the F5/detail-Start target).
+        assert_painted(cx, "detail-acting-on");
         let label = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
         });
