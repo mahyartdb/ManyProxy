@@ -2663,12 +2663,14 @@ fn tick_interval_summary() -> String {
 /// Ticket 17: inline LAN-confirm hint for add/edit dialogs. `Some` when
 /// starting this bind will stop at the LAN confirm gate; `None` for
 /// loopback and for blank (blank means the loopback default).
+/// Ticket 05 (signal-box): plain-words Bind guard — leaving loopback
+/// exposes the machine (the hint says so verbatim, not just "confirm").
 fn lan_hint_for_bind(bind: &str) -> Option<String> {
     if bind.trim().is_empty() || !requires_lan_confirm(bind) {
         return None;
     }
     Some(format!(
-        "Starting on {} needs a LAN confirm — anyone on the network could use it",
+        "Leaving loopback exposes this machine — starting on {} needs a LAN confirm, and anyone on the network could use it",
         bind.trim()
     ))
 }
@@ -17632,6 +17634,27 @@ mod tests {
             "nothing stored"
         );
         assert_eq!(notification_count(cx), 1, "one error notice, never silent");
+    }
+
+    // -- Signal-box 05: ruled train-order dialogs ---------------------------
+
+    /// Ticket 05: the Bind guard says leaving loopback exposes the machine
+    /// (plain words, naming the bind); loopback and blank stay quiet.
+    #[test]
+    fn t05_bind_guard_says_leaving_loopback_exposes_machine() {
+        use crate::lan_hint_for_bind;
+        let hint = lan_hint_for_bind("0.0.0.0").expect("LAN bind guards");
+        assert!(
+            hint.contains("Leaving loopback exposes this machine"),
+            "plain-words guard, got {hint}"
+        );
+        assert!(hint.contains("0.0.0.0"), "names the bind, got {hint}");
+        assert!(hint.contains("LAN confirm"), "names the gate, got {hint}");
+        assert!(
+            lan_hint_for_bind("127.0.0.1").is_none(),
+            "loopback stays quiet"
+        );
+        assert!(lan_hint_for_bind("").is_none(), "blank stays quiet");
     }
 
     // -- Ticket 19: library list paints stored rows --------------------------
