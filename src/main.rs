@@ -1305,11 +1305,9 @@ fn dialog_footer(
 /// Ticket 05: the Advanced disclosure toggle — one behavior, two
 /// placements (the collapsed hint row and the expanded Params header row;
 /// only one renders per frame, so the stable
-/// `params-advanced-toggle` id never collides). Expanding merges
-/// non-blank guided values into the JSON box and clears the inputs;
-/// collapsing echoes the box back into blank guided inputs only. Values
-/// are never lost, and the commit fold can never silently override a JSON
-/// edit (cleared inputs fold nothing).
+/// `params-advanced-toggle` id never collides). The swap itself lives in
+/// [`ConfigForm::expand_merge`] / [`ConfigForm::collapse_echo`] (called
+/// here and by tests).
 fn advanced_toggle_button(
     label: &'static str,
     view: &Entity<AppView>,
@@ -1317,73 +1315,16 @@ fn advanced_toggle_button(
 ) -> impl IntoElement {
     let toggle_view = view.clone();
     let toggle_cell = form.advanced.clone();
-    let toggle_params = form.params.clone();
-    let toggle_protocol = form.protocol.clone();
-    let toggle_server = form.guided_server.clone();
-    let toggle_port = form.guided_port.clone();
-    let toggle_identity = form.guided_identity.clone();
+    let toggle_form = form.clone();
     Button::new("params-advanced-toggle")
         .label(label)
         .on_click(move |_, window, cx| {
             toggle_view.update(cx, |_, cx| {
                 let expanding = !*toggle_cell.borrow();
                 if expanding {
-                    let box_text = toggle_params.read(cx).value().to_string();
-                    let protocol = toggle_protocol.read(cx).value().to_string();
-                    let identity = guided_identity_fields(&protocol)
-                        .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
-                    let merged = fold_guided_into_params(
-                        &box_text,
-                        &toggle_server.read(cx).value().to_string(),
-                        &toggle_port.read(cx).value().to_string(),
-                        identity,
-                        &toggle_identity.read(cx).value().to_string(),
-                    );
-                    let parseable = merged.trim().is_empty()
-                        || serde_json::from_str::<serde_json::Value>(&merged)
-                            .ok()
-                            .is_some_and(|value| value.is_object());
-                    if merged != box_text {
-                        let next = merged.clone();
-                        toggle_params.update(cx, |state, cx| {
-                            state.set_value(next, window, cx);
-                        });
-                    }
-                    if parseable {
-                        for entity in [&toggle_server, &toggle_port, &toggle_identity] {
-                            entity.update(cx, |state, cx| {
-                                state.set_value(String::new(), window, cx);
-                            });
-                        }
-                    }
+                    toggle_form.expand_merge(window, cx);
                 } else {
-                    let box_text = toggle_params.read(cx).value().to_string();
-                    let protocol = toggle_protocol.read(cx).value().to_string();
-                    let read_keys: &[&str] = guided_identity_fields(&protocol)
-                        .map(|guided| guided.read_keys)
-                        .unwrap_or(&[]);
-                    for (entity, value) in [
-                        (
-                            &toggle_server,
-                            guided_prefill_value(&box_text, &["server", "address"]),
-                        ),
-                        (
-                            &toggle_port,
-                            guided_prefill_value(&box_text, &["server_port", "port"]),
-                        ),
-                        (
-                            &toggle_identity,
-                            guided_prefill_value(&box_text, read_keys),
-                        ),
-                    ] {
-                        let blank = entity.read(cx).value().to_string().trim().is_empty();
-                        if blank && !value.is_empty() {
-                            let next = value.clone();
-                            entity.update(cx, |state, cx| {
-                                state.set_value(next, window, cx);
-                            });
-                        }
-                    }
+                    toggle_form.collapse_echo(window, cx);
                 }
                 *toggle_cell.borrow_mut() = expanding;
                 cx.notify();
@@ -1790,6 +1731,78 @@ impl ConfigForm {
             identity,
             &self.guided_identity.read(cx).value().to_string(),
         )
+    }
+
+    /// Ticket 05: expand direction of the Advanced swap — merge non-blank
+    /// guided values into the JSON box, then clear the guided inputs when
+    /// the box parses as an object. A garbage box keeps the inputs, so
+    /// nothing is ever lost (the commit fold reports that error instead).
+    fn expand_merge(&self, window: &mut Window, cx: &mut Context<AppView>) {
+        let box_text = self.params.read(cx).value().to_string();
+        let protocol = self.protocol.read(cx).value().to_string();
+        let identity = guided_identity_fields(&protocol)
+            .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
+        let merged = fold_guided_into_params(
+            &box_text,
+            &self.guided_server.read(cx).value().to_string(),
+            &self.guided_port.read(cx).value().to_string(),
+            identity,
+            &self.guided_identity.read(cx).value().to_string(),
+        );
+        let parseable = merged.trim().is_empty()
+            || serde_json::from_str::<serde_json::Value>(&merged)
+                .ok()
+                .is_some_and(|value| value.is_object());
+        if merged != box_text {
+            let next = merged.clone();
+            self.params.update(cx, |state, cx| {
+                state.set_value(next, window, cx);
+            });
+        }
+        if parseable {
+            for entity in [
+                &self.guided_server,
+                &self.guided_port,
+                &self.guided_identity,
+            ] {
+                entity.update(cx, |state, cx| {
+                    state.set_value(String::new(), window, cx);
+                });
+            }
+        }
+    }
+
+    /// Ticket 05: collapse direction of the Advanced swap — echo the JSON
+    /// box into blank guided inputs only (never clobbers values kept
+    /// across a garbage box).
+    fn collapse_echo(&self, window: &mut Window, cx: &mut Context<AppView>) {
+        let box_text = self.params.read(cx).value().to_string();
+        let protocol = self.protocol.read(cx).value().to_string();
+        let read_keys: &[&str] = guided_identity_fields(&protocol)
+            .map(|guided| guided.read_keys)
+            .unwrap_or(&[]);
+        for (entity, value) in [
+            (
+                &self.guided_server,
+                guided_prefill_value(&box_text, &["server", "address"]),
+            ),
+            (
+                &self.guided_port,
+                guided_prefill_value(&box_text, &["server_port", "port"]),
+            ),
+            (
+                &self.guided_identity,
+                guided_prefill_value(&box_text, read_keys),
+            ),
+        ] {
+            let blank = entity.read(cx).value().to_string().trim().is_empty();
+            if blank && !value.is_empty() {
+                let next = value.clone();
+                entity.update(cx, |state, cx| {
+                    state.set_value(next, window, cx);
+                });
+            }
+        }
     }
 
     /// Ticket 26: patch relative to the dialog-open snapshot. Fields the user
@@ -18003,6 +18016,309 @@ mod tests {
             notification_count(cx),
             before,
             "Cancel fires no toast and writes nothing"
+        );
+    }
+
+    /// Ticket 05: guided label + hint copy for the live protocol text.
+    #[test]
+    fn t05_guided_label_and_hint_name_protocol_needs() {
+        use crate::{guided_hint_line, guided_identity_label};
+        assert_eq!(guided_identity_label("vless"), "Identity (uuid)");
+        assert_eq!(guided_identity_label("trojan"), "Identity (password)");
+        assert_eq!(guided_identity_label("bogus"), "Identity");
+        assert_eq!(
+            guided_hint_line("vless").as_deref(),
+            Some("vless needs uuid.")
+        );
+        assert_eq!(
+            guided_hint_line("tuic").as_deref(),
+            Some("tuic needs uuid and password.")
+        );
+        assert_eq!(
+            guided_hint_line("socks").as_deref(),
+            Some("No secret needed for socks.")
+        );
+        assert_eq!(guided_hint_line("bogus"), None);
+    }
+
+    /// Ticket 05 scenario 1: a new user completes Add through the guided
+    /// mini-form only — the raw JSON box stays the untouched blank template,
+    /// Advanced stays collapsed, and the row lands with merged params.
+    #[gpui_kit::test]
+    fn t05_guided_add_without_json_creates_row(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("First", window, cx);
+                });
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value("198.51.100.9", window, cx);
+                });
+                form.guided_port.update(cx, |state, cx| {
+                    state.set_value("443", window, cx);
+                });
+                form.guided_identity.update(cx, |state, cx| {
+                    state.set_value("11111111-2222-4333-8444-555555555555", window, cx);
+                });
+                let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
+                let box_text = form.params.read(cx).value().to_string();
+                assert!(
+                    box_text.contains("\"uuid\":\"\""),
+                    "raw JSON untouched: {box_text}"
+                );
+                assert!(!*form.advanced.borrow(), "Advanced never opened");
+                closed
+            })
+        });
+        assert!(closed, "guided-valid commit closes");
+        assert!(form_error.borrow().is_none(), "no inline error");
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert_eq!(rows.len(), 1, "one row lands");
+        assert!(rows[0].params.contains("198.51.100.9"), "server folds in");
+        assert!(
+            rows[0]
+                .params
+                .contains("11111111-2222-4333-8444-555555555555"),
+            "identity folds in"
+        );
+    }
+
+    /// Ticket 05 scenario 1 (invalid): a blank identity keeps the dialog
+    /// open, names params inline, and auto-expands Advanced so the box the
+    /// error points at is visible.
+    #[gpui_kit::test]
+    fn t05_guided_blank_identity_stays_open_naming_params(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("Half", window, cx);
+                });
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value("198.51.100.9", window, cx);
+                });
+                let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
+                assert!(*form.advanced.borrow(), "params error expands Advanced");
+                closed
+            })
+        });
+        assert!(!closed, "invalid commit keeps the dialog open");
+        let (field, message) = form_error.borrow().clone().expect("inline error recorded");
+        assert_eq!(field, "params", "inline error names the field");
+        assert!(message.contains("uuid"), "names the missing credential: {message}");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "nothing stored"
+        );
+    }
+
+    /// Ticket 05: the Advanced swap round-trips losslessly — expand merges
+    /// guided values into the box and clears the inputs; collapse echoes
+    /// back; a garbage box never loses guided values.
+    #[gpui_kit::test]
+    fn t05_advanced_swap_round_trips_losslessly(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value("198.51.100.9", window, cx);
+                });
+                form.guided_identity.update(cx, |state, cx| {
+                    state.set_value("11111111-2222-4333-8444-555555555555", window, cx);
+                });
+                form.expand_merge(window, cx);
+                let box_text = form.params.read(cx).value().to_string();
+                assert!(box_text.contains("198.51.100.9"), "server merges: {box_text}");
+                assert!(
+                    box_text.contains("11111111-2222-4333-8444-555555555555"),
+                    "identity merges: {box_text}"
+                );
+                assert!(
+                    form.guided_server.read(cx).value().to_string().is_empty(),
+                    "inputs clear after merge"
+                );
+                form.collapse_echo(window, cx);
+                assert_eq!(
+                    form.guided_server.read(cx).value().to_string(),
+                    "198.51.100.9",
+                    "collapse echoes the box back"
+                );
+                assert_eq!(
+                    form.guided_identity.read(cx).value().to_string(),
+                    "11111111-2222-4333-8444-555555555555",
+                    "identity echoes back"
+                );
+                // Garbage box: guided values survive the expand attempt.
+                form.params.update(cx, |state, cx| {
+                    state.set_value("{{{", window, cx);
+                });
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value("kept.example.com", window, cx);
+                });
+                form.expand_merge(window, cx);
+                assert_eq!(form.params.read(cx).value().to_string(), "{{{");
+                assert_eq!(
+                    form.guided_server.read(cx).value().to_string(),
+                    "kept.example.com",
+                    "garbage box keeps guided values"
+                );
+            });
+        });
+    }
+
+    /// Ticket 05: edit prefills the guided mini-form from the row and opens
+    /// with Advanced expanded (existing JSON rows keep their view).
+    #[gpui_kit::test]
+    fn t05_edit_prefills_guided_and_starts_expanded(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "Work".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &seeded, None);
+                assert_eq!(
+                    form.guided_server.read(cx).value().to_string(),
+                    "198.51.100.9"
+                );
+                assert_eq!(form.guided_port.read(cx).value().to_string(), "443");
+                assert_eq!(
+                    form.guided_identity.read(cx).value().to_string(),
+                    "11111111-2222-4333-8444-555555555555"
+                );
+                assert!(*form.advanced.borrow(), "edit opens expanded");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(seeded, window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert_painted(cx, "field-params");
+        assert!(
+            cx.update(|window, _| window.try_find("field-guided-server").is_none()),
+            "expanded edit hides the mini-form (swap, never stack)"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Ticket 05 (prohibited side effect): import commits through the shared
+    /// footer path and never starts an endpoint.
+    #[gpui_kit::test]
+    fn t05_import_commit_never_starts_endpoints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_import_dialog(
+                    "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one",
+                    "travel",
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| {
+            window.click("import-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "OK click closes the dialog"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "one row lands"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "import never starts endpoints"
+        );
+    }
+
+    /// Ticket 05 scenario 2: a non-loopback bind stops at an explicit
+    /// confirm naming the config and bind before anything starts; the
+    /// post-start warning names them too.
+    #[gpui_kit::test]
+    fn t05_lan_start_gates_with_naming_confirm(cx: &mut TestAppContext) {
+        use crate::{lan_confirm_text, lan_exposure_warning};
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_lan_input("Lan")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+                view.start_selected_engine(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "LAN start stops at the confirm"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts before confirm"
+        );
+        let confirm = lan_confirm_text("Lan", "0.0.0.0");
+        assert!(
+            confirm.contains("\"Lan\"") && confirm.contains("0.0.0.0"),
+            "confirm names config + bind: {confirm}"
+        );
+        let warning =
+            lan_exposure_warning("Lan", "0.0.0.0").expect("non-loopback warns post-start");
+        assert!(
+            warning.contains("\"Lan\"") && warning.contains("0.0.0.0"),
+            "post-start warning names config + bind: {warning}"
         );
     }
 
