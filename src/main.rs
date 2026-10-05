@@ -19,7 +19,6 @@ use gpui_kit::component::badge::Badge;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::description_list::{DescriptionItem, DescriptionList};
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::group_box::GroupBox;
@@ -2313,6 +2312,15 @@ fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
 /// target so the selected row can never be confused with the checked set.
 fn acting_on_label(config: &ProxyConfig) -> String {
     format!("Acting on: {}", config.name)
+}
+
+/// Signal-box 06: which bind endpoint a per-row copy button carries.
+/// Both forms come from [`proxy_urls`] (bind + port only), so the
+/// clipboard can never carry params or secrets through this path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointUrl {
+    Socks,
+    Http,
 }
 
 /// W1: row lifecycle state machine — stopped → starting → running, with
@@ -5165,6 +5173,32 @@ impl AppView {
         let id = config.id.clone();
         let enabled = !config.enabled;
         self.commit_enabled_flag(&id, enabled, window, cx);
+    }
+
+    /// Signal-box 06: per-row copy — one bind endpoint URL on the
+    /// clipboard (the same secret-free [`proxy_urls`] forms the
+    /// all-or-nothing `copy-urls` carries). No selection explains itself,
+    /// exactly like the bulk copy above.
+    fn copy_single_endpoint_url(
+        &mut self,
+        which: EndpointUrl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(config) = self.selected_config(cx) {
+            let (socks, http) = proxy_urls(&config.bind_ip, config.port);
+            let (url, name) = match which {
+                EndpointUrl::Socks => (socks, "SOCKS"),
+                EndpointUrl::Http => (http, "HTTP"),
+            };
+            cx.write_to_clipboard(ClipboardItem::new_string(url));
+            window.push_notification(
+                Notification::success(format!("Copied {name} URL")),
+                cx,
+            );
+        } else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+        }
     }
 
     /// Ticket 43: no selection explains itself — never a dead click.
@@ -10509,7 +10543,9 @@ impl AppView {
             )
     }
 
-    /// Detail endpoints section (bind + port only, upstream host:port).
+    /// Detail endpoints section: labeled rows in the vertical
+    /// description language (label token + value), each bind endpoint
+    /// with its own Copy.
     fn render_detail_endpoints(
         &self,
         cx: &mut Context<Self>,
@@ -10521,16 +10557,81 @@ impl AppView {
         // Ticket 47: the detail upstream reads the same set_rows cache as
         // the list rows (one HashMap lookup per frame, never a JSON parse).
         let upstream = self.cached_upstream(cx, config);
-        // T05: endpoints read as labeled rows (each URL names its
-        // scheme now, instead of one run-on line).
+        // Signal-box 06: per-row copy closes the all-or-nothing gap —
+        // each bind URL copies alone beside its value. Upstream stays
+        // display-only (it never rode Copy URLs either). Labels ride the
+        // description label token and buttons are kit small with tooltips,
+        // so focus, tab order, and density match the operate row below.
         div().id("config-endpoints").test_support().child(
             GroupBox::new().title("Endpoints").gap_2().child(
-                DescriptionList::vertical()
-                    .child(DescriptionItem::new("upstream").value(upstream))
-                    .child(DescriptionItem::new("SOCKS").value(socks_url))
-                    .child(DescriptionItem::new("HTTP").value(http_url)),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(Self::endpoint_row(cx, "upstream", upstream, None))
+                    .child(Self::endpoint_row(
+                        cx,
+                        "SOCKS",
+                        socks_url,
+                        Some(EndpointUrl::Socks),
+                    ))
+                    .child(Self::endpoint_row(
+                        cx,
+                        "HTTP",
+                        http_url,
+                        Some(EndpointUrl::Http),
+                    )),
             ),
         )
+    }
+
+    /// Signal-box 06: one labeled endpoint row — description-label token
+    /// over the value, with an optional per-row Copy button beside it.
+    /// `label` is a static scheme name; `which` wires the copy target.
+    fn endpoint_row(
+        cx: &mut Context<Self>,
+        label: &'static str,
+        value: String,
+        which: Option<EndpointUrl>,
+    ) -> impl IntoElement {
+        let mut value_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(value);
+        if let Some(which) = which {
+            let (id, button_label, tip, a11y) = match which {
+                EndpointUrl::Socks => (
+                    "copy-socks",
+                    "Copy SOCKS",
+                    "Copy the SOCKS endpoint (no secrets)",
+                    "Copy SOCKS URL",
+                ),
+                EndpointUrl::Http => (
+                    "copy-http",
+                    "Copy HTTP",
+                    "Copy the HTTP endpoint (no secrets)",
+                    "Copy HTTP URL",
+                ),
+            };
+            value_row = value_row.child(
+                Button::new(id)
+                    .small()
+                    .label(button_label)
+                    .accessibility_label(a11y)
+                    .tooltip(tip)
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.copy_single_endpoint_url(which, window, cx);
+                    })),
+            );
+        }
+        div().flex().flex_col().child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().description_list_label_foreground)
+                .child(label),
+        ).child(value_row)
     }
 
     /// Detail health section (failed rows render the error Alert).
@@ -19170,6 +19271,78 @@ mod tests {
             assert!(
                 cx.update(|window, _| window.try_find(id.to_string()).is_some()),
                 "{id} operates on the Health pane row"
+            );
+        }
+    }
+
+    /// Signal-box 06: endpoints carry per-row copy — each bind URL
+    /// copies alone beside its value (secret-free by construction: the
+    /// same bind+port forms `copy-urls` carries), and both buttons paint
+    /// in the Details pane. The handler path is exercised directly (the
+    /// inspector has no scroll seam for below-fold clicks — the t04
+    /// rationale), presence is asserted on the painted frame.
+    #[gpui_kit::test]
+    fn t06_endpoint_per_row_copy_copies_single_url(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        // Secret-bearing params: the clipboard must still carry bind+port only.
+        store
+            .add(t30_engine_seed("Work", "10981"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the row so the detail pane renders its endpoints.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in ["copy-socks", "copy-http"] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} rides its endpoint row"
+            );
+        }
+        let (bind, port) = view.read_with(cx, |view, cx| {
+            let row = view.selected_config(cx).expect("selected");
+            (row.bind_ip.clone(), row.port)
+        });
+        let (socks, http) = crate::store::proxy_urls(&bind, port);
+        let read_clip = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.copy_single_endpoint_url(crate::EndpointUrl::Socks, window, cx)
+            });
+        });
+        let clip = read_clip(cx);
+        assert_eq!(clip, socks, "SOCKS copies alone: {clip}");
+        assert!(!clip.contains(&http), "no HTTP form: {clip}");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.copy_single_endpoint_url(crate::EndpointUrl::Http, window, cx)
+            });
+        });
+        let clip = read_clip(cx);
+        assert_eq!(clip, http, "HTTP copies alone: {clip}");
+        assert!(!clip.contains(&socks), "no SOCKS form: {clip}");
+        for canary in ["11111111", "198.51.100.9", "uuid", "password"] {
+            assert!(
+                !clip.contains(canary),
+                "clipboard carries bind+port only, found {canary}: {clip}"
             );
         }
     }
