@@ -10067,14 +10067,14 @@ impl AppView {
             .gap_1()
             .child(self.render_detail_header(cx, config))
             .child(self.render_detail_endpoints(cx, config))
-            .child(self.render_detail_usage(cx, config))
+            .child(self.render_detail_usage(config))
             .child(self.render_detail_actions(cx, config))
     }
 
-    /// Ticket 05: Health pane — health + history plus the engine/probe/log
-    /// actions operating on the same row (same handlers, ids, and loading
-    /// states as the Details row; only one pane renders per frame, so the
-    /// ids never collide). Logs open in the dialog — no inline tail.
+    /// Ticket 05: Health pane — health + history plus the shared operate
+    /// row (same handlers, ids, and loading states as the Details pane;
+    /// only one pane renders per frame, so the ids never collide). Logs
+    /// open in the dialog — no inline tail.
     fn render_inspector_health(
         &self,
         cx: &mut Context<Self>,
@@ -10086,7 +10086,7 @@ impl AppView {
             .gap_1()
             .child(self.render_detail_health(config))
             .child(self.render_detail_history(config))
-            .child(self.render_health_actions(cx, config))
+            .child(self.render_detail_actions(cx, config))
     }
 
     /// Ticket 05: Presets pane — attached routing preset plus the attach
@@ -10251,35 +10251,17 @@ impl AppView {
         )
     }
 
-    /// Detail usage section (persisted down/up buckets + reset).
-    fn render_detail_usage(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        // Ticket 45: manageable usage — persisted down/up buckets with
-        // an explicit reset (confirm-gated, never silent).
+    /// Detail usage section (persisted down/up buckets, display only).
+    /// Signal-box 04: the `usage-reset` action moved into the row menu
+    /// (same id, label, tooltip, handler) — the module keeps the numbers.
+    fn render_detail_usage(&self, config: &ProxyConfig) -> impl IntoElement {
+        // Ticket 45: persisted down/up buckets (the confirm-gated reset
+        // lives in the row menu now, never silent).
         div().id("config-usage").test_support().child(
-            GroupBox::new().title("Usage").gap_2().child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(self.usage_line(&config.id))
-                    .child(
-                        Button::new("usage-reset")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Reset usage")
-                            .tooltip("Reset this row's usage counters")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_usage_reset_confirm(config, window, cx);
-                                }
-                            })),
-                    ),
-            ),
+            GroupBox::new()
+                .title("Usage")
+                .gap_2()
+                .child(self.usage_line(&config.id)),
         )
     }
 
@@ -10296,7 +10278,12 @@ impl AppView {
         )
     }
 
-    /// Detail action row (enable switch, manage/engine/health buttons).
+    /// Signal-box 04: single operate row — the Enabled switch, the six
+    /// inline ops (Start, Stop, Test, Ping, Logs, Copy URLs), and the row
+    /// menu trigger. Stable ids, labels, tooltips, handlers, and loading
+    /// states are unchanged — only the packing changed (the manage row
+    /// collapsed into `row-menu`, so the Endpoints module stays above the
+    /// fold in the 240px cap with no horizontal scroll).
     fn render_detail_actions(
         &self,
         cx: &mut Context<Self>,
@@ -10312,248 +10299,35 @@ impl AppView {
         let is_running = self.engine.is_running(&config.id);
         let failed = self.detail_failed(config);
         let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
-        // Eleven controls in one row exceed the 1000px test frame (the detail
-        // pane stretched to 1037px, and GPUI has no flex-wrap) — two rows,
-        // manage then operate, so the pane keeps the frame width and every
-        // action stays reachable with no horizontal scroll.
+        // Signal-box 04: one operate row — the switch, the six inline
+        // ops, and the row menu trigger. Eight small controls fit the
+        // 1000px frame in a single row, so the Endpoints module stays
+        // above the fold with no horizontal scroll.
         div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Switch::new(switch_id)
-                            .checked(config.enabled)
-                            .label("Enabled")
-                            .on_change(move |enabled: &bool, window, cx| {
-                                let enabled = *enabled;
-                                let id = switch_id_for_handler.clone();
-                                switch_view.update(cx, |view, cx| {
-                                    // Ticket 26: one flag semantic — the
-                                    // switch writes the stored flag only (see
-                                    // [`AppView::commit_enabled_flag`]);
-                                    // starting/stopping stays on Start/Stop.
-                                    // Ticket 30: the Switch is the only
-                                    // enabled control (no duplicate button).
-                                    view.commit_enabled_flag(&id, enabled, window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("edit-config")
-                            // Ticket 44: small + tooltip (detail-bar density for the
-                            // 1000x700 paint frame; tooltips name every action).
-                            .small()
-                            .label("Edit")
-                            .tooltip("Edit the selected configuration")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_edit_dialog(config, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("delete-config")
-                            .danger()
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Delete")
-                            .tooltip("Delete the selected configuration")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_remove_confirm(config, window, cx);
-                                }
-                            })),
-                    )
-                    // Ticket 43: one-click duplicate (disabled copy, fresh
-                    // auto port) plus per-row traffic reset (confirm names
-                    // the row + current totals).
-                    .child(
-                        Button::new("duplicate-config")
-                            .small()
-                            .label("Duplicate")
-                            .tooltip("Duplicate the selected row (disabled copy)")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.commit_duplicate(&config.id, window, cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::info(no_selection_message()),
-                                        cx,
-                                    );
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("reset-traffic")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Reset traffic")
-                            .tooltip("Reset this row's traffic counters")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_traffic_reset_confirm(config, window, cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::info(no_selection_message()),
-                                        cx,
-                                    );
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("copy-urls")
-                            // Ticket 44: small + tooltip; clipboard carries bind
-                            // + port only (never params or secrets).
-                            .small()
-                            .label("Copy URLs")
-                            .tooltip("Copy bind endpoints (no secrets)")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.copy_selected_urls(window, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child({
-                        // T06: loading state + inline spinner while a start
-                        // is in flight (the label already reads `Starting.`
-                        // via `RowPhase::start_label`).
-                        let mut start = Button::new("engine-start")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label(start_label)
-                            .tooltip("Start the selected endpoint (F5)")
-                            .loading(self.start_in_flight)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_selected_engine(window, cx);
-                            }));
-                        if self.start_in_flight {
-                            start = start.child(
-                                div()
-                                    .id("engine-start-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        start
-                    })
-                    .child({
-                        // T06: loading state + inline spinner while a start
-                        // is in flight (stop waits on the same fence).
-                        let mut stop = Button::new("engine-stop")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            // T08: keystroke rides as a `Kbd` chip; the
-                            // pinned string stays on the accessible name.
-                            .label("Stop")
-                            .accessibility_label("Stop (Shift-F5)")
-                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-                            .tooltip("Stop the selected endpoint")
-                            .loading(self.start_in_flight)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.stop_selected_engine(window, cx);
-                            }));
-                        if self.start_in_flight {
-                            stop = stop.child(
-                                div()
-                                    .id("engine-stop-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        stop
-                    })
-                    .child({
-                        // T06: loading state + inline spinner while a
-                        // URL-test probe is in flight.
-                        let mut test = Button::new("health-test")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            // T08: keystroke rides as a `Kbd` chip; the
-                            // pinned string stays on the accessible name.
-                            .label("Test")
-                            .accessibility_label("Test (Ctrl-T)")
-                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-                            .tooltip("Test the selected endpoint")
-                            .loading(self.probe_kind_in_flight(false))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.test_selected_health(window, cx);
-                            }));
-                        if self.probe_kind_in_flight(false) {
-                            test = test.child(
-                                div()
-                                    .id("health-test-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        test
-                    })
-                    .child({
-                        // T06: loading state + inline spinner while a
-                        // TCP-ping probe is in flight.
-                        let mut ping = Button::new("health-ping")
-                            // Ticket 44: small + tooltip (detail-bar density).
-                            .small()
-                            .label("Ping")
-                            .tooltip("TCP-ping the selected endpoint")
-                            .loading(self.probe_kind_in_flight(true))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.ping_selected(window, cx);
-                            }));
-                        if self.probe_kind_in_flight(true) {
-                            ping = ping.child(
-                                div()
-                                    .id("health-ping-spinner")
-                                    .test_support()
-                                    .child(Spinner::new().small()),
-                            );
-                        }
-                        ping
-                    })
-                    .child(
-                        Button::new("logs-open")
-                            .small()
-                            .label("Logs")
-                            .tooltip("Open logs for the selection")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_logs_dialog(window, cx);
-                            })),
-                    ),
-            )
-    }
-
-    /// Ticket 05: Health-pane ops row — Start/Stop, Test, Ping, Logs on the
-    /// same row (same handlers, ids, tooltips, and loading states as the
-    /// Details row above; only one pane renders per frame, so the ids never
-    /// collide). Logs open in the dialog — no inline tail.
-    fn render_health_actions(
-        &self,
-        cx: &mut Context<Self>,
-        config: &ProxyConfig,
-    ) -> impl IntoElement {
-        // W1: the selected row's lifecycle phase (see [`detail_failed`]
-        // for the evidence rule); the Start copy derives from the phase
-        // (same strings as before — `Starting.` while a start is in
-        // flight, `Start` otherwise).
-        let is_running = self.engine.is_running(&config.id);
-        let failed = self.detail_failed(config);
-        let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
-        div()
+            .id("detail-operate")
+            .test_support()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
+            .child(
+                Switch::new(switch_id)
+                    .checked(config.enabled)
+                    .label("Enabled")
+                    .on_change(move |enabled: &bool, window, cx| {
+                        let enabled = *enabled;
+                        let id = switch_id_for_handler.clone();
+                        switch_view.update(cx, |view, cx| {
+                            // Ticket 26: one flag semantic — the
+                            // switch writes the stored flag only (see
+                            // [`AppView::commit_enabled_flag`]);
+                            // starting/stopping stays on Start/Stop.
+                            // Ticket 30: the Switch is the only
+                            // enabled control (no duplicate button).
+                            view.commit_enabled_flag(&id, enabled, window, cx);
+                        });
+                    }),
+            )
             .child({
                 // T06: loading state + inline spinner while a start
                 // is in flight (the label already reads `Starting.`
@@ -10660,6 +10434,176 @@ impl AppView {
                         view.open_logs_dialog(window, cx);
                     })),
             )
+            .child(
+                Button::new("copy-urls")
+                    // Ticket 44: small + tooltip; clipboard carries bind
+                    // + port only (never params or secrets).
+                    .small()
+                    .label("Copy URLs")
+                    .tooltip("Copy bind endpoints (no secrets)")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.copy_selected_urls(window, cx);
+                    })),
+            )
+            .child(self.render_row_menu(cx))
+    }
+
+    /// Signal-box 04: row menu — Edit, Delete, Duplicate, Reset traffic,
+    /// and Reset usage behind one `row-menu` trigger (same labels,
+    /// tooltips, and handlers the manage row and Usage module carried;
+    /// each item keeps its stable id on a custom element because
+    /// `PopupMenuItem` carries no id of its own — the toolbar-menu
+    /// precedent).
+    fn render_row_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let row_view = cx.entity();
+        Button::new("row-menu")
+            .small()
+            .label("Row")
+            .tooltip("Edit, delete, duplicate, or reset this row")
+            .dropdown_menu(move |menu, _, _| {
+                menu.item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("edit-config")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("Edit the selected configuration"))
+                                    .into()
+                            })
+                            .child("Edit")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_edit_dialog(config, window, cx);
+                                }
+                            });
+                        }
+                    }),
+                )
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("delete-config")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("Delete the selected configuration"))
+                                    .into()
+                            })
+                            .child("Delete")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_remove_confirm(config, window, cx);
+                                }
+                            });
+                        }
+                    }),
+                )
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("duplicate-config")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| {
+                                    Tooltip::new("Duplicate the selected row (disabled copy)")
+                                })
+                                .into()
+                            })
+                            .child("Duplicate")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.commit_duplicate(&config.id, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            });
+                        }
+                    }),
+                )
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("reset-traffic")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("Reset this row's traffic counters"))
+                                    .into()
+                            })
+                            .child("Reset traffic")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_traffic_reset_confirm(config, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            });
+                        }
+                    }),
+                )
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("usage-reset")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("Reset this row's usage counters"))
+                                    .into()
+                            })
+                            .child("Reset usage")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_usage_reset_confirm(config, window, cx);
+                                }
+                            });
+                        }
+                    }),
+                )
+            })
     }
 
     /// Ticket 45: one detail-pane latency sparkline from bounded history —
