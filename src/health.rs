@@ -2598,10 +2598,7 @@ mod tests {
             "probe bytes no longer the source, got {line}"
         );
         let untracked = store.detail_line("9");
-        assert_eq!(
-            untracked,
-            "health: never tested — press Test to check"
-        );
+        assert_eq!(untracked, "health: never tested — press Test to check");
     }
 
     /// Ticket 36: the clash poller reads totals off a live controller

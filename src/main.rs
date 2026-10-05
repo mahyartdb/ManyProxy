@@ -1459,13 +1459,19 @@ impl ConfigForm {
                 window,
                 cx,
                 "Upstream server",
-                Some(&guided_prefill_value(&config.params, &["server", "address"])),
+                Some(&guided_prefill_value(
+                    &config.params,
+                    &["server", "address"],
+                )),
             ),
             guided_port: Self::field(
                 window,
                 cx,
                 "Upstream port",
-                Some(&guided_prefill_value(&config.params, &["server_port", "port"])),
+                Some(&guided_prefill_value(
+                    &config.params,
+                    &["server_port", "port"],
+                )),
             ),
             guided_identity: Self::field(
                 window,
@@ -1639,13 +1645,11 @@ impl ConfigForm {
             } else {
                 hint_row = hint_row.child(div().flex_1());
             }
-            col = col.child(
-                hint_row.child(advanced_toggle_button(
-                    "Advanced (raw JSON)",
-                    &view,
-                    &toggle_form,
-                )),
-            );
+            col = col.child(hint_row.child(advanced_toggle_button(
+                "Advanced (raw JSON)",
+                &view,
+                &toggle_form,
+            )));
         }
         col = col
             .child(dialog_field("field-group", "Group", self.group))
@@ -5192,10 +5196,7 @@ impl AppView {
                 EndpointUrl::Http => (http, "HTTP"),
             };
             cx.write_to_clipboard(ClipboardItem::new_string(url));
-            window.push_notification(
-                Notification::success(format!("Copied {name} URL")),
-                cx,
-            );
+            window.push_notification(Notification::success(format!("Copied {name} URL")), cx);
         } else {
             window.push_notification(Notification::info(no_selection_message()), cx);
         }
@@ -7040,14 +7041,9 @@ impl AppView {
                                     .title("Secrets leave in plaintext"),
                             ),
                         )
-                        .child(
-                            div()
-                                .id("export-safer-path")
-                                .test_support()
-                                .child(
-                                    "Safer: share one endpoint with Copy URLs — it never carries secrets.",
-                                ),
-                        )
+                        .child(div().id("export-safer-path").test_support().child(
+                            "Safer: share one endpoint with Copy URLs — it never carries secrets.",
+                        ))
                         .child(
                             div()
                                 .id("export-preview")
@@ -10594,12 +10590,7 @@ impl AppView {
         value: String,
         which: Option<EndpointUrl>,
     ) -> impl IntoElement {
-        let mut value_row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(value);
+        let mut value_row = div().flex().flex_row().items_center().gap_2().child(value);
         if let Some(which) = which {
             let (id, button_label, tip, a11y) = match which {
                 EndpointUrl::Socks => (
@@ -10626,12 +10617,16 @@ impl AppView {
                     })),
             );
         }
-        div().flex().flex_col().child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().description_list_label_foreground)
-                .child(label),
-        ).child(value_row)
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().description_list_label_foreground)
+                    .child(label),
+            )
+            .child(value_row)
     }
 
     /// Detail health section (failed rows render the error Alert).
@@ -16343,8 +16338,7 @@ mod tests {
         paint_dialog_open(cx);
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         let before = notification_count(cx);
-        let paths =
-            ExternalPaths(vec![std::path::PathBuf::from("E:\\x\\a.conf")].into());
+        let paths = ExternalPaths(vec![std::path::PathBuf::from("E:\\x\\a.conf")].into());
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.import_dropped_files(&paths, window, cx));
         });
@@ -18115,9 +18109,7 @@ mod tests {
     /// Ticket 05: export stays a red-bordered caution order — the verbatim
     /// warning plus a visible safer path — and Cancel writes nothing.
     #[gpui_kit::test]
-    fn t05_export_caution_offers_safer_path_and_cancel_writes_nothing(
-        cx: &mut TestAppContext,
-    ) {
+    fn t05_export_caution_offers_safer_path_and_cancel_writes_nothing(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
@@ -18250,7 +18242,10 @@ mod tests {
         assert!(!closed, "invalid commit keeps the dialog open");
         let (field, message) = form_error.borrow().clone().expect("inline error recorded");
         assert_eq!(field, "params", "inline error names the field");
-        assert!(message.contains("uuid"), "names the missing credential: {message}");
+        assert!(
+            message.contains("uuid"),
+            "names the missing credential: {message}"
+        );
         assert_eq!(
             view.read_with(cx, |view, cx| view.config_count(cx)),
             0,
@@ -18278,7 +18273,10 @@ mod tests {
                 });
                 form.expand_merge(window, cx);
                 let box_text = form.params.read(cx).value().to_string();
-                assert!(box_text.contains("198.51.100.9"), "server merges: {box_text}");
+                assert!(
+                    box_text.contains("198.51.100.9"),
+                    "server merges: {box_text}"
+                );
                 assert!(
                     box_text.contains("11111111-2222-4333-8444-555555555555"),
                     "identity merges: {box_text}"
@@ -18692,10 +18690,8 @@ mod tests {
             (&stopped, "b.example.com:443", None, false),
             (&dead, "c.example.com:443", Some("dead"), true),
         ] {
-            let text = library_row_dense_lines_with_upstream(
-                row, upstream, health, serving, None,
-            )
-            .join("\n");
+            let text = library_row_dense_lines_with_upstream(row, upstream, health, serving, None)
+                .join("\n");
             let port = format!(":{}", row.port);
             assert!(text.contains(&port), "port in row:\n{text}");
             assert!(
@@ -18712,9 +18708,13 @@ mod tests {
             None,
         )
         .join("\n");
-        assert!(live.contains("87ms"), "health number rides running row:\n{live}");
-        let idle = library_row_dense_lines_with_upstream(&stopped, "b.example.com:443", None, false, None)
-            .join("\n");
+        assert!(
+            live.contains("87ms"),
+            "health number rides running row:\n{live}"
+        );
+        let idle =
+            library_row_dense_lines_with_upstream(&stopped, "b.example.com:443", None, false, None)
+                .join("\n");
         assert!(
             idle.contains("○ Stopped"),
             "stopped badge stays pinned:\n{idle}"
@@ -18753,7 +18753,11 @@ mod tests {
                             delegate.running.insert(id.clone());
                             delegate.health.insert(
                                 id.clone(),
-                                if i == 21 { "dead".to_string() } else { "12ms".to_string() },
+                                if i == 21 {
+                                    "dead".to_string()
+                                } else {
+                                    "12ms".to_string()
+                                },
                             );
                         }
                     }
@@ -18772,7 +18776,10 @@ mod tests {
                     .filter_map(|id| window.try_find(format!("row-card-{id}")))
                     .map(|snapshot| {
                         let bounds = snapshot.bounds();
-                        (format!("{:?}", bounds.origin.x), format!("{:?}", bounds.size))
+                        (
+                            format!("{:?}", bounds.origin.x),
+                            format!("{:?}", bounds.size),
+                        )
                     })
                     .collect()
             })
@@ -19225,10 +19232,7 @@ mod tests {
                 .try_find("detail-operate".to_string())
                 .expect("operate row paints")
                 .bounds();
-            (
-                endpoints.origin.y + endpoints.size.height,
-                operate.origin.y,
-            )
+            (endpoints.origin.y + endpoints.size.height, operate.origin.y)
         });
         assert!(
             endpoints_bottom <= operate_top,
@@ -21472,9 +21476,8 @@ mod tests {
                 "{id} offers the next step"
             );
         }
-        let (total, enabled) = view.read_with(cx, |view, cx| {
-            view.libraries.read(cx).delegate().counts()
-        });
+        let (total, enabled) =
+            view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().counts());
         assert_eq!((total, enabled), (0, 0), "counts name the empty set");
         assert_eq!(
             view.read_with(cx, |view, _| view.health_status_text()),
@@ -21483,8 +21486,7 @@ mod tests {
         );
         // Usage on empty: the readable store totals zero honestly (the
         // segment hides only on a broken read — never a lying nonzero).
-        let traffic =
-            view.read_with(cx, |view, _| crate::summed_traffic_text(&view.store));
+        let traffic = view.read_with(cx, |view, _| crate::summed_traffic_text(&view.store));
         assert!(
             traffic.is_none() || traffic.as_deref() == Some("↓ 0 B · ↑ 0 B"),
             "usage on empty is absent or zero — never nonzero: {traffic:?}"

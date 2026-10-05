@@ -7949,8 +7949,14 @@ mod tests {
     fn t05_guided_prefill_echoes_json_blank_on_garbage() {
         let params = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"uuid\":\"11111111-2222-4333-8444-555555555555\"}";
-        assert_eq!(guided_prefill_value(params, &["server", "address"]), "a.example.com");
-        assert_eq!(guided_prefill_value(params, &["server_port", "port"]), "443");
+        assert_eq!(
+            guided_prefill_value(params, &["server", "address"]),
+            "a.example.com"
+        );
+        assert_eq!(
+            guided_prefill_value(params, &["server_port", "port"]),
+            "443"
+        );
         assert_eq!(
             guided_prefill_value(params, &["uuid", "id"]),
             "11111111-2222-4333-8444-555555555555"
@@ -8003,7 +8009,10 @@ mod tests {
             "loud for validation, got {bad_port}"
         );
         // Unparseable JSON returns unchanged (validation names that error).
-        assert_eq!(fold_guided_into_params("{{{", "a.example.com", "", None, ""), "{{{");
+        assert_eq!(
+            fold_guided_into_params("{{{", "a.example.com", "", None, ""),
+            "{{{"
+        );
     }
 
     /// Ticket 31: edit a subscription's label/url/group — persists in place,
