@@ -11711,75 +11711,92 @@ impl AppView {
             // are visible without opening About. Button ids are
             // unchanged. Separators group core actions / library menus /
             // help; tooltips name each action.
+            // Signal-box 03: the five levers ride one frame (plate) —
+            // group_box ground, hairline rim, theme radius; the separators
+            // guard the throws inside and the frame edge outside. Button
+            // ids, labels, Kbd chips, tooltips, and handlers are untouched.
             .child(
-                Button::new("add-config")
-                    .primary()
-                    // T08: keystroke rides as a `Kbd` chip; the
-                    // pinned string stays on the accessible name.
-                    .label("Add")
-                    .accessibility_label("Add (Ctrl-N)")
-                    .child(shortcut_kbd("ctrl-n", "(Ctrl-N)"))
-                    .tooltip("Add a proxy configuration")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_add_dialog(window, cx);
-                    })),
-            )
-            .child(Separator::vertical())
-            // Ticket 43: the F5 key starts the SELECTED row (see
-            // [`bind_app_keys`]) — the old "Start all (F5)" label
-            // lied. Selected actions carry their key hints; bulk
-            // actions carry none.
-            .child(
-                Button::new("start-selected")
-                    .primary()
-                    // Ticket 10: short visible label (the strip must fit the
-                    // 1000px frame); the pinned `Start selected (F5)` string
-                    // stays on the accessible name + tooltip + Kbd chip.
-                    .label("Start")
-                    .accessibility_label("Start selected (F5)")
-                    .child(shortcut_kbd("f5", "(F5)"))
-                    .tooltip("Start the selected endpoint")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.start_selected_engine(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("stop-selected")
-                    // Ticket 10: short visible label; pinned
-                    // `Stop selected (Shift-F5)` stays on the accessible name.
-                    .label("Stop")
-                    .accessibility_label("Stop selected (Shift-F5)")
-                    .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-                    .tooltip("Stop the selected endpoint")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.stop_selected_engine(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("test-selected")
-                    // Ticket 10: short visible label; pinned
-                    // `Test selected (Ctrl-T)` stays on the accessible name.
-                    .label("Test")
-                    .accessibility_label("Test selected (Ctrl-T)")
-                    .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-                    .tooltip("Test the selected endpoint")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.test_selected_health(window, cx);
-                    })),
-            )
-            // Signal-box 03: Import returns as a persistent fifth lever —
-            // same `import-config` id, label, tooltip, Kbd chip, and handler
-            // the Library-menu item carried. The pinned `Import (Ctrl-O)`
-            // string stays on the accessible name + chip.
-            .child(
-                Button::new("import-config")
-                    .label("Import")
-                    .accessibility_label("Import (Ctrl-O)")
-                    .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
-                    .tooltip("Import share links or files")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                    })),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .py_1()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().group_box)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("add-config")
+                            .primary()
+                            // T08: keystroke rides as a `Kbd` chip; the
+                            // pinned string stays on the accessible name.
+                            .label("Add")
+                            .accessibility_label("Add (Ctrl-N)")
+                            .child(shortcut_kbd("ctrl-n", "(Ctrl-N)"))
+                            .tooltip("Add a proxy configuration")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_add_dialog(window, cx);
+                            })),
+                    )
+                    .child(Separator::vertical())
+                    // Ticket 43: the F5 key starts the SELECTED row (see
+                    // [`bind_app_keys`]) — the old "Start all (F5)" label
+                    // lied. Selected actions carry their key hints; bulk
+                    // actions carry none.
+                    .child(
+                        Button::new("start-selected")
+                            .primary()
+                            // Ticket 10: short visible label (the strip must fit the
+                            // 1000px frame); the pinned `Start selected (F5)` string
+                            // stays on the accessible name + tooltip + Kbd chip.
+                            .label("Start")
+                            .accessibility_label("Start selected (F5)")
+                            .child(shortcut_kbd("f5", "(F5)"))
+                            .tooltip("Start the selected endpoint")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.start_selected_engine(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("stop-selected")
+                            // Ticket 10: short visible label; pinned
+                            // `Stop selected (Shift-F5)` stays on the accessible name.
+                            .label("Stop")
+                            .accessibility_label("Stop selected (Shift-F5)")
+                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
+                            .tooltip("Stop the selected endpoint")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.stop_selected_engine(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("test-selected")
+                            // Ticket 10: short visible label; pinned
+                            // `Test selected (Ctrl-T)` stays on the accessible name.
+                            .label("Test")
+                            .accessibility_label("Test selected (Ctrl-T)")
+                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
+                            .tooltip("Test the selected endpoint")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.test_selected_health(window, cx);
+                            })),
+                    )
+                    // Signal-box 03: Import returns as a persistent fifth lever —
+                    // same `import-config` id, label, tooltip, Kbd chip, and handler
+                    // the Library-menu item carried. The pinned `Import (Ctrl-O)`
+                    // string stays on the accessible name + chip.
+                    .child(
+                        Button::new("import-config")
+                            .label("Import")
+                            .accessibility_label("Import (Ctrl-O)")
+                            .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
+                            .tooltip("Import share links or files")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                            })),
+                    ),
             )
             .child(Separator::vertical())
             // Ticket 10: Library menu — the import/export buttons moved
