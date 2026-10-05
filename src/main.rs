@@ -6342,10 +6342,13 @@ impl AppView {
         self.health_store.counts(&self.engine.running_ids())
     }
 
+    /// Signal-box 06: the status-bar describer keeps the short form —
+    /// the 880px frame fits every segment today, so the next step lives
+    /// in the detail Health module and the Test tooltip beside it.
     fn health_status_text(&self) -> String {
         let (live, dead) = self.health_counts();
         if live == 0 && dead == 0 {
-            "health: not tested".to_string()
+            "health: never tested".to_string()
         } else {
             format!("health: {live} live · {dead} dead")
         }
