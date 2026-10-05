@@ -10866,6 +10866,10 @@ impl AppView {
     /// precedent).
     fn render_row_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let row_view = cx.entity();
+        // Review fix: the Delete item keeps its danger voice inside the
+        // menu (the old manage row carried it via `.danger()`). Captured
+        // here because the dropdown builder cannot reach the theme itself.
+        let danger = cx.theme().danger;
         Button::new("row-menu")
             .small()
             .label("Row")
@@ -10898,7 +10902,7 @@ impl AppView {
                     }),
                 )
                 .item(
-                    PopupMenuItem::element(|_, _| {
+                    PopupMenuItem::element(move |_, _| {
                         div()
                             .id("delete-config")
                             .test_support()
@@ -10906,6 +10910,7 @@ impl AppView {
                             .flex_row()
                             .items_center()
                             .gap_2()
+                            .text_color(danger)
                             .tooltip(|_, cx| {
                                 cx.new(|_| Tooltip::new("Delete the selected configuration"))
                                     .into()
