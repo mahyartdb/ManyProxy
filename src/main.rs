@@ -10772,6 +10772,16 @@ impl AppView {
             .into_any_element()
     }
 
+    /// Signal-box 03: visible search affordance — moves keyboard focus to
+    /// the library search field (the kit `List` focuses its query input
+    /// while searchable). No new key binding; the `search-focus` button
+    /// itself is the affordance and stays in the tab order.
+    fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.libraries.update(cx, |state, list_cx| {
+            state.focus(window, list_cx);
+        });
+    }
+
     /// Ticket 30: clear the library search filter in place (selection
     /// re-derives by id via `apply_filter`).
     fn clear_library_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -10901,6 +10911,19 @@ impl AppView {
             // card list below.
             .border_b_1()
             .border_color(cx.theme().border)
+            // Signal-box 03: visible search affordance — a small `Search`
+            // button that moves focus to the library search field (the
+            // kit list owns the field itself, so this is the persistent
+            // entry point; no new key binding, tooltips name the action).
+            .child(
+                Button::new("search-focus")
+                    .small()
+                    .label("Search")
+                    .tooltip("Focus the library search field")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.focus_library_search(window, cx);
+                    })),
+            )
             .child(
                 // Kit `Select` has no tooltip slot of its own, so the
                 // filter name rides on a hover wrapper (same copy the
@@ -15872,6 +15895,34 @@ mod tests {
         assert!(
             cx.update(|window, _| window.try_find("menu-import-config").is_some()),
             "menu-import-config renders in the Library menu"
+        );
+    }
+
+    /// Signal-box 03: the visible search affordance focuses the library
+    /// search field (one click or Tab+Enter lands in the query input —
+    /// the keyboard path stays mouseless from there).
+    #[gpui_kit::test]
+    fn t03_search_focus_button_focuses_query(cx: &mut TestAppContext) {
+        use gpui_kit::Focusable as _;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        assert_painted(cx, "search-focus");
+        cx.update(|window, cx| {
+            window.click("search-focus", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        // A searchable `List` focuses its query input, so the focused
+        // handle must equal the libraries' focus handle afterwards.
+        let query_focused = cx.update(|window, cx| {
+            let handle = view.read(cx).libraries.read(cx).focus_handle(cx);
+            window.focused(cx).as_ref() == Some(&handle)
+        });
+        assert!(
+            query_focused,
+            "Search button focuses the library search field"
         );
     }
 
