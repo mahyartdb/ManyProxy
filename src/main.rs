@@ -11767,6 +11767,20 @@ impl AppView {
                         view.test_selected_health(window, cx);
                     })),
             )
+            // Signal-box 03: Import returns as a persistent fifth lever —
+            // same `import-config` id, label, tooltip, Kbd chip, and handler
+            // the Library-menu item carried. The pinned `Import (Ctrl-O)`
+            // string stays on the accessible name + chip.
+            .child(
+                Button::new("import-config")
+                    .label("Import")
+                    .accessibility_label("Import (Ctrl-O)")
+                    .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
+                    .tooltip("Import share links or files")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                    })),
+            )
             .child(Separator::vertical())
             // Ticket 10: Library menu — the import/export buttons moved
             // verbatim (label, tooltip, handler) into items keeping their
@@ -11779,7 +11793,15 @@ impl AppView {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
                                 div()
-                                    .id("import-config")
+                                    // Signal-box 03: distinct from the
+                                    // toolbar `import-config` button (same
+                                    // dialog, different element — duplicate
+                                    // ids panic headless lookups as ambiguous
+                                    // while the menu is open, same as the
+                                    // `groups-dialog` / `menu-groups-dialog`
+                                    // pair). Keeps the Ctrl-O hint inside the
+                                    // Library menu.
+                                    .id("menu-import-config")
                                     .test_support()
                                     .flex()
                                     .flex_row()
@@ -15734,11 +15756,15 @@ mod tests {
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
         // Always-visible strip: dedicated buttons plus menu triggers.
+        // Signal-box 03: Import is a persistent fifth lever again
+        // (`import-config` on the strip); the Library menu keeps its own
+        // `menu-import-config` entry (same dialog, distinct element).
         for id in [
             "add-config",
             "start-selected",
             "stop-selected",
             "test-selected",
+            "import-config",
             "library-menu",
             "manage-menu",
             "engine-menu",
@@ -15759,7 +15785,7 @@ mod tests {
         for (trigger, items) in [
             (
                 "library-menu",
-                &["import-config", "import-clipboard", "export-library"][..],
+                &["menu-import-config", "import-clipboard", "export-library"][..],
             ),
             (
                 "manage-menu",
@@ -15792,6 +15818,44 @@ mod tests {
             cx.run_until_parked();
             paint_frame(cx);
         }
+    }
+
+    /// Signal-box 03: the persistent Import lever opens the same import
+    /// dialog through the existing `import-config` id/handler (regroup,
+    /// not rewiring — verified by click), while the Library menu keeps its
+    /// own `menu-import-config` entry carrying the Ctrl-O hint.
+    #[gpui_kit::test]
+    fn t03_toolbar_import_opens_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        assert_painted(cx, "import-config");
+        cx.update(|window, cx| {
+            window.click("import-config", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "toolbar Import opens the import dialog"
+        );
+        assert_painted(cx, "import-dialog-ok");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("library-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("menu-import-config").is_some()),
+            "menu-import-config renders in the Library menu"
+        );
     }
 
     /// Scenario: subscription expand flips + toolbar/empty/params/import/
@@ -18346,9 +18410,11 @@ mod tests {
         paint_frame(cx);
         for (id, pinned) in [
             ("add-config", "Add (Ctrl-N)"),
-            // Ticket 10: `import-config` moved into the Library menu (a
-            // menu-row div exposes no accessibility label), so only the
-            // dedicated buttons pin theirs here.
+            // Signal-box 03: `import-config` is a persistent strip button
+            // again (a `Button` exposes its accessibility label), while the
+            // Library-menu row (`menu-import-config`) carries none — same as
+            // every other menu-row div.
+            ("import-config", "Import (Ctrl-O)"),
             ("start-selected", "Start selected (F5)"),
             ("stop-selected", "Stop selected (Shift-F5)"),
             ("test-selected", "Test selected (Ctrl-T)"),
@@ -21538,8 +21604,9 @@ mod tests {
         // strip container carries no test anchor; every command pins
         // reachability by presence while `add-config` — the first child,
         // never the clipped end — pins paint). Ticket 10: the strip is 4
-        // dedicated buttons plus 4 menu triggers; menu items render on
-        // open (see `command_strip_all_ids_present`).
+        // dedicated buttons plus 4 menu triggers; signal-box 03 restores
+        // Import as a persistent fifth (`import-config`); menu items render
+        // on open (see `command_strip_all_ids_present`).
         assert_painted(cx, "add-config");
         assert_within_frame(cx, "add-config");
         for id in [
@@ -21547,6 +21614,7 @@ mod tests {
             "start-selected",
             "stop-selected",
             "test-selected",
+            "import-config",
             "library-menu",
             "manage-menu",
             "engine-menu",
