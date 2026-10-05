@@ -21447,6 +21447,45 @@ mod tests {
         );
     }
 
+    /// Signal-box 06: the empty library teaches its next step with no
+    /// dead ends — Add/Import CTAs paint beside the empty copy, and the
+    /// status describer stays honest (zero counts named, never-tested
+    /// health, usage absent instead of a lying zero).
+    #[gpui_kit::test]
+    fn t06_empty_library_describer_teaches_next_step(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "library-empty");
+        for id in ["empty-add", "empty-import", "drop-hint"] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} offers the next step"
+            );
+        }
+        let (total, enabled) = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().counts()
+        });
+        assert_eq!((total, enabled), (0, 0), "counts name the empty set");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_status_text()),
+            "health: never tested",
+            "empty health never reads as failure"
+        );
+        // Usage on empty: the readable store totals zero honestly (the
+        // segment hides only on a broken read — never a lying nonzero).
+        let traffic =
+            view.read_with(cx, |view, _| crate::summed_traffic_text(&view.store));
+        assert!(
+            traffic.is_none() || traffic.as_deref() == Some("↓ 0 B · ↑ 0 B"),
+            "usage on empty is absent or zero — never nonzero: {traffic:?}"
+        );
+    }
+
     // -- Ticket 31: dialogs + import + subscriptions ---------------------
 
     /// Ticket 31: field errors map to their owning dialog field (first error
