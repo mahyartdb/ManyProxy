@@ -67,7 +67,8 @@ use import::{
 };
 use store::{
     count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
-    export_confirm_description, now_unix, protocol_params_template, proxy_urls, ConfigPatch,
+    export_confirm_description, fold_guided_into_params, guided_identity_fields,
+    guided_prefill_value, now_unix, protocol_params_template, proxy_urls, ConfigPatch,
     HealthSnapshot, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
     Subscription as ProxySubscription, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
 };
@@ -1301,6 +1302,95 @@ fn dialog_footer(
         )
 }
 
+/// Ticket 05: the Advanced disclosure toggle — one behavior, two
+/// placements (the collapsed hint row and the expanded Params header row;
+/// only one renders per frame, so the stable
+/// `params-advanced-toggle` id never collides). Expanding merges
+/// non-blank guided values into the JSON box and clears the inputs;
+/// collapsing echoes the box back into blank guided inputs only. Values
+/// are never lost, and the commit fold can never silently override a JSON
+/// edit (cleared inputs fold nothing).
+fn advanced_toggle_button(
+    label: &'static str,
+    view: &Entity<AppView>,
+    form: &ConfigForm,
+) -> impl IntoElement {
+    let toggle_view = view.clone();
+    let toggle_cell = form.advanced.clone();
+    let toggle_params = form.params.clone();
+    let toggle_protocol = form.protocol.clone();
+    let toggle_server = form.guided_server.clone();
+    let toggle_port = form.guided_port.clone();
+    let toggle_identity = form.guided_identity.clone();
+    Button::new("params-advanced-toggle")
+        .label(label)
+        .on_click(move |_, window, cx| {
+            toggle_view.update(cx, |_, cx| {
+                let expanding = !*toggle_cell.borrow();
+                if expanding {
+                    let box_text = toggle_params.read(cx).value().to_string();
+                    let protocol = toggle_protocol.read(cx).value().to_string();
+                    let identity = guided_identity_fields(&protocol)
+                        .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
+                    let merged = fold_guided_into_params(
+                        &box_text,
+                        &toggle_server.read(cx).value().to_string(),
+                        &toggle_port.read(cx).value().to_string(),
+                        identity,
+                        &toggle_identity.read(cx).value().to_string(),
+                    );
+                    let parseable = merged.trim().is_empty()
+                        || serde_json::from_str::<serde_json::Value>(&merged)
+                            .ok()
+                            .is_some_and(|value| value.is_object());
+                    if merged != box_text {
+                        let next = merged.clone();
+                        toggle_params.update(cx, |state, cx| {
+                            state.set_value(next, window, cx);
+                        });
+                    }
+                    if parseable {
+                        for entity in [&toggle_server, &toggle_port, &toggle_identity] {
+                            entity.update(cx, |state, cx| {
+                                state.set_value(String::new(), window, cx);
+                            });
+                        }
+                    }
+                } else {
+                    let box_text = toggle_params.read(cx).value().to_string();
+                    let protocol = toggle_protocol.read(cx).value().to_string();
+                    let read_keys: &[&str] = guided_identity_fields(&protocol)
+                        .map(|guided| guided.read_keys)
+                        .unwrap_or(&[]);
+                    for (entity, value) in [
+                        (
+                            &toggle_server,
+                            guided_prefill_value(&box_text, &["server", "address"]),
+                        ),
+                        (
+                            &toggle_port,
+                            guided_prefill_value(&box_text, &["server_port", "port"]),
+                        ),
+                        (
+                            &toggle_identity,
+                            guided_prefill_value(&box_text, read_keys),
+                        ),
+                    ] {
+                        let blank = entity.read(cx).value().to_string().trim().is_empty();
+                        if blank && !value.is_empty() {
+                            let next = value.clone();
+                            entity.update(cx, |state, cx| {
+                                state.set_value(next, window, cx);
+                            });
+                        }
+                    }
+                }
+                *toggle_cell.borrow_mut() = expanding;
+                cx.notify();
+            });
+        })
+}
+
 /// Handles to the add/edit dialog inputs. Entities are created once in the
 /// button handler (never in render) and cloned into the dialog builder.
 #[derive(Clone)]
@@ -1317,6 +1407,19 @@ struct ConfigForm {
     /// global override, then the default). Persisted in store meta, never in
     /// the row itself, so no schema change.
     test_url: Entity<InputState>,
+    /// Ticket 05 (signal-box): guided protocol-first mini-form — Server,
+    /// Server port, Identity. Prefilled from the params JSON at open;
+    /// non-blank values fold into the params at commit (see
+    /// [`ConfigForm::effective_params`]); blank values leave the JSON
+    /// untouched. The raw JSON lives under the Advanced disclosure.
+    guided_server: Entity<InputState>,
+    guided_port: Entity<InputState>,
+    guided_identity: Entity<InputState>,
+    /// Ticket 05: Advanced disclosure state (raw JSON visible). Add starts
+    /// collapsed (guided-first); edit starts expanded (existing JSON rows
+    /// keep their current view). Shared cell so a params validation error
+    /// can auto-expand the box it points at.
+    advanced: Rc<RefCell<bool>>,
 }
 
 impl ConfigForm {
@@ -1359,6 +1462,8 @@ impl ConfigForm {
         // Ticket 31: the params box opens with the per-protocol field
         // template (guided add, not raw JSON first). Submitting it untouched
         // fails naming the missing field — never silently.
+        // Ticket 05: the guided mini-form opens blank (fold no-ops, so the
+        // template stands) under a collapsed Advanced disclosure.
         let template = protocol_params_template(DEFAULT_PROTOCOL);
         Self {
             name: Self::field(window, cx, "Name", None),
@@ -1373,6 +1478,10 @@ impl ConfigForm {
             bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
             port: Self::field(window, cx, "Port (blank or auto = auto-assign)", None),
             test_url: Self::field(window, cx, "Test URL (blank = global)", None),
+            guided_server: Self::field(window, cx, "Upstream server", None),
+            guided_port: Self::field(window, cx, "Upstream port", None),
+            guided_identity: Self::field(window, cx, "Identity secret", None),
+            advanced: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -1382,6 +1491,12 @@ impl ConfigForm {
         config: &ProxyConfig,
         test_url: Option<&str>,
     ) -> Self {
+        // Ticket 05: the guided mini-form echoes the row's params JSON
+        // (untouched values fold back byte-identical — no spurious patch);
+        // the Advanced disclosure opens expanded on edit.
+        let read_keys: &[&str] = guided_identity_fields(&config.protocol)
+            .map(|guided| guided.read_keys)
+            .unwrap_or(&[]);
         Self {
             name: Self::field(window, cx, "Name", Some(config.name.as_str())),
             protocol: Self::field(window, cx, "Protocol", Some(config.protocol.as_str())),
@@ -1400,6 +1515,25 @@ impl ConfigForm {
                 Some(&config.port.to_string()),
             ),
             test_url: Self::field(window, cx, "Test URL (blank = global)", test_url),
+            guided_server: Self::field(
+                window,
+                cx,
+                "Upstream server",
+                Some(&guided_prefill_value(&config.params, &["server", "address"])),
+            ),
+            guided_port: Self::field(
+                window,
+                cx,
+                "Upstream port",
+                Some(&guided_prefill_value(&config.params, &["server_port", "port"])),
+            ),
+            guided_identity: Self::field(
+                window,
+                cx,
+                "Identity secret",
+                Some(&guided_prefill_value(&config.params, read_keys)),
+            ),
+            advanced: Rc::new(RefCell::new(true)),
         }
     }
 
@@ -1417,6 +1551,14 @@ impl ConfigForm {
     /// name the JSON error inline via the shared `form_error` path at commit.
     /// `show_test_url` renders the per-row probe-URL override (edit only —
     /// the add dialog never implies a row exists yet).
+    /// Ticket 05 (signal-box): protocol-first mini-form — Server, Server
+    /// port, Identity sit under Protocol with a per-protocol hint; the raw
+    /// JSON box lives under the Advanced disclosure (collapsed on add,
+    /// expanded on edit; the toggle flips the shared cell and notifies, so
+    /// the next frame rebuilds). Guided and JSON swap, never stack; the
+    /// toggle rides the hint row when collapsed and the Params header row
+    /// when expanded. The Identity input hides for secret-free protocols
+    /// (its fold would write nowhere).
     fn element(
         self,
         view: Entity<AppView>,
@@ -1426,6 +1568,8 @@ impl ConfigForm {
         show_test_url: bool,
     ) -> impl IntoElement {
         let bind = self.bind.read(cx).value().to_string();
+        let protocol_text = self.protocol.read(cx).value().to_string();
+        let guided = guided_identity_fields(&protocol_text);
         let format_view = view.clone();
         let format_params = self.params.clone();
         let template_view = view.clone();
@@ -1433,13 +1577,37 @@ impl ConfigForm {
         let template_protocol = self.protocol.clone();
         let validate_view = view.clone();
         let validate_params = self.params.clone();
+        let expanded = *self.advanced.borrow();
+        // Pre-clone for the toggle buttons (both placements borrow this,
+        // never `self` — the assembly below moves `self`'s fields).
+        let toggle_form = self.clone();
+        // Ticket 05: guided and JSON swap (never stack) — each mode stays
+        // near the old form's height, so no mode pushes content below the
+        // fold. Server + Server port share one row; the toggle rides the
+        // hint row when collapsed and the params buttons row when expanded.
         let params_row = div()
             .id("field-params")
             .test_support()
             .flex()
             .flex_col()
             .gap_1()
-            .child(Label::new("Params"))
+            // Ticket 05: the toggle rides the Params header row (section
+            // title plus collapse action) — the buttons row below keeps its
+            // exact three-button width, so expanded mode fits the minimum
+            // frame like the old form did.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().child(Label::new("Params")))
+                    .child(advanced_toggle_button(
+                        "Back to guided",
+                        &view,
+                        &toggle_form,
+                    )),
+            )
             // Ticket 11: 96px instead of 120 — the Add form (6 fields +
             // footer) must paint inside the 880x620 minimum frame.
             .child(Textarea::new(&self.params).h(px(96.)))
@@ -1480,13 +1648,66 @@ impl ConfigForm {
             );
         // Ticket 11: gap_1 between fields (not gap_2) — saves ~20px so the
         // 6-field Add form fits the 880x620 minimum frame.
+        // Ticket 05: guided and JSON swap (never stack) — each mode stays
+        // near the old form's height, so no mode pushes content below the
+        // fold. Server + Server port share one row; the hint and the toggle
+        // share one row.
         let mut col = div()
             .flex()
             .flex_col()
             .gap_1()
             .child(dialog_field("field-name", "Name", self.name))
-            .child(dialog_field("field-protocol", "Protocol", self.protocol))
-            .child(params_row)
+            .child(dialog_field("field-protocol", "Protocol", self.protocol));
+        if expanded {
+            col = col.child(params_row);
+        } else {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().flex_1().child(dialog_field(
+                        "field-guided-server",
+                        "Server",
+                        self.guided_server,
+                    )))
+                    .child(div().flex_1().child(dialog_field(
+                        "field-guided-port",
+                        "Server port",
+                        self.guided_port,
+                    ))),
+            );
+            if guided.is_some_and(|guided| guided.key.is_some()) {
+                col = col.child(
+                    div()
+                        .id("field-guided-identity")
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        // Ticket 05: the label names the live params key
+                        // (`Identity (uuid)`); `Label` takes the owned string,
+                        // so no static is needed.
+                        .child(Label::new(guided_identity_label(&protocol_text)))
+                        .child(Input::new(&self.guided_identity)),
+                );
+            }
+            let mut hint_row = div().flex().flex_row().items_center().gap_2();
+            if let Some(hint) = guided_hint_line(&protocol_text) {
+                hint_row =
+                    hint_row.child(div().flex_1().id("guided-hint").test_support().child(hint));
+            } else {
+                hint_row = hint_row.child(div().flex_1());
+            }
+            col = col.child(
+                hint_row.child(advanced_toggle_button(
+                    "Advanced (raw JSON)",
+                    &view,
+                    &toggle_form,
+                )),
+            );
+        }
+        col = col
             .child(dialog_field("field-group", "Group", self.group))
             .child(dialog_field("field-bind", "Bind address", self.bind))
             .child(dialog_field("field-port", "Port", self.port));
@@ -1545,11 +1766,30 @@ impl ConfigForm {
         NewConfig {
             name: self.name.read(cx).value().to_string(),
             protocol: self.protocol.read(cx).value().to_string(),
-            params: self.params.read(cx).value().to_string(),
+            params: self.effective_params(cx),
             group: self.group.read(cx).value().to_string(),
             bind_ip: self.bind.read(cx).value().to_string(),
             port: self.port.read(cx).value().to_string(),
         }
+    }
+
+    /// Ticket 05: params at commit — the raw JSON box text with non-blank
+    /// guided mini-form values folded in (server, server port, the
+    /// protocol's identity key). Blank guided inputs change nothing, so an
+    /// untouched template and an untouched edit row commit byte-identical
+    /// params (validation still names every missing field inline).
+    fn effective_params(&self, cx: &App) -> String {
+        let params = self.params.read(cx).value().to_string();
+        let protocol = self.protocol.read(cx).value().to_string();
+        let identity = guided_identity_fields(&protocol)
+            .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
+        fold_guided_into_params(
+            &params,
+            &self.guided_server.read(cx).value().to_string(),
+            &self.guided_port.read(cx).value().to_string(),
+            identity,
+            &self.guided_identity.read(cx).value().to_string(),
+        )
     }
 
     /// Ticket 26: patch relative to the dialog-open snapshot. Fields the user
@@ -2673,6 +2913,34 @@ fn lan_hint_for_bind(bind: &str) -> Option<String> {
         "Leaving loopback exposes this machine — starting on {} needs a LAN confirm, and anyone on the network could use it",
         bind.trim()
     ))
+}
+
+/// Ticket 05 (signal-box): Identity input label for the live protocol
+/// text (`Identity (uuid)`); generic while the protocol is unknown or
+/// secret-free (the input then hides — see [`ConfigForm::element`]).
+fn guided_identity_label(protocol_raw: &str) -> String {
+    match guided_identity_fields(protocol_raw).and_then(|guided| guided.key) {
+        Some(key) => format!("Identity ({key})"),
+        None => "Identity".to_string(),
+    }
+}
+
+/// Ticket 05: guided hint line under the mini-form (`None` for unknown
+/// protocols — the commit names those through validation, never the hint).
+/// Kept to one short clause (the dialog sizes to its content — a long line
+/// would force it past the 880px minimum; the adjacent Advanced toggle
+/// already points at the JSON).
+fn guided_hint_line(protocol_raw: &str) -> Option<String> {
+    let name = protocol_raw.trim();
+    let guided = guided_identity_fields(protocol_raw)?;
+    if name.is_empty() {
+        return None;
+    }
+    match guided.key {
+        Some(_) => Some(format!("{name} needs {}.", guided.needs)),
+        None if guided.needs == "custom JSON" => Some(format!("{name} takes custom JSON.")),
+        None => Some(format!("No secret needed for {name}.")),
+    }
 }
 
 /// Ticket 31: owning dialog field for a save error — the first invalid
@@ -4264,6 +4532,12 @@ impl AppView {
             Err(error) => {
                 if let Some((field, message)) = field_error_target(&error) {
                     *form_error.borrow_mut() = Some((field.to_string(), message));
+                    // Ticket 05: a params error auto-expands Advanced so the
+                    // box the error points at is visible (the dialog stays
+                    // open either way).
+                    if field == "params" {
+                        *form.advanced.borrow_mut() = true;
+                    }
                     form.focus_field(field, window, cx);
                 }
                 self.report_save_error(error, window, cx);
@@ -4480,6 +4754,11 @@ impl AppView {
                     Err(error) => {
                         if let Some((field, message)) = field_error_target(&error) {
                             *form_error.borrow_mut() = Some((field.to_string(), message));
+                            // Ticket 05: a params error auto-expands Advanced
+                            // (see `commit_add_with_focus`).
+                            if field == "params" {
+                                *form.advanced.borrow_mut() = true;
+                            }
                             form.focus_field(field, window, cx);
                         }
                         self.report_save_error(error, window, cx);
@@ -15975,6 +16254,19 @@ mod tests {
             view.update(cx, |view, cx| view.open_add_dialog(window, cx));
         });
         paint_dialog_open(cx);
+        // Ticket 05: the add dialog opens guided-first — the mini-form and
+        // the Advanced toggle paint while the raw JSON stays disclosed.
+        assert_painted(cx, "field-guided-server");
+        assert_painted(cx, "field-guided-port");
+        assert_painted(cx, "field-guided-identity");
+        assert_painted(cx, "guided-hint");
+        assert_painted(cx, "params-advanced-toggle");
+        assert_absent(cx, "field-params".to_string());
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
         assert_painted(cx, "field-params");
         assert_painted(cx, "params-format");
         assert_painted(cx, "params-template");
@@ -22146,6 +22438,8 @@ mod tests {
 
     /// Ticket 11 (c): Add dialog at 880x620 — every field paints inside the
     /// frame (no clipping when the window is at its minimum).
+    /// Ticket 05: guided-first — the collapsed mini-form fits the minimum
+    /// frame; expanding Advanced reveals the JSON in place.
     #[gpui_kit::test]
     fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -22171,12 +22465,33 @@ mod tests {
         for id in [
             "field-name",
             "field-protocol",
-            "field-params",
+            "field-guided-server",
+            "field-guided-port",
+            "field-guided-identity",
+            "guided-hint",
+            "params-advanced-toggle",
             "field-group",
             "field-bind",
             "field-port",
             "add-dialog-ok",
             "add-dialog-cancel",
+        ] {
+            assert_painted(cx, id);
+            assert_within_frame_min(cx, id);
+        }
+        // Advanced disclosure: the raw JSON paints in place on expand.
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        for id in [
+            "field-params",
+            "params-format",
+            "params-template",
+            "params-validate",
         ] {
             assert_painted(cx, id);
             assert_within_frame_min(cx, id);
