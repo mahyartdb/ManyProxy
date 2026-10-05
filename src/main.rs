@@ -1116,16 +1116,35 @@ impl ListDelegate for LibraryDelegate {
             cx.theme().muted_foreground
         };
         if let Some(first) = lines.next() {
-            // Dense header: checkbox + name + serving dot when running, so
-            // state reads on line one without a separate badge row.
+            // Signal-box timetable: every header opens with the occupancy
+            // lamp in the same leading cell — lit green/red while serving,
+            // dark when stopped — so all rows share one exact geometry.
+            // Flat fill only, never glow or shadow.
             // Ticket 01: a checked row carries its count-chip numeral here
             // (1-based position in the checked set — text, not hue).
+            let lamp_color = if is_running {
+                if health.map(str::trim) == Some("dead") {
+                    cx.theme().danger
+                } else {
+                    cx.theme().success
+                }
+            } else {
+                cx.theme().muted_foreground
+            };
             let check_chip = self.checked_position(&row_id);
             let mut header = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
+                .child(
+                    div()
+                        .id(format!("row-dot-{row_id}"))
+                        .test_support()
+                        .size_1p5()
+                        .rounded_full()
+                        .bg(lamp_color),
+                )
                 .child(checkbox)
                 .child(Label::new(first));
             if let Some(position) = check_chip {
@@ -1140,21 +1159,6 @@ impl ListDelegate for LibraryDelegate {
                         .border_color(cx.theme().accent)
                         .text_color(cx.theme().accent)
                         .child(format!("{position}")),
-                );
-            }
-            if is_running {
-                let dot_color = if health.map(str::trim) == Some("dead") {
-                    cx.theme().danger
-                } else {
-                    cx.theme().success
-                };
-                header = header.child(
-                    div()
-                        .id(format!("row-dot-{row_id}"))
-                        .test_support()
-                        .size_1p5()
-                        .rounded_full()
-                        .bg(dot_color),
                 );
             }
             card = card.child(header);
@@ -17615,11 +17619,13 @@ mod tests {
         );
     }
 
-    /// T02 red-first: a serving row paints the inline status dot beside the
-    /// serving line; a stopped row paints no dot. The pinned badge string
-    /// ([`serving_badge`]) never changes — the dot is a sibling element.
+    /// Signal-box ticket 02: every row carries its occupancy lamp in the
+    /// fixed leading cell — lit while serving, dark when stopped — so all
+    /// rows share one exact geometry. Migrates the throne-density
+    /// `present-iff-serving` dot rule into the always-present lamp (same
+    /// `row-dot-<id>` anchor, flat fill, never glow or shadow).
     #[gpui_kit::test]
-    fn library_row_dot_present_iff_serving(cx: &mut TestAppContext) {
+    fn library_row_lamp_paints_in_every_state(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let seeded = store
@@ -17642,7 +17648,7 @@ mod tests {
         paint_frame(cx);
         assert_painted(cx, &format!("row-dot-{}", seeded.id));
 
-        // Stopped: the dot leaves with the running set.
+        // Stopped: the lamp stays in its cell, dark — geometry unchanged.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -17655,10 +17661,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        assert!(
-            cx.update(|window, _| window.try_find(format!("row-dot-{}", seeded.id)).is_none()),
-            "a stopped row paints no status dot"
-        );
+        assert_painted(cx, &format!("row-dot-{}", seeded.id));
     }
 
     /// T03: facet picker seeds with a non-default group/protocol.
