@@ -247,6 +247,11 @@ struct LibraryDelegate {
     /// Ticket 30: serving truth per row (`config_id` set while running).
     /// The badge renders from this — never from the enabled flag.
     running: HashSet<String>,
+    /// Lane B (B6): crashed-shard truth per row (subset of `running` from
+    /// [`crate::engine::EngineController::ids_on_crashed_shards`], set on
+    /// every reload). Feeds the shared [`serving_tone`] rule so the row lamp
+    /// agrees with the detail Badge about sidecar crashes.
+    crashed: HashSet<String>,
     /// Ticket 43: persisted traffic totals (`config_id` → `(rx, tx)`), set on
     /// every reload so the list shows per-row usage.
     traffic: HashMap<String, (u64, u64)>,
@@ -482,6 +487,7 @@ impl LibraryDelegate {
             selected: None,
             health: HashMap::new(),
             running: HashSet::new(),
+            crashed: HashSet::new(),
             traffic: HashMap::new(),
             sub_labels: HashMap::new(),
             preset_names: HashMap::new(),
@@ -741,6 +747,13 @@ impl LibraryDelegate {
         self.running = ids.into_iter().collect();
         self.refresh_search_words();
         self.apply_filter();
+    }
+
+    /// Lane B (B6): replace the crashed-shard set (ids on crashed sidecar
+    /// shards — always a subset of the running set). No re-filter: facets
+    /// read health/serving, never crash state.
+    fn set_crashed(&mut self, ids: Vec<String>) {
+        self.crashed = ids.into_iter().collect();
     }
 
     /// Ticket 43: replace the per-row traffic totals (persisted store
@@ -1106,14 +1119,15 @@ impl ListDelegate for LibraryDelegate {
                 .into_iter();
         // Operate polish: name at base weight via Label, meta + badge at
         // small size. Meta rides muted; the badge rides the serving color
-        // (danger on dead, success while running, muted when stopped).
-        // Pinned strings unchanged — only the wrappers carry style.
-        let badge_color = if health.map(str::trim) == Some("dead") {
-            cx.theme().danger
-        } else if is_running {
-            cx.theme().success
-        } else {
-            cx.theme().muted_foreground
+        // (danger on dead-while-serving, success while running, muted when
+        // stopped). Pinned strings unchanged — only the wrappers carry style.
+        // Lane B (B6): lamp and badge share [`serving_tone`] — one evidence
+        // rule, so the two can never disagree about a row.
+        let tone = serving_tone(is_running, health, self.crashed.contains(&row.id));
+        let badge_color = match tone {
+            ServingTone::Failed => cx.theme().danger,
+            ServingTone::Serving => cx.theme().success,
+            ServingTone::Stopped => cx.theme().muted_foreground,
         };
         if let Some(first) = lines.next() {
             // Signal-box timetable: every header opens with the occupancy
@@ -1122,14 +1136,12 @@ impl ListDelegate for LibraryDelegate {
             // Flat fill only, never glow or shadow.
             // Ticket 01: a checked row carries its count-chip numeral here
             // (1-based position in the checked set — text, not hue).
-            let lamp_color = if is_running {
-                if health.map(str::trim) == Some("dead") {
-                    cx.theme().danger
-                } else {
-                    cx.theme().success
-                }
-            } else {
-                cx.theme().muted_foreground
+            // Lane B (B6): the lamp reads the same [`serving_tone`] as the
+            // badge above — one evidence rule for both.
+            let lamp_color = match tone {
+                ServingTone::Failed => cx.theme().danger,
+                ServingTone::Serving => cx.theme().success,
+                ServingTone::Stopped => cx.theme().muted_foreground,
             };
             let check_chip = self.checked_position(&row_id);
             let mut header = div()
@@ -2316,6 +2328,29 @@ fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
     match health.map(str::trim).filter(|summary| !summary.is_empty()) {
         Some(summary) => format!("● Running :{port} · {summary}"),
         None => format!("● Running :{port}"),
+    }
+}
+
+/// Lane B (B6): one serving-evidence rule for the row lamp, the row badge,
+/// and the detail Badge — red means dead-while-serving (a `dead` health
+/// summary or a crashed sidecar shard on a running row), green means serving,
+/// everything else is stopped-gray. Single rule, three paint sites, so lamp
+/// and badge can never disagree about a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServingTone {
+    Failed,
+    Serving,
+    Stopped,
+}
+
+fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool) -> ServingTone {
+    let dead_evidence = crashed || health.map(str::trim) == Some("dead");
+    if is_running && dead_evidence {
+        ServingTone::Failed
+    } else if is_running {
+        ServingTone::Serving
+    } else {
+        ServingTone::Stopped
     }
 }
 
@@ -4477,6 +4512,11 @@ impl AppView {
             state.delegate_mut().set_health(health);
             // Ticket 30: serving truth follows the engine on every reload.
             state.delegate_mut().set_running(running);
+            // Lane B (B6): crash truth follows the engine too, so the row
+            // lamp shares the detail Badge's failed evidence.
+            state
+                .delegate_mut()
+                .set_crashed(self.engine.ids_on_crashed_shards());
             state.delegate_mut().set_traffic(traffic);
             state
                 .delegate_mut()
@@ -10524,6 +10564,9 @@ impl AppView {
     /// row (same handlers, ids, and loading states as the Details pane;
     /// only one pane renders per frame, so the ids never collide). Logs
     /// open in the dialog — no inline tail.
+    /// Lane B (B6): opens with the shared detail header (acting row +
+    /// protocol/group tags + bind endpoint + serving Badge), so every pane
+    /// names the same row the operate row acts on.
     fn render_inspector_health(
         &self,
         cx: &mut Context<Self>,
@@ -10533,6 +10576,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1()
+            .child(self.render_detail_header(cx, config))
             .child(self.render_detail_health(config))
             .child(self.render_detail_history(config))
             .child(self.render_detail_actions(cx, config))
@@ -10540,6 +10584,9 @@ impl AppView {
 
     /// Ticket 05: Presets pane — attached routing preset plus the attach
     /// picker entry point (same dialog as before).
+    /// Lane B (B6): opens with the shared detail header like the other
+    /// panes (same acting-row echo, same ids, no collisions — one pane
+    /// renders per frame).
     fn render_inspector_presets(
         &self,
         cx: &mut Context<Self>,
@@ -10549,6 +10596,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1()
+            .child(self.render_detail_header(cx, config))
             // Ticket 37: attached routing preset (name only — rules live in
             // the presets manager) plus the picker entry point.
             .child(div().id("config-preset").test_support().child(
@@ -10592,22 +10640,19 @@ impl AppView {
         // gone). The Start button reads `Starting…` while a start is in
         // flight (second clicks are ignored, never double-applied).
         let is_running = self.engine.is_running(&config.id);
+        let summary_text = self.health_store.row_summary(&config.id);
+        let summary_trimmed = summary_text.trim().to_string();
+        let summary_opt = if summary_trimmed.is_empty() {
+            None
+        } else {
+            Some(summary_trimmed.as_str())
+        };
+        let crashed = self.engine.ids_on_crashed_shards().contains(&config.id);
         let badge = if is_running {
-            let summary = self.health_store.row_summary(&config.id);
-            let summary = summary.trim();
-            serving_badge(
-                true,
-                config.port,
-                if summary.is_empty() {
-                    None
-                } else {
-                    Some(summary)
-                },
-            )
+            serving_badge(true, config.port, summary_opt)
         } else {
             serving_badge(false, config.port, None)
         };
-        let failed = self.detail_failed(config);
         div()
             .flex()
             .flex_row()
@@ -10634,17 +10679,17 @@ impl AppView {
             .child(
                 div().id("detail-serving").test_support().child(
                     // T02: the serving line is a Badge — the pinned
-                    // copy is the child, the dot names the state
-                    // (danger on Failed evidence, success while
-                    // serving, secondary when stopped).
+                    // copy is the child, the dot names the state.
+                    // Lane B (B6): the dot shares [`serving_tone`] with the
+                    // row lamp and badge (danger on failed evidence while
+                    // serving, success while serving, secondary when
+                    // stopped) — one rule, three paint sites.
                     Badge::new()
                         .dot()
-                        .color(if failed {
-                            cx.theme().danger
-                        } else if is_running {
-                            cx.theme().success
-                        } else {
-                            cx.theme().secondary
+                        .color(match serving_tone(is_running, summary_opt, crashed) {
+                            ServingTone::Failed => cx.theme().danger,
+                            ServingTone::Serving => cx.theme().success,
+                            ServingTone::Stopped => cx.theme().secondary,
                         })
                         .child(badge),
                 ),
@@ -10996,10 +11041,10 @@ impl AppView {
     /// precedent).
     fn render_row_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let row_view = cx.entity();
-        // Review fix: the Delete item keeps its danger voice inside the
-        // menu (the old manage row carried it via `.danger()`). Captured
-        // here because the dropdown builder cannot reach the theme itself.
-        let danger = cx.theme().danger;
+        // Lane B (B6): the Delete item carries no danger styling — the
+        // naming confirm (`open_remove_confirm`) is the danger voice
+        // (DESIGN.md Do's: the row-menu Delete gates through a naming
+        // confirm instead of carrying danger styling).
         Button::new("row-menu")
             .small()
             .label("Row")
@@ -11040,7 +11085,6 @@ impl AppView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .text_color(danger)
                             .tooltip(|_, cx| {
                                 cx.new(|_| Tooltip::new("Delete the selected configuration"))
                                     .into()
@@ -19402,6 +19446,66 @@ mod tests {
         // ...while the Details-only sections leave with the pane switch.
         assert_absent(cx, "config-endpoints".to_string());
         assert_absent(cx, "config-preset".to_string());
+    }
+
+    /// Lane B (B6): every inspector pane opens with the shared detail
+    /// header — the Health and Presets panes echo the same acting row the
+    /// operate row acts on (previously Details-only).
+    #[gpui_kit::test]
+    fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        for tab in [
+            crate::InspectorTab::Details,
+            crate::InspectorTab::Health,
+            crate::InspectorTab::Presets,
+        ] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.libraries.update(cx, |state, list_cx| {
+                        state.delegate_mut().selected = Some(IndexPath::new(0));
+                        list_cx.notify();
+                    });
+                    view.inspector_tab = tab;
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+            cx.run_until_parked();
+            paint_frame(cx);
+            assert_painted(cx, "detail-acting-on");
+            assert_painted(cx, "detail-serving");
+        }
+    }
+
+    /// Lane B (B6): one serving-evidence rule — dead-while-serving reads
+    /// Failed (dead summary or crashed shard on a running row), serving
+    /// reads Serving, everything stopped reads Stopped.
+    #[test]
+    fn laneb_serving_tone_single_evidence_rule() {
+        use crate::{serving_tone, ServingTone};
+        assert_eq!(serving_tone(true, Some("dead"), false), ServingTone::Failed);
+        assert_eq!(
+            serving_tone(true, Some(" dead "), true),
+            ServingTone::Failed
+        );
+        assert_eq!(
+            serving_tone(true, Some("87ms"), false),
+            ServingTone::Serving
+        );
+        assert_eq!(serving_tone(true, None, false), ServingTone::Serving);
+        assert_eq!(
+            serving_tone(false, Some("dead"), false),
+            ServingTone::Stopped
+        );
+        assert_eq!(serving_tone(false, None, true), ServingTone::Stopped);
+        assert_eq!(serving_tone(false, None, false), ServingTone::Stopped);
     }
 
     /// Signal-box 04: the detail pane is a block shelf — the Endpoints
