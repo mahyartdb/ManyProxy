@@ -4358,12 +4358,13 @@ impl Store {
     /// (logged + quarantined, never a whole-export abort):
     /// `list_with_quarantine` cannot see that column (`map_row` never reads
     /// it), so export filters it here.
+    /// Ticket A8: single pipeline — this delegates to
+    /// [`Store::export_library_json_with_quarantine`] and drops the skip
+    /// list, so the two exports can never drift apart (one funnel for the
+    /// good-rows shape, the quarantine list, and the v5 sections).
     pub fn export_library_json(&self) -> Result<String, StoreError> {
-        let (rows, _quarantined) = self.list_with_quarantine()?;
-        let (rows, _) = self.without_unreadable_synced(rows);
-        let tombstones = self.list_tombstones_raw()?;
-        let payload = export_payload_full(&rows, &self.list_subscriptions()?, &tombstones);
-        self.enrich_export_payload(&payload, &rows)
+        let (payload, _) = self.export_library_json_with_quarantine()?;
+        Ok(payload)
     }
 
     /// Split `rows` into exportable rows plus skipped ids: any row whose
@@ -6614,6 +6615,61 @@ mod tests {
         assert!(decode_failures(Some(String::new())).is_empty());
         assert!(decode_failures(Some("not-json".to_string())).is_empty());
         assert!(decode_failures(Some("[{\"index\": 2}]".to_string())).len() == 1);
+    }
+
+    /// Ticket A8: a corrupt `failures` CELL in a live row (hand edit, older
+    /// build) reads back as no failures — never a crash, never an error —
+    /// and an empty library round-trips export → restore → export
+    /// byte-identically through the single pipeline.
+    #[test]
+    fn a8_corrupt_failures_cell_and_empty_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .conn
+            .execute(
+                "UPDATE subscriptions SET failures = ?1 WHERE id = ?2",
+                params!["{corrupt!!!", sub.id.parse::<i64>().expect("rowid")],
+            )
+            .expect("corrupt write works");
+        let read = store
+            .get_subscription(&sub.id)
+            .expect("read works")
+            .expect("sub present");
+        assert!(
+            read.failures.is_empty(),
+            "corrupt cell decodes to no failures"
+        );
+
+        // Empty library round-trip through the single export pipeline.
+        let empty = Store::open_in_memory().expect("fresh store opens");
+        let payload = empty.export_library_json().expect("empty export works");
+        let (quarantined_payload, skipped) = empty
+            .export_library_json_with_quarantine()
+            .expect("quarantine export works");
+        assert_eq!(
+            payload, quarantined_payload,
+            "single pipeline: both exports agree"
+        );
+        assert!(skipped.is_empty(), "nothing to skip when empty");
+        let mut restored = Store::open_in_memory().expect("restore target opens");
+        let outcome = restored
+            .restore_library_json(&payload)
+            .expect("empty restore works");
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                configs: 0,
+                subscriptions: 0,
+                tombstones: 0,
+                presets: 0,
+            }
+        );
+        assert_eq!(
+            restored.export_library_json().expect("re-export works"),
+            payload,
+            "empty round-trip is byte-identical"
+        );
     }
 
     /// Removing a subscription releases (never deletes) its rows and drops

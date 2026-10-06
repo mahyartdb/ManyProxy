@@ -3601,6 +3601,55 @@ mod tests {
         let _ = server;
     }
 
+    /// Ticket A8: clash-poll errors never carry the bearer secret — every
+    /// failure arm (dial, write, read, status, deadline) names core/port
+    /// only. Pinned with a refused port plus a wrong-secret stub.
+    #[test]
+    fn a8_clash_poll_errors_never_carry_secret() {
+        use std::time::Duration;
+        const SECRET: &str = "s3cret-hunter2-11111111-2222-4333-8444-555555555555";
+        // Refused port: dial fails before any byte moves.
+        let refused = vec![crate::engine::ClashTarget {
+            core: "down".to_string(),
+            port: 1,
+            secret: SECRET.to_string(),
+        }];
+        for (target, result) in
+            poll_clash_targets(&refused, Duration::from_secs(2), Duration::from_secs(5))
+        {
+            let error = result.expect_err("refused port fails");
+            assert!(!error.contains(SECRET), "secret in error: {error}");
+            assert!(!error.contains("hunter2"), "secret part in error: {error}");
+            assert!(error.contains(&target.core), "core named: {error}");
+        }
+        // Wrong secret against a live stub: 401 names the endpoint only.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("accept works");
+            let mut head = [0u8; 4096];
+            let _ = stream.read(&mut head);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let wrong = vec![crate::engine::ClashTarget {
+            core: "auth".to_string(),
+            port,
+            secret: SECRET.to_string(),
+        }];
+        for (_, result) in
+            poll_clash_targets(&wrong, Duration::from_secs(5), Duration::from_secs(10))
+        {
+            let error = result.expect_err("wrong secret is unauthorized");
+            assert!(error.contains("unauthorized"), "named: {error}");
+            assert!(!error.contains(SECRET), "secret in error: {error}");
+            assert!(!error.contains("hunter2"), "secret part in error: {error}");
+        }
+        server.join().expect("stub drains");
+    }
+
     /// Ticket 47 (RED): ingest strips ANSI once and caches the lowercase
     /// search blob — stored records carry no escapes.
     #[test]
