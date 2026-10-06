@@ -10589,7 +10589,7 @@ impl AppView {
         // Ticket 30: the header carries the same serving badge as the list
         // row (`● Running :port · health` / `○ Stopped`); the enabled flag
         // stays secondary (Switch only — the duplicate Enable button is
-        // gone). The Start button reads `Starting.` while a start is in
+        // gone). The Start button reads `Starting…` while a start is in
         // flight (second clicks are ignored, never double-applied).
         let is_running = self.engine.is_running(&config.id);
         let badge = if is_running {
@@ -10827,7 +10827,7 @@ impl AppView {
         let switch_id_for_handler = config.id.clone();
         // W1: the selected row's lifecycle phase (see [`detail_failed`]
         // for the evidence rule); the Start copy derives from the phase
-        // (same strings as before — `Starting.` while a start is in
+        // (same strings as before — `Starting…` while a start is in
         // flight, `Start` otherwise).
         let is_running = self.engine.is_running(&config.id);
         let failed = self.detail_failed(config);
@@ -10866,12 +10866,16 @@ impl AppView {
             )
             .child({
                 // T06: loading state + inline spinner while a start
-                // is in flight (the label already reads `Starting.`
+                // is in flight (the label already reads `Starting…`
                 // via `RowPhase::start_label`).
+                // Lane B (B6): the F5 hint rides as a Kbd chip like Stop/Test
+                // (pinned string stays on the accessible name + tooltip).
                 let mut start = Button::new("engine-start")
                     // Ticket 44: small + tooltip (detail-bar density).
                     .small()
                     .label(start_label)
+                    .accessibility_label("Start the selected endpoint (F5)")
+                    .child(shortcut_kbd("f5", "(F5)"))
                     .tooltip("Start the selected endpoint (F5)")
                     .loading(self.start_in_flight)
                     .on_click(cx.listener(|view, _, window, cx| {
@@ -11498,6 +11502,10 @@ impl AppView {
             .test_support()
             .flex()
             .flex_row()
+            // Lane B (B5): the crowded bulk set wraps like `detail-operate`
+            // (No-Sideways-Scroll Rule) so every bulk action paints inside
+            // the 880px minimum frame instead of clipping.
+            .flex_wrap()
             .items_center()
             .gap_2()
             .px_2()
@@ -11511,7 +11519,7 @@ impl AppView {
                 Button::new("bulk-start")
                     .small()
                     .label("Start")
-                    .tooltip("Start every selected endpoint")
+                    .tooltip("Start every checked endpoint")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_start(window, cx);
                     })),
@@ -11520,7 +11528,7 @@ impl AppView {
                 Button::new("bulk-stop")
                     .small()
                     .label("Stop")
-                    .tooltip("Stop every selected endpoint")
+                    .tooltip("Stop every checked endpoint")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_stop(window, cx);
                     })),
@@ -11529,7 +11537,7 @@ impl AppView {
                 Button::new("bulk-enable")
                     .small()
                     .label("Enable")
-                    .tooltip("Enable every selected row")
+                    .tooltip("Enable every checked row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_enable(true, window, cx);
                     })),
@@ -11538,7 +11546,7 @@ impl AppView {
                 Button::new("bulk-disable")
                     .small()
                     .label("Disable")
-                    .tooltip("Disable every selected row")
+                    .tooltip("Disable every checked row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.commit_bulk_enable(false, window, cx);
                     })),
@@ -11547,7 +11555,7 @@ impl AppView {
                 Button::new("bulk-move")
                     .small()
                     .label("Move to group")
-                    .tooltip("Move every selected row")
+                    .tooltip("Move every checked row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_bulk_move_dialog(window, cx);
                     })),
@@ -11557,7 +11565,7 @@ impl AppView {
                     .danger()
                     .small()
                     .label("Delete")
-                    .tooltip("Delete every selected row")
+                    .tooltip("Delete every checked row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.open_bulk_delete_confirm(window, cx);
                     })),
@@ -11565,8 +11573,8 @@ impl AppView {
             .child(
                 Button::new("bulk-clear")
                     .small()
-                    .label("Clear selection")
-                    .tooltip("Clear selection (Esc)")
+                    .label("Clear checked")
+                    .tooltip("Clear checked (Esc)")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.clear_checked(window, cx);
                     })),
@@ -11574,8 +11582,8 @@ impl AppView {
             .child(
                 Button::new("bulk-select-visible")
                     .small()
-                    .label("Select visible")
-                    .tooltip("Select every visible row")
+                    .label("Check visible")
+                    .tooltip("Check every visible row")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.select_visible_checked(window, cx);
                     })),
@@ -17345,6 +17353,52 @@ mod tests {
             view.libraries.read(cx).delegate().bulk_label()
         });
         assert_eq!(label, "");
+    }
+
+    /// Lane B (B5): the bulk bar wraps inside the minimum frame — with two
+    /// rows checked every bulk action paints within 880x620 (no clipped
+    /// tail like the old toolbar `He…` clip).
+    #[gpui_kit::test]
+    fn laneb_bulk_bar_wraps_within_min_frame(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.toggle_checked(&first.id);
+                    delegate.toggle_checked(&second.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        assert_painted(cx, "bulk-bar");
+        assert_within_frame_min(cx, "bulk-bar");
+        assert_painted(cx, "bulk-label");
+        for id in [
+            "bulk-start",
+            "bulk-stop",
+            "bulk-enable",
+            "bulk-disable",
+            "bulk-move",
+            "bulk-delete",
+            "bulk-clear",
+            "bulk-select-visible",
+        ] {
+            assert_painted(cx, id);
+            assert_within_frame_min(cx, id);
+        }
     }
 
     /// Ticket 01 UI: two rows checked plus a third selected — the checked
