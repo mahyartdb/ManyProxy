@@ -1439,6 +1439,27 @@ impl ConfigForm {
         })
     }
 
+    /// Lane B (B8): one masked builder for the guided identity secret
+    /// (uuid/password/token) — masked at rest with a reveal toggle at the
+    /// render site, so shoulder-surfing the Add/Edit dialog never lifts a
+    /// credential. Values still read/write normally (fold + prefill).
+    fn secret_field(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        placeholder: &str,
+        default: Option<&str>,
+    ) -> Entity<InputState> {
+        cx.new(|cx| {
+            let state = InputState::new(window, cx)
+                .placeholder(placeholder)
+                .masked(true);
+            match default {
+                Some(value) => state.default_value(value.to_string()),
+                None => state,
+            }
+        })
+    }
+
     /// Ticket 43: one multiline builder for the params box (same
     /// placeholder + default wiring as [`ConfigForm::field`]).
     fn area(
@@ -1478,7 +1499,7 @@ impl ConfigForm {
             test_url: Self::field(window, cx, "Test URL (blank = global)", None),
             guided_server: Self::field(window, cx, "Upstream server", None),
             guided_port: Self::field(window, cx, "Upstream port", None),
-            guided_identity: Self::field(window, cx, "Identity secret", None),
+            guided_identity: Self::secret_field(window, cx, "Identity secret", None),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -1531,7 +1552,7 @@ impl ConfigForm {
                     &["server_port", "port"],
                 )),
             ),
-            guided_identity: Self::field(
+            guided_identity: Self::secret_field(
                 window,
                 cx,
                 "Identity secret",
@@ -1692,8 +1713,11 @@ impl ConfigForm {
                         // Ticket 05: the label names the live params key
                         // (`Identity (uuid)`); `Label` takes the owned string,
                         // so no static is needed.
+                        // Lane B (B8): the secret renders masked with a
+                        // reveal toggle (kit `mask_toggle`) — credentials
+                        // stay out of sight and out of the clipboard.
                         .child(Label::new(guided_identity_label(&protocol_text)))
-                        .child(Input::new(&self.guided_identity)),
+                        .child(Input::new(&self.guided_identity).mask_toggle()),
                 );
             }
             let mut hint_row = div().flex().flex_row().items_center().gap_2();
@@ -3518,6 +3542,23 @@ fn subscription_row(
                             Notification::success("Copied subscription URL (redacted)"),
                             cx,
                         );
+                    });
+                }),
+        );
+        // Lane B (B8): the token-bearing original behind an explicit
+        // plaintext warning — display and Copy URL stay redacted; the full
+        // secret only leaves on a second, informed click.
+        let full_view = view.clone();
+        let full_url = sub.url.clone();
+        let full_label = sub.label.clone();
+        row = row.child(
+            Button::new(format!("sub-copy-full-url-{}", sub.id))
+                .label("Copy full URL")
+                .on_click(move |_, window, cx| {
+                    let url = full_url.clone();
+                    let label = full_label.clone();
+                    full_view.update(cx, |view, cx| {
+                        view.open_sub_full_url_confirm(&label, &url, window, cx);
                     });
                 }),
         );
@@ -9713,6 +9754,40 @@ impl AppView {
                     "preset-attach-cancel",
                     commit_click,
                 ))
+        });
+    }
+
+    /// Lane B (B8): full subscription URL copy behind an explicit
+    /// plaintext warning (the export-dialog pattern) — display and Copy URL
+    /// stay redacted; the token-bearing original only leaves the app on a
+    /// second, informed click.
+    fn open_sub_full_url_confirm(
+        &mut self,
+        label: &str,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let full = url.to_string();
+        let description = format!(
+            "The full URL for \"{label}\" carries its token in plaintext — anyone holding it can \
+             use the subscription. Prefer the redacted copy. Copy the full URL anyway?"
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let full = full.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Copy full subscription URL?")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
+                    window.push_notification(
+                        Notification::warning("Copied FULL subscription URL (carries the token)"),
+                        cx,
+                    );
+                    true
+                })
         });
     }
 
@@ -16707,6 +16782,51 @@ mod tests {
         paint_dialog_open(cx);
         assert_painted(cx, "log-redact-note");
         assert_painted(cx, "log-save-path");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Lane B (B8): the guided identity secret renders masked (uuid /
+    /// password / token never sit visible in Add/Edit) while values still
+    /// set + fold normally; the subscription full-URL copy gates behind a
+    /// plaintext warning instead of copying the token outright.
+    #[gpui_kit::test]
+    fn laneb_identity_masked_and_sub_full_url_confirm(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let (masked, roundtrip) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                let masked = form.guided_identity.read(cx).presentation().is_masked();
+                assert!(
+                    !form.guided_server.read(cx).presentation().is_masked(),
+                    "server stays readable"
+                );
+                form.guided_identity.update(cx, |state, cx| {
+                    state.set_value("11111111-2222-4333-8444-555555555555", window, cx);
+                });
+                let kept = form.guided_identity.read(cx).value().to_string();
+                (masked, kept)
+            })
+        });
+        assert!(masked, "identity secret masked at rest");
+        assert_eq!(
+            roundtrip, "11111111-2222-4333-8444-555555555555",
+            "masked values still set + read"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_sub_full_url_confirm("Nightly", "https://example.com/sub.txt", window, cx)
+            });
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "full URL copy confirms"
+        );
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
