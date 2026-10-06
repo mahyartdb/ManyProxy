@@ -1525,7 +1525,11 @@ impl HealthStore {
                 state: RowState::Dead,
                 cause: Some(cause),
                 ..
-            } => format!("health: {} · {traffic}", truncate(&cause, 140)),
+            // BUG-3: failure evidence renders full text inside the `Endpoint
+            // failed` alert (this branch only ever feeds that Alert — see
+            // `render_detail_health`). The 140-char `truncate` cap stays for
+            // one-line summaries elsewhere, never for the error box.
+            } => format!("health: {cause} · {traffic}"),
             RowHealth {
                 state: RowState::Dead,
                 cause: None,

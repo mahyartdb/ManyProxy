@@ -1212,12 +1212,14 @@ impl ListDelegate for LibraryDelegate {
                         let hint_view = list_view.clone();
                         Button::new("clear-search-hint")
                             .label("Clear search")
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 hint_view.update(cx, |state, list_cx| {
-                                    let delegate = state.delegate_mut();
-                                    delegate.query = String::new();
-                                    delegate.apply_filter();
-                                    list_cx.notify();
+                                    // BUG-1: push the cleared query back into
+                                    // the kit List widget (`query_input` +
+                                    // `last_query`) via `set_query` — mutating
+                                    // `delegate.query` alone leaves stale text
+                                    // that blocks row selection.
+                                    state.set_query("", window, list_cx);
                                 });
                             })
                     })),
@@ -2053,7 +2055,12 @@ fn row_action_message(verb: &str, name: &str) -> String {
 
 /// Ticket 17: live import preview counts, reusing the parser read-only (no
 /// store writes, no toasts — the dialog renders these as inline text).
+/// BUG-4: an empty box is neutral `(0, 0)` — the parser reports empty input
+/// as one `Empty` failure, which must never surface as `0 valid · 1 invalid`.
 fn import_preview_counts(text: &str, file_hint: Option<&str>) -> (usize, usize) {
+    if text.trim().is_empty() {
+        return (0, 0);
+    }
     let batch = match effective_hint_for_text(file_hint, text) {
         Some(name) => import_file_content(&name, text),
         None => import_text(text),
@@ -5467,7 +5474,10 @@ impl AppView {
                 Ok(_) => {
                     self.reload(window, cx);
                     window.push_notification(
-                        Notification::success(format!("Stopped \"{}\"", config.name)),
+                        Notification::success(format!(
+                            "Stopped \"{}\" — flag cleared",
+                            config.name
+                        )),
                         cx,
                     );
                 }
@@ -6380,10 +6390,14 @@ impl AppView {
     /// Signal-box 06: the status-bar describer keeps the short form —
     /// the 880px frame fits every segment today, so the next step lives
     /// in the detail Health module and the Test tooltip beside it.
+    /// BUG-2: session-scoped wording — after Stop the persisted Health pane
+    /// still shows probes/samples, so `never tested` read as a contradiction.
+    /// `no probes this session` names the same (live, dead) == (0, 0) state
+    /// without claiming nothing was ever tested.
     fn health_status_text(&self) -> String {
         let (live, dead) = self.health_counts();
         if live == 0 && dead == 0 {
-            "health: never tested".to_string()
+            "health: no probes this session".to_string()
         } else {
             format!("health: {live} live · {dead} dead")
         }
@@ -11176,12 +11190,12 @@ impl AppView {
 
     /// Ticket 30: clear the library search filter in place (selection
     /// re-derives by id via `apply_filter`).
-    fn clear_library_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// BUG-1: routes through `ListState::set_query` so the kit search input
+    /// (`query_input` + `last_query`) clears together with `delegate.query`
+    /// — a delegate-only reset leaves stale text that blocks row selection.
+    fn clear_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
-            let delegate = state.delegate_mut();
-            delegate.query = String::new();
-            delegate.apply_filter();
-            list_cx.notify();
+            state.set_query("", window, list_cx);
         });
         cx.notify();
     }
@@ -12114,6 +12128,10 @@ impl AppView {
             .id("manyproxy-toolbar")
             .flex()
             .flex_row()
+            // BUG-5: the 880px minimum clipped `help-menu` (`He…`) in a
+            // single-row strip. Per DESIGN.md No-Sideways-Scroll Rule the
+            // crowded strip wraps to a second row instead of overflowing.
+            .flex_wrap()
             .items_center()
             .gap_2()
             .p_2()
@@ -15133,6 +15151,9 @@ mod tests {
         let body = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x";
         assert_eq!(import_preview_counts(body, None), (1, 1));
         assert_eq!(import_preview_message(1, 1), "1 valid · 1 invalid");
+        // BUG-4: an empty box previews neutral, never `0 valid · 1 invalid`.
+        assert_eq!(import_preview_counts("", None), (0, 0));
+        assert_eq!(import_preview_counts("   \n  ", None), (0, 0));
         assert_eq!(import_preview_message(0, 0), "0 valid · 0 invalid");
         // A dropped conf keeps its hint for the preview too.
         let conf = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
@@ -19530,6 +19551,9 @@ mod tests {
     /// T07 red-first: the no-hits hint is a working control — clicking it
     /// clears the query in place and the rows repaint (previously static
     /// text duplicating the `clear-search` button).
+    /// BUG-1: the filter is established through `set_query` (the real typing
+    /// path, kit `query_input` + `delegate.query` together) so the test fails
+    /// if either clear path regresses to a delegate-only reset.
     #[gpui_kit::test]
     fn clear_search_hint_clears_query(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -19538,14 +19562,11 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Narrow to no hits.
-        cx.update(|_, cx| {
+        // Narrow to no hits via the real typing path.
+        cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
-                    let delegate = state.delegate_mut();
-                    delegate.query = "zzz-no-hit".to_string();
-                    delegate.apply_filter();
-                    list_cx.notify();
+                    state.set_query("zzz-no-hit", window, list_cx);
                 });
             });
         });
@@ -21469,7 +21490,7 @@ mod tests {
         assert_eq!((total, enabled), (0, 0), "counts name the empty set");
         assert_eq!(
             view.read_with(cx, |view, _| view.health_status_text()),
-            "health: never tested",
+            "health: no probes this session",
             "empty health never reads as failure"
         );
         // Usage on empty: the readable store totals zero honestly (the
@@ -22885,6 +22906,22 @@ mod tests {
         paint_frame_min(cx);
 
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
+        // BUG-5: the toolbar wraps at the 880px minimum — every lever and
+        // menu trigger (trailing `help-menu` included) paints inside 880.
+        for id in [
+            "add-config",
+            "start-selected",
+            "stop-selected",
+            "test-selected",
+            "import-config",
+            "library-menu",
+            "manage-menu",
+            "engine-menu",
+            "help-menu",
+        ] {
+            assert_painted(cx, id);
+            assert_within_frame_min(cx, id);
+        }
         // Facet bar + pickers paint inside the minimum frame.
         for id in ["facet-bar", "facet-group", "facet-protocol", "facet-status"] {
             assert_painted(cx, id);
