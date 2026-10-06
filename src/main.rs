@@ -7159,33 +7159,6 @@ impl AppView {
             cx.notify();
         }
     }
-    /// Ticket 45: cycle the logs level filter (all → error → warn → info →
-    /// debug → all). Pure state — the dialog reopens to show the result
-    /// (snapshot-at-open semantics, ticket 26 L4).
-    fn cycle_log_level(&mut self) {
-        let label = match self.log_level {
-            None => "all",
-            Some(level) => level.as_str(),
-        };
-        let order = ["all", "error", "warn", "info", "debug"];
-        let next = order
-            .iter()
-            .cycle()
-            .skip_while(|candidate| **candidate != label)
-            .nth(1)
-            .copied()
-            .unwrap_or("all");
-        self.log_level = LogLevel::from_label(next);
-    }
-
-    /// Ticket 45: level-filter label for the cycle button.
-    fn log_level_label(&self) -> String {
-        match self.log_level {
-            None => "Level: all".to_string(),
-            Some(level) => format!("Level: {}", level.as_str()),
-        }
-    }
-
     /// Ticket 06: per-config log dialog with a filter field. OK applies the
     /// filter and re-renders when still open.
     /// Ticket 26 (L4 ruling): the lines snapshot at open; new sidecar lines
@@ -7236,7 +7209,6 @@ impl AppView {
         let chrome_view = view.clone();
         let chrome_level = self.log_level;
         let chrome_tail = self.log_tail;
-        let chrome_cycle_label = self.log_level_label();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
@@ -7250,14 +7222,18 @@ impl AppView {
                 .flex_row()
                 .items_center()
                 .gap_2();
-            for (id, label, level) in [
-                ("log-level-all", "All", None),
-                ("log-level-debug", "Debug", Some(LogLevel::Debug)),
-                ("log-level-info", "Info", Some(LogLevel::Info)),
-                ("log-level-warn", "Warn", Some(LogLevel::Warn)),
-                ("log-level-error", "Error", Some(LogLevel::Error)),
+            // Lane B (B9): the single level control — labels map through
+            // `LogLevel::from_label` (one source, never a hand-duplicated
+            // table), so a corrupt label can only read as `all`.
+            for (id, label) in [
+                ("log-level-all", "All"),
+                ("log-level-debug", "Debug"),
+                ("log-level-info", "Info"),
+                ("log-level-warn", "Warn"),
+                ("log-level-error", "Error"),
             ] {
                 let level_view = chrome_view.clone();
+                let level = LogLevel::from_label(label);
                 let active = current_level == level;
                 level_row = level_row.child(
                     Button::new(id)
@@ -7276,8 +7252,8 @@ impl AppView {
             let copy_view = chrome_view.clone();
             let tail_view = chrome_view.clone();
             let save_view = chrome_view.clone();
-            let cycle_view = chrome_view.clone();
-            let cycle_label = chrome_cycle_label.clone();
+            // Lane B (B9): the five-button level row above is the single
+            // level control — no second cycle button beside Copy/tail/Save.
             let action_row =
                 div()
                     .id("log-actions-row")
@@ -7301,15 +7277,6 @@ impl AppView {
                             .on_click(move |_, window, cx| {
                                 tail_view.update(cx, |view, cx| {
                                     view.toggle_log_tail(window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("logs-level")
-                            .label(cycle_label.clone())
-                            .on_click(move |_, window, cx| {
-                                cycle_view.update(cx, |view, cx| {
-                                    view.cycle_log_level_and_reopen(window, cx);
                                 });
                             }),
                     )
@@ -7380,20 +7347,6 @@ impl AppView {
                 ))
         });
     }
-    fn reopen_logs_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !window.has_active_dialog(cx) || !self.logs_open {
-            return;
-        }
-        window.close_all_dialogs(cx);
-        self.open_logs_dialog(window, cx);
-    }
-
-    /// Ticket 45: level-cycle behind the logs dialog button.
-    fn cycle_log_level_and_reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_log_level();
-        self.reopen_logs_if_open(window, cx);
-    }
-
     /// Ticket 11: user-owned JSON export behind the plaintext-secret
     /// warning. The confirm dialog shows [`export_confirm_description`]
     /// (the [`store::export_warning_text`] verbatim); confirming writes the
@@ -15367,29 +15320,45 @@ mod tests {
         });
     }
 
-    /// Ticket 45: the level cycle walks all → error → warn → info →
-    /// debug → all with matching button labels.
+    /// Lane B (B9): one level control — the five-button level row is the
+    /// only severity switch in the logs dialog (no second cycle button),
+    /// and each button narrows through the same `set_log_level` seam.
     #[gpui_kit::test]
-    fn t45_log_level_cycles_with_labels(cx: &mut TestAppContext) {
+    fn laneb_logs_single_level_control(cx: &mut TestAppContext) {
+        use crate::health::LogLevel;
         cx.update(gpui_kit::init);
+        // Settle the dialog entrance animation so the click's down/up share
+        // one button position (same as the other dialog-click tests).
+        cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
-        let mut labels = Vec::new();
-        for _ in 0..6 {
-            view.update(cx, |view, _| view.cycle_log_level());
-            labels.push(view.read_with(cx, |view, _| view.log_level_label()));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "log-level-all",
+            "log-level-debug",
+            "log-level-info",
+            "log-level-warn",
+            "log-level-error",
+        ] {
+            assert_painted(cx, id);
         }
-        assert_eq!(
-            labels,
-            vec![
-                "Level: error",
-                "Level: warn",
-                "Level: info",
-                "Level: debug",
-                "Level: all",
-                "Level: error",
-            ]
+        assert!(
+            cx.update(|window, _| window.try_find("logs-level".to_string()).is_none()),
+            "no second cycle button beside Copy/tail/Save"
         );
+        cx.update(|window, cx| {
+            window.click("log-level-error", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.log_level),
+            Some(LogLevel::Error),
+            "level row narrows the filter"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Scenario: paste with all-invalid items → dialog stays open (false),
