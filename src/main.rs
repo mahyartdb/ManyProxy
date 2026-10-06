@@ -2395,12 +2395,16 @@ fn acting_on_label(config: &ProxyConfig) -> String {
 }
 
 /// Signal-box 06: which bind endpoint a per-row copy button carries.
-/// Both forms come from [`proxy_urls`] (bind + port only), so the
-/// clipboard can never carry params or secrets through this path.
+/// Lane B (B7): plus the display-only upstream `host:port` (still bind-side
+/// metadata via [`upstream_host_port`] — never params or secrets), so the
+/// row no longer has a copy gap beside a display-only line. Every form comes
+/// from secret-free sources, so the clipboard can never carry params or
+/// secrets through this path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointUrl {
     Socks,
     Http,
+    Upstream,
 }
 
 /// W1: row lifecycle state machine — stopped → starting → running, with
@@ -5355,11 +5359,26 @@ impl AppView {
         if let Some(config) = self.selected_config(cx) {
             let (socks, http) = proxy_urls(&config.bind_ip, config.port);
             let (url, name) = match which {
-                EndpointUrl::Socks => (socks, "SOCKS"),
-                EndpointUrl::Http => (http, "HTTP"),
+                EndpointUrl::Socks => (Some(socks), "SOCKS"),
+                EndpointUrl::Http => (Some(http), "HTTP"),
+                // Lane B (B7): the display-only upstream line copies its
+                // host:port (never params or secrets); rows without one say
+                // so instead of copying nothing.
+                EndpointUrl::Upstream => (upstream_host_port(&config), "upstream"),
             };
-            cx.write_to_clipboard(ClipboardItem::new_string(url));
-            window.push_notification(Notification::success(format!("Copied {name} URL")), cx);
+            match url {
+                Some(url) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url));
+                    window
+                        .push_notification(Notification::success(format!("Copied {name} URL")), cx);
+                }
+                None => {
+                    window.push_notification(
+                        Notification::info(format!("No upstream endpoint for \"{}\"", config.name)),
+                        cx,
+                    );
+                }
+            }
         } else {
             window.push_notification(Notification::info(no_selection_message()), cx);
         }
@@ -10803,8 +10822,8 @@ impl AppView {
         // the list rows (one HashMap lookup per frame, never a JSON parse).
         let upstream = self.cached_upstream(cx, config);
         // Signal-box 06: per-row copy closes the all-or-nothing gap —
-        // each bind URL copies alone beside its value. Upstream stays
-        // display-only (it never rode Copy URLs either). Labels ride the
+        // each endpoint copies alone beside its value (upstream included:
+        // host:port only, never params or secrets). Labels ride the
         // description label token and buttons are kit small with tooltips,
         // so focus, tab order, and density match the operate row below.
         div().id("config-endpoints").test_support().child(
@@ -10813,17 +10832,25 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(Self::endpoint_row(cx, "upstream", upstream, None))
+                    .child(Self::endpoint_row(
+                        cx,
+                        "upstream",
+                        upstream,
+                        "endpoint-value-upstream",
+                        Some(EndpointUrl::Upstream),
+                    ))
                     .child(Self::endpoint_row(
                         cx,
                         "SOCKS",
                         socks_url,
+                        "endpoint-value-socks",
                         Some(EndpointUrl::Socks),
                     ))
                     .child(Self::endpoint_row(
                         cx,
                         "HTTP",
                         http_url,
+                        "endpoint-value-http",
                         Some(EndpointUrl::Http),
                     )),
             ),
@@ -10835,12 +10862,17 @@ impl AppView {
     /// `label` is a static scheme name; `which` wires the copy target.
     /// One line per endpoint (label | value | copy) keeps all three rows
     /// above the fold inside the inspector height.
+    /// Lane B (B7): the truncating value carries the full text as its
+    /// tooltip (still bind-side only — never params or secrets), so a
+    /// narrowed inspector never hides the endpoint it acts on.
     fn endpoint_row(
         cx: &mut Context<Self>,
         label: &'static str,
         value: String,
+        value_id: &'static str,
         which: Option<EndpointUrl>,
     ) -> impl IntoElement {
+        let tip = value.clone();
         let mut value_row = div()
             .flex()
             .flex_row()
@@ -10848,7 +10880,16 @@ impl AppView {
             .gap_2()
             .flex_1()
             .min_w_0()
-            .child(div().flex_1().min_w_0().truncate().child(value));
+            .child(
+                div()
+                    .id(value_id)
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(value),
+            );
         if let Some(which) = which {
             let (id, button_label, tip, a11y) = match which {
                 EndpointUrl::Socks => (
@@ -10862,6 +10903,12 @@ impl AppView {
                     "Copy HTTP",
                     "Copy the HTTP endpoint (no secrets)",
                     "Copy HTTP URL",
+                ),
+                EndpointUrl::Upstream => (
+                    "copy-upstream",
+                    "Copy upstream",
+                    "Copy the upstream host:port (no secrets)",
+                    "Copy upstream endpoint",
                 ),
             };
             value_row = value_row.child(
@@ -19899,7 +19946,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        for id in ["copy-socks", "copy-http"] {
+        for id in ["copy-socks", "copy-http", "copy-upstream"] {
             assert!(
                 cx.update(|window, _| window.try_find(id.to_string()).is_some()),
                 "{id} rides its endpoint row"
@@ -19938,6 +19985,25 @@ mod tests {
             assert!(
                 !clip.contains(canary),
                 "clipboard carries bind+port only, found {canary}: {clip}"
+            );
+        }
+        // Lane B (B7): the upstream line copies its host:port alone.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.copy_single_endpoint_url(crate::EndpointUrl::Upstream, window, cx)
+            });
+        });
+        let clip = read_clip(cx);
+        assert_eq!(
+            clip, "198.51.100.9:443",
+            "upstream copies host:port: {clip}"
+        );
+        // The upstream host:port is display metadata (row meta line shows it
+        // too) — only credential canaries are forbidden here.
+        for canary in ["11111111", "uuid", "password"] {
+            assert!(
+                !clip.contains(canary),
+                "upstream copy carries no secrets, found {canary}: {clip}"
             );
         }
     }
