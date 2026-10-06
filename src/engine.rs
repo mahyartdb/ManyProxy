@@ -495,7 +495,10 @@ pub enum EngineError {
     /// The engine's own `check` rejected the generated config.
     CheckFailed { detail: String },
     /// No `sing-box` binary in the app dir (never `PATH`, never downloads).
-    MissingBinary { searched: String },
+    /// Ticket A6: names the EXPECTED FILE plus the searched dir, like the
+    /// fork/xray/extra variants (never a bare dir that leaves the user
+    /// guessing which filename to place).
+    MissingBinary { binary: String, searched: String },
     /// Ticket 07: no fork-core binary for exotic rows (names the rows and
     /// the expected binary; stock rows are unaffected).
     MissingForkBinary {
@@ -629,9 +632,9 @@ impl std::fmt::Display for EngineError {
                     strip_ansi_codes(detail)
                 )
             }
-            EngineError::MissingBinary { searched } => write!(
+            EngineError::MissingBinary { binary, searched } => write!(
                 f,
-                "engine binary not found (looked for {searched}); install sing-box — ManyProxy never downloads executables silently"
+                "engine binary not found (looked for {binary} in {searched}); install sing-box — ManyProxy never downloads executables silently"
             ),
             EngineError::MissingForkBinary {
                 rows,
@@ -4668,8 +4671,10 @@ pub fn resolve_engine_binary_in(
     app_dir: Option<&Path>,
     _path_env: &str,
 ) -> Result<PathBuf, EngineError> {
-    resolve_bundled_in(app_dir, &engine_binary_file_name())
-        .map_err(|searched| EngineError::MissingBinary { searched })
+    resolve_bundled_in(app_dir, &engine_binary_file_name()).map_err(|searched| EngineError::MissingBinary {
+        binary: engine_binary_file_name(),
+        searched,
+    })
 }
 
 /// Ticket 07: binary file name for the fork core on this platform.
@@ -4709,35 +4714,84 @@ pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
 /// line). Lets a wrong/plain binary fail fast with a named error instead of
 /// serving exotic rows badly. Paths echoed are binary locations, never
 /// secrets.
+/// Ticket A6: bounded by [`FORK_PROBE_TIMEOUT`] — a hung binary is killed
+/// and reported, never waited on forever (the old `output()` had no
+/// deadline). See [`probe_fork_version_with_timeout`] for the test seam.
 pub fn probe_fork_version(binary: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(binary)
+    probe_fork_version_with_timeout(binary, FORK_PROBE_TIMEOUT)
+}
+
+/// Ticket A6: fork-probe deadline (also bounds the detached poll threads
+/// behind `poll_clash_targets`-style callers: the probe never outlives it).
+pub const FORK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ticket A6: testable core of [`probe_fork_version`] (explicit deadline).
+/// Spawn + poll (`try_wait` every 10 ms); past the deadline the child is
+/// killed, reaped, and reported as a timeout. Stdout past 64 KiB is cut
+/// (a `version` line is bytes; a pathological peer cannot grow us).
+pub fn probe_fork_version_with_timeout(
+    binary: &Path,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(binary)
         .arg("version")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|error| {
             format!(
                 "fork version probe failed for {} ({error})",
                 binary.display()
             )
         })?;
-    if !output.status.success() {
-        return Err(format!(
-            "fork version probe failed for {} (non-zero exit)",
-            binary.display()
-        ));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().map_err(|error| {
+            format!(
+                "fork version probe failed for {} ({error})",
+                binary.display()
+            )
+        })? {
+            Some(status) => {
+                if !status.success() {
+                    return Err(format!(
+                        "fork version probe failed for {} (non-zero exit)",
+                        binary.display()
+                    ));
+                }
+                let mut capped = Vec::new();
+                if let Some(stdout) = child.stdout.as_mut() {
+                    let _ = stdout.take(64 * 1024).read_to_end(&mut capped);
+                }
+                let _ = child.wait();
+                let first = String::from_utf8_lossy(&capped)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if first.is_empty() {
+                    return Err(format!(
+                        "fork version probe failed for {} (empty output)",
+                        binary.display()
+                    ));
+                }
+                return Ok(truncate_detail(&first));
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "fork version probe timed out for {}",
+                        binary.display()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
-    let first = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if first.is_empty() {
-        return Err(format!(
-            "fork version probe failed for {} (empty output)",
-            binary.display()
-        ));
-    }
-    Ok(truncate_detail(&first))
 }
 
 /// Ticket 08: binary file name for the Xray core on this platform.
@@ -5574,10 +5628,13 @@ fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String>
 }
 
 /// True when the path is a file the sidecar may execute: present plus the
-/// exec bit on Unix (Windows executability is the `.exe` association itself).
-/// Opens the file and checks the open handle's metadata (never a
-/// check-then-use stat race: the handle proves the file existed at open and
-/// the handle metadata — not a re-stat — decides file-ness).
+/// exec bit on Unix.
+/// Ticket A6 (pinned Windows behavior): Windows has no exec bit — ANY
+/// existing file counts as executable (the `.exe` association + ACLs decide
+/// launch, not us; we never consult `PATH` and never second-guess the ACL).
+/// Directories and missing paths are false on every platform (opening a
+/// directory fails or reports non-file; the handle metadata — not a re-stat
+/// — decides file-ness, so there is no check-then-use race).
 fn is_executable(path: &Path) -> bool {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -9130,6 +9187,7 @@ mod tests {
     #[test]
     fn missing_binaries_state_never_downloads() {
         let stock = EngineError::MissingBinary {
+            binary: engine_binary_file_name(),
             searched: "app-dir + PATH".to_string(),
         }
         .to_string();
@@ -9164,6 +9222,8 @@ mod tests {
 
     /// Binary resolution searches explicit directories only: no download, no
     /// elevation, and the searched list is reported (empty roots fail typed).
+    /// Ticket A6: the stock error names the EXPECTED FILE plus the dir
+    /// (like the fork/xray/extra variants), so the user knows what to place.
     #[test]
     fn binary_resolution_never_elevates_or_downloads() {
         let error = resolve_engine_binary_in(None, "").expect_err("empty search roots fail");
@@ -9171,7 +9231,53 @@ mod tests {
             matches!(error, EngineError::MissingBinary { .. }),
             "typed failure, got {error}"
         );
-        assert!(!error.to_string().is_empty());
+        let text = error.to_string();
+        assert!(
+            text.contains(&engine_binary_file_name()),
+            "names expected file, got {text}"
+        );
+        assert!(
+            text.contains("no app directory"),
+            "names searched dir, got {text}"
+        );
+    }
+
+    /// Ticket A6: `is_executable` pins — missing paths and directories are
+    /// false everywhere; a plain existing file is true on Windows (no exec
+    /// bit to consult — the `.exe` association + ACLs decide launch).
+    #[test]
+    fn a6_executable_bit_behavior_pinned() {
+        assert!(!is_executable(Path::new(
+            "C:\\definitely-not-here-manyproxy\\nope.exe"
+        )));
+        assert!(!is_executable(&std::env::temp_dir()));
+        let probe = std::env::temp_dir().join(format!(
+            "manyproxy-a6-exec-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&probe, "probe").expect("probe writes");
+        #[cfg(not(unix))]
+        assert!(is_executable(&probe), "plain file is executable on Windows");
+        #[cfg(unix)]
+        assert!(!is_executable(&probe), "no exec bit on unix probe");
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    /// Ticket A6: the fork probe fails fast (never hangs) on a missing
+    /// binary, and the timeout seam reports a hung spawn as a timeout.
+    #[test]
+    fn a6_fork_probe_never_hangs() {
+        let missing = Path::new("C:\\definitely-not-here-manyproxy\\fork.exe");
+        let error = probe_fork_version_with_timeout(missing, std::time::Duration::from_secs(5))
+            .expect_err("missing binary fails");
+        assert!(
+            error.contains("fork version probe failed"),
+            "named failure, got {error}"
+        );
+        assert!(
+            !error.contains("timed out"),
+            "missing is fast-fail, not timeout: {error}"
+        );
     }
 
     /// Empty activation set is a typed error, not an empty engine config.
@@ -10570,6 +10676,7 @@ mod tests {
         let (mut controller, stock, fork, xray, extra) = EngineController::fake_quartet();
         controller.set_stock_probe(|| {
             Err(EngineError::MissingBinary {
+                binary: engine_binary_file_name(),
                 searched: "test-seam (no stock binary)".to_string(),
             })
         });
@@ -12250,6 +12357,7 @@ Active Connections\r
                 second: "B".to_string(),
             },
             EngineError::MissingBinary {
+                binary: engine_binary_file_name(),
                 searched: "dir".to_string(),
             },
             EngineError::LanConfirmRequired {
