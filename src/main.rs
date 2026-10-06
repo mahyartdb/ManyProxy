@@ -4064,6 +4064,9 @@ struct AppView {
     /// second Start while set is ignored with an info toast (no second
     /// apply); the detail Start button reads `Starting…` while set.
     start_in_flight: bool,
+    /// Background tick loops started once (idempotent guard so a second
+    /// `start_background_ticks` call never doubles the four loops).
+    ticks_started: bool,
     /// Ticket 47: sidecar presence lines (About dialog), resolved ONCE at
     /// startup — every About open reuses the cache instead of re-probing
     /// the filesystem. (The DB/export paths shown beside them are pure
@@ -4208,6 +4211,7 @@ impl AppView {
             tray: None,
             last_snapshot,
             start_in_flight: false,
+            ticks_started: false,
             sidecar_presence,
             _libraries_subscription: cx.subscribe(
                 &libraries,
@@ -4387,10 +4391,10 @@ impl AppView {
     /// necessity, every user action notifies).
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Ticket 30: a pending sidecar crash notifies here (windowed) with
-        // shard/cause + View-logs — never status-bar-only. `reload_inner`
-        // would otherwise consume the one-shot poll for the status bar alone.
+        // shard/cause + View-logs — never status-bar-only. The inner reload
+        // skips its own poll so the one-shot poll is consumed exactly once.
         self.notify_engine_crash(window, cx);
-        if let Err(error) = self.reload_inner(cx) {
+        if let Err(error) = self.reload_inner_no_poll(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
         // Ticket 43: live-tail — the logs dialog follows new sidecar lines
@@ -4416,14 +4420,34 @@ impl AppView {
         cx.notify();
     }
 
+    /// Reload without consuming the engine poll (the caller already polled
+    /// once and reuses that result — a second one-shot poll would come back
+    /// empty and lose the crash).
+    fn reload_quiet_no_poll(&mut self, cx: &mut Context<Self>) {
+        let _ = self.reload_inner_no_poll(cx);
+        cx.notify();
+    }
+
     fn reload_inner(&mut self, cx: &mut Context<Self>) -> Result<(), StoreError> {
+        self.reload_inner_impl(cx, true)
+    }
+
+    fn reload_inner_no_poll(&mut self, cx: &mut Context<Self>) -> Result<(), StoreError> {
+        self.reload_inner_impl(cx, false)
+    }
+
+    fn reload_inner_impl(&mut self, cx: &mut Context<Self>, poll: bool) -> Result<(), StoreError> {
         // Ticket 47: one store list per reload — log ingest reuses these
         // rows (never a second list). A broken database returns early with
         // the last-good rows and old log lines kept (never a lying empty
         // set — ticket-14 precedent).
         let rows = self.store.list()?;
         self.drain_engine_logs(&rows);
-        self.poll_engine();
+        // Poll exactly once per reload path: callers that already consumed
+        // the one-shot poll pass `poll: false` and reuse their result.
+        if poll {
+            self.poll_engine();
+        }
         let health = self.health_map();
         let running = self.engine.running_ids();
         // Ticket 38: persist the running set on change (session-restore
@@ -5348,7 +5372,14 @@ impl AppView {
             self.open_lan_confirm_single(config, window, cx);
             return;
         }
-        self.commit_start_selected(&config.id, window, cx);
+        // Off-UI in production (the click returns before the bounded
+        // apply); synchronous in tests so headless assertions stay
+        // deterministic.
+        if cfg!(test) {
+            self.commit_start_selected(&config.id, window, cx);
+        } else {
+            self.spawn_commit_start_selected(config.id.clone(), window, cx);
+        }
     }
 
     /// Ticket 09: LAN confirm gate for one config. The dialog names the
@@ -5544,7 +5575,11 @@ impl AppView {
             });
             return;
         }
-        self.commit_start_all(window, cx);
+        if cfg!(test) {
+            self.commit_start_all(window, cx);
+        } else {
+            self.spawn_commit_start_all(window, cx);
+        }
     }
 
     /// Ticket 09: the actual start-all (post-gate). Rows are re-listed so a
@@ -5557,7 +5592,8 @@ impl AppView {
     /// at once; on a row-local failure the maximal healthy subset serves
     /// exactly once (no O(n²) per-row flapping) while the toast names the
     /// failed rows plus both counts. Union-level failures stay atomic.
-    /// Re-entrant calls are ignored (busy guard).
+    /// Re-entrant calls are ignored (busy guard). Idempotent: when every
+    /// row already serves, this is a no-op (no restart flap).
     fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
@@ -5573,6 +5609,14 @@ impl AppView {
         if rows.is_empty() {
             window.push_notification(Notification::warning(start_all_message(0)), cx);
             self.start_in_flight = false;
+            return;
+        }
+        if rows.iter().all(|row| self.engine.is_running(&row.id)) {
+            self.start_in_flight = false;
+            window.push_notification(
+                Notification::info(format!("All {} endpoint(s) already running", rows.len())),
+                cx,
+            );
             return;
         }
         // Ticket 37: attached preset rules merge at serve time — sync them
@@ -5822,7 +5866,9 @@ impl AppView {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
             for row in &rows {
-                let _ = self.store.set_enabled(&row.id, false);
+                if let Err(error) = self.store.set_enabled(&row.id, false) {
+                    eprintln!("close flag clear failed for {}: {error}", row.id);
+                }
             }
         }
         self.snapshot_running_set(&[]);
@@ -5902,14 +5948,20 @@ impl AppView {
         if self.tray.is_none() {
             return false;
         }
+        // Drain the menu queue first so a queued Quit wins over an earlier
+        // Start/Stop (no wasted start before the quit).
+        let mut actions = Vec::new();
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if let Some(action) = crate::tray::action_for_menu_id(event.id.as_ref()) {
-                if action == crate::tray::TrayAction::Quit {
-                    self.quit_from_tray();
-                    return true;
-                }
-                self.handle_tray_action(action, window, cx);
+                actions.push(action);
             }
+        }
+        if actions.contains(&crate::tray::TrayAction::Quit) {
+            self.quit_from_tray();
+            return true;
+        }
+        for action in actions {
+            self.handle_tray_action(action, window, cx);
         }
         while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
             if matches!(
@@ -5926,7 +5978,9 @@ impl AppView {
     }
 
     /// Ticket 38: tray menu dispatch (Quit is handled by the caller —
-    /// see [`AppView::poll_tray_once`]).
+    /// see [`AppView::poll_tray_once`]). Start/Stop first restore the
+    /// window so their confirm dialogs never open modal on a hidden
+    /// window (which looks hung); Show itself is the restore.
     fn handle_tray_action(
         &mut self,
         action: crate::tray::TrayAction,
@@ -5935,17 +5989,31 @@ impl AppView {
     ) {
         match action {
             crate::tray::TrayAction::Show => self.show_window_from_tray(window, cx),
-            crate::tray::TrayAction::StartAll => self.start_all_engines(window, cx),
-            crate::tray::TrayAction::StopAll => self.stop_all_engines(window, cx),
+            crate::tray::TrayAction::StartAll => {
+                self.show_window_from_tray(window, cx);
+                self.start_all_engines(window, cx);
+            }
+            crate::tray::TrayAction::StopAll => {
+                self.show_window_from_tray(window, cx);
+                self.stop_all_engines(window, cx);
+            }
             crate::tray::TrayAction::Quit => self.quit_from_tray(),
         }
     }
 
     /// Ticket 38: tray Quit — stops every endpoint, clears the snapshot
     /// (nothing serves after quit), drops the icon (no orphan), and asks
-    /// the caller to quit the app.
+    /// the caller to quit the app. Clears the enabled flags so a relaunch
+    /// never shows running rows that died with the quit.
     fn quit_from_tray(&mut self) {
         self.engine.stop_all();
+        if let Ok(rows) = self.store.list() {
+            for row in &rows {
+                if let Err(error) = self.store.set_enabled(&row.id, false) {
+                    eprintln!("tray quit flag clear failed for {}: {error}", row.id);
+                }
+            }
+        }
         self.snapshot_running_set(&[]);
         // Drop first so the icon (NIM_DELETE) is gone before the loop ends.
         self.tray = None;
@@ -6287,6 +6355,13 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ticket 37: attached preset rules merge at serve time — sync them
+        // first like every other start path; a corrupt store aborts the
+        // restore loudly instead of serving preset-less.
+        if let Err(reason) = self.sync_presets_to_engine() {
+            window.push_notification(Notification::error(format!("Cannot restore: {reason}")), cx);
+            return;
+        }
         let mut started = 0usize;
         let mut failed: Vec<String> = Vec::new();
         for row in rows {
@@ -6405,8 +6480,9 @@ impl AppView {
 
     /// Ticket 12: record probe outcomes into the session store and persist
     /// each row's latest sample (+ dead flag) for restart. Traffic stays
-    /// session-only; logs are never persisted. Persistence failures are
-    /// ignored (a full disk must not break the health view).
+    /// session-only; logs are never persisted. Persistence failures log
+    /// loudly (a full disk must not break the health view, but it must not
+    /// fail silently either).
     /// Ticket 47: one transaction per probe round (batched snapshots via
     /// [`Store::save_health_snapshots`]) instead of one tx per outcome.
     fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
@@ -6422,7 +6498,9 @@ impl AppView {
             });
         }
         if !snapshots.is_empty() {
-            let _ = self.store.save_health_snapshots(&snapshots);
+            if let Err(error) = self.store.save_health_snapshots(&snapshots) {
+                eprintln!("health snapshot persist failed: {error}");
+            }
         }
     }
 
@@ -7220,6 +7298,10 @@ impl AppView {
         if let Some(live_path) = self.store.db_path() {
             match Store::restore_library_file(&live_path, payload, now_unix()) {
                 Ok((outcome, backup)) => {
+                    // No live file existed → no backup was taken (never a
+                    // phantom path); name that instead of a location.
+                    let backup_text = backup.as_deref().map(|path| path.display().to_string());
+                    let backup_text = backup_text.as_deref().unwrap_or("(no prior library file)");
                     // Reopen the swapped file so the live handle tracks it.
                     match Store::open_file(&live_path) {
                         Ok(fresh) => {
@@ -7229,7 +7311,7 @@ impl AppView {
                                 Notification::success(format!(
                                     "{} (backup {})",
                                     restore_done_message(&outcome),
-                                    backup.display()
+                                    backup_text
                                 )),
                                 cx,
                             );
@@ -7238,8 +7320,7 @@ impl AppView {
                             self.reload(window, cx);
                             window.push_notification(
                                 Notification::error(format!(
-                                    "Restore swapped but reopen failed ({error}); backup at {}",
-                                    backup.display()
+                                    "Restore swapped but reopen failed ({error}); backup at {backup_text}"
                                 )),
                                 cx,
                             );
@@ -9788,6 +9869,9 @@ impl AppView {
                 .await;
             cx.update(|cx| {
                 weak.update(cx, |view, cx| {
+                    if !view.ticks_enabled {
+                        return;
+                    }
                     view.refresh_due_on_startup(cx);
                 })
                 .ok();
@@ -9884,8 +9968,10 @@ impl AppView {
         if !self.ticks_enabled {
             return None;
         }
+        // Single one-shot poll per tick: the reload below must not poll a
+        // second time (it would come back empty and lose the crash).
         let cause = self.poll_engine();
-        self.reload_quiet(cx);
+        self.reload_quiet_no_poll(cx);
         cause
     }
 
@@ -9904,7 +9990,7 @@ impl AppView {
             return None;
         }
         let detail = self.poll_engine_detail();
-        self.reload_quiet(cx);
+        self.reload_quiet_no_poll(cx);
         if let Some(detail) = detail {
             window.push_notification(Notification::error(crash_notification_text(&detail)), cx);
             return Some(detail);
@@ -10185,7 +10271,13 @@ impl AppView {
     /// runs one bounded pass, and exits when ticks are stopped or the view
     /// is released. Never called by tests (headless tests call the tick
     /// methods directly with mock seams, never touching the network).
+    /// Idempotent: a second call is a no-op (otherwise it would double to
+    /// eight loops).
     fn start_background_ticks(&mut self, cx: &mut Context<Self>) {
+        if self.ticks_started {
+            return;
+        }
+        self.ticks_started = true;
         spawn_tick(cx, ENGINE_POLL_TICK_SECS, |view, cx| {
             view.tick_engine_poll(cx);
         });
@@ -11618,7 +11710,11 @@ impl AppView {
             return;
         }
         let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-        self.commit_bulk_start_ids(&ids, window, cx);
+        if cfg!(test) {
+            self.commit_bulk_start_ids(&ids, window, cx);
+        } else {
+            self.spawn_commit_bulk_start_ids(ids, window, cx);
+        }
     }
 
     /// Ticket 44: bulk start for an explicit id set (post-gate).
@@ -11679,6 +11775,69 @@ impl AppView {
                 cx,
             );
         }
+    }
+
+    /// Off-UI start wrappers: the click returns immediately so the
+    /// `Starting…` state paints first; the synchronous `commit_*` seam
+    /// (still the headless/test entry) runs on the next pump via the
+    /// window handle. The engine stays on the main thread (it is not
+    /// `Send`); the async defer keeps the UI from freezing on the click
+    /// itself while the heavy apply still runs as one bounded unit.
+    /// Tests call the `commit_*` seams directly and stay synchronous
+    /// (`cfg!(test)` at the call sites), so headless assertions never
+    /// need to pump async completions.
+    #[allow(dead_code)]
+    fn spawn_commit_start_selected(&mut self, id: String, window: &Window, cx: &mut Context<Self>) {
+        let handle = window.window_handle();
+        let view = cx.entity().clone();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_start_selected(&id, window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    #[allow(dead_code)]
+    fn spawn_commit_start_all(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let handle = window.window_handle();
+        let view = cx.entity().clone();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| view.commit_start_all(window, cx));
+            });
+        })
+        .detach();
+    }
+
+    #[allow(dead_code)]
+    fn spawn_commit_bulk_start_ids(
+        &mut self,
+        ids: Vec<String>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = window.window_handle();
+        let view = cx.entity().clone();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_bulk_start_ids(&ids, window, cx);
+                });
+            });
+        })
+        .detach();
     }
 
     /// Ticket 44: bulk stop over the checked set. One reload, one toast.
@@ -12643,6 +12802,9 @@ impl Render for AppView {
 }
 
 fn main() {
+    // Ticket 38: drop a dead autostart entry (target exe gone) at startup so
+    // a moved/uninstalled copy never lingers in HKCU Run. Best-effort.
+    let _ = crate::tray::clear_dead_autostart_target();
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
         // Ticket 26: app keyboard shortcuts (Add/Import/Start/Stop/Test).
@@ -12661,35 +12823,46 @@ fn main() {
                 view.update(cx, |view, cx| {
                     view.create_tray(window, cx);
                     view.restore_on_launch(window, cx);
+                    // Ticket 38: login launches (autostart `--tray`) start
+                    // hidden in the tray instead of popping a window.
+                    if crate::tray::launched_minimized() {
+                        view.hide_to_tray(window, cx);
+                    }
                 });
                 // Ticket 38: tray event pump (menu actions + left-click
                 // toggle) on the main thread. Ends when the window is gone;
                 // a Quit action stops the engines, drops the icon, and quits
                 // the app from here (the view owns engine + icon only).
-                let poll_view = view.clone();
-                let poll_handle = window.window_handle();
-                cx.spawn(async move |cx| {
-                    loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(TRAY_PUMP_MILLIS))
-                            .await;
-                        // `Err` when the window or app is gone: the pump
-                        // ends with it. `Ok(true)` is a tray Quit.
-                        let tick = cx.update_window(poll_handle, |_, window, cx| {
-                            poll_view.update(cx, |view, cx| view.poll_tray_once(window, cx))
-                        });
-                        match tick {
-                            // Quit requested: stop the pump, then quit.
-                            Ok(true) => {
-                                cx.update(|cx| cx.quit());
-                                break;
+                // Skipped entirely when the tray is absent (no 500ms pump
+                // forever with `tray == None`); the loop also exits if the
+                // icon ever goes away without a Quit.
+                let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
+                if has_tray {
+                    let poll_view = view.clone();
+                    let poll_handle = window.window_handle();
+                    cx.spawn(async move |cx| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(TRAY_PUMP_MILLIS))
+                                .await;
+                            // `Err` when the window or app is gone: the pump
+                            // ends with it. `Ok(true)` is a tray Quit.
+                            let tick = cx.update_window(poll_handle, |_, window, cx| {
+                                poll_view.update(cx, |view, cx| view.poll_tray_once(window, cx))
+                            });
+                            match tick {
+                                // Quit requested: stop the pump, then quit.
+                                Ok(true) => {
+                                    cx.update(|cx| cx.quit());
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(_) => break,
                             }
-                            Ok(false) => {}
-                            Err(_) => break,
                         }
-                    }
-                })
-                .detach();
+                    })
+                    .detach();
+                }
                 // Ticket 33: never silently kill running endpoints on window
                 // close. Ticket 38: with a tray icon the close hides to the
                 // tray instead (endpoints keep serving); without one the hook

@@ -27,9 +27,11 @@ fn main() {
         .filter(|hash| !hash.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=MANYPROXY_GIT_HASH={hash}");
-    embed_resource::compile("manyproxy.rc", embed_resource::NONE)
-        .manifest_optional()
-        .unwrap();
+    if let Err(error) =
+        embed_resource::compile("manyproxy.rc", embed_resource::NONE).manifest_optional()
+    {
+        panic!("ticket 21: cannot embed manyproxy.rc ({error})");
+    }
 }
 
 /// Ticket 38: decode the tray icon from `assets/icon.ico` (no new art) into
@@ -125,8 +127,13 @@ fn pick_ico_entry(data: &[u8]) -> Option<IcoEntry> {
             continue;
         }
         // PNG-compressed entries start with the PNG magic; BMP/DIB entries
-        // need a rasterizer this build script deliberately avoids.
-        if data[offset..].starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        // need a rasterizer this build script deliberately avoids. The magic
+        // check stays inside the entry bounds (never past `len` into a
+        // neighboring entry).
+        if len >= 8
+            && data[offset..offset + len]
+                .starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        {
             entries.push(IcoEntry {
                 width,
                 height,
