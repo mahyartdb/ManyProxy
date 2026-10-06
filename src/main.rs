@@ -173,6 +173,40 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Test selected", "Ctrl-T"),
 ];
 
+/// Lane B (B7): confirm copy for the Settings traffic wipe — names the
+/// library scope so the click can never be a blind clear.
+fn settings_clear_traffic_text(total: usize) -> String {
+    format!("Clear traffic counters for all {total} configuration(s)? This cannot be undone.")
+}
+
+/// Lane B (B7): confirm copy for the Settings health-snapshot wipe.
+fn settings_clear_health_text() -> String {
+    "Clear every persisted health snapshot? Rows read untested until the next probe. \
+     This cannot be undone."
+        .to_string()
+}
+
+/// Lane B (B7): confirm copy for the Settings running-snapshot reset.
+fn settings_clear_snapshot_text() -> String {
+    "Forget the running snapshot? The next launch starts with nothing running. The live \
+     engine is untouched. This cannot be undone."
+        .to_string()
+}
+
+/// Lane B (B7): confirm copy for a group delete — names the group and its
+/// row count. Empty-only deletes still refuse loudly at commit; the copy
+/// says so up front instead of surprising.
+fn group_delete_confirm_text(name: &str, count: usize) -> String {
+    if count == 0 {
+        format!("Delete empty group \"{name}\"? No rows move (none use it). This cannot be undone.")
+    } else {
+        format!(
+            "Delete group \"{name}\" ({count} row(s))? Groups with rows refuse — move the rows \
+             out first. This cannot be undone."
+        )
+    }
+}
+
 /// Ticket 33: close-confirm text for a window close with running endpoints.
 /// `None` when nothing runs (close proceeds silently — nothing to kill).
 /// `Some` names every running row so the confirm can never be a blind kill.
@@ -5138,6 +5172,64 @@ impl AppView {
         }
     }
 
+    /// Lane B (B7): Settings traffic wipe behind an explicit naming
+    /// confirm (same gate as [`AppView::open_usage_reset_confirm`]) — one
+    /// click never zeroes silently.
+    fn open_clear_traffic_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let description =
+            settings_clear_traffic_text(self.libraries.read(cx).delegate().counts().0);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Clear traffic counters")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_clear_traffic(window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Lane B (B7): Settings health-snapshot wipe behind an explicit
+    /// confirm — one click never drops probe evidence silently.
+    fn open_clear_health_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let description = settings_clear_health_text();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Clear health snapshots")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_clear_health(window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Lane B (B7): Settings running-snapshot reset behind an explicit
+    /// confirm — one click never forgets the restore set silently.
+    fn open_clear_snapshot_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let description = settings_clear_snapshot_text();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Reset running snapshot")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_clear_snapshot(window, cx));
+                    true
+                })
+        });
+    }
     /// Ticket 43: Settings commit — clear every row's traffic totals. The
     /// toast names the cleared row count; the session mirrors rehydrate on
     /// the next tick.
@@ -6318,7 +6410,7 @@ impl AppView {
                                 .label("Clear traffic counters")
                                 .on_click(move |_, window, cx| {
                                     clear_traffic_view.update(cx, |view, cx| {
-                                        view.commit_clear_traffic(window, cx);
+                                        view.open_clear_traffic_confirm(window, cx);
                                     });
                                 }),
                         )
@@ -6327,7 +6419,7 @@ impl AppView {
                                 .label("Clear health snapshots")
                                 .on_click(move |_, window, cx| {
                                     clear_health_view.update(cx, |view, cx| {
-                                        view.commit_clear_health(window, cx);
+                                        view.open_clear_health_confirm(window, cx);
                                     });
                                 }),
                         )
@@ -6336,7 +6428,7 @@ impl AppView {
                                 .label("Reset running snapshot")
                                 .on_click(move |_, window, cx| {
                                     clear_snapshot_view.update(cx, |view, cx| {
-                                        view.commit_clear_snapshot(window, cx);
+                                        view.open_clear_snapshot_confirm(window, cx);
                                     });
                                 }),
                         )
@@ -12107,7 +12199,7 @@ impl AppView {
                             .on_click(move |_, window, cx| {
                                 let group = delete_group.clone();
                                 delete_view.update(cx, |view, cx| {
-                                    view.commit_delete_group(&group, window, cx);
+                                    view.open_group_delete_confirm(&group, window, cx);
                                 });
                             }),
                     );
@@ -12227,7 +12319,8 @@ impl AppView {
 
     /// Ticket 44: delete-group commit. Non-empty groups refuse loudly (names
     /// the count so the manager can offer move-first); empty groups close
-    /// clean.
+    /// clean. Dialog-free: the confirm caller owns the refresh, so this
+    /// never nukes unrelated dialogs.
     fn commit_delete_group(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_group(name) {
             Ok(()) => {
@@ -12248,8 +12341,6 @@ impl AppView {
                     Notification::success(format!("Deleted empty group \"{name}\"")),
                     cx,
                 );
-                window.close_all_dialogs(cx);
-                self.open_groups_dialog(window, cx);
             }
             Err(error) => {
                 window.push_notification(
@@ -12258,6 +12349,51 @@ impl AppView {
                 );
             }
         }
+    }
+
+    /// Lane B (B7): group delete behind a count-naming confirm. The refresh
+    /// pops only the confirm + the stale manager (scoped `close_dialog`
+    /// pair, never a full `close_all_dialogs`) and reopens the manager, so
+    /// dialogs stacked beneath survive. Returns false so the alert framework
+    /// pops nothing further.
+    fn open_group_delete_confirm(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let group = name.to_string();
+        let count = self
+            .store
+            .group_counts()
+            .unwrap_or_default()
+            .iter()
+            .find(|(label, _)| label == name)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        let description = group_delete_confirm_text(name, count);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let group = group.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .title("Delete group")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.commit_delete_group(&group, window, cx);
+                        // Scoped refresh: pop the confirm, pop the stale
+                        // manager, reopen it fresh. Anything stacked beneath
+                        // the manager is untouched.
+                        window.close_dialog(cx);
+                        window.close_dialog(cx);
+                        view.open_groups_dialog(window, cx);
+                    });
+                    false
+                })
+        });
     }
 
     /// Startup-stack split (same cause as [AppView::render_toolbar]): the shell
@@ -16690,6 +16826,55 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
+    /// Lane B (B7): the Settings destructive buttons gate behind naming
+    /// confirms — the click opens a confirm dialog (no silent one-click
+    /// wipe) and the copy names the scope.
+    #[gpui_kit::test]
+    fn laneb_settings_clears_confirm(cx: &mut TestAppContext) {
+        use crate::{
+            settings_clear_health_text, settings_clear_snapshot_text, settings_clear_traffic_text,
+        };
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        assert!(
+            settings_clear_traffic_text(3).contains("all 3 configuration(s)"),
+            "traffic confirm names scope"
+        );
+        assert!(
+            settings_clear_health_text().contains("untested until the next probe"),
+            "health confirm names consequence"
+        );
+        assert!(
+            settings_clear_snapshot_text().contains("live engine is untouched"),
+            "snapshot confirm names consequence"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_clear_traffic_confirm(window, cx));
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "traffic wipe confirms"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_clear_health_confirm(window, cx));
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "health wipe confirms"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_clear_snapshot_confirm(window, cx));
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "snapshot reset confirms"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
     /// Scenario: honest empty start-all and stop-on-stopped toasts headless.
     #[gpui_kit::test]
     fn empty_start_and_stopped_stop_warn_honestly(cx: &mut TestAppContext) {
@@ -17801,6 +17986,42 @@ mod tests {
             slashed.title
         );
         assert!(!slashed.id.contains('/'), "no raw slash in element ids");
+    }
+
+    /// Lane B (B7): group delete gates behind a count-naming confirm — the
+    /// copy names the group + row count for both arms, and opening the gate
+    /// raises a dialog (the commit itself stays dialog-free).
+    #[gpui_kit::test]
+    fn laneb_group_delete_confirms_naming_count(cx: &mut TestAppContext) {
+        assert!(
+            crate::group_delete_confirm_text("crew", 0).contains("\"crew\""),
+            "empty arm names the group"
+        );
+        assert!(
+            crate::group_delete_confirm_text("site/east", 2).contains("2 row(s)"),
+            "non-empty arm names the count"
+        );
+        assert!(
+            crate::group_delete_confirm_text("site/east", 2).contains("refuse"),
+            "non-empty arm warns up front"
+        );
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(facet_seed("One", "vless", "site/east", "10843"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_group_delete_confirm("site/east", window, cx)
+            });
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "group delete confirms"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Ticket 44 (06 parity): group-label slug keeps plain names stable
