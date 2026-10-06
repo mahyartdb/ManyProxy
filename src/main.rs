@@ -193,6 +193,16 @@ fn settings_clear_snapshot_text() -> String {
         .to_string()
 }
 
+/// Lane B (B8): overwrite-gate copy for the logs Save — names the exact
+/// destination (the `MANYPROXY_LOGS` override when set, else the
+/// `manyproxy-logs.txt` library sibling) so the second click is informed.
+fn logs_overwrite_text(path: &std::path::Path) -> String {
+    format!(
+        "Overwrite {} with the visible log lines? Secrets stay redacted.",
+        path.display()
+    )
+}
+
 /// Lane B (B7): confirm copy for a group delete — names the group and its
 /// row count. Empty-only deletes still refuse loudly at commit; the copy
 /// says so up front instead of surprising.
@@ -6894,12 +6904,17 @@ impl AppView {
     /// toggle picks the newest 200 (tail on) or the oldest 200 (tail off,
     /// paused at the head). This is the single source behind the dialog,
     /// Save-visible, and Copy-all — all three always agree.
+    /// Lane B (B8): every line passes through [`redact_secrets`] (ANSI
+    /// stripped first, so escape codes can never split a secret the
+    /// scrubber must see) — the dialog, Copy, and Save can never leak a
+    /// credential through this path.
     fn visible_log_lines(&self, cx: &App) -> Vec<String> {
         let selected = self.selected_config(cx).map(|config| config.id);
         let filter = self.log_filter.trim().to_lowercase();
         let level = self.log_level;
-        let render =
-            |level: &str, message: &str| format!("[{}] {}", level, strip_ansi_codes(message));
+        let render = |level: &str, message: &str| {
+            format!("[{}] {}", level, redact_secrets(&strip_ansi_codes(message)))
+        };
         let records: Vec<&crate::health::LogRecord> = match selected.as_deref() {
             Some(id) => self.logs.for_config(id),
             None => self.logs.all().iter().collect(),
@@ -6935,7 +6950,32 @@ impl AppView {
     /// Ticket 45: Save-visible commit — writes to
     /// [`Store::default_logs_path`] (the export-path pattern) and toasts the
     /// path; failures toast instead of silently dropping evidence.
+    /// Lane B (B8): an existing file gates behind an overwrite confirm
+    /// naming the exact destination — Save never clobbers silently.
     fn save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = Store::default_logs_path();
+        if path.exists() {
+            let view = cx.entity();
+            let description = logs_overwrite_text(&path);
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let view = view.clone();
+                let description = description.clone();
+                alert
+                    .confirm()
+                    .title("Overwrite saved logs?")
+                    .description(description)
+                    .on_ok(move |_, window, cx| {
+                        view.update(cx, |view, cx| view.commit_save_visible_logs(window, cx));
+                        true
+                    })
+            });
+            return;
+        }
+        self.commit_save_visible_logs(window, cx);
+    }
+
+    /// Lane B (B8): the Save-visible write behind the overwrite gate.
+    fn commit_save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = Store::default_logs_path();
         match self.write_visible_logs_to(&path, cx) {
             Ok(()) => window.push_notification(
@@ -7161,17 +7201,32 @@ impl AppView {
                             });
                         },
                     ));
-            let mut body = div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(level_row)
-                .child(action_row)
-                .child(dialog_field(
-                    "field-log-filter",
-                    "Filter",
-                    filter_state.clone(),
-                ));
+            let save_path_text = format!("Save writes to {}", Store::default_logs_path().display());
+            let mut body =
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(level_row)
+                    .child(action_row)
+                    // Lane B (B8): redaction + destination disclosure — Copy and
+                    // Save carry scrubbed lines to the named path (the
+                    // `MANYPROXY_LOGS` override when set), never raw secrets.
+                    .child(div().id("log-redact-note").test_support().text_sm().child(
+                        "Copy and Save carry redacted lines — secrets never leave this dialog.",
+                    ))
+                    .child(
+                        div()
+                            .id("log-save-path")
+                            .test_support()
+                            .text_sm()
+                            .child(save_path_text),
+                    )
+                    .child(dialog_field(
+                        "field-log-filter",
+                        "Filter",
+                        filter_state.clone(),
+                    ));
             let mut list = div()
                 .id("log-lines")
                 .test_support()
@@ -16596,6 +16651,63 @@ mod tests {
                 .to_string()
         });
         assert!(clip.contains("panic"), "clipboard carries visible lines");
+    }
+
+    /// Lane B (B8): visible log lines redact secrets (dialog, Copy, and
+    /// Save share the path), the dialog discloses the redaction + the exact
+    /// Save destination, and Save gates on overwrite instead of clobbering.
+    #[gpui_kit::test]
+    fn laneb_logs_redact_and_save_gate(cx: &mut TestAppContext) {
+        use crate::logs_overwrite_text;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(ticket43_seed("Alpha", "10861"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.logs.push_raw(
+                    "warn dial failed password=hunter2",
+                    &crate::health::LogTagIndex::default(),
+                );
+            });
+        });
+        let lines = view.read_with(cx, |view, cx| view.visible_log_lines(cx));
+        assert!(
+            lines.iter().all(|line| !line.contains("hunter2")),
+            "rendered lines redact: {lines:?}"
+        );
+        let path = std::env::temp_dir().join("manyproxy-laneb-logs.txt");
+        assert!(
+            logs_overwrite_text(&path).contains("Secrets stay redacted"),
+            "overwrite gate promises redaction"
+        );
+        assert!(
+            logs_overwrite_text(&path).contains(&path.display().to_string()),
+            "overwrite gate names the destination"
+        );
+        // The gate itself: no pre-existing file writes straight through.
+        let _ = std::fs::remove_file(&path);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.write_visible_logs_to(&path, cx).expect("save works")
+            });
+        });
+        let body = std::fs::read_to_string(&path).expect("logs file written");
+        assert!(
+            !body.contains("hunter2"),
+            "saved file carries no secrets: {body}"
+        );
+        let _ = std::fs::remove_file(&path);
+        // Dialog discloses the redaction note + the save destination.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "log-redact-note");
+        assert_painted(cx, "log-save-path");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Ticket 03 (throne-density): the consolidated command strip keeps
