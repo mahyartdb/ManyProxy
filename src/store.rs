@@ -349,6 +349,12 @@ pub enum StoreError {
         path: PathBuf,
         message: String,
     },
+    /// Ticket A2: DPAPI seal/open failure (never a `Sql` mislabel). The
+    /// write aborts before commit, so nothing is stored — never silent
+    /// plaintext, never a partial row.
+    Crypto {
+        message: String,
+    },
     Sql(rusqlite::Error),
 }
 
@@ -365,6 +371,9 @@ impl std::fmt::Display for StoreError {
             StoreError::NotFound(id) => write!(f, "config not found: {id}"),
             StoreError::Io { path, message } => {
                 write!(f, "cannot write {}: {}", path.display(), message)
+            }
+            StoreError::Crypto { message } => {
+                write!(f, "cannot protect secrets ({message}; nothing was written)")
             }
             StoreError::Sql(error) => write!(f, "database error: {error}"),
         }
@@ -767,9 +776,7 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
         Err(_) => {
             errors.push(FieldError::new(
                 "bind_ip",
-                format!(
-                    "bind address must be an IP literal or localhost, got '{trimmed}'"
-                ),
+                format!("bind address must be an IP literal or localhost, got '{trimmed}'"),
             ));
             None
         }
@@ -2105,22 +2112,20 @@ impl Store {
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
 
     /// Ticket 35: seal params for storage. A DPAPI failure aborts the
-    /// write loudly (never silent plaintext).
+    /// write loudly (never silent plaintext). Ticket A2: typed as
+    /// `Crypto`, never `Sql` (a crypto outage is not a database error).
     fn seal_or_fail(plaintext: &str) -> Result<String, StoreError> {
-        crate::dpapi::seal_params(plaintext).map_err(|message| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )))
+        crate::dpapi::seal_params(plaintext).map_err(|message| StoreError::Crypto {
+            message: format!("dpapi seal failed: {message}"),
         })
     }
 
     /// Ticket 35: open stored params. Sealed values decrypt; legacy JSON
-    /// passes through; anything else fails loudly.
+    /// passes through; anything else fails loudly. Ticket A2: typed as
+    /// `Crypto`, never `Sql`.
     fn unseal_or_fail(stored: &str) -> Result<String, StoreError> {
-        crate::dpapi::unseal_params(stored).map_err(|message| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )))
+        crate::dpapi::unseal_params(stored).map_err(|message| StoreError::Crypto {
+            message: format!("dpapi open failed: {message}"),
         })
     }
 
@@ -6032,7 +6037,10 @@ mod tests {
             .map(|e| format!("{}: {}", e.field, e.message))
             .collect::<Vec<_>>()
             .join("; ");
-        assert!(message.contains("localhost"), "reconciled message: {message}");
+        assert!(
+            message.contains("localhost"),
+            "reconciled message: {message}"
+        );
     }
 
     // -- Ticket 04: subscriptions + refresh (merge seam; injected bodies) --
@@ -8890,9 +8898,23 @@ mod tests {
             add_result.expect_err("DPAPI-down add aborts"),
             refresh_result.expect_err("DPAPI-down refresh aborts"),
         ] {
+            // Ticket A2: crypto failures are `Crypto`, never `Sql`, with an
+            // honest message (no "database error" mislabel).
+            assert!(
+                matches!(error, StoreError::Crypto { .. }),
+                "distinct crypto variant, got {error:?}"
+            );
             assert!(
                 error.to_string().contains("dpapi"),
                 "loud dpapi cause, got {error}"
+            );
+            assert!(
+                error.to_string().contains("nothing was written"),
+                "honest no-write message, got {error}"
+            );
+            assert!(
+                !matches!(error, StoreError::Sql(_)),
+                "never mislabeled as Sql: {error:?}"
             );
         }
         assert_eq!(
