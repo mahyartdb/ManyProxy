@@ -2596,6 +2596,29 @@ fn search_count_text(visible: usize, total: usize) -> String {
     format!("{visible} of {total}")
 }
 
+/// Lane B (B9): serving-ports segment copy — bare `:port` tokens capped at
+/// three with an honest `+N` remainder (`None` while nothing serves, so the
+/// segment stays absent instead of naming a lying zero). No `serving`
+/// prefix: the segment rides beside `engine-status`, which already names
+/// the running state — the prefix would only push the 880px strip over.
+fn serving_ports_text(ports: &[u16]) -> Option<String> {
+    if ports.is_empty() {
+        return None;
+    }
+    let mut sorted = ports.to_vec();
+    sorted.sort_unstable();
+    let shown: Vec<String> = sorted
+        .iter()
+        .take(3)
+        .map(|port| format!(":{port}"))
+        .collect();
+    if sorted.len() > 3 {
+        Some(format!("{} +{}", shown.join(" "), sorted.len() - 3))
+    } else {
+        Some(shown.join(" "))
+    }
+}
+
 /// Ticket 30: no-hits copy for a query that matches nothing (total > 0).
 fn no_matches_text() -> String {
     "No matches — Clear search".to_string()
@@ -11561,9 +11584,25 @@ impl AppView {
     }
 
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
-        let (total, enabled) = self.libraries.read(cx).delegate().counts();
+        let libraries = self.libraries.read(cx);
+        let delegate = libraries.delegate();
+        let (total, enabled) = delegate.counts();
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
+        // Lane B (B9): live segments — the active filter echo (left) and
+        // the serving bind ports (center). Each paints only while its state
+        // is set, so the strip never carries a stale or lying segment. Tail
+        // stays dialog-local (its Pause/Resume toggle + toast name the
+        // state): a permanent strip flag does not fit the 880px minimum
+        // beside the other live segments.
+        let filter_text = delegate.active_filter_text();
+        let ports: Vec<u16> = delegate
+            .rows
+            .iter()
+            .filter(|row| self.engine.is_running(&row.id))
+            .map(|row| row.port)
+            .collect();
+        let ports_text = serving_ports_text(&ports);
         // throne-density 04: three regions inside the single `left()` slot
         // (kit `StatusBar` pins only `left`/`right` — with just `left`, its
         // center end-aligns, so the spread lives here). `flex_1` spacers
@@ -11573,7 +11612,7 @@ impl AppView {
         // as one strip.
         // Ticket 45: summed usage totals ride the right region (absent on
         // a broken read — never a lying zero).
-        let left = div()
+        let mut left = div()
             .id("status-left")
             .test_support()
             .flex()
@@ -11586,7 +11625,23 @@ impl AppView {
                     .test_support()
                     .child(format!("{total} configurations · {enabled} enabled")),
             );
-        let center = div()
+        // Lane B (B9): the active filter echo rides the left region (long
+        // queries truncate with the full text on hover — same pattern as
+        // the endpoint rows).
+        if !filter_text.is_empty() {
+            let tip = filter_text.clone();
+            left = left.child(Separator::vertical()).child(
+                div()
+                    .id("status-filter")
+                    .test_support()
+                    .min_w_0()
+                    .max_w(px(280.))
+                    .truncate()
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(filter_text),
+            );
+        }
+        let mut center = div()
             .id("status-center")
             .test_support()
             .flex()
@@ -11596,6 +11651,13 @@ impl AppView {
             .child(div().id("engine-status").test_support().child(engine_text))
             .child(Separator::vertical())
             .child(div().id("health-status").test_support().child(health_text));
+        // Lane B (B9): serving bind ports ride the center region beside the
+        // engine + health they evidence (absent while nothing serves).
+        if let Some(ports) = ports_text {
+            center = center
+                .child(Separator::vertical())
+                .child(div().id("status-ports").test_support().child(ports));
+        }
         let mut right = div()
             .id("status-right")
             .test_support()
@@ -24190,6 +24252,75 @@ mod tests {
             );
             assert_within_frame_min(cx, id);
         }
+    }
+
+    /// Lane B (B9): status strip carries live segments — the active filter
+    /// echo and the serving bind ports — each present only while its state
+    /// is set, all inside the 880px minimum frame (usage totals seeded too,
+    /// so the realistic full strip is the measured case).
+    #[gpui_kit::test]
+    fn laneb_status_live_segments(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::serving_ports_text;
+        use gpui_kit::component::IndexPath;
+        use gpui_kit::Keystroke;
+        assert_eq!(serving_ports_text(&[]), None);
+        assert_eq!(
+            serving_ports_text(&[10802, 10801]),
+            Some(":10801 :10802".to_string())
+        );
+        assert_eq!(
+            serving_ports_text(&[1, 2, 3, 4]),
+            Some(":1 :2 :3 +1".to_string())
+        );
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(t26_engine_seed("Work", "10911"))
+            .expect("seed works");
+        store
+            .add_traffic_batch(&[(seeded.id.clone(), 2_048, 1_024)])
+            .expect("traffic accrues");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    // Matching facet: the row stays visible while the filter
+                    // echo still has something to name.
+                    state
+                        .delegate_mut()
+                        .set_facet_protocol(Some("vless".to_string()));
+                    list_cx.notify();
+                });
+            });
+        });
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let keystroke = Keystroke::parse("f5").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        for id in ["status-filter", "status-ports"] {
+            assert_painted(cx, id);
+            assert_within_frame_min(cx, id);
+        }
+        let filter = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().active_filter_text()
+        });
+        assert!(
+            filter.contains("protocol: vless"),
+            "filter segment names the facet: {filter}"
+        );
     }
 
     /// Ticket 11 (b): status strip at minimum width — library totals stay
