@@ -3059,6 +3059,55 @@ mod tests {
         );
     }
 
+    /// Ticket A7: one redaction contract across both owners — the same
+    /// uuid/password/token corpus is clean through `redact_secrets`
+    /// (log/sidecar paths) AND `import::redact_link` (label paths), and the
+    /// pinned order is redact-FIRST, truncate-LAST (a long secret link is
+    /// still clean after the 96-char display cut — truncation never slices
+    /// a secret into an unredacted tail).
+    #[test]
+    fn a7_redaction_contract_holds_in_both_owners() {
+        const UUID: &str = "11111111-2222-4333-8444-555555555555";
+        const PASSWORD: &str = "hunter2-hunter2-hunter2-99";
+        const TOKEN: &str = "tok-ABCDEF1234567890abcdef";
+        let corpus = [
+            format!("vless://{UUID}@host.example.com:443?security=tls#x"),
+            format!("trojan://{PASSWORD}@host.example.com:443#x"),
+            format!("https://host.example.com/sub?token={TOKEN}&other=1"),
+            format!("ss://{PASSWORD}@host.example.com:8388#x"),
+        ];
+        for raw in &corpus {
+            let via_health = redact_secrets(raw);
+            for secret in [UUID, PASSWORD, TOKEN] {
+                assert!(
+                    !via_health.contains(secret),
+                    "health leaked {secret} in {via_health} (from {raw})"
+                );
+            }
+            let via_import = crate::import::redact_link(raw);
+            for secret in [UUID, PASSWORD, TOKEN] {
+                assert!(
+                    !via_import.contains(secret),
+                    "import leaked {secret} in {via_import} (from {raw})"
+                );
+            }
+            assert!(
+                via_import.contains("host.example.com"),
+                "host kept for diagnostics: {via_import}"
+            );
+        }
+        // Order pin: a 200-char secret query redacts fully even though the
+        // display truncates at 96 chars (redact-first means the cut only
+        // ever slices mask characters, never plaintext).
+        let long_secret = format!("https://host.example.com/sub?token={}", "s".repeat(200));
+        let redacted = crate::import::redact_link(&long_secret);
+        assert!(redacted.chars().count() <= 97, "truncated: {redacted}");
+        assert!(
+            !redacted.contains(&"s".repeat(5)),
+            "no secret run past the cut: {redacted}"
+        );
+    }
+
     /// Only 2xx is a working egress: 302/500 from the local stub fail the
     /// URL test instead of counting as success.
     #[test]

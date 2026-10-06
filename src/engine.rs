@@ -626,10 +626,13 @@ impl std::fmt::Display for EngineError {
                 // Ticket 29: `check` stderr arrives with ANSI color escapes
                 // (the raw `[31mFATAL[0m` toast); the surfaced error keeps the
                 // text and drops the codes.
+                // Ticket A7: stderr is UNTRUSTED (echoes config fragments) —
+                // redact secrets after stripping (strip first: ANSI codes
+                // never carry secrets and only obscure the patterns).
                 write!(
                     f,
                     "engine config check failed ({})",
-                    strip_ansi_codes(detail)
+                    crate::health::redact_secrets(&strip_ansi_codes(detail))
                 )
             }
             EngineError::MissingBinary { binary, searched } => write!(
@@ -11502,6 +11505,29 @@ mod tests {
             "no escape codes: {text:?}"
         );
         assert!(!text.contains("[31m"), "no SGR residue: {text}");
+    }
+
+    /// Ticket A7: `check` stderr is untrusted — secrets echoing in it are
+    /// redacted in the surfaced error (strip-then-redact order; the UUID
+    /// never reaches the toast even wrapped in ANSI color).
+    #[test]
+    fn a7_check_failed_redacts_stderr_secrets() {
+        let error = EngineError::CheckFailed {
+            detail: t29_ansi(
+                "[ESC][31mFATAL[ESC][0m password=hunter2 uuid 11111111-2222-4333-8444-555555555555",
+            ),
+        };
+        let text = error.to_string();
+        assert!(text.contains("FATAL"), "text kept: {text}");
+        assert!(!text.contains("hunter2"), "password redacted: {text}");
+        assert!(
+            !text.contains("11111111-2222"),
+            "uuid redacted: {text}"
+        );
+        assert!(
+            !text.contains(char::from(27u8)),
+            "no escape codes: {text:?}"
+        );
     }
 
     /// Scenario 3 end to end: an ANSI-colored `check` failure from any
