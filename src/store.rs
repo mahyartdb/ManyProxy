@@ -8348,7 +8348,10 @@ mod tests {
         );
         assert!(
             matches!(
-                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[public, private]),
+                subscription_fetch_policy_resolved(
+                    "https://example.com/sub.txt",
+                    &[public, private]
+                ),
                 Block { .. }
             ),
             "one internal answer poisons the set"

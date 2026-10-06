@@ -4674,9 +4674,11 @@ pub fn resolve_engine_binary_in(
     app_dir: Option<&Path>,
     _path_env: &str,
 ) -> Result<PathBuf, EngineError> {
-    resolve_bundled_in(app_dir, &engine_binary_file_name()).map_err(|searched| EngineError::MissingBinary {
-        binary: engine_binary_file_name(),
-        searched,
+    resolve_bundled_in(app_dir, &engine_binary_file_name()).map_err(|searched| {
+        EngineError::MissingBinary {
+            binary: engine_binary_file_name(),
+            searched,
+        }
     })
 }
 
@@ -9254,10 +9256,8 @@ mod tests {
             "C:\\definitely-not-here-manyproxy\\nope.exe"
         )));
         assert!(!is_executable(&std::env::temp_dir()));
-        let probe = std::env::temp_dir().join(format!(
-            "manyproxy-a6-exec-{}.tmp",
-            std::process::id()
-        ));
+        let probe =
+            std::env::temp_dir().join(format!("manyproxy-a6-exec-{}.tmp", std::process::id()));
         std::fs::write(&probe, "probe").expect("probe writes");
         #[cfg(not(unix))]
         assert!(is_executable(&probe), "plain file is executable on Windows");
@@ -11520,10 +11520,7 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("FATAL"), "text kept: {text}");
         assert!(!text.contains("hunter2"), "password redacted: {text}");
-        assert!(
-            !text.contains("11111111-2222"),
-            "uuid redacted: {text}"
-        );
+        assert!(!text.contains("11111111-2222"), "uuid redacted: {text}");
         assert!(
             !text.contains(char::from(27u8)),
             "no escape codes: {text:?}"
