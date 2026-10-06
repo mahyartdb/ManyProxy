@@ -66,6 +66,14 @@ pub const AUTO_PORT_CAPACITY: usize = (AUTO_PORT_END - AUTO_PORT_START + 1) as u
 /// Ticket 27: auto-port candidates in assignment order (primary, then
 /// spillover). Every auto assignment in this file funnels through here so
 /// the two ranges never drift apart.
+/// Ticket A4: the pool is GLOBAL across binds (one port number serves one
+/// local endpoint; two binds never share an auto port). Auto-assign
+/// deliberately ignores `bind_ip` so `127.0.0.1:10801` and
+/// `0.0.0.0:10801` can never collide at activation. At rest two rows MAY
+/// share a bind:port (saves are never blocked — see the schema note); the
+/// conflict error naming both parties stays an activation-time concern.
+/// Restore is stricter (a duplicated bind:port in a backup fails loudly as
+/// corruption — see `restore_library_json`).
 pub fn auto_port_candidates() -> impl Iterator<Item = u16> {
     (AUTO_PORT_START..=AUTO_PORT_END).chain(AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END)
 }
@@ -4662,8 +4670,8 @@ impl Store {
                 .ok_or_else(|| invalid(format!("{what} needs a protocol")))?;
             let protocol = canonical_protocol(&protocol_raw)
                 .ok_or_else(|| invalid(format!("{what} has an unknown protocol")))?;
-            let params_raw = get_str(entry, "params")
-                .ok_or_else(|| invalid(format!("{what} needs params")))?;
+            let params_raw =
+                get_str(entry, "params").ok_or_else(|| invalid(format!("{what} needs params")))?;
             match serde_json::from_str::<serde_json::Value>(&params_raw) {
                 Ok(serde_json::Value::Object(_)) => {}
                 _ => return Err(invalid(format!("{what} has corrupt params"))),
@@ -4714,7 +4722,8 @@ impl Store {
         // (two rows can never claim one endpoint; activation would refuse
         // it later — fail at restore instead).
         {
-            let mut seen: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<(String, i64)> =
+                std::collections::HashSet::new();
             for (index, row) in rows.iter().enumerate() {
                 let key = (row.bind_ip.trim().to_ascii_lowercase(), row.port);
                 if !seen.insert(key.clone()) {
@@ -7633,13 +7642,19 @@ mod tests {
         unknown_protocol["protocol"] = serde_json::Value::String("nope".to_string());
         cases.push(("unknown protocol", unknown_protocol));
         let mut missing_params = valid_entry();
-        missing_params.as_object_mut().expect("object").remove("params");
+        missing_params
+            .as_object_mut()
+            .expect("object")
+            .remove("params");
         cases.push(("missing params", missing_params));
         let mut corrupt_params = valid_entry();
         corrupt_params["params"] = serde_json::Value::String("{garbage".to_string());
         cases.push(("corrupt params", corrupt_params));
         let mut missing_bind = valid_entry();
-        missing_bind.as_object_mut().expect("object").remove("bind_ip");
+        missing_bind
+            .as_object_mut()
+            .expect("object")
+            .remove("bind_ip");
         cases.push(("missing bind_ip", missing_bind));
         let mut bad_bind = valid_entry();
         bad_bind["bind_ip"] = serde_json::Value::String("not a bind!!".to_string());
