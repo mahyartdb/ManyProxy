@@ -85,7 +85,13 @@ actions!(
         StartSelected,
         StopSelected,
         TestSelected,
-        ClearChecked
+        ClearChecked,
+        EditSelected,
+        DeleteSelected,
+        FocusSearch,
+        InspectorDetails,
+        InspectorHealth,
+        InspectorPresets
     ]
 );
 
@@ -97,6 +103,11 @@ pub const APP_KEY_CONTEXT: &str = "manyproxy-library";
 /// Modifier-only chords (never printable characters) so list search typing
 /// is unaffected; dialogs are guarded at the handler, not the binding.
 /// Ticket 44: Escape clears the multi-select set (same guard).
+/// Lane B (B9): Delete edits nothing — it opens the naming confirm;
+/// Ctrl-F lands in search; Ctrl-E edits; Ctrl-1/2/3 switch inspector panes.
+/// Delete/Ctrl-E/Ctrl-F are inert while typing in a field (the focused
+/// input consumes the keystroke before the shell sees it) and while any
+/// dialog is open.
 pub fn bind_app_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-n", AddConfig, Some(APP_KEY_CONTEXT)),
@@ -105,6 +116,12 @@ pub fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("shift-f5", StopSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-t", TestSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("escape", ClearChecked, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-e", EditSelected, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("delete", DeleteSelected, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-f", FocusSearch, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-1", InspectorDetails, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-2", InspectorHealth, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-3", InspectorPresets, Some(APP_KEY_CONTEXT)),
     ]);
 }
 
@@ -165,12 +182,21 @@ pub const GIT_HASH: &str = match option_env!("MANYPROXY_GIT_HASH") {
 /// Ticket 33: the five app shortcuts in one place — the About dialog and the
 /// toolbar hint labels both read this, so the visible hints can never drift
 /// from the [`bind_app_keys`] bindings.
+/// Lane B (B9): plus row-edit, row-delete, search-focus, inspector tabs,
+/// and the Escape checked-clear — every binding documented, no hidden keys.
 pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Add configuration", "Ctrl-N"),
     ("Import configurations", "Ctrl-O"),
     ("Start selected", "F5"),
     ("Stop selected", "Shift-F5"),
     ("Test selected", "Ctrl-T"),
+    ("Edit selected", "Ctrl-E"),
+    ("Delete selected", "Delete"),
+    ("Focus search", "Ctrl-F"),
+    ("Inspector details", "Ctrl-1"),
+    ("Inspector health", "Ctrl-2"),
+    ("Inspector presets", "Ctrl-3"),
+    ("Clear checked", "Esc"),
 ];
 
 /// Lane B (B7): confirm copy for the Settings traffic wipe — names the
@@ -12715,6 +12741,57 @@ impl AppView {
             .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
                 view.clear_checked_unless_dialog(window, cx);
             }))
+            // Lane B (B9): row edit/delete + search focus + inspector tabs.
+            // Each handler no-ops while any dialog is open (same guard as
+            // the Ticket 26 actions); Delete opens the naming confirm and
+            // Edit opens the edit dialog, so neither ever acts silently.
+            .on_action(cx.listener(|view, _: &EditSelected, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                if let Some(config) = view.selected_config(cx) {
+                    view.open_edit_dialog(config, window, cx);
+                } else {
+                    window.push_notification(Notification::info(no_selection_message()), cx);
+                }
+            }))
+            .on_action(cx.listener(|view, _: &DeleteSelected, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                if let Some(config) = view.selected_config(cx) {
+                    view.open_remove_confirm(config, window, cx);
+                } else {
+                    window.push_notification(Notification::info(no_selection_message()), cx);
+                }
+            }))
+            .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.focus_library_search(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &InspectorDetails, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.inspector_tab = InspectorTab::Details;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|view, _: &InspectorHealth, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.inspector_tab = InspectorTab::Health;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|view, _: &InspectorPresets, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.inspector_tab = InspectorTab::Presets;
+                cx.notify();
+            }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
                     view.import_dropped_files(paths, window, cx);
@@ -13472,6 +13549,11 @@ mod tests {
             "Ctrl-T",
             "Ctrl-N",
             "Ctrl-O",
+            "Ctrl-E",
+            "Delete",
+            "Ctrl-F",
+            "Ctrl-1",
+            "Esc",
             "Opt-in only",
             "default off",
         ] {
@@ -21591,6 +21673,114 @@ mod tests {
         );
     }
 
+    /// Lane B (B9): Delete opens the naming confirm for the selected row
+    /// (honest toast with no selection), Ctrl-E opens Edit, Ctrl-F focuses
+    /// search without side effects, Ctrl-1/2/3 switch inspector panes, and
+    /// every one of them no-ops while a dialog is open.
+    #[gpui_kit::test]
+    fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let press = |cx: &mut VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+            cx.run_until_parked();
+        };
+        // Ctrl-2 lands on the Health pane.
+        press(cx, "ctrl-2");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Health,
+            "Ctrl-2 switches pane"
+        );
+        press(cx, "ctrl-3");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Presets,
+            "Ctrl-3 switches pane"
+        );
+        press(cx, "ctrl-1");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Details,
+            "Ctrl-1 switches pane"
+        );
+        // Ctrl-F focuses search with no dialog and no toast.
+        let before = notification_count(cx);
+        press(cx, "ctrl-f");
+        assert_eq!(notification_count(cx), before, "search focus is silent");
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "search focus opens nothing"
+        );
+        // Ctrl-E opens the edit dialog for the selected row.
+        press(cx, "ctrl-e");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Ctrl-E edits the selected row"
+        );
+        assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delete opens the naming confirm for the selected row (refocus
+        // the shell first — closing the edit dialog parks focus elsewhere,
+        // same as real usage returning to the list).
+        cx.update(|window, cx| window.focus(&focus, cx));
+        press(cx, "delete");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Delete confirms the selected row"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Guarded while open: Delete with the edit dialog up changes nothing.
+        press(cx, "ctrl-e");
+        let guarded = notification_count(cx);
+        cx.update(|window, cx| window.focus(&focus, cx));
+        press(cx, "delete");
+        assert_eq!(notification_count(cx), guarded, "guarded Delete is silent");
+        assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // No selection explains itself instead of confirming nothing.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = None;
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let before = notification_count(cx);
+        press(cx, "delete");
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "Delete with no selection toasts"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "no selection confirms nothing"
+        );
+    }
+
     /// Scenario: Logs OK applies the filter and closes exactly once (L5:
     /// never an explicit close plus a framework close).
     #[gpui_kit::test]
@@ -24163,6 +24353,13 @@ mod tests {
             ("Start selected", "F5"),
             ("Stop selected", "Shift-F5"),
             ("Test selected", "Ctrl-T"),
+            ("Edit selected", "Ctrl-E"),
+            ("Delete selected", "Delete"),
+            ("Focus search", "Ctrl-F"),
+            ("Inspector details", "Ctrl-1"),
+            ("Inspector health", "Ctrl-2"),
+            ("Inspector presets", "Ctrl-3"),
+            ("Clear checked", "Esc"),
         ];
         assert_eq!(crate::SHORTCUT_LINES.len(), expected.len());
         for (line, want) in crate::SHORTCUT_LINES.iter().zip(expected) {
