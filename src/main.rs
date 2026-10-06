@@ -642,6 +642,28 @@ impl LibraryDelegate {
         self.facet_group.is_some() || self.facet_protocol.is_some() || self.facet_status.is_some()
     }
 
+    /// Lane B (B9): names the active filters for the no-hits empty state
+    /// (only the set parts — `group: X · protocol: y · status: Z ·
+    /// search: "q"`), so a filtered-to-zero list explains itself instead of
+    /// masquerading as an empty library.
+    fn active_filter_text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(group) = &self.facet_group {
+            parts.push(format!("group: {group}"));
+        }
+        if let Some(protocol) = &self.facet_protocol {
+            parts.push(format!("protocol: {protocol}"));
+        }
+        if let Some(status) = &self.facet_status {
+            parts.push(format!("status: {}", status.label()));
+        }
+        let query = self.query.trim();
+        if !query.is_empty() {
+            parts.push(format!("search: \"{query}\""));
+        }
+        parts.join(" · ")
+    }
+
     /// Ticket 44: honest bulk-bar label. The bulk set is the primitive
     /// (actions run over the full set, never just the visible slice).
     /// Ticket 01: the bar always reads `N checked (of M visible)` — both
@@ -1252,33 +1274,63 @@ impl ListDelegate for LibraryDelegate {
         // slots); ids and pinned strings are unchanged.
         // T07: the no-hits hint is a working Button (same delegate seam the
         // checkbox uses) — it clears the query in place.
+        // Lane B (B9): facet-only filters land here too (any filter hiding
+        // every row reads as no-hits, never as an empty library). The
+        // description names the active filters; Clear all resets query +
+        // facets while Clear search keeps its BUG-1 seam untouched.
         let list_view = cx.entity();
-        if !self.query.trim().is_empty() && !self.rows.is_empty() {
+        if !self.rows.is_empty() && self.visible.is_empty() {
             let (visible, total) = (self.visible.len(), self.rows.len());
+            let mut description = search_count_text(visible, total);
+            let filters = self.active_filter_text();
+            if !filters.is_empty() {
+                description.push_str(&format!(" · {filters}"));
+            }
+            let hint_view = list_view.clone();
+            let all_view = list_view.clone();
             return div().id("library-empty").test_support().size_full().child(
                 Empty::new()
                     .header(
                         EmptyHeader::new()
                             .title(EmptyTitle::new().child(no_matches_text()))
-                            .description(
-                                EmptyDescription::new().child(search_count_text(visible, total)),
-                            ),
+                            .description(EmptyDescription::new().child(description)),
                     )
-                    .content(EmptyContent::new().child({
-                        let hint_view = list_view.clone();
-                        Button::new("clear-search-hint")
-                            .label("Clear search")
-                            .on_click(move |_, window, cx| {
-                                hint_view.update(cx, |state, list_cx| {
-                                    // BUG-1: push the cleared query back into
-                                    // the kit List widget (`query_input` +
-                                    // `last_query`) via `set_query` — mutating
-                                    // `delegate.query` alone leaves stale text
-                                    // that blocks row selection.
-                                    state.set_query("", window, list_cx);
-                                });
-                            })
-                    })),
+                    .content(
+                        EmptyContent::new().child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("clear-search-hint")
+                                        .label("Clear search")
+                                        .on_click(move |_, window, cx| {
+                                            hint_view.update(cx, |state, list_cx| {
+                                                // BUG-1: push the cleared query back into
+                                                // the kit List widget (`query_input` +
+                                                // `last_query`) via `set_query` — mutating
+                                                // `delegate.query` alone leaves stale text
+                                                // that blocks row selection.
+                                                state.set_query("", window, list_cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("clear-search-facets")
+                                        .label("Clear all")
+                                        .tooltip("Clear search and every filter")
+                                        .on_click(move |_, window, cx| {
+                                            all_view.update(cx, |state, list_cx| {
+                                                state.set_query("", window, list_cx);
+                                                state.delegate_mut().clear_facets();
+                                                list_cx.notify();
+                                            });
+                                        }),
+                                ),
+                        ),
+                    ),
             );
         }
         div().id("library-empty").test_support().size_full().child(
@@ -11616,7 +11668,10 @@ impl AppView {
     /// over unknown rows (counts read from the delegate's last-good rows —
     /// zero only when the list really is empty).
     fn render_empty_ctas(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (total, _, query) = self
+        // Lane B (B9): truly-empty means no ROWS (not no visible) — a
+        // filtered-to-zero list keeps the Clear-search/Clear-all path
+        // instead of borrowing the Add/Import CTAs.
+        let (_, total, query) = self
             .libraries
             .read(cx)
             .delegate()
@@ -22296,6 +22351,57 @@ mod tests {
             cx.update(|window, _| window.try_find("search-count".to_string()).is_some()),
             "N of M row renders"
         );
+    }
+
+    /// Lane B (B9): facet-only filters that hide every row read as no-hits
+    /// (never as an empty library) with the active filters named, and the
+    /// combined Clear all restores query + facets together.
+    #[gpui_kit::test]
+    fn laneb_facet_empty_and_clear_all(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(facet_seed("One", "vless", "home", "10843"))
+            .expect("seed works");
+        store
+            .add(facet_seed("Two", "vless", "home", "10844"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state
+                        .delegate_mut()
+                        .set_facet_group(Some("nope".to_string()));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "library-empty");
+        assert_painted(cx, "clear-search-hint");
+        assert_painted(cx, "clear-search-facets");
+        assert!(
+            cx.update(|window, _| window.try_find("empty-library-ctas".to_string()).is_none()),
+            "filtered-to-zero never offers Add/Import"
+        );
+        let named = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().active_filter_text()
+        });
+        assert!(
+            named.contains("group: nope"),
+            "empty state names the facet: {named}"
+        );
+        cx.update(|window, cx| {
+            window.click("clear-search-facets", cx);
+        });
+        cx.run_until_parked();
+        let visible = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().visible.len()
+        });
+        assert_eq!(visible, 2, "Clear all restores every row");
     }
 
     /// Scenario: empty library paints Add/Import CTAs (never a bare blank).
