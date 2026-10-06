@@ -6056,6 +6056,39 @@ mod tests {
 
     /// Stored configs may share a port; the conflict error naming both
     /// parties is raised at activation time (ticket 03), not at rest.
+    /// Ticket A4: the auto pool is global across binds — even a LAN bind
+    /// consumes the shared pool, so it can never collide with a loopback
+    /// auto port at activation. Exhaustion is honest only past BOTH ranges
+    /// (see `AUTO_PORT_CAPACITY`); the error text is stable for the UI.
+    #[test]
+    fn a4_auto_pool_is_global_across_binds() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let loopback = store
+            .add(NewConfig {
+                bind_ip: "127.0.0.1".to_string(),
+                port: String::new(),
+                ..valid_input("Loop")
+            })
+            .expect("loopback auto assigns");
+        let lan = store
+            .add(NewConfig {
+                bind_ip: "0.0.0.0".to_string(),
+                port: String::new(),
+                ..valid_input("Lan")
+            })
+            .expect("LAN auto assigns");
+        assert_ne!(
+            loopback.port, lan.port,
+            "global pool: no per-bind reuse ({} vs {})",
+            loopback.port, lan.port
+        );
+        assert_eq!(
+            AUTO_PORT_CAPACITY as usize,
+            (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
+                + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize,
+            "exhaustion only past both ranges"
+        );
+    }
     #[test]
     fn duplicate_ports_allowed_at_rest() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");

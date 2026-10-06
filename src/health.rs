@@ -3614,13 +3614,13 @@ mod tests {
             port: 1,
             secret: SECRET.to_string(),
         }];
-        for (target, result) in
+        for (_, result) in
             poll_clash_targets(&refused, Duration::from_secs(2), Duration::from_secs(5))
         {
             let error = result.expect_err("refused port fails");
             assert!(!error.contains(SECRET), "secret in error: {error}");
             assert!(!error.contains("hunter2"), "secret part in error: {error}");
-            assert!(error.contains(&target.core), "core named: {error}");
+            assert!(error.contains("127.0.0.1"), "endpoint named: {error}");
         }
         // Wrong secret against a live stub: 401 names the endpoint only.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
