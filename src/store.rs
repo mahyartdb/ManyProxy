@@ -6083,7 +6083,7 @@ mod tests {
             loopback.port, lan.port
         );
         assert_eq!(
-            AUTO_PORT_CAPACITY as usize,
+            AUTO_PORT_CAPACITY,
             (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
                 + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize,
             "exhaustion only past both ranges"
