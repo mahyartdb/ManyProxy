@@ -235,12 +235,15 @@ pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
 /// entry [`Store::refresh_with_bytes`] enforces size + UTF-8 again at
 /// ingest, so the 8 MiB / 20 s limits live in code on both sides — never
 /// comment-only.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const SUBSCRIPTION_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Ticket A5: per-fetch network timeout, seconds (enforced by the fetch
 /// path; recorded here so the two sides cannot drift).
+#[cfg_attr(not(test), allow(dead_code))]
 pub const SUBSCRIPTION_TIMEOUT_SECS: u64 = 20;
 /// Ticket A5: redirect hops followed per fetch, each hop re-running
 /// [`subscription_fetch_policy`] (enforced by the fetch path).
+#[cfg_attr(not(test), allow(dead_code))]
 pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
 
 /// Ticket A5: DNS-rebind guard — the fetch-time half of
@@ -251,6 +254,7 @@ pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
 /// name can never smuggle the fetch onto a local service. An empty
 /// resolution fails closed (Block, never fetch blind). Reasons never echo
 /// the URL.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn subscription_fetch_policy_resolved(
     url: &str,
     resolved: &[std::net::IpAddr],
@@ -3739,6 +3743,7 @@ impl Store {
     /// and UTF-8 before parsing, so oversize/non-text bodies keep the
     /// last-good members and record `last_error` instead of growing us
     /// without bound. Reasons never echo body bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn refresh_with_bytes(
         &mut self,
         sub_id: &str,
