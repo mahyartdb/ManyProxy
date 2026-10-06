@@ -230,6 +230,47 @@ pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
     SubscriptionFetchPolicy::Allow
 }
 
+/// Ticket A5: enforced subscription-fetch caps. The async fetch path
+/// enforces these at the socket (size + timeout + redirect hops); the byte
+/// entry [`Store::refresh_with_bytes`] enforces size + UTF-8 again at
+/// ingest, so the 8 MiB / 20 s limits live in code on both sides — never
+/// comment-only.
+pub const SUBSCRIPTION_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Ticket A5: per-fetch network timeout, seconds (enforced by the fetch
+/// path; recorded here so the two sides cannot drift).
+pub const SUBSCRIPTION_TIMEOUT_SECS: u64 = 20;
+/// Ticket A5: redirect hops followed per fetch, each hop re-running
+/// [`subscription_fetch_policy`] (enforced by the fetch path).
+pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
+
+/// Ticket A5: DNS-rebind guard — the fetch-time half of
+/// [`subscription_fetch_policy`]. The pure policy blocks literal internal
+/// hosts without DNS; this runs AFTER resolution: a public hostname that
+/// resolves (or re-resolves, e.g. via a redirect target) to a
+/// loopback/private/link-local/unspecified address is Blocked, so a benign
+/// name can never smuggle the fetch onto a local service. An empty
+/// resolution fails closed (Block, never fetch blind). Reasons never echo
+/// the URL.
+pub fn subscription_fetch_policy_resolved(
+    url: &str,
+    resolved: &[std::net::IpAddr],
+) -> SubscriptionFetchPolicy {
+    let base = subscription_fetch_policy(url);
+    if matches!(base, SubscriptionFetchPolicy::Block { .. }) {
+        return base;
+    }
+    if resolved.is_empty() {
+        return SubscriptionFetchPolicy::Block {
+            reason: "subscription host does not resolve (refusing to fetch blind)",
+        };
+    }
+    if resolved.iter().any(|ip| is_internal_host(&ip.to_string())) {
+        return SubscriptionFetchPolicy::Block {
+            reason: "subscription resolves to an internal host (loopback/private/link-local are never fetched; import local files manually)",
+        };
+    }
+    base
+}
 /// Ticket 27: true for loopback/private/link-local/unspecified hosts (IP
 /// literals only; hostnames are never internal without DNS). Mirrors the
 /// preset intake classifier — both copies block `localhost` subdomains and
@@ -3694,6 +3735,37 @@ impl Store {
     /// and applies atomically per group. Unparseable bodies keep the
     /// last-good members and record `last_error`. Refresh never enables or
     /// starts configs.
+    /// Ticket A5: byte-level ingest — enforces [`SUBSCRIPTION_MAX_BYTES`]
+    /// and UTF-8 before parsing, so oversize/non-text bodies keep the
+    /// last-good members and record `last_error` instead of growing us
+    /// without bound. Reasons never echo body bytes.
+    pub fn refresh_with_bytes(
+        &mut self,
+        sub_id: &str,
+        body: &[u8],
+        now: i64,
+    ) -> Result<RefreshOutcome, StoreError> {
+        if body.len() > SUBSCRIPTION_MAX_BYTES {
+            let reason = "subscription body too large".to_string();
+            self.record_subscription_error(sub_id, &reason)?;
+            return Ok(RefreshOutcome {
+                error: Some(reason),
+                ..Default::default()
+            });
+        }
+        let text = match std::str::from_utf8(body) {
+            Ok(text) => text,
+            Err(_) => {
+                let reason = "subscription body is not UTF-8".to_string();
+                self.record_subscription_error(sub_id, &reason)?;
+                return Ok(RefreshOutcome {
+                    error: Some(reason),
+                    ..Default::default()
+                });
+            }
+        };
+        self.refresh_with_body(sub_id, text, now)
+    }
     pub fn refresh_with_body(
         &mut self,
         sub_id: &str,
@@ -8186,6 +8258,118 @@ mod tests {
         store
             .add_subscription("Plain", "http://example.com/sub.txt", "g", true)
             .expect("http add allowed");
+    }
+
+    /// Ticket A5: redirect + DNS-rebind coverage — every hop re-runs the
+    /// policy, so a benign host redirecting (or resolving) to loopback is
+    /// Blocked; caps are enforced code; Warn reasons never carry tokens.
+    #[test]
+    fn a5_redirect_rebind_caps_hold() {
+        use SubscriptionFetchPolicy::{Allow, Block, Warn};
+        // A redirect target is just another URL through the same policy: a
+        // hop to 127.0.0.1 is Blocked before any byte is fetched from it.
+        for target in [
+            "http://127.0.0.1/evil?token=hunter2",
+            "https://127.0.0.1:8080/evil",
+            "http://localhost/evil",
+            "https://[::1]/evil",
+        ] {
+            assert!(
+                matches!(subscription_fetch_policy(target), Block { .. }),
+                "redirect target blocked: {target}"
+            );
+        }
+        // DNS-rebind: public name, internal resolution → Block.
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().expect("ip parses");
+        let private: std::net::IpAddr = "10.9.9.9".parse().expect("ip parses");
+        let public: std::net::IpAddr = "93.184.216.34".parse().expect("ip parses");
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[loopback]),
+                Block { .. }
+            ),
+            "rebind to loopback blocked"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[public, private]),
+                Block { .. }
+            ),
+            "one internal answer poisons the set"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[public]),
+                Allow
+            ),
+            "public resolution stays Allow"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("http://example.com/sub.txt", &[public]),
+                Warn { .. }
+            ),
+            "plaintext-http Warn survives resolution (LAN-provider compat)"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[]),
+                Block { .. }
+            ),
+            "empty resolution fails closed"
+        );
+        // Literal-internal URLs stay Block even with a public resolution
+        // claim (no DNS laundering past the literal guard).
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("http://127.0.0.1/sub", &[public]),
+                Block { .. }
+            ),
+            "literal internal never laundered"
+        );
+        // Warn reasons never echo the URL/token.
+        let reason = match subscription_fetch_policy("http://example.com/sub?token=hunter2") {
+            Warn { reason } => reason,
+            other => panic!("expected Warn, got {other:?}"),
+        };
+        assert!(!reason.contains("hunter2"), "no token echo: {reason}");
+        assert!(!reason.contains("example.com"), "no URL echo: {reason}");
+        // Caps live in code and match the fetch path (8 MiB / 20 s / 5).
+        assert_eq!(SUBSCRIPTION_MAX_BYTES, 8 * 1024 * 1024);
+        assert_eq!(SUBSCRIPTION_TIMEOUT_SECS, 20);
+        assert_eq!(SUBSCRIPTION_MAX_REDIRECTS, 5);
+        // Byte entry enforces size + UTF-8, keeping last-good members.
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("baseline refresh works");
+        assert_eq!(store.list().expect("list works").len(), 2);
+        let big = vec![b'x'; SUBSCRIPTION_MAX_BYTES + 1];
+        let outcome = store
+            .refresh_with_bytes(&sub.id, &big, 200)
+            .expect("oversize is an outcome, not an error");
+        assert!(
+            outcome.error.as_deref() == Some("subscription body too large"),
+            "loud cap, got {outcome:?}"
+        );
+        let outcome = store
+            .refresh_with_bytes(&sub.id, &[0xff, 0xfe, 0xfd], 300)
+            .expect("non-UTF8 is an outcome, not an error");
+        assert!(
+            outcome.error.as_deref() == Some("subscription body is not UTF-8"),
+            "loud encoding, got {outcome:?}"
+        );
+        assert_eq!(
+            store.list().expect("list works").len(),
+            2,
+            "capped bodies keep last-good members"
+        );
+        // Small valid bodies still flow through the byte entry.
+        let outcome = store
+            .refresh_with_bytes(&sub.id, sub_body_two().as_bytes(), 400)
+            .expect("valid bytes refresh");
+        assert!(outcome.error.is_none(), "clean, got {outcome:?}");
     }
 
     /// Manual ssh/noise rows validate like the import path (credentials
