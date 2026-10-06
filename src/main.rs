@@ -11408,7 +11408,10 @@ impl AppView {
         // confirm instead of carrying danger styling).
         Button::new("row-menu")
             .small()
-            .label("Row")
+            // Lane B (B9): the trigger names what it holds — the bare `Row`
+            // label hid Edit/Delete behind a mystery menu (id, tooltip, and
+            // items unchanged).
+            .label("Row actions…")
             .tooltip("Edit, delete, duplicate, or reset this row")
             .dropdown_menu(move |menu, _, _| {
                 menu.item(
@@ -24252,6 +24255,37 @@ mod tests {
             );
             assert_within_frame_min(cx, id);
         }
+    }
+
+    /// Lane B (B9): the row-menu trigger names its actions (`Row actions…`
+    /// — same id, tooltip, and items; the bare `Row` hid Edit/Delete).
+    #[gpui_kit::test]
+    fn laneb_row_menu_names_its_actions(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let label = cx.update(|window, _| {
+            window
+                .try_find("row-menu".to_string())
+                .unwrap_or_else(|| panic!("row-menu renders"))
+                .label()
+                .map(str::to_string)
+        });
+        assert_eq!(label.as_deref(), Some("Row actions…"));
     }
 
     /// Lane B (B9): status strip carries live segments — the active filter
