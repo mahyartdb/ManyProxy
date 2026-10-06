@@ -9443,6 +9443,16 @@ impl AppView {
             .map(|preset| preset.name)
     }
 
+    /// Lane B (B9): attached preset name plus its rule count for the
+    /// inspector Presets pane (`(name, rules)` — `None` when unattached,
+    /// missing, or unparsable, so the pane degrades to the plain line).
+    fn preset_summary_for(&self, preset_id: Option<&str>) -> Option<(String, usize)> {
+        let id = preset_id?;
+        let preset = self.store.get_preset(id).ok().flatten()?;
+        let count = preset.rules().ok().map(|rules| rules.len())?;
+        Some((preset.name, count))
+    }
+
     /// Ticket 37: explicit refresh of one URL preset (fetch + replace rules).
     /// Re-reads the record so a stale snapshot cannot fetch a removed
     /// preset. Only URL presets with a source URL refresh; anything else
@@ -10890,26 +10900,54 @@ impl AppView {
             .flex_col()
             .gap_1()
             .child(self.render_detail_header(cx, config))
-            // Ticket 37: attached routing preset (name only — rules live in
-            // the presets manager) plus the picker entry point.
+            // Ticket 37: attached routing preset plus the picker entry
+            // point. Lane B (B9): the line carries the rule count and an
+            // attached row detaches inline (no dialog round-trip); rules
+            // themselves still live in the presets manager.
             .child(div().id("config-preset").test_support().child(
-                match self.preset_name_for(config.preset_id.as_deref()) {
-                    Some(name) => format!("routing preset: {name}"),
-                    None => "no routing preset".to_string(),
+                match self.preset_summary_for(config.preset_id.as_deref()) {
+                    Some((name, count)) => format!("routing preset: {name} ({count} rule(s))"),
+                    None => match self.preset_name_for(config.preset_id.as_deref()) {
+                        Some(name) => format!("routing preset: {name}"),
+                        None => "no routing preset".to_string(),
+                    },
                 },
             ))
             .child(
-                Button::new("preset-open")
-                    // Ticket 44: small + tooltip (detail-bar density for the
-                    // 1000x700 paint frame; tooltips name every action).
-                    .small()
-                    .label("Preset")
-                    .tooltip("Attach a routing preset")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        if let Some(config) = view.selected_config(cx) {
-                            view.open_preset_attach_dialog(config, window, cx);
-                        }
-                    })),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("preset-open")
+                            // Ticket 44: small + tooltip (detail-bar density for the
+                            // 1000x700 paint frame; tooltips name every action).
+                            .small()
+                            .label("Preset")
+                            .tooltip("Attach a routing preset")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.open_preset_attach_dialog(config, window, cx);
+                                }
+                            })),
+                    )
+                    .child(if config.preset_id.is_some() {
+                        let detach_id = config.id.clone();
+                        Button::new("preset-detach-inline")
+                            .small()
+                            .label("Detach")
+                            .tooltip("Detach the routing preset from this row")
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.commit_preset_attach(&detach_id, None, window, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id("preset-detach-idle")
+                            .test_support()
+                            .into_any_element()
+                    }),
             )
     }
 
@@ -22877,6 +22915,66 @@ mod tests {
                 .expect("row kept")
         });
         assert_eq!(detached.preset_id, None);
+    }
+
+    /// Lane B (B9): the Presets pane names the attached preset + its rule
+    /// count and detaches inline (no attach-dialog round-trip for removal).
+    #[gpui_kit::test]
+    fn laneb_preset_pane_detaches_inline_with_rule_count(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(seed_input("Work")).expect("seed works");
+        let preset = store
+            .create_preset(
+                "ads",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "block"})],
+            )
+            .expect("preset seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_attach(&row.id, Some(preset.id.clone()), window, cx);
+            });
+        });
+        let summary = view.read_with(cx, |view, _| {
+            view.preset_summary_for(Some(preset.id.as_str()))
+        });
+        assert_eq!(
+            summary,
+            Some(("ads".to_string(), 1)),
+            "pane names name + rule count"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+                view.inspector_tab = crate::InspectorTab::Presets;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "config-preset");
+        assert_painted(cx, "preset-detach-inline");
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("preset-detach-inline", cx);
+        });
+        cx.run_until_parked();
+        let detached = view.read_with(cx, |view, _| {
+            view.store
+                .get(&row.id)
+                .expect("get works")
+                .expect("row kept")
+        });
+        assert_eq!(detached.preset_id, None, "inline detach clears");
+        assert_eq!(notification_count(cx), before + 1, "detach toasts");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Ticket 37: the presets manager opens with footer buttons and lists
