@@ -751,18 +751,25 @@ fn normalized_group(raw: &str) -> String {
 }
 
 /// Blank means loopback default; otherwise the text must parse as an IP
-/// literal (spec: loopback default; LAN binds gated at activation time).
+/// literal or `localhost` (spec: loopback default; LAN binds gated at
+/// activation time). Matches the engine save/start gate message
+/// (`BadBind`: "want an IP address or localhost").
 fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Some(DEFAULT_BIND.to_string());
+    }
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Some(trimmed.to_string());
     }
     match trimmed.parse::<IpAddr>() {
         Ok(_) => Some(trimmed.to_string()),
         Err(_) => {
             errors.push(FieldError::new(
                 "bind_ip",
-                format!("bind address must be an IP literal, got '{trimmed}'"),
+                format!(
+                    "bind address must be an IP literal or localhost, got '{trimmed}'"
+                ),
             ));
             None
         }
@@ -6006,10 +6013,26 @@ mod tests {
     }
 
     /// IpAddr import is used (keeps the dependency honest if refactored).
+    /// Ticket A1: `localhost` validates as a loopback bind (save gate agrees
+    /// with the engine start gate); garbage still fails naming localhost.
     #[test]
     fn localhost_parses_as_loopback() {
         let ip: IpAddr = DEFAULT_BIND.parse().expect("default bind parses");
         assert!(ip.is_loopback());
+        let mut errors = Vec::new();
+        assert_eq!(
+            validated_bind("localhost", &mut errors).as_deref(),
+            Some("localhost")
+        );
+        assert!(errors.is_empty());
+        let mut errors = Vec::new();
+        assert!(validated_bind("not a bind!!", &mut errors).is_none());
+        let message = errors
+            .iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(message.contains("localhost"), "reconciled message: {message}");
     }
 
     // -- Ticket 04: subscriptions + refresh (merge seam; injected bodies) --

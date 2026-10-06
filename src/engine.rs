@@ -8115,10 +8115,20 @@ impl EngineController {
 }
 
 /// True for loopback literals (spec: default bind; anything else is an
-/// explicit LAN exposure). Unparseable input warns rather than serves
-/// silently.
+/// explicit LAN exposure). `localhost` (any case) counts as loopback so the
+/// save gate, the start gate, and the LAN-confirm gate agree (ticket A1:
+/// `normalize_bind_key` already folds it to `loopback`; this was the odd one
+/// out). Unparseable input warns rather than serves silently.
 pub fn is_loopback_bind(bind: &str) -> bool {
-    bind.trim()
+    let trimmed = bind.trim();
+    if trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed
+            .strip_suffix('.')
+            .is_some_and(|bare| bare.eq_ignore_ascii_case("localhost"))
+    {
+        return true;
+    }
+    trimmed
         .parse::<std::net::IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
@@ -8977,11 +8987,18 @@ mod tests {
     }
 
     /// Custom binds are allowed but flagged; loopback stays quiet.
+    /// Ticket A1: `localhost` (any case) is loopback everywhere — no LAN
+    /// confirm, no warning, consistent with `normalize_bind_key`.
     #[test]
     fn lan_warning_only_for_non_loopback() {
         assert!(is_loopback_bind("127.0.0.1"));
         assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind("LocalHost"));
         assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!requires_lan_confirm("localhost"));
+        assert!(!requires_lan_confirm("127.0.0.1"));
+        assert!(requires_lan_confirm("0.0.0.0"));
         assert!(lan_exposure_warning("A", "127.0.0.1").is_none());
         let warning = lan_exposure_warning("B", "0.0.0.0").expect("LAN warns");
         assert!(warning.contains("\"B\""), "names config: {warning}");
