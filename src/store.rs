@@ -4651,17 +4651,52 @@ impl Store {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0)
                 .max(0);
+            // Ticket A3: strict restore — missing/wrong-typed core fields fail
+            // loudly (same `invalid()` shape as id/port above), never silent
+            // defaults that would resurrect a corrupt export as good rows.
+            let name = get_str(entry, "name")
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| invalid(format!("{what} needs a name")))?;
+            let protocol_raw = get_str(entry, "protocol")
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| invalid(format!("{what} needs a protocol")))?;
+            let protocol = canonical_protocol(&protocol_raw)
+                .ok_or_else(|| invalid(format!("{what} has an unknown protocol")))?;
+            let params_raw = get_str(entry, "params")
+                .ok_or_else(|| invalid(format!("{what} needs params")))?;
+            match serde_json::from_str::<serde_json::Value>(&params_raw) {
+                Ok(serde_json::Value::Object(_)) => {}
+                _ => return Err(invalid(format!("{what} has corrupt params"))),
+            }
+            let bind_ip_raw = get_str(entry, "bind_ip")
+                .ok_or_else(|| invalid(format!("{what} needs a bind_ip")))?;
+            {
+                let trimmed = bind_ip_raw.trim();
+                let bind_ok = trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("localhost")
+                    || trimmed.parse::<std::net::IpAddr>().is_ok();
+                if !bind_ok {
+                    return Err(invalid(format!("{what} has a bad bind_ip")));
+                }
+            }
+            // Ticket A3: reserved ranges never restore silently (the save
+            // gate would have refused them); name the range like the engine.
+            if let Some(range) = crate::engine::reserved_range_of(port as u16) {
+                return Err(invalid(format!(
+                    "{what} uses reserved port {port} ({range})"
+                )));
+            }
             rows.push(LibraryRow {
                 id,
-                name: get_str(entry, "name").unwrap_or_default(),
-                protocol: get_str(entry, "protocol").unwrap_or_else(|| "vless".to_string()),
-                params: get_str(entry, "params").unwrap_or_else(|| "{}".to_string()),
+                name,
+                protocol,
+                params: params_raw,
                 group: get_str(entry, "group").unwrap_or_else(|| "default".to_string()),
                 enabled: entry
                     .get("enabled")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
-                bind_ip: get_str(entry, "bind_ip").unwrap_or_else(|| "127.0.0.1".to_string()),
+                bind_ip: bind_ip_raw,
                 port,
                 subscription_id: get_str(entry, "subscription_id"),
                 identity_key: get_str(entry, "identity_key"),
@@ -4674,6 +4709,21 @@ impl Store {
                 traffic_rx,
                 traffic_tx,
             });
+        }
+        // Ticket A3: duplicate bind:port on the restore path fails loudly
+        // (two rows can never claim one endpoint; activation would refuse
+        // it later — fail at restore instead).
+        {
+            let mut seen: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+            for (index, row) in rows.iter().enumerate() {
+                let key = (row.bind_ip.trim().to_ascii_lowercase(), row.port);
+                if !seen.insert(key.clone()) {
+                    return Err(invalid(format!(
+                        "library[{index}] duplicates bind:port {}:{}",
+                        row.bind_ip, row.port
+                    )));
+                }
+            }
         }
         struct SubRow {
             id: i64,
@@ -7545,6 +7595,101 @@ mod tests {
         );
     }
 
+    /// Ticket A3: strict restore — corrupt library rows fail loudly (missing
+    /// / wrong-typed name/protocol/params/bind_ip, reserved ports, duplicate
+    /// bind:port), with nothing written.
+    #[test]
+    fn a3_restore_rejects_corrupt_rows_loudly() {
+        fn valid_entry() -> serde_json::Value {
+            serde_json::json!({
+                "id": "1",
+                "name": "one",
+                "protocol": "vless",
+                "params": "{\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"11111111-2222-4333-8444-555555555555\"}",
+                "group": "default",
+                "enabled": false,
+                "bind_ip": "127.0.0.1",
+                "port": 10801,
+            })
+        }
+        fn payload_with(entries: Vec<serde_json::Value>) -> String {
+            serde_json::json!({
+                "library": entries,
+                "subscriptions": [],
+            })
+            .to_string()
+        }
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        let mut missing_name = valid_entry();
+        missing_name.as_object_mut().expect("object").remove("name");
+        cases.push(("missing name", missing_name));
+        let mut blank_name = valid_entry();
+        blank_name["name"] = serde_json::Value::String("   ".to_string());
+        cases.push(("blank name", blank_name));
+        let mut wrong_protocol = valid_entry();
+        wrong_protocol["protocol"] = serde_json::json!(42);
+        cases.push(("wrong-typed protocol", wrong_protocol));
+        let mut unknown_protocol = valid_entry();
+        unknown_protocol["protocol"] = serde_json::Value::String("nope".to_string());
+        cases.push(("unknown protocol", unknown_protocol));
+        let mut missing_params = valid_entry();
+        missing_params.as_object_mut().expect("object").remove("params");
+        cases.push(("missing params", missing_params));
+        let mut corrupt_params = valid_entry();
+        corrupt_params["params"] = serde_json::Value::String("{garbage".to_string());
+        cases.push(("corrupt params", corrupt_params));
+        let mut missing_bind = valid_entry();
+        missing_bind.as_object_mut().expect("object").remove("bind_ip");
+        cases.push(("missing bind_ip", missing_bind));
+        let mut bad_bind = valid_entry();
+        bad_bind["bind_ip"] = serde_json::Value::String("not a bind!!".to_string());
+        cases.push(("bad bind_ip", bad_bind));
+        let mut reserved = valid_entry();
+        reserved["port"] = serde_json::json!(18600);
+        cases.push(("reserved port", reserved));
+        for (label, entry) in cases {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let payload = payload_with(vec![entry]);
+            let error = store
+                .restore_library_json(&payload)
+                .expect_err(&format!("{label} must fail"));
+            assert!(
+                matches!(error, StoreError::Invalid(_)),
+                "{label}: Invalid, got {error}"
+            );
+            assert!(
+                store.list().expect("list works").is_empty(),
+                "{label}: nothing written"
+            );
+        }
+        // Duplicate bind:port fails loudly with nothing written.
+        {
+            let mut second = valid_entry();
+            second["id"] = serde_json::Value::String("2".to_string());
+            second["name"] = serde_json::Value::String("two".to_string());
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let payload = payload_with(vec![valid_entry(), second]);
+            let error = store
+                .restore_library_json(&payload)
+                .expect_err("duplicate bind:port must fail");
+            assert!(
+                matches!(error, StoreError::Invalid(_)),
+                "Invalid, got {error}"
+            );
+            assert!(error.to_string().contains("duplicates"), "got {error}");
+            assert!(store.list().expect("list works").is_empty());
+        }
+        // localhost bind restores fine (A1 parity: loopback by name).
+        {
+            let mut entry = valid_entry();
+            entry["bind_ip"] = serde_json::Value::String("localhost".to_string());
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let outcome = store
+                .restore_library_json(&payload_with(vec![entry]))
+                .expect("localhost bind restores");
+            assert_eq!(outcome.configs, 1);
+        }
+    }
     /// Atomic export: tmp + rename leaves a parseable file and no tmp litter.
     #[test]
     fn t25_export_is_atomic_no_tmp_litter() {
