@@ -495,7 +495,10 @@ pub enum EngineError {
     /// The engine's own `check` rejected the generated config.
     CheckFailed { detail: String },
     /// No `sing-box` binary in the app dir (never `PATH`, never downloads).
-    MissingBinary { searched: String },
+    /// Ticket A6: names the EXPECTED FILE plus the searched dir, like the
+    /// fork/xray/extra variants (never a bare dir that leaves the user
+    /// guessing which filename to place).
+    MissingBinary { binary: String, searched: String },
     /// Ticket 07: no fork-core binary for exotic rows (names the rows and
     /// the expected binary; stock rows are unaffected).
     MissingForkBinary {
@@ -623,15 +626,18 @@ impl std::fmt::Display for EngineError {
                 // Ticket 29: `check` stderr arrives with ANSI color escapes
                 // (the raw `[31mFATAL[0m` toast); the surfaced error keeps the
                 // text and drops the codes.
+                // Ticket A7: stderr is UNTRUSTED (echoes config fragments) —
+                // redact secrets after stripping (strip first: ANSI codes
+                // never carry secrets and only obscure the patterns).
                 write!(
                     f,
                     "engine config check failed ({})",
-                    strip_ansi_codes(detail)
+                    crate::health::redact_secrets(&strip_ansi_codes(detail))
                 )
             }
-            EngineError::MissingBinary { searched } => write!(
+            EngineError::MissingBinary { binary, searched } => write!(
                 f,
-                "engine binary not found (looked for {searched}); install sing-box — ManyProxy never downloads executables silently"
+                "engine binary not found (looked for {binary} in {searched}); install sing-box — ManyProxy never downloads executables silently"
             ),
             EngineError::MissingForkBinary {
                 rows,
@@ -1365,6 +1371,40 @@ fn custom_full_config(
     Ok((core, document))
 }
 
+/// Ticket 08/41: true when an extra-core `exe` value must be refused before
+/// any filesystem access: path separators, ADS streams (`:`), reserved
+/// Windows device names (`CON`/`PRN`/`AUX`/`NUL`/`COM1`-`COM9`/`LPT1`-`LPT9`,
+/// bare or with an extension — these never resolve to a real file),
+/// trailing dots/spaces (Windows strips them, so `evil.exe ` ≡ `evil.exe`),
+/// and control characters. The app-dir join happens only after this gate.
+fn is_bad_extra_exe_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return true;
+    }
+    if name.contains(['/', '\\', ':']) {
+        return true;
+    }
+    if name.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return true;
+    }
+    // Windows trims trailing dots/spaces before resolution.
+    if name.ends_with(['.', ' ']) {
+        return true;
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    if (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.len() == 4
+        && upper[3..].bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    false
+}
+
 /// Ticket 08: validate one extra-core slot row. Returns the executable file
 /// name (app dir only, never a path) and the config JSON string passed
 /// through to the sidecar file.
@@ -1382,11 +1422,11 @@ fn validate_extra_row(config: &ProxyConfig) -> Result<(String, String), EngineEr
             detail: "extra-core rows need an \"exe\" file name (resolved in the app directory)"
                 .to_string(),
         })?;
-    if exe.contains(['/', '\\', ':']) || exe == "." || exe == ".." {
+    if is_bad_extra_exe_name(exe) {
         return Err(EngineError::BadExtra {
             name: config.name.clone(),
             field: "exe".to_string(),
-            detail: "extra-core \"exe\" must be a plain file name in the app directory (no paths)"
+            detail: "extra-core \"exe\" must be a plain file name in the app directory (no paths, streams, device names, or trailing dots/spaces)"
                 .to_string(),
         });
     }
@@ -2228,6 +2268,13 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     // replacement colliding with a served row) fail naming both parties.
     // Unparseable documents fail open here (the schema gate above already
     // rejected them; never double-report).
+    // Bridge ingress is ours too: a replacement squatting an assigned
+    // bridge port would break the bridge silently, so it conflicts naming
+    // the bridge owner.
+    let bridge_owner_by_port: HashMap<u16, String> = egresses
+        .iter()
+        .map(|egress| (egress.bridge_port, egress.owner.clone()))
+        .collect();
     let mut replacement_listens: Vec<(String, String, u16)> = Vec::new();
     for config in configs {
         if !is_custom_config_protocol(&config.protocol) {
@@ -2240,6 +2287,16 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             continue;
         };
         for (bind, port) in custom_config_listens(&document) {
+            if normalize_bind_key(&bind) == "loopback" {
+                if let Some(owner) = bridge_owner_by_port.get(&port) {
+                    return Err(EngineError::PortConflict {
+                        bind,
+                        port,
+                        first: owner.clone(),
+                        second: config.name.clone(),
+                    });
+                }
+            }
             let key = (normalize_bind_key(&bind), port);
             if let Some(first) = taken.get(&key) {
                 return Err(EngineError::PortConflict {
@@ -2501,16 +2558,47 @@ fn preset_rules_for(
             serde_json::Value::String(crate::preset::served_action(action).to_string()),
         );
         if route_like {
-            merged.insert(
-                "outbound".to_string(),
-                serde_json::Value::String(serving_tag.to_string()),
-            );
+            match obj.get("outbound").and_then(serde_json::Value::as_str) {
+                // No explicit outbound: route through the attached row.
+                None => {
+                    merged.insert(
+                        "outbound".to_string(),
+                        serde_json::Value::String(serving_tag.to_string()),
+                    );
+                }
+                // An explicit outbound is preserved, never silently
+                // overwritten: only this row's serving tag or `direct`
+                // resolve in the served exits — a sibling's tag or a typo
+                // fails loudly instead of serving the row's outbound while
+                // claiming otherwise.
+                Some(explicit) if explicit == serving_tag || explicit == "direct" => {}
+                Some(_) => {
+                    return Err(bad(format!(
+                        "rule {index}: field \"outbound\" names an unknown exit (want the row's outbound or \"direct\")"
+                    )));
+                }
+            }
         }
-        if !merged.contains_key("inbound") {
-            merged.insert(
-                "inbound".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::String(inbound_tag.to_string())]),
-            );
+        // Presets are per-row policy: an unscoped rule is scoped to this
+        // row's inbound automatically, and an explicit `inbound` must name
+        // exactly this row's inbound — keeping a foreign inbound verbatim
+        // would apply this row's rule to a sibling row's traffic.
+        match merged.get("inbound") {
+            None => {
+                merged.insert(
+                    "inbound".to_string(),
+                    serde_json::Value::Array(vec![serde_json::Value::String(
+                        inbound_tag.to_string(),
+                    )]),
+                );
+            }
+            Some(serde_json::Value::Array(items))
+                if items.len() == 1 && items[0].as_str() == Some(inbound_tag) => {}
+            Some(_) => {
+                return Err(bad(format!(
+                    "rule {index}: field \"inbound\" must scope to this row (foreign inbounds are never kept)"
+                )));
+            }
         }
         out.push(serde_json::Value::Object(merged));
     }
@@ -4400,7 +4488,10 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
             .get("listen_port")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| invalid("inbound without listen_port"))?;
-        if !binds.insert((listen.to_ascii_lowercase(), port)) {
+        // Loopback spellings (`127.0.0.1` vs `localhost` vs `::1`) are one
+        // endpoint — compare normalized keys, or a duplicate bind slips
+        // through under a different spelling.
+        if !binds.insert((normalize_bind_key(listen), port)) {
             return Err(invalid("duplicate inbound bind"));
         }
         if obj.contains_key("set_system_proxy") {
@@ -4583,8 +4674,12 @@ pub fn resolve_engine_binary_in(
     app_dir: Option<&Path>,
     _path_env: &str,
 ) -> Result<PathBuf, EngineError> {
-    resolve_bundled_in(app_dir, &engine_binary_file_name())
-        .map_err(|searched| EngineError::MissingBinary { searched })
+    resolve_bundled_in(app_dir, &engine_binary_file_name()).map_err(|searched| {
+        EngineError::MissingBinary {
+            binary: engine_binary_file_name(),
+            searched,
+        }
+    })
 }
 
 /// Ticket 07: binary file name for the fork core on this platform.
@@ -4624,35 +4719,86 @@ pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
 /// line). Lets a wrong/plain binary fail fast with a named error instead of
 /// serving exotic rows badly. Paths echoed are binary locations, never
 /// secrets.
+/// Ticket A6: bounded by [`FORK_PROBE_TIMEOUT`] — a hung binary is killed
+/// and reported, never waited on forever (the old `output()` had no
+/// deadline). See [`probe_fork_version_with_timeout`] for the test seam.
 pub fn probe_fork_version(binary: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(binary)
+    probe_fork_version_with_timeout(binary, FORK_PROBE_TIMEOUT)
+}
+
+/// Ticket A6: fork-probe deadline for [`probe_fork_version`] (the
+/// `version` subprocess only; clash poll threads carry their own per-core
+/// and total budgets in `health`).
+pub const FORK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ticket A6: testable core of [`probe_fork_version`] (explicit deadline).
+/// Spawn + poll (`try_wait` every 10 ms); past the deadline the child is
+/// killed, reaped, and reported as a timeout. Stdout past 64 KiB is cut
+/// (a `version` line is bytes; a pathological peer cannot grow us).
+pub fn probe_fork_version_with_timeout(
+    binary: &Path,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(binary)
         .arg("version")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|error| {
             format!(
                 "fork version probe failed for {} ({error})",
                 binary.display()
             )
         })?;
-    if !output.status.success() {
-        return Err(format!(
-            "fork version probe failed for {} (non-zero exit)",
-            binary.display()
-        ));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().map_err(|error| {
+            format!(
+                "fork version probe failed for {} ({error})",
+                binary.display()
+            )
+        })? {
+            Some(status) => {
+                if !status.success() {
+                    return Err(format!(
+                        "fork version probe failed for {} (non-zero exit)",
+                        binary.display()
+                    ));
+                }
+                let mut capped = Vec::new();
+                if let Some(stdout) = child.stdout.as_mut() {
+                    let _ = stdout.take(64 * 1024).read_to_end(&mut capped);
+                }
+                let _ = child.wait();
+                let first = String::from_utf8_lossy(&capped)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if first.is_empty() {
+                    return Err(format!(
+                        "fork version probe failed for {} (empty output)",
+                        binary.display()
+                    ));
+                }
+                return Ok(truncate_detail(&first));
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "fork version probe timed out for {}",
+                        binary.display()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
-    let first = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if first.is_empty() {
-        return Err(format!(
-            "fork version probe failed for {} (empty output)",
-            binary.display()
-        ));
-    }
-    Ok(truncate_detail(&first))
 }
 
 /// Ticket 08: binary file name for the Xray core on this platform.
@@ -4695,7 +4841,7 @@ pub fn resolve_xray_binary() -> Result<PathBuf, EngineError> {
 /// elevated). `Err` is a human reason or the searched directory.
 pub fn resolve_extra_binary_in(app_dir: Option<&Path>, exe: &str) -> Result<PathBuf, String> {
     let name = exe.trim();
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':']) {
+    if is_bad_extra_exe_name(name) {
         return Err(format!(
             "bad extra-core exe \"{name}\" (want a plain file name in the app directory)"
         ));
@@ -4776,7 +4922,7 @@ pub fn strip_ansi_codes(text: &str) -> String {
 // and typo hints. Pure helpers first (tested directly); the controller
 // consumes them below. Protocol emission tables are untouched (ticket 42).
 
-/// Ticket 41: stale secret-temp file prefix (`manyproxy-<stem>-<pid>-<n>.json`
+/// Ticket 41: stale secret-temp file prefix (`manyproxy-<stem>-<pid>-<n>-<rand>.json`
 /// from [`unique_config_path`]). The sweep below only touches this prefix in
 /// the given directory (never a recursive scan, never another prefix).
 pub const STALE_TEMP_PREFIX: &str = "manyproxy-";
@@ -4817,12 +4963,33 @@ pub fn should_reap_process(image: &str, port: u16, our_ports: &[u16]) -> bool {
 
 /// Ticket 41: our stale secret-temp files in `dir` (prefix-filtered,
 /// non-recursive). Pure listing — the caller decides removal.
+/// A failed `read_dir` or a per-entry error is reported on stderr and
+/// skipped best-effort (a stale secret must never linger silently because
+/// the listing swallowed its error); the sweep still removes whatever the
+/// listing did find.
 pub fn stale_temp_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "manyproxy: stale-temp listing failed for {} ({error})",
+                dir.display()
+            );
+            return Vec::new();
+        }
     };
     let mut out = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!(
+                    "manyproxy: stale-temp entry unreadable in {} ({error})",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -4948,6 +5115,22 @@ pub fn startup_reap_and_sweep(
     report
 }
 
+/// Ticket 41: absolute path to a Windows system tool (never bare-name
+/// `PATH` lookup: a planted `netstat`/`tasklist`/`taskkill` earlier on
+/// `PATH` would execute as us at startup). `%SystemRoot%` first (the
+/// platform's own pointer), `C:\Windows` fallback.
+fn system_tool(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        Path::new(&root).join("System32").join(name)
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(name)
+    }
+}
+
 /// Ticket 41: production startup reaper — real `netstat`/`tasklist`/
 /// `taskkill` on Windows (best-effort, seconds at most), temp sweep on
 /// every platform. Non-Windows skips the process pass (no image lookup
@@ -4955,7 +5138,7 @@ pub fn startup_reap_and_sweep(
 /// `errors`, never in the user's face.
 pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
     let netstat_output = if cfg!(windows) {
-        std::process::Command::new("netstat")
+        std::process::Command::new(system_tool("netstat.exe"))
             .args(["-ano", "-p", "TCP"])
             .output()
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
@@ -4967,7 +5150,7 @@ pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
         if !cfg!(windows) {
             return None;
         }
-        let output = std::process::Command::new("tasklist")
+        let output = std::process::Command::new(system_tool("tasklist.exe"))
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "TABLE", "/NH"])
             .output()
             .ok()?;
@@ -4984,7 +5167,7 @@ pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
         // Ours-only by construction: `pid` passed this closure only after
         // the image + port predicate above. Exact-pid kill, no image-wide
         // kill, never a filter miss.
-        std::process::Command::new("taskkill")
+        std::process::Command::new(system_tool("taskkill.exe"))
             .args(["/PID", &pid.to_string(), "/F"])
             .output()
             .is_ok_and(|output| output.status.success())
@@ -5136,9 +5319,10 @@ pub fn validate_egress_resolution_with(
         {
             continue;
         }
-        let Ok(params) = params_object(config) else {
-            continue;
-        };
+        // Malformed rows fail here too — skipping them would exempt the
+        // row from the egress DNS gate (defense in depth: the plan already
+        // rejects them, but this gate never passes a row it cannot read).
+        let params = params_object(config)?;
         for server in egress_servers_of(&params) {
             if resolve_egress_host(&server, resolver).is_err() {
                 return Err(EngineError::DnsFailure {
@@ -5385,10 +5569,27 @@ pub struct StartAllOutcome {
 /// sidecar backends — and any two ManyProxy processes — never share a path).
 static CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Per-instance unique temp config path (`manyproxy-<stem>-<pid>-<n>.json`).
+/// Per-instance unique temp config path (`manyproxy-<stem>-<pid>-<n>-<rand>.json`).
+/// The trailing random component (OS CSPRNG, time+counter fallback) makes
+/// paths unpredictable across processes; creation uses `create_new` (see
+/// [`write_config_restricted`]) so a planted file or symlink at the path is
+/// never followed or truncated.
 fn unique_config_path(stem: &str) -> PathBuf {
     let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("manyproxy-{stem}-{}-{n}.json", std::process::id()))
+    let mut rand = [0u8; 8];
+    if getrandom::fill(&mut rand).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let mixed = nanos.wrapping_add((n as u128).wrapping_mul(0x9e3779b97f4a7c15));
+        rand.copy_from_slice(&mixed.to_ne_bytes()[..8]);
+    }
+    let r = u64::from_ne_bytes(rand);
+    std::env::temp_dir().join(format!(
+        "manyproxy-{stem}-{}-{n}-{r:016x}.json",
+        std::process::id()
+    ))
 }
 
 /// Notice line pushed when the log buffer lock is found poisoned (fail-open
@@ -5398,19 +5599,32 @@ const LOG_POISON_NOTICE: &str = "log pipe unreadable (log reader failed)";
 /// Write the sidecar config with owner-only permissions (0600 on Unix; the
 /// Windows temp dir is per-user by construction, tightened best-effort via
 /// [`crate::store::harden_file_permissions`]). The file holds secrets, so
-/// creation must not widen access.
+/// creation uses `create_new` (never truncate-through): a planted symlink or
+/// file at the path is removed first and never followed — creation must not
+/// widen access and must never write secrets through a link.
 fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|error| format!("cannot write engine config ({error})"))?;
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A leftover (or planted link) sits at our unique path: remove
+            // the link itself — `remove_file` on a symlink removes the link,
+            // never its target — then create exclusively.
+            std::fs::remove_file(path)
+                .map_err(|error| format!("cannot write engine config ({error})"))?;
+            options
+                .open(path)
+                .map_err(|error| format!("cannot write engine config ({error})"))?
+        }
+        Err(error) => return Err(format!("cannot write engine config ({error})")),
+    };
     file.write_all(config_json.as_bytes())
         .map_err(|error| format!("cannot write engine config ({error})"))?;
     drop(file);
@@ -5421,18 +5635,29 @@ fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String>
 }
 
 /// True when the path is a file the sidecar may execute: present plus the
-/// exec bit on Unix (Windows executability is the `.exe` association itself).
+/// exec bit on Unix.
+/// Ticket A6 (pinned Windows behavior): Windows has no exec bit — ANY
+/// existing file counts as executable (the `.exe` association + ACLs decide
+/// launch, not us; we never consult `PATH` and never second-guess the ACL).
+/// Directories and missing paths are false on every platform (opening a
+/// directory fails or reports non-file; the handle metadata — not a re-stat
+/// — decides file-ness, so there is no check-then-use race).
 fn is_executable(path: &Path) -> bool {
-    if !path.is_file() {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
         return false;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        return path
-            .metadata()
-            .map(|meta| meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
+        return meta.permissions().mode() & 0o111 != 0;
     }
     #[cfg(not(unix))]
     {
@@ -5444,7 +5669,7 @@ fn is_executable(path: &Path) -> bool {
 /// `localhost`, `::1`, `::ffff:127.0.0.1`; blank means the loopback default)
 /// compare equal so two rows can never claim the same local endpoint under
 /// different spellings. Anything else compares case-insensitively verbatim.
-fn normalize_bind_key(bind: &str) -> String {
+pub(crate) fn normalize_bind_key(bind: &str) -> String {
     match bind.trim().to_ascii_lowercase().as_str() {
         "" | "localhost" | "127.0.0.1" | "::1" | "::ffff:127.0.0.1" => "loopback".to_string(),
         other => other.to_string(),
@@ -5453,11 +5678,14 @@ fn normalize_bind_key(bind: &str) -> String {
 
 /// Probe-bind one endpoint before any sidecar is stopped: catches a foreign
 /// holder (or a sibling sidecar that kept its socket) while rollback is still
-/// cheap. Probes are serialized process-wide so parallel applies (and test
+/// cheap. Returns the bound listener — the caller holds it until just before
+/// spawn, so the reservation is atomic from probe through `check` (no
+/// bind-then-drop TOCTOU: a dropped probe re-opens the race it just closed).
+/// Probes are serialized process-wide so parallel applies (and test
 /// threads sharing fixed ports) never fail on each other; a genuinely held
 /// port still fails after bounded retries. Blank binds probe the loopback
 /// default.
-fn probe_bind_available(bind: &str, port: u16) -> Result<(), String> {
+fn probe_bind_available(bind: &str, port: u16) -> Result<std::net::TcpListener, String> {
     static PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     let _guard = PROBE_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
@@ -5474,10 +5702,8 @@ fn probe_bind_available(bind: &str, port: u16) -> Result<(), String> {
     let mut last = format!("probe failed for {host}:{port}");
     for _ in 0..10 {
         match std::net::TcpListener::bind(format!("{host}:{port}")) {
-            Ok(listener) => {
-                drop(listener);
-                return Ok(());
-            }
+            // Held by the caller until pre-spawn drop — never dropped here.
+            Ok(listener) => return Ok(listener),
             Err(error) => {
                 last = format!("{host}:{port} is already in use ({error})");
                 std::thread::sleep(Duration::from_millis(10));
@@ -5500,6 +5726,21 @@ fn find_system_mutation_key(document: &serde_json::Value) -> Option<(String, Str
                     let lowered = key.to_ascii_lowercase();
                     if lowered == "tun" || lowered == "dns" || lowered == "set_system_proxy" {
                         return Some((key.clone(), path.to_string()));
+                    }
+                    // Value semantics, not just key names: `{"type":"tun"}`
+                    // (sing-box tun inbound/outbound) and
+                    // `{"protocol":"dns"}` (xray dns outbound) mutate the
+                    // system without any forbidden key. Only the schema
+                    // discriminator keys carry this meaning — matching
+                    // values anywhere else would false-positive on prose
+                    // (descriptions, remarks).
+                    if lowered == "type" || lowered == "protocol" {
+                        if let Some(kind) = value.as_str() {
+                            let kind = kind.to_ascii_lowercase();
+                            if kind == "tun" || kind == "dns" {
+                                return Some((key.clone(), path.to_string()));
+                            }
+                        }
                     }
                     let child = if path.is_empty() {
                         key.clone()
@@ -5563,25 +5804,27 @@ impl WaitTarget for std::process::Child {
     }
 }
 
-fn wait_child_bounded(target: &mut impl WaitTarget, timeout: Duration) {
+fn wait_child_bounded(target: &mut impl WaitTarget, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
         match target.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return true,
             Ok(None) => {}
-            Err(_) => return,
+            Err(_) => return false,
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = target.kill();
     for _ in 0..20 {
         match target.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return true,
             Ok(None) => {}
-            Err(_) => return,
+            Err(_) => return false,
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let _ = target.kill();
+    matches!(target.try_wait(), Ok(Some(_)))
 }
 
 /// Production driver: `sing-box check` validates, `sing-box run` serves. The
@@ -5629,8 +5872,8 @@ pub struct RealEngineBackend {
     /// Ticket 23: current reader generation (mirrored into `log_buffer`).
     reader_gen: u64,
     /// Ticket 23: the live reader thread. Reaped when finished; a still-live
-    /// handle at stop is detached (it exits on pipe EOF after the kill) and
-    /// its lines are fenced out by the generation.
+    /// handle at stop is kept for a later reap (it exits on pipe EOF after
+    /// the kill) and its lines are fenced out by the generation.
     reader_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -5787,12 +6030,18 @@ impl RealEngineBackend {
     /// The config file is left alone — file removal is
     /// [`RealEngineBackend::remove_config_file`], so `start()` can
     /// stop-then-write-then-spawn without deleting the file it just wrote.
+    /// Even on the give-up arm the kill is escalated once more before the
+    /// handle drops (dropping a `Child` never kills the process), so a
+    /// timed-out stop still ends the sidecar best-effort.
     fn stop_child(&mut self) {
         self.reader_gen = self.reader_gen.wrapping_add(1);
         let gen = self.reader_gen;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            wait_child_bounded(&mut child, Duration::from_secs(3));
+            let reaped = wait_child_bounded(&mut child, Duration::from_secs(3));
+            if !reaped {
+                let _ = child.kill();
+            }
         }
         // Ticket 13: drop buffered (raw) lines with the sidecar so a later
         // start never replays stale output.
@@ -5807,19 +6056,32 @@ impl RealEngineBackend {
                 slot.0 = gen;
             }
         }
-        // Reap a finished reader; detach a still-live one (it exits on pipe
-        // EOF after the kill, and its lines are fenced out by the bumped
-        // generation).
-        let finished = self
+        // Join a finished reader promptly; wait briefly for one racing pipe
+        // EOF, then join. A still-live handle (kill failed, pipe held open
+        // by a surviving child) is kept for a later reap — it exits on pipe
+        // EOF after the kill above, and its lines are fenced out by the
+        // bumped generation. Never detach: a detached thread blocked on a
+        // live pipe would run forever with no join handle. The spin is
+        // bounded so stop never hangs the caller.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if self
+                .reader_handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self
             .reader_handle
             .as_ref()
-            .is_some_and(|handle| handle.is_finished());
-        if finished {
+            .is_some_and(|handle| handle.is_finished())
+        {
             if let Some(handle) = self.reader_handle.take() {
                 let _ = handle.join();
             }
-        } else {
-            self.reader_handle.take();
         }
     }
 }
@@ -5941,7 +6203,19 @@ impl EngineBackend for RealEngineBackend {
     }
 
     fn poll_exit(&mut self) -> Option<String> {
-        let status = self.child.as_mut()?.try_wait().ok()??;
+        // `Ok(None)` = still running (no report); `Ok(Some)` = exited
+        // (reap once with the named cause); `Err` = the child state is
+        // unknown — fail closed with an unknown-exit report instead of
+        // pretending the sidecar is still running.
+        let status = match self.child.as_mut()?.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => return None,
+            Err(error) => {
+                self.child = None;
+                self.remove_config_file();
+                return Some(format!("engine exited (unknown: {error})"));
+            }
+        };
         self.child = None;
         // Ticket 23: a reaped crash leaves no secret file behind. Buffered
         // lines are kept for post-mortem (the next stop/start clears them).
@@ -5983,16 +6257,13 @@ impl EngineBackend for RealEngineBackend {
 }
 
 /// Ticket 23 HIGH: RAII teardown — dropping a backend (window close, panic
-/// unwind, controller teardown) kills the sidecar with a bounded reap and
-/// removes the secret config file, best-effort. No `main()` close hook is
-/// needed: teardown lives in the backend itself.
+/// unwind, controller teardown) runs the same teardown as `stop`: the
+/// sidecar is killed with a bounded reap (escalated even on the give-up arm)
+/// and the secret config file is removed, best-effort. No `main()` close
+/// hook is needed: teardown lives in the backend itself.
 impl Drop for RealEngineBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            wait_child_bounded(&mut child, Duration::from_secs(1));
-        }
-        self.remove_config_file();
+        self.stop();
     }
 }
 
@@ -6464,29 +6735,38 @@ impl EngineController {
         self.crashed.contains(core)
     }
 
+    /// Ticket 41: owning core of a custom row, `None` when the params are
+    /// malformed or the `core` value is unknown. Callers fail closed on
+    /// `None`: an unreadable row is never attributed to a healthy shard
+    /// (the old silent-stock default would report a broken row as served).
+    fn custom_core_of(row: &ProxyConfig) -> Option<OwningCore> {
+        params_object(row)
+            .ok()
+            .and_then(|params| owning_core_of(&row.name, &params).ok())
+    }
+
     /// Ticket 41: the serving shard of one active row (`stock`/`fork`/
     /// `xray`/`extra-<id>`) — the same routing [`EngineController::is_running`]
     /// reports per row, so crash-drop and tick-skip always agree.
+    /// `unknown` for unreadable custom rows (validated rows never land
+    /// here — the plan rejects them first — so this is dead-defensive, but
+    /// never a silent stock attribution).
     fn shard_of_row(&self, row: &ProxyConfig) -> String {
         if is_extra_core_protocol(&row.protocol) {
             return format!("extra-{}", row.id);
         }
         if is_custom_config_protocol(&row.protocol) {
-            let core = params_object(row)
-                .ok()
-                .and_then(|params| owning_core_of(&row.name, &params).ok())
-                .unwrap_or(OwningCore::Stock);
-            return core.as_str().to_string();
+            return Self::custom_core_of(row)
+                .map(|core| core.as_str().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
         }
         if needs_xray(row) {
             return OwningCore::Xray.as_str().to_string();
         }
         if is_custom_outbound_protocol(&row.protocol) {
-            let core = params_object(row)
-                .ok()
-                .and_then(|params| owning_core_of(&row.name, &params).ok())
-                .unwrap_or(OwningCore::Stock);
-            return core.as_str().to_string();
+            return Self::custom_core_of(row)
+                .map(|core| core.as_str().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
         }
         if needs_fork(row) {
             return OwningCore::Fork.as_str().to_string();
@@ -7138,9 +7418,21 @@ impl EngineController {
         // untracked). Exhaustion and injection failures are typed here,
         // before anything stops, like every other apply gate.
         // Ticket 41: bind-and-hold reservation — each controller port stays
-        // bound in `clash_holds` until the sidecars have taken their ports,
-        // so no sibling process wins the old pick-then-probe race (TOCTOU).
-        // The holds drop when this apply returns, either way.
+        // bound in `clash_holds` through the check phase (never a
+        // bind-then-drop probe), then drops just before spawn so the sidecar
+        // can bind its own controller (a hold kept through spawn would make
+        // the sidecar collide with itself). Scoped narrowly: probe gate +
+        // checks only.
+        // Process-wide reservation window (held to the pre-spawn drop
+        // below): two concurrent applies must never fail on each other's
+        // held reservations — without it, parallel applies racing the same
+        // fixed ports flake. Never held across spawn itself.
+        static PORT_WINDOW_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let port_window_guard = PORT_WINDOW_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut clash_holds: Vec<std::net::TcpListener> = Vec::new();
         let mut clash: Vec<ClashTarget> = Vec::new();
         for (core, gen, rows_present) in [
@@ -7270,6 +7562,32 @@ impl EngineController {
                 return Err(error);
             }
         }
+        // Ticket 08/41: bridge-port hold reservation — the arithmetic
+        // assignment alone never held the ports, so a sibling process could
+        // win the race before the xray sidecar bound its ingress. Every
+        // bridge port stays bound here through the check phase and drops
+        // just before spawn (same narrow scope as the clash holds).
+        let mut bridge_holds: Vec<std::net::TcpListener> = Vec::new();
+        {
+            let mut seen: HashSet<u16> = HashSet::new();
+            for egress in &plan.egresses {
+                if !seen.insert(egress.bridge_port) {
+                    continue;
+                }
+                match std::net::TcpListener::bind(format!("127.0.0.1:{}", egress.bridge_port)) {
+                    Ok(listener) => bridge_holds.push(listener),
+                    Err(error) => {
+                        let failure = EngineError::PortUnavailable {
+                            bind: "127.0.0.1".to_string(),
+                            port: egress.bridge_port,
+                            name: format!("xray bridge ({})", egress.owner),
+                        };
+                        self.last_error = Some(format!("{failure} (bridge hold failed: {error})"));
+                        return Err(failure);
+                    }
+                }
+            }
+        }
         // Ticket 23 MED: probe-bind every serving endpoint (plus every
         // bridge listener) BEFORE any sidecar is stopped — a foreign holder
         // fails typed here, while rollback is still free.
@@ -7278,7 +7596,13 @@ impl EngineController {
         // own sockets for a foreign holder). The skip set comes only from
         // configs we served (never guessed); a foreign squatter on a
         // previously-served port surfaces later as a typed spawn failure.
+        // Probe reservations are held (not dropped) through the check phase
+        // and released just before spawn — same narrow scope as above.
+        let mut probe_holds: Vec<std::net::TcpListener> = Vec::new();
         {
+            // Own-skip set over normalized bind keys: a served `localhost`
+            // and a candidate `127.0.0.1` are the same endpoint — raw string
+            // comparison would mistake our own socket for a foreign holder.
             let mut own: std::collections::HashSet<(String, u16)> =
                 std::collections::HashSet::new();
             for served in self
@@ -7287,7 +7611,11 @@ impl EngineController {
                 .flatten()
                 .chain(self.served_extra.iter().flatten())
             {
-                own.extend(served_listen_ports(served));
+                own.extend(
+                    served_listen_ports(served)
+                        .into_iter()
+                        .map(|(bind, port)| (normalize_bind_key(&bind), port)),
+                );
             }
             let mut endpoints: Vec<(String, String, u16)> = Vec::new();
             for row in plan.main_rows.iter().chain(plan.fork_rows.iter()) {
@@ -7309,6 +7637,11 @@ impl EngineController {
             // always fail closed on our own reservation).
             let held: std::collections::HashSet<u16> =
                 clash.iter().map(|target| target.port).collect();
+            let bridge_ports: std::collections::HashSet<u16> = plan
+                .egresses
+                .iter()
+                .map(|egress| egress.bridge_port)
+                .collect();
             for target in &clash {
                 endpoints.push((
                     format!("clash controller ({})", target.core),
@@ -7327,20 +7660,31 @@ impl EngineController {
                 ));
             }
             for (name, bind, port) in &endpoints {
-                if own.contains(&(bind.clone(), *port)) {
+                if own.contains(&(normalize_bind_key(bind), *port)) {
                     continue;
                 }
                 if name.starts_with("clash controller (") && held.contains(port) {
                     continue;
                 }
-                if probe_bind_available(bind, *port).is_err() {
-                    let error = EngineError::PortUnavailable {
-                        bind: bind.clone(),
-                        port: *port,
-                        name: name.clone(),
-                    };
-                    self.last_error = Some(error.to_string());
-                    return Err(error);
+                // Bridge ingress is held by us above (loopback bind, one of
+                // our bridge ports — rows and replacements can never claim
+                // these: reserved-range validation plus the
+                // replacement-vs-bridge conflict below): probing it would
+                // fail on our own hold, so it skips the probe outright.
+                if normalize_bind_key(bind) == "loopback" && bridge_ports.contains(port) {
+                    continue;
+                }
+                match probe_bind_available(bind, *port) {
+                    Ok(listener) => probe_holds.push(listener),
+                    Err(_) => {
+                        let error = EngineError::PortUnavailable {
+                            bind: bind.clone(),
+                            port: *port,
+                            name: name.clone(),
+                        };
+                        self.last_error = Some(error.to_string());
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -7364,6 +7708,8 @@ impl EngineController {
             }
         }
         // Ticket 27: every extra slot checks its own passed-through config.
+        // A missing generation skips its slot only (`continue` — a `break`
+        // would silently skip every later slot's check).
         for (slot, gen) in self.extra_backends.iter_mut().zip(extra_gens.iter()) {
             if let Some(json) = gen {
                 if let Err(detail) = slot.check_config(json) {
@@ -7375,7 +7721,7 @@ impl EngineController {
                     return Err(error);
                 }
             } else {
-                break;
+                continue;
             }
         }
         // Restart only populated sidecars; empty subsets stay down. Each
@@ -7388,6 +7734,16 @@ impl EngineController {
                 slot.clear_extra_exe();
             }
         }
+        // Holds release here — after every check, before any spawn. The
+        // sidecars bind their own inbounds/ingress/controllers at spawn, so
+        // a hold kept a moment longer would collide with the very process
+        // it reserved for. The drop→bind window is one syscall wide per
+        // port (nothing runs between them but the spawn itself). The
+        // process-wide reservation window releases with the holds.
+        drop(probe_holds);
+        drop(bridge_holds);
+        drop(clash_holds);
+        drop(port_window_guard);
         // Ticket 23 HIGH: a failed spawn rolls the shards this apply touched
         // back to their previously served configs (snapshot below) instead of
         // leaving a split brain — some shards on the new set, one shard down.
@@ -7473,14 +7829,21 @@ impl EngineController {
             // shards whose new spawn just failed (the failure may be
             // transient; a persistent failure just leaves that shard down,
             // still truthful, never half-serving). Shards already stopped
-            // with no previous config stay down.
+            // with no previous config stay down. Rollback failures are
+            // surfaced (never `Err(_)`-discarded: a failed rollback is a
+            // split brain the caller must see).
+            let mut rollback_errors: Vec<String> = Vec::new();
             for (index, prev) in prev_served.clone().into_iter().enumerate() {
                 let backend = self.backend_at(index);
                 backend.stop();
                 match prev {
                     Some(prev) => match backend.start(&prev) {
                         Ok(()) => self.served[index] = Some(prev),
-                        Err(_) => self.served[index] = None,
+                        Err(error) => {
+                            self.served[index] = None;
+                            rollback_errors
+                                .push(format!("rollback {} failed: {error}", SHARDS[index]));
+                        }
                     },
                     None => self.served[index] = None,
                 }
@@ -7496,10 +7859,12 @@ impl EngineController {
                                     self.served_extra[index] = Some(prev);
                                 }
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 if index < self.served_extra.len() {
                                     self.served_extra[index] = None;
                                 }
+                                rollback_errors
+                                    .push(format!("rollback extra-{index} failed: {error}"));
                             }
                         },
                         None => {
@@ -7510,11 +7875,14 @@ impl EngineController {
                     }
                 }
             }
-            let detail = failures
+            let mut detail = failures
                 .iter()
                 .map(|(shard, error)| format!("{shard}: {error}"))
                 .collect::<Vec<_>>()
                 .join("; ");
+            if !rollback_errors.is_empty() {
+                detail = format!("{detail}; {}", rollback_errors.join("; "));
+            }
             self.last_error = Some(detail);
             let (_, first) = failures.into_iter().next().expect("failures non-empty");
             // Ticket 36: controllers follow the restored served set.
@@ -7718,10 +8086,11 @@ impl EngineController {
                 .is_some_and(|slot| slot.is_running());
         }
         if is_custom_config_protocol(&row.protocol) {
-            let core = params_object(row)
-                .ok()
-                .and_then(|params| owning_core_of(&row.name, &params).ok())
-                .unwrap_or(OwningCore::Stock);
+            // Unreadable rows fail closed (never reported running on a
+            // shard they cannot be attributed to).
+            let Some(core) = Self::custom_core_of(row) else {
+                return false;
+            };
             return match core {
                 OwningCore::Stock => self.backend.is_running(),
                 OwningCore::Fork => self.fork_backend.is_running(),
@@ -7732,10 +8101,9 @@ impl EngineController {
             return self.xray_backend.is_running();
         }
         if is_custom_outbound_protocol(&row.protocol) {
-            let core = params_object(row)
-                .ok()
-                .and_then(|params| owning_core_of(&row.name, &params).ok())
-                .unwrap_or(OwningCore::Stock);
+            let Some(core) = Self::custom_core_of(row) else {
+                return false;
+            };
             return match core {
                 OwningCore::Stock => self.backend.is_running(),
                 OwningCore::Fork => self.fork_backend.is_running(),
@@ -7811,10 +8179,20 @@ impl EngineController {
 }
 
 /// True for loopback literals (spec: default bind; anything else is an
-/// explicit LAN exposure). Unparseable input warns rather than serves
-/// silently.
+/// explicit LAN exposure). `localhost` (any case) counts as loopback so the
+/// save gate, the start gate, and the LAN-confirm gate agree (ticket A1:
+/// `normalize_bind_key` already folds it to `loopback`; this was the odd one
+/// out). Unparseable input warns rather than serves silently.
 pub fn is_loopback_bind(bind: &str) -> bool {
-    bind.trim()
+    let trimmed = bind.trim();
+    if trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed
+            .strip_suffix('.')
+            .is_some_and(|bare| bare.eq_ignore_ascii_case("localhost"))
+    {
+        return true;
+    }
+    trimmed
         .parse::<std::net::IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
@@ -8096,25 +8474,38 @@ mod tests {
     /// port (the test listener stands in for our own sidecar's hold), and
     /// stopping one of two served rows works too. A genuinely foreign
     /// holder on a NEW port still fails typed.
+    /// Ports are ephemeral (loopback `:0` picks), never fixed: fixed ports
+    /// flake under parallel suites when a sibling test holds the same port.
     #[test]
     fn ticket36_reapply_skips_own_served_ports() {
+        fn free_port() -> u16 {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("probe bind works")
+                .local_addr()
+                .expect("addr works")
+                .port()
+        }
         let (mut controller, _stock, _fork) = EngineController::fake_pair();
+        let first_port = free_port();
         let rows = vec![fixture(
             "1",
             "Alpha",
             "shadowsocks",
             ss_params("pass1"),
             "127.0.0.1",
-            18411,
+            first_port,
         )];
         controller.start_all(&rows).expect("first start works");
         // A real hold on the served port (standing in for our own
-        // sidecar's socket): the re-apply must recognize its own ports
-        // and skip them instead of crying foreign-holder.
-        let held = std::net::TcpListener::bind("127.0.0.1:18411").expect("holds 18411");
+        // sidecar's socket, which the fake backend never binds): the
+        // re-apply must recognize its own ports and skip them instead of
+        // crying foreign-holder.
+        let held =
+            std::net::TcpListener::bind(format!("127.0.0.1:{first_port}")).expect("holds port");
         controller
             .start_all(&rows)
             .expect("re-apply skips own ports");
+        let second_port = free_port();
         let two = vec![
             fixture(
                 "1",
@@ -8122,7 +8513,7 @@ mod tests {
                 "shadowsocks",
                 ss_params("pass1"),
                 "127.0.0.1",
-                18411,
+                first_port,
             ),
             fixture(
                 "2",
@@ -8130,30 +8521,32 @@ mod tests {
                 "shadowsocks",
                 ss_params("pass2"),
                 "127.0.0.1",
-                18412,
+                second_port,
             ),
         ];
         controller.start_all(&two).expect("second row starts");
         assert!(controller.stop_one("1"), "stop one of two works");
         assert!(controller.is_running("2"), "other row keeps serving");
         // A genuinely foreign hold on a NEW port still fails typed.
-        let _foreign = std::net::TcpListener::bind("127.0.0.1:18413").expect("holds 18413");
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").expect("holds a port");
+        let blocked_port = foreign.local_addr().expect("addr works").port();
         let blocked = vec![fixture(
             "9",
             "Blocked",
             "shadowsocks",
             ss_params("pass9"),
             "127.0.0.1",
-            18413,
+            blocked_port,
         )];
         let error = controller
             .start_all(&blocked)
             .expect_err("foreign hold fails");
         assert!(
-            error.to_string().contains("18413"),
+            error.to_string().contains(&blocked_port.to_string()),
             "names the port, got {error}"
         );
         drop(held);
+        drop(foreign);
     }
 
     /// Ticket 36 (live): a real stock sing-box 1.14.2 sidecar serves a
@@ -8350,7 +8743,10 @@ mod tests {
                             .starts_with("manyproxy-t36-live-")
                     })
                 })
-                .unwrap_or(true),
+                // Fail closed: an unreadable temp dir proves nothing, so it
+                // must fail the litter check (a vacuous pass would hide
+                // leaked secret files).
+                .unwrap_or(false),
             "no temp litter left"
         );
         result.expect("PROBE live-traffic: clash totals move");
@@ -8655,11 +9051,18 @@ mod tests {
     }
 
     /// Custom binds are allowed but flagged; loopback stays quiet.
+    /// Ticket A1: `localhost` (any case) is loopback everywhere — no LAN
+    /// confirm, no warning, consistent with `normalize_bind_key`.
     #[test]
     fn lan_warning_only_for_non_loopback() {
         assert!(is_loopback_bind("127.0.0.1"));
         assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind("LocalHost"));
         assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!requires_lan_confirm("localhost"));
+        assert!(!requires_lan_confirm("127.0.0.1"));
+        assert!(requires_lan_confirm("0.0.0.0"));
         assert!(lan_exposure_warning("A", "127.0.0.1").is_none());
         let warning = lan_exposure_warning("B", "0.0.0.0").expect("LAN warns");
         assert!(warning.contains("\"B\""), "names config: {warning}");
@@ -8791,6 +9194,7 @@ mod tests {
     #[test]
     fn missing_binaries_state_never_downloads() {
         let stock = EngineError::MissingBinary {
+            binary: engine_binary_file_name(),
             searched: "app-dir + PATH".to_string(),
         }
         .to_string();
@@ -8825,6 +9229,8 @@ mod tests {
 
     /// Binary resolution searches explicit directories only: no download, no
     /// elevation, and the searched list is reported (empty roots fail typed).
+    /// Ticket A6: the stock error names the EXPECTED FILE plus the dir
+    /// (like the fork/xray/extra variants), so the user knows what to place.
     #[test]
     fn binary_resolution_never_elevates_or_downloads() {
         let error = resolve_engine_binary_in(None, "").expect_err("empty search roots fail");
@@ -8832,7 +9238,51 @@ mod tests {
             matches!(error, EngineError::MissingBinary { .. }),
             "typed failure, got {error}"
         );
-        assert!(!error.to_string().is_empty());
+        let text = error.to_string();
+        assert!(
+            text.contains(&engine_binary_file_name()),
+            "names expected file, got {text}"
+        );
+        assert!(
+            text.contains("no app directory"),
+            "names searched dir, got {text}"
+        );
+    }
+
+    /// Ticket A6: `is_executable` pins — missing paths and directories are
+    /// false everywhere; a plain existing file is true on Windows (no exec
+    /// bit to consult — the `.exe` association + ACLs decide launch).
+    #[test]
+    fn a6_executable_bit_behavior_pinned() {
+        assert!(!is_executable(Path::new(
+            "C:\\definitely-not-here-manyproxy\\nope.exe"
+        )));
+        assert!(!is_executable(&std::env::temp_dir()));
+        let probe =
+            std::env::temp_dir().join(format!("manyproxy-a6-exec-{}.tmp", std::process::id()));
+        std::fs::write(&probe, "probe").expect("probe writes");
+        #[cfg(not(unix))]
+        assert!(is_executable(&probe), "plain file is executable on Windows");
+        #[cfg(unix)]
+        assert!(!is_executable(&probe), "no exec bit on unix probe");
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    /// Ticket A6: the fork probe fails fast (never hangs) on a missing
+    /// binary, and the timeout seam reports a hung spawn as a timeout.
+    #[test]
+    fn a6_fork_probe_never_hangs() {
+        let missing = Path::new("C:\\definitely-not-here-manyproxy\\fork.exe");
+        let error = probe_fork_version_with_timeout(missing, std::time::Duration::from_secs(5))
+            .expect_err("missing binary fails");
+        assert!(
+            error.contains("fork version probe failed"),
+            "named failure, got {error}"
+        );
+        assert!(
+            !error.contains("timed out"),
+            "missing is fast-fail, not timeout: {error}"
+        );
     }
 
     /// Empty activation set is a typed error, not an empty engine config.
@@ -10231,6 +10681,7 @@ mod tests {
         let (mut controller, stock, fork, xray, extra) = EngineController::fake_quartet();
         controller.set_stock_probe(|| {
             Err(EngineError::MissingBinary {
+                binary: engine_binary_file_name(),
                 searched: "test-seam (no stock binary)".to_string(),
             })
         });
@@ -11056,6 +11507,26 @@ mod tests {
             "no escape codes: {text:?}"
         );
         assert!(!text.contains("[31m"), "no SGR residue: {text}");
+    }
+
+    /// Ticket A7: `check` stderr is untrusted — secrets echoing in it are
+    /// redacted in the surfaced error (strip-then-redact order; the UUID
+    /// never reaches the toast even wrapped in ANSI color).
+    #[test]
+    fn a7_check_failed_redacts_stderr_secrets() {
+        let error = EngineError::CheckFailed {
+            detail: t29_ansi(
+                "[ESC][31mFATAL[ESC][0m password=hunter2 uuid 11111111-2222-4333-8444-555555555555",
+            ),
+        };
+        let text = error.to_string();
+        assert!(text.contains("FATAL"), "text kept: {text}");
+        assert!(!text.contains("hunter2"), "password redacted: {text}");
+        assert!(!text.contains("11111111-2222"), "uuid redacted: {text}");
+        assert!(
+            !text.contains(char::from(27u8)),
+            "no escape codes: {text:?}"
+        );
     }
 
     /// Scenario 3 end to end: an ANSI-colored `check` failure from any
@@ -11911,6 +12382,7 @@ Active Connections\r
                 second: "B".to_string(),
             },
             EngineError::MissingBinary {
+                binary: engine_binary_file_name(),
                 searched: "dir".to_string(),
             },
             EngineError::LanConfirmRequired {
@@ -12640,9 +13112,14 @@ Active Connections\r
     /// slot), a real sleeping child dies fast via `stop_child` (buffer
     /// cleared, generation fenced), and `drain_log_lines` takes the
     /// producer's buffered lines. No sing-box, loopback only.
+    /// Live-gated: spawns real OS processes (`cmd.exe`), so it runs only
+    /// with `MANYPROXY_LIVE_CHECK=1` like every other real-process proof.
     #[cfg(windows)]
     #[test]
     fn t48_stub_executable_lifecycle() {
+        if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
+            return;
+        }
         use std::io::BufRead as _;
 
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());

@@ -1,0 +1,359 @@
+{
+  "components": [
+    {
+      "css": ".ds-btn-primary { background: #171717; color: #fafafa; border: none; border-radius: 6px; padding: 6px 12px; font-size: 1rem; line-height: 1.25; cursor: pointer; } .ds-btn-primary:hover { background: #262626; } .ds-btn-primary:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; } .ds-btn-primary:active { background: #0a0a0a; }",
+      "description": "The constructive commitment button: Add and Start. Short visible labels; the full Name (Key) string rides the accessible name, tooltip, and Kbd chip. Loading pairs the in-flight label with an inline spinner; actions never render disabled — they stay enabled with an honest toast.",
+      "html": "<button class=\"ds-btn-primary\">Start</button>",
+      "kind": "button",
+      "name": "Primary Button",
+      "refersTo": "button-primary"
+    },
+    {
+      "css": ".ds-btn-danger { background: #ef4444; color: #ffffff; border: none; border-radius: 6px; padding: 6px 12px; font-size: 0.875rem; line-height: 1.25; cursor: pointer; } .ds-btn-danger:hover { background: #dc2626; } .ds-btn-danger:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }",
+      "description": "Destructive confirms only. The row-menu Delete gates through a naming confirm instead of carrying danger styling (menu items cannot carry button danger styles).",
+      "html": "<button class=\"ds-btn-danger\">Delete</button>",
+      "kind": "button",
+      "name": "Danger Button",
+      "refersTo": "button-danger"
+    },
+    {
+      "css": ".ds-row-card { background: #f5f5f5; border: 1px solid #e5e5e5; border-radius: 6px; padding: 4px 8px; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; } .ds-row-card:hover { background: #f5f5f5; border-color: #d4d4d4; } .ds-row-card.selected { background: #bfdbfe33; border-color: #60a5fa; } .ds-row-card.checked { border: 2px solid #60a5fa; } .ds-row-lamp { width: 6px; height: 6px; border-radius: 9999px; background: #737373; } .ds-row-lamp.running { background: #22c55e; } .ds-row-lamp.dead { background: #ef4444; } .ds-row-name { font-size: 1rem; line-height: 1.25; color: #0a0a0a; } .ds-row-meta { font-size: 0.875rem; line-height: 1.25; color: #737373; } .ds-row-badge-running { font-size: 0.875rem; color: #16a34a; } .ds-row-badge-stopped { font-size: 0.875rem; color: #737373; } .ds-check-chip { display: inline-block; font-size: 0.875rem; color: #60a5fa; border: 1px solid #60a5fa; border-radius: 9999px; padding: 0 4px; }",
+      "description": "The signal-box track circuit: occupancy lamp (fixed leading cell, flat fill — green serving, red dead-while-serving, dark stopped) plus checkbox plus name; numeral check chip beside the name while checked; muted meta line; serving-color badge line. Wash marks selection only; a 2px accent rim marks the checked set; a row both checked and selected shows both.",
+      "html": "<div class=\"ds-row-card checked\"><div><span class=\"ds-row-lamp running\"></span><span class=\"ds-row-name\">p-france-paris-p1</span><span class=\"ds-check-chip\">2</span></div><div class=\"ds-row-meta\">amneziawg &middot; 81.171.72.134:51820 &middot; europe &middot; bind 127.0.0.1:10802 &middot; enabled</div><div class=\"ds-row-badge-running\">&#9679; Running :10802</div></div>",
+      "kind": "card",
+      "name": "Library Row Card",
+      "refersTo": "row-card"
+    },
+    {
+      "css": ".ds-lever-frame { display: flex; align-items: center; gap: 8px; background: #f5f5f5; border: 1px solid #e5e5e5; border-radius: 6px; padding: 4px; }",
+      "description": "The lever frame: five persistent throws (Add, Start, Stop, Test, Import) on one plate — group_box ground, hairline rim, theme radius, separators guarding the throws inside and the frame edge outside. Library / Manage / Engine / Help menus carry the rest.",
+      "html": "<div class=\"ds-lever-frame\"><button class=\"ds-btn-primary\">Add</button><button class=\"ds-btn-primary\">Start</button><button>Stop</button><button>Test</button><button>Import</button></div>",
+      "kind": "toolbar",
+      "name": "Lever Frame Toolbar",
+      "refersTo": "button-primary"
+    },
+    {
+      "css": ".ds-operate-row { display: flex; align-items: center; gap: 8px; } .ds-operate-row .menu-trigger { border: 1px solid #e5e5e5; border-radius: 6px; padding: 2px 8px; font-size: 0.875rem; }",
+      "description": "The single operate row: Enabled switch plus six inline small ops (Start, Stop, Test, Ping, Logs, Copy URLs) plus the Row menu trigger. Edit, Delete, Duplicate, Reset traffic, and Reset usage hide behind the Row menu with stable ids on custom elements.",
+      "html": "<div class=\"ds-operate-row\"><span>Enabled</span><button>Start</button><button>Stop</button><button>Test</button><button>Ping</button><button>Logs</button><button>Copy URLs</button><button class=\"menu-trigger\">Row</button></div>",
+      "kind": "toolbar",
+      "name": "Detail Operate Row",
+      "refersTo": "row-card"
+    },
+    {
+      "css": ".ds-endpoint-row { display: flex; flex-direction: column; } .ds-endpoint-label { font-size: 0.875rem; color: #737373; } .ds-endpoint-value { display: flex; align-items: center; gap: 8px; font-size: 1rem; color: #0a0a0a; } .ds-endpoint-copy { font-size: 0.875rem; border: 1px solid #e5e5e5; border-radius: 6px; padding: 2px 8px; }",
+      "description": "One labeled endpoint row: description-label token over the value, with a small per-row Copy beside the SOCKS and HTTP values (bind plus port only, never secrets). Upstream stays display-only.",
+      "html": "<div class=\"ds-endpoint-row\"><div class=\"ds-endpoint-label\">SOCKS</div><div class=\"ds-endpoint-value\">socks5://127.0.0.1:10802 <button class=\"ds-endpoint-copy\">Copy SOCKS</button></div></div>",
+      "kind": "card",
+      "name": "Endpoint Row",
+      "refersTo": "row-card"
+    },
+    {
+      "css": ".ds-tag { display: inline-block; background: #f5f5f5; color: #171717; border: 1px solid #e5e5e5; border-radius: 6px; padding: 1px 8px; font-size: 0.875rem; line-height: 1.25; }",
+      "description": "Read-only labels for protocol and group in the detail header, beside the Acting on: <name> echo and the serving Badge.",
+      "html": "<span class=\"ds-tag\">amneziawg</span> <span class=\"ds-tag\">europe</span>",
+      "kind": "chip",
+      "name": "Tag Chip",
+      "refersTo": "row-card"
+    },
+    {
+      "css": ".ds-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.875rem; color: #0a0a0a; } .ds-badge .dot { width: 6px; height: 6px; border-radius: 9999px; background: #737373; } .ds-badge.running .dot { background: #22c55e; } .ds-badge.failed .dot { background: #ef4444; }",
+      "description": "Serving line with state dot: gray stopped (secondary), green serving (success), red failed (danger). The detail health line reads health: never tested — press Test to check until the first probe; the status bar keeps the short health: never tested describer.",
+      "html": "<span class=\"ds-badge running\"><span class=\"dot\"></span>&#9679; Running :10802</span>",
+      "kind": "chip",
+      "name": "Serving Badge",
+      "refersTo": "row-selected"
+    },
+    {
+      "css": ".ds-input { background: #ffffff; color: #0a0a0a; border: 1px solid #e5e5e5; border-radius: 6px; padding: 6px 8px; font-size: 1rem; line-height: 1.25; width: 100%; } .ds-input::placeholder { color: #737373; } .ds-input:focus { outline: none; border-color: #60a5fa; } .ds-guided-hint { font-size: 0.875rem; color: #737373; }",
+      "description": "Stacked label-over-field inputs in every dialog. Add opens guided-first (Server, Server-port, Identity plus a one-clause hint); JSON is an Advanced disclosure. Validation keeps the dialog open with inline errors; params errors auto-expand Advanced.",
+      "html": "<input class=\"ds-input\" placeholder=\"Upstream server\" />",
+      "kind": "input",
+      "name": "Text Input",
+      "refersTo": "row-card"
+    },
+    {
+      "css": ".ds-kbd { display: inline-block; background: #f5f5f5; color: #404040; border: 1px solid #e5e5e5; border-radius: 9999px; padding: 0 6px; font-size: 0.75rem; line-height: 1.5; font-family: system-ui, sans-serif; }",
+      "description": "Shortcut hints riding on bound buttons only (Add, Start, Stop, Test, Import). Unbound menu items carry no Kbd chips — a hint without a binding would be a lie.",
+      "html": "<span class=\"ds-kbd\">F5</span>",
+      "kind": "chip",
+      "name": "Shortcut Chip",
+      "refersTo": "button-primary"
+    },
+    {
+      "css": ".ds-empty-ctas { display: flex; align-items: center; justify-content: center; gap: 8px; } .ds-drop-hint { font-size: 0.875rem; color: #737373; } .ds-drop-hint.blocked { opacity: 0.45; }",
+      "description": "Empty-library next step: working Add and Import buttons beside the empty copy (counts 0,0; usage absent-or-zero). The always-visible drop hint dims to 0.45 theme opacity while a dialog blocks drops.",
+      "html": "<div class=\"ds-empty-ctas\"><button>Add configuration</button><button>Import configurations</button></div>",
+      "kind": "empty",
+      "name": "Empty State CTAs",
+      "refersTo": "row-card"
+    }
+  ],
+  "extensions": {
+    "breakpoints": [],
+    "colorMeta": {
+      "chrome-band": {
+        "canonical": "#F8F8F8",
+        "displayName": "Chrome Band",
+        "role": "neutral",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#f5f5f5"
+        ]
+      },
+      "hairline": {
+        "canonical": "#e5e5e5",
+        "displayName": "Hairline",
+        "role": "neutral",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#f5f5f5"
+        ]
+      },
+      "ink": {
+        "canonical": "#0a0a0a",
+        "displayName": "Working Ink",
+        "role": "neutral",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#f5f5f5"
+        ]
+      },
+      "muted-ink": {
+        "canonical": "#737373",
+        "displayName": "Muted Ink",
+        "role": "neutral",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#f5f5f5"
+        ]
+      },
+      "paper": {
+        "canonical": "#ffffff",
+        "displayName": "Paper White",
+        "role": "neutral",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#e5e5e5",
+          "#ffffff"
+        ]
+      },
+      "primary-ink": {
+        "canonical": "#171717",
+        "displayName": "Switchboard Ink",
+        "role": "primary",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#f5f5f5"
+        ]
+      },
+      "primary-ink-foreground": {
+        "canonical": "#fafafa",
+        "displayName": "Paper Text",
+        "role": "primary",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#fafafa"
+        ]
+      },
+      "primary-ink-hover": {
+        "canonical": "#262626",
+        "displayName": "Ink Hover",
+        "role": "primary",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#f5f5f5"
+        ]
+      },
+      "quiet-surface": {
+        "canonical": "#f5f5f5",
+        "displayName": "Quiet Surface",
+        "role": "neutral",
+        "tonalRamp": [
+          "#0a0a0a",
+          "#262626",
+          "#404040",
+          "#525252",
+          "#737373",
+          "#a3a3a3",
+          "#d4d4d4",
+          "#f5f5f5"
+        ]
+      },
+      "selection-rim": {
+        "canonical": "#60a5fa",
+        "displayName": "Selection Rim",
+        "role": "neutral",
+        "tonalRamp": [
+          "#172554",
+          "#1e3a8a",
+          "#1e40af",
+          "#1d4ed8",
+          "#2563eb",
+          "#3b82f6",
+          "#60a5fa",
+          "#bfdbfe"
+        ]
+      },
+      "selection-wash": {
+        "canonical": "#bfdbfe33",
+        "displayName": "Selection Wash",
+        "role": "neutral",
+        "tonalRamp": [
+          "#172554",
+          "#1e3a8a",
+          "#1e40af",
+          "#1d4ed8",
+          "#2563eb",
+          "#3b82f6",
+          "#60a5fa",
+          "#bfdbfe"
+        ]
+      },
+      "signal-go": {
+        "canonical": "#22c55e",
+        "displayName": "Serving Green",
+        "role": "neutral",
+        "tonalRamp": [
+          "#052e16",
+          "#14532d",
+          "#166534",
+          "#15803d",
+          "#16a34a",
+          "#22c55e",
+          "#4ade80",
+          "#bbf7d0"
+        ]
+      },
+      "signal-stop": {
+        "canonical": "#ef4444",
+        "displayName": "Alarm Red",
+        "role": "neutral",
+        "tonalRamp": [
+          "#450a0a",
+          "#7f1d1d",
+          "#991b1b",
+          "#b91c1c",
+          "#dc2626",
+          "#ef4444",
+          "#f87171",
+          "#fecaca"
+        ]
+      }
+    },
+    "motion": [],
+    "shadows": [],
+    "typographyMeta": {
+      "body": {
+        "displayName": "Body",
+        "purpose": "Row names, dialog titles, button labels, endpoint values."
+      },
+      "small": {
+        "displayName": "Small",
+        "purpose": "Row metadata, serving badges, hints, status bar, filters."
+      }
+    }
+  },
+  "generatedAt": "2026-10-05",
+  "narrative": {
+    "dos": [
+      "Do build new rows, bars, and panes from theme tokens (border, group_box, list_active, muted_foreground, danger, success) so light-theme changes propagate.",
+      "Do keep shortcut hints visible on buttons and full `Name (Key)` strings on accessible names and tooltips.",
+      "Do name affected rows in confirms, failures, and toasts — honesty is the brand voice.",
+      "Do keep the serving badge, dot, and detail Badge in agreement: green serving, red dead/failed, gray stopped.",
+      "Do preserve all control states when restyling: default, hover, focus, active, disabled, loading, error, empty."
+    ],
+    "donts": [
+      "Don't introduce display type, gradient text, glass, emoji icons, or shadows — the world is plain, flat, and unadorned by decision.",
+      "Don't spend color on decoration; blue is selection-only, green/red are state-only, black is primary-action-only.",
+      "Don't add a third text size or a second corner radius without replacing the system, not extending it.",
+      "Don't turn confirm dialogs into silent actions or collapse per-item import failures into a single toast.",
+      "Don't surface secrets: copy, logs, URLs, and search matching stay clear of credential fields."
+    ],
+    "keyCharacteristics": [
+      "Ink on paper: near-black on white, quiet gray surfaces, hairline separators.",
+      "Signal-only color: blue marks selection, green/red mark serving state, black marks primary action.",
+      "Two-size type: names at base, metadata and status at small.",
+      "Flat hairline surfaces with a single 6px radius; pills only for dots and key chips.",
+      "Ledger-density rows with full default/hover/selected/loading/error/empty states."
+    ],
+    "northStar": "The Honest Switchboard",
+    "overview": "ManyProxy looks like the instrument it is: a plain, dense ledger of proxy endpoints where every row, badge, and toast reads as a labeled entry and nothing is unaccounted for. Surfaces stay paper-white and quiet gray; near-black ink carries names and actions; color appears only where it carries meaning. There is one typeface, two text sizes, one corner radius, and zero shadows. Every control names its action in a tooltip, every shortcut rides visibly on its button, and every consequential step confirms by naming the affected rows.",
+    "rules": [
+      {
+        "body": "Color marks primary actions, current selection, and serving state — never decoration.",
+        "name": "The Signal-Only Rule",
+        "section": "colors"
+      },
+      {
+        "body": "Names at base, metadata and status at small. No third size and no display faces in UI.",
+        "name": "The Two-Size Rule",
+        "section": "typography"
+      },
+      {
+        "body": "Crowded action sets wrap to a second row; panes scroll vertically only.",
+        "name": "The No-Sideways-Scroll Rule",
+        "section": "layout"
+      },
+      {
+        "body": "Surfaces are flat at rest. Separation comes from hairlines and tonal bands.",
+        "name": "The Flat-By-Default Rule",
+        "section": "elevation"
+      },
+      {
+        "body": "6px on cards, fields, and buttons; pills only for dots, key chips, and small controls.",
+        "name": "The One-Radius Rule",
+        "section": "shapes"
+      }
+    ]
+  },
+  "schemaVersion": 2,
+  "title": "Design System: ManyProxy"
+}

@@ -104,9 +104,25 @@ pub struct RemotePresetRequest {
     pub name: String,
 }
 
-fn cap_name(name: String) -> String {
+fn fnv1a_64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+pub(crate) fn cap_name(name: String) -> String {
     if name.chars().count() > MAX_PRESET_NAME_CHARS {
-        name.chars().take(MAX_PRESET_NAME_CHARS).collect()
+        // Overlong names keep uniqueness with a hash suffix instead of a
+        // bare truncation (two names sharing a 256-char prefix would
+        // otherwise collide into one stored preset).
+        let suffix = format!("-{:016x}", fnv1a_64(&name));
+        let keep = MAX_PRESET_NAME_CHARS.saturating_sub(suffix.len());
+        let mut truncated: String = name.chars().take(keep).collect();
+        truncated.push_str(&suffix);
+        truncated
     } else {
         name
     }
@@ -152,13 +168,19 @@ pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
             ));
         }
         // Ticket 42: `proxy` aliases `route` (both point at the row's
-        // serving tag at merge).
+        // serving tag at merge). The `outbound` rule mirrors the engine
+        // merge: route-like actions may carry a string `outbound`
+        // (overwritten with the serving tag at merge); every other action
+        // must not carry one (the merge rejects it — intake must too,
+        // never a late failure after the preset stored).
         if action == "route" || action == "proxy" {
             if let Some(outbound) = obj.get("outbound") {
                 if !outbound.is_string() {
                     return Err(bad_rule(index, "field \"outbound\" must be a string"));
                 }
             }
+        } else if obj.contains_key("outbound") {
+            return Err(bad_rule(index, "field \"outbound\" needs action \"route\""));
         }
     }
     Ok(())
@@ -278,20 +300,32 @@ pub fn parse_preset_json(text: &str, default_name: &str) -> Result<PresetImport,
 /// endpoint path.
 pub fn looks_like_preset_json(text: &str) -> bool {
     let trimmed = strip_preset_bom(text.trim()).trim();
-    if !trimmed.starts_with('{') {
-        return false;
-    }
-    match serde_json::from_str::<Value>(trimmed) {
-        Ok(Value::Object(map)) => {
-            map.get("rules").is_some_and(|rules| rules.is_array())
-                && !map.contains_key("outbounds")
-                && !map.contains_key("type")
-                && !map.contains_key("protocol")
-                && !map.contains_key("servers")
-                && !map.contains_key("proxies")
-                && !map.contains_key("library")
+    if trimmed.starts_with('{') {
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Object(map)) => {
+                map.get("rules").is_some_and(|rules| rules.is_array())
+                    && !map.contains_key("outbounds")
+                    && !map.contains_key("type")
+                    && !map.contains_key("protocol")
+                    && !map.contains_key("servers")
+                    && !map.contains_key("proxies")
+                    && !map.contains_key("library")
+            }
+            _ => false,
         }
-        _ => false,
+    } else if trimmed.starts_with('[') {
+        // A bare rules array (the parser names it by the file stem): every
+        // element must be an object carrying an `action` string. Anything
+        // else (endpoint batches, link lists) stays on the endpoint path.
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Array(items)) if !items.is_empty() => items.iter().all(|item| {
+                item.as_object()
+                    .is_some_and(|obj| obj.get("action").is_some_and(Value::is_string))
+            }),
+            _ => false,
+        }
+    } else {
+        false
     }
 }
 
@@ -428,37 +462,49 @@ pub fn decode_route_link(line: &str) -> Result<PresetImport, PresetError> {
 /// classifier lives here too instead of importing the store.
 fn is_internal_host(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
-    if lower == "localhost" {
+    let bare = lower.strip_suffix('.').unwrap_or(&lower);
+    if bare == "localhost" || bare.ends_with(".localhost") {
         return true;
     }
-    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         match ip {
-            std::net::IpAddr::V4(v4) => {
-                let octets = v4.octets();
-                v4.is_loopback()
-                    || v4.is_unspecified()
-                    || v4.is_link_local()
-                    || octets[0] == 10
-                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-                    || (octets[0] == 192 && octets[1] == 168)
-                    || octets[0] == 127
-            }
+            std::net::IpAddr::V4(v4) => return is_internal_v4(&v4),
             std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
+                // IPv4-mapped forms (`::ffff:127.0.0.1`) carry an IPv4
+                // loopback/private address — judge the mapped address,
+                // never the wrapper. (`to_ipv4_mapped`, not `to_ipv4`:
+                // the latter also maps `::1` to `0.0.0.1`, which would
+                // slip the loopback gate.)
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    return is_internal_v4(&mapped);
+                }
+                let segments = v6.segments();
+                return v6.is_loopback()
                     || v6.is_unspecified()
                     || v6.is_multicast()
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (segments[0] & 0xffc0) == 0xfe80
+                    || (segments[0] & 0xfe00) == 0xfc00;
             }
         }
-    } else {
-        false
     }
+    false
 }
 
-/// Decode `throne://remoteroute/<standard-base64 of "<url>[#name]">`. The URL
-/// must be `http(s)` and must not target an internal host (same SSRF guard
-/// as subscription intake); the name falls back to the URL host.
+fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_unspecified()
+        || v4.is_link_local()
+        || octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+        || octets[0] == 127
+}
+
+/// Decode `throne://remoteroute/<base64 of "<url>[#name]">` (standard or
+/// urlsafe alphabet, like the route link). The URL must be `http(s)` and
+/// must not target an internal host (same SSRF guard as subscription
+/// intake); the name falls back to the URL host.
 pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, PresetError> {
     let (command, payload) = split_throne_command(line)?;
     if !command.eq_ignore_ascii_case("remoteroute") {
@@ -467,7 +513,13 @@ pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, Prese
             "not a remote route preset link",
         ));
     }
-    let bytes = decode_std_b64(payload)?;
+    let bytes = match decode_std_b64(payload) {
+        Ok(bytes) => bytes,
+        Err(std_error) => match decode_urlsafe_b64(payload) {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(std_error),
+        },
+    };
     let inner = String::from_utf8(bytes)
         .map_err(|_| PresetError::new(PresetErrorKind::NonUtf8, "payload is not UTF-8"))?;
     let inner = inner.trim();
@@ -821,14 +873,18 @@ mod tests {
         assert!(!looks_like_preset_json("\u{FEFF}vless://u@h:1"));
     }
 
-    /// Overlong preset names truncate to 256 chars at intake.
+    /// Overlong preset names stay bounded at 256 chars with a hash suffix
+    /// (two names sharing a prefix never collide into one preset).
     #[test]
     fn long_preset_name_truncates_to_256_chars() {
         let long = "a".repeat(300);
         let text = format!(r#"{{"name":"{long}","rules":[]}}"#);
         let parsed = parse_preset_json(&text, "").expect("long name parses");
-        assert_eq!(parsed.name, "a".repeat(256));
         assert_eq!(parsed.name.chars().count(), 256);
+        assert!(parsed.name.starts_with(&"a".repeat(200)), "{parsed:?}");
+        let other = format!(r#"{{"name":"{}b","rules":[]}}"#, "a".repeat(299));
+        let parsed_other = parse_preset_json(&other, "").expect("long name parses");
+        assert_ne!(parsed.name, parsed_other.name, "prefix collision avoided");
     }
 
     /// A remote-route link without `#name` falls back to the URL host.
@@ -839,5 +895,65 @@ mod tests {
             .expect("remote link decodes");
         assert_eq!(request.url, "https://example.com/preset.json");
         assert_eq!(request.name, "example.com");
+    }
+
+    /// Intake mirrors the engine merge: `outbound` needs a route-like
+    /// action (a stored direct/reject rule carrying one would fail at
+    /// serve time instead).
+    #[test]
+    fn non_route_outbound_rejected_at_intake() {
+        for action in ["direct", "reject", "block"] {
+            let error = validate_preset_rules(&[serde_json::json!({
+                "action": action, "outbound": "some-tag",
+            })])
+            .unwrap_err();
+            assert_eq!(error.kind, PresetErrorKind::BadRule);
+            assert!(error.message.contains("\"outbound\""), "{error}");
+        }
+        validate_preset_rules(&[serde_json::json!({
+            "action": "route", "outbound": "some-tag",
+        })])
+        .expect("route may carry outbound");
+    }
+
+    /// Bare rules arrays route to the preset path (objects with actions);
+    /// anything else stays on the endpoint path.
+    #[test]
+    fn bare_array_routes_to_preset_path() {
+        assert!(looks_like_preset_json(r#"[{"action":"direct"}]"#));
+        assert!(!looks_like_preset_json("[]"));
+        assert!(!looks_like_preset_json(r#"["vless://u@h:1"]"#));
+        assert!(!looks_like_preset_json(r#"[{"type":"vless"}]"#));
+        assert!(!looks_like_preset_json("vless://u@h:1"));
+    }
+
+    /// Remote-route links accept the urlsafe alphabet (mirrors route links).
+    #[test]
+    fn remote_route_link_accepts_urlsafe_base64() {
+        use base64::Engine as _;
+        // U+FFFF (bytes EF BF BF) urlsafe-encodes to a chunk containing
+        // `-_`, which standard decoding rejects — deterministically
+        // exercising the urlsafe fallback.
+        let inner = "https://example.com/p.json#\u{FFFF}";
+        let payload = base64::engine::general_purpose::URL_SAFE.encode(inner.as_bytes());
+        assert!(payload.contains('-') || payload.contains('_'));
+        assert!(base64::engine::general_purpose::STANDARD
+            .decode(&payload)
+            .is_err());
+        let request = decode_remote_route_link(&format!("throne://remoteroute/{payload}"))
+            .expect("urlsafe remote link decodes");
+        assert_eq!(request.url, "https://example.com/p.json");
+        assert_eq!(request.name, "\u{FFFF}");
+    }
+
+    /// IPv4-mapped loopback and localhost subdomains never pass the SSRF
+    /// guard (same policy the fetch re-checks).
+    #[test]
+    fn internal_host_blocks_mapped_loopback_and_localhost() {
+        assert!(is_internal_host("::ffff:127.0.0.1"));
+        assert!(is_internal_host("app.localhost"));
+        assert!(is_internal_host("localhost."));
+        assert!(!is_internal_host("example.com"));
+        assert!(!is_internal_host("93.184.216.34"));
     }
 }
