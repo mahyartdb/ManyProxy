@@ -4726,8 +4726,9 @@ pub fn probe_fork_version(binary: &Path) -> Result<String, String> {
     probe_fork_version_with_timeout(binary, FORK_PROBE_TIMEOUT)
 }
 
-/// Ticket A6: fork-probe deadline (also bounds the detached poll threads
-/// behind `poll_clash_targets`-style callers: the probe never outlives it).
+/// Ticket A6: fork-probe deadline for [`probe_fork_version`] (the
+/// `version` subprocess only; clash poll threads carry their own per-core
+/// and total budgets in `health`).
 pub const FORK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Ticket A6: testable core of [`probe_fork_version`] (explicit deadline).
@@ -4741,6 +4742,7 @@ pub fn probe_fork_version_with_timeout(
     use std::io::Read as _;
     let mut child = std::process::Command::new(binary)
         .arg("version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -5667,7 +5669,7 @@ fn is_executable(path: &Path) -> bool {
 /// `localhost`, `::1`, `::ffff:127.0.0.1`; blank means the loopback default)
 /// compare equal so two rows can never claim the same local endpoint under
 /// different spellings. Anything else compares case-insensitively verbatim.
-fn normalize_bind_key(bind: &str) -> String {
+pub(crate) fn normalize_bind_key(bind: &str) -> String {
     match bind.trim().to_ascii_lowercase().as_str() {
         "" | "localhost" | "127.0.0.1" | "::1" | "::ffff:127.0.0.1" => "loopback".to_string(),
         other => other.to_string(),

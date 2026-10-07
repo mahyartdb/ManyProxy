@@ -3254,11 +3254,15 @@ fn already_subscribed_message(label: &str) -> String {
 /// re-check), so a benign host redirecting to loopback/private/link-local
 /// is blocked before any byte is fetched from it. Same-policy hops are
 /// followed (CDN compat) up to a small bound; anything else fails loudly.
+/// Residual risk (honest): DNS is owned by the platform client, so a
+/// hostile host rebinding between hops is invisible here — accepted
+/// because subscription URLs are user-supplied and user-trusted (see the
+/// wiring note on `subscription_fetch_policy_resolved`).
 async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Result<String, String> {
     use futures::AsyncReadExt as _;
-    const MAX_BYTES: usize = 8 * 1024 * 1024;
-    const TIMEOUT_SECS: u64 = 20;
-    const MAX_REDIRECTS: usize = 5;
+    const MAX_BYTES: usize = store::SUBSCRIPTION_MAX_BYTES;
+    const TIMEOUT_SECS: u64 = store::SUBSCRIPTION_TIMEOUT_SECS;
+    const MAX_REDIRECTS: usize = store::SUBSCRIPTION_MAX_REDIRECTS;
     let mut current = url.trim().to_string();
     for _ in 0..=MAX_REDIRECTS {
         match store::subscription_fetch_policy(&current) {

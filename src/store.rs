@@ -230,23 +230,21 @@ pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
     SubscriptionFetchPolicy::Allow
 }
 
-/// Ticket A5: enforced subscription-fetch caps. The async fetch path
-/// enforces these at the socket (size + timeout + redirect hops); the byte
-/// entry [`Store::refresh_with_bytes`] enforces size + UTF-8 again at
-/// ingest, so the 8 MiB / 20 s limits live in code on both sides — never
-/// comment-only.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Ticket A5: enforced subscription-fetch caps. Single source of truth for
+/// the async fetch path (`fetch_subscription_body` enforces all three
+/// inline: size while streaming, timeout per request, redirect hops with a
+/// per-hop policy re-check) and for the byte ingest below
+/// ([`Store::refresh_with_bytes`], size + UTF-8 at ingest). Limits live in
+/// code on both sides — never comment-only.
 pub const SUBSCRIPTION_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Ticket A5: per-fetch network timeout, seconds (enforced by the fetch
 /// path; recorded here so the two sides cannot drift).
-#[cfg_attr(not(test), allow(dead_code))]
 pub const SUBSCRIPTION_TIMEOUT_SECS: u64 = 20;
 /// Ticket A5: redirect hops followed per fetch, each hop re-running
 /// [`subscription_fetch_policy`] (enforced by the fetch path).
-#[cfg_attr(not(test), allow(dead_code))]
 pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
 
-/// Ticket A5: DNS-rebind guard — the fetch-time half of
+/// Ticket A5: DNS-rebind guard — the resolution-time half of
 /// [`subscription_fetch_policy`]. The pure policy blocks literal internal
 /// hosts without DNS; this runs AFTER resolution: a public hostname that
 /// resolves (or re-resolves, e.g. via a redirect target) to a
@@ -254,6 +252,16 @@ pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
 /// name can never smuggle the fetch onto a local service. An empty
 /// resolution fails closed (Block, never fetch blind). Reasons never echo
 /// the URL.
+///
+/// Honest wiring note: the live platform-client fetch path cannot observe
+/// resolved IPs (DNS is owned by the client), so it enforces the literal
+/// per-hop policy instead and this helper pins the contract for any
+/// fetch path with visible resolution (plus the tests below). A hostile
+/// subscription host could still rebind between hops invisible to the
+/// client — accepted residual risk: subscription URLs are user-supplied
+/// and user-trusted, refreshes keep last-good members on failure, and the
+/// loopback services reachable that way speak proxy protocols, not the
+/// plain-GET the fetch issues.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn subscription_fetch_policy_resolved(
     url: &str,
@@ -822,7 +830,7 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
         return Some(DEFAULT_BIND.to_string());
     }
     if trimmed.eq_ignore_ascii_case("localhost") {
-        return Some(trimmed.to_string());
+        return Some("localhost".to_string());
     }
     match trimmed.parse::<IpAddr>() {
         Ok(_) => Some(trimmed.to_string()),
@@ -3742,7 +3750,10 @@ impl Store {
     /// Ticket A5: byte-level ingest — enforces [`SUBSCRIPTION_MAX_BYTES`]
     /// and UTF-8 before parsing, so oversize/non-text bodies keep the
     /// last-good members and record `last_error` instead of growing us
-    /// without bound. Reasons never echo body bytes.
+    /// without bound. Reasons never echo body bytes. (The live fetch
+    /// enforces the same two caps inline while streaming — the platform
+    /// client owns that socket — so this is the ingest-side half for
+    /// byte callers; both halves share the constants above.)
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn refresh_with_bytes(
         &mut self,
@@ -4798,12 +4809,15 @@ impl Store {
         }
         // Ticket A3: duplicate bind:port on the restore path fails loudly
         // (two rows can never claim one endpoint; activation would refuse
-        // it later — fail at restore instead).
+        // it later — fail at restore instead). Keys fold through the same
+        // loopback-alias canonicalization as activation
+        // (`normalize_bind_key`), so `127.0.0.1`, `localhost`, and `::1`
+        // compare equal here exactly as they do at start time.
         {
             let mut seen: std::collections::HashSet<(String, i64)> =
                 std::collections::HashSet::new();
             for (index, row) in rows.iter().enumerate() {
-                let key = (row.bind_ip.trim().to_ascii_lowercase(), row.port);
+                let key = (crate::engine::normalize_bind_key(&row.bind_ip), row.port);
                 if !seen.insert(key.clone()) {
                     return Err(invalid(format!(
                         "library[{index}] duplicates bind:port {}:{}",
@@ -7857,6 +7871,21 @@ mod tests {
                 matches!(error, StoreError::Invalid(_)),
                 "Invalid, got {error}"
             );
+            assert!(error.to_string().contains("duplicates"), "got {error}");
+            assert!(store.list().expect("list works").is_empty());
+        }
+        // Loopback aliases compare equal (review: `127.0.0.1`, `localhost`,
+        // `::1` claim one endpoint at activation, so restore refuses them).
+        for alias in ["localhost", "::1", "LOCALHOST", " 127.0.0.1 "] {
+            let mut second = valid_entry();
+            second["id"] = serde_json::Value::String("2".to_string());
+            second["name"] = serde_json::Value::String("two".to_string());
+            second["bind_ip"] = serde_json::Value::String(alias.to_string());
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let payload = payload_with(vec![valid_entry(), second]);
+            let error = store
+                .restore_library_json(&payload)
+                .expect_err(&format!("alias {alias:?} must collide"));
             assert!(error.to_string().contains("duplicates"), "got {error}");
             assert!(store.list().expect("list works").is_empty());
         }
