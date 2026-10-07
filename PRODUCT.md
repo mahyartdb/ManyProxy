@@ -20,7 +20,7 @@ Local-only, zero system mutation — a claim a neighboring proxy client could no
 
 ## Operating Context
 
-Windows 10/11 64-bit desktop app (GPUI), run via `cargo run` in dev or the built exe. The app exe and sidecar binaries (`sing-box`, `sing-box-awg`, `xray`, at most one user-supplied extra-core executable) sit in the same folder; resolution is app-dir only, never `PATH`. Data lives in a local user-owned SQLite file; secrets at rest are sealed with Windows DPAPI (user scope). Core workflows: Add dialog (Name, Protocol, Params JSON, Group, Bind, Port with auto-assign), Import dialog (paste box, files, drag-drop, clipboard, live valid/invalid preview), Subscriptions manager (label, URL, group, auto-refresh with per-subscription intervals), per-row Start/Stop/Test/Ping/Copy URLs/Logs, bulk bar for multi-select, JSON export with plaintext-secret warning. Shortcuts ride the buttons: Add `Ctrl-N`, Import `Ctrl-O`, Start selected `F5`, Stop selected `Shift-F5`, Test selected `Ctrl-T`. A tray icon and a close-confirm naming running rows guard shutdown. No admin rights needed for default loopback use.
+Windows 10/11 64-bit desktop app (GPUI), run via `cargo run` in dev or the built exe. The app exe and sidecar binaries (`sing-box`, `sing-box-awg`, `xray`, at most one user-supplied extra-core executable) sit in the same folder; resolution is app-dir only, never `PATH`. Data lives in a local user-owned SQLite file; secrets at rest are sealed with Windows DPAPI (user scope). Core workflows: Add dialog (Name, Protocol, Params JSON, Group, Bind, Port with auto-assign and a live auto-port budget readout), Import dialog (paste box, files, drag-drop, clipboard, live valid/invalid preview — new rows arrive selected and checked), Subscriptions manager (label, URL, group, auto-refresh with per-subscription radio intervals), per-row Start/Stop/Test/Ping/Copy URLs/Logs, bulk bar for multi-select, JSON export with plaintext-secret warning. Shortcuts ride the buttons: Add `Ctrl-N`, Import `Ctrl-O`, Start selected `F5`, Stop selected `Shift-F5`, Test selected `Ctrl-T`, Copy URLs `Ctrl-U` — plus a `Ctrl-K` command palette over the whole action set (also in the Help menu). A tray icon and a close-confirm naming running rows guard shutdown. No admin rights needed for default loopback use.
 
 ## Capabilities and Constraints
 
@@ -28,7 +28,7 @@ Confirmed: per-config loopback endpoints (SOCKS5 + HTTP, bind + port only, never
 
 Durable prohibitions (must survive all future work): no system proxy switching, no TUN/virtual interface, no OS DNS rewrite, no routing-rule editor, no admin/elevation path, no auto-update replacing binaries, no telemetry beyond user-initiated subscription fetches and probes through the user's own endpoints, no silent binary downloads.
 
-Explicitly undecided: future surfaces beyond the current library/detail/dialog flow; whether the dense-table spike (`table_spike`, default off) ever replaces the card list.
+Explicitly undecided: future surfaces beyond the current library/detail/dialog flow. (Decided: the dense-table spike is gone — the card list is the only library view.)
 
 ## Brand Commitments
 

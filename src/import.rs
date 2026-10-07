@@ -173,6 +173,7 @@ impl BatchResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportOutcome {
     pub imported: usize,
+    pub imported_ids: Vec<String>,
     pub duplicates: usize,
     pub failures: Vec<ImportFailure>,
 }
@@ -2516,6 +2517,7 @@ pub fn commit_batch(
         .collect();
     let mut outcome = ImportOutcome {
         imported: 0,
+        imported_ids: Vec::new(),
         duplicates: 0,
         failures: batch.failures,
     };
@@ -2539,6 +2541,7 @@ pub fn commit_batch(
     }
     let added = store.add_batch(inputs)?;
     outcome.imported = added.len();
+    outcome.imported_ids = added.iter().map(|config| config.id.clone()).collect();
     Ok(outcome)
 }
 

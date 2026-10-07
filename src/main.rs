@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::badge::Badge;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::group_box::GroupBox;
@@ -28,6 +29,7 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -36,9 +38,6 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::table::{
-    Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
-};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
@@ -91,7 +90,9 @@ actions!(
         FocusSearch,
         InspectorDetails,
         InspectorHealth,
-        InspectorPresets
+        InspectorPresets,
+        OpenPalette,
+        CopyUrls
     ]
 );
 
@@ -122,6 +123,8 @@ pub fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("ctrl-1", InspectorDetails, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-2", InspectorHealth, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-3", InspectorPresets, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-k", OpenPalette, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-u", CopyUrls, Some(APP_KEY_CONTEXT)),
     ]);
 }
 
@@ -197,6 +200,8 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Inspector health", "Ctrl-2"),
     ("Inspector presets", "Ctrl-3"),
     ("Clear checked", "Esc"),
+    ("Copy URLs", "Ctrl-U"),
+    ("Command palette", "Ctrl-K"),
 ];
 
 /// Lane B (B7): confirm copy for the Settings traffic wipe — names the
@@ -782,6 +787,17 @@ impl LibraryDelegate {
         }
     }
 
+    /// Check every known id in one pass (post-import lands here — the new
+    /// rows arrive checked so the bulk bar offers its actions, and unknown
+    /// ids are ignored like [`LibraryDelegate::toggle_checked`]).
+    fn check_ids(&mut self, ids: &[String]) {
+        for id in ids {
+            if self.rows.iter().any(|row| &row.id == id) {
+                self.checked.insert(id.clone());
+            }
+        }
+    }
+
     /// Ticket 44: empty the multi-select set (bulk Clear + Esc with no
     /// dialog open call this).
     fn clear_checked(&mut self) {
@@ -906,183 +922,8 @@ impl LibraryDelegate {
     }
 }
 
-// Ticket 07: read-through table spike over the committed dense `List`.
-// `DenseTableDelegate` owns no filter or sort state — rows, health, serving
-// and traffic all read through `libraries` (`visible` order), so the table
-// can never fork the list. Behind `AppView::table_spike` (default off); the
-// `List` stays mounted and is the only path when the flag is off.
-//
-// Row snapshot: config + cached upstream + health summary + traffic totals +
-// checked flag. Aliased so the tuple never trips `type_complexity`.
-type DenseRowSnapshot = (ProxyConfig, String, String, Option<(u64, u64)>, bool);
-struct DenseTableDelegate {
-    libraries: Entity<ListState<LibraryDelegate>>,
-    columns: Vec<Column>,
-}
-
-impl DenseTableDelegate {
-    // Ticket 07: eight spike columns via `Column::new(key, name).sortable().width()`.
-    fn new(libraries: Entity<ListState<LibraryDelegate>>) -> Self {
-        Self {
-            libraries,
-            columns: vec![
-                Column::new("check", "").sortable().width(px(36.)),
-                Column::new("name", "Name").sortable().width(px(140.)),
-                Column::new("proto", "Proto").sortable().width(px(70.)),
-                Column::new("group", "Group").sortable().width(px(90.)),
-                Column::new("upstream", "Upstream")
-                    .sortable()
-                    .width(px(140.)),
-                Column::new("bind", "Bind").sortable().width(px(110.)),
-                Column::new("health", "Health").sortable().width(px(80.)),
-                Column::new("traffic", "Traffic").sortable().width(px(90.)),
-            ],
-        }
-    }
-
-    // Ticket 07: one read-through snapshot (row + the same strings the dense
-    // list renders). `None` when the table row has no library row (filter
-    // narrowed between frames) — callers paint an empty cell, never a wrong row.
-    fn snapshot_for(&self, row_ix: usize, cx: &App) -> Option<DenseRowSnapshot> {
-        let state = self.libraries.read(cx);
-        let delegate = state.delegate();
-        let visible_ix = *delegate.visible.get(row_ix)?;
-        let row = delegate.rows.get(visible_ix)?.clone();
-        let upstream = delegate
-            .upstream_for(&row.id)
-            .unwrap_or("no upstream")
-            .to_string();
-        let health = delegate.health.get(&row.id).cloned().unwrap_or_default();
-        let traffic = delegate.traffic.get(&row.id).copied();
-        let checked = delegate.checked.contains(&row.id);
-        Some((row, upstream, health, traffic, checked))
-    }
-
-    // Ticket 07: cell text reusing the dense summary strings (name / proto /
-    // group / upstream / bind / health summary / traffic summary). Checkbox
-    // column reports the `checked` set, never an index.
-    fn cell_string(&self, row_ix: usize, col_ix: usize, cx: &App) -> String {
-        let key = self
-            .columns
-            .get(col_ix)
-            .map(|column| column.key.to_string())
-            .unwrap_or_default();
-        let Some((row, upstream, health, traffic, checked)) = self.snapshot_for(row_ix, cx) else {
-            return String::new();
-        };
-        match key.as_str() {
-            "check" => {
-                if checked {
-                    "checked".to_string()
-                } else {
-                    String::new()
-                }
-            }
-            "name" => row.name.clone(),
-            "proto" => row.protocol.clone(),
-            "group" => row.group.clone(),
-            "upstream" => upstream,
-            "bind" => format!("{}:{}", row.bind_ip, row.port),
-            "health" => health,
-            "traffic" => traffic
-                .and_then(|(rx, tx)| traffic_summary_text(rx, tx))
-                .unwrap_or_default(),
-            _ => String::new(),
-        }
-    }
-}
-
-impl TableDelegate for DenseTableDelegate {
-    fn columns_count(&self, _cx: &App) -> usize {
-        self.columns.len()
-    }
-
-    fn rows_count(&self, cx: &App) -> usize {
-        self.libraries.read(cx).delegate().visible.len()
-    }
-
-    fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        self.columns
-            .get(col_ix)
-            .cloned()
-            .unwrap_or_else(|| Column::new("unknown", ""))
-    }
-
-    // Ticket 07: no forked sort state — the `List` filter/sort stays the single
-    // owner, so header clicks intentionally do nothing in the spike.
-    fn perform_sort(
-        &mut self,
-        _col_ix: usize,
-        _sort: ColumnSort,
-        _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
-    ) {
-    }
-
-    fn render_td(
-        &mut self,
-        row_ix: usize,
-        col_ix: usize,
-        _window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> impl IntoElement {
-        let key = self
-            .columns
-            .get(col_ix)
-            .map(|column| column.key.to_string())
-            .unwrap_or_default();
-        // Ticket 07: read-through snapshot; same strings as
-        // `library_row_dense_lines_with_upstream`, same `check-<id>` domain id.
-        let Some((row, upstream, health, traffic, checked)) = self.snapshot_for(row_ix, cx) else {
-            return div().into_any_element();
-        };
-        if key == "check" {
-            // Ticket 07: checkbox cell reuses `toggle_checked` on the id (never
-            // an index) through the committed `List` entity.
-            let libraries = self.libraries.clone();
-            let toggle_id = row.id.clone();
-            let row_name = row.name.clone();
-            let row_id = row.id.clone();
-            return Checkbox::new(format!("check-{row_id}"))
-                .small()
-                .checked(checked)
-                // Ticket 01: same bulk-set wording as the list checkbox —
-                // the table spike never forks the grammar.
-                .accessibility_label(if checked {
-                    format!("Checked {row_name} (bulk action target)")
-                } else {
-                    format!("Check {row_name} for bulk actions")
-                })
-                .on_change(move |_, _, cx| {
-                    let toggle_id = toggle_id.clone();
-                    libraries.update(cx, |state, list_cx| {
-                        state.delegate_mut().toggle_checked(&toggle_id);
-                        list_cx.notify();
-                    });
-                })
-                .into_any_element();
-        }
-        let text = match key.as_str() {
-            "name" => row.name.clone(),
-            "proto" => row.protocol.clone(),
-            "group" => row.group.clone(),
-            "upstream" => upstream,
-            "bind" => format!("{}:{}", row.bind_ip, row.port),
-            "health" => health,
-            "traffic" => traffic
-                .and_then(|(rx, tx)| traffic_summary_text(rx, tx))
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
-        // Ticket 07: compact text cell (inherited table theme tokens only;
-        // small text keeps rows dense like the `List`).
-        div().text_sm().child(text).into_any_element()
-    }
-
-    fn cell_text(&self, row_ix: usize, col_ix: usize, cx: &App) -> String {
-        self.cell_string(row_ix, col_ix, cx)
-    }
-}
+// Ticket 07 spike removed: the card list is the only library view — the
+// unreachable flag, its delegate, and its render arm are gone.
 
 impl ListDelegate for LibraryDelegate {
     type Item = ListItem;
@@ -1250,7 +1091,18 @@ impl ListDelegate for LibraryDelegate {
                         .bg(lamp_color),
                 )
                 .child(checkbox)
-                .child(Label::new(first));
+                .child(
+                    div()
+                        .id(format!("row-name-{row_id}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .tooltip({
+                            let tip = first.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .child(Label::new(first)),
+                );
             if let Some(position) = check_chip {
                 header = header.child(
                     div()
@@ -1275,10 +1127,14 @@ impl ListDelegate for LibraryDelegate {
         // reads the serving color, both at small size under the base name.
         for (index, line) in lines.enumerate() {
             if index == 0 {
+                let tip = line.clone();
                 card = card.child(
                     div()
+                        .id(format!("row-meta-{row_id}"))
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                         .child(line),
                 );
             } else {
@@ -1417,6 +1273,7 @@ type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 fn dialog_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
+    ok_label: &'static str,
     commit: DialogCommit,
 ) -> DialogFooter {
     let commit_click = commit.clone();
@@ -1428,7 +1285,7 @@ fn dialog_footer(
         )
         .child(
             Button::new(ok_id)
-                .label("OK")
+                .label(ok_label)
                 .on_click(move |_, window, cx| {
                     if commit_click(window, cx) {
                         window.close_all_dialogs(cx);
@@ -1662,6 +1519,23 @@ impl ConfigForm {
     /// toggle rides the hint row when collapsed and the Params header row
     /// when expanded. The Identity input hides for secret-free protocols
     /// (its fold would write nowhere).
+    /// Auto-port budget readout — the ranges auto-assign fills from, and how
+    /// many stored rows already hold a port inside them. Manual out-of-range
+    /// ports never consume budget, so the count only climbs when exhaustion
+    /// can actually bite.
+    fn port_budget_text(rows: &[ProxyConfig]) -> String {
+        use crate::store::{
+            AUTO_PORT_END, AUTO_PORT_SPILL_END, AUTO_PORT_SPILL_START, AUTO_PORT_START,
+        };
+        let total = (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
+            + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize;
+        let used = rows
+            .iter()
+            .filter(|row| crate::store::is_auto_port(row.port))
+            .count();
+        format!("Auto ports: {used} of {total} in use (10801–10999, spill 18081–18380)")
+    }
+
     fn element(
         self,
         view: Entity<AppView>,
@@ -1669,6 +1543,7 @@ impl ConfigForm {
         collision: Option<String>,
         form_error: Option<(String, String)>,
         show_test_url: bool,
+        port_budget: Option<String>,
     ) -> impl IntoElement {
         let bind = self.bind.read(cx).value().to_string();
         let protocol_text = self.protocol.read(cx).value().to_string();
@@ -1815,6 +1690,15 @@ impl ConfigForm {
             .child(dialog_field("field-group", "Group", self.group))
             .child(dialog_field("field-bind", "Bind address", self.bind))
             .child(dialog_field("field-port", "Port", self.port));
+        if let Some(budget) = port_budget {
+            col = col.child(
+                div()
+                    .id("port-budget")
+                    .test_support()
+                    .text_sm()
+                    .child(budget),
+            );
+        }
         // Ticket 43: per-row probe override lives on edit only.
         if show_test_url {
             col = col.child(dialog_field(
@@ -3424,37 +3308,38 @@ pub fn summed_traffic_text(store: &Store) -> Option<String> {
     Some(format!("↓ {} · ↑ {}", format_bytes(rx), format_bytes(tx)))
 }
 
-/// Ticket 45: one interval-picker row — preset buttons writing the shared
+/// Ticket 45: one interval-picker row — preset radios writing the shared
 /// `interval_secs` cell (the dialog commit reads it, like the
-/// auto-refresh switch). The current preset reads back in brackets.
+/// auto-refresh switch). Each radio carries the checked state, so the
+/// current preset reads as selected instead of bracketed text. Standalone
+/// radios (not a group — the group re-keys children by index) keep the
+/// stable `sub-interval-*` ids; exclusivity holds because every radio
+/// derives `checked` from the one shared cell.
 fn interval_picker_row(id_prefix: &str, interval_secs: Rc<RefCell<i64>>) -> impl IntoElement {
     let current = *interval_secs.borrow();
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .child(Label::new(format!(
-            "Refresh every {}",
-            format_interval_secs(current)
-        )));
+    let mut opts = div().flex().flex_row().items_center().gap_2();
     for preset in INTERVAL_PRESETS {
         let cell = interval_secs.clone();
         let secs = *preset;
-        let label = if secs == current {
-            format!("[{}]", format_interval_secs(secs))
-        } else {
-            format_interval_secs(secs)
-        };
-        row = row.child(
-            Button::new(format!("{id_prefix}-{secs}"))
-                .label(label)
+        opts = opts.child(
+            Radio::new(format!("{id_prefix}-{secs}"))
+                .label(format_interval_secs(secs))
+                .tooltip(format!("Refresh every {}", format_interval_secs(secs)))
+                .checked(secs == current)
                 .on_click(move |_, _, _| {
                     *cell.borrow_mut() = secs;
                 }),
         );
     }
-    row
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(Label::new(format!(
+            "Refresh every {}",
+            format_interval_secs(current)
+        )))
+        .child(opts)
 }
 
 /// Handles to the subscription add form inside the subscriptions dialog.
@@ -4156,6 +4041,36 @@ impl FacetPicker {
     }
 }
 
+/// Command palette (Ctrl-K): one searchable surface over the whole
+/// action set — every key-bound action plus every menu-only destination.
+/// Sections below are the dispatch table: keep the group/item order and
+/// [`AppView::palette_op_at`] in agreement (a test pins both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteOp {
+    Add,
+    Import,
+    StartSelected,
+    StopSelected,
+    TestSelected,
+    CopyUrls,
+    EditSelected,
+    DeleteSelected,
+    FocusSearch,
+    ClearChecked,
+    DetailsTab,
+    HealthTab,
+    PresetsTab,
+    Subscriptions,
+    PresetManager,
+    Groups,
+    Logs,
+    Settings,
+    About,
+    StartAll,
+    StopAll,
+    TestAll,
+}
+
 /// Ticket 05: bottom-inspector tab over the existing detail builders.
 /// `Details` is the default overview; `Health` surfaces health + history
 /// with the row ops; `Presets` carries the attached routing preset.
@@ -4313,13 +4228,9 @@ struct AppView {
     /// `Copy` field — the `TabBar` is `RenderOnce`, so it is rebuilt from
     /// this every frame; no entity is created in render.
     inspector_tab: InspectorTab,
-    /// Ticket 07: read-through DataTable spike (default off). `table_state`
-    /// renders `visible` order with no filter/sort of its own; the `List`
-    /// stays mounted and is the only path when `table_spike` is false.
-    table_spike: bool,
-    table_state: Entity<TableState<DenseTableDelegate>>,
-    _table_libraries_subscription: Subscription,
-    _table_select_subscription: Subscription,
+    /// Command-palette state, created on open (never in render) and held
+    /// so the dialog builder owns stable interaction state.
+    palette: Option<Entity<CommandState>>,
 }
 
 impl AppView {
@@ -4370,14 +4281,6 @@ impl AppView {
             window,
             cx,
         );
-        // Ticket 07: read-through table state over `libraries` (no rows of its
-        // own, no filter/sort). Created once here, never in render.
-        let table_state = cx.new(|cx| {
-            TableState::new(DenseTableDelegate::new(libraries.clone()), window, cx)
-                .row_selectable(true)
-                .col_selectable(false)
-                .cell_selectable(false)
-        });
         // Ticket 38: seed the snapshot guard from the stored set so the
         // first reload does not rewrite an unchanged snapshot.
         let last_snapshot = store.load_running_snapshot();
@@ -4448,66 +4351,11 @@ impl AppView {
                     cx.notify();
                 },
             ),
-            // Ticket 07: `List` event mirrors the table selection by config id
-            // (read-through, never an index). Guards live in the sync helper.
-            _table_libraries_subscription: cx.subscribe(
-                &libraries,
-                |view: &mut Self, _state, _event: &ListEvent, cx| {
-                    view.sync_table_selection(cx);
-                },
-            ),
-            // Ticket 07: table row click mirrors the `List` selection by config
-            // id (never a blind index — the visible order may have shifted).
-            _table_select_subscription: cx.subscribe(
-                &table_state,
-                |view: &mut Self, _state, event: &TableEvent, cx| {
-                    let TableEvent::SelectRow(row_ix) = event else {
-                        return;
-                    };
-                    let row_ix = *row_ix;
-                    let (id_opt, current_id) = {
-                        let libs = view.libraries.read(cx);
-                        let delegate = libs.delegate();
-                        let id = delegate
-                            .visible
-                            .get(row_ix)
-                            .and_then(|&visible_ix| delegate.rows.get(visible_ix))
-                            .map(|row| row.id.clone());
-                        let current = delegate.selected_row().map(|row| row.id.clone());
-                        (id, current)
-                    };
-                    let Some(id) = id_opt else {
-                        return;
-                    };
-                    if current_id == Some(id.clone()) {
-                        return;
-                    }
-                    let pos = {
-                        let libs = view.libraries.read(cx);
-                        let delegate = libs.delegate();
-                        delegate.visible.iter().position(|&visible_ix| {
-                            delegate
-                                .rows
-                                .get(visible_ix)
-                                .map(|row| row.id == id)
-                                .unwrap_or(false)
-                        })
-                    };
-                    if let Some(pos) = pos {
-                        view.libraries.update(cx, |list_state, list_cx| {
-                            list_state.delegate_mut().selected = Some(IndexPath::new(pos));
-                            list_cx.notify();
-                        });
-                        view.sync_table_selection(cx);
-                    }
-                },
-            ),
             facet_group,
             facet_protocol,
             facet_status,
             inspector_tab: InspectorTab::Details,
-            table_spike: false,
-            table_state: table_state.clone(),
+            palette: None,
         };
         let mut view = view;
         let rows = match view.store.list() {
@@ -4558,44 +4406,6 @@ impl AppView {
 
     fn selected_config(&self, cx: &App) -> Option<ProxyConfig> {
         self.libraries.read(cx).delegate().selected_row()
-    }
-
-    // Ticket 07: mirror the `List` selection into the spike table by config id
-    // (never an index). No-ops when both already agree, so the table event
-    // echo cannot loop. Called from the `List` subscription and from render
-    // when the flag is on (covers filter/set_rows paths that emit no event).
-    fn sync_table_selection(&self, cx: &mut Context<Self>) {
-        let (selected_id, visible_ids) = {
-            let libs = self.libraries.read(cx);
-            let delegate = libs.delegate();
-            let selected = delegate.selected_row().map(|row| row.id.clone());
-            let ids: Vec<String> = delegate
-                .visible
-                .iter()
-                .filter_map(|&visible_ix| delegate.rows.get(visible_ix))
-                .map(|row| row.id.clone())
-                .collect();
-            (selected, ids)
-        };
-        let table_ix = self.table_state.read(cx).selected_row();
-        let table_id = table_ix.and_then(|ix| visible_ids.get(ix).cloned());
-        if selected_id == table_id {
-            return;
-        }
-        match selected_id.and_then(|id| visible_ids.iter().position(|other| other == &id)) {
-            Some(pos) => {
-                self.table_state.update(cx, |state, table_cx| {
-                    state.set_selected_row(pos, table_cx);
-                });
-            }
-            None => {
-                if table_ix.is_some() {
-                    self.table_state.update(cx, |state, table_cx| {
-                        state.clear_selection(table_cx);
-                    });
-                }
-            }
-        }
     }
 
     /// Ticket 47: cached upstream display for one row (no JSON parse on the
@@ -5087,6 +4897,9 @@ impl AppView {
                     });
                 }
                 self.reload(window, cx);
+                // Focus returns to the shell so keyboard control survives a
+                // destructive commit (the selection it acted on is gone).
+                window.focus(&self.focus, cx);
                 window.push_notification(
                     Notification::success(removed_message(&name, was_running)),
                     cx,
@@ -5209,6 +5022,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Reset")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Reset traffic")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -5344,6 +5163,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Clear")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Clear traffic counters")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -5363,6 +5188,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Clear")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Clear health snapshots")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -5382,6 +5213,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Reset")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Reset running snapshot")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -5707,6 +5544,11 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Start"),
+                )
                 .title(LAN_CONFIRM_TITLE)
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -5873,6 +5715,11 @@ impl AppView {
                 let description = description.clone();
                 alert
                     .confirm()
+                    .button_props(
+                        DialogButtonProps::default()
+                            .show_cancel(true)
+                            .ok_text("Start all"),
+                    )
                     .title(LAN_CONFIRM_TITLE)
                     .description(description)
                     .on_ok(move |_, window, cx| {
@@ -6073,6 +5920,11 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Stop all"),
+                )
                 .title("Stop all endpoints")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -6444,6 +6296,13 @@ impl AppView {
                         .gap_2()
                         .child(
                             div()
+                                .id("settings-section-startup")
+                                .test_support()
+                                .text_sm()
+                                .child("Startup"),
+                        )
+                        .child(
+                            div()
                                 .id("settings-autostart")
                                 .test_support()
                                 .child(
@@ -6502,6 +6361,14 @@ impl AppView {
                         )
                         // Ticket 43: probe URL (global override; blank =
                         // default; per-row overrides ride in each row's Test).
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-probe")
+                                .test_support()
+                                .text_sm()
+                                .child("Probe"),
+                        )
                         .child(dialog_field(
                             "field-settings-test-url",
                             "Test URL (blank = default)",
@@ -6536,6 +6403,14 @@ impl AppView {
                         )
                         // Ticket 43: paths (display + copy; reveal = copy —
                         // the shell never shells out to an explorer).
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-paths")
+                                .test_support()
+                                .text_sm()
+                                .child("Paths"),
+                        )
                         .child(
                             div()
                                 .id("settings-db-path")
@@ -6580,8 +6455,17 @@ impl AppView {
                         )
                         // Ticket 43: destructive maintenance — each behind
                         // its own explicit click + honest count toast.
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-maintenance")
+                                .test_support()
+                                .text_sm()
+                                .child("Maintenance"),
+                        )
                         .child(
                             Button::new("settings-clear-traffic")
+                                .danger()
                                 .label("Clear traffic counters")
                                 .on_click(move |_, window, cx| {
                                     clear_traffic_view.update(cx, |view, cx| {
@@ -6591,6 +6475,7 @@ impl AppView {
                         )
                         .child(
                             Button::new("settings-clear-health")
+                                .danger()
                                 .label("Clear health snapshots")
                                 .on_click(move |_, window, cx| {
                                     clear_health_view.update(cx, |view, cx| {
@@ -6600,6 +6485,7 @@ impl AppView {
                         )
                         .child(
                             Button::new("settings-clear-snapshot")
+                                .danger()
                                 .label("Reset running snapshot")
                                 .on_click(move |_, window, cx| {
                                     clear_snapshot_view.update(cx, |view, cx| {
@@ -6618,6 +6504,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "settings-dialog-ok",
                     "settings-dialog-cancel",
+                    "Done",
                     Rc::new(|_, _| true),
                 ))
         });
@@ -6721,6 +6608,11 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Restart"),
+                )
                 .title(LAN_CONFIRM_TITLE)
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -6745,10 +6637,170 @@ impl AppView {
         );
         window.open_alert_dialog(cx, move |alert, _, _| {
             alert
+                .button_props(DialogButtonProps::default().ok_text("Close"))
                 .title(format!("About {APP_TITLE}"))
                 .description(body.clone())
                 .on_ok(|_, _, _| true)
         });
+    }
+
+    /// Map a palette (section, row) to its op. Section 0 is Library (13
+    /// rows), section 1 is Manage (9 rows) — the same order the dialog
+    /// builds below.
+    fn palette_op_at(index: IndexPath) -> Option<PaletteOp> {
+        match (index.section, index.row) {
+            (0, 0) => Some(PaletteOp::Add),
+            (0, 1) => Some(PaletteOp::Import),
+            (0, 2) => Some(PaletteOp::StartSelected),
+            (0, 3) => Some(PaletteOp::StopSelected),
+            (0, 4) => Some(PaletteOp::TestSelected),
+            (0, 5) => Some(PaletteOp::CopyUrls),
+            (0, 6) => Some(PaletteOp::EditSelected),
+            (0, 7) => Some(PaletteOp::DeleteSelected),
+            (0, 8) => Some(PaletteOp::FocusSearch),
+            (0, 9) => Some(PaletteOp::ClearChecked),
+            (0, 10) => Some(PaletteOp::DetailsTab),
+            (0, 11) => Some(PaletteOp::HealthTab),
+            (0, 12) => Some(PaletteOp::PresetsTab),
+            (1, 0) => Some(PaletteOp::Subscriptions),
+            (1, 1) => Some(PaletteOp::PresetManager),
+            (1, 2) => Some(PaletteOp::Groups),
+            (1, 3) => Some(PaletteOp::Logs),
+            (1, 4) => Some(PaletteOp::Settings),
+            (1, 5) => Some(PaletteOp::About),
+            (1, 6) => Some(PaletteOp::StartAll),
+            (1, 7) => Some(PaletteOp::StopAll),
+            (1, 8) => Some(PaletteOp::TestAll),
+            _ => None,
+        }
+    }
+
+    /// Open the palette (single dialog — the Ctrl-K handler guards against
+    /// stacking it over another dialog).
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let state = cx.new(|cx| CommandState::new(window, cx));
+        self.palette = Some(state.clone());
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view = view.clone();
+            dialog.title("Command palette").child(
+                Command::new(&state)
+                    .placeholder("Type a command…")
+                    .group(CommandGroup::new().label("Library").items(vec![
+                            CommandItem::new()
+                                .label("Add configuration")
+                                .keywords(["new", "create"]),
+                            CommandItem::new()
+                                .label("Import configurations")
+                                .keywords(["import", "link", "file"]),
+                            CommandItem::new()
+                                .label("Start selected")
+                                .keywords(["start", "serve", "f5"]),
+                            CommandItem::new().label("Stop selected").keywords(["stop"]),
+                            CommandItem::new()
+                                .label("Test selected")
+                                .keywords(["test", "probe", "health"]),
+                            CommandItem::new().label("Copy URLs").keywords([
+                                "copy",
+                                "clipboard",
+                                "url",
+                                "endpoint",
+                            ]),
+                            CommandItem::new()
+                                .label("Edit selected")
+                                .keywords(["edit", "rename"]),
+                            CommandItem::new()
+                                .label("Delete selected")
+                                .keywords(["delete", "remove"]),
+                            CommandItem::new()
+                                .label("Focus search field")
+                                .keywords(["search", "find", "filter"]),
+                            CommandItem::new()
+                                .label("Clear selection")
+                                .keywords(["clear", "escape", "deselect"]),
+                            CommandItem::new()
+                                .label("Show Details tab")
+                                .keywords(["details", "tab"]),
+                            CommandItem::new()
+                                .label("Show Health tab")
+                                .keywords(["health", "tab"]),
+                            CommandItem::new()
+                                .label("Show Presets tab")
+                                .keywords(["preset", "tab"]),
+                        ]))
+                    .group(CommandGroup::new().label("Manage").items(vec![
+                            CommandItem::new()
+                                .label("Subscriptions")
+                                .keywords(["subscription", "refresh"]),
+                            CommandItem::new()
+                                .label("Routing presets")
+                                .keywords(["preset", "routing", "rules"]),
+                            CommandItem::new()
+                                .label("Groups")
+                                .keywords(["group", "move"]),
+                            CommandItem::new().label("Logs").keywords(["log", "output"]),
+                            CommandItem::new()
+                                .label("Settings")
+                                .keywords(["settings", "options", "test url"]),
+                            CommandItem::new().label("About").keywords([
+                                "about",
+                                "version",
+                                "shortcuts",
+                            ]),
+                            CommandItem::new()
+                                .label("Start all")
+                                .keywords(["start", "all", "serve"]),
+                            CommandItem::new()
+                                .label("Stop all")
+                                .keywords(["stop", "all"]),
+                            CommandItem::new()
+                                .label("Test all")
+                                .keywords(["test", "all", "probe"]),
+                        ]))
+                    .on_confirm(move |index, window, cx| {
+                        view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
+                    }),
+            )
+        });
+    }
+
+    /// Run one palette op: the palette closes first, then the op runs
+    /// through the same handlers the buttons, menus, and keys use (the
+    /// shell dialog guard would block direct dispatch while hosted).
+    fn run_palette_op(&mut self, index: IndexPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(op) = Self::palette_op_at(index) else {
+            return;
+        };
+        window.close_all_dialogs(cx);
+        match op {
+            PaletteOp::Add => window.dispatch_action(Box::new(AddConfig), cx),
+            PaletteOp::Import => window.dispatch_action(Box::new(ImportConfigs), cx),
+            PaletteOp::StartSelected => window.dispatch_action(Box::new(StartSelected), cx),
+            PaletteOp::StopSelected => window.dispatch_action(Box::new(StopSelected), cx),
+            PaletteOp::TestSelected => window.dispatch_action(Box::new(TestSelected), cx),
+            PaletteOp::CopyUrls => window.dispatch_action(Box::new(CopyUrls), cx),
+            PaletteOp::EditSelected => window.dispatch_action(Box::new(EditSelected), cx),
+            PaletteOp::DeleteSelected => window.dispatch_action(Box::new(DeleteSelected), cx),
+            PaletteOp::FocusSearch => window.dispatch_action(Box::new(FocusSearch), cx),
+            PaletteOp::ClearChecked => window.dispatch_action(Box::new(ClearChecked), cx),
+            PaletteOp::DetailsTab => window.dispatch_action(Box::new(InspectorDetails), cx),
+            PaletteOp::HealthTab => window.dispatch_action(Box::new(InspectorHealth), cx),
+            PaletteOp::PresetsTab => window.dispatch_action(Box::new(InspectorPresets), cx),
+            PaletteOp::Subscriptions => self.open_subscriptions_dialog(window, cx),
+            PaletteOp::PresetManager => self.open_presets_dialog(window, cx),
+            PaletteOp::Groups => self.open_groups_dialog(window, cx),
+            PaletteOp::Logs => self.open_logs_dialog(window, cx),
+            PaletteOp::Settings => self.open_settings_dialog(window, cx),
+            PaletteOp::About => self.open_about_dialog(window, cx),
+            PaletteOp::StartAll => self.start_all_engines(window, cx),
+            PaletteOp::StopAll => self.stop_all_engines(window, cx),
+            PaletteOp::TestAll => {
+                self.test_all_health(window, cx);
+            }
+        }
     }
 
     /// Ticket 06: per-row summaries for the virtualized list.
@@ -7108,6 +7160,12 @@ impl AppView {
                 let description = description.clone();
                 alert
                     .confirm()
+                    .button_props(
+                        DialogButtonProps::default()
+                            .show_cancel(true)
+                            .ok_text("Overwrite")
+                            .ok_variant(ButtonVariant::Danger),
+                    )
                     .title("Overwrite saved logs?")
                     .description(description)
                     .on_ok(move |_, window, cx| {
@@ -7242,6 +7300,12 @@ impl AppView {
             // Ticket 43: severity filter row + Copy/tail row. Each button
             // re-renders this same dialog around its new state.
             let (current_level, tail_on) = (chrome_level, chrome_tail);
+            // Lane B (B9): the single level control — labels map through
+            // `LogLevel::from_label` (one source, never a hand-duplicated
+            // table), so a corrupt label can only read as `all`. Each
+            // radio carries the checked state instead of a `● ` text
+            // prefix, with its stable id for headless clicks. Standalone
+            // radios (not a group — the group re-keys children by index).
             let mut level_row = div()
                 .id("log-level-row")
                 .test_support()
@@ -7249,26 +7313,15 @@ impl AppView {
                 .flex_row()
                 .items_center()
                 .gap_2();
-            // Lane B (B9): the single level control — labels map through
-            // `LogLevel::from_label` (one source, never a hand-duplicated
-            // table), so a corrupt label can only read as `all`.
-            for (id, label) in [
-                ("log-level-all", "All"),
-                ("log-level-debug", "Debug"),
-                ("log-level-info", "Info"),
-                ("log-level-warn", "Warn"),
-                ("log-level-error", "Error"),
-            ] {
+            for label in ["All", "Debug", "Info", "Warn", "Error"] {
                 let level_view = chrome_view.clone();
                 let level = LogLevel::from_label(label);
-                let active = current_level == level;
+                let id = format!("log-level-{label}").to_lowercase();
                 level_row = level_row.child(
-                    Button::new(id)
-                        .label(if active {
-                            format!("● {label}")
-                        } else {
-                            label.to_string()
-                        })
+                    Radio::new(id)
+                        .label(label)
+                        .tooltip(format!("Show {label} and above"))
+                        .checked(current_level == level)
                         .on_click(move |_, window, cx| {
                             level_view.update(cx, |view, cx| {
                                 view.set_log_level(level, window, cx);
@@ -7370,6 +7423,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "logs-dialog-ok",
                     "logs-dialog-cancel",
+                    "Close",
                     commit_click,
                 ))
         });
@@ -7461,6 +7515,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "export-dialog-ok",
                     "export-dialog-cancel",
+                    "Export",
                     commit_click,
                 ))
         });
@@ -7490,6 +7545,12 @@ impl AppView {
                 let description = description.clone();
                 alert
                     .confirm()
+                    .button_props(
+                        DialogButtonProps::default()
+                            .show_cancel(true)
+                            .ok_text("Overwrite")
+                            .ok_variant(ButtonVariant::Danger),
+                    )
                     .title("Overwrite export?")
                     .description(description)
                     .on_ok(move |_, window, cx| {
@@ -7559,6 +7620,12 @@ impl AppView {
             let payload = payload.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Restore")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Restore library")
                 .description(
                     "This replaces the current library with the exported backup \
@@ -7699,6 +7766,8 @@ impl AppView {
         // Ticket 31: rows snapshot for the live bind/port collision warning
         // (a broken database warns nothing — the commit still reports it).
         let rows = self.store.list().unwrap_or_default();
+        // Port budget readout rides the dialog (auto-assign draws from it).
+        let budget = ConfigForm::port_budget_text(&rows);
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
         // Ticket 43: cloned up front — the builder needs one for the params
@@ -7722,10 +7791,14 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title("Add proxy configuration")
-                .child(
-                    form.clone()
-                        .element(element_view.clone(), cx, collision, inline, false),
-                )
+                .child(form.clone().element(
+                    element_view.clone(),
+                    cx,
+                    collision,
+                    inline,
+                    false,
+                    Some(budget.clone()),
+                ))
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -7734,6 +7807,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "add-dialog-ok",
                     "add-dialog-cancel",
+                    "Add",
                     commit_click,
                 ))
         });
@@ -7761,6 +7835,8 @@ impl AppView {
         // Ticket 31: rows snapshot for the live collision warning; the edited
         // row itself is excluded.
         let rows = self.store.list().unwrap_or_default();
+        // Port budget readout rides the dialog (auto-assign draws from it).
+        let budget = ConfigForm::port_budget_text(&rows);
         let exclude = id.clone();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
@@ -7796,10 +7872,14 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title(title.clone())
-                .child(
-                    form.clone()
-                        .element(element_view.clone(), cx, collision, inline, true),
-                )
+                .child(form.clone().element(
+                    element_view.clone(),
+                    cx,
+                    collision,
+                    inline,
+                    true,
+                    Some(budget.clone()),
+                ))
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -7808,6 +7888,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "edit-dialog-ok",
                     "edit-dialog-cancel",
+                    "Save",
                     commit_click,
                 ))
         });
@@ -7835,6 +7916,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Remove configuration")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -7860,6 +7947,12 @@ impl AppView {
             let id = id.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Reset")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Reset usage counters")
                 .description(format!(
                     "Reset usage counters for \"{name}\" to zero? This cannot be undone."
@@ -7964,6 +8057,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "import-dialog-ok",
                     "import-dialog-cancel",
+                    "Import",
                     commit_click,
                 ))
         });
@@ -8361,6 +8455,28 @@ impl AppView {
                     window.push_notification(Notification::success(summary), cx);
                 } else {
                     window.push_notification(Notification::warning(summary), cx);
+                }
+                // The new rows arrive selected (first imported) and checked
+                // (all imported) so F5 and the bulk bar act on them at once —
+                // no click-a-row round trip after a successful import.
+                if !outcome.imported_ids.is_empty() {
+                    let first = outcome.imported_ids.clone();
+                    self.libraries.update(cx, |list_state, list_cx| {
+                        let delegate = list_state.delegate_mut();
+                        delegate.check_ids(&first);
+                        if let Some(pos) = first.iter().find_map(|id| {
+                            delegate.visible.iter().position(|&visible_ix| {
+                                delegate
+                                    .rows
+                                    .get(visible_ix)
+                                    .map(|row| &row.id == id)
+                                    .unwrap_or(false)
+                            })
+                        }) {
+                            delegate.selected = Some(IndexPath::new(pos));
+                        }
+                        list_cx.notify();
+                    });
                 }
                 true
             }
@@ -9297,6 +9413,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "preset-edit-ok",
                     "preset-edit-cancel",
+                    "Save",
                     commit_click,
                 ))
         });
@@ -9364,6 +9481,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Delete routing preset")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -9711,6 +9834,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "presets-dialog-ok",
                     "presets-dialog-cancel",
+                    "Done",
                     commit_click,
                 ))
         });
@@ -9820,6 +9944,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "preset-attach-ok",
                     "preset-attach-cancel",
+                    "Attach",
                     commit_click,
                 ))
         });
@@ -9846,6 +9971,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Copy URL")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Copy full subscription URL?")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -10033,6 +10164,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "subscriptions-dialog-ok",
                     "subscriptions-dialog-cancel",
+                    "Done",
                     commit_click,
                 ))
         });
@@ -10161,6 +10293,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "subscription-edit-dialog-ok",
                     "subscription-edit-dialog-cancel",
+                    "Save",
                     commit_click,
                 ))
         });
@@ -10182,6 +10315,12 @@ impl AppView {
             let id = id.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Remove")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Remove subscription")
                 .description(format!(
                     "Remove \"{label}\"? Its configs stay in the library."
@@ -10723,6 +10862,10 @@ impl AppView {
             .border_t_1()
             .border_color(cx.theme().border)
             .p_2()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
             .child(
                 Empty::new()
                     .header(EmptyHeader::new().title(EmptyTitle::new().child(
@@ -10795,18 +10938,30 @@ impl AppView {
             // panel and paints empty space below a still-scrolling box.
             .h_full()
             .min_h_0()
-            .overflow_y_scroll()
-            .overflow_x_hidden()
             .child(self.render_inspector_tabs(cx))
-            .child(match self.inspector_tab {
-                InspectorTab::Details => {
-                    self.render_inspector_details(cx, config).into_any_element()
-                }
-                InspectorTab::Health => self.render_inspector_health(cx, config).into_any_element(),
-                InspectorTab::Presets => {
-                    self.render_inspector_presets(cx, config).into_any_element()
-                }
-            })
+            // The tab bar stays pinned: only the pane body scrolls, so the
+            // tabs never scroll away and the operate row is always one
+            // scroll from a visible anchor.
+            .child(
+                div()
+                    .id("config-detail-body")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .overflow_x_hidden()
+                    .child(match self.inspector_tab {
+                        InspectorTab::Details => {
+                            self.render_inspector_details(cx, config).into_any_element()
+                        }
+                        InspectorTab::Health => {
+                            self.render_inspector_health(cx, config).into_any_element()
+                        }
+                        InspectorTab::Presets => {
+                            self.render_inspector_presets(cx, config).into_any_element()
+                        }
+                    }),
+            )
             .into_any_element()
     }
 
@@ -10886,6 +11041,7 @@ impl AppView {
             .flex_col()
             .gap_1()
             .child(self.render_detail_header(cx, config))
+            .child(self.render_detail_endpoints(cx, config))
             .child(self.render_detail_health(config))
             .child(self.render_detail_history(config))
             .child(self.render_detail_actions(cx, config))
@@ -10906,6 +11062,7 @@ impl AppView {
             .flex_col()
             .gap_1()
             .child(self.render_detail_header(cx, config))
+            .child(self.render_detail_endpoints(cx, config))
             // Ticket 37: attached routing preset plus the picker entry
             // point. Lane B (B9): the line carries the rule count and an
             // attached row detaches inline (no dialog round-trip); rules
@@ -10955,6 +11112,7 @@ impl AppView {
                             .into_any_element()
                     }),
             )
+            .child(self.render_detail_actions(cx, config))
     }
 
     /// W1/failed evidence shared by the detail builders: a crashed sidecar
@@ -10999,11 +11157,14 @@ impl AppView {
             .w_full()
             // Ticket 01: the header echoes the acting row — the same
             // selected row F5 and the detail Start touch. The name renders
-            // once via `detail-acting-on` (no second copy beside it).
+            // once via `detail-acting-on` (no second copy beside it). The
+            // status role announces selection changes to assistive tech —
+            // arrow-keying the list is no longer silent.
             .child(
                 div()
                     .id("detail-acting-on")
                     .test_support()
+                    .role(Role::Status)
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(acting_on_label(config)),
@@ -11256,6 +11417,8 @@ impl AppView {
             .items_center()
             .gap_2()
             .w_full()
+            .border_t_1()
+            .border_color(cx.theme().border)
             .child(
                 Switch::new(switch_id)
                     .checked(config.enabled)
@@ -11626,12 +11789,16 @@ impl AppView {
             .flex_row()
             .items_center()
             .gap_2()
-            .child(
-                div()
-                    .id("status-count")
-                    .test_support()
-                    .child(format!("{total} configurations · {enabled} enabled")),
-            );
+            .child(div().id("status-count").test_support().child(format!(
+                "{} {} · {} enabled",
+                total,
+                if total == 1 {
+                    "configuration"
+                } else {
+                    "configurations"
+                },
+                enabled
+            )));
         // Lane B (B9): the active filter echo rides the left region (long
         // queries truncate with the full text on hover — same pattern as
         // the endpoint rows).
@@ -11860,6 +12027,7 @@ impl AppView {
             .test_support()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap_2()
             .px_2()
@@ -11875,7 +12043,9 @@ impl AppView {
                 Button::new("search-focus")
                     .small()
                     .label("Search")
-                    .tooltip("Focus the library search field")
+                    .accessibility_label("Focus the library search field (Ctrl-F)")
+                    .child(shortcut_kbd("ctrl-f", "(Ctrl-F)"))
+                    .tooltip("Focus the library search field (Ctrl-F)")
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.focus_library_search(window, cx);
                     })),
@@ -12055,11 +12225,14 @@ impl AppView {
     }
 
     /// Ticket 44: empty the multi-select set.
-    fn clear_checked(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn clear_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().clear_checked();
             list_cx.notify();
         });
+        // The bulk bar unmounts with the set — focus returns to the shell
+        // so it never strands on a removed button.
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -12161,6 +12334,11 @@ impl AppView {
                 let description = description.clone();
                 alert
                     .confirm()
+                    .button_props(
+                        DialogButtonProps::default()
+                            .show_cancel(true)
+                            .ok_text("Start"),
+                    )
                     .title(LAN_CONFIRM_TITLE)
                     .description(description)
                     .on_ok(move |_, window, cx| {
@@ -12355,6 +12533,12 @@ impl AppView {
             let ids = ids.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title(format!("Delete {count} configurations?"))
                 .description(format!(
                     "Delete {count} checked configuration(s)? Running endpoints stop first. This cannot be undone."
@@ -12381,6 +12565,9 @@ impl AppView {
             list_cx.notify();
         });
         self.reload(window, cx);
+        // Focus returns to the shell so keyboard control survives the bulk
+        // delete (the checked set it acted on is gone).
+        window.focus(&self.focus, cx);
         window.push_notification(
             Notification::success(format!("Removed {removed} configuration(s)")),
             cx,
@@ -12436,6 +12623,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "bulk-move-ok",
                     "bulk-move-cancel",
+                    "Move",
                     commit_click,
                 ))
         });
@@ -12534,6 +12722,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "groups-dialog-ok",
                     "groups-dialog-cancel",
+                    "Done",
                     commit_click,
                 ))
         });
@@ -12579,6 +12768,7 @@ impl AppView {
                 .footer(dialog_footer(
                     "group-rename-ok",
                     "group-rename-cancel",
+                    "Rename",
                     commit_click,
                 ))
         });
@@ -12697,6 +12887,12 @@ impl AppView {
             let description = description.clone();
             alert
                 .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger),
+                )
                 .title("Delete group")
                 .description(description)
                 .on_ok(move |_, window, cx| {
@@ -12763,6 +12959,18 @@ impl AppView {
             .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
                 view.clear_checked_unless_dialog(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &OpenPalette, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.open_palette(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &CopyUrls, window, cx| {
+                if window.has_active_dialog(cx) {
+                    return;
+                }
+                view.copy_selected_urls(window, cx);
+            }))
             // Lane B (B9): row edit/delete + search focus + inspector tabs.
             // Each handler no-ops while any dialog is open (same guard as
             // the Ticket 26 actions); Delete opens the naming confirm and
@@ -12828,8 +13036,8 @@ impl AppView {
     /// Ticket 10: 4 dedicated buttons plus Library / Manage / Engine / Help
     /// dropdown menus — same ids, labels, tooltips, and handlers throughout.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Ticket 10: the 14-button strip is 4 dedicated core-flow buttons
-        // (Add, Start selected, Stop selected, Test selected — same ids,
+        // Ticket 10: the 14-button strip is 5 dedicated core-flow buttons
+        // (Add, Start selected, Stop selected, Test selected, Import — same ids,
         // labels, Kbd chips, tooltips, handlers) plus Library / Manage /
         // Engine / Help dropdown triggers, so the strip fits narrow
         // windows. The other 10 actions moved verbatim (label, tooltip,
@@ -12846,7 +13054,9 @@ impl AppView {
             .flex_row()
             // BUG-5: the 880px minimum clipped `help-menu` (`He…`) in a
             // single-row strip. Per DESIGN.md No-Sideways-Scroll Rule the
-            // crowded strip wraps to a second row instead of overflowing.
+            // crowded strip wraps to a second row instead of overflowing;
+            // all nine toolbar buttons ride small density so the full
+            // strip fits 880px on one row and wraps only under it.
             .flex_wrap()
             .items_center()
             .gap_2()
@@ -12878,6 +13088,7 @@ impl AppView {
                     .border_color(cx.theme().border)
                     .child(
                         Button::new("add-config")
+                            .small()
                             .primary()
                             // T08: keystroke rides as a `Kbd` chip; the
                             // pinned string stays on the accessible name.
@@ -12896,6 +13107,7 @@ impl AppView {
                     // actions carry none.
                     .child(
                         Button::new("start-selected")
+                            .small()
                             .primary()
                             // Ticket 10: short visible label (the strip must fit the
                             // 1000px frame); the pinned `Start selected (F5)` string
@@ -12910,6 +13122,7 @@ impl AppView {
                     )
                     .child(
                         Button::new("stop-selected")
+                            .small()
                             // Ticket 10: short visible label; pinned
                             // `Stop selected (Shift-F5)` stays on the accessible name.
                             .label("Stop")
@@ -12922,6 +13135,7 @@ impl AppView {
                     )
                     .child(
                         Button::new("test-selected")
+                            .small()
                             // Ticket 10: short visible label; pinned
                             // `Test selected (Ctrl-T)` stays on the accessible name.
                             .label("Test")
@@ -12938,6 +13152,7 @@ impl AppView {
                     // string stays on the accessible name + chip.
                     .child(
                         Button::new("import-config")
+                            .small()
                             .label("Import")
                             .accessibility_label("Import (Ctrl-O)")
                             .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
@@ -12953,6 +13168,7 @@ impl AppView {
             // stable ids.
             .child(
                 Button::new("library-menu")
+                    .small()
                     .label("Library")
                     .tooltip("Import and export the library")
                     .dropdown_menu(move |menu, _, _| {
@@ -13049,6 +13265,7 @@ impl AppView {
             // facet-bar `groups-dialog` button (which stays put).
             .child(
                 Button::new("manage-menu")
+                    .small()
                     .label("Manage")
                     .tooltip("Subscriptions, presets, and groups")
                     .dropdown_menu(move |menu, _, _| {
@@ -13131,6 +13348,7 @@ impl AppView {
             // (no key hints, matching the strip).
             .child(
                 Button::new("engine-menu")
+                    .small()
                     .label("Engine")
                     .tooltip("Start, stop, and test every endpoint")
                     .dropdown_menu(move |menu, _, _| {
@@ -13210,6 +13428,7 @@ impl AppView {
             // Ticket 10: Help menu — About and Settings moved verbatim.
             .child(
                 Button::new("help-menu")
+                    .small()
                     .label("Help")
                     .tooltip("About and settings")
                     .dropdown_menu(move |menu, _, _| {
@@ -13261,6 +13480,32 @@ impl AppView {
                                 }
                             }),
                         )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                div()
+                                    .id("open-palette")
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| {
+                                            Tooltip::new("Every action, searchable (Ctrl-K)")
+                                        })
+                                        .into()
+                                    })
+                                    .child("Command palette")
+                            })
+                            .on_click({
+                                let view = help_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_palette(window, cx);
+                                    });
+                                }
+                            }),
+                        )
                     }),
             )
     }
@@ -13275,12 +13520,6 @@ impl Render for AppView {
         // detail pane keeps `config-detail` inside its panel, so selection,
         // search, and scroll ownership are unchanged.
         let show_detail = self.config_count(cx) != 0;
-        // Ticket 07: spike flag (default off). The `List` stays mounted and is
-        // the only path when off — nothing below may change that arm.
-        let show_table = self.table_spike;
-        if show_table {
-            self.sync_table_selection(cx);
-        }
         let search_count = self.render_search_count(cx);
         let facet_bar = self.render_facet_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
@@ -13304,17 +13543,6 @@ impl Render for AppView {
                     .search_placeholder("Search configurations")
                     .flex_1(),
             );
-        // Ticket 07: spike table below the `List` (never instead of it).
-        // Default-off, so the paint path above is byte-identical when off.
-        if show_table {
-            list_pane = list_pane.child(
-                div()
-                    .id("dense-table-spike")
-                    .test_support()
-                    .h(px(200.))
-                    .child(DataTable::new(&self.table_state).small()),
-            );
-        }
         list_pane = list_pane.child(empty_ctas);
         // File drops land anywhere on the shell via on_drop (see
         // [`AppView::import_dropped_files`]); a drop while any dialog is
@@ -13449,6 +13677,12 @@ fn main() {
                                 let description = description.clone();
                                 alert
                                     .confirm()
+                                    .button_props(
+                                        DialogButtonProps::default()
+                                            .show_cancel(true)
+                                            .ok_text("Stop all and close")
+                                            .ok_variant(ButtonVariant::Danger),
+                                    )
                                     .title("Close ManyProxy?")
                                     .description(description)
                                     .on_ok(move |_, window, cx| {
@@ -13908,6 +14142,77 @@ mod tests {
             });
         });
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
+    }
+
+    /// Post-import landing: the new rows arrive selected (first) and
+    /// checked (all), so F5 and the bulk bar act on them with no extra
+    /// click.
+    #[gpui_kit::test]
+    fn import_commit_selects_and_checks_new_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.commit_import(
+                    "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nvless://22222222-3333-4444-8555-666666666666@b.example.com:443#two"
+                        .to_string(),
+                    "travel".to_string(),
+                    None,
+                    window,
+                    cx,
+                ));
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
+        assert!(
+            view.read_with(cx, |view, cx| view
+                .selected_config(cx)
+                .map(|config| config.name))
+                .is_some(),
+            "first imported row is selected"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .checked_rows()
+                .len()),
+            2,
+            "all imported rows arrive checked"
+        );
+    }
+
+    /// Port budget: empty and partially-filled libraries read honestly.
+    #[test]
+    fn port_budget_text_counts_auto_ports() {
+        use crate::ConfigForm;
+        assert!(
+            ConfigForm::port_budget_text(&[]).contains("0 of 499"),
+            "empty library: {}",
+            ConfigForm::port_budget_text(&[])
+        );
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("A", "a.example.com", "10801"))
+            .expect("seed works");
+        store
+            .add(row19_seed("B", "b.example.com", "18081"))
+            .expect("seed works");
+        let rows = store.list().expect("list works");
+        let text = ConfigForm::port_budget_text(&rows);
+        assert!(text.contains("2 of 499"), "both ranges count: {text}");
     }
 
     /// Ticket 11: the Export button opens a confirm dialog carrying the
@@ -17292,10 +17597,14 @@ mod tests {
         paint_dialog_open(cx);
         assert_painted(cx, "field-settings-test-url");
         assert_painted(cx, "settings-save-test-url");
-        assert_painted(cx, "settings-ticks");
+        assert_painted(cx, "settings-section-startup");
+        assert_painted(cx, "settings-section-probe");
         // The dialog scrolls at test height — below-the-fold controls assert
         // presence (they render in the completed frame).
         for id in [
+            "settings-ticks",
+            "settings-section-paths",
+            "settings-section-maintenance",
             "settings-copy-db-path",
             "settings-copy-export-path",
             "settings-clear-traffic",
@@ -20139,10 +20448,18 @@ mod tests {
                 "{id} renders"
             );
         }
-        // Named failure paints in the Health pane...
+        // Named failure paints in the Health pane, with the endpoints above
+        // it (endpoints ride every pane — the URL stays readable beside
+        // the failure it explains)...
+        assert_painted(cx, "config-endpoints");
         assert_painted(cx, "config-health");
         assert_painted(cx, "config-health-alert");
-        assert_painted(cx, "config-history");
+        // ...history exists on the pane (below the fold at short panel
+        // heights — the tab bar stays pinned and the body scrolls to it).
+        assert!(
+            cx.update(|window, _| window.try_find("config-history".to_string()).is_some()),
+            "config-history renders on the Health pane"
+        );
         // ...with the row ops present on the same row...
         for id in [
             "engine-start",
@@ -20156,8 +20473,7 @@ mod tests {
                 "{id} operates on the Health pane row"
             );
         }
-        // ...while the Details-only sections leave with the pane switch.
-        assert_absent(cx, "config-endpoints".to_string());
+        // ...while the Presets-only section leaves with the pane switch.
         assert_absent(cx, "config-preset".to_string());
     }
 
@@ -20194,7 +20510,98 @@ mod tests {
             paint_frame(cx);
             assert_painted(cx, "detail-acting-on");
             assert_painted(cx, "detail-serving");
+            // Endpoints ride every pane (the URL is never a tab away);
+            // the operate row exists on every pane (below the fold at
+            // short panel heights — the body scrolls to it).
+            assert_painted(cx, "config-endpoints");
+            assert!(
+                cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
+                "detail-operate renders on every pane"
+            );
         }
+    }
+
+    /// Command palette: the (section, row) table covers both groups in
+    /// full and rejects out-of-range indices (the dialog build order and
+    /// this table must agree — this pins both).
+    #[test]
+    fn palette_op_at_covers_both_groups() {
+        use crate::{AppView, PaletteOp};
+        use gpui_kit::component::IndexPath;
+        let library = [
+            PaletteOp::Add,
+            PaletteOp::Import,
+            PaletteOp::StartSelected,
+            PaletteOp::StopSelected,
+            PaletteOp::TestSelected,
+            PaletteOp::CopyUrls,
+            PaletteOp::EditSelected,
+            PaletteOp::DeleteSelected,
+            PaletteOp::FocusSearch,
+            PaletteOp::ClearChecked,
+            PaletteOp::DetailsTab,
+            PaletteOp::HealthTab,
+            PaletteOp::PresetsTab,
+        ];
+        for (row, want) in library.into_iter().enumerate() {
+            assert_eq!(
+                AppView::palette_op_at(IndexPath::new(row).section(0)),
+                Some(want),
+                "library row {row}"
+            );
+        }
+        let manage = [
+            PaletteOp::Subscriptions,
+            PaletteOp::PresetManager,
+            PaletteOp::Groups,
+            PaletteOp::Logs,
+            PaletteOp::Settings,
+            PaletteOp::About,
+            PaletteOp::StartAll,
+            PaletteOp::StopAll,
+            PaletteOp::TestAll,
+        ];
+        for (row, want) in manage.into_iter().enumerate() {
+            assert_eq!(
+                AppView::palette_op_at(IndexPath::new(row).section(1)),
+                Some(want),
+                "manage row {row}"
+            );
+        }
+        assert_eq!(AppView::palette_op_at(IndexPath::new(13).section(0)), None);
+        assert_eq!(AppView::palette_op_at(IndexPath::new(9).section(1)), None);
+        assert_eq!(AppView::palette_op_at(IndexPath::new(0).section(2)), None);
+    }
+
+    /// Command palette opens as a dialog and running the Add op lands the
+    /// Add dialog (close-then-dispatch through the real shell handlers).
+    #[gpui_kit::test]
+    fn command_palette_opens_and_runs_add(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_palette(window, cx));
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "palette opens a dialog"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.run_palette_op(IndexPath::new(0).section(0), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("add-dialog-ok").is_some()),
+            "Add op opens the Add dialog"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Lane B (B6): one serving-evidence rule — dead-while-serving reads
@@ -24498,6 +24905,8 @@ mod tests {
             ("Inspector health", "Ctrl-2"),
             ("Inspector presets", "Ctrl-3"),
             ("Clear checked", "Esc"),
+            ("Copy URLs", "Ctrl-U"),
+            ("Command palette", "Ctrl-K"),
         ];
         assert_eq!(crate::SHORTCUT_LINES.len(), expected.len());
         for (line, want) in crate::SHORTCUT_LINES.iter().zip(expected) {
@@ -24777,18 +25186,6 @@ mod tests {
             ),
             "redact_secrets",
         );
-        // Table: all eight spike cells read through the same strings.
-        let cells: Vec<String> = view.read_with(cx, |view, cx| {
-            use gpui_kit::component::table::TableDelegate;
-            let table = crate::DenseTableDelegate::new(view.libraries.clone());
-            assert_eq!(table.columns_count(cx), 8, "spike keeps eight columns");
-            (0..table.columns_count(cx))
-                .map(|col| table.cell_string(0, col, cx))
-                .collect()
-        });
-        for (col, text) in cells.iter().enumerate() {
-            assert_no_canaries(text, &format!("table col {col}"));
-        }
         // Inspector inputs: the cached upstream plus the endpoint pair.
         let cached = view.read_with(cx, |view, cx| {
             let row = view.selected_config(cx).expect("selected");
