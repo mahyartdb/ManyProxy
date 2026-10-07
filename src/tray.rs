@@ -69,13 +69,33 @@ pub const AUTOSTART_VALUE_NAME: &str = "ManyProxy";
 /// Real Run key path (never used by tests).
 pub const AUTOSTART_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
+/// Flag appended to the autostart command so a login launch starts hidden
+/// in the tray instead of popping a window (honored in `main` via
+/// [`launched_minimized`]).
+pub const AUTOSTART_MINIMIZED_FLAG: &str = "--tray";
+
 /// Quoted current-exe command for the Run value (`None` when the exe path
 /// is unknown — the checkbox then reports the failure instead of writing
-/// a broken value).
+/// a broken value). Carries [`AUTOSTART_MINIMIZED_FLAG`] so login launches
+/// start hidden.
 pub fn autostart_command() -> Option<String> {
     std::env::current_exe()
         .ok()
+        .map(|path| format!("\"{}\" {AUTOSTART_MINIMIZED_FLAG}", path.display()))
+}
+
+/// Bare quoted current-exe command (pre-flag form). Only used to recognize
+/// a legacy autostart value as on — new writes always carry the flag.
+fn autostart_command_legacy() -> Option<String> {
+    std::env::current_exe()
+        .ok()
         .map(|path| format!("\"{}\"", path.display()))
+}
+
+/// True when this process was launched from the autostart entry (start
+/// hidden in the tray instead of showing a window).
+pub fn launched_minimized() -> bool {
+    std::env::args().any(|arg| arg == AUTOSTART_MINIMIZED_FLAG)
 }
 
 /// Read the autostart command stored under `key_path` (`None` when absent
@@ -131,8 +151,13 @@ pub fn clear_autostart_at(key_path: &str) -> Result<(), String> {
         // No value means already off (checked first so a missing value is
         // never an error, whatever the OS reports on delete).
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("cannot read autostart value ({error})")),
         Ok(_) => key
+            .delete_value(AUTOSTART_VALUE_NAME)
+            .map_err(|error| format!("cannot clear autostart value ({error})")),
+        // Corrupt value type (non-string data under our value name) or any
+        // other read failure: the value is ours, so delete it anyway —
+        // removal must never get stuck on unreadable data.
+        Err(_) => key
             .delete_value(AUTOSTART_VALUE_NAME)
             .map_err(|error| format!("cannot clear autostart value ({error})")),
     }
@@ -144,12 +169,68 @@ pub fn clear_autostart_at(_key_path: &str) -> Result<(), String> {
 }
 
 /// True when the real Run value equals this exe's command (a stale value
-/// from a moved exe reads as off, never as on).
+/// from a moved exe reads as off, never as on). A legacy pre-flag value
+/// for this same exe also reads as on (re-enable rewrites it with the
+/// flag); anything else is off.
 pub fn autostart_enabled() -> bool {
-    match (read_autostart_at(AUTOSTART_RUN_KEY), autostart_command()) {
-        (Some(stored), Some(command)) => stored == command,
+    autostart_value_is_on(read_autostart_at(AUTOSTART_RUN_KEY).as_deref())
+}
+
+fn autostart_value_is_on(stored: Option<&str>) -> bool {
+    match (stored, autostart_command()) {
+        (Some(stored), Some(command)) => {
+            stored == command || autostart_command_legacy().is_some_and(|legacy| stored == legacy)
+        }
         _ => false,
     }
+}
+
+/// The stored command's target exe path (`None` when the value is absent
+/// or unparseable). The value is ours (`AUTOSTART_VALUE_NAME`); the path
+/// is the quoted first token with any launch flag stripped.
+fn autostart_target_exe(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let exe = if let Some(rest) = trimmed.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("").to_string()
+    } else {
+        trimmed.split_whitespace().next().unwrap_or("").to_string()
+    };
+    if exe.is_empty() {
+        None
+    } else {
+        Some(exe)
+    }
+}
+
+/// Remove the autostart value under `key_path` when its target exe no
+/// longer exists (moved/uninstalled copy — a dead entry that would
+/// otherwise linger in Run forever). Unparseable values are removed too
+/// (the value is ours and names nothing runnable — fail-closed to off).
+/// Returns true when a dead entry was removed.
+#[cfg(windows)]
+pub fn clear_dead_autostart_target_at(key_path: &str) -> bool {
+    let Some(stored) = read_autostart_at(key_path) else {
+        return false;
+    };
+    let live = autostart_target_exe(&stored).is_some_and(|exe| std::path::Path::new(&exe).exists());
+    if live {
+        return false;
+    }
+    clear_autostart_at(key_path).is_ok()
+}
+
+#[cfg(not(windows))]
+pub fn clear_dead_autostart_target_at(_key_path: &str) -> bool {
+    false
+}
+
+/// Startup cleanup of a dead autostart entry under the real Run key
+/// (best-effort, never loud — see [`clear_dead_autostart_target_at`]).
+pub fn clear_dead_autostart_target() -> bool {
+    clear_dead_autostart_target_at(AUTOSTART_RUN_KEY)
 }
 
 /// The explicit opt-in behind the Settings checkbox: `true` writes the
@@ -195,19 +276,26 @@ pub fn partition_restore(
 }
 
 /// Native window hide/show through the `HWND` (see module docs).
-/// `false` when the handle is null or the call cannot apply.
+/// `false` when the handle is null, stale, or the end state did not land.
 #[cfg(windows)]
 pub fn hide_window_handle(hwnd: isize) -> bool {
     if hwnd == 0 {
         return false;
     }
-    // SAFETY: `ShowWindow` on a non-null `HWND` is synchronous and never
-    // dereferences our memory; a stale handle fails inside the OS without
-    // touching us. Called on the main thread only.
+    // SAFETY: `IsWindow`/`ShowWindow`/`IsWindowVisible` on an `HWND` are
+    // synchronous and never dereference our memory; a stale handle fails
+    // inside the OS without touching us. Called on the main thread only.
     unsafe {
-        native::ShowWindow(hwnd, native::SW_HIDE);
+        // `ShowWindow` alone no-ops on a stale handle while reading as
+        // applied — gate on `IsWindow` first.
+        if native::IsWindow(hwnd) == 0 {
+            return false;
+        }
+        // `ShowWindow` reports the previous visibility (nonzero = was
+        // visible); the end-state check confirms the hide landed.
+        let was_visible = native::ShowWindow(hwnd, native::SW_HIDE);
+        was_visible != 0 || native::IsWindowVisible(hwnd) == 0
     }
-    true
 }
 
 /// Restore a hidden window through the `HWND` (see module docs).
@@ -218,12 +306,15 @@ pub fn show_window_handle(hwnd: isize) -> bool {
     }
     // SAFETY: same contract as [`hide_window_handle`].
     unsafe {
-        native::ShowWindow(hwnd, native::SW_SHOW);
+        if native::IsWindow(hwnd) == 0 {
+            return false;
+        }
+        let was_visible = native::ShowWindow(hwnd, native::SW_SHOW);
+        was_visible != 0 || native::IsWindowVisible(hwnd) != 0
     }
-    true
 }
 
-/// Hand-rolled `user32` hide/show (two constants, one call — the same
+/// Hand-rolled `user32` hide/show (two constants, three calls — the same
 /// minimal-FFI shape as `dpapi.rs`, no `windows`-crate weight).
 #[cfg(windows)]
 mod native {
@@ -233,6 +324,8 @@ mod native {
     #[link(name = "user32")]
     unsafe extern "system" {
         pub fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+        pub fn IsWindow(hwnd: isize) -> i32;
+        pub fn IsWindowVisible(hwnd: isize) -> i32;
     }
 }
 
@@ -424,21 +517,18 @@ mod tests {
         assert!(!show_window_handle(0));
     }
 
-    /// Autostart command is the quoted current-exe path (the exact value
-    /// the Settings checkbox writes to the Run key).
+    /// Autostart command is the quoted current-exe path plus the hidden-start
+    /// flag (the exact value the Settings checkbox writes to the Run key).
     #[test]
     fn autostart_command_is_quoted_exe_path() {
         let command = autostart_command().expect("current exe is known");
-        assert!(
-            command.starts_with('"') && command.ends_with('"'),
-            "quoted command, got {command}"
-        );
-        let inner = &command[1..command.len() - 1];
-        assert!(!inner.is_empty(), "exe path inside quotes");
+        let exe = std::env::current_exe().expect("exe");
         assert_eq!(
             command,
-            format!("\"{}\"", std::env::current_exe().expect("exe").display())
+            format!("\"{}\" {AUTOSTART_MINIMIZED_FLAG}", exe.display())
         );
+        // A normal launch never carries the flag.
+        assert!(!launched_minimized(), "test harness did not pass --tray");
     }
 
     /// A stale Run value (moved exe) never reads as on: it differs from
@@ -488,5 +578,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The on/off predicate accepts the current flagged command and the
+    /// legacy bare-exe value; anything else (foreign path, absent) is off.
+    #[test]
+    fn autostart_on_predicate_accepts_current_and_legacy() {
+        let command = autostart_command().expect("exe known");
+        assert!(autostart_value_is_on(Some(&command)));
+        let legacy = autostart_command_legacy().expect("exe known");
+        assert!(autostart_value_is_on(Some(&legacy)));
+        assert!(!autostart_value_is_on(Some(
+            "\"C:\\other\\manyproxy.exe\" --tray"
+        )));
+        assert!(!autostart_value_is_on(None));
+    }
+
+    /// Dead autostart targets clean up: a value pointing at a missing exe
+    /// is removed; a live target is kept; absent stays absent.
+    #[cfg(windows)]
+    #[test]
+    fn dead_autostart_target_cleans_up() {
+        let key = format!(r"Software\ManyProxyTrayTest\dead-{}", std::process::id());
+        assert!(!clear_dead_autostart_target_at(&key), "absent stays absent");
+        set_autostart_at(&key, "\"C:\\definitely\\not\\here\\manyproxy.exe\" --tray")
+            .expect("dead value writes");
+        assert!(clear_dead_autostart_target_at(&key), "dead entry removed");
+        assert_eq!(read_autostart_at(&key), None);
+        set_autostart_at(&key, &autostart_command().expect("exe known")).expect("live writes");
+        assert!(!clear_dead_autostart_target_at(&key), "live target kept");
+        clear_autostart_at(&key).expect("cleanup");
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+        let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&key);
+    }
+
+    /// A corrupt (non-string) value under our name still clears instead of
+    /// failing on the read.
+    #[cfg(windows)]
+    #[test]
+    fn corrupt_autostart_type_still_clears() {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+        let key_path = format!(r"Software\ManyProxyTrayTest\corrupt-{}", std::process::id());
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(&key_path)
+            .expect("temp key");
+        key.set_value(AUTOSTART_VALUE_NAME, &42u32)
+            .expect("dword writes");
+        drop(key);
+        clear_autostart_at(&key_path).expect("corrupt value still clears");
+        assert_eq!(read_autostart_at(&key_path), None);
+        let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&key_path);
     }
 }

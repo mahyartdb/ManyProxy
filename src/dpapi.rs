@@ -179,7 +179,10 @@ pub fn seal_params(plaintext: &str) -> Result<String, String> {
 /// Unknown markers fail loudly (never guessed).
 pub fn unseal_params(stored: &str) -> Result<String, String> {
     use base64::Engine as _;
-    if let Some(rest) = stored.strip_prefix(MARKER) {
+    // Trim both sides consistently: detection and decoding agree whether
+    // the caller pasted leading whitespace, trailing newlines, or neither.
+    let trimmed = stored.trim();
+    if let Some(rest) = trimmed.strip_prefix(MARKER) {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(rest.trim())
             .map_err(|_| "dpapi params are not valid base64".to_string())?;
@@ -187,8 +190,17 @@ pub fn unseal_params(stored: &str) -> Result<String, String> {
         return String::from_utf8(plain)
             .map_err(|_| "dpapi params are not valid utf-8".to_string());
     }
-    if stored.trim_start().starts_with('{') {
-        return Ok(stored.to_string());
+    // Legacy plaintext passes through ONLY as a JSON object: `"{garbage"`
+    // (or any other non-JSON) fails loudly instead of smuggling corrupt
+    // params into the library as a trusted row.
+    if trimmed.starts_with('{') {
+        let is_object = serde_json::from_str::<serde_json::Value>(trimmed)
+            .map(|value| value.is_object())
+            .unwrap_or(false);
+        if is_object {
+            return Ok(stored.to_string());
+        }
+        return Err("legacy params are not valid JSON (refusing to guess)".to_string());
     }
     Err("unknown params storage marker (refusing to guess)".to_string())
 }
@@ -356,6 +368,24 @@ mod tests {
         assert!(
             error.contains("dpapi") || error.contains("Windows"),
             "loud dpapi cause, got {error}"
+        );
+    }
+
+    /// Brace-led but not a JSON object (`"{garbage"`) is refused, never
+    /// passed through as legacy plaintext; sealed detection trims both
+    /// sides like the trailing-whitespace arm.
+    #[test]
+    fn unseal_rejects_brace_led_non_json() {
+        for bad in ["{garbage", "{", "[1,2]", "\"str\"", "   {oops"] {
+            let error = unseal_params(bad).expect_err(&format!("{bad:?} must fail"));
+            assert!(
+                error.contains("JSON") || error.contains("unknown params storage marker"),
+                "named cause, got {error}"
+            );
+        }
+        assert_eq!(
+            unseal_params("  {\"a\":1}").expect("legacy object passes"),
+            "  {\"a\":1}"
         );
     }
 

@@ -203,10 +203,18 @@ impl Default for RealHealthProber {
 
 /// Resolve a local endpoint for dialing. Wildcard binds (`0.0.0.0`/`::`)
 /// are served on loopback, so dial loopback instead of the unspecified
-/// address (which can never connect).
-fn endpoint_addr(bind: &str, port: u16) -> Result<SocketAddr, String> {
+/// address (which can never connect). Hostname binds resolve with a
+/// deadline (see [`resolve_endpoint_host`]).
+///
+/// Probes dial the row's own LOCAL endpoint only: a non-loopback result (a
+/// hostile bind or a rebinding hostname) is refused instead of dialed, so
+/// a health check can never steer traffic at a remote host. The egress
+/// under test is exercised through the proxy; the dial itself stays on
+/// loopback. Refusals name loopback so [`classify_health_cause`] reads
+/// them as local, never egress.
+fn endpoint_addr(bind: &str, port: u16, timeout: Duration) -> Result<SocketAddr, String> {
     let trimmed = bind.trim();
-    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+    let addr = if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
         let host = if ip.is_unspecified() {
             if ip.is_ipv4() {
                 "127.0.0.1".to_string()
@@ -224,14 +232,34 @@ fn endpoint_addr(bind: &str, port: u16) -> Result<SocketAddr, String> {
         };
         socket
             .parse::<SocketAddr>()
-            .map_err(|_| format!("bad endpoint {host}:{port}"))
+            .map_err(|_| format!("bad endpoint {host}:{port}"))?
     } else {
-        format!("{trimmed}:{port}")
+        resolve_endpoint_host(trimmed, port, timeout)
+            .ok_or_else(|| format!("cannot resolve endpoint {trimmed}:{port}"))?
+    };
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "refusing non-loopback probe endpoint {addr} (probes dial the local loopback endpoint only)"
+        ));
+    }
+    Ok(addr)
+}
+
+/// Resolve `host:port` with a deadline. `to_socket_addrs` blocks on DNS
+/// with no deadline of its own, so the lookup runs on a detached thread
+/// and a late answer is dropped, never awaited — a hung resolver must
+/// never hang a probe round.
+fn resolve_endpoint_host(host: &str, port: u16, timeout: Duration) -> Option<SocketAddr> {
+    let text = format!("{host}:{port}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let first = text
             .to_socket_addrs()
             .ok()
-            .and_then(|mut addrs| addrs.next())
-            .ok_or_else(|| format!("cannot resolve endpoint {trimmed}:{port}"))
-    }
+            .and_then(|mut addrs| addrs.next());
+        let _ = tx.send(first);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
 }
 
 /// Split `scheme://host/rest`. Errors never echo the URL (queries carry
@@ -259,7 +287,7 @@ impl HealthProber for RealHealthProber {
         port: u16,
         url: &str,
     ) -> Result<ProbeSuccess, String> {
-        let endpoint = endpoint_addr(bind, port)?;
+        let endpoint = endpoint_addr(bind, port, self.timeout)?;
         let (scheme, host) = split_http_url(url)?;
         if !scheme.eq_ignore_ascii_case("http") {
             return Err(format!(
@@ -280,7 +308,18 @@ impl HealthProber for RealHealthProber {
             .map_err(|error| format!("url test via {endpoint}: write failed ({error})"))?;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
+        let read_started = Instant::now();
         loop {
+            // Overall read deadline: per-read timeouts alone never bound a
+            // slow drip (one byte per timeout keeps the loop alive until
+            // the 64KB cap — hours, not seconds).
+            let elapsed = read_started.elapsed();
+            if elapsed >= self.timeout {
+                return Err(format!(
+                    "url test via {endpoint}: timed out waiting for response headers"
+                ));
+            }
+            stream.set_read_timeout(Some(self.timeout - elapsed)).ok();
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -290,6 +329,11 @@ impl HealthProber for RealHealthProber {
                     }
                 }
                 Err(error) => {
+                    if error.kind() == std::io::ErrorKind::TimedOut {
+                        return Err(format!(
+                            "url test via {endpoint}: timed out waiting for response headers"
+                        ));
+                    }
                     return Err(format!("url test via {endpoint}: read failed ({error})"));
                 }
             }
@@ -302,7 +346,9 @@ impl HealthProber for RealHealthProber {
             .nth(1)
             .and_then(|code| code.parse::<u16>().ok())
             .ok_or_else(|| format!("url test via {endpoint}: bad proxy response"))?;
-        if (200..400).contains(&code) {
+        // Only 2xx is success: a 3xx (captive portal, redirector) or any
+        // other status is not a working egress.
+        if (200..300).contains(&code) {
             Ok(ProbeSuccess {
                 latency_ms: started.elapsed().as_millis() as u64,
                 bytes_rx: rx_bytes,
@@ -319,7 +365,7 @@ impl HealthProber for RealHealthProber {
         bind: &str,
         port: u16,
     ) -> Result<ProbeSuccess, String> {
-        let endpoint = endpoint_addr(bind, port)?;
+        let endpoint = endpoint_addr(bind, port, self.timeout)?;
         let started = Instant::now();
         TcpStream::connect_timeout(&endpoint, self.timeout)
             .map_err(|error| format!("tcp ping {endpoint}: {error}"))?;
@@ -367,14 +413,19 @@ fn run_one(
                 latency_ms: None,
                 error: Some(format!(
                     "unsupported protocol \"{}\" for \"{}\" (no health probe for this protocol yet)",
-                    config.protocol, config.name
+                    config.protocol,
+                    redact_secrets(&config.name)
                 )),
             },
             success: None,
         };
     }
-    match probe(prober, config, &config.bind_ip, config.port, url) {
-        Ok(success) => TestOutcome {
+    // A panicking driver must fail its own row, never poison the round.
+    let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        probe(prober, config, &config.bind_ip, config.port, url)
+    }));
+    match probed {
+        Ok(Ok(success)) => TestOutcome {
             sample: HealthSample {
                 config_id: config.id.clone(),
                 at,
@@ -384,7 +435,7 @@ fn run_one(
             },
             success: Some(success),
         },
-        Err(cause) => TestOutcome {
+        Ok(Err(cause)) => TestOutcome {
             sample: HealthSample {
                 config_id: config.id.clone(),
                 at,
@@ -392,8 +443,21 @@ fn run_one(
                 latency_ms: None,
                 error: Some(format!(
                     "{verb} failed for \"{}\": {}",
-                    config.name,
+                    redact_secrets(&config.name),
                     redact_secrets(&cause)
+                )),
+            },
+            success: None,
+        },
+        Err(_) => TestOutcome {
+            sample: HealthSample {
+                config_id: config.id.clone(),
+                at,
+                kind,
+                latency_ms: None,
+                error: Some(format!(
+                    "{verb} failed for \"{}\": probe panicked",
+                    redact_secrets(&config.name)
                 )),
             },
             success: None,
@@ -448,13 +512,18 @@ fn run_all_concurrent(
                     break;
                 };
                 let outcome = run_one(config, prober, kind, verb, probe, url);
+                // Poison-tolerant push: a panicking sibling already
+                // recovered above, but never let a poisoned slot abort the
+                // whole round — recover the guard and keep its results.
                 done.lock()
-                    .expect("probe slot lock held")
+                    .unwrap_or_else(|poison| poison.into_inner())
                     .push((index, outcome));
             });
         }
     });
-    let mut done = done.into_inner().expect("probe slots readable");
+    let mut done = done
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
     done.sort_by_key(|(index, _)| *index);
     done.into_iter().map(|(_, outcome)| outcome).collect()
 }
@@ -1305,6 +1374,8 @@ impl HealthStore {
     /// Samples only — traffic counters stay session-only (a fresh session
     /// has moved no bytes yet). Unknown kinds default to URL tests; callers
     /// pass only snapshots of known rows so removed configs never resurrect.
+    /// Restored errors re-run [`redact_secrets`]: snapshots predate the fix
+    /// or were written by older builds, so hydrate never trusts them blind.
     pub fn hydrate(&mut self, snapshots: &[HealthSnapshot]) {
         for snapshot in snapshots {
             let kind = if snapshot.kind == HealthKind::TcpPing.as_str() {
@@ -1317,7 +1388,7 @@ impl HealthStore {
                 at: snapshot.at,
                 kind,
                 latency_ms: snapshot.latency_ms,
-                error: snapshot.error.clone(),
+                error: snapshot.error.as_ref().map(|cause| redact_secrets(cause)),
             });
         }
     }
@@ -1593,14 +1664,27 @@ impl LogLevel {
     }
 }
 
+/// True when `word` appears as a whole word (lowercase alphanumeric run)
+/// in `lower` — never a raw substring, so `terror` is not an `error` and
+/// `panicky` is not a `panic`.
+fn has_word(lower: &str, word: &str) -> bool {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+fn has_any_word(lower: &str, words: &[&str]) -> bool {
+    words.iter().any(|word| has_word(lower, word))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_level(line: &str) -> LogLevel {
     let lower = line.to_ascii_lowercase();
-    if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
+    if has_any_word(&lower, &["error", "errors", "fatal", "panic", "critical"]) {
         LogLevel::Error
-    } else if lower.contains("warn") {
+    } else if has_any_word(&lower, &["warn", "warning"]) {
         LogLevel::Warn
-    } else if lower.contains("debug") || lower.contains("trace") {
+    } else if has_any_word(&lower, &["debug", "trace"]) {
         LogLevel::Debug
     } else {
         LogLevel::Info
@@ -1644,15 +1728,55 @@ impl LogTagIndex {
         Self { tags }
     }
 
-    /// Claim a line for the first config whose tag it contains.
+    /// Claim a line for the first config whose tag it names as a bounded
+    /// token. Tags are `in-{id}`/`out-{id}`; a raw substring match would
+    /// misattribute `out-12` to `out-1`, so the tag must sit on word
+    /// boundaries (no alphanumeric/`-`/`_` glued on either side).
     pub fn tag_for(&self, line: &str) -> Option<String> {
         for (tag, id) in &self.tags {
-            if line.contains(tag) {
+            if tag_matches_bounded(line, tag) {
                 return Some(id.clone());
             }
         }
         None
     }
+}
+
+/// Chars that extend a log tag (`out-1` glued to `2` is `out-12`, not a
+/// mention of `out-1`).
+fn is_tag_cont_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// True when `tag` occurs in `line` with boundary chars on both sides.
+/// All occurrences are tried (an early overlap rejection never hides a
+/// later exact mention). Byte-index safe: tags are ASCII, so every
+/// advance lands on a char boundary.
+fn tag_matches_bounded(line: &str, tag: &str) -> bool {
+    if tag.is_empty() || tag.len() > line.len() {
+        return false;
+    }
+    let mut start = 0;
+    while start + tag.len() <= line.len() {
+        let Some(pos) = line[start..].find(tag) else {
+            return false;
+        };
+        let found = start + pos;
+        let end = found + tag.len();
+        let prev_ok = line[..found]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_tag_cont_char(c));
+        let next_ok = line[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_tag_cont_char(c));
+        if prev_ok && next_ok {
+            return true;
+        }
+        start = found + 1;
+    }
+    false
 }
 
 /// Redacted, tagged sidecar lines with a per-config filter.
@@ -1714,14 +1838,16 @@ impl LogStore {
     }
 }
 
-/// Ticket 47: crash-cause lines survive ring eviction (case-insensitive
-/// `panic`/`fatal`/`crash` — sing-box fatal errors, Go panics, and our own
-/// crash vocabulary).
+/// Ticket 47: crash-cause lines survive ring eviction. Whole-word match
+/// (`panic`/`fatal`/`crash`/`crashed` — sing-box fatal errors, Go panics,
+/// and our own crash vocabulary): a raw substring would pin spam that
+/// merely contains the letters and flush the real evidence.
 fn is_crash_cause_line(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    ["panic", "fatal", "crash"]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    has_any_word(
+        &lower,
+        &["panic", "panicked", "fatal", "crash", "crashed", "crashes"],
+    )
 }
 
 /// Claim a sidecar line for a config when it names that config's endpoint.
@@ -1743,19 +1869,26 @@ const SECRET_KEYS: &[&str] = &[
     "uuid",
     "privatekey",
     "private_key",
+    "private-key",
     "apikey",
     "api_key",
+    "api-key",
     "auth",
     "authorization",
     "bearer",
     "basic",
     "access_token",
+    "access-token",
     "refresh_token",
+    "refresh-token",
     "cookie",
     "set-cookie",
     "set_cookie",
     "client_secret",
     "clientsecret",
+    "client-secret",
+    "psk",
+    "key",
 ];
 
 fn is_secret_key(token: &str) -> bool {
@@ -1765,9 +1898,53 @@ fn is_secret_key(token: &str) -> bool {
     if SECRET_KEYS.contains(&clean.as_str()) {
         return true;
     }
-    ["_key", "_token", "_secret", "_password", "_passwd"]
-        .iter()
-        .any(|suffix| clean.ends_with(suffix))
+    [
+        "_key",
+        "_token",
+        "_secret",
+        "_password",
+        "_passwd",
+        "-key",
+        "-token",
+        "-secret",
+        "-password",
+        "-passwd",
+    ]
+    .iter()
+    .any(|suffix| clean.ends_with(suffix))
+}
+
+/// UUID-shaped (`8-4-4-4-12` hex) or bare 32-hex, with or without a key.
+fn is_uuid_like(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[14] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+    {
+        return bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 14, 18, 23].contains(&index) || byte.is_ascii_hexdigit());
+    }
+    bytes.len() == 32 && bytes.iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A key-less token that still reads as a secret: UUID-shaped, or a long
+/// opaque run with an entropy signal (a digit or `-`/`_`). Length-gated so
+/// plain words, tags (`out-1`), and host labels pass through untouched.
+fn is_bare_secret(token: &str) -> bool {
+    if is_uuid_like(token) {
+        return true;
+    }
+    if token.len() < 20 {
+        return false;
+    }
+    token
+        .bytes()
+        .any(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'_')
+        || token.len() >= 32
 }
 
 fn is_token_char(c: char) -> bool {
@@ -1796,6 +1973,13 @@ fn is_value_end(c: char) -> bool {
     )
 }
 
+/// Ends a masked secret value: like [`is_value_end`] but spaces/tabs are
+/// VALUE bytes, not terminators — a secret's tail must never leak because
+/// it contains a space (`Authorization: Bearer <token>`).
+fn is_secret_value_end(c: char) -> bool {
+    c != ' ' && c != '\t' && is_value_end(c)
+}
+
 /// Redact credential values in `key=value`, `key: value`, `"key": "value"`,
 /// `Bearer <token>`, `scheme://userinfo@host`, and `?key=value` forms.
 /// Non-secret text (hosts, tags, config names) passes through untouched.
@@ -1804,7 +1988,13 @@ pub fn redact_secrets(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < chars.len() {
-        // URL userinfo: scheme://credentials@ → scheme://***@.
+        // URL userinfo: scheme://credentials@ → scheme://***@. Any scheme
+        // qualifies (`vless://uuid@…` exactly like `https://user@…`); only
+        // a path/query/fragment delimiter BEFORE the `@` disqualifies it
+        // (a `/` after the `@` is a path, never a reason to keep the
+        // credentials — the old code leaked userinfo on any pathed URL).
+        // Scanning resumes after the `@` so `?token=` values in the same
+        // link still pass key=value redaction below.
         if i + 2 < chars.len() && chars[i] == ':' && chars[i + 1] == '/' && chars[i + 2] == '/' {
             out.push_str("://");
             let j = i + 3;
@@ -1818,24 +2008,17 @@ pub fn redact_secrets(line: &str) -> String {
                 end += 1;
             }
             let mut at = None;
-            let mut slash = false;
             for (k, ch) in chars.iter().enumerate().take(end).skip(j) {
-                if *ch == '/' {
-                    slash = true;
+                if matches!(*ch, '/' | '?' | '#') {
                     break;
                 }
                 if *ch == '@' {
                     at = Some(k);
                 }
             }
-            if let (Some(at), false) = (at, slash) {
+            if let Some(at) = at {
                 out.push_str("***@");
-                let mut j = at + 1;
-                while j < end {
-                    out.push(chars[j]);
-                    j += 1;
-                }
-                i = end;
+                i = at + 1;
                 continue;
             }
             // No userinfo: emit just the scheme separator and fall through
@@ -1864,7 +2047,10 @@ pub fn redact_secrets(line: &str) -> String {
                     "bearer" | "basic"
                 );
                 if k < chars.len() && (chars[k] == '=' || chars[k] == ':') {
-                    // Replay key + separator verbatim, then mask the value.
+                    // Replay key + separator verbatim, then mask the ENTIRE
+                    // value — including inner spaces — so `Authorization:
+                    // Bearer <token>` never leaks its tail. Only structural
+                    // ends (`"`, `,`, `&`, …) terminate the mask.
                     while j <= k {
                         out.push(chars[j]);
                         j += 1;
@@ -1876,7 +2062,7 @@ pub fn redact_secrets(line: &str) -> String {
                         j += 1;
                     }
                     out.push_str("***");
-                    while j < chars.len() && !is_value_end(chars[j]) {
+                    while j < chars.len() && !is_secret_value_end(chars[j]) {
                         j += 1;
                     }
                     // Replay a closing quote when we consumed an opening one.
@@ -1899,6 +2085,14 @@ pub fn redact_secrets(line: &str) -> String {
                     i = j;
                     continue;
                 }
+            }
+            // Key-less secrets: UUIDs and long opaque runs mask bare (no
+            // `key=` needed). Hosts, tags, and plain words are too short
+            // or lack the entropy signal, so they pass through.
+            if is_bare_secret(&token) {
+                out.push_str("***");
+                i = j;
+                continue;
             }
             out.push_str(&token);
             i = j;
@@ -2783,24 +2977,213 @@ mod tests {
     }
 
     /// Endpoint normalization: wildcards dial loopback; bad binds name the
-    /// endpoint without secrets.
+    /// endpoint without secrets. Non-loopback targets are refused (probes
+    /// dial the local endpoint only); hostname resolution is deadline-bound.
     #[test]
     fn endpoint_addr_normalizes_wildcards() {
+        use std::time::Duration;
+        let timeout = Duration::from_secs(2);
         assert_eq!(
-            endpoint_addr("0.0.0.0", 10801)
+            endpoint_addr("0.0.0.0", 10801, timeout)
                 .expect("parses")
                 .ip()
                 .to_string(),
             "127.0.0.1"
         );
         assert_eq!(
-            endpoint_addr("::", 10801).expect("parses").ip().to_string(),
+            endpoint_addr("::", 10801, timeout)
+                .expect("parses")
+                .ip()
+                .to_string(),
             "::1"
         );
-        assert!(endpoint_addr("not a host!", 1).is_err());
+        assert_eq!(
+            endpoint_addr("127.0.0.1", 10801, timeout)
+                .expect("loopback parses")
+                .ip()
+                .to_string(),
+            "127.0.0.1"
+        );
+        assert!(endpoint_addr("not a host!", 1, timeout).is_err());
+        let refused =
+            endpoint_addr("93.184.216.34", 80, timeout).expect_err("non-loopback refused");
+        assert!(
+            refused.contains("loopback"),
+            "refusal names loopback (local cause): {refused}"
+        );
         assert!(split_http_url("https://example.com/x").is_ok());
         assert!(split_http_url("notaurl").is_err());
         assert!(split_http_url(DEFAULT_TEST_URL).is_ok());
+    }
+
+    /// Redaction: Authorization values mask in full (never just the first
+    /// word), pathed URLs still mask userinfo, link queries still mask,
+    /// and bare UUIDs/keys mask with no key name.
+    #[test]
+    fn redact_secrets_covers_auth_pathed_bare_forms() {
+        for (raw, leaked) in [
+            ("Authorization: Bearer abc123def", "abc123def"),
+            ("authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("password=hunter2 with spaces", "hunter2"),
+            (
+                "https://user:s3cret@host:8443/path?token=abc123#row",
+                "s3cret",
+            ),
+            (
+                "https://user:s3cret@host:8443/path?token=abc123#row",
+                "abc123",
+            ),
+            (
+                "vless://11111111-2222-4333-8444-555555555555@host:443?path=/ws&security=tls#x",
+                "11111111-2222",
+            ),
+            (
+                "peer 11111111-2222-4333-8444-555555555555 connected",
+                "11111111-2222",
+            ),
+            (
+                "key ab12cd34ef56ab78cd90ef12ab34cd56 seen",
+                "ab12cd34ef56ab78cd90ef12ab34cd56",
+            ),
+        ] {
+            let redacted = redact_secrets(raw);
+            assert!(
+                !redacted.contains(leaked),
+                "leaked {leaked} in {redacted} (from {raw})"
+            );
+        }
+        // Fragments and tags survive when no secret precedes them.
+        assert_eq!(
+            redact_secrets("vless://host:443#my-row"),
+            "vless://host:443#my-row"
+        );
+    }
+
+    /// Ticket A7: one redaction contract across both owners — the same
+    /// uuid/password/token corpus is clean through `redact_secrets`
+    /// (log/sidecar paths) AND `import::redact_link` (label paths), and the
+    /// pinned order is redact-FIRST, truncate-LAST (a long secret link is
+    /// still clean after the 96-char display cut — truncation never slices
+    /// a secret into an unredacted tail).
+    #[test]
+    fn a7_redaction_contract_holds_in_both_owners() {
+        const UUID: &str = "11111111-2222-4333-8444-555555555555";
+        const PASSWORD: &str = "hunter2-hunter2-hunter2-99";
+        const TOKEN: &str = "tok-ABCDEF1234567890abcdef";
+        let corpus = [
+            format!("vless://{UUID}@host.example.com:443?security=tls#x"),
+            format!("trojan://{PASSWORD}@host.example.com:443#x"),
+            format!("https://host.example.com/sub?token={TOKEN}&other=1"),
+            format!("ss://{PASSWORD}@host.example.com:8388#x"),
+        ];
+        for raw in &corpus {
+            let via_health = redact_secrets(raw);
+            for secret in [UUID, PASSWORD, TOKEN] {
+                assert!(
+                    !via_health.contains(secret),
+                    "health leaked {secret} in {via_health} (from {raw})"
+                );
+            }
+            let via_import = crate::import::redact_link(raw);
+            for secret in [UUID, PASSWORD, TOKEN] {
+                assert!(
+                    !via_import.contains(secret),
+                    "import leaked {secret} in {via_import} (from {raw})"
+                );
+            }
+            assert!(
+                via_import.contains("host.example.com"),
+                "host kept for diagnostics: {via_import}"
+            );
+        }
+        // Order pin: a 200-char secret query redacts fully even though the
+        // display truncates at 96 chars (redact-first means the cut only
+        // ever slices mask characters, never plaintext).
+        let long_secret = format!("https://host.example.com/sub?token={}", "s".repeat(200));
+        let redacted = crate::import::redact_link(&long_secret);
+        assert!(redacted.chars().count() <= 97, "truncated: {redacted}");
+        assert!(
+            !redacted.contains(&"s".repeat(5)),
+            "no secret run past the cut: {redacted}"
+        );
+    }
+
+    /// Only 2xx is a working egress: 302/500 from the local stub fail the
+    /// URL test instead of counting as success.
+    #[test]
+    fn real_url_test_only_2xx_is_success() {
+        use std::io::{Read as _, Write as _};
+        use std::time::Duration;
+        fn stub_once(reply: Vec<u8>) -> u16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+            let port = listener.local_addr().expect("addr works").port();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept works");
+                let mut head = [0u8; 4096];
+                let _ = stream.read(&mut head);
+                let _ = stream.write_all(&reply);
+            });
+            port
+        }
+        let config = fixture("p1", "Probe", "vless", "127.0.0.1", 10801);
+        let prober = RealHealthProber::new(Duration::from_secs(2));
+        let ok = stub_once(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+        prober
+            .url_test(&config, "127.0.0.1", ok, "http://example.com/")
+            .expect("204 succeeds");
+        let redirect = stub_once(
+            b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+        let error = prober
+            .url_test(&config, "127.0.0.1", redirect, "http://example.com/")
+            .expect_err("302 fails");
+        assert!(error.contains("302"), "names the status: {error}");
+        let broken = stub_once(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        );
+        let error = prober
+            .url_test(&config, "127.0.0.1", broken, "http://example.com/")
+            .expect_err("500 fails");
+        assert!(error.contains("500"), "names the status: {error}");
+    }
+
+    /// A slow drip (bytes inside every read window, forever) cannot hold
+    /// the URL test past its overall read deadline.
+    #[test]
+    fn real_url_test_slow_drip_hits_overall_deadline() {
+        use std::io::{Read as _, Write as _};
+        use std::time::{Duration, Instant};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept works");
+            let mut head = [0u8; 4096];
+            let _ = stream.read(&mut head);
+            // Drips land well inside every per-read window, so only the
+            // overall deadline can stop this (per-read timeouts alone
+            // would run to the 64KB cap — over ten minutes here).
+            for _ in 0..10_000 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let config = fixture("p1", "Probe", "vless", "127.0.0.1", 10801);
+        let prober = RealHealthProber::new(Duration::from_millis(500));
+        let started = Instant::now();
+        let error = prober
+            .url_test(&config, "127.0.0.1", port, "http://example.com/")
+            .expect_err("drip must fail");
+        assert!(error.contains("timed out"), "deadline cause: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded, took {:?}",
+            started.elapsed()
+        );
     }
 
     // -- Ticket 41: probe attribution normalization + cause classifier ------
@@ -3218,6 +3601,55 @@ mod tests {
         let _ = server;
     }
 
+    /// Ticket A8: clash-poll errors never carry the bearer secret — every
+    /// failure arm (dial, write, read, status, deadline) names core/port
+    /// only. Pinned with a refused port plus a wrong-secret stub.
+    #[test]
+    fn a8_clash_poll_errors_never_carry_secret() {
+        use std::time::Duration;
+        const SECRET: &str = "s3cret-hunter2-11111111-2222-4333-8444-555555555555";
+        // Refused port: dial fails before any byte moves.
+        let refused = vec![crate::engine::ClashTarget {
+            core: "down".to_string(),
+            port: 1,
+            secret: SECRET.to_string(),
+        }];
+        for (_, result) in
+            poll_clash_targets(&refused, Duration::from_secs(2), Duration::from_secs(5))
+        {
+            let error = result.expect_err("refused port fails");
+            assert!(!error.contains(SECRET), "secret in error: {error}");
+            assert!(!error.contains("hunter2"), "secret part in error: {error}");
+            assert!(error.contains("127.0.0.1"), "endpoint named: {error}");
+        }
+        // Wrong secret against a live stub: 401 names the endpoint only.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let port = listener.local_addr().expect("addr works").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("accept works");
+            let mut head = [0u8; 4096];
+            let _ = stream.read(&mut head);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let wrong = vec![crate::engine::ClashTarget {
+            core: "auth".to_string(),
+            port,
+            secret: SECRET.to_string(),
+        }];
+        for (_, result) in
+            poll_clash_targets(&wrong, Duration::from_secs(5), Duration::from_secs(10))
+        {
+            let error = result.expect_err("wrong secret is unauthorized");
+            assert!(error.contains("unauthorized"), "named: {error}");
+            assert!(!error.contains(SECRET), "secret in error: {error}");
+            assert!(!error.contains("hunter2"), "secret part in error: {error}");
+        }
+        server.join().expect("stub drains");
+    }
+
     /// Ticket 47 (RED): ingest strips ANSI once and caches the lowercase
     /// search blob — stored records carry no escapes.
     #[test]
@@ -3268,10 +3700,9 @@ mod tests {
             );
         }
         assert_eq!(index.tag_for("warn in-1: x").as_deref(), Some("1"));
-        // Substring-overlap quirk (pre-existing, preserved): "out-12"
-        // contains "out-1", so first-config-wins claims it for "1" — parity,
-        // never longest-match.
-        assert_eq!(index.tag_for("error out-12: y").as_deref(), Some("1"));
+        // Bounded-token match: "out-12" is 12's tag, never a mention of
+        // "out-1" (a raw substring match would misattribute it to "1").
+        assert_eq!(index.tag_for("error out-12: y").as_deref(), Some("12"));
         assert_eq!(index.tag_for("info engine started"), None);
         // Without the overlapping id, 12 wins its own tag.
         let index12 = LogTagIndex::build(&active[1..]);

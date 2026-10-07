@@ -132,8 +132,9 @@ pub struct ImportFailure {
 impl ImportFailure {
     fn new(index: usize, label: impl Into<String>, error: ImportError) -> Self {
         // Ticket 24 (SEC L1, LOW caps): labels are bounded display strings —
-        // never a paste of unbounded user input.
-        let label = label.into();
+        // never a paste of unbounded user input. Sanitized like display
+        // names (controls/bidi/ANSI never reach notifications).
+        let label = sanitize_name(&label.into());
         let label = if label.chars().count() > 96 {
             format!("{}…", label.chars().take(96).collect::<String>())
         } else {
@@ -172,6 +173,7 @@ impl BatchResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportOutcome {
     pub imported: usize,
+    pub imported_ids: Vec<String>,
     pub duplicates: usize,
     pub failures: Vec<ImportFailure>,
 }
@@ -249,6 +251,11 @@ const MAX_B64_COMPACT: usize = 1_000_000;
 /// query strings; overlong material is never a credential).
 const MAX_QUERY_ITEM: usize = 4096;
 
+/// Ticket 24: at most this many `&`-pairs are read from one query string
+/// (a million-pair query is never legitimate; extras ride the same map,
+/// so one count cap bounds both).
+const MAX_QUERY_PAIRS: usize = 256;
+
 /// Ticket 24: display names (remarks/fragments/tags) truncate here.
 const MAX_NAME_CHARS: usize = 256;
 
@@ -320,8 +327,10 @@ fn strip_bom(text: &str) -> &str {
 // URI splitting (hand-rolled: full control over the error taxonomy)
 // ---------------------------------------------------------------------------
 
-/// Split `host[:port]` with bracketed-IPv6 support. Bare IPv6 without
-/// brackets is rejected (taxonomy: bad host with IPv6 rules).
+/// Split `host[:port]` with bracketed-IPv6 support. Bare IPv6 is accepted
+/// too: when the head before the last `:` parses as an IPv6 address it is
+/// the host and the tail is the port; when the whole text parses as IPv6
+/// there is no port; anything else with stray colons is a bad host.
 fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> {
     if text.is_empty() {
         return Err(bad_host("missing host"));
@@ -333,6 +342,9 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
         let host = rest[..end].to_string();
         if host.trim().is_empty() {
             return Err(bad_host("missing host"));
+        }
+        if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(bad_host("bad host"));
         }
         let after = &rest[end + 1..];
         if after.is_empty() {
@@ -350,9 +362,20 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
         Some(i) => {
             let (host, port) = (&text[..i], &text[i + 1..]);
             if host.contains(':') {
+                // Bare IPv6: `::1:443` is host `::1` + port; `2001:db8::1`
+                // is a whole address with no port; `foo:bar:443` is neither.
+                if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                    if port.is_empty() {
+                        return Err(bad_port("bad port ''"));
+                    }
+                    return Ok((host.to_string(), Some(port.to_string())));
+                }
+                if text.parse::<std::net::Ipv6Addr>().is_ok() {
+                    return Ok((text.to_string(), None));
+                }
                 return Err(bad_host("bare IPv6 must use [brackets]"));
             }
-            if host.is_empty() || host.chars().any(char::is_whitespace) {
+            if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
                 return Err(bad_host("missing host"));
             }
             if port.is_empty() {
@@ -372,18 +395,19 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
 /// Port text → 1..=65535. Hysteria-style multi-port (`mport`/comma lists)
 /// takes the first entry (first-wins). Ticket 24: strict — leading zeros
 /// (`0443`) and explicit signs (`+443`) are rejected, not normalized.
+/// Echoes into reasons are capped ([`cap_echo`]), never unbounded input.
 fn parse_port(text: &str) -> Result<u16, ImportError> {
     let first = text.split([',', ';']).next().unwrap_or("").trim();
     if first.len() > 1 && first.starts_with('0') {
-        return Err(bad_port(format!("bad port '{text}'")));
+        return Err(bad_port(format!("bad port '{}'", cap_echo(text))));
     }
     // Rust's unsigned parse accepts a leading `+`: reject explicit signs.
     if first.starts_with('+') || first.starts_with('-') {
-        return Err(bad_port(format!("bad port '{text}'")));
+        return Err(bad_port(format!("bad port '{}'", cap_echo(text))));
     }
     match first.parse::<u32>() {
         Ok(port) if (1..=65_535).contains(&port) => Ok(port as u16),
-        _ => Err(bad_port(format!("bad port '{text}'"))),
+        _ => Err(bad_port(format!("bad port '{}'", cap_echo(text)))),
     }
 }
 
@@ -444,6 +468,17 @@ fn split_uri(_scheme: &str, rest: &str) -> Result<UriParts, ImportError> {
     })
 }
 
+/// Ticket 24 (M1): parsers whose grammar cannot express a URI path reject
+/// a non-empty one explicitly instead of silently dropping it (only the
+/// vless-like grammar preserves paths into transport opts). A lone
+/// trailing slash stays tolerated — real-world clients append one.
+fn reject_unexpected_path(protocol: &str, parts: &UriParts) -> Result<(), ImportError> {
+    if !parts.path.trim_matches('/').is_empty() {
+        return Err(bad_host(format!("{protocol} link has an unexpected path")));
+    }
+    Ok(())
+}
+
 /// Query pairs, percent-decoded with form (`+` → space) semantics, unordered
 /// with unique names (first wins). Ticket 24: names are case-sensitive
 /// (spec #716 — `PBK` never satisfies a `pbk` check; the reality error says
@@ -454,7 +489,7 @@ fn query_map(raw: &str) -> HashMap<String, String> {
     if raw.is_empty() {
         return map;
     }
-    for pair in raw.split('&') {
+    for pair in raw.split('&').take(MAX_QUERY_PAIRS) {
         if pair.is_empty() {
             continue;
         }
@@ -487,12 +522,64 @@ fn display_name(fragment: &str, protocol: &str, host: &str, port: u16) -> String
 
 /// Ticket 28: one display-name length cap (link remarks and JSON tags share
 /// `MAX_NAME_CHARS`; the truncation itself never carries secrets).
+/// Display names also strip ANSI escapes, control chars, and bidi
+/// overrides (terminal-injection / spoofing surface) before the cap.
 fn cap_name(name: String) -> String {
-    if name.chars().count() > MAX_NAME_CHARS {
-        name.chars().take(MAX_NAME_CHARS).collect()
+    let clean = sanitize_name(&name);
+    if clean.chars().count() > MAX_NAME_CHARS {
+        clean.chars().take(MAX_NAME_CHARS).collect()
     } else {
-        name
+        clean
     }
+}
+
+/// Bound untrusted input echoed into failure reasons (scheme/command/port
+/// echoes): capped at 64 chars like the type echoes, never unbounded input.
+fn cap_echo(text: &str) -> String {
+    const MAX_ECHO_CHARS: usize = 64;
+    if text.chars().count() > MAX_ECHO_CHARS {
+        format!("{}…", text.chars().take(MAX_ECHO_CHARS).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
+/// Strip ANSI escape sequences (CSI `ESC [ … final-byte`, plus a trailing
+/// bare ESC), control chars, bidi overrides/isolates, and directional
+/// marks from a display string. Keeps the text, drops only the codes.
+fn sanitize_name(text: &str) -> String {
+    const CSI_FINAL: std::ops::RangeInclusive<char> = '@'..='~';
+    let mut no_ansi = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1B}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if CSI_FINAL.contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        no_ansi.push(c);
+    }
+    no_ansi
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{200E}'
+                        | '\u{200F}'
+                        | '\u{061C}'
+                        | '\u{FEFF}'
+                )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -868,11 +955,13 @@ fn parse_ss_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
                 .find(':')
                 .ok_or_else(|| missing_credential("ss link is missing password"))?;
             // Ticket 24 (M14): inner-slash trim parity with the split
-            // branch, plus the same percent-decode parity.
+            // branch. The legacy blob was never URI-encoded (it rode
+            // inside base64), so a literal `%41` in the password stays
+            // verbatim — percent-decoding here would mangle it into `A`.
             let (host, port_text) = split_host_port(host_port.trim_end_matches('/'))?;
             (
                 percent_decode(&userinfo[..j], false),
-                percent_decode(&userinfo[j + 1..], false),
+                userinfo[j + 1..].to_string(),
                 host,
                 require_port(port_text.as_deref())?,
             )
@@ -900,10 +989,11 @@ fn parse_ss_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
 }
 
 /// Hysteria2 (`hysteria2://`, `hy2://`): auth required, port omitted → 443,
-/// multi-port first-wins. Ticket 42: the `hysteria2+realm` rendezvous scheme
-/// never reaches here — [`parse_link`] rejects it with guidance (the realm
+/// multi-port first-wins. The `hysteria2+realm` rendezvous scheme never
+/// reaches here — [`parse_link`] rejects it with guidance (the realm
 /// block conflicts with server addressing and has no link mapping).
-fn parse_hy2(scheme: &str, parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+fn parse_hy2(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("hysteria2", parts)?;
     let auth = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     if auth.trim().is_empty() {
         return Err(missing_credential(
@@ -919,9 +1009,6 @@ fn parse_hy2(scheme: &str, parts: &UriParts) -> Result<ImportedConfig, ImportErr
     let mut params = base_params("hysteria2", &parts.host, port);
     insert_str(&mut params, "password", auth);
     insert_str(&mut params, "sni", sni);
-    if scheme == "hysteria2+realm" {
-        insert_str(&mut params, "variant", "realm".to_string());
-    }
     insert_extras(
         &mut params,
         query,
@@ -943,6 +1030,7 @@ fn parse_hy2(scheme: &str, parts: &UriParts) -> Result<ImportedConfig, ImportErr
 /// for the engine's strict per-protocol check (typed bad-option, never a
 /// silent mis-serve).
 fn parse_snell(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("snell", parts)?;
     let mut psk = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     if psk.trim().is_empty() {
         psk = parts.query.get("psk").cloned().unwrap_or_default();
@@ -1018,6 +1106,7 @@ fn parse_snell(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// passwordless v1 shape omits the key and takes the schema default 1);
 /// `sni` falls back to the host exactly like the other TLS protocols.
 fn parse_shadowtls(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("shadowtls", parts)?;
     let password = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     let version = match parts
         .query
@@ -1087,6 +1176,7 @@ fn unsupported_protocol_guidance(scheme: &str) -> ImportError {
 
 /// Legacy Hysteria v1 (`hysteria://auth@host:port?…`): auth and port required.
 fn parse_hy1(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("hysteria", parts)?;
     let auth = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     if auth.trim().is_empty() {
         return Err(missing_credential("hysteria link is missing auth"));
@@ -1111,6 +1201,7 @@ fn parse_hy1(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// TUIC (`tuic://uuid:password@host:port?…`): userinfo splits on the first
 /// colon so passwords may contain `:`.
 fn parse_tuic(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("tuic", parts)?;
     let raw = parts.userinfo.as_deref().unwrap_or("");
     let i = raw
         .find(':')
@@ -1122,7 +1213,7 @@ fn parse_tuic(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     if uuid.trim().is_empty() {
         return Err(missing_credential("tuic link is missing uuid"));
     }
-    if password.is_empty() {
+    if password.trim().is_empty() {
         return Err(missing_credential("tuic link is missing password"));
     }
     let port = require_port(parts.port_text.as_deref())?;
@@ -1150,6 +1241,7 @@ fn parse_tuic(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// version-matrix validator (engine.rs). Only the protocol name (params,
 /// display name, and credential errors) varies.
 fn parse_wg_like(protocol: &str, parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path(protocol, parts)?;
     let private_key = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     if private_key.trim().is_empty() {
         return Err(missing_credential(format!(
@@ -1157,7 +1249,13 @@ fn parse_wg_like(protocol: &str, parts: &UriParts) -> Result<ImportedConfig, Imp
         )));
     }
     let query = &parts.query;
-    let public_key = query.get("publickey").cloned().unwrap_or_default();
+    // Both query spellings satisfy the public key (`publickey` is the URI
+    // convention, `public_key` the JSON one); extras already consume both.
+    let public_key = query
+        .get("publickey")
+        .or_else(|| query.get("public_key"))
+        .cloned()
+        .unwrap_or_default();
     if public_key.trim().is_empty() {
         return Err(missing_credential(format!(
             "{protocol} link is missing publickey"
@@ -1208,6 +1306,7 @@ fn parse_socks_like(
     parts: &UriParts,
     default_port: Option<u16>,
 ) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path(protocol, parts)?;
     let port = match (parts.port_text.as_deref(), default_port) {
         (Some(text), _) => parse_port(text)?,
         (None, Some(fallback)) => fallback,
@@ -1221,7 +1320,7 @@ fn parse_socks_like(
                 // rejected, never stored as an empty credential.
                 let username = percent_decode(&raw[..i], false);
                 let password = percent_decode(&raw[i + 1..], false);
-                if username.trim().is_empty() || password.is_empty() {
+                if username.trim().is_empty() || password.trim().is_empty() {
                     return Err(missing_credential(format!(
                         "{protocol} link has empty credentials"
                     )));
@@ -1265,8 +1364,9 @@ fn parse_socks_like(
 }
 
 fn parse_anytls(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("anytls", parts)?;
     let password = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
-    if password.is_empty() {
+    if password.trim().is_empty() {
         return Err(missing_credential("anytls link is missing password"));
     }
     let port = require_port(parts.port_text.as_deref())?;
@@ -1287,6 +1387,7 @@ fn parse_anytls(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 }
 
 fn parse_naive(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("naive", parts)?;
     let raw = parts.userinfo.as_deref().unwrap_or("");
     let i = raw
         .find(':')
@@ -1295,7 +1396,7 @@ fn parse_naive(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
         percent_decode(&raw[..i], false),
         percent_decode(&raw[i + 1..], false),
     );
-    if username.trim().is_empty() || password.is_empty() {
+    if username.trim().is_empty() || password.trim().is_empty() {
         return Err(missing_credential("naive link is missing credentials"));
     }
     let port = match parts.port_text.as_deref() {
@@ -1324,6 +1425,7 @@ fn parse_naive(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// omitted → 22. A `private_key`/`privatekey` query value also satisfies the
 /// secret half (never echoed in errors).
 fn parse_ssh(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("ssh", parts)?;
     let raw = parts.userinfo.as_deref().unwrap_or("");
     let (user, password) = match raw.find(':') {
         Some(i) => (
@@ -1341,7 +1443,7 @@ fn parse_ssh(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
         .or_else(|| parts.query.get("privatekey"))
         .map(|key| !key.trim().is_empty())
         .unwrap_or(false);
-    if password.is_empty() && !query_key {
+    if password.trim().is_empty() && !query_key {
         return Err(missing_credential(
             "ssh link is missing password (or ?private_key=)",
         ));
@@ -1353,7 +1455,7 @@ fn parse_ssh(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     let mut params = base_params("ssh", &parts.host, port);
     insert_str(&mut params, "user", user.clone());
     insert_str(&mut params, "username", user);
-    if !password.is_empty() {
+    if !password.trim().is_empty() {
         insert_str(&mut params, "password", password);
     }
     // Ticket 24 (HIGH extras-overwrite): `private_key` is a CORE_KEY, so
@@ -1394,6 +1496,7 @@ fn parse_ssh(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// with a `key` alias so JSON rows and links agree. Port required.
 /// AWG-vs-Noise confusion is rejected in the engine (wrong-layer), not here.
 fn parse_noise(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("noise", parts)?;
     let key = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
     if key.trim().is_empty() {
         return Err(missing_credential("noise link is missing key"));
@@ -1440,7 +1543,8 @@ fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
     }
     if !command.eq_ignore_ascii_case("add") {
         return Err(unknown_scheme(format!(
-            "unknown throne command '{command}'"
+            "unknown throne command '{}'",
+            cap_echo(command)
         )));
     }
     if payload.trim().is_empty() {
@@ -1518,12 +1622,14 @@ pub const VALID_LINK_SCHEMES: &[&str] = &[
     "snell",
     "shadowtls",
     "shadow-tls",
+    "shadow_tls",
     "v2rayn",
     "anytls",
     "ssh",
     "noise",
     "http",
     "https",
+    "naive",
     "naive+https",
 ];
 fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
@@ -1614,10 +1720,19 @@ fn json_outbound(_index: usize, value: &serde_json::Value) -> Result<ImportedCon
     let host_raw = json_string(obj, &["server", "address"])
         .ok_or_else(|| ImportError::new(ImportErrorKind::BadHost, "item is missing \"server\""))?;
     let host_trimmed = host_raw.trim();
-    let host = host_trimmed
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host_trimmed);
+    // Brackets must balance: `[::1` without `]` is a bad host, never the
+    // verbatim string (parity with the legacy-vmess `"add"` handling).
+    let host = if let Some(inner) = host_trimmed.strip_prefix('[') {
+        let inner = inner
+            .strip_suffix(']')
+            .ok_or_else(|| bad_host("item has a bad \"server\" (unclosed '[')"))?;
+        if inner.trim().is_empty() {
+            return Err(bad_host("item has a bad \"server\" (empty host)"));
+        }
+        inner
+    } else {
+        host_trimmed
+    };
     if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(bad_host("item has a bad \"server\""));
     }
@@ -2168,7 +2283,9 @@ fn valid_scheme_chars(scheme: &str) -> bool {
         Some(first) if first.is_ascii_alphabetic() => {}
         _ => return false,
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+    // `_` is not RFC-3986, but `shadow_tls://` links circulate in the wild
+    // and the grammar accepts them (same alias as the JSON/Clash intake).
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.' || c == '_')
 }
 
 /// Parse one share link. Never panics; every failure mode maps to the error
@@ -2187,12 +2304,14 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         .ok_or_else(|| unknown_scheme("not a share link (missing '://')"))?;
     let scheme_raw = &text[..sep];
     if !valid_scheme_chars(scheme_raw) {
-        return Err(unknown_scheme(format!("unknown scheme '{scheme_raw}'")));
+        return Err(unknown_scheme(format!(
+            "unknown scheme '{}'",
+            cap_echo(scheme_raw)
+        )));
     }
     let scheme = scheme_raw.to_ascii_lowercase();
     let rest = &text[sep + 3..];
-    match scheme.as_str() {
-        // Ticket 42: v2rayn links are legacy-vmess blobs under another
+    match scheme.as_str() {        // Ticket 42: v2rayn links are legacy-vmess blobs under another
         // scheme (base64 alphabet has no `@`, so the legacy branch owns
         // them exactly like `vmess://`).
         "vmess" | "v2rayn" => {
@@ -2218,7 +2337,7 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         // the row keeps the `xray` kind so the engine bridges it to the
         // Xray sidecar (Xray-only fields pass through verbatim).
         "xray" => parse_vless_like("xray", &split_uri(&scheme, rest)?, "uuid"),
-        "hysteria2" | "hy2" => parse_hy2(&scheme, &split_uri(&scheme, rest)?),
+        "hysteria2" | "hy2" => parse_hy2(&split_uri(&scheme, rest)?),
         // Ticket 42 (US-22): realm rendezvous has no link mapping (the
         // realm block conflicts with server addressing) — loud import
         // reject with guidance, never parse-ok/start-fail. Native `realm`
@@ -2237,10 +2356,12 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         "noise" => parse_noise(&split_uri(&scheme, rest)?),
         "http" => parse_socks_like("http", &split_uri(&scheme, rest)?, Some(80)),
         "https" => parse_socks_like("https", &split_uri(&scheme, rest)?, Some(443)),
-        "naive+https" => parse_naive(&split_uri(&scheme, rest)?),
+        "naive" | "naive+https" => parse_naive(&split_uri(&scheme, rest)?),
         // Ticket 42 (US-24): native 1.14.x outbounds.
         "snell" => parse_snell(&split_uri(&scheme, rest)?),
-        "shadowtls" | "shadow-tls" => parse_shadowtls(&split_uri(&scheme, rest)?),
+        "shadowtls" | "shadow-tls" | "shadow_tls" => {
+            parse_shadowtls(&split_uri(&scheme, rest)?)
+        }
         // Ticket 42 (US-24): no upstream 1.14.2 schema (or endpoint-only /
         // 1.15+-only) — loud import reject with per-protocol guidance.
         "mieru" | "juicity" | "openvpn" | "masque" | "trusttunnel" => {
@@ -2248,7 +2369,8 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         }
         // Ticket 31: a typo scheme names the valid schemes.
         _ => Err(unknown_scheme(format!(
-            "unknown scheme '{scheme}' (valid: {})",
+            "unknown scheme '{}' (valid: {})",
+            cap_echo(&scheme),
             VALID_LINK_SCHEMES.join(", ")
         ))),
     }
@@ -2263,7 +2385,7 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
 /// config has `outbounds` but never both export sections, so it stays on the
 /// import path (duplicates, never a restore).
 pub fn is_library_export(text: &str) -> bool {
-    let trimmed = text.trim();
+    let trimmed = strip_bom(text.trim()).trim();
     if !trimmed.starts_with('{') {
         return false;
     }
@@ -2395,6 +2517,7 @@ pub fn commit_batch(
         .collect();
     let mut outcome = ImportOutcome {
         imported: 0,
+        imported_ids: Vec::new(),
         duplicates: 0,
         failures: batch.failures,
     };
@@ -2418,6 +2541,7 @@ pub fn commit_batch(
     }
     let added = store.add_batch(inputs)?;
     outcome.imported = added.len();
+    outcome.imported_ids = added.iter().map(|config| config.id.clone()).collect();
     Ok(outcome)
 }
 
@@ -2440,6 +2564,9 @@ pub fn import_multi_file_contents(files: &[(&str, &str)]) -> BatchResult {
             offset += 1;
         }
     }
+    // Cross-file dedupe: two files carrying the same remark must not
+    // produce twin display names (per-file batches dedupe internally only).
+    dedupe_names(&mut out.configs);
     out
 }
 
@@ -2466,8 +2593,8 @@ pub fn effective_hint_for_text(hint: Option<&str>, text: &str) -> Option<String>
 // ---------------------------------------------------------------------------
 
 /// Normalized subscription identity for refresh upserts: protocol + server +
-/// port + credential + method + sni/path, NOT the remark. Server is trimmed,
-/// bracket-stripped, trailing-dot-trimmed and lowercased (hostnames are
+/// port + credential (including the SSH `user`) + method + sni/path, NOT the
+/// remark. Server is trimmed, bracket-stripped, trailing-dot-trimmed and lowercased (hostnames are
 /// case-insensitive, surrounding whitespace/brackets/a root dot are not
 /// identity); credential values stay verbatim. Ticket 24 (LOW): `flow` and
 /// `security` are deliberately excluded from identity (same server with a
@@ -2508,20 +2635,23 @@ pub fn normalized_identity(protocol: &str, params: &str) -> String {
                 })
                 .unwrap_or_default();
             let port = get(&map, &["server_port", "port"]).unwrap_or_default();
+            // Credential slots, verbatim. Alias spellings (`user`/`username`,
+            // `private_key`/`privatekey`, …) share one slot so link rows and
+            // JSON rows with different spellings still dedupe — and an SSH
+            // `user` is never dropped from the key (different users on the
+            // same server are different rows).
             let creds: Vec<String> = [
-                "uuid",
-                "password",
-                "auth",
-                "private_key",
-                "privatekey",
-                "public_key",
-                "publickey",
-                "method",
-                "username",
-                "token",
+                &["uuid"] as &[&str],
+                &["password"],
+                &["auth"],
+                &["private_key", "privatekey"],
+                &["public_key", "publickey"],
+                &["method"],
+                &["username", "user"],
+                &["token"],
             ]
             .iter()
-            .filter_map(|key| get(&map, &[key]))
+            .filter_map(|keys| get(&map, keys))
             .collect();
             let sni: Vec<String> = ["sni", "peer", "servername"]
                 .iter()
@@ -2556,7 +2686,7 @@ pub struct AddSubRequest {
 /// [`parse_addsub_link`] reason instead of falling through to the generic
 /// unknown-command failure.
 pub fn is_addsub_attempt(line: &str) -> bool {
-    let trimmed = line.trim();
+    let trimmed = strip_bom(line.trim()).trim();
     let Some(sep) = trimmed.find("://") else {
         return false;
     };
@@ -2576,7 +2706,7 @@ pub fn is_addsub_attempt(line: &str) -> bool {
 /// The URL must be `http(s)`; a missing group falls back to the default.
 pub fn parse_addsub_link(line: &str) -> Result<AddSubRequest, ImportError> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
-    let text = line.trim();
+    let text = strip_bom(line.trim()).trim();
     let sep = text
         .find("://")
         .ok_or_else(|| unknown_scheme("not a share link (missing '://')"))?;
@@ -2590,7 +2720,8 @@ pub fn parse_addsub_link(line: &str) -> Result<AddSubRequest, ImportError> {
     };
     if !command.eq_ignore_ascii_case("addsub") {
         return Err(unknown_scheme(format!(
-            "unknown throne command '{command}'"
+            "unknown throne command '{}'",
+            cap_echo(command)
         )));
     }
     if payload.trim().is_empty() {
@@ -2803,10 +2934,12 @@ fn is_proxies_header(line: &str) -> bool {
 }
 
 fn has_clash_proxies(trimmed: &str) -> bool {
-    trimmed.lines().any(|raw_line| {
-        let indent = raw_line.len() - raw_line.trim_start().len();
-        indent == 0 && is_proxies_header(raw_line.trim())
-    })
+    // Leading whitespace is allowed, exactly like the parser's own header
+    // search below (indented `proxies:` under a document marker still
+    // parses, so the detector must agree with the parser).
+    trimmed
+        .lines()
+        .any(|raw_line| is_proxies_header(raw_line.trim()))
 }
 
 /// Limited Clash `proxies:` parser (block style only): each `- ` entry needs
@@ -2857,14 +2990,27 @@ fn import_clash_proxies(content: &str) -> BatchResult {
         }
     }
     fn clash_value(raw: &str) -> String {
-        let mut value = raw.trim().to_string();
-        if value.len() >= 2
-            && ((value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\'')))
+        let trimmed = raw.trim();
+        if trimmed.len() >= 2
+            && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
         {
-            value = value[1..value.len() - 1].to_string();
+            // Quoted: the quotes delimit the value, so an inner `#` is data
+            // (e.g. `"x #y"` keeps its `#y`).
+            return trimmed[1..trimmed.len() - 1].to_string();
         }
-        value
+        // Unquoted: a `#` preceded by a space/tab starts a YAML comment, so
+        // `password: x #comment` is the password `x` (a bare `x#y` with no
+        // space keeps its `#y`, exactly like YAML).
+        let bytes = trimmed.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'#' && i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+                return trimmed[..i].trim_end().to_string();
+            }
+            i += 1;
+        }
+        trimmed.to_string()
     }
     let mut out = BatchResult::default();
     let lines: Vec<&str> = content.lines().collect();
@@ -3015,14 +3161,20 @@ fn import_clash_proxies(content: &str) -> BatchResult {
                 .find(|(key, _)| key == "port")
                 .map(|(_, value)| value.clone())
                 .unwrap_or_default();
-            let port = parse_port(&port_raw)
-                .map_err(|_| bad_port(format!("clash entry has a bad \"port\" ({port_raw})")))?;
-            let name = fields
-                .iter()
-                .find(|(key, _)| key == "name")
-                .map(|(_, value)| value.clone())
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| format!("{protocol}-{host}:{port}"));
+            let port = parse_port(&port_raw).map_err(|_| {
+                bad_port(format!(
+                    "clash entry has a bad \"port\" ({})",
+                    port_raw.trim().chars().take(64).collect::<String>()
+                ))
+            })?;
+            let name = cap_name(
+                fields
+                    .iter()
+                    .find(|(key, _)| key == "name")
+                    .map(|(_, value)| value.clone())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| format!("{protocol}-{host}:{port}")),
+            );
             let mut params = base_params(&protocol, &host, port);
             // Ticket 42: Clash/Meta spellings fold to sing-box names so the
             // rows serve instead of dying in `check` (nested option blocks
@@ -3118,7 +3270,7 @@ pub fn redact_link(line: &str) -> String {
             // host for diagnostics.
             None => {
                 let scheme = text[..scheme_end].to_ascii_lowercase();
-                if ["vmess", "ss", "shadowsocks", "throne"].contains(&scheme.as_str()) {
+                if ["vmess", "v2rayn", "ss", "shadowsocks", "throne"].contains(&scheme.as_str()) {
                     text.replace_range(after..auth_end, "…");
                 }
             }
@@ -3667,7 +3819,16 @@ mod tests {
             let error = parse_link(&link).expect_err(&format!("port {bad} fails"));
             assert_eq!(error.kind, ImportErrorKind::BadPort, "port {bad}");
         }
-        let error = parse_link(&format!("vless://{UUID}@::1:443")).expect_err("bare IPv6 fails");
+        let bare = parse_link(&format!("vless://{UUID}@::1:443#v6bare"))
+            .expect("bare IPv6 host with numeric port parses");
+        assert_eq!(bare.host, "::1");
+        assert_eq!(bare.port, 443);
+        let bare_no_port =
+            parse_link("hysteria2://secret@2001:db8::1#v6noport").expect("bare IPv6 host parses");
+        assert_eq!(bare_no_port.host, "2001:db8::1");
+        assert_eq!(bare_no_port.port, 443);
+        let error = parse_link(&format!("vless://{UUID}@foo:bar:443"))
+            .expect_err("non-IP stray colons still fail");
         assert_eq!(error.kind, ImportErrorKind::BadHost);
         let bracketed =
             parse_link(&format!("vless://{UUID}@[::1]:443#v6")).expect("bracketed IPv6 parses");
@@ -5258,5 +5419,194 @@ mod tests {
         assert_eq!(second.failures.len(), 1);
         assert_eq!(second.failures[0].index, 2);
         assert_eq!(store.list().expect("list works").len(), 2);
+    }
+
+    // -- audit fixes ---------------------------------------------------------
+
+    #[test]
+    fn audit_naive_and_shadow_tls_schemes_accepted() {
+        let naive = parse_link("naive://user:pass@example.com:8443#n").expect("naive parses");
+        assert_eq!(naive.protocol, "naive");
+        assert_eq!(naive.port, 8443);
+        let shadow = parse_link("shadow_tls://shadowpw@example.com:443?sni=example.com#st")
+            .expect("shadow_tls parses");
+        assert_eq!(shadow.protocol, "shadowtls");
+        assert!(VALID_LINK_SCHEMES.contains(&"naive"));
+        assert!(VALID_LINK_SCHEMES.contains(&"shadow_tls"));
+    }
+
+    #[test]
+    fn audit_wg_public_key_spelling_accepted() {
+        for query in ["publickey=cHVia2V5", "public_key=cHVia2V5"] {
+            let link = format!("wireguard://cHJpdmF0ZWtleQ@example.com:51820?{query}#wg");
+            let config = parse_link(&link).expect("wg parses");
+            assert_eq!(params_of(&config)["public_key"], "cHVia2V5");
+        }
+    }
+
+    #[test]
+    fn audit_whitespace_only_passwords_rejected() {
+        for link in [
+            "anytls://%20%20@example.com:8443#x",
+            "tuic://11111111-2222-4333-8444-555555555555:%20@example.com:4433#x",
+            "naive://user:%20@example.com:8443#x",
+            "ssh://alice:%20@example.com:22#x",
+            "socks://user:%20@example.com:1080#x",
+        ] {
+            let error = parse_link(link).expect_err(&format!("{link} fails"));
+            assert_eq!(
+                error.kind,
+                ImportErrorKind::MissingCredential,
+                "link {link}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_unexpected_uri_paths_rejected_trailing_slash_ok() {
+        for link in [
+            "hysteria2://letmein@example.com:8443/extra?sni=example.com#x",
+            "tuic://11111111-2222-4333-8444-555555555555:pw@example.com:4433/extra#x",
+            "anytls://secret@example.com:8443/extra#x",
+            "socks://user:pass@example.com:1080/extra#x",
+        ] {
+            let error = parse_link(link).expect_err(&format!("{link} fails"));
+            assert_eq!(error.kind, ImportErrorKind::BadHost, "link {link}");
+        }
+        // A lone trailing slash stays tolerated.
+        parse_link("snell://psk@example.com:8388/#x").expect("trailing slash ok");
+        // VLESS keeps preserving real paths.
+        let config = parse_link(&format!("vless://{UUID}@a.example.com:443/ws-path#x"))
+            .expect("vless path parses");
+        assert_eq!(params_of(&config)["path"], "ws-path");
+    }
+
+    #[test]
+    fn audit_bom_stripped_in_export_addsub_predicates() {
+        use crate::store::export_payload_full;
+        let full = export_payload_full(&[], &[], &[]);
+        assert!(is_library_export(&format!("\u{FEFF}{full}")));
+        assert!(is_addsub_attempt("\u{FEFF}throne://addsub/aGk"));
+        assert!(!is_addsub_attempt("\u{FEFF}not a link"));
+    }
+
+    #[test]
+    fn audit_query_pair_count_capped() {
+        let big = (0..2000)
+            .map(|i| format!("k{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let link = format!("vless://{UUID}@a.example.com:443?{big}#x");
+        let config = parse_link(&link).expect("huge query parses (capped)");
+        let params = params_of(&config);
+        assert!(
+            params.as_object().expect("object").len() < 2000,
+            "pairs capped"
+        );
+    }
+
+    #[test]
+    fn audit_clash_detector_allows_leading_whitespace() {
+        let body = "# doc\n  proxies:\n    - name: w\n      type: trojan\n      server: t.example.com\n      port: 443\n      password: pw\n";
+        assert!(has_clash_proxies(body.trim()), "indented header detected");
+        let out = import_text(body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+    }
+
+    #[test]
+    fn audit_display_names_strip_controls_rtl_ansi() {
+        let esc = '\u{1B}';
+        let config = parse_link(&format!(
+            "vless://{UUID}@a.example.com:443#\u{202E}evil{esc}[31mred\u{0007}name"
+        ))
+        .expect("remark parses");
+        assert!(!config.name.contains('\u{202E}'), "got {}", config.name);
+        assert!(!config.name.contains(esc), "got {}", config.name);
+        assert!(!config.name.contains('\u{7}'), "got {}", config.name);
+        assert!(config.name.contains("evil"), "got {}", config.name);
+        assert!(config.name.chars().count() <= 256);
+    }
+
+    #[test]
+    fn audit_multi_file_dedupes_names_across_files() {
+        let files = [
+            ("a.txt", "trojan://pw@a.example.com:443#same"),
+            ("b.txt", "trojan://pw@b.example.com:443#same"),
+        ];
+        let out = import_multi_file_contents(&files);
+        assert_eq!(out.configs.len(), 2);
+        assert_eq!(out.configs[0].name, "same");
+        assert_eq!(out.configs[1].name, "same-2");
+    }
+
+    #[test]
+    fn audit_legacy_ss_password_kept_verbatim() {
+        let config = parse_link(&format!(
+            "ss://{}",
+            b64("aes-256-gcm:hunter%412@example.com:8388")
+        ))
+        .expect("legacy ss parses");
+        assert_eq!(params_of(&config)["password"], "hunter%412");
+    }
+
+    #[test]
+    fn audit_json_bracket_host_validated() {
+        let body = serde_json::json!([{
+            "type": "vless", "tag": "k", "server": "[::1",
+            "server_port": 443, "uuid": UUID,
+        }]);
+        let out = import_text(&body.to_string());
+        assert_eq!(out.configs.len(), 0);
+        assert_eq!(out.failures[0].code, ImportErrorKind::BadHost);
+        // Bracketed hosts reject inner whitespace/controls.
+        assert!(split_host_port("[exa mple]:443").is_err());
+        assert!(split_host_port("[example\u{7}]:443").is_err());
+        assert!(split_host_port("example\u{7}:443").is_err());
+    }
+
+    #[test]
+    fn audit_scheme_and_port_echoes_capped() {
+        let scheme = format!("{}://example.com:443", "g".repeat(500));
+        let error = parse_link(&scheme).expect_err("bad scheme fails");
+        assert!(
+            !error.message.contains(&"g".repeat(100)),
+            "scheme echo capped, len {}",
+            error.message.chars().count()
+        );
+        let link = format!("vless://{UUID}@example.com:{}", "9".repeat(500));
+        let error = parse_link(&link).expect_err("bad port fails");
+        assert_eq!(error.kind, ImportErrorKind::BadPort);
+        assert!(
+            error.message.chars().count() < 200,
+            "port echo capped: {}",
+            error.message.chars().count()
+        );
+    }
+
+    #[test]
+    fn audit_ssh_identity_includes_user() {
+        let alice = normalized_identity(
+            "ssh",
+            "{\"type\":\"ssh\",\"server\":\"a.example.com\",\"server_port\":22,\"user\":\"alice\",\"username\":\"alice\",\"password\":\"p\"}",
+        );
+        let bob = normalized_identity(
+            "ssh",
+            "{\"type\":\"ssh\",\"server\":\"a.example.com\",\"server_port\":22,\"user\":\"bob\",\"username\":\"bob\",\"password\":\"p\"}",
+        );
+        assert_ne!(alice, bob, "different ssh users are different rows");
+    }
+
+    #[test]
+    fn audit_v2rayn_redacted_and_clash_comment_stripped() {
+        let redacted = redact_link(&format!("v2rayn://{}", b64("{\"add\":\"h.example.com\"}")));
+        assert!(
+            !redacted.contains("h.example.com"),
+            "v2rayn payload masked: {redacted}"
+        );
+        let body = "proxies:\n  - name: c\n    type: ss\n    server: s.example.com\n    port: 8388\n    cipher: aes-256-gcm\n    password: hunter2 #comment\n";
+        let out = import_subscription_body(body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(params_of(&out.configs[0])["password"], "hunter2");
     }
 }

@@ -66,6 +66,14 @@ pub const AUTO_PORT_CAPACITY: usize = (AUTO_PORT_END - AUTO_PORT_START + 1) as u
 /// Ticket 27: auto-port candidates in assignment order (primary, then
 /// spillover). Every auto assignment in this file funnels through here so
 /// the two ranges never drift apart.
+/// Ticket A4: the pool is GLOBAL across binds (one port number serves one
+/// local endpoint; two binds never share an auto port). Auto-assign
+/// deliberately ignores `bind_ip` so `127.0.0.1:10801` and
+/// `0.0.0.0:10801` can never collide at activation. At rest two rows MAY
+/// share a bind:port (saves are never blocked — see the schema note); the
+/// conflict error naming both parties stays an activation-time concern.
+/// Restore is stricter (a duplicated bind:port in a backup fails loudly as
+/// corruption — see `restore_library_json`).
 pub fn auto_port_candidates() -> impl Iterator<Item = u16> {
     (AUTO_PORT_START..=AUTO_PORT_END).chain(AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END)
 }
@@ -89,9 +97,11 @@ pub const SECRETS_AT_REST_NOTE: &str = "secrets at rest: row params DPAPI-sealed
 
 /// Ticket 27: best-effort user-only permissions for a secrets-bearing file
 /// (library DB, sidecar configs). Unix sets 0600; Windows strips inherited
-/// ACLs to the current user via `icacls` (best-effort: failures are ignored
-/// so hardening never breaks open/write — the file stays usable in its
-/// per-user dir). Never echoes file contents.
+/// ACLs and grants the current user SID only (best-effort: failures are
+/// ignored so hardening never breaks open/write — the file stays usable in
+/// its per-user dir). Never grants Administrators (user-only means
+/// user-only) and never trusts the spoofable `USERNAME` env (the SID comes
+/// from `whoami /user`). Never echoes file contents.
 pub fn harden_file_permissions(path: &Path) {
     #[cfg(unix)]
     {
@@ -100,28 +110,57 @@ pub fn harden_file_permissions(path: &Path) {
     }
     #[cfg(windows)]
     {
-        // Best-effort: `<user>:(R,W)` only, no inherited entries. The temp
-        // dir and %APPDATA% are per-user by construction; this tightens the
-        // file itself when icacls is available.
+        // Best-effort: `<user-sid>:(R,W)` only, no inherited entries. The
+        // temp dir and %APPDATA% are per-user by construction; this tightens
+        // the file itself when icacls is available. SIDs need the `*`
+        // prefix (otherwise icacls reads them as account names and grants
+        // nothing — which would lock even the owner out after the
+        // inheritance strip above).
+        let principal = current_user_sid()
+            .map(|sid| format!("*{sid}"))
+            .unwrap_or_else(|| "OWNER RIGHTS".to_string());
         let _ = std::process::Command::new("icacls")
             .arg(path)
             .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg("*S-1-5-32-544:(R)")
             .output();
         let _ = std::process::Command::new("icacls")
             .arg(path)
             .arg("/grant:r")
-            .arg(format!(
-                "{}:(R,W)",
-                std::env::var("USERNAME").unwrap_or_else(|_| "OWNER RIGHTS".to_string())
-            ))
+            .arg(format!("{principal}:(R,W)"))
             .output();
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
     }
+}
+
+/// Current process user SID via `whoami /user` (`None` when the lookup
+/// fails — the caller falls back to `OWNER RIGHTS`, never to `USERNAME`).
+#[cfg(windows)]
+fn current_user_sid() -> Option<String> {
+    let output = std::process::Command::new("whoami")
+        .arg("/user")
+        .arg("/fo")
+        .arg("csv")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split(|c: char| c == '"' || c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .find(|token| is_sid_shape(token))
+        .map(str::to_string)
+}
+
+/// True for `S-1-...` SID shapes (digits and dashes after the prefix).
+#[cfg(windows)]
+fn is_sid_shape(token: &str) -> bool {
+    token.len() > 4
+        && token.starts_with("S-1-")
+        && token[4..].chars().all(|c| c.is_ascii_digit() || c == '-')
 }
 
 /// Ticket 27: subscription-fetch policy for one URL (pure, no DNS, no fetch).
@@ -191,14 +230,70 @@ pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
     SubscriptionFetchPolicy::Allow
 }
 
+/// Ticket A5: enforced subscription-fetch caps. Single source of truth for
+/// the async fetch path (`fetch_subscription_body` enforces all three
+/// inline: size while streaming, timeout per request, redirect hops with a
+/// per-hop policy re-check) and for the byte ingest below
+/// ([`Store::refresh_with_bytes`], size + UTF-8 at ingest). Limits live in
+/// code on both sides — never comment-only.
+pub const SUBSCRIPTION_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Ticket A5: per-fetch network timeout, seconds (enforced by the fetch
+/// path; recorded here so the two sides cannot drift).
+pub const SUBSCRIPTION_TIMEOUT_SECS: u64 = 20;
+/// Ticket A5: redirect hops followed per fetch, each hop re-running
+/// [`subscription_fetch_policy`] (enforced by the fetch path).
+pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
+
+/// Ticket A5: DNS-rebind guard — the resolution-time half of
+/// [`subscription_fetch_policy`]. The pure policy blocks literal internal
+/// hosts without DNS; this runs AFTER resolution: a public hostname that
+/// resolves (or re-resolves, e.g. via a redirect target) to a
+/// loopback/private/link-local/unspecified address is Blocked, so a benign
+/// name can never smuggle the fetch onto a local service. An empty
+/// resolution fails closed (Block, never fetch blind). Reasons never echo
+/// the URL.
+///
+/// Honest wiring note: the live platform-client fetch path cannot observe
+/// resolved IPs (DNS is owned by the client), so it enforces the literal
+/// per-hop policy instead and this helper pins the contract for any
+/// fetch path with visible resolution (plus the tests below). A hostile
+/// subscription host could still rebind between hops invisible to the
+/// client — accepted residual risk: subscription URLs are user-supplied
+/// and user-trusted, refreshes keep last-good members on failure, and the
+/// loopback services reachable that way speak proxy protocols, not the
+/// plain-GET the fetch issues.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn subscription_fetch_policy_resolved(
+    url: &str,
+    resolved: &[std::net::IpAddr],
+) -> SubscriptionFetchPolicy {
+    let base = subscription_fetch_policy(url);
+    if matches!(base, SubscriptionFetchPolicy::Block { .. }) {
+        return base;
+    }
+    if resolved.is_empty() {
+        return SubscriptionFetchPolicy::Block {
+            reason: "subscription host does not resolve (refusing to fetch blind)",
+        };
+    }
+    if resolved.iter().any(|ip| is_internal_host(&ip.to_string())) {
+        return SubscriptionFetchPolicy::Block {
+            reason: "subscription resolves to an internal host (loopback/private/link-local are never fetched; import local files manually)",
+        };
+    }
+    base
+}
 /// Ticket 27: true for loopback/private/link-local/unspecified hosts (IP
-/// literals only; hostnames are never internal without DNS).
+/// literals only; hostnames are never internal without DNS). Mirrors the
+/// preset intake classifier — both copies block `localhost` subdomains and
+/// IPv4-mapped forms (decode-time and fetch-time stay in parity).
 fn is_internal_host(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
-    if lower == "localhost" {
+    let bare = lower.strip_suffix('.').unwrap_or(&lower);
+    if bare == "localhost" || bare.ends_with(".localhost") {
         return true;
     }
-    if let Ok(ip) = lower.parse::<IpAddr>() {
+    if let Ok(ip) = bare.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(v4) => {
                 let octets = v4.octets();
@@ -211,6 +306,19 @@ fn is_internal_host(host: &str) -> bool {
                     || octets[0] == 127
             }
             IpAddr::V6(v6) => {
+                // Mapped-only: `::1` is not mapped (falls through to the
+                // plain v6 checks below); `to_ipv4` would also match
+                // IPv4-compatible `::a.b.c.d` and misroute `::1`.
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    let octets = mapped.octets();
+                    return mapped.is_loopback()
+                        || mapped.is_unspecified()
+                        || mapped.is_link_local()
+                        || octets[0] == 10
+                        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                        || (octets[0] == 192 && octets[1] == 168)
+                        || octets[0] == 127;
+                }
                 v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
                 // fe80::/10 link-local, fc00::/7 unique-local
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
@@ -302,6 +410,12 @@ pub enum StoreError {
         path: PathBuf,
         message: String,
     },
+    /// Ticket A2: DPAPI seal/open failure (never a `Sql` mislabel). The
+    /// write aborts before commit, so nothing is stored — never silent
+    /// plaintext, never a partial row.
+    Crypto {
+        message: String,
+    },
     Sql(rusqlite::Error),
 }
 
@@ -318,6 +432,9 @@ impl std::fmt::Display for StoreError {
             StoreError::NotFound(id) => write!(f, "config not found: {id}"),
             StoreError::Io { path, message } => {
                 write!(f, "cannot write {}: {}", path.display(), message)
+            }
+            StoreError::Crypto { message } => {
+                write!(f, "cannot protect secrets ({message}; nothing was written)")
             }
             StoreError::Sql(error) => write!(f, "database error: {error}"),
         }
@@ -695,19 +812,32 @@ fn defaulted(raw: &str, default: &str) -> String {
     }
 }
 
+/// Canonical group-label normalization: surrounding whitespace never
+/// distinguishes labels (stored labels are always trimmed — see
+/// [`defaulted`]). Every group entry point (rename/move/delete/count
+/// matching) funnels through here so `" g1 "` and `"g1"` are one group.
+fn normalized_group(raw: &str) -> String {
+    raw.trim().to_string()
+}
+
 /// Blank means loopback default; otherwise the text must parse as an IP
-/// literal (spec: loopback default; LAN binds gated at activation time).
+/// literal or `localhost` (spec: loopback default; LAN binds gated at
+/// activation time). Matches the engine save/start gate message
+/// (`BadBind`: "want an IP address or localhost").
 fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Some(DEFAULT_BIND.to_string());
+    }
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Some("localhost".to_string());
     }
     match trimmed.parse::<IpAddr>() {
         Ok(_) => Some(trimmed.to_string()),
         Err(_) => {
             errors.push(FieldError::new(
                 "bind_ip",
-                format!("bind address must be an IP literal, got '{trimmed}'"),
+                format!("bind address must be an IP literal or localhost, got '{trimmed}'"),
             ));
             None
         }
@@ -1295,7 +1425,27 @@ fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscriptio
     Ok(Subscription {
         id: id.to_string(),
         label: row.get(1)?,
-        url: row.get(2)?,
+        // Ticket 35/48: subscription URLs carry tokens, so the column is
+        // sealed at rest like params. Sealed values open here — the single
+        // read funnel; pre-seal rows (legacy databases, hand-built
+        // fixtures) pass through since all writers seal.
+        url: {
+            let stored: String = row.get(2)?;
+            if stored.trim_start().starts_with(crate::dpapi::MARKER) {
+                crate::dpapi::unseal_params(&stored).map_err(|message| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            message,
+                        )),
+                    )
+                })?
+            } else {
+                stored
+            }
+        },
         group: row.get(3)?,
         auto_refresh: auto_refresh != 0,
         last_refresh_at: row.get(5)?,
@@ -1578,6 +1728,44 @@ pub struct RestoreOutcome {
     pub presets: usize,
 }
 
+/// True when two paths name the same file: canonical comparison when both
+/// resolve, parent-canonical + file-name comparison otherwise (the export
+/// target usually does not exist yet, so canonicalization alone never
+/// suffices), absolutized-lexical fallback last.
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if let (Ok(canonical_a), Ok(canonical_b)) = (a.canonicalize(), b.canonicalize()) {
+        return canonical_a == canonical_b;
+    }
+    fn canonical_parent_joined(path: &Path) -> Option<PathBuf> {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+        let canonical_parent = parent.canonicalize().ok()?;
+        Some(canonical_parent.join(path.file_name()?))
+    }
+    if let (Some(joined_a), Some(joined_b)) =
+        (canonical_parent_joined(a), canonical_parent_joined(b))
+    {
+        #[cfg(windows)]
+        {
+            // Windows paths are case-insensitive; canonicalization already
+            // normalized separators.
+            return joined_a.to_string_lossy().to_lowercase()
+                == joined_b.to_string_lossy().to_lowercase();
+        }
+        #[cfg(not(windows))]
+        {
+            return joined_a == joined_b;
+        }
+    }
+    fn absolutize(path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        }
+    }
+    absolutize(a) == absolutize(b)
+}
+
 /// Ticket 25 (L4): same-directory tmp sibling for atomic export writes.
 fn tmp_export_path(path: &Path) -> PathBuf {
     let tmp_name = format!(
@@ -1585,12 +1773,31 @@ fn tmp_export_path(path: &Path) -> PathBuf {
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("manyproxy-export.json"),
-        std::process::id()
+        unique_name_suffix(now_unix())
     );
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
         _ => PathBuf::from(tmp_name),
     }
+}
+
+/// Append a SQLite sidecar suffix (`-wal`/`-shm`/`-journal`) at the
+/// OS-string level so non-UTF8 paths survive (never `display()` concat,
+/// which breaks on non-UTF8 bytes).
+fn sibling_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Process-unique filename suffix: `<ts>-<pid>-<counter>` so two
+/// quarantines/backups/restores in the same second never collide (same
+/// process shares pid+timestamp; the counter disambiguates).
+static NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unique_name_suffix(ts: i64) -> String {
+    let n = NAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{ts}-{}-{n}", std::process::id())
 }
 
 pub struct Store {
@@ -1599,6 +1806,34 @@ pub struct Store {
     /// stores). Powers backup-before-restore + temp-DB atomic swaps without
     /// touching the live user DB from tests (isolated `MANYPROXY_DB` only).
     db_path: Option<PathBuf>,
+}
+
+/// Swap a rebuilt temp DB over the live path. Plain rename first; on
+/// Windows the destination may be open (this process's own live handle or
+/// a lingering lock) and rename fails — then remove the destination +
+/// sidecars and retry once, with copy-over as a last resort. Off-Windows
+/// the rename error propagates unchanged.
+fn swap_tmp_over_live(tmp: &Path, db_path: &Path) -> std::io::Result<()> {
+    if std::fs::rename(tmp, db_path).is_ok() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(db_path);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(sibling_sidecar(db_path, suffix));
+        }
+        if std::fs::rename(tmp, db_path).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(tmp, db_path)?;
+        let _ = std::fs::remove_file(tmp);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, db_path)
+    }
 }
 
 impl Store {
@@ -1636,31 +1871,32 @@ impl Store {
     pub fn open_file(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                std::fs::create_dir_all(parent).map_err(|error| StoreError::Io {
+                    path: parent.to_path_buf(),
+                    message: error.to_string(),
                 })?;
             }
         }
         // Fast reject: a non-empty file that is not SQLite at all (bad magic)
-        // quarantines before rusqlite ever touches it.
+        // quarantines before rusqlite ever touches it. Reads only the 16-byte
+        // header (never the whole file for a magic check).
         if path.exists() {
             if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > 0 && meta.len() < 100 {
-                    // Too small to be a valid SQLite header — still let
-                    // rusqlite decide, but pre-check the magic below for the
-                    // common garbage case.
-                }
                 if meta.len() > 0 {
-                    if let Ok(head) =
-                        std::fs::read(path).map(|b| b.into_iter().take(16).collect::<Vec<_>>())
-                    {
-                        let magic = b"SQLite format 3\0";
-                        if head.len() == 16 && head.as_slice() != magic {
-                            let quarantined = Self::quarantine_corrupt_file(path)?;
-                            return Err(Self::schema_error(format!(
-                                "library database is corrupt (integrity check failed): preserved as {} — restore from an export instead of running on a half-migrated file",
-                                quarantined.display()
-                            )));
+                    if let Ok(mut file) = std::fs::File::open(path) {
+                        use std::io::Read as _;
+                        let mut head = [0u8; 16];
+                        // `read_exact` fails on short files; short-but-nonempty
+                        // files fall through to rusqlite (loud + quarantine).
+                        if file.read_exact(&mut head).is_ok() {
+                            let magic = b"SQLite format 3\0";
+                            if head != *magic {
+                                let quarantined = Self::quarantine_corrupt_file(path)?;
+                                return Err(Self::schema_error(format!(
+                                    "library database is corrupt (integrity check failed): preserved as {} — restore from an export instead of running on a half-migrated file",
+                                    quarantined.display()
+                                )));
+                            }
                         }
                     }
                 }
@@ -1714,10 +1950,7 @@ impl Store {
         harden_file_permissions(path);
         // WAL sidecars (`<db>-wal`, `<db>-shm`) hold the same secrets;
         // tighten them too when present.
-        for sibling in [
-            PathBuf::from(format!("{}-wal", path.display())),
-            PathBuf::from(format!("{}-shm", path.display())),
-        ] {
+        for sibling in [sibling_sidecar(path, "-wal"), sibling_sidecar(path, "-shm")] {
             if sibling.exists() {
                 harden_file_permissions(&sibling);
             }
@@ -1776,8 +2009,9 @@ impl Store {
     }
 
     /// Ticket 40: preserve a corrupt/foreign DB file aside as
-    /// `library.db.corrupt-<ts>` (timestamp + pid, same directory so the
-    /// live path stays on one filesystem). Returns the quarantine path.
+    /// `library.db.corrupt-<ts>-<pid>-<counter>` (timestamp + pid + counter,
+    /// same directory so the live path stays on one filesystem). Returns the
+    /// quarantine path.
     fn quarantine_corrupt_file(path: &Path) -> Result<PathBuf, StoreError> {
         let ts = now_unix();
         let base = path
@@ -1786,9 +2020,9 @@ impl Store {
             .unwrap_or("library.db");
         let quarantined = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => {
-                parent.join(format!("{base}.corrupt-{ts}-{}", std::process::id()))
+                parent.join(format!("{base}.corrupt-{}", unique_name_suffix(ts)))
             }
-            _ => PathBuf::from(format!("{base}.corrupt-{ts}-{}", std::process::id())),
+            _ => PathBuf::from(format!("{base}.corrupt-{}", unique_name_suffix(ts))),
         };
         std::fs::rename(path, &quarantined).map_err(|error| {
             StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
@@ -1796,16 +2030,15 @@ impl Store {
         // Remove WAL sidecars of the bad file so a stale journal never
         // shadows the quarantine.
         for suffix in ["-wal", "-shm", "-journal"] {
-            let sibling = PathBuf::from(format!("{}{suffix}", path.display()));
-            let _ = std::fs::remove_file(sibling);
+            let _ = std::fs::remove_file(sibling_sidecar(path, suffix));
         }
         Ok(quarantined)
     }
 
     /// Ticket 40: timestamped backup before any wipe
-    /// (`library.db.bak-<ts>-<pid>` in the same directory). The backup is a
-    /// plain file copy (same-filesystem, crash-safe source read); restore
-    /// uses temp-DB + rename, never in-place overwrite.
+    /// (`library.db.bak-<ts>-<pid>-<counter>` in the same directory). The
+    /// backup is a plain file copy (same-filesystem, crash-safe source read);
+    /// restore uses temp-DB + rename, never in-place overwrite.
     pub fn backup_db_file(db_path: &Path, now: i64) -> Result<PathBuf, StoreError> {
         let base = db_path
             .file_name()
@@ -1813,9 +2046,9 @@ impl Store {
             .unwrap_or("library.db");
         let backup = match db_path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => {
-                parent.join(format!("{base}.bak-{now}-{}", std::process::id()))
+                parent.join(format!("{base}.bak-{}", unique_name_suffix(now)))
             }
-            _ => PathBuf::from(format!("{base}.bak-{now}-{}", std::process::id())),
+            _ => PathBuf::from(format!("{base}.bak-{}", unique_name_suffix(now))),
         };
         std::fs::copy(db_path, &backup).map_err(|error| {
             StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
@@ -1828,12 +2061,13 @@ impl Store {
     /// takes a timestamped backup, rebuilds into a temp sibling DB, runs
     /// `quick_check`, then atomically renames over the live path. A kill
     /// before the rename leaves the old library intact. Returns the outcome
-    /// plus the backup path.
+    /// plus the backup path (`None` when no live file existed, so no backup
+    /// was taken — never a phantom path to a file that was never written).
     pub fn restore_library_file(
         db_path: &Path,
         payload: &str,
         now: i64,
-    ) -> Result<(RestoreOutcome, PathBuf), StoreError> {
+    ) -> Result<(RestoreOutcome, Option<PathBuf>), StoreError> {
         // Validate first: a malformed backup never touches the live DB.
         {
             let mut dry = Store::open_in_memory()?;
@@ -1841,39 +2075,37 @@ impl Store {
             dry.check_quick()?;
         }
         let backup = if db_path.exists() {
-            Self::backup_db_file(db_path, now)?
+            Some(Self::backup_db_file(db_path, now)?)
         } else {
-            // No live file yet: still create a marker backup path? No — just
-            // proceed; return a non-existent backup path in the same dir.
-            let base = db_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("library.db");
-            match db_path.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => {
-                    parent.join(format!("{base}.bak-{now}-{}", std::process::id()))
-                }
-                _ => PathBuf::from(format!("{base}.bak-{now}-{}", std::process::id())),
-            }
+            None
         };
+        // The live file's parents may not exist yet (fresh directory):
+        // create them before the temp DB lands.
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|error| StoreError::Io {
+                    path: parent.to_path_buf(),
+                    message: error.to_string(),
+                })?;
+            }
+        }
         // Build into a temp sibling DB in the same directory (same filesystem
         // → rename is atomic).
         let tmp = match db_path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.join(format!(
-                ".{}.restore-{}-{}",
+                ".{}.restore-{}",
                 db_path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("library.db"),
-                std::process::id(),
-                now
+                unique_name_suffix(now)
             )),
-            _ => PathBuf::from(format!(".library.restore-{}-{now}", std::process::id())),
+            _ => PathBuf::from(format!(".library.restore-{}", unique_name_suffix(now))),
         };
         // Ensure a stale temp from a killed restore never shadows us.
         let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", tmp.display())));
-        let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", tmp.display())));
+        let _ = std::fs::remove_file(sibling_sidecar(&tmp, "-wal"));
+        let _ = std::fs::remove_file(sibling_sidecar(&tmp, "-shm"));
         let outcome = {
             let mut tmp_store = Store::open_with_path(
                 Connection::open(&tmp).map_err(StoreError::from)?,
@@ -1888,16 +2120,18 @@ impl Store {
             drop(tmp_store);
             outcome
         };
-        std::fs::rename(&tmp, db_path).map_err(|error| {
+        swap_tmp_over_live(&tmp, db_path).map_err(|error| {
             let _ = std::fs::remove_file(&tmp);
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            StoreError::Io {
+                path: db_path.to_path_buf(),
+                message: error.to_string(),
+            }
         })?;
         // Drop stale WAL sidecars of the old live file; the renamed file
         // carries its own journal state.
         for suffix in ["-wal", "-shm", "-journal"] {
-            let sibling = PathBuf::from(format!("{}{suffix}", db_path.display()));
             // Only remove sidecars that predate the rename (best-effort).
-            let _ = std::fs::remove_file(sibling);
+            let _ = std::fs::remove_file(sibling_sidecar(db_path, suffix));
         }
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1927,32 +2161,32 @@ impl Store {
     /// params at rest (ticket 35, DPAPI); version 4 adds routing presets
     /// (ticket 37: `route_presets` table + `proxy_configs.preset_id`); version
     /// 5 stages per-sub intervals, health history, preset extensions, and
-    /// URL-keyed tombstones (ticket 40). Fresh and legacy (`user_version = 0`)
+    /// URL-keyed tombstones (ticket 40); version 6 seals subscription URLs
+    /// at rest (ticket 35/48: tokens ride in query strings). Fresh and legacy
+    /// (`user_version = 0`)
     /// databases migrate forward idempotently; a database from a NEWER build
     /// fails loudly (never a silent empty). The version bump lands LAST, so a
     /// kill mid-migration retries on next open instead of trusting a
     /// half-migrated file.
-    const SCHEMA_VERSION: i64 = 5;
+    const SCHEMA_VERSION: i64 = 6;
     /// Minimum SQLite for this schema: STRICT tables need 3.37+.
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
 
     /// Ticket 35: seal params for storage. A DPAPI failure aborts the
-    /// write loudly (never silent plaintext).
+    /// write loudly (never silent plaintext). Ticket A2: typed as
+    /// `Crypto`, never `Sql` (a crypto outage is not a database error).
     fn seal_or_fail(plaintext: &str) -> Result<String, StoreError> {
-        crate::dpapi::seal_params(plaintext).map_err(|message| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )))
+        crate::dpapi::seal_params(plaintext).map_err(|message| StoreError::Crypto {
+            message: format!("dpapi seal failed: {message}"),
         })
     }
 
     /// Ticket 35: open stored params. Sealed values decrypt; legacy JSON
-    /// passes through; anything else fails loudly.
+    /// passes through; anything else fails loudly. Ticket A2: typed as
+    /// `Crypto`, never `Sql`.
     fn unseal_or_fail(stored: &str) -> Result<String, StoreError> {
-        crate::dpapi::unseal_params(stored).map_err(|message| {
-            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )))
+        crate::dpapi::unseal_params(stored).map_err(|message| StoreError::Crypto {
+            message: format!("dpapi open failed: {message}"),
         })
     }
 
@@ -2174,9 +2408,13 @@ impl Store {
                 }
             }
         }
-        // Ticket 35 (version 3): seal params at rest. Legacy JSON values
-        // seal in one transaction; already-sealed rows are untouched, so the
-        // migration is idempotent and reruns are no-ops.
+        // Ticket 35 (version 3): seal params at rest. Every non-sealed value
+        // seals in one transaction — including legacy non-JSON garbage that
+        // does not start with `{` (leaving it would strand plaintext under a
+        // bumped version, violating the sealed-at-rest contract); already-
+        // sealed rows are untouched, so the migration is idempotent and
+        // reruns are no-ops. Unreadable-after-seal rows surface through the
+        // quarantine list, never as silent plaintext.
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -2192,14 +2430,41 @@ impl Store {
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
                 for (id, value) in rows {
-                    if value.trim_start().starts_with('{') {
-                        let sealed = Self::seal_or_fail(&value)?;
-                        tx.execute(
-                            &format!("UPDATE proxy_configs SET {column} = ?1 WHERE id = ?2"),
-                            rusqlite::params![sealed, id],
-                        )?;
+                    if value.starts_with(crate::dpapi::MARKER) {
+                        continue;
                     }
+                    let sealed = Self::seal_or_fail(&value)?;
+                    tx.execute(
+                        &format!("UPDATE proxy_configs SET {column} = ?1 WHERE id = ?2"),
+                        rusqlite::params![sealed, id],
+                    )?;
                 }
+            }
+            tx.commit()?;
+        }
+        // Ticket 35/48 (version 6): seal subscription URLs at rest.
+        // Subscription URLs carry tokens in the query string, so the
+        // `subscriptions.url` column seals exactly like params — sealed rows
+        // are skipped, every other row seals in one transaction before the
+        // version bump below (never stranded plaintext).
+        if version < 6 {
+            let tx = self.conn.transaction()?;
+            let rows = {
+                let mut stmt = tx.prepare("SELECT id, url FROM subscriptions")?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            for (id, url) in rows {
+                if url.trim_start().starts_with(crate::dpapi::MARKER) {
+                    continue;
+                }
+                let sealed = Self::seal_or_fail(&url)?;
+                tx.execute(
+                    "UPDATE subscriptions SET url = ?1 WHERE id = ?2",
+                    rusqlite::params![sealed, id],
+                )?;
             }
             tx.commit()?;
         }
@@ -2459,7 +2724,9 @@ impl Store {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn export_library_json_with_quarantine(&self) -> Result<(String, Vec<String>), StoreError> {
         let (rows, quarantined) = self.list_with_quarantine()?;
-        let skipped: Vec<String> = quarantined.iter().map(|q| q.id.clone()).collect();
+        let mut skipped: Vec<String> = quarantined.iter().map(|q| q.id.clone()).collect();
+        let (rows, mut bad_synced) = self.without_unreadable_synced(rows);
+        skipped.append(&mut bad_synced);
         // Build the export from the good rows only (same shape as
         // `export_library_json`, quarantined rows omitted, never failed).
         let subs = self.list_subscriptions()?;
@@ -2608,7 +2875,8 @@ impl Store {
     /// Returns the rows moved. An empty new name is rejected (nothing
     /// written); renaming a missing group moves zero rows.
     pub fn rename_group(&mut self, old: &str, new: &str) -> Result<usize, StoreError> {
-        let new = new.trim();
+        let old = normalized_group(old);
+        let new = normalized_group(new);
         if new.is_empty() {
             return Err(StoreError::Invalid(vec![FieldError::new(
                 "group",
@@ -2626,7 +2894,7 @@ impl Store {
     /// (bulk semantics — already-removed rows are not failures); returns
     /// the rows actually moved. An empty group name is rejected.
     pub fn move_to_group(&mut self, ids: &[String], group: &str) -> Result<usize, StoreError> {
-        let group = group.trim();
+        let group = normalized_group(group);
         if group.is_empty() {
             return Err(StoreError::Invalid(vec![FieldError::new(
                 "group",
@@ -2658,6 +2926,7 @@ impl Store {
     /// deleting an already-empty group is a no-op success. The default
     /// group label itself is never special-cased here — emptiness decides.
     pub fn delete_group(&mut self, name: &str) -> Result<(), StoreError> {
+        let name = normalized_group(name);
         let remaining: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM proxy_configs WHERE grp = ?1",
             params![name],
@@ -2708,13 +2977,32 @@ impl Store {
         };
         let tx = self.conn.transaction()?;
         if let Some(preset) = preset_id {
-            let exists: i64 = tx.query_row(
+            let rowid_preset: i64 = preset.parse().unwrap_or(-1);
+            let rule_count: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM route_presets WHERE id = ?1",
-                params![preset.parse::<i64>().unwrap_or(-1)],
+                params![rowid_preset],
                 |row| row.get(0),
             )?;
-            if exists == 0 {
+            if rule_count == 0 {
                 return Err(StoreError::NotFound(preset.to_string()));
+            }
+            // An empty-rules preset serves nothing (the merge would add no
+            // rule, silently serving preset-less) — refuse the attach loudly
+            // until the preset carries rules.
+            let rules_json: String = tx.query_row(
+                "SELECT rules_json FROM route_presets WHERE id = ?1",
+                params![rowid_preset],
+                |row| row.get(0),
+            )?;
+            let empty = serde_json::from_str::<serde_json::Value>(&rules_json)
+                .ok()
+                .and_then(|value| value.as_array().cloned())
+                .is_some_and(|rules| rules.is_empty());
+            if empty {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "preset",
+                    "preset has no rules yet — refresh it before attaching",
+                )]));
             }
         }
         let changed = tx.execute(
@@ -3026,32 +3314,46 @@ impl Store {
     /// Delete a preset. Refused (`Invalid`) while any row attaches it — the
     /// refusal names the attached rows, so the UI can offer the explicit
     /// detach-then-delete path ([`Store::delete_preset_detaching`]).
+    /// Existence check + attachment check + delete run in ONE transaction so
+    /// a concurrent attach between check and delete can never dangle.
     pub fn delete_preset(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Ok(false),
         };
-        if self.get_preset(id)?.is_none() {
+        let tx = self.conn.transaction()?;
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM route_presets WHERE id = ?1",
+            params![rowid],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
             return Ok(false);
         }
-        let attached = self.preset_attachments(id)?;
+        let attached: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT name, id FROM proxy_configs WHERE preset_id = ?1 ORDER BY id")?;
+            let mapped = stmt.query_map(params![id], |row| {
+                Ok(format!(
+                    "\"{}\" (id {})",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
         if !attached.is_empty() {
-            let names: Vec<String> = attached
-                .iter()
-                .map(|row| format!("\"{}\" (id {})", row.name, row.id))
-                .collect();
             return Err(StoreError::Invalid(vec![FieldError::new(
                 "preset",
                 format!(
                     "preset is still attached to {} row(s): {} — detach first or delete explicitly with detach",
                     attached.len(),
-                    names.join(", ")
+                    attached.join(", ")
                 ),
             )]));
         }
-        let removed = self
-            .conn
-            .execute("DELETE FROM route_presets WHERE id = ?1", params![rowid])?;
+        let removed = tx.execute("DELETE FROM route_presets WHERE id = ?1", params![rowid])?;
+        tx.commit()?;
         Ok(removed > 0)
     }
 
@@ -3096,15 +3398,9 @@ impl Store {
                 "preset name must not be empty",
             )]));
         }
-        let capped: String = if trimmed.chars().count() > crate::preset::MAX_PRESET_NAME_CHARS {
-            trimmed
-                .chars()
-                .take(crate::preset::MAX_PRESET_NAME_CHARS)
-                .collect()
-        } else {
-            trimmed.to_string()
-        };
-        Ok(capped)
+        // Same bound as the preset intake (hash-suffixed on overflow, so
+        // two long names never truncate-collide into one preset).
+        Ok(crate::preset::cap_name(trimmed.to_string()))
     }
 
     fn validated_preset_source(raw: &str) -> String {
@@ -3194,7 +3490,8 @@ impl Store {
 
     /// Add a subscription record. The URL must be `http(s)`; blank groups
     /// fall back to the default. Members appear on the next refresh, never
-    /// enabled or started.
+    /// enabled or started. The URL seals at rest (tokens ride in query
+    /// strings); reads unseal transparently.
     pub fn add_subscription(
         &mut self,
         label: &str,
@@ -3205,10 +3502,11 @@ impl Store {
         let label = Self::validated_subscription_label(label)?;
         let url = Self::validated_subscription_url(url)?;
         let group = defaulted(group, DEFAULT_GROUP);
+        let sealed_url = Self::seal_or_fail(&url)?;
         self.conn.execute(
             "INSERT INTO subscriptions (label, url, grp, auto_refresh)
              VALUES (?1, ?2, ?3, ?4)",
-            params![label, url, group, auto_refresh as i64],
+            params![label, sealed_url, group, auto_refresh as i64],
         )?;
         let id = self.conn.last_insert_rowid();
         self.get_subscription(&id.to_string())?
@@ -3237,9 +3535,10 @@ impl Store {
         let label = Self::validated_subscription_label(label)?;
         let url = Self::validated_subscription_url(url)?;
         let group = defaulted(group, DEFAULT_GROUP);
+        let sealed_url = Self::seal_or_fail(&url)?;
         self.conn.execute(
             "UPDATE subscriptions SET label = ?1, url = ?2, grp = ?3 WHERE id = ?4",
-            params![label, url, group, rowid],
+            params![label, sealed_url, group, rowid],
         )?;
         self.get_subscription(id)?
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
@@ -3247,17 +3546,16 @@ impl Store {
 
     /// Ticket 31: find a subscription by exact (trimmed) URL — the friendly
     /// `already subscribed` path. A missing row is `None`, never an error.
+    /// Compared in Rust over unsealed rows: sealed URLs are nondeterministic
+    /// ciphertext, so SQL equality could never match them.
     pub fn find_subscription_by_url(&self, url: &str) -> Result<Option<Subscription>, StoreError> {
         let trimmed = url.trim();
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs
-             FROM subscriptions WHERE url = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![trimmed], map_subscription_row)?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
+        for sub in self.list_subscriptions()? {
+            if sub.url == trimmed {
+                return Ok(Some(sub));
+            }
         }
+        Ok(None)
     }
 
     /// All subscriptions in stable id order.
@@ -3369,17 +3667,49 @@ impl Store {
     /// Ticket 40: drop tombstones whose subscription URL no longer has a live
     /// subscription AND whose subscription id is gone. Returns the pruned
     /// count. Explicit (never on the remove path) so re-subscribe before GC
-    /// still honors deletes.
+    /// still honors deletes. Matched in Rust over unsealed URLs: sealed
+    /// `subscriptions.url` ciphertext never equals the plaintext tombstone
+    /// copy in SQL.
     #[allow(dead_code)]
     pub fn gc_tombstones(&mut self) -> Result<usize, StoreError> {
-        let removed = self.conn.execute(
-            "DELETE FROM subscription_tombstones
-             WHERE subscription_id NOT IN (SELECT id FROM subscriptions)
-               AND (subscription_url IS NULL
-                    OR subscription_url NOT IN (SELECT url FROM subscriptions))",
-            [],
-        )?;
-        Ok(removed)
+        let live_ids: HashSet<String> = {
+            let mut stmt = self.conn.prepare("SELECT id FROM subscriptions")?;
+            let mapped = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect()
+        };
+        let live_urls: HashSet<String> = self
+            .list_subscriptions()?
+            .into_iter()
+            .map(|sub| sub.url)
+            .collect();
+        let tombs: Vec<(String, String, Option<String>)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT subscription_id, identity_key, subscription_url FROM subscription_tombstones",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut pruned = 0;
+        for (sub_id, key, url) in tombs {
+            let url_dead = url.as_deref().is_none_or(|url| !live_urls.contains(url));
+            if !live_ids.contains(&sub_id) && url_dead {
+                pruned += self.conn.execute(
+                    "DELETE FROM subscription_tombstones WHERE subscription_id = ?1 AND identity_key = ?2",
+                    params![sub_id, key],
+                )?;
+            }
+        }
+        Ok(pruned)
     }
 
     /// Record a fetch-level failure (e.g. network error from the intake
@@ -3417,6 +3747,41 @@ impl Store {
     /// and applies atomically per group. Unparseable bodies keep the
     /// last-good members and record `last_error`. Refresh never enables or
     /// starts configs.
+    /// Ticket A5: byte-level ingest — enforces [`SUBSCRIPTION_MAX_BYTES`]
+    /// and UTF-8 before parsing, so oversize/non-text bodies keep the
+    /// last-good members and record `last_error` instead of growing us
+    /// without bound. Reasons never echo body bytes. (The live fetch
+    /// enforces the same two caps inline while streaming — the platform
+    /// client owns that socket — so this is the ingest-side half for
+    /// byte callers; both halves share the constants above.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn refresh_with_bytes(
+        &mut self,
+        sub_id: &str,
+        body: &[u8],
+        now: i64,
+    ) -> Result<RefreshOutcome, StoreError> {
+        if body.len() > SUBSCRIPTION_MAX_BYTES {
+            let reason = "subscription body too large".to_string();
+            self.record_subscription_error(sub_id, &reason)?;
+            return Ok(RefreshOutcome {
+                error: Some(reason),
+                ..Default::default()
+            });
+        }
+        let text = match std::str::from_utf8(body) {
+            Ok(text) => text,
+            Err(_) => {
+                let reason = "subscription body is not UTF-8".to_string();
+                self.record_subscription_error(sub_id, &reason)?;
+                return Ok(RefreshOutcome {
+                    error: Some(reason),
+                    ..Default::default()
+                });
+            }
+        };
+        self.refresh_with_body(sub_id, text, now)
+    }
     pub fn refresh_with_body(
         &mut self,
         sub_id: &str,
@@ -3901,11 +4266,16 @@ impl Store {
                         StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
                     })?;
                     tx.execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
-                    // Ticket 25: refresh-deletes prune like remove() does.
+                    // Ticket 25: refresh-deletes prune like remove() does
+                    // (snapshot + history, never a stale resurrection).
                     tx.execute(
                         "DELETE FROM health_snapshots WHERE config_id = ?1",
                         params![id],
                     )?;
+                    let _ = tx.execute(
+                        "DELETE FROM health_history WHERE config_id = ?1",
+                        params![id],
+                    );
                 }
             }
         }
@@ -4000,11 +4370,68 @@ impl Store {
     /// rebuilds routing policy and counters. Tolerant of corrupt rows
     /// (quarantined rows are skipped, never fail the whole export — the
     /// caller uses `export_library_json_with_quarantine` for the skip list).
+    /// Rows whose sync baseline no longer unseals are skipped the same way
+    /// (logged + quarantined, never a whole-export abort):
+    /// `list_with_quarantine` cannot see that column (`map_row` never reads
+    /// it), so export filters it here.
+    /// Ticket A8: single pipeline — this delegates to
+    /// [`Store::export_library_json_with_quarantine`] and drops the skip
+    /// list, so the two exports can never drift apart (one funnel for the
+    /// good-rows shape, the quarantine list, and the v5 sections).
     pub fn export_library_json(&self) -> Result<String, StoreError> {
-        let (rows, _quarantined) = self.list_with_quarantine()?;
-        let tombstones = self.list_tombstones_raw()?;
-        let payload = export_payload_full(&rows, &self.list_subscriptions()?, &tombstones);
-        self.enrich_export_payload(&payload, &rows)
+        let (payload, _) = self.export_library_json_with_quarantine()?;
+        Ok(payload)
+    }
+
+    /// Split `rows` into exportable rows plus skipped ids: any row whose
+    /// `synced_params` fails to unseal is logged and skipped (never a whole
+    /// export failure). A broken side-channel read degrades to no filtering
+    /// (loud `eprintln`, never silent data loss either way).
+    fn without_unreadable_synced(&self, rows: Vec<ProxyConfig>) -> (Vec<ProxyConfig>, Vec<String>) {
+        let mut bad: HashSet<String> = HashSet::new();
+        match self
+            .conn
+            .prepare("SELECT id, synced_params FROM proxy_configs WHERE synced_params IS NOT NULL")
+        {
+            Ok(mut stmt) => {
+                match stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                }) {
+                    Ok(mapped) => {
+                        for entry in mapped {
+                            match entry {
+                                Ok((id, Some(sealed))) => {
+                                    if Self::unseal_or_fail(&sealed).is_err() {
+                                        eprintln!(
+                                            "export skips row {id}: unreadable sync baseline (quarantined)"
+                                        );
+                                        bad.insert(id.to_string());
+                                    }
+                                }
+                                Ok((_, None)) => {}
+                                Err(error) => {
+                                    eprintln!(
+                                        "export sync-baseline scan hit an unreadable row ({error}); keeping it"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("export sync-baseline scan failed ({error}); no rows filtered");
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("export sync-baseline scan failed ({error}); no rows filtered");
+            }
+        }
+        let skipped: Vec<String> = bad.iter().cloned().collect();
+        let kept: Vec<ProxyConfig> = rows
+            .into_iter()
+            .filter(|row| !bad.contains(&row.id))
+            .collect();
+        (kept, skipped)
     }
 
     /// Ticket 40: patch the v5 full-fidelity sections into a base export
@@ -4021,6 +4448,8 @@ impl Store {
         type SideRow = (bool, Option<String>, i64, i64, Option<String>);
         // Ownership side-channels + traffic + preset linkage, keyed by id.
         let mut side: HashMap<String, SideRow> = HashMap::new();
+        // Row ids whose sync baseline failed to unseal (quarantined below).
+        let mut unreadable_synced: HashSet<String> = HashSet::new();
         {
             // preset_id → preset name resolution happens below; here we read
             // the raw linkage plus counters.
@@ -4046,9 +4475,19 @@ impl Store {
                 .collect();
             for entry in entries {
                 let (id, adoptable, synced, rx, tx, preset_id) = entry?;
-                let synced = synced
-                    .map(|sealed| Self::unseal_or_fail(&sealed))
-                    .transpose()?;
+                // One unreadable sync baseline quarantines its row (logged +
+                // skipped), never the whole export.
+                let synced = match synced {
+                    Some(sealed) => match Self::unseal_or_fail(&sealed) {
+                        Ok(text) => Some(text),
+                        Err(error) => {
+                            eprintln!("export skips row {id}: unreadable sync baseline ({error})");
+                            unreadable_synced.insert(id.to_string());
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let preset_name = preset_id
                     .as_deref()
                     .and_then(|pid| preset_names.get(pid).cloned());
@@ -4063,12 +4502,13 @@ impl Store {
         if let Some(entries) = value.get_mut("library").and_then(|v| v.as_array_mut()) {
             // Drop any library entries for quarantined rows (base payload was
             // built from good rows only, so this is a no-op — belt and
-            // suspenders for callers that pass a foreign base).
+            // suspenders for callers that pass a foreign base) plus rows
+            // whose sync baseline failed to unseal above.
             let good_ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
             entries.retain(|e| {
                 e.get("id")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|id| good_ids.contains(id))
+                    .is_some_and(|id| good_ids.contains(id) && !unreadable_synced.contains(id))
             });
             for entry in entries.iter_mut() {
                 if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
@@ -4167,6 +4607,16 @@ impl Store {
     ) -> Result<Option<PathBuf>, StoreError> {
         if !confirmed {
             return Ok(None);
+        }
+        // Never overwrite the live database with JSON export bytes: refuse
+        // when the destination resolves to the live DB file.
+        if let Some(live) = self.db_path.as_deref() {
+            if paths_equal(live, path) {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "export",
+                    "export path must not be the live database file",
+                )]));
+            }
         }
         let payload = self.export_library_json()?;
         if let Some(parent) = path.parent() {
@@ -4298,17 +4748,52 @@ impl Store {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0)
                 .max(0);
+            // Ticket A3: strict restore — missing/wrong-typed core fields fail
+            // loudly (same `invalid()` shape as id/port above), never silent
+            // defaults that would resurrect a corrupt export as good rows.
+            let name = get_str(entry, "name")
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| invalid(format!("{what} needs a name")))?;
+            let protocol_raw = get_str(entry, "protocol")
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| invalid(format!("{what} needs a protocol")))?;
+            let protocol = canonical_protocol(&protocol_raw)
+                .ok_or_else(|| invalid(format!("{what} has an unknown protocol")))?;
+            let params_raw =
+                get_str(entry, "params").ok_or_else(|| invalid(format!("{what} needs params")))?;
+            match serde_json::from_str::<serde_json::Value>(&params_raw) {
+                Ok(serde_json::Value::Object(_)) => {}
+                _ => return Err(invalid(format!("{what} has corrupt params"))),
+            }
+            let bind_ip_raw = get_str(entry, "bind_ip")
+                .ok_or_else(|| invalid(format!("{what} needs a bind_ip")))?;
+            {
+                let trimmed = bind_ip_raw.trim();
+                let bind_ok = trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("localhost")
+                    || trimmed.parse::<std::net::IpAddr>().is_ok();
+                if !bind_ok {
+                    return Err(invalid(format!("{what} has a bad bind_ip")));
+                }
+            }
+            // Ticket A3: reserved ranges never restore silently (the save
+            // gate would have refused them); name the range like the engine.
+            if let Some(range) = crate::engine::reserved_range_of(port as u16) {
+                return Err(invalid(format!(
+                    "{what} uses reserved port {port} ({range})"
+                )));
+            }
             rows.push(LibraryRow {
                 id,
-                name: get_str(entry, "name").unwrap_or_default(),
-                protocol: get_str(entry, "protocol").unwrap_or_else(|| "vless".to_string()),
-                params: get_str(entry, "params").unwrap_or_else(|| "{}".to_string()),
+                name,
+                protocol,
+                params: params_raw,
                 group: get_str(entry, "group").unwrap_or_else(|| "default".to_string()),
                 enabled: entry
                     .get("enabled")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
-                bind_ip: get_str(entry, "bind_ip").unwrap_or_else(|| "127.0.0.1".to_string()),
+                bind_ip: bind_ip_raw,
                 port,
                 subscription_id: get_str(entry, "subscription_id"),
                 identity_key: get_str(entry, "identity_key"),
@@ -4321,6 +4806,25 @@ impl Store {
                 traffic_rx,
                 traffic_tx,
             });
+        }
+        // Ticket A3: duplicate bind:port on the restore path fails loudly
+        // (two rows can never claim one endpoint; activation would refuse
+        // it later — fail at restore instead). Keys fold through the same
+        // loopback-alias canonicalization as activation
+        // (`normalize_bind_key`), so `127.0.0.1`, `localhost`, and `::1`
+        // compare equal here exactly as they do at start time.
+        {
+            let mut seen: std::collections::HashSet<(String, i64)> =
+                std::collections::HashSet::new();
+            for (index, row) in rows.iter().enumerate() {
+                let key = (crate::engine::normalize_bind_key(&row.bind_ip), row.port);
+                if !seen.insert(key.clone()) {
+                    return Err(invalid(format!(
+                        "library[{index}] duplicates bind:port {}:{}",
+                        row.bind_ip, row.port
+                    )));
+                }
+            }
         }
         struct SubRow {
             id: i64,
@@ -4496,14 +5000,31 @@ impl Store {
                 .transpose()?;
             sealed_rows.push((row, sealed_params, sealed_synced));
         }
+        // Seal subscription URLs BEFORE opening the tx (same atomicity rule:
+        // export payloads carry plaintext URLs by design, and they seal on
+        // the way back in; already-sealed input stays as-is).
+        let mut sealed_sub_urls: Vec<String> = Vec::with_capacity(sub_rows.len());
+        for sub in &sub_rows {
+            if sub.url.trim_start().starts_with(crate::dpapi::MARKER) {
+                sealed_sub_urls.push(sub.url.clone());
+            } else {
+                sealed_sub_urls.push(Self::seal_or_fail(&sub.url)?);
+            }
+        }
         let tx = self.conn.transaction()?;
         // Wipe + rebuild in ONE transaction (atomic: mid-kill rolls back).
         tx.execute("DELETE FROM proxy_configs", [])?;
         tx.execute("DELETE FROM subscriptions", [])?;
         tx.execute("DELETE FROM subscription_tombstones", [])?;
-        // Presets: only wipe when the payload carries presets (old payloads
-        // preserve live presets for re-attach, ticket-37 compat).
-        if !preset_rows.is_empty() || obj.contains_key("route_presets") {
+        // Presets: only wipe when the payload carries an explicit presets
+        // array (missing or explicit `null` preserves live presets for
+        // re-attach, ticket-37 compat; only `[]` or a populated array —
+        // an explicit statement about the set — clears first).
+        if obj
+            .get("route_presets")
+            .and_then(|v| v.as_array())
+            .is_some()
+        {
             tx.execute("DELETE FROM route_presets", [])?;
         }
         for preset in &preset_rows {
@@ -4547,7 +5068,7 @@ impl Store {
                 preset_by_name.insert(name, id.to_string());
             }
         }
-        for sub in &sub_rows {
+        for (sub, sealed_url) in sub_rows.iter().zip(sealed_sub_urls.iter()) {
             tx.execute(
                 "INSERT INTO subscriptions
                    (id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs)
@@ -4555,7 +5076,7 @@ impl Store {
                 params![
                     sub.id,
                     sub.label,
-                    sub.url,
+                    sealed_url,
                     sub.group,
                     sub.auto_refresh as i64,
                     sub.last_refresh_at,
@@ -5130,11 +5651,18 @@ impl Store {
 
     /// First free port in the auto range, given the set of taken ports.
     /// Ticket 27: primary then spillover (see [`auto_port_candidates`]).
-    fn auto_port(&self) -> Result<u16, StoreError> {
+    /// `exclude` frees one in-use port from the taken set (the edit-to-auto
+    /// path passes the row's own current port: it stays taken by nobody
+    /// else, so the row may keep it instead of burning a fresh port per
+    /// edit and starving the range).
+    fn auto_port_excluding(&self, exclude: Option<u16>) -> Result<u16, StoreError> {
         let mut stmt = self.conn.prepare("SELECT port FROM proxy_configs")?;
-        let taken: HashSet<i64> = stmt
+        let mut taken: HashSet<i64> = stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<HashSet<_>, _>>()?;
+        if let Some(own) = exclude {
+            taken.remove(&(own as i64));
+        }
         for port in auto_port_candidates() {
             if !taken.contains(&(port as i64)) {
                 return Ok(port);
@@ -5183,7 +5711,10 @@ impl Store {
         };
         let port = match &patch.port {
             Some(raw) => match parse_port_field(raw) {
-                Ok(None) => match self.auto_port() {
+                // Blank/`auto` re-resolves against every port but this row's
+                // own (it may keep its current port; otherwise the range
+                // drains one port per edit).
+                Ok(None) => match self.auto_port_excluding(Some(current.port)) {
                     Ok(port) => Some(port),
                     Err(StoreError::Invalid(mut auto_errors)) => {
                         errors.append(&mut auto_errors);
@@ -5539,6 +6070,39 @@ mod tests {
 
     /// Stored configs may share a port; the conflict error naming both
     /// parties is raised at activation time (ticket 03), not at rest.
+    /// Ticket A4: the auto pool is global across binds — even a LAN bind
+    /// consumes the shared pool, so it can never collide with a loopback
+    /// auto port at activation. Exhaustion is honest only past BOTH ranges
+    /// (see `AUTO_PORT_CAPACITY`); the error text is stable for the UI.
+    #[test]
+    fn a4_auto_pool_is_global_across_binds() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let loopback = store
+            .add(NewConfig {
+                bind_ip: "127.0.0.1".to_string(),
+                port: String::new(),
+                ..valid_input("Loop")
+            })
+            .expect("loopback auto assigns");
+        let lan = store
+            .add(NewConfig {
+                bind_ip: "0.0.0.0".to_string(),
+                port: String::new(),
+                ..valid_input("Lan")
+            })
+            .expect("LAN auto assigns");
+        assert_ne!(
+            loopback.port, lan.port,
+            "global pool: no per-bind reuse ({} vs {})",
+            loopback.port, lan.port
+        );
+        assert_eq!(
+            AUTO_PORT_CAPACITY,
+            (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
+                + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize,
+            "exhaustion only past both ranges"
+        );
+    }
     #[test]
     fn duplicate_ports_allowed_at_rest() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -5638,10 +6202,29 @@ mod tests {
     }
 
     /// IpAddr import is used (keeps the dependency honest if refactored).
+    /// Ticket A1: `localhost` validates as a loopback bind (save gate agrees
+    /// with the engine start gate); garbage still fails naming localhost.
     #[test]
     fn localhost_parses_as_loopback() {
         let ip: IpAddr = DEFAULT_BIND.parse().expect("default bind parses");
         assert!(ip.is_loopback());
+        let mut errors = Vec::new();
+        assert_eq!(
+            validated_bind("localhost", &mut errors).as_deref(),
+            Some("localhost")
+        );
+        assert!(errors.is_empty());
+        let mut errors = Vec::new();
+        assert!(validated_bind("not a bind!!", &mut errors).is_none());
+        let message = errors
+            .iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            message.contains("localhost"),
+            "reconciled message: {message}"
+        );
     }
 
     // -- Ticket 04: subscriptions + refresh (merge seam; injected bodies) --
@@ -6084,6 +6667,61 @@ mod tests {
         assert!(decode_failures(Some(String::new())).is_empty());
         assert!(decode_failures(Some("not-json".to_string())).is_empty());
         assert!(decode_failures(Some("[{\"index\": 2}]".to_string())).len() == 1);
+    }
+
+    /// Ticket A8: a corrupt `failures` CELL in a live row (hand edit, older
+    /// build) reads back as no failures — never a crash, never an error —
+    /// and an empty library round-trips export → restore → export
+    /// byte-identically through the single pipeline.
+    #[test]
+    fn a8_corrupt_failures_cell_and_empty_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .conn
+            .execute(
+                "UPDATE subscriptions SET failures = ?1 WHERE id = ?2",
+                params!["{corrupt!!!", sub.id.parse::<i64>().expect("rowid")],
+            )
+            .expect("corrupt write works");
+        let read = store
+            .get_subscription(&sub.id)
+            .expect("read works")
+            .expect("sub present");
+        assert!(
+            read.failures.is_empty(),
+            "corrupt cell decodes to no failures"
+        );
+
+        // Empty library round-trip through the single export pipeline.
+        let empty = Store::open_in_memory().expect("fresh store opens");
+        let payload = empty.export_library_json().expect("empty export works");
+        let (quarantined_payload, skipped) = empty
+            .export_library_json_with_quarantine()
+            .expect("quarantine export works");
+        assert_eq!(
+            payload, quarantined_payload,
+            "single pipeline: both exports agree"
+        );
+        assert!(skipped.is_empty(), "nothing to skip when empty");
+        let mut restored = Store::open_in_memory().expect("restore target opens");
+        let outcome = restored
+            .restore_library_json(&payload)
+            .expect("empty restore works");
+        assert_eq!(
+            outcome,
+            RestoreOutcome {
+                configs: 0,
+                subscriptions: 0,
+                tombstones: 0,
+                presets: 0,
+            }
+        );
+        assert_eq!(
+            restored.export_library_json().expect("re-export works"),
+            payload,
+            "empty round-trip is byte-identical"
+        );
     }
 
     /// Removing a subscription releases (never deletes) its rows and drops
@@ -7146,6 +7784,122 @@ mod tests {
         );
     }
 
+    /// Ticket A3: strict restore — corrupt library rows fail loudly (missing
+    /// / wrong-typed name/protocol/params/bind_ip, reserved ports, duplicate
+    /// bind:port), with nothing written.
+    #[test]
+    fn a3_restore_rejects_corrupt_rows_loudly() {
+        fn valid_entry() -> serde_json::Value {
+            serde_json::json!({
+                "id": "1",
+                "name": "one",
+                "protocol": "vless",
+                "params": "{\"server\":\"a.example.com\",\"server_port\":443,\"uuid\":\"11111111-2222-4333-8444-555555555555\"}",
+                "group": "default",
+                "enabled": false,
+                "bind_ip": "127.0.0.1",
+                "port": 10801,
+            })
+        }
+        fn payload_with(entries: Vec<serde_json::Value>) -> String {
+            serde_json::json!({
+                "library": entries,
+                "subscriptions": [],
+            })
+            .to_string()
+        }
+        let mut cases: Vec<(&str, serde_json::Value)> = Vec::new();
+        let mut missing_name = valid_entry();
+        missing_name.as_object_mut().expect("object").remove("name");
+        cases.push(("missing name", missing_name));
+        let mut blank_name = valid_entry();
+        blank_name["name"] = serde_json::Value::String("   ".to_string());
+        cases.push(("blank name", blank_name));
+        let mut wrong_protocol = valid_entry();
+        wrong_protocol["protocol"] = serde_json::json!(42);
+        cases.push(("wrong-typed protocol", wrong_protocol));
+        let mut unknown_protocol = valid_entry();
+        unknown_protocol["protocol"] = serde_json::Value::String("nope".to_string());
+        cases.push(("unknown protocol", unknown_protocol));
+        let mut missing_params = valid_entry();
+        missing_params
+            .as_object_mut()
+            .expect("object")
+            .remove("params");
+        cases.push(("missing params", missing_params));
+        let mut corrupt_params = valid_entry();
+        corrupt_params["params"] = serde_json::Value::String("{garbage".to_string());
+        cases.push(("corrupt params", corrupt_params));
+        let mut missing_bind = valid_entry();
+        missing_bind
+            .as_object_mut()
+            .expect("object")
+            .remove("bind_ip");
+        cases.push(("missing bind_ip", missing_bind));
+        let mut bad_bind = valid_entry();
+        bad_bind["bind_ip"] = serde_json::Value::String("not a bind!!".to_string());
+        cases.push(("bad bind_ip", bad_bind));
+        let mut reserved = valid_entry();
+        reserved["port"] = serde_json::json!(18600);
+        cases.push(("reserved port", reserved));
+        for (label, entry) in cases {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let payload = payload_with(vec![entry]);
+            let error = store
+                .restore_library_json(&payload)
+                .expect_err(&format!("{label} must fail"));
+            assert!(
+                matches!(error, StoreError::Invalid(_)),
+                "{label}: Invalid, got {error}"
+            );
+            assert!(
+                store.list().expect("list works").is_empty(),
+                "{label}: nothing written"
+            );
+        }
+        // Duplicate bind:port fails loudly with nothing written.
+        {
+            let mut second = valid_entry();
+            second["id"] = serde_json::Value::String("2".to_string());
+            second["name"] = serde_json::Value::String("two".to_string());
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let payload = payload_with(vec![valid_entry(), second]);
+            let error = store
+                .restore_library_json(&payload)
+                .expect_err("duplicate bind:port must fail");
+            assert!(
+                matches!(error, StoreError::Invalid(_)),
+                "Invalid, got {error}"
+            );
+            assert!(error.to_string().contains("duplicates"), "got {error}");
+            assert!(store.list().expect("list works").is_empty());
+        }
+        // Loopback aliases compare equal (review: `127.0.0.1`, `localhost`,
+        // `::1` claim one endpoint at activation, so restore refuses them).
+        for alias in ["localhost", "::1", "LOCALHOST", " 127.0.0.1 "] {
+            let mut second = valid_entry();
+            second["id"] = serde_json::Value::String("2".to_string());
+            second["name"] = serde_json::Value::String("two".to_string());
+            second["bind_ip"] = serde_json::Value::String(alias.to_string());
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let payload = payload_with(vec![valid_entry(), second]);
+            let error = store
+                .restore_library_json(&payload)
+                .expect_err(&format!("alias {alias:?} must collide"));
+            assert!(error.to_string().contains("duplicates"), "got {error}");
+            assert!(store.list().expect("list works").is_empty());
+        }
+        // localhost bind restores fine (A1 parity: loopback by name).
+        {
+            let mut entry = valid_entry();
+            entry["bind_ip"] = serde_json::Value::String("localhost".to_string());
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            let outcome = store
+                .restore_library_json(&payload_with(vec![entry]))
+                .expect("localhost bind restores");
+            assert_eq!(outcome.configs, 1);
+        }
+    }
     /// Atomic export: tmp + rename leaves a parseable file and no tmp litter.
     #[test]
     fn t25_export_is_atomic_no_tmp_litter() {
@@ -7629,6 +8383,121 @@ mod tests {
             .expect("http add allowed");
     }
 
+    /// Ticket A5: redirect + DNS-rebind coverage — every hop re-runs the
+    /// policy, so a benign host redirecting (or resolving) to loopback is
+    /// Blocked; caps are enforced code; Warn reasons never carry tokens.
+    #[test]
+    fn a5_redirect_rebind_caps_hold() {
+        use SubscriptionFetchPolicy::{Allow, Block, Warn};
+        // A redirect target is just another URL through the same policy: a
+        // hop to 127.0.0.1 is Blocked before any byte is fetched from it.
+        for target in [
+            "http://127.0.0.1/evil?token=hunter2",
+            "https://127.0.0.1:8080/evil",
+            "http://localhost/evil",
+            "https://[::1]/evil",
+        ] {
+            assert!(
+                matches!(subscription_fetch_policy(target), Block { .. }),
+                "redirect target blocked: {target}"
+            );
+        }
+        // DNS-rebind: public name, internal resolution → Block.
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().expect("ip parses");
+        let private: std::net::IpAddr = "10.9.9.9".parse().expect("ip parses");
+        let public: std::net::IpAddr = "93.184.216.34".parse().expect("ip parses");
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[loopback]),
+                Block { .. }
+            ),
+            "rebind to loopback blocked"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved(
+                    "https://example.com/sub.txt",
+                    &[public, private]
+                ),
+                Block { .. }
+            ),
+            "one internal answer poisons the set"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[public]),
+                Allow
+            ),
+            "public resolution stays Allow"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("http://example.com/sub.txt", &[public]),
+                Warn { .. }
+            ),
+            "plaintext-http Warn survives resolution (LAN-provider compat)"
+        );
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("https://example.com/sub.txt", &[]),
+                Block { .. }
+            ),
+            "empty resolution fails closed"
+        );
+        // Literal-internal URLs stay Block even with a public resolution
+        // claim (no DNS laundering past the literal guard).
+        assert!(
+            matches!(
+                subscription_fetch_policy_resolved("http://127.0.0.1/sub", &[public]),
+                Block { .. }
+            ),
+            "literal internal never laundered"
+        );
+        // Warn reasons never echo the URL/token.
+        let reason = match subscription_fetch_policy("http://example.com/sub?token=hunter2") {
+            Warn { reason } => reason,
+            other => panic!("expected Warn, got {other:?}"),
+        };
+        assert!(!reason.contains("hunter2"), "no token echo: {reason}");
+        assert!(!reason.contains("example.com"), "no URL echo: {reason}");
+        // Caps live in code and match the fetch path (8 MiB / 20 s / 5).
+        assert_eq!(SUBSCRIPTION_MAX_BYTES, 8 * 1024 * 1024);
+        assert_eq!(SUBSCRIPTION_TIMEOUT_SECS, 20);
+        assert_eq!(SUBSCRIPTION_MAX_REDIRECTS, 5);
+        // Byte entry enforces size + UTF-8, keeping last-good members.
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("baseline refresh works");
+        assert_eq!(store.list().expect("list works").len(), 2);
+        let big = vec![b'x'; SUBSCRIPTION_MAX_BYTES + 1];
+        let outcome = store
+            .refresh_with_bytes(&sub.id, &big, 200)
+            .expect("oversize is an outcome, not an error");
+        assert!(
+            outcome.error.as_deref() == Some("subscription body too large"),
+            "loud cap, got {outcome:?}"
+        );
+        let outcome = store
+            .refresh_with_bytes(&sub.id, &[0xff, 0xfe, 0xfd], 300)
+            .expect("non-UTF8 is an outcome, not an error");
+        assert!(
+            outcome.error.as_deref() == Some("subscription body is not UTF-8"),
+            "loud encoding, got {outcome:?}"
+        );
+        assert_eq!(
+            store.list().expect("list works").len(),
+            2,
+            "capped bodies keep last-good members"
+        );
+        // Small valid bodies still flow through the byte entry.
+        let outcome = store
+            .refresh_with_bytes(&sub.id, sub_body_two().as_bytes(), 400)
+            .expect("valid bytes refresh");
+        assert!(outcome.error.is_none(), "clean, got {outcome:?}");
+    }
+
     /// Manual ssh/noise rows validate like the import path (credentials
     /// required; opaque rows still pass through).
     #[test]
@@ -7742,6 +8611,56 @@ mod tests {
         );
     }
 
+    /// Ticket 35/48: a stored subscription URL carries no token plaintext
+    /// at rest, reads back identically, and still matches by URL.
+    #[test]
+    fn ticket35_stored_sub_urls_have_no_plaintext() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store
+            .add_subscription(
+                "Nightly",
+                "https://example.com/sub.txt?token=SECRET-TOKEN",
+                "default",
+                true,
+            )
+            .expect("add works");
+        let raw: String = store
+            .conn
+            .query_row(
+                "SELECT url FROM subscriptions WHERE id = ?1",
+                rusqlite::params![created.id.parse::<i64>().expect("numeric id")],
+                |row| row.get(0),
+            )
+            .expect("raw read works");
+        assert!(
+            !raw.contains("SECRET-TOKEN"),
+            "subscription url column sealed at rest"
+        );
+        let back = store
+            .get_subscription(&created.id)
+            .expect("get works")
+            .expect("row kept");
+        assert_eq!(
+            back.url, "https://example.com/sub.txt?token=SECRET-TOKEN",
+            "reads decrypt transparently"
+        );
+        assert_eq!(
+            store
+                .find_subscription_by_url("https://example.com/sub.txt?token=SECRET-TOKEN")
+                .expect("find works")
+                .map(|sub| sub.id),
+            Some(created.id.clone()),
+            "sealed rows still match by url"
+        );
+        assert!(
+            store
+                .find_subscription_by_url("https://example.com/other.txt")
+                .expect("find works")
+                .is_none(),
+            "missing url is None"
+        );
+    }
+
     /// Ticket 35: a v2 plaintext database migrates to sealed params on open
     /// with zero data loss (file-backed migration fixture).
     #[test]
@@ -7802,7 +8721,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .expect("version reads");
-            assert_eq!(version, 5, "schema advanced to 5 (ticket-40 v5)");
+            assert_eq!(version, Store::SCHEMA_VERSION, "schema advances fully");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -8257,6 +9176,15 @@ mod tests {
             .expect("get works")
             .expect("preset kept");
         assert_eq!(back.rules().expect("rules decode").len(), 0);
+        // Attaching an empty-rules preset is refused (it would serve
+        // preset-less without a word).
+        assert!(
+            store.set_config_preset(&row.id, Some(&preset.id)).is_err(),
+            "empty attach refused"
+        );
+        store
+            .add_preset_rule(&preset.id, serde_json::json!({"action": "direct"}))
+            .expect("re-add rule works");
         // Attach, then delete must refuse.
         store
             .set_config_preset(&row.id, Some(&preset.id))
@@ -8440,9 +9368,23 @@ mod tests {
             add_result.expect_err("DPAPI-down add aborts"),
             refresh_result.expect_err("DPAPI-down refresh aborts"),
         ] {
+            // Ticket A2: crypto failures are `Crypto`, never `Sql`, with an
+            // honest message (no "database error" mislabel).
+            assert!(
+                matches!(error, StoreError::Crypto { .. }),
+                "distinct crypto variant, got {error:?}"
+            );
             assert!(
                 error.to_string().contains("dpapi"),
                 "loud dpapi cause, got {error}"
+            );
+            assert!(
+                error.to_string().contains("nothing was written"),
+                "honest no-write message, got {error}"
+            );
+            assert!(
+                !matches!(error, StoreError::Sql(_)),
+                "never mislabeled as Sql: {error:?}"
             );
         }
         assert_eq!(
@@ -8788,11 +9730,24 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version reads");
-        assert_eq!(version, 5, "migrated to v5");
+        assert_eq!(version, Store::SCHEMA_VERSION, "migrated fully");
         // interval_secs defaults 86400.
         let subs = store.list_subscriptions().expect("subs list");
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].interval_secs, 86_400, "default interval");
+        // The v4 plaintext subscription URL sealed at rest, reads back plain.
+        let raw_url: String = store
+            .conn
+            .query_row("SELECT url FROM subscriptions", [], |r| r.get(0))
+            .expect("raw url reads");
+        assert!(
+            !raw_url.contains("example.com"),
+            "subscription url column sealed at rest"
+        );
+        assert_eq!(
+            subs[0].url, "https://example.com/a.txt",
+            "reads decrypt transparently"
+        );
         // Zero data loss.
         let rows = store.list().expect("rows list");
         assert_eq!(rows.len(), 1);
@@ -8804,7 +9759,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version reads");
-        assert_eq!(version2, 5);
+        assert_eq!(version2, Store::SCHEMA_VERSION);
         // Fresh and migrated converge: same v5 columns present.
         let fresh = Store::open_in_memory().expect("fresh opens");
         for (table, column) in [
@@ -9432,6 +10387,7 @@ mod tests {
         let empty = r#"{"outbounds":[],"library":[],"subscriptions":[],"tombstones":[],"route_presets":[],"meta":{}}"#;
         let (_outcome, bak) =
             Store::restore_library_file(&path, empty, now_unix()).expect("file restore works");
+        let bak = bak.expect("restore took a backup over a live file");
         assert!(bak.exists(), "restore took a backup");
         let store = Store::open_file(&path).expect("reopen works");
         assert!(
@@ -9441,6 +10397,162 @@ mod tests {
         // The pre-restore backup still holds the exported row.
         let _ = (payload, backup);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Export refuses the live database path (JSON bytes must never
+    /// overwrite the library file).
+    #[test]
+    fn export_refuses_live_db_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-exportguard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        let store = Store::open_file(&path).expect("file store opens");
+        let live = store.db_path().expect("file-backed");
+        let error = store
+            .commit_export(&live, true)
+            .expect_err("export over live DB must fail");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error:?}");
+        };
+        assert!(fields.iter().any(|e| e.field == "export"));
+        assert!(path.exists(), "live DB untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Edit-to-auto reuses the row's own port (never burns a fresh port
+    /// per edit toward exhaustion).
+    #[test]
+    fn edit_to_auto_keeps_own_port() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store.add(valid_input("Solo")).expect("add works");
+        let before = created.port;
+        let updated = store
+            .update(
+                &created.id,
+                ConfigPatch {
+                    port: Some("auto".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("edit-to-auto works");
+        assert_eq!(
+            updated.port, before,
+            "own port reused, got {}",
+            updated.port
+        );
+    }
+
+    /// `route_presets: null` preserves live presets like a missing section
+    /// (only an explicit array — even empty — wipes first).
+    #[test]
+    fn restore_null_presets_preserves_live() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .create_preset("keep", "manual", None, &[])
+            .expect("preset seeds");
+        let payload = r#"{"outbounds":[],"library":[],"subscriptions":[],"tombstones":[],"route_presets":null,"meta":{}}"#;
+        store
+            .restore_library_json(payload)
+            .expect("null-presets restore works");
+        assert_eq!(
+            store.list_presets().expect("list works").len(),
+            1,
+            "explicit null preserves live presets"
+        );
+        let wiped = r#"{"outbounds":[],"library":[],"subscriptions":[],"tombstones":[],"route_presets":[],"meta":{}}"#;
+        store
+            .restore_library_json(wiped)
+            .expect("empty-array restore works");
+        assert!(
+            store.list_presets().expect("list works").is_empty(),
+            "explicit empty array wipes"
+        );
+    }
+
+    /// Restoring with no live file succeeds with no backup (never a phantom
+    /// path to a file that was never written).
+    #[test]
+    fn restore_without_live_file_returns_no_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-nolive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("fresh").join("library.db");
+        assert!(!path.exists());
+        let payload = r#"{"outbounds":[],"library":[],"subscriptions":[],"tombstones":[],"route_presets":[],"meta":{}}"#;
+        let (outcome, backup) =
+            Store::restore_library_file(&path, payload, now_unix()).expect("restore works");
+        assert!(backup.is_none(), "no live file means no backup");
+        assert_eq!(outcome.configs, 0);
+        assert!(path.exists(), "fresh parents created, live file written");
+        Store::open_file(&path).expect("restored file opens");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Export skips a row whose sync baseline no longer unseals (logged +
+    /// quarantined) instead of aborting the whole export.
+    #[test]
+    fn export_skips_row_with_bad_synced_params() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let good = store.add(valid_input("Good")).expect("add works");
+        let bad = store.add(valid_input("Bad")).expect("add works");
+        store
+            .conn
+            .execute(
+                "UPDATE proxy_configs SET synced_params = 'garbage!!!' WHERE id = ?1",
+                rusqlite::params![bad.id.parse::<i64>().expect("numeric id")],
+            )
+            .expect("corrupt baseline seeds");
+        let payload = store.export_library_json().expect("export survives");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("JSON");
+        let ids: Vec<String> = value["library"]
+            .as_array()
+            .expect("library section")
+            .iter()
+            .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(ids.contains(&good.id), "good row exports, got {ids:?}");
+        assert!(
+            !ids.contains(&bad.id),
+            "bad-baseline row quarantined, got {ids:?}"
+        );
+        let (quarantine_payload, skipped) = store
+            .export_library_json_with_quarantine()
+            .expect("quarantine export works");
+        assert!(skipped.contains(&bad.id), "skip list names it");
+        let _ = quarantine_payload;
+    }
+
+    /// Group rename/move/delete trim consistently (`" g1 "` is `"g1"`).
+    #[test]
+    fn group_ops_trim_consistently() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut a = valid_input("A");
+        a.group = "g1".to_string();
+        store.add(a).expect("add works");
+        assert_eq!(
+            store
+                .rename_group("  g1  ", "  team  ")
+                .expect("padded rename works"),
+            1,
+            "old and new both trim"
+        );
+        assert!(
+            store.delete_group(" team ").is_err(),
+            "padded delete still sees the moved row (refuses, never a false-empty Ok)"
+        );
     }
 
     /// DPAPI-down migration fails loudly, version stays, retry succeeds.
@@ -9507,7 +10619,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version reads");
         assert!(
-            version < 5,
+            version < Store::SCHEMA_VERSION,
             "version stays, next open retries (got {version})"
         );
         // Retry with DPAPI up migrates fully.
@@ -9516,7 +10628,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version reads");
-        assert_eq!(version, 5);
+        assert_eq!(version, Store::SCHEMA_VERSION);
         std::fs::remove_dir_all(&dir).ok();
     }
     /// Ticket 43: the word `auto` (any case) means auto-assign, like blank.

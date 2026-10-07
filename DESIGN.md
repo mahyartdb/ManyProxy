@@ -63,7 +63,7 @@ Color is signal-only and rides gpui-kit theme tokens everywhere — app code car
 - Lamp-first rows: every row opens with an occupancy lamp in a fixed leading cell (green serving, red dead-while-serving, dark muted when stopped; flat fill, never glow).
 - One selection grammar: wash marks the selected row and nothing else; checked rows carry rim plus count chip; the bulk bar always reads `N checked (of M visible)`; the detail header echoes `Acting on: <name>`.
 - Lever-frame toolbar: five persistent throws (Add, Start, Stop, Test, Import) on one plate; everything else lives in named Library / Manage / Engine / Help menus.
-- Block-shelf detail: endpoints above the fold, one operate row (Enabled switch + six inline ops + Row menu), manage actions behind the menu.
+- Block-shelf detail: endpoints on every pane, one operate row (Enabled switch + six inline ops + Row menu), manage actions behind the menu.
 - Guided-first dialogs: Add opens on a Server / Server-port / Identity mini-form; JSON is an Advanced disclosure; validation keeps the dialog open with inline errors.
 - Honest states: every action stays enabled with an honest toast (no disabled controls); loading shows label plus spinner; empty states teach the next step.
 
@@ -119,7 +119,7 @@ Ink, paper, signal: a monochrome working surface where color is information, nev
 
 A fixed top band (title bar, lever-frame toolbar), a vertical split with the card list on top (`flex_1`) and the inspector below (filling its resizable panel: 240px start, 240–480px range, internal scroll only past the panel height), and a fixed status strip with three regions — counts left (`status-left`), engine + health center (`status-center`), usage totals right (`status-right`) — split by separators. Filters stack as thin bands above the list: search-with-count plus a visible search-focus button, facet pickers, then the bulk bar only while rows are checked. Spacing runs on two steps throughout: tight 4px groups ({spacing.sm}: card text padding, header gaps, dialog field stacks) separated by generous 8px rhythms ({spacing.md}: toolbar padding, section gaps, dialog bodies).
 
-The detail pane packs modules above one operate row: Endpoints, Health, Usage, History as GroupBox instruments, then a single `detail-operate` row (Enabled switch + Start/Stop/Test/Ping/Logs/Copy URLs + `row-menu` trigger). Eight small controls fit the 1000px frame in that one row, so endpoints stay above the fold with no horizontal scroll; at narrower widths the row wraps to a second line (never sideways scroll). The detail header names the row once via `Acting on: <name>` plus protocol/group Tags, bind endpoint, and serving Badge.
+The detail pane opens with the tab bar pinned above a scrolling body, then packs modules above one operate row: every pane carries the header plus Endpoints, then Details adds Usage, Health adds health + History, Presets adds the preset line + attach row — then a single `detail-operate` row (Enabled switch + Start/Stop/Test/Ping/Logs/Copy URLs + `row-menu` trigger) under its own hairline. Eight small controls fit the 1000px frame in that one row, so endpoints stay above the fold with no horizontal scroll; at narrower widths the row wraps to a second line (never sideways scroll). The detail header names the row once via `Acting on: <name>` plus protocol/group Tags, bind endpoint, and serving Badge.
 
 The window opens at 1000x700 with an 880x620 minimum; toolbar, detail, dialogs, and every status segment paint inside the minimum frame (pinned by containment tests).
 
@@ -153,20 +153,20 @@ Restrained and consistent: one button voice, one field voice, one chip voice per
 
 - **Shape:** theme-radius corners ({rounded.md}).
 - **Primary:** near-black fill ({colors.primary-ink}) with paper text; hover deepens ({colors.primary-ink-hover}). Used for Add and Start — the two constructive commitments.
-- **Hover / Focus:** kit hover tints plus visible keyboard focus; shortcuts ride as Kbd chips beside labels (Add, Start, Stop, Test, Import) with the full `Name (Key)` string on the accessible name.
+- **Hover / Focus:** kit hover tints plus visible keyboard focus; shortcuts ride as Kbd chips beside labels (Add, Start, Stop, Test, Import, Search) with the full `Name (Key)` string on the accessible name. Destructive commits (remove, bulk delete, clear-checked) return focus to the shell, since the control they acted from unmounts. The inspector header carries the status role so selection changes announce.
 - **Danger:** alarm-red fill ({colors.signal-stop}) with paper text (destructive confirms; the row-menu Delete gates through a naming confirm instead of carrying danger styling).
-- **Small density:** `.small()` variant across facet, bulk, detail operate row, and endpoint rows so the full control set fits without scrolling.
+- **Small density:** `.small()` variant across toolbar, facet, bulk, detail operate row, and endpoint rows so the full control set fits without scrolling (the nine toolbar buttons ride small so the strip fits the 880px minimum on one row).
 - **Loading:** `Starting…` label plus inline spinner (`engine-start-spinner`) while a start is in flight; probe buttons spinner while testing or pinging. Tooltips name every action.
 - **Enabled-with-honest-toast:** no control renders kit `.disabled()` — every action stays enabled and explains itself on press (`Nothing to start — the library is empty`, `"<name>" is already stopped`). Loading covers in-flight inertness.
 
 ### Lever frame (toolbar)
 
-Five persistent throws — Add (`add-config`), Start (`start-selected`), Stop (`stop-selected`), Test (`test-selected`), Import (`import-config`) — ride one plate: `group_box` ground, hairline rim, theme radius, separators guarding the throws inside and the frame edge outside. Short visible labels with full `Name (Key)` names on tooltips, accessible labels, and Kbd chips. Library, Manage, Engine, and Help menus carry the rest (Import keeps a distinct `menu-import-config` twin inside Library carrying the Ctrl-O hint; Manage/Engine/Help items carry no Kbd chips because no bindings exist for them).
+Five persistent throws — Add (`add-config`), Start (`start-selected`), Stop (`stop-selected`), Test (`test-selected`), Import (`import-config`) — ride one plate: `group_box` ground, hairline rim, theme radius, separators guarding the throws inside and the frame edge outside. Short visible labels with full `Name (Key)` names on tooltips, accessible labels, and Kbd chips. Library, Manage, Engine, and Help menus carry the rest (Import keeps a distinct `menu-import-config` twin inside Library carrying the Ctrl-O hint; Manage/Engine items carry no Kbd chips because no bindings exist for them; Help adds the `open-palette` entry for the command palette). Every key-bound action plus every menu-only destination also lives in the `Ctrl-K` palette: Library group (13 ops) and Manage group (9 ops) dispatched through the same handlers as buttons, menus, and keys.
 
 ### Chips
 
 - **Style:** Tag chips for protocol and group in the detail header; Kbd chips for shortcut hints; Badge with dot for the serving line (green serving, red failed, gray stopped); numeral check chips (`row-check-chip-<id>`) for checked-set position.
-- **State:** chips are read-only labels except Kbd hints, which are part of their buttons.
+- **State:** chips are read-only labels except Kbd hints, which are part of their buttons. Exclusive choices ride kit `Radio` with real checked state — the subscription interval picker and the log-level row — never bracketed (`[3600]`) or prefixed (`● Error`) text conventions.
 
 ### Cards / Containers
 
@@ -178,20 +178,20 @@ Five persistent throws — Add (`add-config`), Start (`start-selected`), Stop (`
 
 ### Inputs / Fields
 
-- **Style:** hairline stroke, paper fill, theme radius; stacked label-over-field at 4px gaps. Params box fixed at 96px, import box at 160px.
+- **Style:** hairline stroke, paper fill, theme radius; stacked label-over-field at 4px gaps. Params box fixed at 96px, import box at 160px. The Port field carries a live auto-port budget readout (`port-budget`: used of 499 across `10801–10999` plus spill `18081–18380`) on Add and Edit.
 - **Guided-first:** the Add dialog opens on Server / Server-port / Identity mini-fields with a one-clause hint (`vless needs uuid.`); JSON is an Advanced disclosure toggled from the hint row (collapsed) or the Params header (expanded). Guided and JSON swap, never stack; expanding merges guided values into JSON, collapsing echoes JSON into blank guided inputs only. Edit opens expanded to preserve existing JSON.
 - **Focus:** kit focus ring; validation keeps dialogs open with an inline error notification rather than closing; params errors auto-expand Advanced.
 - **Error / Disabled:** inline error lines and collision warnings inside the form; `lan-hint` names the loopback guard in plain words (`Leaving loopback exposes this machine — …`); disabled rows read `disabled` in their muted meta line. No disabled-control styling exists — see honest-toast above.
 
 ### Navigation
 
-- **Inspector tabs:** small segmented Details / Health / Presets bar with stable test anchors and aria labels; only one pane renders per frame, so shared ids never collide.
-- **Status bar:** three regions — library counts (`N configurations · M enabled`; honest zero-totals on empty, never a lying zero, absent on a broken read), engine + health (`health: never tested` short form; `N live · M dead` once probed), usage totals (absent when unreadable).
+- **Inspector tabs:** small segmented Details / Health / Presets bar, pinned above the scrolling pane body, with stable test anchors and aria labels; only one pane renders per frame, so shared ids never collide. Endpoints render on all three panes; the operate row closes every pane under its own hairline.
+- **Status bar:** three regions — library counts (`N configurations · M enabled`, singular at 1; honest zero-totals on empty, never a lying zero, absent on a broken read), engine + health (`health: never tested` short form; `N live · M dead` once probed), usage totals (absent when unreadable).
 - **Search and bulk:** `N of M` search count with a Clear-search reset; a visible `search-focus` button in the facet bar lands focus in the query input (no new binding); the bulk bar always reads `N checked (of M visible)`.
 
 ### Library Row (signature component)
 
-Occupancy lamp (`row-dot-<id>`, fixed leading cell, flat fill) plus checkbox plus name on line one, with the numeral check chip beside the name while checked; small muted meta line (`protocol · upstream · group · bind:port · state`); small badge line in serving color with optional traffic totals. Hover tints quiet; selection takes wash plus rim; checked takes the 2px accent rim. Stopped rows honestly show pinned `○ Stopped` with no fabricated latency; a row both checked and selected shows both marks.
+Occupancy lamp (`row-dot-<id>`, fixed leading cell, flat fill) plus checkbox plus name on line one, with the numeral check chip beside the name while checked; the name (`row-name-<id>`) and meta line (`row-meta-<id>`) truncate with full-text hover tooltips, like the endpoint rows. Small muted meta line (`protocol · upstream · group · bind:port · state`); small badge line in serving color with optional traffic totals. Hover tints quiet; selection takes wash plus rim; checked takes the 2px accent rim. Stopped rows honestly show pinned `○ Stopped` with no fabricated latency; a row both checked and selected shows both marks. A successful import selects the first new row and checks all of them, so `F5` and the bulk bar act at once.
 
 ### Endpoints module
 
@@ -200,12 +200,12 @@ Compact one-line rows (fixed small muted label in the description-label token, t
 ### Health and empty states
 
 - **Health:** detail line reads `health: never tested — press Test to check` until the first probe; dead rows render the same pinned copy inside an error Alert titled `Endpoint failed`, with the same operate row inline beside it. The status bar keeps the short `health: never tested` describer.
-- **Empty library:** empty copy with working Add (`empty-add`) and Import (`empty-import`) buttons beside it; counts read (0,0); usage is absent-or-zero, never nonzero.
+- **Empty library:** empty copy with working Add (`empty-add`) and Import (`empty-import`) buttons beside it; counts read (0,0); usage is absent-or-zero, never nonzero. The no-selection inspector centers its `Empty` block in the pane instead of anchoring left.
 - **File drops:** no persistent hint band — drops land anywhere on the shell, and a blocked drop (dialog open) toasts `Close the open dialog first — dropped files were not imported` instead of stacking.
 
 ### Dialogs
 
-Titled modal, stacked fields, Cancel/OK footer sharing one commit closure (mouse and keyboard confirm identically; the export dialog joins the shared footers audit). Import previews live valid/invalid counts; export states its plaintext-secret warning verbatim inside a kit error Alert (`export-warning-box`) with a visible safer path (`Copy URLs never carries secrets`); LAN binds stop at an explicit naming confirm naming the config and bind before start, with a post-start warning toast.
+Titled modal, stacked fields, named commit footer sharing one commit closure (mouse and keyboard confirm identically — Add, Save, Import, Export, Move, Attach, Rename, Done, Close — never a bare OK; the export dialog joins the shared footers audit). Confirms resolve with a named affirmative carrying its result (`Delete` / `Overwrite` / `Reset` / `Clear` / `Start` / `Restore` / `Stop all and close`), danger variant on destructive ones. Settings groups into labelled sections (Startup, Probe, Paths, Maintenance) with hairline separators and danger styling on its three destructive buttons. Import previews live valid/invalid counts; export states its plaintext-secret warning verbatim inside a kit error Alert (`export-warning-box`) with a visible safer path (`Copy URLs never carries secrets`); LAN binds stop at an explicit naming confirm naming the config and bind before start, with a post-start warning toast.
 
 ## Do's and Don'ts
 
