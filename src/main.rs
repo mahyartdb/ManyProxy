@@ -346,6 +346,12 @@ struct LibraryDelegate {
     facet_group: Option<String>,
     facet_protocol: Option<String>,
     facet_status: Option<FacetStatus>,
+    /// T04 (gpui-18-sweep CAP-5): back-link to the owning view, set once
+    /// from [`AppView::render`] (guarded — one update, then quiet). Lets the
+    /// truly-empty `Empty` host working Add/Import buttons in content, so no
+    /// CTA strands in a separate strip below the list. `None` only before
+    /// the first frame (bare-delegate unit tests never render).
+    app_view: Option<Entity<AppView>>,
 }
 
 /// Ticket 44: status facet over row state + serving set + health summaries —
@@ -573,6 +579,7 @@ impl LibraryDelegate {
             facet_group: None,
             facet_protocol: None,
             facet_status: None,
+            app_view: None,
         }
     }
 
@@ -1227,7 +1234,10 @@ impl ListDelegate for LibraryDelegate {
                                 .gap_2()
                                 .child(
                                     Button::new("clear-search-hint")
+                                        // T04: `.small()` like every empty-state button.
+                                        .small()
                                         .label("Clear search")
+                                        .tooltip("Clear the search query (keeps facet filters and checked)")
                                         .on_click(move |_, window, cx| {
                                             hint_view.update(cx, |state, list_cx| {
                                                 // BUG-1: push the cleared query back into
@@ -1241,6 +1251,8 @@ impl ListDelegate for LibraryDelegate {
                                 )
                                 .child(
                                     Button::new("clear-search-facets")
+                                        // T04: `.small()` like every empty-state button.
+                                        .small()
                                         .label("Clear all")
                                         .tooltip("Clear search and every filter")
                                         .on_click(move |_, window, cx| {
@@ -1255,9 +1267,63 @@ impl ListDelegate for LibraryDelegate {
                     ),
             );
         }
+        // T04 (gpui-18-sweep CAP-5): the truly-empty library teaches inside
+        // the `Empty` — title + description + working Add/Import buttons in
+        // content. The old `render_empty_ctas` strip below the list stranded
+        // the CTAs outside the empty, so assistive tech heard them apart
+        // from it. The `empty-library-ctas` wrapper rides inside the content
+        // (same id, same handlers — the CTA-click tests keep their anchor);
+        // buttons ride `.small()` like every other action row. Without the
+        // back-link (pre-first-frame only) the copy still teaches, minus the
+        // buttons — never dead buttons.
+        let add_view = self.app_view.clone();
+        let import_view = self.app_view.clone();
+        let mut ctas = div()
+            .id("empty-library-ctas")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap_2();
+        if let Some(view) = add_view {
+            ctas = ctas.child(
+                Button::new("empty-add")
+                    .small()
+                    .label("Add configuration")
+                    .tooltip("Add a proxy configuration")
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.open_add_dialog(window, cx);
+                        });
+                    }),
+            );
+        }
+        if let Some(view) = import_view {
+            ctas = ctas.child(
+                Button::new("empty-import")
+                    .small()
+                    .label("Import configurations")
+                    .tooltip("Import share links or files")
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
+                        });
+                    }),
+            );
+        }
         div().id("library-empty").test_support().size_full().child(
             Empty::new()
-                .header(EmptyHeader::new().title(EmptyTitle::new().child(empty_library_text()))),
+                .header(
+                    EmptyHeader::new()
+                        .title(EmptyTitle::new().child(empty_library_text()))
+                        .description(
+                            EmptyDescription::new().child(
+                                "Add one proxy, or import many at once — new rows land here.",
+                            ),
+                        ),
+                )
+                .content(EmptyContent::new().child(ctas)),
         )
     }
 }
@@ -7646,6 +7712,23 @@ impl AppView {
             cx.notify();
         }
     }
+
+    /// T04 (gpui-18-sweep CAP-5): clear the log text filter + level back to
+    /// All, behind the no-lines Empty's working button. Same close + reopen
+    /// rhythm as [`toggle_log_tail`](Self::toggle_log_tail) so the dialog
+    /// repaints around the restored tail; no toast (the reopen is the
+    /// confirmation).
+    fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.log_filter.clear();
+        self.log_level = None;
+        if self.logs_open && window.has_active_dialog(cx) {
+            window.close_all_dialogs(cx);
+            self.logs_open = false;
+            self.open_logs_dialog(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
     /// Ticket 06: per-config log dialog with a filter field. OK applies the
     /// filter and re-renders when still open.
     /// Ticket 26 (L4 ruling): the lines snapshot at open; new sidecar lines
@@ -7703,6 +7786,9 @@ impl AppView {
         let chrome_view = view.clone();
         let chrome_level = self.log_level;
         let chrome_tail = self.log_tail;
+        // T04 (CAP-5): the no-lines Empty names whether a filter is active
+        // so the copy stays honest (empty tail vs filtered-out tail).
+        let chrome_filter_active = !self.log_filter.trim().is_empty();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
@@ -7752,8 +7838,11 @@ impl AppView {
             let copy_view = chrome_view.clone();
             let tail_view = chrome_view.clone();
             let save_view = chrome_view.clone();
+            let clear_view = chrome_view.clone();
             // Lane B (B9): the five-button level row above is the single
             // level control — no second cycle button beside Copy/tail/Save.
+            // T04 (CAP-4): log actions ride `.small()` like every other
+            // action row, with tooltips naming each action.
             let action_row =
                 div()
                     .id("log-actions-row")
@@ -7764,7 +7853,9 @@ impl AppView {
                     .gap_2()
                     .child(
                         Button::new("log-copy-visible")
+                            .small()
                             .label("Copy visible")
+                            .tooltip("Copy the visible log lines (redacted)")
                             .on_click(move |_, window, cx| {
                                 copy_view.update(cx, |view, cx| {
                                     view.copy_visible_logs(window, cx);
@@ -7773,20 +7864,30 @@ impl AppView {
                     )
                     .child(
                         Button::new("log-tail-toggle")
+                            .small()
                             .label(if tail_on { "Pause tail" } else { "Resume tail" })
+                            .tooltip(if tail_on {
+                                "Pause the live tail"
+                            } else {
+                                "Resume the live tail"
+                            })
                             .on_click(move |_, window, cx| {
                                 tail_view.update(cx, |view, cx| {
                                     view.toggle_log_tail(window, cx);
                                 });
                             }),
                     )
-                    .child(Button::new("logs-save").label("Save").on_click(
-                        move |_, window, cx| {
-                            save_view.update(cx, |view, cx| {
-                                view.save_visible_logs(window, cx);
-                            });
-                        },
-                    ));
+                    .child(
+                        Button::new("logs-save")
+                            .small()
+                            .label("Save")
+                            .tooltip("Save the visible redacted lines to the logs file")
+                            .on_click(move |_, window, cx| {
+                                save_view.update(cx, |view, cx| {
+                                    view.save_visible_logs(window, cx);
+                                });
+                            }),
+                    );
             let save_path_text = format!("Save writes to {}", Store::default_logs_path().display());
             let mut body =
                 div()
@@ -7820,7 +7921,47 @@ impl AppView {
                 .flex_col()
                 .gap_1();
             if lines.is_empty() {
-                list = list.child("No log lines for this filter yet");
+                // T04 (gpui-18-sweep CAP-5): no-lines renders the kit `Empty`
+                // (title + description + working Clear-filter button in
+                // content), never a bare string. The button clears the text
+                // filter + level together — clearing text alone while a level
+                // hides everything would look broken.
+                let clear_filter_view = clear_view.clone();
+                list = list.child(
+                    Empty::new()
+                        .header(
+                            EmptyHeader::new()
+                                .title(EmptyTitle::new().child("No log lines to show"))
+                                .description(EmptyDescription::new().child(
+                                    if chrome_filter_active || current_level.is_some() {
+                                        "No lines match the current filter — clear it to see everything."
+                                    } else {
+                                        "No log lines recorded yet."
+                                    },
+                                )),
+                        )
+                        .content(
+                            EmptyContent::new().child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("log-clear-filter")
+                                            .small()
+                                            .label("Clear filter")
+                                            .tooltip("Clear the log text filter and level")
+                                            .on_click(move |_, window, cx| {
+                                                clear_filter_view.update(cx, |view, cx| {
+                                                    view.clear_log_filter(window, cx);
+                                                });
+                                            }),
+                                    ),
+                            ),
+                        ),
+                );
             }
             for line in &lines {
                 list = list.child(line.clone());
@@ -11277,8 +11418,8 @@ impl AppView {
         if latencies.len() < 2 {
             // Honest empty state — a bare `div()` painted a titled GroupBox
             // with a silent body, the one spot the sweep left speaking no
-            // language. Same voice as the Logs tail ("No log lines for this
-            // filter yet") and the preset line ("no routing preset").
+            // language. Same voice as the Logs tail ("No log lines to show")
+            // and the preset line ("no routing preset").
             return div()
                 .id("config-history-empty")
                 .test_support()
@@ -11358,12 +11499,12 @@ impl AppView {
     /// scroll cap) is unchanged.
     fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
-            // Empty library: the list already paints the empty text plus the
-            // working Add/Import CTAs (`render_empty_ctas`). Painting the
-            // no-selection `Empty` as well stacks a second title + button row
-            // into the same footer strip and the rows visually collide, while
-            // "select a configuration" is nonsense with zero rows. Keep the
-            // stable id as a zero-height placeholder instead.
+            // Empty library: the list already paints its own Empty with the
+            // Add/Import CTAs in content (`LibraryDelegate::render_empty`).
+            // Painting the no-selection `Empty` as well stacks a second title
+            // + button row into the same strip and the rows visually collide,
+            // while "select a configuration" is nonsense with zero rows. Keep
+            // the stable id as a zero-height placeholder instead.
             if self.config_count(cx) == 0 {
                 return div().id("config-detail").test_support().into_any_element();
             }
@@ -11388,9 +11529,16 @@ impl AppView {
             .justify_center()
             .child(
                 Empty::new()
-                    .header(EmptyHeader::new().title(EmptyTitle::new().child(
-                        "Select a configuration to inspect its endpoint, health, and usage",
-                    )))
+                    .header(
+                        EmptyHeader::new()
+                            .title(EmptyTitle::new().child(
+                                "Select a configuration to inspect its endpoint, health, and usage",
+                            ))
+                            // T04 (CAP-5): the empty names its next step inline.
+                            .description(EmptyDescription::new().child(
+                                "Pick a row in the library — its endpoints and controls appear here.",
+                            )),
+                    )
                     .content(
                         EmptyContent::new().child(
                             div()
@@ -11401,6 +11549,8 @@ impl AppView {
                                 .gap_2()
                                 .child(
                                     Button::new("detail-add")
+                                        // T04: `.small()` like every empty-state button.
+                                        .small()
                                         .label("Add configuration")
                                         .tooltip("Add a proxy configuration")
                                         .on_click(cx.listener(|view, _, window, cx| {
@@ -11409,6 +11559,8 @@ impl AppView {
                                 )
                                 .child(
                                     Button::new("detail-import")
+                                        // T04: `.small()` like every empty-state button.
+                                        .small()
                                         .label("Import configurations")
                                         .tooltip("Import share links or files")
                                         .on_click(cx.listener(|view, _, window, cx| {
@@ -11635,7 +11787,20 @@ impl AppView {
             // as the group's second child. Detach stays in-pane behind
             // `preset-detach-inline` (same handler); unattached rows keep
             // the `preset-detach-idle` marker so the row never reflows.
-            .child(
+            // T04 (CAP-4): the kit list clips values via `overflow_hidden`
+            // (verified 0.6.6 `description_list.rs`) with no tooltip slot,
+            // so the full preset line rides an outer hover wrapper — the
+            // same legal pattern as the facet `Select` tips.
+            .child({
+                let preset_line = match self.preset_summary_for(config.preset_id.as_deref()) {
+                    Some((name, count)) => {
+                        format!("{name} ({count} rule(s))")
+                    }
+                    None => match self.preset_name_for(config.preset_id.as_deref()) {
+                        Some(name) => name,
+                        None => "no routing preset".to_string(),
+                    },
+                };
                 div().id("config-preset").test_support().child(
                     GroupBox::new()
                         .title("Routing preset")
@@ -11648,30 +11813,23 @@ impl AppView {
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(
-                                    DescriptionList::new()
-                                        .bordered(false)
-                                        .small()
-                                        .columns(1)
-                                        .label_width(px(72.))
-                                        .item(
-                                            "Preset",
-                                            match self
-                                                .preset_summary_for(config.preset_id.as_deref())
-                                            {
-                                                Some((name, count)) => {
-                                                    format!("{name} ({count} rule(s))")
-                                                }
-                                                None => match self
-                                                    .preset_name_for(config.preset_id.as_deref())
-                                                {
-                                                    Some(name) => name,
-                                                    None => "no routing preset".to_string(),
-                                                },
-                                            },
-                                            1,
-                                        ),
-                                )
+                                .child({
+                                    let tip = preset_line.clone();
+                                    div()
+                                        .id("preset-line-tip")
+                                        .test_support()
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| Tooltip::new(tip.clone())).into()
+                                        })
+                                        .child(
+                                            DescriptionList::new()
+                                                .bordered(false)
+                                                .small()
+                                                .columns(1)
+                                                .label_width(px(72.))
+                                                .item("Preset", preset_line, 1),
+                                        )
+                                })
                                 .child(
                                     div()
                                         .flex()
@@ -11715,8 +11873,8 @@ impl AppView {
                                         }),
                                 ),
                         ),
-                ),
-            )
+                )
+            })
             .child(self.render_detail_endpoints(cx, config))
     }
 
@@ -12437,6 +12595,18 @@ impl AppView {
         // value changes, not segment appearance — a serving flip legitimately
         // widens the center (engine + ports evidence), and freezing that too
         // would need ~940px, breaking the minimum frame.
+        // T04 (CAP-4): every truncating segment carries its full text as a
+        // tooltip, so a narrowed strip never hides the value it reports.
+        let count_text = format!(
+            "{} {} · {} enabled",
+            total,
+            if total == 1 {
+                "configuration"
+            } else {
+                "configurations"
+            },
+            enabled
+        );
         let mut left = div()
             .id("status-left")
             .test_support()
@@ -12445,23 +12615,16 @@ impl AppView {
             .items_center()
             .gap_2()
             .min_w(px(210.))
-            .child(
+            .child({
+                let tip = count_text.clone();
                 div()
                     .id("status-count")
                     .test_support()
                     .min_w(px(180.))
                     .truncate()
-                    .child(format!(
-                        "{} {} · {} enabled",
-                        total,
-                        if total == 1 {
-                            "configuration"
-                        } else {
-                            "configurations"
-                        },
-                        enabled
-                    )),
-            );
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(count_text)
+            });
         // Lane B (B9): the active filter echo rides the left region (long
         // queries truncate with the full text on hover — same pattern as
         // the endpoint rows).
@@ -12486,38 +12649,44 @@ impl AppView {
             .items_center()
             .gap_2()
             .min_w(px(430.))
-            .child(
+            .child({
+                let tip = engine_text.clone();
                 div()
                     .id("engine-status")
                     .test_support()
                     .min_w(px(140.))
                     .truncate()
-                    .child(engine_text),
-            )
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(engine_text)
+            })
             .child(Separator::vertical())
-            .child(
+            .child({
+                let tip = health_text.clone();
                 div()
                     .id("health-status")
                     .test_support()
                     .min_w(px(190.))
                     .truncate()
-                    .child(health_text),
-            );
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(health_text)
+            });
         // Lane B (B9): serving bind ports ride the center region beside the
         // engine + health they evidence (absent while nothing serves).
         // Ticket 10: capped + truncating (same pattern as the filter echo).
         // The 200px cap clears the honest maximum (`:port :port :port +N`)
         // so caps never clip real content, only pathological growth.
         if let Some(ports) = ports_text {
-            center = center.child(Separator::vertical()).child(
+            center = center.child(Separator::vertical()).child({
+                let tip = ports.clone();
                 div()
                     .id("status-ports")
                     .test_support()
                     .min_w_0()
                     .max_w(px(200.))
                     .truncate()
-                    .child(ports),
-            );
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(ports)
+            });
         }
         let mut right = div()
             .id("status-right")
@@ -12530,15 +12699,17 @@ impl AppView {
         if let Some(totals) = summed_traffic_text(&self.store) {
             // Ticket 10: capped like ports — `↓ X.X UU · ↑ Y.Y UU` holds its
             // width across units, so the 200px cap never clips honest totals.
-            right = right.child(Separator::vertical()).child(
+            right = right.child(Separator::vertical()).child({
+                let tip = totals.clone();
                 div()
                     .id("traffic-status")
                     .test_support()
                     .min_w_0()
                     .max_w(px(200.))
                     .truncate()
-                    .child(totals),
-            );
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(totals)
+            });
         }
         let bar = div()
             .flex()
@@ -12580,6 +12751,8 @@ impl AppView {
             .child(search_count_text(visible, total))
             .child(if has_query {
                 Button::new("clear-search")
+                    // T04: `.small()` like every search/facet clear.
+                    .small()
                     .label("Clear search")
                     .tooltip("Clear the search query (keeps facet filters and checked)")
                     .on_click(move |_, window, cx| {
@@ -12619,62 +12792,15 @@ impl AppView {
         cx.notify();
     }
 
-    /// Ticket 43: empty-library CTAs — clickable Add and Import buttons under
-    /// the list when the library is truly empty (no rows AND no query). A
-    /// filtered-to-zero list keeps the Clear-search path instead (see
-    /// [`LibraryDelegate::render_empty`]); a broken database shows no CTAs
-    /// over unknown rows (counts read from the delegate's last-good rows —
-    /// zero only when the list really is empty).
-    fn render_empty_ctas(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Lane B (B9): truly-empty means no ROWS (not no visible) — a
-        // filtered-to-zero list keeps the Clear-search/Clear-all path
-        // instead of borrowing the Add/Import CTAs.
-        let (_, total, query) = self
-            .libraries
-            .read(cx)
-            .delegate()
-            .delegate_counts_for_search();
-        if total != 0 || !query.trim().is_empty() {
-            return div().id("empty-ctas").test_support().into_any_element();
-        }
-        div()
-            .id("empty-ctas")
-            .test_support()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            // T07: the empty-library CTA id folds in the real working
-            // buttons (previously static text duplicating them from inside
-            // the list) — Add opens the add dialog, Import the import one.
-            .child(
-                div()
-                    .id("empty-library-ctas")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .child(
-                        Button::new("empty-add")
-                            .label("Add configuration")
-                            .tooltip("Add a proxy configuration")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_add_dialog(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("empty-import")
-                            .label("Import configurations")
-                            .tooltip("Import share links or files")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                            })),
-                    ),
-            )
-            .into_any_element()
+    /// T04 (gpui-18-sweep CAP-5): retired strip — the truly-empty Add/Import
+    /// CTAs live in the `library-empty` Empty's content now (see
+    /// [`LibraryDelegate::render_empty`]), so assistive tech hears the empty
+    /// and its actions together instead of apart. The `empty-ctas` anchor
+    /// stays as a zero-size placeholder (never a second button row); a
+    /// filtered-to-zero list keeps the Clear-search/Clear-all path inside
+    /// the list's own Empty.
+    fn render_empty_ctas(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().id("empty-ctas").test_support()
     }
 
     /// T03: refresh the three pickers from the live delegate. Guarded twice
@@ -14332,6 +14458,19 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // T04 (gpui-18-sweep CAP-5): back-link the delegate to this view once,
+        // so the truly-empty `Empty` hosts working Add/Import buttons in
+        // content. Guarded (one update, then quiet) like `sync_facet_pickers`
+        // — a stable frame never notifies. Runs before the list builds, so
+        // the same frame's empty view already sees the link.
+        let app_entity = cx.entity();
+        self.libraries.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            if delegate.app_view.is_none() {
+                delegate.app_view = Some(app_entity);
+                cx.notify();
+            }
+        });
         // The sketch: fixed top bar (TitleBar + toolbar + drop hint),
         // then a vertical split — middle list over bottom info bar — then a
         // fixed status strip. Only the middle/bottom split resizes; the top
@@ -14367,7 +14506,9 @@ impl Render for AppView {
         // [`AppView::import_dropped_files`]); a drop while any dialog is
         // open is refused with an honest toast — no persistent hint band.
         self.render_shell(cx)
-            .child(TitleBar::new().child(APP_TITLE))
+            // T04 (CAP-4): the caption rides kit text (`Label`), never a raw
+            // string child — verified `label.rs` `Label::new(impl Into<SharedString>)`.
+            .child(TitleBar::new().child(Label::new(APP_TITLE)))
             .child(self.render_toolbar(cx))
             .child(
                 div()
@@ -26408,6 +26549,134 @@ mod tests {
             traffic.is_none() || traffic.as_deref() == Some("↓ 0 B · ↑ 0 B"),
             "usage on empty is absent or zero — never nonzero: {traffic:?}"
         );
+    }
+
+    /// T04 (gpui-18-sweep CAP-5): the truly-empty CTAs live INSIDE the
+    /// `library-empty` Empty content — the CTA row's bounds sit inside the
+    /// empty's bounds, so assistive tech hears the empty and its actions
+    /// together. Handler behavior stays covered by
+    /// `empty_library_ctas_open_add_and_import`.
+    #[gpui_kit::test]
+    fn t04_empty_library_actions_live_inside_empty(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "library-empty");
+        assert_painted(cx, "empty-library-ctas");
+        assert_painted(cx, "empty-add");
+        assert_painted(cx, "empty-import");
+        let (outer, inner) = cx.update(|window, _| {
+            let outer = window
+                .try_find("library-empty".to_string())
+                .expect("empty paints")
+                .bounds();
+            let inner = window
+                .try_find("empty-library-ctas".to_string())
+                .expect("ctas paint")
+                .bounds();
+            (outer, inner)
+        });
+        assert!(
+            outer.origin.x <= inner.origin.x
+                && outer.origin.y <= inner.origin.y
+                && outer.origin.x + outer.size.width >= inner.origin.x + inner.size.width
+                && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height,
+            "empty CTAs sit inside library-empty: outer {outer:?}, inner {inner:?}"
+        );
+    }
+
+    /// T04 (gpui-18-sweep CAP-4): density anchors paint — the search clear
+    /// (query active), the facet clear (facet active), the no-selection
+    /// detail CTAs (rows exist, none selected), and the truncating status
+    /// segments. `.small()` + tooltip ride the builders (compiler-pinned);
+    /// this test guards the ids they ride on.
+    #[gpui_kit::test]
+    fn t04_density_anchors_paint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Query + facet active (hiding every row) so both clears paint;
+        // no selection so the detail no-selection CTAs paint.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.query = "work".to_string();
+                    delegate.set_facet_group(Some("nope".to_string()));
+                    delegate.apply_filter();
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "search-count",
+            "clear-search",
+            "clear-facets",
+            "detail-add",
+            "detail-import",
+            "status-count",
+            "engine-status",
+            "health-status",
+        ] {
+            assert_painted(cx, id);
+        }
+    }
+
+    /// T04 (gpui-18-sweep CAP-5): the log viewer with no matching lines
+    /// renders the kit Empty with a working Clear-filter action; clicking
+    /// it restores the full tail (filter + level cleared, dialog reopens).
+    #[gpui_kit::test]
+    fn t04_log_no_lines_empty_clears_filter(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.log_filter = "zzz-no-hit".to_string();
+                view.open_logs_dialog(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "logs dialog open"
+        );
+        assert_painted(cx, "log-lines");
+        assert_painted(cx, "log-copy-visible");
+        assert_painted(cx, "log-tail-toggle");
+        assert_painted(cx, "logs-save");
+        assert_painted(cx, "log-clear-filter");
+        cx.update(|window, cx| {
+            window.click("log-clear-filter", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.log_filter.clone()),
+            String::new(),
+            "Clear filter restores the full tail"
+        );
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog reopens around the restored tail"
+        );
+        assert_painted(cx, "log-lines");
     }
 
     // -- Ticket 31: dialogs + import + subscriptions ---------------------
