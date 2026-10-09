@@ -2855,6 +2855,15 @@ fn search_count_text(visible: usize, total: usize) -> String {
     format!("{visible} of {total}")
 }
 
+/// T06 (CAP-7): facet hover copy — the dimension, the active choice (with
+/// its result count, same text as the trigger), and the live `N of M`
+/// visible count, e.g. `Filter by group: Group: travel (2) · 1 of 2 shown`.
+/// Painted on the outer wrapper div: kit `Select` has no tooltip slot
+/// (verified 0.6.6 `select.rs`), so the tooltip never rides the picker.
+fn facet_tip_text(dimension: &str, active_display: &str, visible: usize, total: usize) -> String {
+    format!("Filter by {dimension}: {active_display} · {visible} of {total} shown")
+}
+
 /// Lane B (B9): serving-ports segment copy — bare `:port` tokens capped at
 /// three with an honest `+N` remainder (`None` while nothing serves, so the
 /// segment stays absent instead of naming a lying zero). No `serving`
@@ -4440,6 +4449,18 @@ impl FacetMenu {
         }
     }
 
+    /// T06 (CAP-7): the active choice's trigger text (`Group: travel (2)` /
+    /// `Group: All`) for the outer hover tooltip — the same choice+count
+    /// the trigger shows, so hover and trigger can never disagree.
+    fn current_display(&self, delegate: &LibraryDelegate) -> String {
+        let (choices, current) = self.choices(delegate);
+        choices
+            .into_iter()
+            .find(|choice| choice.value == current)
+            .map(|choice| choice.display)
+            .unwrap_or_else(|| "All".to_string())
+    }
+
     /// Commit a picked value through the existing delegate seams (the same
     /// setters the dialog buttons called, with the same notifications).
     fn apply(&self, view: &mut AppView, value: Option<String>, cx: &mut Context<AppView>) {
@@ -4553,6 +4574,18 @@ impl InspectorTab {
             1 => InspectorTab::Health,
             2 => InspectorTab::Presets,
             _ => InspectorTab::Details,
+        }
+    }
+
+    /// T06 (CAP-7): accessible tab name carrying its bound key (`Name (Key)`
+    /// per DESIGN.md) — the visible `Kbd` suffix chip on each tab mirrors
+    /// this string. Pure seam so headless tests pin the hint contract
+    /// (`Kbd` itself has no element id to assert).
+    fn a11y_label(self) -> &'static str {
+        match self {
+            InspectorTab::Details => "Inspector Details tab (Ctrl-1)",
+            InspectorTab::Health => "Inspector Health tab (Ctrl-2)",
+            InspectorTab::Presets => "Inspector Presets tab (Ctrl-3)",
         }
     }
 }
@@ -11675,6 +11708,11 @@ impl AppView {
     /// carry aria labels, and selection lives in
     /// [`AppView::inspector_tab`] — the bar is `RenderOnce`, so it is
     /// rebuilt from the field each frame; no entity is created in render.
+    /// T06 (CAP-7): each tab carries its bound key twice — the full
+    /// `Name (Key)` accessible name plus a visible `Kbd` suffix chip
+    /// (Ctrl-1/2/3 are bound in [`bind_app_keys`], so the hints are never
+    /// unbound-action lies). No `Tab::id` invention: the wrapper +
+    /// markers stay the only anchors.
     fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         // Kit `TabBar::new` owns the id for state keys only — it never lands
@@ -11693,19 +11731,22 @@ impl AppView {
                 .child(
                     Tab::new()
                         .label("Details")
-                        .aria_label("Inspector Details tab")
+                        .aria_label(InspectorTab::Details.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-1", "(Ctrl-1)"))
                         .child(div().id("inspector-tab-details").test_support()),
                 )
                 .child(
                     Tab::new()
                         .label("Health")
-                        .aria_label("Inspector Health tab")
+                        .aria_label(InspectorTab::Health.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-2", "(Ctrl-2)"))
                         .child(div().id("inspector-tab-health").test_support()),
                 )
                 .child(
                     Tab::new()
                         .label("Presets")
-                        .aria_label("Inspector Presets tab")
+                        .aria_label(InspectorTab::Presets.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-3", "(Ctrl-3)"))
                         .child(div().id("inspector-tab-presets").test_support()),
                 ),
         )
@@ -11744,13 +11785,14 @@ impl AppView {
             .flex_col()
             .gap_1()
             .child(self.render_detail_header(cx, config))
-            // Health (and its `config-health-alert` failure evidence) runs
-            // BEFORE the endpoints table: a dead or errored row is the reason
-            // the user opened this pane, so the evidence sits directly under
-            // the acting row instead of below three endpoint rows where the
-            // 240px panel clipped it out of sight.
-            .child(self.render_detail_health(config))
+            // T06 (CAP-7): frozen pane order Header → Endpoints →
+            // tab-specific on every pane, so Endpoints stays above the fold
+            // and every tab scans the same. The health evidence follows the
+            // endpoints it explains; the pane-body scroll (reset on every
+            // switch via `set_inspector_tab`) reaches it, and the operate
+            // row stays pinned below the scroller either way.
             .child(self.render_detail_endpoints(cx, config))
+            .child(self.render_detail_health(config))
             .child(self.render_detail_history(config))
     }
 
@@ -11769,16 +11811,15 @@ impl AppView {
             .flex_col()
             .gap_1()
             .child(self.render_detail_header(cx, config))
+            // T06 (CAP-7): frozen pane order Header → Endpoints →
+            // tab-specific, matching the Health pane — the preset block
+            // follows the endpoints table so Endpoints stays above the
+            // fold on every tab.
+            .child(self.render_detail_endpoints(cx, config))
             // Ticket 37: attached routing preset plus the picker entry
             // point. Lane B (B9): the line carries the rule count and an
             // attached row detaches inline (no dialog round-trip); rules
             // themselves still live in the presets manager.
-            //
-            // The preset block runs BEFORE the endpoints table, matching the
-            // Health pane: the attached preset and its attach/detach control
-            // are what this pane exists to show, so they sit directly under
-            // the acting row rather than below three endpoint rows the 240px
-            // panel would clip.
             // Ticket 44 sweep (T02): the preset module shares the boxed
             // `GroupBox` + gap_1 rhythm (same `config-preset` id). The
             // summary reads as a one-item `DescriptionList` (label
@@ -11875,7 +11916,6 @@ impl AppView {
                         ),
                 )
             })
-            .child(self.render_detail_endpoints(cx, config))
     }
 
     /// W1/failed evidence shared by the detail builders: a crashed sidecar
@@ -12860,6 +12900,35 @@ impl AppView {
     ) -> impl IntoElement {
         self.sync_facet_pickers(window, cx);
         let has_facets = self.libraries.read(cx).delegate().facets_active();
+        // T06 (CAP-7): hover copy names the active choice (with its result
+        // count) plus the live `N of M` — owned strings moved into the
+        // wrapper tooltip builders below (outer wrappers only: kit
+        // `Select` has no tooltip slot).
+        let (group_tip, protocol_tip, status_tip) = {
+            let libraries = self.libraries.read(cx);
+            let delegate = libraries.delegate();
+            let (visible, total, _) = delegate.delegate_counts_for_search();
+            (
+                facet_tip_text(
+                    "group",
+                    &FacetMenu::Group.current_display(delegate),
+                    visible,
+                    total,
+                ),
+                facet_tip_text(
+                    "protocol",
+                    &FacetMenu::Protocol.current_display(delegate),
+                    visible,
+                    total,
+                ),
+                facet_tip_text(
+                    "status",
+                    &FacetMenu::Status.current_display(delegate),
+                    visible,
+                    total,
+                ),
+            )
+        };
         div()
             .id("facet-bar")
             .test_support()
@@ -12890,12 +12959,12 @@ impl AppView {
             )
             .child(
                 // Kit `Select` has no tooltip slot of its own, so the
-                // filter name rides on a hover wrapper (same copy the
-                // old dialog triggers carried).
+                // filter name rides on a hover wrapper (T06: the active
+                // choice + live count, same text the trigger shows).
                 div()
                     .id("facet-group-tip")
                     .test_support()
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new("Filter by group")).into())
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(group_tip.clone())).into())
                     .child(
                         Select::new(&self.facet_group.state)
                             .id("facet-group")
@@ -12907,7 +12976,7 @@ impl AppView {
                 div()
                     .id("facet-protocol-tip")
                     .test_support()
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new("Filter by protocol")).into())
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(protocol_tip.clone())).into())
                     .child(
                         Select::new(&self.facet_protocol.state)
                             .id("facet-protocol")
@@ -12919,7 +12988,7 @@ impl AppView {
                 div()
                     .id("facet-status-tip")
                     .test_support()
-                    .tooltip(|_, cx| cx.new(|_| Tooltip::new("Filter by status")).into())
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(status_tip.clone())).into())
                     .child(
                         Select::new(&self.facet_status.state)
                             .id("facet-status")
@@ -22601,6 +22670,7 @@ mod tests {
     fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
         use gpui_kit::component::IndexPath;
+        use gpui_kit::point;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let seeded = store
@@ -22644,6 +22714,23 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "config-health");
+        // T06 (same-ticket rationale): frozen pane order (Header →
+        // Endpoints → tab-specific) puts the endpoints above the health
+        // evidence, so the tall dead-row alert starts below the fold of
+        // the 240px panel — scroll the pane body and the alert paints in
+        // place (reachable, not just present), the pinned operate row
+        // untouched.
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         assert_painted(cx, "config-health-alert");
         // Live again: the Alert leaves with the failure.
         cx.update(|_, cx| {
@@ -22679,6 +22766,7 @@ mod tests {
     fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, TestOutcome};
         use gpui_kit::component::IndexPath;
+        use gpui_kit::point;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let seeded = store
@@ -22735,6 +22823,23 @@ mod tests {
         // the failure it explains)...
         assert_painted(cx, "config-endpoints");
         assert_painted(cx, "config-health");
+        // T06 (same-ticket rationale): frozen pane order (Header →
+        // Endpoints → tab-specific) puts the endpoints above the health
+        // evidence — the comment above already read that way — so the
+        // tall dead-row alert starts below the fold of the 240px panel.
+        // Scroll the pane body and the alert paints in place (reachable,
+        // not just present), the pinned operate row untouched.
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         assert_painted(cx, "config-health-alert");
         // ...history exists on the pane (below the fold at short panel
         // heights — the tab bar stays pinned and the body scrolls to it).
@@ -22920,6 +23025,7 @@ mod tests {
     fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, TestOutcome};
         use gpui_kit::component::IndexPath;
+        use gpui_kit::point;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let seeded = store
@@ -23032,6 +23138,23 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "config-health");
+        // T06 (same-ticket rationale): frozen pane order (Header →
+        // Endpoints → tab-specific) puts the endpoints above the health
+        // evidence, so the tall dead-row alert starts below the fold of
+        // the 240px panel — scroll the pane body and the alert paints in
+        // place (reachable, not just present), the pinned operate row
+        // untouched.
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         assert_painted(cx, "config-health-alert");
         assert!(
             cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
@@ -26801,6 +26924,306 @@ mod tests {
         );
     }
 
+    /// T06 (gpui-18-sweep CAP-7): one persistently visible search field —
+    /// `ListState::searchable(true)` plus `List::search_placeholder` — with
+    /// a live `N of M` count. Ctrl-F lands focus in the kit query input
+    /// (behavioral proof the field paints and takes focus); typing through
+    /// the real `set_query` path moves the count; the placeholder seam
+    /// stays pinned. Scoped clears themselves ride the existing
+    /// `ticket03_clears_affect_only_their_target` isolation test.
+    #[gpui_kit::test]
+    fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
+        use gpui_kit::Focusable as _;
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(facet_seed("Work", "vless", "travel", "10801"))
+            .expect("seed works");
+        store
+            .add(facet_seed("Office", "vmess", "team", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            crate::SEARCH_PLACEHOLDER,
+            "Search configurations",
+            "search field placeholder pinned"
+        );
+        assert_painted(cx, "search-count");
+        // Ctrl-F focuses the kit query input — the field exists and takes
+        // focus (same shell-focus + keystroke rhythm as the laneb tab test).
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let keystroke = Keystroke::parse("ctrl-f").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        let query_focused = cx.update(|window, cx| {
+            // A searchable `List` focuses its query input, so the focused
+            // handle must equal the libraries' focus handle afterwards
+            // (same seam as `t03_search_focus_button_focuses_query`).
+            let handle = view.read(cx).libraries.read(cx).focus_handle(cx);
+            window.focused(cx).as_ref() == Some(&handle)
+        });
+        assert!(query_focused, "Ctrl-F lands in the library search field");
+        // Typing through the real path moves the live count (2 of 2 → 1).
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.set_query("Work", window, list_cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (visible, total, query) = view.read_with(cx, |view, cx| {
+            view.libraries
+                .read(cx)
+                .delegate()
+                .delegate_counts_for_search()
+        });
+        assert_eq!((visible, total), (1, 2), "query filters the library");
+        assert_eq!(query, "Work", "query established");
+        assert_eq!(crate::search_count_text(visible, total), "1 of 2");
+        assert_painted(cx, "search-count");
+        assert_painted(cx, "clear-search");
+    }
+
+    /// T06 (CAP-7): facet hover tooltips name the active choice (with its
+    /// result count, same text as the trigger) plus the live `N of M` —
+    /// painted on the outer wrapper divs, never an invented
+    /// `Select::tooltip`. Pure delegate seams + painted wrappers.
+    #[gpui_kit::test]
+    fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(facet_seed("Work", "vless", "travel", "10801"))
+            .expect("seed works");
+        store
+            .add(facet_seed("Office", "vmess", "travel", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        // The wrappers paint — the only legal tooltip anchors.
+        assert_painted(cx, "facet-group-tip");
+        assert_painted(cx, "facet-protocol-tip");
+        assert_painted(cx, "facet-status-tip");
+        // Establish a group facet + query: visible 1 of 2, travel holds 2.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.set_facet_group(Some("travel".to_string()));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.set_query("Work", window, list_cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (group_tip, protocol_tip, status_tip) = view.read_with(cx, |view, cx| {
+            let delegate = view.libraries.read(cx).delegate();
+            let (visible, total, _) = delegate.delegate_counts_for_search();
+            (
+                crate::facet_tip_text(
+                    "group",
+                    &crate::FacetMenu::Group.current_display(delegate),
+                    visible,
+                    total,
+                ),
+                crate::facet_tip_text(
+                    "protocol",
+                    &crate::FacetMenu::Protocol.current_display(delegate),
+                    visible,
+                    total,
+                ),
+                crate::facet_tip_text(
+                    "status",
+                    &crate::FacetMenu::Status.current_display(delegate),
+                    visible,
+                    total,
+                ),
+            )
+        });
+        assert_eq!(
+            group_tip,
+            "Filter by group: Group: travel (2) · 1 of 2 shown"
+        );
+        assert_eq!(
+            protocol_tip,
+            "Filter by protocol: Protocol: All · 1 of 2 shown"
+        );
+        assert_eq!(status_tip, "Filter by status: Status: All · 1 of 2 shown");
+    }
+
+    /// T06 (CAP-7): inspector tabs carry Ctrl-1/2/3 hints (accessible names
+    /// pin the keys; the visible `Kbd` suffix chips mirror them), keep the
+    /// wrapper + zero-size-marker anchors, reset the pane scroll on switch,
+    /// and keep pane order frozen Header → Endpoints → tab-specific on
+    /// every pane. No per-tab id invention (`Tab::ix` is `pub(crate)`).
+    #[gpui_kit::test]
+    fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        use gpui_kit::point;
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Accessible names pin the bound keys (the `Kbd` suffix chips have
+        // no element id to assert headless — these strings are the contract).
+        assert_eq!(
+            crate::InspectorTab::Details.a11y_label(),
+            "Inspector Details tab (Ctrl-1)"
+        );
+        assert_eq!(
+            crate::InspectorTab::Health.a11y_label(),
+            "Inspector Health tab (Ctrl-2)"
+        );
+        assert_eq!(
+            crate::InspectorTab::Presets.a11y_label(),
+            "Inspector Presets tab (Ctrl-3)"
+        );
+        // Select the row so every pane renders its sections.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        // Frozen order on every pane: header, then endpoints, then the
+        // tab-specific module (layout bounds keep DOM order — the scroller
+        // only offsets at paint time, so tops strictly increase).
+        for (tab, specific) in [
+            (crate::InspectorTab::Details, "config-usage"),
+            (crate::InspectorTab::Health, "config-health"),
+            (crate::InspectorTab::Presets, "config-preset"),
+        ] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, _| {
+                    view.set_inspector_tab(tab);
+                });
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+            cx.run_until_parked();
+            paint_frame(cx);
+            assert_painted(cx, "inspector-tabs");
+            for id in [
+                "inspector-tab-details",
+                "inspector-tab-health",
+                "inspector-tab-presets",
+            ] {
+                assert!(
+                    cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                    "{id} marker stays stable on {tab:?}"
+                );
+            }
+            let tops = cx.update(|window, _| {
+                ["detail-acting-on", "config-endpoints", specific]
+                    .iter()
+                    .map(|id| {
+                        window
+                            .try_find(id.to_string())
+                            .unwrap_or_else(|| panic!("{id} renders on {tab:?}"))
+                            .bounds()
+                            .origin
+                            .y
+                    })
+                    .collect::<Vec<_>>()
+            });
+            assert!(
+                tops[0] < tops[1] && tops[1] < tops[2],
+                "pane order frozen Header → Endpoints → tab-specific on {tab:?}: {tops:?}"
+            );
+        }
+        // Scroll reset through the real key path: sink the Health pane to
+        // the bottom, then Ctrl-1 starts Details at the top.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.set_inspector_tab(crate::InspectorTab::Health);
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (offset, max) = cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+            let scrolled = view.read(cx);
+            (
+                scrolled.detail_scroll.offset().y,
+                scrolled.detail_scroll.max_offset().y,
+            )
+        });
+        assert!(
+            max > px(0.),
+            "the Health pane scrolls (something below the fold): {max:?}"
+        );
+        assert_eq!(offset, -max, "sunk to the bottom: {offset:?}");
+        let press = |cx: &mut VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+            cx.run_until_parked();
+        };
+        press(cx, "ctrl-1");
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (tab, reset) = cx.update(|_, cx| {
+            let switched = view.read(cx);
+            (switched.inspector_tab, switched.detail_scroll.offset().y)
+        });
+        assert_eq!(tab, crate::InspectorTab::Details, "Ctrl-1 switches panes");
+        assert_eq!(
+            reset,
+            px(0.),
+            "the Details pane starts scrolled to the top, not mid-pane"
+        );
+        // Ctrl-2/3 drive the other two panes through the same actions.
+        press(cx, "ctrl-2");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Health,
+            "Ctrl-2 switches pane"
+        );
+        press(cx, "ctrl-3");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Presets,
+            "Ctrl-3 switches pane"
+        );
+    }
+
     /// Scenario: empty library paints Add/Import CTAs (never a bare blank).
     #[gpui_kit::test]
     fn empty_library_paints_ctas(cx: &mut TestAppContext) {
@@ -27521,6 +27944,7 @@ mod tests {
     #[gpui_kit::test]
     fn laneb_preset_pane_detaches_inline_with_rule_count(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
+        use gpui_kit::point;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let row = store.add(seed_input("Work")).expect("seed works");
@@ -27559,6 +27983,22 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "config-preset");
+        // T06 (same-ticket rationale): frozen pane order (Header →
+        // Endpoints → tab-specific) puts the endpoints above the preset
+        // block, so the inline Detach starts below the fold of the 240px
+        // panel — scroll the pane body, then the control paints in place
+        // and the click below lands on the visible element.
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         assert_painted(cx, "preset-detach-inline");
         let before = notification_count(cx);
         cx.update(|window, cx| {
