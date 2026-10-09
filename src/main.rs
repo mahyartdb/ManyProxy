@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::badge::Badge;
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
@@ -12240,6 +12240,16 @@ impl AppView {
                     }),
             )
             .child({
+                // T05 (CAP-6): primaries ride one `ButtonGroup` (joined
+                // Start/Stop/Test). The group stays callback-free on purpose:
+                // verified `button_group.rs` replaces each child's handler
+                // with selection-state bookkeeping once a group `on_click`
+                // is set, so setting one would break dispatch-through-the-
+                // same-handlers. Each child keeps its id, label, tooltip,
+                // Kbd chip, loading flag, spinner, and existing handler
+                // (same toasts + in-flight guards as the toolbar; labels
+                // differ by scope only). Ping/Logs/Copy URLs stay loose —
+                // the ticket groups Start/Stop/Test only.
                 // T06: loading state + inline spinner while a start
                 // is in flight (the label already reads `Starting…`
                 // via `RowPhase::start_label`).
@@ -12264,9 +12274,6 @@ impl AppView {
                             .child(Spinner::new().small()),
                     );
                 }
-                start
-            })
-            .child({
                 // T06: loading state + inline spinner while a start
                 // is in flight (stop waits on the same fence).
                 let mut stop = Button::new("engine-stop")
@@ -12290,9 +12297,6 @@ impl AppView {
                             .child(Spinner::new().small()),
                     );
                 }
-                stop
-            })
-            .child({
                 // T06: loading state + inline spinner while a
                 // URL-test probe is in flight.
                 let mut test = Button::new("health-test")
@@ -12316,7 +12320,10 @@ impl AppView {
                             .child(Spinner::new().small()),
                     );
                 }
-                test
+                ButtonGroup::new("detail-operate-primaries")
+                    .child(start)
+                    .child(stop)
+                    .child(test)
             })
             .child({
                 // T06: loading state + inline spinner while a
@@ -12978,6 +12985,28 @@ impl AppView {
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .child(div().id("bulk-label").test_support().child(label))
+                // T05 (CAP-6): selection verbs first (the opposite pair
+                // stays adjacent so Check-visible / Clear-checked read as
+                // one choice), then a separator into the state verbs.
+                .child(
+                    Button::new("bulk-select-visible")
+                        .small()
+                        .label("Check visible")
+                        .tooltip("Check every visible row")
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.select_visible_checked(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("bulk-clear")
+                        .small()
+                        .label("Clear checked")
+                        .tooltip("Clear checked (Esc)")
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.clear_checked(window, cx);
+                        })),
+                )
+                .child(Separator::vertical())
                 .child(
                     Button::new("bulk-start")
                         .small()
@@ -13023,6 +13052,9 @@ impl AppView {
                             view.open_bulk_move_dialog(window, cx);
                         })),
                 )
+                // T05 (CAP-6): destructive trails behind its own separator —
+                // `Delete.danger` closes the bar, never interleaves it.
+                .child(Separator::vertical())
                 .child(
                     Button::new("bulk-delete")
                         .danger()
@@ -13031,24 +13063,6 @@ impl AppView {
                         .tooltip("Delete every checked row")
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.open_bulk_delete_confirm(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-clear")
-                        .small()
-                        .label("Clear checked")
-                        .tooltip("Clear checked (Esc)")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.clear_checked(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("bulk-select-visible")
-                        .small()
-                        .label("Check visible")
-                        .tooltip("Check every visible row")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.select_visible_checked(window, cx);
                         })),
                 )
                 .into_any_element(),
@@ -23378,6 +23392,296 @@ mod tests {
             "usage-reset",
         ] {
             assert_absent(cx, id.to_string());
+        }
+    }
+
+    /// Ticket 05 (CAP-6): primaries ride one `ButtonGroup`, management stays
+    /// behind the single `Row actions…` trigger, and operate Start reaches the
+    /// selected row through the same handler as toolbar Start (same outcome,
+    /// same toast — scope-named labels only).
+    /// Ledger Ruling: headless snapshots expose presence + bounds, not DOM
+    /// order, so "grouped" asserts as row-major Start/Stop/Test adjacency and
+    /// "same handler" asserts as equal outcomes + equal toast counts across
+    /// the two triggers on one mount (fake engine, loopback seed). Row-menu
+    /// choice stays the `DropdownMenu` pattern (`Button.dropdown_menu`):
+    /// `DropdownButton` is a split action+menu and the row has no single
+    /// action half worth promoting.
+    #[gpui_kit::test]
+    fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t26_engine_seed("Work", "10981"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, _) = FakeHealthProber::shared();
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        // Primaries paint with their pinned ids; Ping, Logs, Copy URLs, and
+        // the single menu trigger ride the same row untouched.
+        for id in [
+            "engine-start",
+            "engine-stop",
+            "health-test",
+            "health-ping",
+            "logs-open",
+            "copy-urls",
+            "row-menu",
+        ] {
+            assert_painted(cx, id);
+        }
+        // Grouped: Start, Stop, Test sort consecutively in row-major order.
+        let mut primaries = Vec::new();
+        for id in ["engine-start", "engine-stop", "health-test"] {
+            let bounds = cx.update(|window, _| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .bounds()
+            });
+            primaries.push((bounds.origin.y, bounds.origin.x));
+        }
+        assert!(
+            primaries[0] <= primaries[1] && primaries[1] <= primaries[2],
+            "primaries group in Start/Stop/Test order: {primaries:?}"
+        );
+        // Same handler: toolbar Start and operate Start reach the same
+        // outcome (running + one toast each) on the same mount.
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("start-selected", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "toolbar Start starts the selected row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "toolbar Start toasts once"
+        );
+        cx.update(|window, cx| {
+            window.click("stop-selected", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "toolbar Stop stops it again"
+        );
+        // Re-pin the selection across the stop's reload (the same row a
+        // user still has selected) before the operate-Start click.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("engine-start", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "operate Start starts the selected row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "operate Start toasts once"
+        );
+        // Minimum frame: the grouped row still fits two wrapped lines with
+        // no horizontal scroll (same measure as the t04 two-line rule).
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        let (operate_bounds, start_height) = cx.update(|window, _| {
+            let operate = window
+                .try_find("detail-operate".to_string())
+                .expect("operate row renders")
+                .bounds();
+            let start = window
+                .try_find("engine-start".to_string())
+                .expect("start renders")
+                .bounds();
+            (operate, start.size.height)
+        });
+        assert!(
+            operate_bounds.origin.x >= px(0.)
+                && operate_bounds.origin.x + operate_bounds.size.width <= px(880.) + px(1.),
+            "grouped operate row never scrolls horizontally: {operate_bounds:?}"
+        );
+        assert!(
+            operate_bounds.size.height <= start_height * 2. + px(12.),
+            "grouped operate row fits two wrapped lines: row {operate_bounds:?} vs button {start_height:?}"
+        );
+    }
+
+    /// Ticket 05 (CAP-6): bulk verbs read selection | state | destructive-
+    /// trailing with the `N checked (of M visible)` label, wrapping to at most
+    /// three lines without sideways scroll at the minimum frame.
+    /// Ledger Ruling: kit `Separator` carries no id slot, so "grouped"
+    /// asserts as row-major reading order (selection pair, then state verbs,
+    /// `bulk-delete` last) and "≤3 lines" measures against the real button
+    /// height like the t04 two-line rule.
+    #[gpui_kit::test]
+    fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let second = store
+            .add(row19_seed("Home", "b.example.com", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.toggle_checked(&first.id);
+                    delegate.toggle_checked(&second.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        cx.run_until_parked();
+        paint_frame_min(cx);
+        assert_painted(cx, "bulk-bar");
+        assert_painted(cx, "bulk-label");
+        // Every verb paints inside the minimum frame (no sideways scroll).
+        let verbs = [
+            "bulk-select-visible",
+            "bulk-clear",
+            "bulk-start",
+            "bulk-stop",
+            "bulk-enable",
+            "bulk-disable",
+            "bulk-move",
+            "bulk-delete",
+        ];
+        for id in verbs {
+            assert_painted(cx, id);
+            assert_within_frame_min(cx, id);
+        }
+        // Reading order is the grouping: selection pair, state verbs,
+        // destructive trailing last.
+        let mut order = Vec::new();
+        for id in verbs {
+            let bounds = cx.update(|window, _| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .bounds()
+            });
+            order.push((bounds.origin.y, bounds.origin.x));
+        }
+        for pair in order.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "bulk verbs read selection | state | Delete trailing: {order:?}"
+            );
+        }
+        assert_eq!(
+            view.read_with(cx, |view, cx| {
+                view.libraries.read(cx).delegate().bulk_label()
+            }),
+            "2 checked (of 2 visible)"
+        );
+        // At most three wrapped lines of small controls.
+        let (bar_bounds, button_height) = cx.update(|window, _| {
+            let bar = window
+                .try_find("bulk-bar".to_string())
+                .expect("bulk bar renders")
+                .bounds();
+            let button = window
+                .try_find("bulk-start".to_string())
+                .expect("bulk start renders")
+                .bounds();
+            (bar, button.size.height)
+        });
+        assert!(
+            bar_bounds.size.height <= button_height * 3. + px(24.),
+            "bulk bar wraps to at most three lines: bar {bar_bounds:?} vs button {button_height:?}"
+        );
+    }
+
+    /// Ticket 05 (CAP-6): management hides behind exactly one disclosed
+    /// `Row actions…` trigger — the five items stay unmounted while closed
+    /// (t04 pins the closed half) and all five paint once opened.
+    #[gpui_kit::test]
+    fn t05_row_menu_opens_management_items(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "row-menu");
+        for id in [
+            "edit-config",
+            "delete-config",
+            "duplicate-config",
+            "reset-traffic",
+            "usage-reset",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| {
+            window.click("row-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "edit-config",
+            "delete-config",
+            "duplicate-config",
+            "reset-traffic",
+            "usage-reset",
+        ] {
+            assert_painted(cx, id);
         }
     }
 
