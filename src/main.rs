@@ -20,6 +20,7 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
+use gpui_kit::component::description_list::DescriptionList;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::group_box::GroupBox;
@@ -11118,6 +11119,21 @@ impl AppView {
         }
     }
 
+    /// Ticket 45: one row's persisted usage buckets (down/up) for the
+    /// detail pane. A broken read renders honestly, never a lying zero.
+    /// Ticket 44 sweep (T02): formatted down/up pair behind the boxed
+    /// usage module's `DescriptionList`. `None` when nothing has flowed
+    /// or the read breaks — the module falls back to
+    /// [`usage_line`](Self::usage_line), never a lying zero.
+    fn usage_parts(&self, config_id: &str) -> Option<(String, String)> {
+        match self.store.traffic_totals() {
+            Ok(totals) => totals
+                .get(config_id)
+                .map(|(rx, tx)| (format_bytes(*rx), format_bytes(*tx))),
+            Err(_) => None,
+        }
+    }
+
     /// Ticket 45: bounded history line for the detail pane — the newest 120
     /// successful samples as a native sparkline. Under two points (fresh
     /// rows) it renders nothing — progressive disclosure, so the detail
@@ -11488,50 +11504,95 @@ impl AppView {
             // are what this pane exists to show, so they sit directly under
             // the acting row rather than below three endpoint rows the 240px
             // panel would clip.
-            .child(div().id("config-preset").test_support().child(
-                match self.preset_summary_for(config.preset_id.as_deref()) {
-                    Some((name, count)) => format!("routing preset: {name} ({count} rule(s))"),
-                    None => match self.preset_name_for(config.preset_id.as_deref()) {
-                        Some(name) => format!("routing preset: {name}"),
-                        None => "no routing preset".to_string(),
-                    },
-                },
-            ))
+            // Ticket 44 sweep (T02): the preset module shares the boxed
+            // `GroupBox` + gap_1 rhythm (same `config-preset` id). The
+            // summary reads as a one-item `DescriptionList` (label
+            // `Preset`, value names the rule count; `bordered(false)` so
+            // no second box lands inside the group), with the attach row
+            // as the group's second child. Detach stays in-pane behind
+            // `preset-detach-inline` (same handler); unattached rows keep
+            // the `preset-detach-idle` marker so the row never reflows.
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("preset-open")
-                            // Ticket 44: small + tooltip (detail-bar density for the
-                            // 1000x700 paint frame; tooltips name every action).
-                            .small()
-                            .label("Preset")
-                            .tooltip("Attach a routing preset")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.open_preset_attach_dialog(config, window, cx);
-                                }
-                            })),
-                    )
-                    .child(if config.preset_id.is_some() {
-                        let detach_id = config.id.clone();
-                        Button::new("preset-detach-inline")
-                            .small()
-                            .label("Detach")
-                            .tooltip("Detach the routing preset from this row")
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.commit_preset_attach(&detach_id, None, window, cx);
-                            }))
-                            .into_any_element()
-                    } else {
-                        div()
-                            .id("preset-detach-idle")
-                            .test_support()
-                            .into_any_element()
-                    }),
+                div().id("config-preset").test_support().child(
+                    GroupBox::new()
+                        .title("Routing preset")
+                        .gap_1()
+                        // Ticket 44 sweep (T02): one wrapper child keeps the
+                        // group's 4px rhythm — the box's inner content gap is
+                        // kit-owned, so two direct children would drift to it.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    DescriptionList::new()
+                                        .bordered(false)
+                                        .small()
+                                        .columns(1)
+                                        .label_width(px(72.))
+                                        .item(
+                                            "Preset",
+                                            match self
+                                                .preset_summary_for(config.preset_id.as_deref())
+                                            {
+                                                Some((name, count)) => {
+                                                    format!("{name} ({count} rule(s))")
+                                                }
+                                                None => match self
+                                                    .preset_name_for(config.preset_id.as_deref())
+                                                {
+                                                    Some(name) => name,
+                                                    None => "no routing preset".to_string(),
+                                                },
+                                            },
+                                            1,
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("preset-open")
+                                                // Ticket 44: small + tooltip (detail-bar density for the
+                                                // 1000x700 paint frame; tooltips name every action).
+                                                .small()
+                                                .label("Preset")
+                                                .tooltip("Attach a routing preset")
+                                                .on_click(cx.listener(|view, _, window, cx| {
+                                                    if let Some(config) = view.selected_config(cx) {
+                                                        view.open_preset_attach_dialog(
+                                                            config, window, cx,
+                                                        );
+                                                    }
+                                                })),
+                                        )
+                                        .child(if config.preset_id.is_some() {
+                                            let detach_id = config.id.clone();
+                                            Button::new("preset-detach-inline")
+                                                .small()
+                                                .label("Detach")
+                                                .tooltip("Detach the routing preset from this row")
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        view.commit_preset_attach(
+                                                            &detach_id, None, window, cx,
+                                                        );
+                                                    },
+                                                ))
+                                                .into_any_element()
+                                        } else {
+                                            div()
+                                                .id("preset-detach-idle")
+                                                .test_support()
+                                                .into_any_element()
+                                        }),
+                                ),
+                        ),
+                ),
             )
             .child(self.render_detail_endpoints(cx, config))
     }
@@ -11618,6 +11679,15 @@ impl AppView {
     /// Detail endpoints section: compact one-line rows (fixed small muted
     /// label, truncating value, trailing per-row Copy), each bind endpoint
     /// with its own Copy.
+    /// Ticket 44 sweep (T02): boxed in the shared `GroupBox` + gap_1
+    /// rhythm. The rows stay custom (not `DescriptionList`): the trailing
+    /// per-row Copy buttons and the pinned `endpoint-value-*` ids need a
+    /// three-cell row the list grid cannot host at the 72px label width
+    /// the 880px-minimum containment depends on — labels already ride the
+    /// description-label token and values truncate with full-text tooltips.
+    /// Upstream is display-only (never editable); its Copy carries
+    /// host:port alone behind the pinned `copy-upstream` id, like the
+    /// SOCKS/HTTP copies carry bind:port alone (never params or secrets).
     fn render_detail_endpoints(
         &self,
         cx: &mut Context<Self>,
@@ -11750,10 +11820,12 @@ impl AppView {
     }
 
     /// Detail health section (failed rows render the error Alert).
+    /// Ticket 44 sweep (T02): `gap_1` like every other module — the lone
+    /// `gap_2` broke the shared container rhythm for no reading gain.
     fn render_detail_health(&self, config: &ProxyConfig) -> impl IntoElement {
         let failed = self.detail_failed(config);
         div().id("config-health").test_support().child(
-            GroupBox::new().title("Health").gap_2().child(
+            GroupBox::new().title("Health").gap_1().child(
                 // T05: a dead/crashed row renders the same pinned
                 // health copy inside an error Alert; healthy rows keep
                 // the plain line (no Alert element at all).
@@ -11779,11 +11851,14 @@ impl AppView {
     /// Detail usage readout (persisted down/up buckets, display only).
     /// Signal-box 04: the `usage-reset` action moved into the row menu
     /// (same id, label, tooltip, handler) — the module keeps the numbers.
-    /// Ticket 04: compact single small line under a hairline (same
-    /// `config-usage` id, same [`usage_line`](Self::usage_line) text) —
-    /// the GroupBox title + padding cost 54px and pushed the operate row
-    /// below the fold at the 880x620 minimum; the hairline keeps the
-    /// ruled-instrument reading.
+    /// Ticket 44 sweep (T02): boxed in the shared `GroupBox` + gap_1
+    /// rhythm with the other four modules (same `config-usage` id, no
+    /// naked gray string beside boxed neighbors). The buckets read as a
+    /// two-item `DescriptionList` (`bordered(false)`, 72px labels like the
+    /// endpoint rows); the Ticket 04 hairline-only form gave back 54px at
+    /// the 880x620 minimum, but the operate row is pinned below the pane
+    /// scroller now, so the boxed module scrolls inside the body while
+    /// Start stays painted — `t04_detail_fits_minimum_window` guards it.
     fn render_detail_usage(
         &self,
         cx: &mut Context<Self>,
@@ -11791,18 +11866,31 @@ impl AppView {
     ) -> impl IntoElement {
         // Ticket 45: persisted down/up buckets (the confirm-gated reset
         // lives in the row menu now, never silent).
-        div()
-            .id("config-usage")
-            .test_support()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .pt_1()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(self.usage_line(&config.id))
+        div().id("config-usage").test_support().child(
+            GroupBox::new()
+                .title("Usage")
+                .gap_1()
+                .child(match self.usage_parts(&config.id) {
+                    Some((down, up)) => DescriptionList::new()
+                        .bordered(false)
+                        .small()
+                        .columns(2)
+                        .label_width(px(72.))
+                        .item("Down", down, 1)
+                        .item("Up", up, 1)
+                        .into_any_element(),
+                    None => div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(self.usage_line(&config.id))
+                        .into_any_element(),
+                }),
+        )
     }
 
     /// Detail history section (bounded latency sparkline).
+    /// Ticket 44 sweep (T02): `gap_1` like every other module — the lone
+    /// `gap_2` broke the shared container rhythm for no reading gain.
     fn render_detail_history(&self, config: &ProxyConfig) -> impl IntoElement {
         // Ticket 45: trend-visible health — bounded history sparkline
         // (native LineChart; 90d retention window served from
@@ -11810,7 +11898,7 @@ impl AppView {
         div().id("config-history").test_support().child(
             GroupBox::new()
                 .title("History")
-                .gap_2()
+                .gap_1()
                 .child(self.history_line(&config.id)),
         )
     }
@@ -23154,6 +23242,130 @@ mod tests {
                 "upstream copy carries no secrets, found {canary}: {clip}"
             );
         }
+    }
+
+    /// Ticket 44 sweep (T02): every inspector module shares one container
+    /// grammar — a row selected on each of Details/Health/Presets paints
+    /// all five modules boxed (usage/preset join endpoints/health/history
+    /// in `GroupBox` + gap_1), endpoint values keep their truncating ids
+    /// with per-row copies beside them, and the preset pane detaches
+    /// inline only when attached.
+    /// Ledger Ruling: headless snapshots expose presence + bounds, not
+    /// rendered text runs, so the wording halves assert through the pure
+    /// seams (`usage_line` honest-empty, `preset_summary_for` rule count
+    /// pinned by laneb) while the painted half asserts every module
+    /// anchor on its pane.
+    #[gpui_kit::test]
+    fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Fresh seed: nothing has flowed, so the boxed usage module falls
+        // back to the honest line through `usage_parts` = None (never a
+        // lying zero).
+        let row_id = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().rows[0].id.clone()
+        });
+        // The boxed buckets and the honest line share one seam: buckets
+        // present render as the `DescriptionList`, absent buckets fall
+        // back to the line (never a lying zero either way).
+        let (parts, line) = view.read_with(cx, |view, _| {
+            (view.usage_parts(&row_id), view.usage_line(&row_id))
+        });
+        match parts {
+            Some((down, up)) => assert_eq!(
+                line,
+                format!("usage down {down} · up {up}"),
+                "boxed buckets match the honest line"
+            ),
+            None => assert_eq!(line, "usage unavailable", "no buckets, no lying zero"),
+        };
+        for tab in [
+            crate::InspectorTab::Details,
+            crate::InspectorTab::Health,
+            crate::InspectorTab::Presets,
+        ] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.libraries.update(cx, |state, list_cx| {
+                        state.delegate_mut().selected = Some(IndexPath::new(0));
+                        list_cx.notify();
+                    });
+                    view.inspector_tab = tab;
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+            cx.run_until_parked();
+            paint_frame(cx);
+            // Endpoints ride every pane (the box anchor paints at the top);
+            // the full rows + per-row copies paint on Details, while on
+            // Health/Presets the lower rows sit below the fold at short
+            // panel heights — presence (not paint) there, per the
+            // below-fold convention. The bind:port-only clipboard path
+            // stays pinned by the t06/t10 clip asserts.
+            assert_painted(cx, "config-endpoints");
+            match tab {
+                crate::InspectorTab::Details => {
+                    for id in [
+                        "endpoint-value-socks",
+                        "endpoint-value-http",
+                        "copy-socks",
+                        "copy-http",
+                        "copy-upstream",
+                    ] {
+                        assert_painted(cx, id);
+                    }
+                }
+                crate::InspectorTab::Health | crate::InspectorTab::Presets => {
+                    for id in [
+                        "endpoint-value-socks",
+                        "endpoint-value-http",
+                        "copy-socks",
+                        "copy-http",
+                        "copy-upstream",
+                    ] {
+                        assert!(
+                            cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                            "{id} renders on {tab:?}"
+                        );
+                    }
+                }
+            }
+            // Tab-specific modules share the same box rhythm; history
+            // sits below the fold at short panel heights, so presence
+            // (not paint) is the assertion there.
+            match tab {
+                crate::InspectorTab::Details => {
+                    assert_painted(cx, "config-usage");
+                }
+                crate::InspectorTab::Health => {
+                    assert_painted(cx, "config-health");
+                    assert!(
+                        cx.update(|window, _| window
+                            .try_find("config-history".to_string())
+                            .is_some()),
+                        "config-history renders on the Health pane"
+                    );
+                }
+                crate::InspectorTab::Presets => {
+                    assert_painted(cx, "config-preset");
+                }
+            }
+        }
+        // Unattached row on the Presets pane: the inline detach stays
+        // unmounted behind its idle marker (attached detach is pinned by
+        // `laneb_preset_pane_detaches_inline_with_rule_count`).
+        assert!(
+            cx.update(|window, _| window.try_find("preset-detach-idle".to_string()).is_some()),
+            "idle detach marker holds the row"
+        );
+        assert_absent(cx, "preset-detach-inline".to_string());
     }
 
     /// Ticket 10 (US-5.3): the bulk Copy URLs action carries bind + port
