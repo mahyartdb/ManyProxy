@@ -1,1 +1,4 @@
 /target
+
+# Scratch output from browser-automation tooling (unrelated to this app).
+.playwright-mcp/

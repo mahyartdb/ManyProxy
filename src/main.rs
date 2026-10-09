@@ -4359,6 +4359,15 @@ impl InspectorTab {
 struct AppView {
     focus: FocusHandle,
     libraries: Entity<ListState<LibraryDelegate>>,
+    /// Tracked scroll state for the inspector pane body
+    /// (`config-detail-body`). GPUI applies a scroller's offset at PAINT time
+    /// (`window.with_element_offset`), so a child's layout bounds never move
+    /// when the pane scrolls — layout bounds cannot prove the wheel works.
+    /// Tracking the handle exposes `offset()`/`max_offset()`: `max_offset().y
+    /// > 0` states that a tab's sections really do exceed the 240px panel
+    /// (there is something below the fold to reach), and a wheel event moving
+    /// `offset().y` states that the user can reach it.
+    detail_scroll: ScrollHandle,
     store: Store,
     /// Ticket 05: supervised sidecar owner (one combined config for the
     /// active set). Production uses the real `sing-box` driver; tests swap
@@ -4566,6 +4575,7 @@ impl AppView {
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
+            detail_scroll: ScrollHandle::new(),
             store,
             engine: EngineController::production(),
             health_store: HealthStore::default(),
@@ -11133,9 +11143,14 @@ impl AppView {
     /// perceivable without animation.
     const MOTION_FAST_MS: u64 = 150;
 
-    /// Ticket 09: headless policy twin of the enter fade below — zero under
-    /// reduced motion, the capped budget otherwise.
-    #[cfg(test)]
+    /// Ticket 09: the duration the enter fade below actually runs with.
+    /// Reduced motion collapses to Duration::ZERO, so the surface paints its
+    /// end state on the first frame with no intermediate frames.
+    ///
+    /// This was a #[cfg(test)] policy twin that no production code called,
+    /// so it asserted GPUI's behavior rather than the app's. motion_enter now
+    /// reads it, which makes the reduced-motion guarantee structural: the
+    /// number under test IS the number animated with.
     fn motion_fast_duration(cx: &App) -> Duration {
         if cx.reduce_motion() {
             Duration::ZERO
@@ -11153,11 +11168,12 @@ impl AppView {
     fn motion_enter(
         child: impl IntoElement + 'static,
         id: impl Into<ElementId>,
+        cx: &App,
     ) -> impl IntoElement {
         div()
             .with_animation(
                 id,
-                Animation::new(Duration::from_millis(Self::MOTION_FAST_MS)),
+                Animation::new(Self::motion_fast_duration(cx)),
                 |this, delta| this.opacity(delta),
             )
             .child(child)
@@ -11288,6 +11304,7 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .overflow_x_hidden()
+                    .track_scroll(&self.detail_scroll)
                     .child(Self::motion_enter(
                         match self.inspector_tab {
                             InspectorTab::Details => {
@@ -11301,6 +11318,7 @@ impl AppView {
                             }
                         },
                         format!("inspector-pane-enter-{}", self.inspector_tab.index()),
+                        cx,
                     )),
             )
             // The operate row is PINNED below the scroller, not the last
@@ -11313,6 +11331,19 @@ impl AppView {
             // every section.
             .child(self.render_detail_actions(cx, config))
             .into_any_element()
+    }
+
+    /// Switch the inspector pane and reset the pane body's scroll to the top.
+    ///
+    /// One setter for all four call sites (the tab bar and the three
+    /// `Inspector*` actions) because `config-detail-body` is the SAME element
+    /// across tab switches — only its child changes — so the tracked offset
+    /// survives the switch. Scrolling down the Health pane and then opening
+    /// Details left the new pane at an arbitrary offset with blank space above
+    /// its first section.
+    fn set_inspector_tab(&mut self, tab: InspectorTab) {
+        self.inspector_tab = tab;
+        self.detail_scroll.set_offset(point(px(0.), px(0.)));
     }
 
     /// Ticket 05: `Details / Health / Presets` segmented bar over the
@@ -11333,7 +11364,7 @@ impl AppView {
                 .selected_index(self.inspector_tab.index())
                 .on_click(move |index, _, cx| {
                     view.update(cx, |view, _| {
-                        view.inspector_tab = InspectorTab::from_index(*index);
+                        view.set_inspector_tab(InspectorTab::from_index(*index));
                     });
                 })
                 .child(
@@ -12653,6 +12684,7 @@ impl AppView {
                 )
                 .into_any_element(),
             "bulk-bar-enter",
+            cx,
         )
         .into_any_element()
     }
@@ -13477,21 +13509,21 @@ impl AppView {
                 if window.has_active_dialog(cx) {
                     return;
                 }
-                view.inspector_tab = InspectorTab::Details;
+                view.set_inspector_tab(InspectorTab::Details);
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &InspectorHealth, window, cx| {
                 if window.has_active_dialog(cx) {
                     return;
                 }
-                view.inspector_tab = InspectorTab::Health;
+                view.set_inspector_tab(InspectorTab::Health);
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &InspectorPresets, window, cx| {
                 if window.has_active_dialog(cx) {
                     return;
                 }
-                view.inspector_tab = InspectorTab::Presets;
+                view.set_inspector_tab(InspectorTab::Presets);
                 cx.notify();
             }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
@@ -22712,6 +22744,117 @@ mod tests {
         );
     }
 
+    /// Closes the gap the live review could not confirm: the inspector body is a
+    /// real scroll container, so content below the fold in the 240px panel is
+    /// reachable by wheel.
+    ///
+    /// The assertion is on the tracked [`AppView::detail_scroll`] handle, not
+    /// on child bounds: GPUI applies a scroller's offset at PAINT time via
+    /// `window.with_element_offset`, so a child's layout bounds never move
+    /// when the pane scrolls and cannot witness a scroll at all.
+    /// `max_offset().y > 0` states a tab's sections really do exceed the panel
+    /// (something is below the fold to reach); a wheel event moving
+    /// `offset().y` states the user can reach it.
+    #[gpui_kit::test]
+    fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        use gpui_kit::point;
+        use gpui_kit::test::TestWindowExt;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let select_health_tab = |view: &Entity<AppView>, cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.libraries.update(cx, |state, list_cx| {
+                        state.delegate_mut().selected = Some(IndexPath::new(0));
+                        list_cx.notify();
+                    });
+                    view.inspector_tab = crate::InspectorTab::Health;
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+            cx.run_until_parked();
+            paint_frame(cx);
+        };
+        select_health_tab(&view, cx);
+        // Overflow exists: the Health pane's sections exceed the 240px panel.
+        let max_offset = cx.update(|_, cx| view.read(cx).detail_scroll.max_offset());
+        assert!(
+            max_offset.y > px(0.),
+            "the Health pane overflows the panel, so there is something below \
+             the fold to scroll to: {max_offset:?}"
+        );
+        // A wheel over the pane body moves the tracked offset. GPUI's scroller
+        // keeps `offset.y` in `[-max_offset.y, 0]` — negative is further down
+        // the content — so scrolling down takes a NEGATIVE wheel delta.
+        let scrolled = cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-80.))),
+                cx,
+            );
+            view.read(cx).detail_scroll.offset().y
+        });
+        assert!(
+            scrolled < px(0.),
+            "wheeling the inspector body scrolls it down: offset={scrolled:?}"
+        );
+        // It clamps at the end rather than running away.
+        let over = cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+            let view = view.read(cx);
+            (
+                view.detail_scroll.offset().y,
+                view.detail_scroll.max_offset().y,
+            )
+        });
+        assert_eq!(
+            over.0, -over.1,
+            "the pane clamps at its maximum offset: {:?}",
+            over
+        );
+        // Switching panes via the real InspectorDetails action starts the
+        // new pane at the top rather than inheriting the previous tab's
+        // scroll position, and drives the shared set_inspector_tab path.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.focus.focus(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::InspectorDetails), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (tab, offset) = cx.update(|_, cx| {
+            let view = view.read(cx);
+            (view.inspector_tab.index(), view.detail_scroll.offset().y)
+        });
+        assert_eq!(
+            tab,
+            crate::InspectorTab::Details.index(),
+            "the action actually switched panes"
+        );
+        assert_eq!(
+            offset,
+            px(0.),
+            "the Details pane starts scrolled to the top, not mid-history"
+        );
+    }
+
     /// Ticket 04: detail pane fits the 880x620 minimum window — with a row
     /// selected on the Details pane, the endpoint values, their Copy
     /// buttons, and the Start control all paint inside the minimum frame
@@ -23153,8 +23296,20 @@ mod tests {
         }
     }
 
-    /// Ticket 09 (CAP-9): the motion policy honors reduced motion — zero
-    /// under it, the capped budget otherwise.
+    /// Ticket 09 (CAP-9): the motion policy honors reduced motion — zero under
+    /// it, the capped budget otherwise.
+    ///
+    /// This now asserts PRODUCTION behavior, not a twin: `motion_fast_duration`
+    /// is what [`AppView::motion_enter`] hands to `Animation::new`, so the
+    /// number checked here is the number animated with. The earlier version was
+    /// `#[cfg(test)]` and nothing in the app called it, which made the
+    /// reduced-motion guarantee unfalsifiable.
+    ///
+    /// GPUI closes the loop: an animation whose `Duration` resolves under
+    /// `App::reduce_motion` renders its final frame with no intermediate
+    /// frames (gpui `elements/animation.rs`, the `cx.reduce_motion()` branch in
+    /// the keyframe layout pass), so `Duration::ZERO` means "paint the end
+    /// state on the first frame" rather than "divide by zero".
     #[gpui_kit::test]
     fn t09_motion_fast_duration_honors_reduce_motion(cx: &mut TestAppContext) {
         use std::time::Duration;
@@ -23168,11 +23323,26 @@ mod tests {
                 Duration::ZERO,
                 "reduced motion means no animation"
             );
+            // Read twice: the policy must track the live setting, not latch
+            // the first value it saw.
+            assert_eq!(
+                AppView::motion_fast_duration(cx),
+                Duration::ZERO,
+                "reduced motion is stable across reads"
+            );
             cx.set_reduce_motion(false);
             assert_eq!(
                 AppView::motion_fast_duration(cx),
                 Duration::from_millis(AppView::MOTION_FAST_MS),
                 "motion stays on the capped budget"
+            );
+            // Back on: the OS-level toggle is honored in both directions, which
+            // is what a user flipping the setting at runtime sees.
+            cx.set_reduce_motion(true);
+            assert_eq!(
+                AppView::motion_fast_duration(cx),
+                Duration::ZERO,
+                "turning reduced motion back on collapses the fade again"
             );
         });
     }

@@ -85,8 +85,52 @@ False alarms ruled out (were downscale artifacts, not bugs): footer button
 reads `Logs` not `Loass`; traffic order is canonically `↓ rx · ↑ tx`
 (main.rs:3532), which is what renders.
 
-Not verified live: reduced-motion traversal (needs an OS-level toggle; covered
-by the `motion_fast_duration` unit seam returning `Duration::ZERO`).
+Both gaps are now closed (see "Closing the two flagged gaps" below).
+
+### Closing the two flagged gaps
+
+**Gap 1 - inspector scroll.** Partly my procedure, partly a real bug.
+
+The wheel DOES work: re-driven with `delivery_mode: "foreground"` on a tab whose
+content overflows, the Health pane scrolled and revealed History with its honest
+empty line while the operate row stayed pinned. The earlier "unconfirmed" reading
+came from scrolling the Details pane (content fits, so there is nothing to
+scroll) and from background-mode wheel events that GPUI ignores.
+
+The real bug the chase exposed: `config-detail-body` is the SAME element across
+tab switches - only its child changes - so the scroll offset SURVIVED the
+switch. Scroll down Health, open Details, and the new pane started mid-scroll
+with blank space above its first section.
+
+- `AppView::detail_scroll: ScrollHandle` + `.track_scroll(...)` on the pane body.
+  Layout bounds cannot witness a scroll (GPUI applies the offset at PAINT time
+  via `window.with_element_offset`), so the handle's `offset()`/`max_offset()`
+  are the only honest probe.
+- `set_inspector_tab` resets the offset to the top. One setter for all four call
+  sites (tab bar + the three `Inspector*` actions) so none can forget the reset.
+- `inspector_body_scrolls_to_reach_below_fold_sections` asserts
+  `max_offset().y > 0` (something IS below the fold), a wheel moves `offset().y`,
+  it clamps at `-max`, and switching panes returns to 0 - via the real
+  `InspectorDetails` action, which needed a focus first for the dispatch to
+  bubble to the shell handler.
+
+**Gap 2 - reduced motion.** The `motion_fast_duration` seam was `#[cfg(test)]`
+and nothing in production called it, so it asserted GPUI's behavior rather than
+the app's: unfalsifiable by construction.
+
+- Promoted to production code; `motion_enter` now hands
+  `Animation::new(Self::motion_fast_duration(cx))` the duration, so the number
+  under test IS the number animated with.
+- `t09_motion_fast_duration_honors_reduce_motion` drives a real `App` with
+  `set_reduce_motion`, asserts zero-length twice (no latching), the capped budget
+  with motion on, and that flipping the setting back on collapses it again.
+- GPUI closes the loop: with `Duration::ZERO` the keyframe pass takes its
+  `cx.reduce_motion()` branch and paints the final frame with no intermediate
+  frames (gpui `elements/animation.rs`), so zero means "end state on the first
+  frame", not a division by zero.
+
+Verify trio: fmt clean, clippy clean, `cargo test --locked` -> 806 passed,
+0 failed. Both re-confirmed live.
 
 ### Fixes (both defects closed)
 
