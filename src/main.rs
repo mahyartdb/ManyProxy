@@ -1098,6 +1098,8 @@ impl ListDelegate for LibraryDelegate {
                 ServingTone::Stopped => cx.theme().muted_foreground,
             };
             let check_chip = self.checked_position(&row_id);
+            let checked_total = self.checked.len();
+            let lamp_label = lamp_access_label(tone, &row.name);
             let mut header = div()
                 .flex()
                 .flex_row()
@@ -1109,7 +1111,12 @@ impl ListDelegate for LibraryDelegate {
                         .test_support()
                         .size(px(12.))
                         .rounded_full()
-                        .bg(lamp_color),
+                        .bg(lamp_color)
+                        .tooltip({
+                            let tip = lamp_label.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .aria_label(lamp_label.clone()),
                 )
                 .child(checkbox)
                 .child(
@@ -1125,6 +1132,7 @@ impl ListDelegate for LibraryDelegate {
                         .child(Label::new(first)),
                 );
             if let Some(position) = check_chip {
+                let chip_tip = check_chip_tip(position, checked_total);
                 header = header.child(
                     div()
                         .id(format!("row-check-chip-{row_id}"))
@@ -1135,6 +1143,11 @@ impl ListDelegate for LibraryDelegate {
                         .border_1()
                         .border_color(cx.theme().accent)
                         .text_color(cx.theme().accent)
+                        .tooltip({
+                            let tip = chip_tip.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .aria_label(chip_tip)
                         .child(format!("{position}")),
                 );
             }
@@ -2584,6 +2597,25 @@ fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool) -> Servin
     } else {
         ServingTone::Stopped
     }
+}
+
+/// T01 (gpui-18-sweep): text equivalent of the occupancy lamp so serving
+/// state never rides on hue alone. Ruling: kit `Marker` is a container row
+/// (not a dot) and `Badge` carries no id/tooltip/a11y in 0.6.6, so the 12px
+/// flat-fill lamp geometry stays a div — only the accessible name + tooltip
+/// are added, pinned `row-dot-<id>` unchanged.
+fn lamp_access_label(tone: ServingTone, name: &str) -> String {
+    match tone {
+        ServingTone::Failed => format!("Failed — {name} (dead while serving)"),
+        ServingTone::Serving => format!("Serving — {name}"),
+        ServingTone::Stopped => format!("Stopped — {name}"),
+    }
+}
+
+/// T01 (gpui-18-sweep): text equivalent of the numeral check chip — position
+/// is 1-based in the checked set, total is the set length.
+fn check_chip_tip(position: usize, total: usize) -> String {
+    format!("Checked {position} of {total} — bulk action target")
 }
 
 /// Ticket 01: detail-header acting-row line — names the F5/detail-Start
@@ -25036,6 +25068,31 @@ mod tests {
         for canary in ["hunter2", "SECRET-UUID", "token=abc"] {
             assert!(!serving_badge(true, 10801, Some("87ms")).contains(canary));
         }
+    }
+
+    /// T01 (gpui-18-sweep): lamp + chip text equivalents — state perceivable
+    /// without hue alone; chip names its position of the total.
+    #[test]
+    fn t01_status_text_equivalents() {
+        use crate::{check_chip_tip, lamp_access_label, ServingTone};
+        assert_eq!(
+            lamp_access_label(ServingTone::Serving, "paris"),
+            "Serving — paris"
+        );
+        assert_eq!(
+            lamp_access_label(ServingTone::Stopped, "paris"),
+            "Stopped — paris"
+        );
+        assert_eq!(
+            lamp_access_label(ServingTone::Failed, "paris"),
+            "Failed — paris (dead while serving)"
+        );
+        assert_ne!(
+            lamp_access_label(ServingTone::Serving, "paris"),
+            lamp_access_label(ServingTone::Stopped, "paris")
+        );
+        assert_eq!(check_chip_tip(1, 3), "Checked 1 of 3 — bulk action target");
+        assert_eq!(check_chip_tip(3, 3), "Checked 3 of 3 — bulk action target");
     }
 
     /// Scenario: running vs stopped rows render the badge in the row lines;
