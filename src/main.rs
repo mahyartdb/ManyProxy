@@ -237,6 +237,16 @@ fn logs_overwrite_text(path: &std::path::Path) -> String {
     )
 }
 
+/// T07 (gpui-18-sweep CAP-8): save-destination disclosure — names the exact
+/// path Save writes (the `MANYPROXY_LOGS` override when set, else the
+/// `manyproxy-logs.txt` library sibling) so the click is never a surprise.
+fn logs_save_path_text() -> String {
+    format!(
+        "Save writes to {} (set MANYPROXY_LOGS to override the location)",
+        Store::default_logs_path().display()
+    )
+}
+
 /// Lane B (B7): confirm copy for a group delete — names the group and its
 /// row count. Empty-only deletes still refuse loudly at commit; the copy
 /// says so up front instead of surprising.
@@ -952,6 +962,54 @@ impl LibraryDelegate {
 
 // Ticket 07 spike removed: the card list is the only library view — the
 // unreachable flag, its delegate, and its render arm are gone.
+
+/// T07 (gpui-18-sweep CAP-8): the virtualized log-lines delegate — one
+/// `ListItem` per visible line (`log-line-<ix>`), fed from the
+/// [`AppView::visible_log_lines`] snapshot at dialog open. The kit `List`
+/// (built on `v_virtual_list`) mounts only the viewport rows, so the
+/// 200-line tail never becomes a 200-child `flex_col` no matter how many
+/// records the ring holds. Rows truncate with full-text tooltips (uniform
+/// single-line height keeps the virtualizer honest); selection is left
+/// unowned (log lines are evidence, never a target).
+struct LogLinesDelegate {
+    lines: Vec<String>,
+}
+
+impl ListDelegate for LogLinesDelegate {
+    type Item = ListItem;
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+        self.lines.len()
+    }
+
+    fn set_selected_index(
+        &mut self,
+        _index: Option<IndexPath>,
+        _window: &mut Window,
+        _cx: &mut Context<ListState<Self>>,
+    ) {
+    }
+
+    fn render_item(
+        &mut self,
+        index: IndexPath,
+        _window: &mut Window,
+        _cx: &mut Context<ListState<Self>>,
+    ) -> Option<ListItem> {
+        let line = self.lines.get(index.row)?.clone();
+        let tip = line.clone();
+        Some(
+            ListItem::new(format!("log-line-{}", index.row)).child(
+                div()
+                    .id(format!("log-line-text-{}", index.row))
+                    .text_sm()
+                    .truncate()
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(line),
+            ),
+        )
+    }
+}
 
 impl ListDelegate for LibraryDelegate {
     type Item = ListItem;
@@ -4631,6 +4689,9 @@ struct AppView {
     /// Ticket 43: stored-record count at the last logs-dialog open — the
     /// live-tail watermark (a reload with more records reopens when tailing).
     logs_seen: usize,
+    /// T07 (gpui-18-sweep CAP-8): the virtualized log-lines viewport state
+    /// for the open logs dialog (`None` while closed).
+    log_list: Option<Entity<ListState<LogLinesDelegate>>>,
     /// Ticket 43: expanded subscription rows in the manager dialog (sub ids).
     expanded_subs: HashSet<String>,
     /// Ticket 36: last-seen clash connection bytes (`core/conn-id` → (rx,
@@ -4819,6 +4880,10 @@ impl AppView {
             log_tail: true,
             logs_open: false,
             logs_seen: 0,
+            // T07 (gpui-18-sweep CAP-8): the virtualized log-lines viewport,
+            // synced from the visible snapshot on every logs-dialog open (the
+            // dialog builder is `Fn`, so the handle rides in per open).
+            log_list: None,
             expanded_subs: HashSet::new(),
             traffic_last_seen: TrafficSeenMap::default(),
             traffic_tick_in_flight: false,
@@ -7788,6 +7853,21 @@ impl AppView {
         let view = cx.entity();
         let reader = filter_state.clone();
         let lines = self.log_lines(cx);
+        // T07 (gpui-18-sweep CAP-8): the virtualized viewport syncs from the
+        // same snapshot the dialog shows — kit `List` mounts only viewport
+        // rows, so the 200-line tail never becomes a 200-child `flex_col`.
+        // Unselectable: log lines are evidence, never a target.
+        self.log_list = Some(cx.new(|cx| {
+            ListState::new(
+                LogLinesDelegate {
+                    lines: lines.clone(),
+                },
+                window,
+                cx,
+            )
+            .selectable(false)
+        }));
+        let log_list_state = self.log_list.clone();
         let title = match self.selected_config(cx) {
             Some(config) => format!("Logs — {}", config.name),
             None => "Logs".to_string(),
@@ -7876,52 +7956,66 @@ impl AppView {
             // level control — no second cycle button beside Copy/tail/Save.
             // T04 (CAP-4): log actions ride `.small()` like every other
             // action row, with tooltips naming each action.
-            let action_row =
-                div()
-                    .id("log-actions-row")
-                    .test_support()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("log-copy-visible")
-                            .small()
-                            .label("Copy visible")
-                            .tooltip("Copy the visible log lines (redacted)")
-                            .on_click(move |_, window, cx| {
-                                copy_view.update(cx, |view, cx| {
-                                    view.copy_visible_logs(window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("log-tail-toggle")
-                            .small()
-                            .label(if tail_on { "Pause tail" } else { "Resume tail" })
-                            .tooltip(if tail_on {
-                                "Pause the live tail"
-                            } else {
-                                "Resume the live tail"
-                            })
-                            .on_click(move |_, window, cx| {
-                                tail_view.update(cx, |view, cx| {
-                                    view.toggle_log_tail(window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("logs-save")
-                            .small()
-                            .label("Save")
-                            .tooltip("Save the visible redacted lines to the logs file")
-                            .on_click(move |_, window, cx| {
-                                save_view.update(cx, |view, cx| {
-                                    view.save_visible_logs(window, cx);
-                                });
-                            }),
-                    );
-            let save_path_text = format!("Save writes to {}", Store::default_logs_path().display());
+            // T07 (CAP-8): the live-tail streaming indicator — a small
+            // `Spinner` beside the toggle while the tail streams (every
+            // tail-reopen lands with it painted); pausing drops it. The
+            // toggle itself keeps a `min_w` floor so Pause/Resume never
+            // reflows the row.
+            let mut action_row = div()
+                .id("log-actions-row")
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("log-copy-visible")
+                        .small()
+                        .label("Copy visible")
+                        .tooltip("Copy the visible log lines (redacted)")
+                        .on_click(move |_, window, cx| {
+                            copy_view.update(cx, |view, cx| {
+                                view.copy_visible_logs(window, cx);
+                            });
+                        }),
+                );
+            if tail_on {
+                action_row = action_row.child(
+                    div()
+                        .id("log-tail-spinner")
+                        .test_support()
+                        .child(Spinner::new().small()),
+                );
+            }
+            action_row = action_row
+                .child(
+                    Button::new("log-tail-toggle")
+                        .small()
+                        .min_w(px(120.))
+                        .label(if tail_on { "Pause tail" } else { "Resume tail" })
+                        .tooltip(if tail_on {
+                            "Pause the live tail"
+                        } else {
+                            "Resume the live tail"
+                        })
+                        .on_click(move |_, window, cx| {
+                            tail_view.update(cx, |view, cx| {
+                                view.toggle_log_tail(window, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new("logs-save")
+                        .small()
+                        .label("Save")
+                        .tooltip("Save the visible redacted lines to the logs file")
+                        .on_click(move |_, window, cx| {
+                            save_view.update(cx, |view, cx| {
+                                view.save_visible_logs(window, cx);
+                            });
+                        }),
+                );
+            let save_path_text = logs_save_path_text();
             let mut body =
                 div()
                     .flex()
@@ -7947,12 +8041,12 @@ impl AppView {
                         "Filter",
                         filter_state.clone(),
                     ));
-            let mut list = div()
-                .id("log-lines")
-                .test_support()
-                .flex()
-                .flex_col()
-                .gap_1();
+            let mut list = div().id("log-lines").test_support().w_full();
+            // T07 (gpui-18-sweep CAP-8): lines render through the kit `List`
+            // viewport (`log-line-<ix>`, only visible rows mount) instead of a
+            // `flex_col` of raw strings — the same snapshot, virtualized. The
+            // builder is `Fn`, so the synced state rides in per open.
+            let log_list_viewport = log_list_state.as_ref();
             if lines.is_empty() {
                 // T04 (gpui-18-sweep CAP-5): no-lines renders the kit `Empty`
                 // (title + description + working Clear-filter button in
@@ -7995,9 +8089,12 @@ impl AppView {
                             ),
                         ),
                 );
-            }
-            for line in &lines {
-                list = list.child(line.clone());
+            } else if let Some(state) = log_list_viewport {
+                list = list.child(List::new(state).h(px(320.)).w_full());
+            } else {
+                for line in &lines {
+                    list = list.child(line.clone());
+                }
             }
             body = body.child(list);
             let close_view = chrome_view.clone();
@@ -18751,6 +18848,198 @@ mod tests {
         assert_painted(cx, "log-redact-note");
         assert_painted(cx, "log-save-path");
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// T07 (gpui-18-sweep CAP-8): a 10k-line tail stays virtualized and
+    /// redacted — the ring + 200-line visible window bound the work, the
+    /// dialog mounts only viewport rows (`log-line-<ix>`), level/filter
+    /// narrow through the same seam, the tail-reopen paints a `Spinner`,
+    /// and Pause/Resume keeps a stable width. No sleeps: all state flips
+    /// are synchronous dialog reopens.
+    #[gpui_kit::test]
+    fn t07_logs_virtualized_filter_level_tail(cx: &mut TestAppContext) {
+        use crate::health::{LogLevel, LogTagIndex};
+        cx.update(gpui_kit::init);
+        // Settle the dialog entrance animation so the toggle/level clicks'
+        // down/up share one position (dialog-click precedent).
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let tags = LogTagIndex::default();
+                for i in 0..10_000 {
+                    if i % 7 == 0 {
+                        view.logs.push_raw(
+                            &format!("error boom {i} password=hunter2 token=secret-abc"),
+                            &tags,
+                        );
+                    } else if i % 11 == 0 {
+                        view.logs.push_raw(
+                            &format!(
+                                "warn wobble {i} \
+                                 vless://11111111-2222-4333-8444-555555555555@h.example.com:443"
+                            ),
+                            &tags,
+                        );
+                    } else {
+                        view.logs.push_raw(&format!("info line {i}"), &tags);
+                    }
+                }
+                view.log_tail = true;
+            });
+        });
+        // Perf by construction: the ring caps storage, the visible window
+        // caps the render snapshot (newest last while tailing).
+        let visible = view.read_with(cx, |view, cx| view.visible_log_lines(cx));
+        assert_eq!(visible.len(), 200, "visible window caps the tail");
+        assert!(
+            visible.last().expect("tail nonempty").contains("9999"),
+            "tail follows the newest (i=9999 seeds a warn line: 9999 % 11 == 0): {:?}",
+            visible.last()
+        );
+        for line in &visible {
+            for secret in ["hunter2", "secret-abc", "555555555555"] {
+                assert!(
+                    !line.contains(secret),
+                    "uuid/password/token forms stay redacted: {line}"
+                );
+            }
+        }
+        // The dialog paints the virtualized viewport + streaming chrome.
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "log-lines",
+            "log-level-row",
+            "log-tail-spinner",
+            "log-redact-note",
+            "log-save-path",
+            "log-copy-visible",
+            "log-tail-toggle",
+            "logs-save",
+            "logs-dialog-ok",
+            "logs-dialog-cancel",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_painted(cx, "log-line-0");
+        assert!(
+            cx.update(|window, _| window.try_find("log-line-199").is_none()),
+            "off-viewport rows never mount (virtualized, not a 200-child flex_col)"
+        );
+        // Pause/Resume keeps a stable width; pausing drops the spinner.
+        let pause_width = cx.update(|window, _| {
+            window
+                .try_find("log-tail-toggle")
+                .expect("toggle paints")
+                .bounds()
+                .size
+                .width
+        });
+        cx.update(|window, cx| {
+            window.click("log-tail-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("log-tail-spinner").is_none()),
+            "paused tail shows no spinner"
+        );
+        assert_painted(cx, "log-tail-toggle");
+        let resume_width = cx.update(|window, _| {
+            window
+                .try_find("log-tail-toggle")
+                .expect("toggle paints")
+                .bounds()
+                .size
+                .width
+        });
+        assert_eq!(
+            pause_width, resume_width,
+            "Pause/Resume keeps a stable width (no row reflow)"
+        );
+        // Resuming reopens around the latest lines with the spinner back.
+        cx.update(|window, cx| {
+            window.click("log-tail-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert_painted(cx, "log-tail-spinner");
+        // The level row is the single level control — picking Error narrows
+        // through the same seam with no second switch beside it.
+        cx.update(|window, cx| {
+            window.within("log-level-row").click(4_usize, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.log_level),
+            Some(LogLevel::Error),
+            "level row narrows the filter"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("logs-level").is_none()),
+            "no second level control beside Copy/tail/Save"
+        );
+        let narrowed = view.read_with(cx, |view, cx| view.visible_log_lines(cx));
+        assert!(
+            !narrowed.is_empty() && narrowed.iter().all(|line| line.contains("[error]")),
+            "only errors survive: {narrowed:?}"
+        );
+        assert_painted(cx, "log-line-0");
+        assert_painted(cx, "log-tail-spinner");
+        // Copy carries the same redacted snapshot the dialog shows.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.copy_visible_logs(window, cx));
+        });
+        let clip = cx
+            .update(|_, cx| {
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .map(|text| text.to_string())
+            })
+            .unwrap_or_default();
+        assert!(clip.contains("[error]"), "clipboard carries visible lines");
+        for secret in ["hunter2", "secret-abc", "555555555555"] {
+            assert!(!clip.contains(secret), "clipboard stays redacted: {clip}");
+        }
+        // Save writes exactly the visible redacted lines.
+        let dir = std::env::temp_dir().join(format!("manyproxy-t07-logs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let path = dir.join("visible.txt");
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.write_visible_logs_to(&path, cx).expect("save works");
+            });
+        });
+        let saved = std::fs::read_to_string(&path).expect("saved file reads");
+        assert_eq!(saved, narrowed.join("\n"), "file matches visible lines");
+        for secret in ["hunter2", "secret-abc", "555555555555"] {
+            assert!(!saved.contains(secret), "saved file stays redacted");
+        }
+        std::fs::remove_dir_all(&dir).expect("temp dir cleans");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// T07 (gpui-18-sweep CAP-8): the save disclosure names the exact
+    /// destination plus the `MANYPROXY_LOGS` override (pure seam — the
+    /// dialog paints the same string under `log-save-path`).
+    #[test]
+    fn t07_logs_save_path_discloses_override() {
+        use crate::logs_save_path_text;
+        let text = logs_save_path_text();
+        assert!(
+            text.contains("MANYPROXY_LOGS"),
+            "names the override: {text}"
+        );
+        assert!(
+            text.contains(&Store::default_logs_path().display().to_string()),
+            "names the exact destination: {text}"
+        );
     }
 
     /// Lane B (B8): the guided identity secret renders masked (uuid /
