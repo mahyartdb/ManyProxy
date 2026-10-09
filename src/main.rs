@@ -19,10 +19,12 @@ use gpui_kit::component::badge::Badge;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::chart::LineChart;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::description_list::DescriptionList;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
+use gpui_kit::component::form::{field, v_form, Field};
 use gpui_kit::component::group_box::GroupBox;
 use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::kbd::Kbd;
@@ -30,7 +32,7 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::radio::Radio;
+use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -1272,18 +1274,17 @@ fn shortcut_kbd(keystroke: &str, fallback: &str) -> AnyElement {
     }
 }
 
-/// One labeled text field inside the add/edit dialog. Takes the state
-/// entity by value so the built element is `'static` (the element clones
-/// the entity internally).
-fn dialog_field(id: &'static str, label: &str, state: Entity<InputState>) -> impl IntoElement {
-    div()
-        .id(id)
-        .test_support()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(Label::new(label))
-        .child(Input::new(&state))
+/// One labeled text field inside the add/edit dialog. A kit [`Field`]
+/// (label-over-input) carrying the pinned wrapper id on an inner div, so the
+/// headless field anchors (`field-name`, …) keep painting while the dialog
+/// bodies compose on `v_form`. Takes the state entity by value so the built
+/// element is `'static` (the element clones the entity internally).
+/// Ticket T03: the label rides kit `field()` + `ParentElement::child` (never
+/// an invented `Field::child` method — verified absent in 0.6.6 `field.rs`).
+fn dialog_field(id: &'static str, label: &str, state: Entity<InputState>) -> Field {
+    field()
+        .label(label.to_string())
+        .child(div().id(id).test_support().child(Input::new(&state)))
 }
 
 /// Ticket 18: shared commit signature for plain-dialog footers — the same
@@ -1291,6 +1292,11 @@ fn dialog_field(id: &'static str, label: &str, state: Entity<InputState>) -> imp
 /// footer OK click. Returns true when the dialog should close (false keeps
 /// it open, e.g. total import failure).
 type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
+
+/// Ticket T03 (gpui-18-sweep CAP-3): repaint callback shared by the kit
+/// `RadioGroup` pickers — the group writes its cell, then notifies the
+/// owning view through this so the new mark paints on the same frame.
+type DialogRepaint = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Ticket 18: explicit mouse commit path for plain dialogs. A plain `Dialog`
 /// renders footer buttons ONLY via `.footer(...)` (`button_props.on_ok` fires
@@ -1388,6 +1394,7 @@ fn advanced_toggle_button(
     let toggle_cell = form.advanced.clone();
     let toggle_form = form.clone();
     Button::new("params-advanced-toggle")
+        .small()
         .label(label)
         .on_click(move |_, window, cx| {
             toggle_view.update(cx, |_, cx| {
@@ -1703,53 +1710,75 @@ impl ConfigForm {
                         },
                     )),
             );
-        // Ticket 11: gap_1 between fields (not gap_2) — saves ~20px so the
-        // 6-field Add form fits the 880x620 minimum frame.
-        // Ticket 05: guided and JSON swap (never stack) — each mode stays
-        // near the old form's height, so no mode pushes content below the
-        // fold. Server + Server port share one row; the hint and the toggle
-        // share one row.
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap_1()
+        // Ticket 11: small density on the form grid — the Add form (6 fields +
+        // footer) must paint inside the 880x620 minimum frame.
+        // Ticket T03 (gpui-18-sweep CAP-3): the body composes on kit `v_form`
+        // + `field()` — each field keeps its pinned wrapper id on an inner
+        // div (kit `Field` re-keys its own node by column index, so the
+        // anchor rides one level down). Guided and JSON swap, never stack:
+        // the raw JSON box rides a kit `Collapsible` Advanced section
+        // (controlled `open`, no motion id — closed content unmounts).
+        // Server + Server port share one side-by-side row of nested kit
+        // fields, as do bind + port (stacked rows would push the port readout
+        // below the minimum-frame fold — verified by
+        // `t11_add_dialog_paints_inside_minimum_frame`); the toggle rides the
+        // hint row when collapsed and the params buttons row when expanded.
+        let mut form = v_form()
+            .small()
             .child(dialog_field("field-name", "Name", self.name))
             .child(dialog_field("field-protocol", "Protocol", self.protocol));
         if expanded {
-            col = col.child(params_row);
+            form = form.child(
+                field()
+                    .label_indent(false)
+                    .child(Collapsible::new().open(expanded).content(params_row)),
+            );
         } else {
-            col = col.child(
+            // The guided mini-form rides ONE labelless field — side-by-side
+            // Server/Server port, the optional masked Identity, then the hint
+            // + Advanced toggle row — so the guided block costs a single grid
+            // row set instead of three.
+            let mut guided_block = div().flex().flex_col().gap_1();
+            guided_block = guided_block.child(
                 div()
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child(div().flex_1().child(dialog_field(
-                        "field-guided-server",
-                        "Server",
-                        self.guided_server,
-                    )))
-                    .child(div().flex_1().child(dialog_field(
-                        "field-guided-port",
-                        "Server port",
-                        self.guided_port,
-                    ))),
+                    .child(
+                        div().flex_1().child(
+                            field().label("Server").child(
+                                div()
+                                    .id("field-guided-server")
+                                    .test_support()
+                                    .child(Input::new(&self.guided_server)),
+                            ),
+                        ),
+                    )
+                    .child(
+                        div().flex_1().child(
+                            field().label("Server port").child(
+                                div()
+                                    .id("field-guided-port")
+                                    .test_support()
+                                    .child(Input::new(&self.guided_port)),
+                            ),
+                        ),
+                    ),
             );
             if guided.is_some_and(|guided| guided.key.is_some()) {
-                col = col.child(
-                    div()
-                        .id("field-guided-identity")
-                        .test_support()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
+                guided_block = guided_block.child(
+                    field()
                         // Ticket 05: the label names the live params key
-                        // (`Identity (uuid)`); `Label` takes the owned string,
-                        // so no static is needed.
-                        // Lane B (B8): the secret renders masked with a
-                        // reveal toggle (kit `mask_toggle`) — credentials
+                        // (`Identity (uuid)`); the secret renders masked with
+                        // a reveal toggle (kit `mask_toggle`) — credentials
                         // stay out of sight and out of the clipboard.
-                        .child(Label::new(guided_identity_label(&protocol_text)))
-                        .child(Input::new(&self.guided_identity).mask_toggle()),
+                        .label(guided_identity_label(&protocol_text))
+                        .child(
+                            div()
+                                .id("field-guided-identity")
+                                .test_support()
+                                .child(Input::new(&self.guided_identity).mask_toggle()),
+                        ),
                 );
             }
             let mut hint_row = div().flex().flex_row().items_center().gap_2();
@@ -1759,53 +1788,79 @@ impl ConfigForm {
             } else {
                 hint_row = hint_row.child(div().flex_1());
             }
-            col = col.child(hint_row.child(advanced_toggle_button(
+            guided_block = guided_block.child(hint_row.child(advanced_toggle_button(
                 "Advanced (raw JSON)",
                 &view,
                 &toggle_form,
             )));
+            form = form.child(field().label_indent(false).child(guided_block));
         }
-        col = col
-            .child(dialog_field("field-group", "Group", self.group))
-            .child(dialog_field("field-bind", "Bind address", self.bind))
-            .child(dialog_field("field-port", "Port", self.port));
-        if let Some(budget) = port_budget {
-            col = col.child(
+        form = form.child(dialog_field("field-group", "Group", self.group));
+        form = form.child(
+            field().label_indent(false).child(
                 div()
-                    .id("port-budget")
-                    .test_support()
-                    .text_sm()
-                    .child(budget),
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().flex_1().child(dialog_field(
+                        "field-bind",
+                        "Bind address",
+                        self.bind,
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(dialog_field("field-port", "Port", self.port)),
+                    ),
+            ),
+        );
+        if let Some(budget) = port_budget {
+            form = form.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("port-budget")
+                        .test_support()
+                        .text_sm()
+                        .child(budget),
+                ),
             );
         }
         // Ticket 43: per-row probe override lives on edit only.
         if show_test_url {
-            col = col.child(dialog_field(
+            form = form.child(dialog_field(
                 "field-test-url",
                 "Test URL (blank = global)",
                 self.test_url,
             ));
         }
         if let Some(hint) = lan_hint_for_bind(&bind) {
-            col = col.child(div().id("lan-hint").test_support().child(hint));
+            form = form.child(
+                field()
+                    .label_indent(false)
+                    .child(div().id("lan-hint").test_support().child(hint)),
+            );
         }
         if let Some(warning) = collision {
-            col = col.child(
-                div()
-                    .id("bind-collision-warning")
-                    .test_support()
-                    .child(warning),
+            form = form.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("bind-collision-warning")
+                        .test_support()
+                        .child(warning),
+                ),
             );
         }
-        if let Some((field, message)) = form_error {
-            col = col.child(
-                div()
-                    .id("form-field-error")
-                    .test_support()
-                    .child(format!("{field}: {message}")),
+        if let Some((field_name, message)) = form_error {
+            form = form.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("form-field-error")
+                        .test_support()
+                        .child(format!("{field_name}: {message}")),
+                ),
             );
         }
-        col
+        form
     }
 
     /// Ticket 31: move keyboard focus to the named field's input
@@ -2031,19 +2086,19 @@ impl ImportForm {
                 failure.reason
             )
         });
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap_2()
+        // Ticket T03 (gpui-18-sweep CAP-3): the import body composes on kit
+        // `v_form` + `field()` — every row keeps its pinned id on an inner
+        // div. Preview counts, first-failure reason, and file names ride
+        // labelless fields under the inputs.
+        let mut form = v_form()
+            .small()
             .child(
-                div()
-                    .id("field-import-text")
-                    .test_support()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(Label::new("Links, JSON, or conf"))
-                    .child(Textarea::new(&self.text).h(px(160.))),
+                field().label("Links, JSON, or conf").child(
+                    div()
+                        .id("field-import-text")
+                        .test_support()
+                        .child(Textarea::new(&self.text).h(px(160.))),
+                ),
             )
             .child(dialog_field(
                 "field-import-group",
@@ -2056,40 +2111,55 @@ impl ImportForm {
             let browse_view = view.clone();
             let browse_text = self.text.clone();
             let browse_group = self.group.clone();
-            col = col.child(
-                Button::new("import-browse")
-                    .label("Browse files…")
-                    .on_click(move |_, window, cx| {
-                        let current_text = browse_text.read(cx).value().to_string();
-                        let current_group = browse_group.read(cx).value().to_string();
-                        browse_view.update(cx, |view, cx| {
-                            view.browse_for_import_files(current_text, current_group, window, cx);
-                        });
-                    }),
+            form = form.child(
+                field().label_indent(false).child(
+                    Button::new("import-browse")
+                        .label("Browse files…")
+                        .on_click(move |_, window, cx| {
+                            let current_text = browse_text.read(cx).value().to_string();
+                            let current_group = browse_group.read(cx).value().to_string();
+                            browse_view.update(cx, |view, cx| {
+                                view.browse_for_import_files(
+                                    current_text,
+                                    current_group,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                ),
             );
         }
-        col = col.child(
-            div()
-                .id("import-preview")
-                .test_support()
-                .child(import_preview_message(valid, invalid)),
+        form = form.child(
+            field().label_indent(false).child(
+                div()
+                    .id("import-preview")
+                    .test_support()
+                    .child(import_preview_message(valid, invalid)),
+            ),
         );
         // Ticket 43: first-failure reason pre-commit (inline, never toast-only).
         // Ticket 07: multi-aware (same batch as the preview counts above).
         if let Some(reason) = first_failure {
-            col = col.child(
-                div()
-                    .id("import-first-failure")
-                    .test_support()
-                    .child(format!("first problem: {reason}")),
+            form = form.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("import-first-failure")
+                        .test_support()
+                        .child(format!("first problem: {reason}")),
+                ),
             );
         }
         if let Some(files) =
             import_files_label(self.file_hint.as_deref(), self.multi_files.as_deref())
         {
-            col = col.child(div().id("import-files").test_support().child(files));
+            form = form.child(
+                field()
+                    .label_indent(false)
+                    .child(div().id("import-files").test_support().child(files)),
+            );
         }
-        col
+        form
     }
 }
 
@@ -3565,29 +3635,45 @@ pub fn summed_traffic_text(store: &Store) -> Option<String> {
     Some(format!("↓ {} · ↑ {}", format_bytes(rx), format_bytes(tx)))
 }
 
-/// Ticket 45: one interval-picker row — preset radios writing the shared
-/// `interval_secs` cell (the dialog commit reads it, like the
-/// auto-refresh switch). Each radio carries the checked state, so the
-/// current preset reads as selected instead of bracketed text. Standalone
-/// radios (not a group — the group re-keys children by index) keep the
-/// stable `sub-interval-*` ids; exclusivity holds because every radio
-/// derives `checked` from the one shared cell.
-/// Ticket 08: one static group caption (`sub-interval-caption`), never a
-/// repeating summary of the current value.
-fn interval_picker_row(id_prefix: &str, interval_secs: Rc<RefCell<i64>>) -> impl IntoElement {
+/// Ticket 45: one interval-picker group — preset choices writing the shared
+/// `interval_secs` cell (the dialog commit reads it, like the auto-refresh
+/// switch).
+/// Ticket T03 (gpui-18-sweep CAP-3): exactly one grouped exclusive choice —
+/// kit `RadioGroup` with `selected_index` + `on_change` over the six presets,
+/// so the current preset reads as selected instead of bracketed text, with
+/// arrow-key navigation the standalone row lacked. The group re-keys its
+/// children by index (verified 0.6.6 `radio.rs` render: `radio.id = ix.into()`)
+/// and the group node itself does not self-register for headless observation
+/// (verified 0.6.6 `radio_group.rs` — only `Radio` calls `.test_support()`),
+/// so per-option string ids cannot survive: the stable anchors are the static
+/// caption (`{prefix}-caption`) and the observed wrapper (`{prefix}-group`);
+/// headless clicks scope within the wrapper by index. `repaint` notifies the
+/// owning view so the new mark paints at once.
+/// Ticket 08: one static group caption, never a repeating summary of the
+/// current value.
+fn interval_picker_row(
+    id_prefix: &str,
+    interval_secs: Rc<RefCell<i64>>,
+    repaint: DialogRepaint,
+) -> impl IntoElement {
     let current = *interval_secs.borrow();
-    let mut opts = div().flex().flex_row().items_center().gap_2();
+    let selected = INTERVAL_PRESETS
+        .iter()
+        .position(|preset| *preset == current);
+    let mut group = RadioGroup::horizontal(format!("{id_prefix}-options"))
+        .selected_index(selected)
+        .on_change(move |ix, window, cx| {
+            if let Some(secs) = INTERVAL_PRESETS.get(*ix) {
+                *interval_secs.borrow_mut() = *secs;
+            }
+            repaint(window, cx);
+        });
     for preset in INTERVAL_PRESETS {
-        let cell = interval_secs.clone();
-        let secs = *preset;
-        opts = opts.child(
-            Radio::new(format!("{id_prefix}-{secs}"))
-                .label(format_interval_secs(secs))
-                .tooltip(format!("Refresh every {}", format_interval_secs(secs)))
-                .checked(secs == current)
-                .on_click(move |_, _, _| {
-                    *cell.borrow_mut() = secs;
-                }),
+        let label = format_interval_secs(*preset);
+        group = group.child(
+            Radio::new(label.clone())
+                .label(label.clone())
+                .tooltip(format!("Refresh every {label}")),
         );
     }
     div()
@@ -3600,7 +3686,12 @@ fn interval_picker_row(id_prefix: &str, interval_secs: Rc<RefCell<i64>>) -> impl
                 .test_support()
                 .child(Label::new("Refresh interval")),
         )
-        .child(opts)
+        .child(
+            div()
+                .id(format!("{id_prefix}-group"))
+                .test_support()
+                .child(group),
+        )
 }
 
 /// Handles to the subscription add form inside the subscriptions dialog.
@@ -3656,29 +3747,36 @@ impl SubForm {
     /// Ticket 31: appends the inline plaintext-fetch warning when the live
     /// URL input is http (rebuilt on every render, so it tracks typing —
     /// same pattern as the LAN hint on [`ConfigForm::element`]).
-    fn element(self, cx: &App) -> impl IntoElement {
+    /// Ticket T03 (gpui-18-sweep CAP-3): the add form composes on kit
+    /// `v_form` + `field()`; the interval choice is the shared
+    /// [`interval_picker_row`] `RadioGroup`.
+    fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
         let auto = self.auto_refresh.clone();
         let checked = *auto.borrow();
         let url = self.url.read(cx).value().to_string();
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap_2()
+        let repaint_view = view.clone();
+        let repaint: DialogRepaint = Rc::new(move |_, cx| {
+            repaint_view.update(cx, |_, _| {});
+        });
+        let mut form = v_form()
+            .small()
             .child(dialog_field("field-sub-label", "Label", self.label))
             .child(dialog_field("field-sub-url", "Subscription URL", self.url));
         // Ticket 08: the plaintext-fetch warning sits beside the URL field
         // it describes (not at the form foot).
         if let Some(warning) = http_subscription_warning(&url) {
-            col = col.child(
-                div()
-                    .id("sub-add-http-warning")
-                    .test_support()
-                    .child(warning),
+            form = form.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("sub-add-http-warning")
+                        .test_support()
+                        .child(warning),
+                ),
             );
         }
-        col = col
+        form = form
             .child(dialog_field("field-sub-group", "Group", self.group))
-            .child(
+            .child(field().label_indent(false).child(
                 div().id("field-sub-auto").test_support().child(
                     Switch::new("sub-auto-add")
                         .checked(checked)
@@ -3694,16 +3792,20 @@ impl SubForm {
                             *auto.borrow_mut() = *next;
                         }),
                 ),
-            )
+            ))
             // Ticket 45: per-subscription interval picker (preset buttons
             // write the shared cell; OK commits it).
-            .child(
+            .child(field().label_indent(false).child(
                 div()
                     .id("field-sub-interval")
                     .test_support()
-                    .child(interval_picker_row("sub-interval-add", self.interval_secs)),
-            );
-        col
+                    .child(interval_picker_row(
+                        "sub-interval-add",
+                        self.interval_secs,
+                        repaint,
+                    )),
+            ));
+        form
     }
 }
 
@@ -6567,16 +6669,16 @@ impl AppView {
         let db_path = Store::default_path().display().to_string();
         let export_path = Store::default_export_path().display().to_string();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            // Ticket 43: copy-path + clear-data buttons (each re-reads live
+            // state through the view — never a stale snapshot). Every clone
+            // is per-render (the builder is `Fn`): button handlers own these,
+            // never the outer bindings.
             let autostart_view = view.clone();
             let restore_view = view.clone();
             let autostart_cell = autostart_state.clone();
             let restore_cell = restore_state.clone();
             let autostart_on = *autostart_state.borrow();
             let restore_on = *restore_state.borrow();
-            // Ticket 43: copy-path + clear-data buttons (each re-reads live
-            // state through the view — never a stale snapshot). Every clone
-            // is per-render (the builder is `Fn`): button handlers own these,
-            // never the outer bindings.
             let save_reader = test_url_reader.clone();
             let save_view = test_url_view.clone();
             let copy_db_view = test_url_view.clone();
@@ -7609,33 +7711,44 @@ impl AppView {
             let (current_level, tail_on) = (chrome_level, chrome_tail);
             // Lane B (B9): the single level control — labels map through
             // `LogLevel::from_label` (one source, never a hand-duplicated
-            // table), so a corrupt label can only read as `all`. Each
-            // radio carries the checked state instead of a `● ` text
-            // prefix, with its stable id for headless clicks. Standalone
-            // radios (not a group — the group re-keys children by index).
-            let mut level_row = div()
-                .id("log-level-row")
-                .test_support()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2();
-            for label in ["All", "Debug", "Info", "Warn", "Error"] {
-                let level_view = chrome_view.clone();
-                let level = LogLevel::from_label(label);
-                let id = format!("log-level-{label}").to_lowercase();
-                level_row = level_row.child(
-                    Radio::new(id)
+            // table).
+            // Ticket T03 (gpui-18-sweep CAP-3): exactly one grouped exclusive
+            // choice — kit `RadioGroup` with `selected_index` + `on_change`
+            // over All/Debug/Info/Warn/Error. Each level reads as selected
+            // instead of a `● ` text prefix, with arrow-key navigation the
+            // standalone row lacked. The group re-keys children by index and
+            // does not self-register for headless observation (verified 0.6.6
+            // `radio.rs` / `radio_group.rs`), so the per-level string ids are
+            // retired: the pinned `log-level-row` id rides an observed
+            // wrapper and headless clicks scope within it by index.
+            const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
+            let selected_level = LOG_LEVEL_LABELS
+                .iter()
+                .position(|label| LogLevel::from_label(label) == current_level);
+            let mut level_group = RadioGroup::horizontal("log-level-options")
+                .selected_index(selected_level)
+                .on_change({
+                    // Per-render clone — the dialog builder is `Fn`.
+                    let group_view = chrome_view.clone();
+                    move |ix, window, cx| {
+                        let level = LOG_LEVEL_LABELS
+                            .get(*ix)
+                            .map(|label| LogLevel::from_label(label))
+                            .unwrap_or(current_level);
+                        let level_view = group_view.clone();
+                        level_view.update(cx, |view, cx| {
+                            view.set_log_level(level, window, cx);
+                        });
+                    }
+                });
+            for label in LOG_LEVEL_LABELS {
+                level_group = level_group.child(
+                    Radio::new(label)
                         .label(label)
-                        .tooltip(format!("Show {label} and above"))
-                        .checked(current_level == level)
-                        .on_click(move |_, window, cx| {
-                            level_view.update(cx, |view, cx| {
-                                view.set_log_level(level, window, cx);
-                            });
-                        }),
+                        .tooltip(format!("Show {label} and above")),
                 );
             }
+            let level_row = div().id("log-level-row").test_support().child(level_group);
             let copy_view = chrome_view.clone();
             let tail_view = chrome_view.clone();
             let save_view = chrome_view.clone();
@@ -10465,7 +10578,7 @@ impl AppView {
                     subscription_member_names(&member_rows, &sub.id),
                 ));
             }
-            body = body.child(form.clone().element(cx));
+            body = body.child(form.clone().element(view_for_rows.clone(), cx));
             dialog
                 .title("Subscriptions")
                 .child(body)
@@ -10554,6 +10667,9 @@ impl AppView {
         let interval_cell: Rc<RefCell<i64>> = Rc::new(RefCell::new(sub.interval_secs));
         let read_interval = interval_cell.clone();
         let edit_interval = interval_cell.clone();
+        // Ticket T03: repaint handle for the interval group (the commit
+        // below moves `view`; the dialog builder clones per render).
+        let repaint_view = view.clone();
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
         // identically to the Confirm key path, including stay-open-on-error).
         let commit: DialogCommit = Rc::new(move |window, cx| {
@@ -10569,6 +10685,8 @@ impl AppView {
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
+            // Ticket T03: per-render clone — the builder re-runs every frame.
+            let repaint_view = repaint_view.clone();
             // Ticket 31: live plaintext warning for the URL being typed.
             // Ticket 08: beside the URL field it describes, not the form foot.
             let url_now = url_state.read(cx).value().to_string();
@@ -10578,10 +10696,10 @@ impl AppView {
                     .test_support()
                     .child(warning)
             });
-            let mut col = div()
-                .flex()
-                .flex_col()
-                .gap_2()
+            // Ticket T03: edit body on kit `v_form` + `field()` with the
+            // shared interval `RadioGroup`.
+            let mut form = v_form()
+                .small()
                 .child(dialog_field(
                     "field-sub-edit-label",
                     "Label",
@@ -10593,20 +10711,25 @@ impl AppView {
                     url_state.clone(),
                 ));
             if let Some(warning) = edit_warning {
-                col = col.child(warning);
+                form = form.child(field().label_indent(false).child(warning));
             }
-            col = col
+            form = form
                 .child(dialog_field(
                     "field-sub-edit-group",
                     "Group",
                     group_state.clone(),
                 ))
-                .child(div().id("field-sub-edit-interval").test_support().child(
-                    interval_picker_row("sub-interval-edit", edit_interval.clone()),
+                .child(field().label_indent(false).child(
+                    div().id("field-sub-edit-interval").test_support().child({
+                        let repaint: DialogRepaint = Rc::new(move |_, cx| {
+                            repaint_view.update(cx, |_, _| {});
+                        });
+                        interval_picker_row("sub-interval-edit", edit_interval.clone(), repaint)
+                    }),
                 ));
             dialog
                 .title(title.clone())
-                .child(col)
+                .child(form)
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -13292,50 +13415,61 @@ impl AppView {
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
-            let mut body = div().flex().flex_col().gap_2();
+            // Ticket T03 (gpui-18-sweep CAP-3): the manager body composes on
+            // kit `v_form` + `field()` — each group row is a labeled field
+            // (name + count label, Rename/Delete actions), so the manager
+            // reads in the same form language as the other dialogs. Row
+            // button ids are unchanged.
+            let mut form = v_form().small();
             if groups.is_empty() {
-                body = body.child("No groups yet — groups appear when rows use them");
+                form = form.child(
+                    field()
+                        .label_indent(false)
+                        .child("No groups yet — groups appear when rows use them"),
+                );
             }
             for (group, count) in &groups {
                 let rename_view = view.clone();
                 let delete_view = view.clone();
                 let rename_group = group.clone();
                 let delete_group = group.clone();
-                let line = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(Label::new(format!("{group} ({count})")))
-                    .child(
-                        // Ticket 44: manager ids slug the label (slashes never
-                        // reach an element id); the row label stays verbatim.
-                        Button::new(format!("group-rename-{}", slugify_group_id(group)))
-                            .label("Rename")
-                            .on_click(move |_, window, cx| {
-                                let group = rename_group.clone();
-                                rename_view.update(cx, |view, cx| {
-                                    view.open_group_rename_dialog(&group, window, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        // Ticket 44: manager ids slug the label (slashes never
-                        // reach an element id); the row label stays verbatim.
-                        Button::new(format!("group-delete-{}", slugify_group_id(group)))
-                            .label("Delete")
-                            .on_click(move |_, window, cx| {
-                                let group = delete_group.clone();
-                                delete_view.update(cx, |view, cx| {
-                                    view.open_group_delete_confirm(&group, window, cx);
-                                });
-                            }),
-                    );
-                body = body.child(line);
+                form = form.child(
+                    field().label(format!("{group} ({count})")).child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                // Ticket 44: manager ids slug the label (slashes never
+                                // reach an element id); the row label stays verbatim.
+                                Button::new(format!("group-rename-{}", slugify_group_id(group)))
+                                    .label("Rename")
+                                    .on_click(move |_, window, cx| {
+                                        let group = rename_group.clone();
+                                        rename_view.update(cx, |view, cx| {
+                                            view.open_group_rename_dialog(&group, window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                // Ticket 44: manager ids slug the label (slashes never
+                                // reach an element id); the row label stays verbatim.
+                                Button::new(format!("group-delete-{}", slugify_group_id(group)))
+                                    .label("Delete")
+                                    .on_click(move |_, window, cx| {
+                                        let group = delete_group.clone();
+                                        delete_view.update(cx, |view, cx| {
+                                            view.open_group_delete_confirm(&group, window, cx);
+                                        });
+                                    }),
+                            ),
+                    ),
+                );
             }
             dialog
                 .title("Groups")
-                .child(body)
+                .child(form)
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -13375,14 +13509,14 @@ impl AppView {
             let commit_click = commit.clone();
             dialog
                 .title(format!("Rename group \"{old_name}\""))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(Label::new("New group name"))
-                        .child(Input::new(&name_state)),
-                )
+                // Ticket T03: single-field body on kit `v_form` + `field()`.
+                // The new `field-group-rename-name` anchor keeps the input
+                // findable now that the kit field owns the label.
+                .child(v_form().small().child(dialog_field(
+                    "field-group-rename-name",
+                    "New group name",
+                    name_state.clone(),
+                )))
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -16385,9 +16519,15 @@ mod tests {
         });
     }
 
-    /// Lane B (B9): one level control — the five-button level row is the
-    /// only severity switch in the logs dialog (no second cycle button),
-    /// and each button narrows through the same `set_log_level` seam.
+    /// Lane B (B9): one level control — the level group is the only
+    /// severity switch in the logs dialog (no second cycle button), and each
+    /// choice narrows through the same `set_log_level` seam.
+    /// Ticket T03: the row rides kit `RadioGroup` (`selected_index` +
+    /// `on_change`). The group re-keys children by index and does not
+    /// self-register for headless observation (verified 0.6.6 `radio.rs` /
+    /// `radio_group.rs`), so the per-level string ids are retired — the
+    /// pinned `log-level-row` id rides an observed wrapper and the headless
+    /// click scopes within it by index (4 = Error).
     #[gpui_kit::test]
     fn laneb_logs_single_level_control(cx: &mut TestAppContext) {
         use crate::health::LogLevel;
@@ -16401,21 +16541,13 @@ mod tests {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        for id in [
-            "log-level-all",
-            "log-level-debug",
-            "log-level-info",
-            "log-level-warn",
-            "log-level-error",
-        ] {
-            assert_painted(cx, id);
-        }
+        assert_painted(cx, "log-level-row");
         assert!(
             cx.update(|window, _| window.try_find("logs-level".to_string()).is_none()),
             "no second cycle button beside Copy/tail/Save"
         );
         cx.update(|window, cx| {
-            window.click("log-level-error", cx);
+            window.within("log-level-row").click(4_usize, cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -17261,8 +17393,15 @@ mod tests {
 
     /// Ticket 08: the subscriptions interval control is exactly one grouped
     /// exclusive choice of the six presets with the current value marked —
-    /// one static group caption (no redundant summary line), six radios
+    /// one static group caption (no redundant summary line), six choices
     /// sharing one cell (last click wins).
+    /// Ticket T03: the choice rides kit `RadioGroup` (`selected_index` +
+    /// `on_change`). The group re-keys children by index (verified 0.6.6
+    /// `radio.rs`: `radio.id = ix.into()`) and does not self-register for
+    /// headless observation, so per-option string ids cannot survive — the
+    /// anchors are the static caption, the `field-sub-interval` wrapper, and
+    /// the new observed `sub-interval-add-group` id; headless clicks scope
+    /// within the group by preset index (0/always … 5/7d).
     #[gpui_kit::test]
     fn t08_interval_picker_one_grouped_exclusive_choice(cx: &mut TestAppContext) {
         use crate::INTERVAL_PRESETS;
@@ -17277,14 +17416,12 @@ mod tests {
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         // One static group caption, never a repeating summary of the value.
         assert_painted(cx, "sub-interval-add-caption");
-        // Exactly the six preset radios, each painted.
+        // Exactly one group hosting the six preset choices.
         assert_eq!(INTERVAL_PRESETS.len(), 6, "six interval choices");
-        for secs in INTERVAL_PRESETS {
-            assert_painted(cx, &format!("sub-interval-add-{secs}"));
-        }
+        assert_painted(cx, "sub-interval-add-group");
         // Exclusive: each click moves the one shared cell (current = marked).
         cx.update(|window, cx| {
-            window.click("sub-interval-add-3600", cx);
+            window.within("sub-interval-add-group").click(1_usize, cx);
         });
         cx.run_until_parked();
         assert_eq!(
@@ -17298,7 +17435,7 @@ mod tests {
             "clicking 1h marks 1h current"
         );
         cx.update(|window, cx| {
-            window.click("sub-interval-add-86400", cx);
+            window.within("sub-interval-add-group").click(4_usize, cx);
         });
         cx.run_until_parked();
         assert_eq!(
