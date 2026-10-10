@@ -73,12 +73,14 @@ use import::{
 use store::{
     count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
     export_confirm_description, fold_dial_into_params, fold_guided_into_params,
-    fold_mux_into_params, fold_tls_optional_into_params, fold_transport_into_params,
-    fold_vless_inner_into_params, guided_identity_fields, guided_prefill_bool,
-    guided_prefill_value, is_virtual_protocol, now_unix, pristine_template_rewrite,
-    protocol_params_template, proxy_urls, ConfigPatch, DialFold, HealthSnapshot, MuxFold,
-    NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError, Subscription as ProxySubscription,
-    TlsOptionalFold, TransportFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    fold_mux_into_params, fold_shadowsocks_inner_into_params, fold_tls_optional_into_params,
+    fold_tls_vmess_into_params, fold_transport_into_params, fold_trojan_inner_into_params,
+    fold_vless_inner_into_params, fold_vmess_inner_into_params, guided_identity_fields,
+    guided_prefill_bool, guided_prefill_value, is_virtual_protocol, now_unix,
+    pristine_template_rewrite, protocol_params_template, proxy_urls, vmess_cipher_value,
+    vmess_tls_enabled, ConfigPatch, DialFold, HealthSnapshot, MuxFold, NewConfig, ProxyConfig,
+    RestoreOutcome, Store, StoreError, Subscription as ProxySubscription, TlsOptionalFold,
+    TransportFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -1694,6 +1696,36 @@ struct ConfigForm {
     /// [`ConfigForm::vless_block`]) — collapsed by default per the t11
     /// minimum-frame contract.
     vless_open: Rc<RefCell<bool>>,
+    /// Config-completeness T03: VMess inner fields — masked uuid secret +
+    /// generate, aid text, cipher + packet_encoding pickers. Prefilled from
+    /// params on Edit (cipher via the grammar-aware reader); rendered (and
+    /// folded) only while the live protocol is `vmess`.
+    vmess_uuid: Entity<InputState>,
+    vmess_aid: Entity<InputState>,
+    vmess_security: Entity<SelectState<PanelChoiceList>>,
+    vmess_packet_encoding: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T03: outer VMess disclosure (see
+    /// [`ConfigForm::vmess_block`]) — collapsed by default like VLESS.
+    vmess_open: Rc<RefCell<bool>>,
+    /// Config-completeness T03: Trojan inner field — masked password secret
+    /// (no generator: passwords are not uuids). Rendered (and folded) only
+    /// while the live protocol is `trojan`.
+    trojan_password: Entity<InputState>,
+    /// Config-completeness T03: outer Trojan disclosure (see
+    /// [`ConfigForm::trojan_block`]) — collapsed by default like VLESS.
+    trojan_open: Rc<RefCell<bool>>,
+    /// Config-completeness T03: Shadowsocks inner fields — method + plugin
+    /// pickers, masked password secret, plugin_opts text, uot cell.
+    /// Rendered (and folded) only while the live protocol is `shadowsocks`;
+    /// the page carries S3+S4 only (no S1/S2 — Throne HasMux parity).
+    ss_method: Entity<SelectState<PanelChoiceList>>,
+    ss_password: Entity<InputState>,
+    ss_plugin: Entity<SelectState<PanelChoiceList>>,
+    ss_plugin_opts: Entity<InputState>,
+    ss_uot: Rc<RefCell<bool>>,
+    /// Config-completeness T03: outer Shadowsocks disclosure (see
+    /// [`ConfigForm::shadowsocks_block`]) — collapsed by default like VLESS.
+    ss_open: Rc<RefCell<bool>>,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -1909,6 +1941,21 @@ impl ConfigForm {
             s4_inet6: Self::field(window, cx, "IPv6 bind address", None),
             s4_open: Rc::new(RefCell::new(false)),
             vless_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T03: panels open blank (every fold
+            // no-ops, so the template stands) under collapsed disclosures.
+            vmess_uuid: Self::secret_field(window, cx, "UUID", None),
+            vmess_aid: Self::field(window, cx, "Alter ID (aid)", None),
+            vmess_security: Self::panel_select(window, cx, vmess_security_choices(), "auto"),
+            vmess_packet_encoding: Self::panel_select(window, cx, packet_encoding_choices(), ""),
+            vmess_open: Rc::new(RefCell::new(false)),
+            trojan_password: Self::secret_field(window, cx, "Password", None),
+            trojan_open: Rc::new(RefCell::new(false)),
+            ss_method: Self::panel_select(window, cx, ss_method_choices(), ""),
+            ss_password: Self::secret_field(window, cx, "Password", None),
+            ss_plugin: Self::panel_select(window, cx, ss_plugin_choices(), ""),
+            ss_plugin_opts: Self::field(window, cx, "Plugin options", None),
+            ss_uot: Rc::new(RefCell::new(false)),
+            ss_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -1939,10 +1986,17 @@ impl ConfigForm {
             network_value
         };
         let security = guided_prefill_value(params, &["security"]);
-        let tls_on = matches!(
-            security.to_ascii_lowercase().as_str(),
-            "tls" | "xtls" | "reality"
-        );
+        // Config-completeness T03: vmess rows may carry the legacy boolean
+        // `tls` import writes for `vmess://` links (the cipher sits in
+        // `security` there) — the grammar-aware reader owns that protocol.
+        let tls_on = if config.protocol == "vmess" {
+            vmess_tls_enabled(params)
+        } else {
+            matches!(
+                security.to_ascii_lowercase().as_str(),
+                "tls" | "xtls" | "reality"
+            )
+        };
         Self {
             name: Self::field(window, cx, "Name", Some(config.name.as_str())),
             protocol_select: cx.new(|cx| {
@@ -2138,6 +2192,75 @@ impl ConfigForm {
             ),
             s4_open: Rc::new(RefCell::new(false)),
             vless_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T03: inner pages echo the row's params
+            // JSON (untouched values fold back byte-identical — no spurious
+            // patch). The vmess cipher reads grammar-aware (legacy `security`
+            // vs new-style `encryption`); the ss method/plugin blanks stand
+            // for "no selection" (never fabricated, never stripped).
+            vmess_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            vmess_aid: Self::field(
+                window,
+                cx,
+                "Alter ID (aid)",
+                Some(&guided_prefill_value(params, &["alter_id", "aid"])),
+            ),
+            vmess_security: Self::panel_select(
+                window,
+                cx,
+                vmess_security_choices(),
+                &vmess_cipher_value(params),
+            ),
+            vmess_packet_encoding: Self::panel_select(
+                window,
+                cx,
+                packet_encoding_choices(),
+                &guided_prefill_value(params, &["packet_encoding", "packetEncoding"]),
+            ),
+            vmess_open: Rc::new(RefCell::new(false)),
+            trojan_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            trojan_open: Rc::new(RefCell::new(false)),
+            ss_method: Self::panel_select(
+                window,
+                cx,
+                ss_method_choices(),
+                &guided_prefill_value(params, &["method"]),
+            ),
+            ss_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            ss_plugin: Self::panel_select(
+                window,
+                cx,
+                ss_plugin_choices(),
+                &guided_prefill_value(params, &["plugin"]),
+            ),
+            ss_plugin_opts: Self::field(
+                window,
+                cx,
+                "Plugin options",
+                Some(&guided_prefill_value(
+                    params,
+                    &["plugin_opts", "plugin-opts", "pluginOpts"],
+                )),
+            ),
+            ss_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_tcp", "uot"],
+            ))),
+            ss_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(true)),
         }
     }
@@ -2181,32 +2304,102 @@ impl ConfigForm {
         format!("Auto ports: {used} of {total} in use (10801–10999, spill 18081–18380)")
     }
 
-    /// Config-completeness T02: VLESS guided page — inner fields plus the
-    /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
-    /// `open`, no motion id — closed content unmounts, entities persist, so
-    /// hiding never wipes per R5). Rendered only while the live protocol is
-    /// `vless`; every other protocol keeps the T01 form byte-for-byte.
-    /// The whole page rides ONE outer collapsed disclosure (a single header
-    /// row at the 880x620 minimum — t11 pins the core form in-frame; seven
-    /// open rows would push it out).
-    /// Kit constructors/builders: `Select::new(&state)` +
-    /// `.id().small().accessibility_label()`, `Input` (+ masked `uuid` with
-    /// `mask_toggle`), `Button` (+ `.small()` generators), `RadioGroup`
-    /// (`selected_index` + `on_change`, interval-picker precedent),
-    /// `Switch` (`checked` + `on_change` over shared cells), `Field` +
-    /// `v_form` layout, outer-wrapper `Tooltip`s, `Label` captions.
-    fn vless_block(
+    /// Config-completeness T03: one masked-secret-plus-generate row (the
+    /// VLESS and VMess uuid fields) — `id_prefix` pins `<prefix>-uuid` /
+    /// `<prefix>-uuid-generate`. Same kit pieces as the T02 inline row
+    /// (`Input` + `mask_toggle`, `.small()` `Button` + tooltip, honest
+    /// toast naming the protocol-neutral outcome).
+    fn uuid_row(
         &self,
         view: &Entity<AppView>,
-        repaint: &DialogRepaint,
-        cx: &App,
+        secret: &Entity<InputState>,
+        id_prefix: &str,
     ) -> impl IntoElement {
-        let mut block = div().flex().flex_col().gap_2();
-        // Inner: uuid (masked + generate) + flow + packet_encoding.
-        let uuid_entity = self.vless_uuid.clone();
+        let secret_entity = secret.clone();
         let uuid_view = view.clone();
-        block = block.child(
-            field().label("UUID".to_string()).child(
+        field().label("UUID".to_string()).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .id(format!("{id_prefix}-uuid"))
+                        .test_support()
+                        .child(Input::new(secret).mask_toggle()),
+                )
+                .child(
+                    Button::new(format!("{id_prefix}-uuid-generate"))
+                        .small()
+                        .label("Generate")
+                        .tooltip("Generate a random UUIDv4")
+                        .accessibility_label("Generate a random UUIDv4")
+                        .on_click(move |_, window, cx| {
+                            let generated = generate_uuid_v4();
+                            uuid_view.update(cx, |_, cx| {
+                                secret_entity.update(cx, |state, cx| {
+                                    state.set_value(generated, &mut *window, cx);
+                                });
+                            });
+                            window
+                                .push_notification(Notification::info("Generated a new UUID"), cx);
+                        }),
+                ),
+        )
+    }
+
+    /// Config-completeness T03: one kit-maximal dropdown row — label-over
+    /// field with the hover copy on an outer wrapper (kit `Select` has no
+    /// tooltip slot — facet-bar precedent) and the T01 ENTER-guard on the
+    /// wrapper (kit `BaseSelect` propagates Confirm even with its popup
+    /// open; without the stop the picker's Enter pick would also commit a
+    /// half-filled row). Kit: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`.
+    fn panel_select_row(
+        label: &str,
+        tip_id: &'static str,
+        tip: &str,
+        select_id: &'static str,
+        a11y: &str,
+        state: &Entity<SelectState<PanelChoiceList>>,
+    ) -> Field {
+        let tip = tip.to_string();
+        field().label(label.to_string()).child(
+            div()
+                .id(tip_id)
+                .test_support()
+                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    Select::new(state)
+                        .id(select_id)
+                        .small()
+                        .accessibility_label(a11y),
+                ),
+        )
+    }
+
+    /// Config-completeness T03: one outer collapsed disclosure per guided
+    /// page (a single header row at the 880x620 minimum — t11 pins the core
+    /// form in-frame; the full page is one click away). Closed content
+    /// unmounts, entities persist (R5). Kit: `Collapsible` (controlled
+    /// `open`) + `Button` toggle + `Label` caption.
+    fn page_disclosure(
+        caption: &str,
+        caption_id: &'static str,
+        toggle_id: &'static str,
+        section_id: &'static str,
+        open: &Rc<RefCell<bool>>,
+        view: &Entity<AppView>,
+        block: impl IntoElement,
+    ) -> impl IntoElement {
+        Collapsible::new()
+            .open(*open.borrow())
+            .child(
                 div()
                     .flex()
                     .flex_row()
@@ -2215,73 +2408,25 @@ impl ConfigForm {
                     .child(
                         div()
                             .flex_1()
-                            .id("vless-uuid")
+                            .id(caption_id)
                             .test_support()
-                            .child(Input::new(&self.vless_uuid).mask_toggle()),
+                            .child(Label::new(caption.to_string())),
                     )
-                    .child(
-                        Button::new("vless-uuid-generate")
-                            .small()
-                            .label("Generate")
-                            .tooltip("Generate a random UUIDv4")
-                            .accessibility_label("Generate a random UUIDv4")
-                            .on_click(move |_, window, cx| {
-                                let generated = generate_uuid_v4();
-                                uuid_view.update(cx, |_, cx| {
-                                    uuid_entity.update(cx, |state, cx| {
-                                        state.set_value(generated, &mut *window, cx);
-                                    });
-                                });
-                                window.push_notification(
-                                    Notification::info("Generated a new UUID"),
-                                    cx,
-                                );
-                            }),
-                    ),
-            ),
-        );
-        let flow_select = self.vless_flow.clone();
-        let packet_select = self.vless_packet_encoding.clone();
-        block = block.child(
-            field().label("Flow".to_string()).child(
-                div()
-                    .id("vless-flow-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| Tooltip::new("VLESS flow (vision disables mux)".to_string()))
-                            .into()
-                    })
-                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        Select::new(&flow_select)
-                            .id("vless-flow")
-                            .small()
-                            .accessibility_label("VLESS flow"),
-                    ),
-            ),
-        );
-        block = block.child(
-            field().label("Packet encoding".to_string()).child(
-                div()
-                    .id("vless-packet-encoding-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| Tooltip::new("VLESS packet encoding".to_string()))
-                            .into()
-                    })
-                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        Select::new(&packet_select)
-                            .id("vless-packet-encoding")
-                            .small()
-                            .accessibility_label("VLESS packet encoding"),
-                    ),
-            ),
-        );
+                    .child(panel_toggle_button(
+                        toggle_id,
+                        if *open.borrow() { "Hide" } else { "Show" },
+                        view,
+                        open,
+                    )),
+            )
+            .content(div().id(section_id).test_support().child(block))
+    }
+
+    /// Config-completeness T03: shared Transport panel (S1) — the exact T02
+    /// section (network picker plus per-network conditionals; `headers` /
+    /// early-data stay JSON-only so the engine never drops them), shared by
+    /// the vless/vmess/trojan pages (one rule, three pages).
+    fn s1_section(&self, view: &Entity<AppView>, cx: &App) -> impl IntoElement {
         // S1: Transport — network picker plus per-network conditionals
         // (only keys `apply_transport` maps; `headers`/early-data stay
         // JSON-only so the engine never drops them on the floor).
@@ -2335,39 +2480,50 @@ impl ConfigForm {
             }
             _ => {}
         }
-        block = block.child(
-            field().label_indent(false).child(
-                Collapsible::new()
-                    .open(*self.s1_open.borrow())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .id("s1-caption")
-                                    .test_support()
-                                    .child(Label::new("Transport")),
-                            )
-                            .child(panel_toggle_button(
-                                "s1-toggle",
-                                if *self.s1_open.borrow() {
-                                    "Hide"
-                                } else {
-                                    "Show"
-                                },
-                                view,
-                                &self.s1_open,
-                            )),
-                    )
-                    .content(div().id("s1-section").test_support().child(s1_body)),
-            ),
-        );
+        field().label_indent(false).child(
+            Collapsible::new()
+                .open(*self.s1_open.borrow())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("s1-caption")
+                                .test_support()
+                                .child(Label::new("Transport")),
+                        )
+                        .child(panel_toggle_button(
+                            "s1-toggle",
+                            if *self.s1_open.borrow() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                            view,
+                            &self.s1_open,
+                        )),
+                )
+                .content(div().id("s1-section").test_support().child(s1_body)),
+        )
+    }
+
+    /// Config-completeness T03: shared TLS panel, optional variant (S2) —
+    /// the exact T02 section (enable toggle plus credential inputs;
+    /// disabling folds `security` away while every other key stays
+    /// preserved), shared by the vless/vmess/trojan pages.
+    fn s2_section(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
         // S2: TLS, optional variant — enable toggle plus credential inputs.
         // Disabling folds `security` away; every other key stays preserved.
+        let _ = cx;
         let s2_enable = self.s2_enable.clone();
         let s2_repaint = repaint.clone();
         let s2_insecure = self.s2_insecure.clone();
@@ -2460,10 +2616,145 @@ impl ConfigForm {
                         .child(Input::new(&self.s2_sid)),
                 ),
             );
-        block = block.child(
-            field().label_indent(false).child(
+        field().label_indent(false).child(
+            Collapsible::new()
+                .open(*self.s2_open.borrow())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("s2-caption")
+                                .test_support()
+                                .child(Label::new("TLS")),
+                        )
+                        .child(panel_toggle_button(
+                            "s2-toggle",
+                            if *self.s2_open.borrow() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                            view,
+                            &self.s2_open,
+                        )),
+                )
+                .content(div().id("s2-section").test_support().child(s2_body)),
+        )
+    }
+
+    /// Config-completeness T03: shared Mux+Brutal panel (S3) — the exact
+    /// T02 section (`flow=vision` unmounts the section with reason text,
+    /// stored keys preserved, fold skipped; brutal forces On). `vision`
+    /// comes from the page's flow picker (true only on VLESS with
+    /// `xtls-rprx-vision`); every other page passes false. Kit:
+    /// `RadioGroup` (`selected_index` + `on_change`) + `Switch` + `Input`.
+    fn s3_section(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+        vision: bool,
+    ) -> AnyElement {
+        // S3: Mux+Brutal — `flow=vision` unmounts the section with reason
+        // text (stored keys preserved, fold skipped); brutal forces On.
+        let _ = cx;
+        if vision {
+            return field().label_indent(false).child(
+                div()
+                    .id("s3-vision-note")
+                    .test_support()
+                    .child("Mux is unavailable with the xtls-rprx-vision flow — stored mux keys are preserved."),
+            ).into_any_element();
+        }
+        let effective = self.s3_effective_mode();
+        let selected = ["", "on", "off"].iter().position(|mode| *mode == effective);
+        let mode_labels = ["Keep Default", "On", "Off"];
+        let mode_cell = self.s3_mode.clone();
+        let mode_repaint = repaint.clone();
+        let mut group = RadioGroup::horizontal("s3-mux-options")
+            .selected_index(selected)
+            .on_change(move |ix, window, cx| {
+                if let Some(mode) = ["", "on", "off"].get(*ix) {
+                    *mode_cell.borrow_mut() = mode.to_string();
+                }
+                mode_repaint(window, cx);
+            });
+        for label in mode_labels {
+            group = group.child(
+                Radio::new(label)
+                    .small()
+                    .label(label)
+                    .tooltip(format!("Mux mode {label}")),
+            );
+        }
+        let mut s3_body = div().flex().flex_col().gap_1().child(
+            field().label("Multiplex mode".to_string()).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("s3-mux-caption")
+                            .test_support()
+                            .child(Label::new("Multiplex mode")),
+                    )
+                    .child(div().id("s3-mux-group").test_support().child(group)),
+            ),
+        );
+        if *self.s3_brutal.borrow() && effective == "on" && self.s3_mode.borrow().as_str() != "on" {
+            s3_body = s3_body.child(
+                div()
+                    .id("s3-brutal-note")
+                    .test_support()
+                    .child("Brutal requires mux (forced On)."),
+            );
+        }
+        let brutal_cell = self.s3_brutal.clone();
+        let brutal_repaint = repaint.clone();
+        s3_body = s3_body
+            .child(
+                field().label_indent(false).child(
+                    div().id("s3-brutal").test_support().child(
+                        Switch::new("s3-brutal-switch")
+                            .small()
+                            .checked(*self.s3_brutal.borrow())
+                            .label("Brutal (forces mux On)")
+                            .tooltip("Brutal congestion speeds (Mbps); enabling forces mux On")
+                            .accessibility_label("Enable Brutal speeds (forces mux On)")
+                            .on_change(move |next: &bool, window, cx| {
+                                *brutal_cell.borrow_mut() = *next;
+                                brutal_repaint(window, cx);
+                            }),
+                    ),
+                ),
+            )
+            .child(
+                field().label("Brutal up Mbps".to_string()).child(
+                    div()
+                        .id("s3-up")
+                        .test_support()
+                        .child(Input::new(&self.s3_up)),
+                ),
+            )
+            .child(
+                field().label("Brutal down Mbps".to_string()).child(
+                    div()
+                        .id("s3-down")
+                        .test_support()
+                        .child(Input::new(&self.s3_down)),
+                ),
+            );
+        field()
+            .label_indent(false)
+            .child(
                 Collapsible::new()
-                    .open(*self.s2_open.borrow())
+                    .open(*self.s3_open.borrow())
                     .child(
                         div()
                             .flex()
@@ -2473,151 +2764,40 @@ impl ConfigForm {
                             .child(
                                 div()
                                     .flex_1()
-                                    .id("s2-caption")
+                                    .id("s3-caption")
                                     .test_support()
-                                    .child(Label::new("TLS")),
+                                    .child(Label::new("Mux")),
                             )
                             .child(panel_toggle_button(
-                                "s2-toggle",
-                                if *self.s2_open.borrow() {
+                                "s3-toggle",
+                                if *self.s3_open.borrow() {
                                     "Hide"
                                 } else {
                                     "Show"
                                 },
                                 view,
-                                &self.s2_open,
+                                &self.s3_open,
                             )),
                     )
-                    .content(div().id("s2-section").test_support().child(s2_body)),
-            ),
-        );
-        // S3: Mux+Brutal — `flow=vision` unmounts the section with reason
-        // text (stored keys preserved, fold skipped); brutal forces On.
-        let flow = Self::panel_value(&self.vless_flow, cx, "");
-        if flow == "xtls-rprx-vision" {
-            block = block.child(field().label_indent(false).child(
-                div()
-                    .id("s3-vision-note")
-                    .test_support()
-                    .child("Mux is unavailable with the xtls-rprx-vision flow — stored mux keys are preserved."),
-            ));
-        } else {
-            let effective = self.s3_effective_mode();
-            let selected = ["", "on", "off"].iter().position(|mode| *mode == effective);
-            let mode_labels = ["Keep Default", "On", "Off"];
-            let mode_cell = self.s3_mode.clone();
-            let mode_repaint = repaint.clone();
-            let mut group = RadioGroup::horizontal("s3-mux-options")
-                .selected_index(selected)
-                .on_change(move |ix, window, cx| {
-                    if let Some(mode) = ["", "on", "off"].get(*ix) {
-                        *mode_cell.borrow_mut() = mode.to_string();
-                    }
-                    mode_repaint(window, cx);
-                });
-            for label in mode_labels {
-                group = group.child(
-                    Radio::new(label)
-                        .small()
-                        .label(label)
-                        .tooltip(format!("Mux mode {label}")),
-                );
-            }
-            let mut s3_body = div().flex().flex_col().gap_1().child(
-                field().label("Multiplex mode".to_string()).child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .id("s3-mux-caption")
-                                .test_support()
-                                .child(Label::new("Multiplex mode")),
-                        )
-                        .child(div().id("s3-mux-group").test_support().child(group)),
-                ),
-            );
-            if *self.s3_brutal.borrow()
-                && effective == "on"
-                && self.s3_mode.borrow().as_str() != "on"
-            {
-                s3_body = s3_body.child(
-                    div()
-                        .id("s3-brutal-note")
-                        .test_support()
-                        .child("Brutal requires mux (forced On)."),
-                );
-            }
-            let brutal_cell = self.s3_brutal.clone();
-            let brutal_repaint = repaint.clone();
-            s3_body = s3_body
-                .child(
-                    field().label_indent(false).child(
-                        div().id("s3-brutal").test_support().child(
-                            Switch::new("s3-brutal-switch")
-                                .small()
-                                .checked(*self.s3_brutal.borrow())
-                                .label("Brutal (forces mux On)")
-                                .tooltip("Brutal congestion speeds (Mbps); enabling forces mux On")
-                                .accessibility_label("Enable Brutal speeds (forces mux On)")
-                                .on_change(move |next: &bool, window, cx| {
-                                    *brutal_cell.borrow_mut() = *next;
-                                    brutal_repaint(window, cx);
-                                }),
-                        ),
-                    ),
-                )
-                .child(
-                    field().label("Brutal up Mbps".to_string()).child(
-                        div()
-                            .id("s3-up")
-                            .test_support()
-                            .child(Input::new(&self.s3_up)),
-                    ),
-                )
-                .child(
-                    field().label("Brutal down Mbps".to_string()).child(
-                        div()
-                            .id("s3-down")
-                            .test_support()
-                            .child(Input::new(&self.s3_down)),
-                    ),
-                );
-            block = block.child(
-                field().label_indent(false).child(
-                    Collapsible::new()
-                        .open(*self.s3_open.borrow())
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .id("s3-caption")
-                                        .test_support()
-                                        .child(Label::new("Mux")),
-                                )
-                                .child(panel_toggle_button(
-                                    "s3-toggle",
-                                    if *self.s3_open.borrow() {
-                                        "Hide"
-                                    } else {
-                                        "Show"
-                                    },
-                                    view,
-                                    &self.s3_open,
-                                )),
-                        )
-                        .content(div().id("s3-section").test_support().child(s3_body)),
-                ),
-            );
-        }
+                    .content(div().id("s3-section").test_support().child(s3_body)),
+            )
+            .into_any_element()
+    }
+
+    /// Config-completeness T03: shared Advanced dial panel (S4, dial half)
+    /// — the exact T02 section (four toggles plus timeout/bind inputs; TLS
+    /// extras are a later ticket with their own engine `tls{}` mapping),
+    /// shared by all four pages. Kit: `Switch` (`checked` + `on_change`
+    /// over shared cells) + `Input`.
+    fn s4_section(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
         // S4: Advanced dial — toggles plus timeout/bind inputs (TLS extras
         // are a later ticket with their own engine `tls{}` mapping).
+        let _ = cx;
         let dial_switch = |id: &'static str,
                            switch_id: &'static str,
                            label: &str,
@@ -2704,66 +2884,298 @@ impl ConfigForm {
                         .child(Input::new(&self.s4_inet6)),
                 ),
             );
+        field().label_indent(false).child(
+            Collapsible::new()
+                .open(*self.s4_open.borrow())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("s4-caption")
+                                .test_support()
+                                .child(Label::new("Advanced dial")),
+                        )
+                        .child(panel_toggle_button(
+                            "s4-toggle",
+                            if *self.s4_open.borrow() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                            view,
+                            &self.s4_open,
+                        )),
+                )
+                .content(div().id("s4-section").test_support().child(s4_body)),
+        )
+    }
+
+    /// Config-completeness T03: VMess guided page — uuid (+uuidgen button),
+    /// aid, cipher and packet_encoding inner plus the shared S1–S4 panels
+    /// (same section fns as VLESS — one rule, four pages). Rendered only
+    /// while the live protocol is `vmess`; every other protocol keeps its
+    /// form. The whole page rides ONE outer collapsed disclosure (a single
+    /// header row at the 880x620 minimum — t11 pins the core form in-frame).
+    /// Kit constructors/builders: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, masked `Input` +
+    /// `mask_toggle`, `.small()` `Button` generator, `Field` + `v_form`
+    /// layout, outer-wrapper `Tooltip`s, `Label` captions.
+    fn vmess_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.uuid_row(view, &self.vmess_uuid, "vmess"));
         block = block.child(
-            field().label_indent(false).child(
-                Collapsible::new()
-                    .open(*self.s4_open.borrow())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .id("s4-caption")
-                                    .test_support()
-                                    .child(Label::new("Advanced dial")),
-                            )
-                            .child(panel_toggle_button(
-                                "s4-toggle",
-                                if *self.s4_open.borrow() {
-                                    "Hide"
-                                } else {
-                                    "Show"
-                                },
-                                view,
-                                &self.s4_open,
-                            )),
-                    )
-                    .content(div().id("s4-section").test_support().child(s4_body)),
+            field().label("Alter ID".to_string()).child(
+                div()
+                    .id("vmess-aid")
+                    .test_support()
+                    .child(Input::new(&self.vmess_aid)),
             ),
         );
+        block = block.child(Self::panel_select_row(
+            "Security",
+            "vmess-security-tip",
+            "VMess packet cipher (legacy links keep it in security)",
+            "vmess-security",
+            "VMess security (packet cipher)",
+            &self.vmess_security,
+        ));
+        block = block.child(Self::panel_select_row(
+            "Packet encoding",
+            "vmess-packet-encoding-tip",
+            "VMess packet encoding",
+            "vmess-packet-encoding",
+            "VMess packet encoding",
+            &self.vmess_packet_encoding,
+        ));
+        block = block.child(self.s1_section(view, cx));
+        block = block.child(self.s2_section(view, repaint, cx));
+        block = block.child(self.s3_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        Self::page_disclosure(
+            "VMess settings",
+            "vmess-section-caption",
+            "vmess-section-toggle",
+            "vmess-section",
+            &self.vmess_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T03: Trojan guided page — masked password inner
+    /// plus the full shared S1+S2+S3+S4 panels (same section fns as VLESS).
+    /// Rendered only while the live protocol is `trojan`. Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::vmess_block`].
+    fn trojan_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("trojan-password")
+                    .test_support()
+                    .child(Input::new(&self.trojan_password).mask_toggle()),
+            ),
+        );
+        block = block.child(self.s1_section(view, cx));
+        block = block.child(self.s2_section(view, repaint, cx));
+        block = block.child(self.s3_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        Self::page_disclosure(
+            "Trojan settings",
+            "trojan-section-caption",
+            "trojan-section-toggle",
+            "trojan-section",
+            &self.trojan_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T03: Shadowsocks guided page — method, password,
+    /// plugin, plugin_opts and uot inner with Mux-only Settings (no
+    /// Transport/Security panels — Throne HasMux parity) plus the shared
+    /// S4 dial panel (dial fields only — no TLS section, HasTLS gating).
+    /// Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::vmess_block`]. The plugin footer is honest: any
+    /// non-empty plugin fails generate naming the field until its
+    /// executable sits beside the engine.
+    fn shadowsocks_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(Self::panel_select_row(
+            "Method",
+            "ss-method-tip",
+            "Shadowsocks cipher (all 18)",
+            "ss-method",
+            "Shadowsocks method",
+            &self.ss_method,
+        ));
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("ss-password")
+                    .test_support()
+                    .child(Input::new(&self.ss_password).mask_toggle()),
+            ),
+        );
+        block = block.child(Self::panel_select_row(
+            "Plugin",
+            "ss-plugin-tip",
+            "Plugin executable (none runs stock)",
+            "ss-plugin",
+            "Shadowsocks plugin",
+            &self.ss_plugin,
+        ));
+        block = block.child(
+            field().label("Plugin options".to_string()).child(
+                div()
+                    .id("ss-plugin-opts")
+                    .test_support()
+                    .child(Input::new(&self.ss_plugin_opts)),
+            ),
+        );
+        let uot_cell = self.ss_uot.clone();
+        let uot_repaint = repaint.clone();
+        block = block.child(
+            field().label_indent(false).child(
+                div().id("ss-uot").test_support().child(
+                    Switch::new("ss-uot-switch")
+                        .small()
+                        .checked(*self.ss_uot.borrow())
+                        .label("UDP over TCP (uot)")
+                        .tooltip("UDP over TCP for shadowsocks (folds the uot flat)")
+                        .accessibility_label("UDP over TCP for shadowsocks")
+                        .on_change(move |next: &bool, window, cx| {
+                            *uot_cell.borrow_mut() = *next;
+                            uot_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        if !Self::panel_value(&self.ss_plugin, cx, "").trim().is_empty() {
+            block = block.child(field().label_indent(false).child(
+                div().id("ss-plugin-note").test_support().child(
+                    "Plugin rows need the plugin executable beside the engine — stock check fails without it.",
+                ),
+            ));
+        }
+        block = block.child(self.s3_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        Self::page_disclosure(
+            "Shadowsocks settings",
+            "ss-section-caption",
+            "ss-section-toggle",
+            "ss-section",
+            &self.ss_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T02: VLESS guided page — inner fields plus the
+    /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
+    /// `open`, no motion id — closed content unmounts, entities persist, so
+    /// hiding never wipes per R5). Rendered only while the live protocol is
+    /// `vless`; every other protocol keeps the T01 form byte-for-byte.
+    /// The whole page rides ONE outer collapsed disclosure (a single header
+    /// row at the 880x620 minimum — t11 pins the core form in-frame; seven
+    /// open rows would push it out).
+    /// Kit constructors/builders: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, `Input` (+ masked `uuid` with
+    /// `mask_toggle`), `Button` (+ `.small()` generators), `RadioGroup`
+    /// (`selected_index` + `on_change`, interval-picker precedent),
+    /// `Switch` (`checked` + `on_change` over shared cells), `Field` +
+    /// `v_form` layout, outer-wrapper `Tooltip`s, `Label` captions.
+    fn vless_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        // Inner: uuid (masked + generate) + flow + packet_encoding.
+        block = block.child(self.uuid_row(view, &self.vless_uuid, "vless"));
+        let flow_select = self.vless_flow.clone();
+        let packet_select = self.vless_packet_encoding.clone();
+        block = block.child(
+            field().label("Flow".to_string()).child(
+                div()
+                    .id("vless-flow-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("VLESS flow (vision disables mux)".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&flow_select)
+                            .id("vless-flow")
+                            .small()
+                            .accessibility_label("VLESS flow"),
+                    ),
+            ),
+        );
+        block = block.child(
+            field().label("Packet encoding".to_string()).child(
+                div()
+                    .id("vless-packet-encoding-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("VLESS packet encoding".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&packet_select)
+                            .id("vless-packet-encoding")
+                            .small()
+                            .accessibility_label("VLESS packet encoding"),
+                    ),
+            ),
+        );
+        // S1: Transport (shared section — see `s1_section`).
+        block = block.child(self.s1_section(view, cx));
+        // S2: TLS, optional variant (shared section — see `s2_section`).
+        block = block.child(self.s2_section(view, repaint, cx));
+        // S3: Mux+Brutal (shared section — see `s3_section`).
+        let flow = Self::panel_value(&self.vless_flow, cx, "");
+        block = block.child(self.s3_section(view, repaint, cx, flow == "xtls-rprx-vision"));
+        // S4: Advanced dial (shared section — see `s4_section`).
+        block = block.child(self.s4_section(view, repaint, cx));
         // One outer collapsed disclosure: a single header row at the minimum
         // frame (t11), the full page one click away.
-        Collapsible::new()
-            .open(*self.vless_open.borrow())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .id("vless-section-caption")
-                            .test_support()
-                            .child(Label::new("VLESS settings")),
-                    )
-                    .child(panel_toggle_button(
-                        "vless-section-toggle",
-                        if *self.vless_open.borrow() {
-                            "Hide"
-                        } else {
-                            "Show"
-                        },
-                        view,
-                        &self.vless_open,
-                    )),
-            )
-            .content(div().id("vless-section").test_support().child(block))
+        Self::page_disclosure(
+            "VLESS settings",
+            "vless-section-caption",
+            "vless-section-toggle",
+            "vless-section",
+            &self.vless_open,
+            view,
+            block,
+        )
     }
 
     fn element(
@@ -2793,18 +3205,28 @@ impl ConfigForm {
         // Pre-clone for the toggle buttons (both placements borrow this,
         // never `self` — the assembly below moves `self`'s fields).
         let toggle_form = self.clone();
-        // Config-completeness T02: the VLESS page builds here, before the
-        // assembly below moves `self`'s fields (`vless_block` borrows
+        // Config-completeness T02/T03: the guided page builds here, before
+        // the assembly below moves `self`'s fields (each `*_block` borrows
         // `&self`; the built element owns entity/Rc clones, so the borrow
-        // ends before the first move).
-        let vless_panels = if protocol_text == "vless" && !expanded {
+        // ends before the first move). One page per protocol — every other
+        // protocol keeps the T01 form byte-for-byte.
+        let guided_panels = if expanded {
+            None
+        } else {
             let repaint_view = view.clone();
             let repaint: DialogRepaint = Rc::new(move |_window, cx| {
                 repaint_view.update(cx, |_, cx| cx.notify());
             });
-            Some(self.vless_block(&view, &repaint, cx))
-        } else {
-            None
+            match protocol_text.as_str() {
+                "vless" => Some(self.vless_block(&view, &repaint, cx).into_any_element()),
+                "vmess" => Some(self.vmess_block(&view, &repaint, cx).into_any_element()),
+                "trojan" => Some(self.trojan_block(&view, &repaint, cx).into_any_element()),
+                "shadowsocks" => Some(
+                    self.shadowsocks_block(&view, &repaint, cx)
+                        .into_any_element(),
+                ),
+                _ => None,
+            }
         };
         // Ticket 05: guided and JSON swap (never stack) — each mode stays
         // near the old form's height, so no mode pushes content below the
@@ -2939,10 +3361,10 @@ impl ConfigForm {
                 ),
             );
         }
-        // Config-completeness T02: VLESS guided page (inner + S1–S4,
+        // Config-completeness T02/T03: guided page (inner + shared panels,
         // prebuilt above) between the protocol row and the guided/JSON
         // swap — other protocols keep the T01 form byte-for-byte.
-        if let Some(panels) = vless_panels {
+        if let Some(panels) = guided_panels {
             form = form.child(field().label_indent(false).child(panels));
         }
         if expanded {
@@ -3134,10 +3556,12 @@ impl ConfigForm {
     /// protocol's identity key). Blank guided inputs change nothing, so an
     /// untouched template and an untouched edit row commit byte-identical
     /// params (validation still names every missing field inline).
-    /// Config-completeness T02: on `vless` rows the inner fields plus the
-    /// S1/S2/S4 panels (and S3 unless vision-disabled) fold in the same
-    /// byte-identical way; any other protocol skips the panels outright so
-    /// a type switch can never smear VLESS keys onto foreign rows.
+    /// Config-completeness T02/T03: on guided pages the inner fields plus
+    /// the attached shared panels fold in the same byte-identical way —
+    /// vless/vmess/trojan take S1/S2/S4 (S3 unless vision-disabled on
+    /// vless), shadowsocks takes S3+S4 only (Mux-only Settings, Throne
+    /// HasMux parity); any other protocol skips the panels outright so a
+    /// type switch can never smear guided keys onto foreign rows.
     fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -3150,19 +3574,51 @@ impl ConfigForm {
             identity,
             self.guided_identity.read(cx).value().as_ref(),
         );
-        if protocol != "vless" {
-            return params;
+        match protocol.as_str() {
+            "vless" => {
+                let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
+                let params = fold_vless_inner_into_params(&params, &uuid, &flow, &packet_encoding);
+                let params = fold_transport_into_params(&params, &self.transport_fold(cx));
+                let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
+                let params = if flow == "xtls-rprx-vision" {
+                    params
+                } else {
+                    fold_mux_into_params(&params, &self.mux_fold(cx))
+                };
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "vmess" => {
+                let (uuid, aid, cipher, packet_encoding) = self.vmess_inner_values(cx);
+                let params =
+                    fold_vmess_inner_into_params(&params, &uuid, &aid, &cipher, &packet_encoding);
+                let params = fold_transport_into_params(&params, &self.transport_fold(cx));
+                let params = fold_tls_vmess_into_params(&params, &self.tls_optional_fold(cx));
+                let params = fold_mux_into_params(&params, &self.mux_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "trojan" => {
+                let password = self.trojan_password.read(cx).value().to_string();
+                let params = fold_trojan_inner_into_params(&params, &password);
+                let params = fold_transport_into_params(&params, &self.transport_fold(cx));
+                let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
+                let params = fold_mux_into_params(&params, &self.mux_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "shadowsocks" => {
+                let (method, password, plugin, plugin_opts, uot) = self.ss_inner_values(cx);
+                let params = fold_shadowsocks_inner_into_params(
+                    &params,
+                    &method,
+                    &password,
+                    &plugin,
+                    &plugin_opts,
+                    uot,
+                );
+                let params = fold_mux_into_params(&params, &self.mux_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            _ => params,
         }
-        let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
-        let params = fold_vless_inner_into_params(&params, &uuid, &flow, &packet_encoding);
-        let params = fold_transport_into_params(&params, &self.transport_fold(cx));
-        let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
-        let params = if flow == "xtls-rprx-vision" {
-            params
-        } else {
-            fold_mux_into_params(&params, &self.mux_fold(cx))
-        };
-        fold_dial_into_params(&params, &self.dial_fold(cx))
     }
 
     /// Config-completeness T02: read one panel dropdown (default when the
@@ -3186,6 +3642,32 @@ impl ConfigForm {
             self.vless_uuid.read(cx).value().to_string(),
             Self::panel_value(&self.vless_flow, cx, ""),
             Self::panel_value(&self.vless_packet_encoding, cx, ""),
+        )
+    }
+
+    /// Config-completeness T03: VMess inner texts in fold order (uuid, aid,
+    /// cipher, packet_encoding). The cipher picker falls back to `auto`
+    /// (the sing-box default) when the row carries none.
+    fn vmess_inner_values(&self, cx: &App) -> (String, String, String, String) {
+        (
+            self.vmess_uuid.read(cx).value().to_string(),
+            self.vmess_aid.read(cx).value().to_string(),
+            Self::panel_value(&self.vmess_security, cx, "auto"),
+            Self::panel_value(&self.vmess_packet_encoding, cx, ""),
+        )
+    }
+
+    /// Config-completeness T03: Shadowsocks inner texts in fold order
+    /// (method, password, plugin, plugin_opts, uot). The method/plugin
+    /// pickers fall back to blank ("no selection" — the fold never
+    /// fabricates nor strips).
+    fn ss_inner_values(&self, cx: &App) -> (String, String, String, String, bool) {
+        (
+            Self::panel_value(&self.ss_method, cx, ""),
+            self.ss_password.read(cx).value().to_string(),
+            Self::panel_value(&self.ss_plugin, cx, ""),
+            self.ss_plugin_opts.read(cx).value().to_string(),
+            *self.ss_uot.borrow(),
         )
     }
 
@@ -3253,9 +3735,9 @@ impl ConfigForm {
     /// guided values into the JSON box, then clear the guided inputs when
     /// the box parses as an object. A garbage box keeps the inputs, so
     /// nothing is ever lost (the commit fold reports that error instead).
-    /// Config-completeness T02: on `vless` rows the panels merge and clear
-    /// the same way (one truth after expand); other protocols keep the
-    /// guided-only behavior byte-for-byte.
+    /// Config-completeness T02/T03: on guided pages the panels merge and
+    /// clear the same way (one truth after expand); other protocols keep
+    /// the guided-only behavior byte-for-byte.
     fn expand_merge(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -3268,16 +3750,61 @@ impl ConfigForm {
             identity,
             self.guided_identity.read(cx).value().as_ref(),
         );
-        let vless = protocol == "vless";
-        if vless {
-            let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
-            merged = fold_vless_inner_into_params(&merged, &uuid, &flow, &packet_encoding);
-            merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
-            merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
-            if flow != "xtls-rprx-vision" {
-                merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+        // Each page folds exactly what it renders (never smears keys onto
+        // foreign rows); the clear below resets exactly what was merged.
+        let page = matches!(
+            protocol.as_str(),
+            "vless" | "vmess" | "trojan" | "shadowsocks"
+        );
+        if page {
+            match protocol.as_str() {
+                "vless" => {
+                    let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
+                    merged = fold_vless_inner_into_params(&merged, &uuid, &flow, &packet_encoding);
+                    merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
+                    merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
+                    if flow != "xtls-rprx-vision" {
+                        merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    }
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "vmess" => {
+                    let (uuid, aid, cipher, packet_encoding) = self.vmess_inner_values(cx);
+                    merged = fold_vmess_inner_into_params(
+                        &merged,
+                        &uuid,
+                        &aid,
+                        &cipher,
+                        &packet_encoding,
+                    );
+                    merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
+                    merged = fold_tls_vmess_into_params(&merged, &self.tls_optional_fold(cx));
+                    merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "trojan" => {
+                    let password = self.trojan_password.read(cx).value().to_string();
+                    merged = fold_trojan_inner_into_params(&merged, &password);
+                    merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
+                    merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
+                    merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "shadowsocks" => {
+                    let (method, password, plugin, plugin_opts, uot) = self.ss_inner_values(cx);
+                    merged = fold_shadowsocks_inner_into_params(
+                        &merged,
+                        &method,
+                        &password,
+                        &plugin,
+                        &plugin_opts,
+                        uot,
+                    );
+                    merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                _ => {}
             }
-            merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
         }
         let parseable = merged.trim().is_empty()
             || serde_json::from_str::<serde_json::Value>(&merged)
@@ -3299,57 +3826,83 @@ impl ConfigForm {
                     state.set_value(String::new(), window, cx);
                 });
             }
-            if vless {
-                self.clear_panels(window, cx);
+            if page {
+                self.clear_panels(window, cx, &protocol);
             }
         }
     }
 
-    /// Config-completeness T02: collapse counterpart of [`ConfigForm::expand_merge`]
-    /// for the panels — reset text inputs, dropdowns (to their defaults),
-    /// toggles and the mux mode cell.
-    fn clear_panels(&self, window: &mut Window, cx: &mut Context<AppView>) {
-        for entity in [
-            &self.vless_uuid,
-            &self.s1_path,
-            &self.s1_host,
-            &self.s1_method,
-            &self.s1_service_name,
-            &self.s2_sni,
-            &self.s2_alpn,
-            &self.s2_pbk,
-            &self.s2_sid,
+    /// Config-completeness T02/T03: collapse counterpart of
+    /// [`ConfigForm::expand_merge`] for the panels — reset text inputs,
+    /// dropdowns (to their defaults), toggles and the mux mode cell.
+    /// Resets exactly what the page merged: the current page's inner plus
+    /// the shared panels it folds (shadowsocks folds S3+S4 only, so S1/S2
+    /// inputs — possibly holding another page's unmerged typing — stand).
+    fn clear_panels(&self, window: &mut Window, cx: &mut Context<AppView>, protocol: &str) {
+        let mut texts: Vec<&Entity<InputState>> = vec![
             &self.s3_up,
             &self.s3_down,
             &self.s4_timeout,
             &self.s4_bind,
             &self.s4_inet4,
             &self.s4_inet6,
-        ] {
-            entity.update(cx, |state, cx| {
-                state.set_value(String::new(), window, cx);
-            });
-        }
-        for (entity, default) in [
-            (&self.vless_flow, ""),
-            (&self.vless_packet_encoding, ""),
-            (&self.s1_network, "tcp"),
-            (&self.s2_fp, ""),
-        ] {
-            let next = default.to_string();
-            entity.update(cx, |state, cx| {
-                state.set_selected_value(&next, window, cx);
-            });
-        }
-        for cell in [
-            &self.s2_enable,
-            &self.s2_insecure,
+        ];
+        let mut selects: Vec<(&Entity<SelectState<PanelChoiceList>>, &'static str)> = vec![];
+        let mut cells: Vec<&Rc<RefCell<bool>>> = vec![
             &self.s3_brutal,
             &self.s4_reuse,
             &self.s4_fastopen,
             &self.s4_fragment,
             &self.s4_multipath,
-        ] {
+        ];
+        if protocol != "shadowsocks" {
+            texts.extend([
+                &self.s1_path,
+                &self.s1_host,
+                &self.s1_method,
+                &self.s1_service_name,
+                &self.s2_sni,
+                &self.s2_alpn,
+                &self.s2_pbk,
+                &self.s2_sid,
+            ]);
+            selects.extend([(&self.s1_network, "tcp"), (&self.s2_fp, "")]);
+            cells.extend([&self.s2_enable, &self.s2_insecure]);
+        }
+        match protocol {
+            "vless" => {
+                texts.push(&self.vless_uuid);
+                selects.extend([(&self.vless_flow, ""), (&self.vless_packet_encoding, "")]);
+            }
+            "vmess" => {
+                texts.extend([&self.vmess_uuid, &self.vmess_aid]);
+                selects.extend([
+                    (&self.vmess_security, "auto"),
+                    (&self.vmess_packet_encoding, ""),
+                ]);
+            }
+            "trojan" => {
+                texts.push(&self.trojan_password);
+            }
+            "shadowsocks" => {
+                texts.extend([&self.ss_password, &self.ss_plugin_opts]);
+                selects.extend([(&self.ss_method, ""), (&self.ss_plugin, "")]);
+                cells.push(&self.ss_uot);
+            }
+            _ => {}
+        }
+        for entity in texts {
+            entity.update(cx, |state, cx| {
+                state.set_value(String::new(), window, cx);
+            });
+        }
+        for (entity, default) in selects {
+            let next = default.to_string();
+            entity.update(cx, |state, cx| {
+                state.set_selected_value(&next, window, cx);
+            });
+        }
+        for cell in cells {
             *cell.borrow_mut() = false;
         }
         *self.s3_mode.borrow_mut() = String::new();
@@ -3358,9 +3911,9 @@ impl ConfigForm {
     /// Ticket 05: collapse direction of the Advanced swap — echo the JSON
     /// box into blank guided inputs only (never clobbers values kept
     /// across a garbage box).
-    /// Config-completeness T02: on `vless` rows the panels echo the same
-    /// way (defaults count as blank for dropdowns, off counts as blank
-    /// for toggles).
+    /// Config-completeness T02/T03: on guided pages the panels echo the
+    /// same way (defaults count as blank for dropdowns, off counts as
+    /// blank for toggles).
     fn collapse_echo(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -3389,17 +3942,27 @@ impl ConfigForm {
                 });
             }
         }
-        if protocol == "vless" {
-            self.echo_panels(window, cx, &box_text);
+        if matches!(
+            protocol.as_str(),
+            "vless" | "vmess" | "trojan" | "shadowsocks"
+        ) {
+            self.echo_panels(window, cx, &box_text, &protocol);
         }
     }
 
-    /// Config-completeness T02: collapse counterpart of
+    /// Config-completeness T02/T03: collapse counterpart of
     /// [`ConfigForm::clear_panels`] — echo the JSON box into blank/default
     /// panel inputs only (never clobbers values kept across a garbage box).
-    fn echo_panels(&self, window: &mut Window, cx: &mut Context<AppView>, box_text: &str) {
+    /// Shared panels echo on every guided page; inner fields echo per page
+    /// (the vmess cipher reads grammar-aware, like prefill).
+    fn echo_panels(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        box_text: &str,
+        protocol: &str,
+    ) {
         for (entity, keys) in [
-            (&self.vless_uuid, &["uuid", "id"][..]),
             (&self.s1_path, &["path"][..]),
             (&self.s1_host, &["host"][..]),
             (&self.s1_method, &["method"][..]),
@@ -3423,13 +3986,33 @@ impl ConfigForm {
                 });
             }
         }
+        // Inner texts per page (blank inputs only, same rule).
+        let inner_texts: &[(&Entity<InputState>, &[&str])] = match protocol {
+            "vless" => &[(&self.vless_uuid, &["uuid", "id"][..])],
+            "vmess" => &[
+                (&self.vmess_uuid, &["uuid", "id"][..]),
+                (&self.vmess_aid, &["alter_id", "aid"][..]),
+            ],
+            "trojan" => &[(&self.trojan_password, &["password"][..])],
+            "shadowsocks" => &[
+                (&self.ss_password, &["password"][..]),
+                (
+                    &self.ss_plugin_opts,
+                    &["plugin_opts", "plugin-opts", "pluginOpts"][..],
+                ),
+            ],
+            _ => &[],
+        };
+        for (entity, keys) in inner_texts {
+            let value = guided_prefill_value(box_text, keys);
+            let blank = entity.read(cx).value().to_string().trim().is_empty();
+            if blank && !value.is_empty() {
+                entity.update(cx, |state, cx| {
+                    state.set_value(value.clone(), window, cx);
+                });
+            }
+        }
         for (entity, keys, default) in [
-            (&self.vless_flow, &["flow"][..], ""),
-            (
-                &self.vless_packet_encoding,
-                &["packet_encoding", "packetEncoding"][..],
-                "",
-            ),
             (&self.s1_network, &["network"][..], "tcp"),
             (&self.s2_fp, &["fp", "fingerprint"][..], ""),
         ] {
@@ -3441,6 +4024,56 @@ impl ConfigForm {
                 .unwrap_or_default();
             if current == default && !value.is_empty() && value != default {
                 entity.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
+        // Inner dropdowns per page (a default counts as blank, same rule).
+        let inner_selects: &[EchoSelect] = match protocol {
+            "vless" => &[
+                (&self.vless_flow, &["flow"][..], ""),
+                (
+                    &self.vless_packet_encoding,
+                    &["packet_encoding", "packetEncoding"][..],
+                    "",
+                ),
+            ],
+            "vmess" => &[(
+                &self.vmess_packet_encoding,
+                &["packet_encoding", "packetEncoding"][..],
+                "",
+            )],
+            "shadowsocks" => &[
+                (&self.ss_method, &["method"][..], ""),
+                (&self.ss_plugin, &["plugin"][..], ""),
+            ],
+            _ => &[],
+        };
+        for (entity, keys, default) in inner_selects {
+            let value = guided_prefill_value(box_text, keys);
+            let current = entity
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == *default && !value.is_empty() && value != *default {
+                entity.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
+        // The vmess cipher reads grammar-aware (legacy `security` vs
+        // new-style `encryption`) — the same reader prefill uses.
+        if protocol == "vmess" {
+            let value = vmess_cipher_value(box_text);
+            let current = self
+                .vmess_security
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == "auto" && !value.is_empty() && value != "auto" {
+                self.vmess_security.update(cx, |state, cx| {
                     state.set_selected_value(&value, window, cx);
                 });
             }
@@ -3466,15 +4099,27 @@ impl ConfigForm {
             }
         }
         // `security: "tls"` is not a truthy spelling — the enable toggle
-        // echoes the on-values the engine maps (same rule as prefill).
+        // echoes the on-values the engine maps (same rule as prefill;
+        // vmess rows read grammar-aware for the legacy boolean).
         if !*self.s2_enable.borrow() {
-            let security = guided_prefill_value(box_text, &["security"]);
-            if matches!(
-                security.to_ascii_lowercase().as_str(),
-                "tls" | "xtls" | "reality"
-            ) {
+            let on = if protocol == "vmess" {
+                vmess_tls_enabled(box_text)
+            } else {
+                let security = guided_prefill_value(box_text, &["security"]);
+                matches!(
+                    security.to_ascii_lowercase().as_str(),
+                    "tls" | "xtls" | "reality"
+                )
+            };
+            if on {
                 *self.s2_enable.borrow_mut() = true;
             }
+        }
+        if protocol == "shadowsocks"
+            && !*self.ss_uot.borrow()
+            && guided_prefill_bool(box_text, &["udp_over_tcp", "uot"])
+        {
+            *self.ss_uot.borrow_mut() = true;
         }
         if self.s3_mode.borrow().is_empty() {
             let mode = guided_prefill_value(box_text, &["mux"]);
@@ -6238,6 +6883,60 @@ fn fp_choices() -> Vec<PanelChoice> {
         ],
     )
 }
+
+/// Config-completeness T03: vmess packet ciphers (exactly the 5
+/// [`crate::store::VMESS_CIPHERS`] values — one source for picker, prefill
+/// and fold, so a value the UI cannot pick is a value the fold cannot
+/// write). `auto` leads as the sing-box default.
+fn vmess_security_choices() -> Vec<PanelChoice> {
+    use crate::store::VMESS_CIPHERS;
+    let mut items: Vec<(&str, &str)> = Vec::with_capacity(VMESS_CIPHERS.len());
+    for cipher in VMESS_CIPHERS {
+        let title = if cipher == "auto" {
+            "auto (default)"
+        } else {
+            cipher
+        };
+        items.push((cipher, title));
+    }
+    panel_choices("vmess-security-option", &items)
+}
+
+/// Config-completeness T03: all 18 sing-box shadowsocks ciphers (exactly
+/// [`crate::store::SS_METHODS`]) behind one blank "Select method…" row.
+/// Method has no valid default — the blank row stands for "no selection"
+/// (the fold never fabricates nor strips; the commit gate names a missing
+/// method instead).
+fn ss_method_choices() -> Vec<PanelChoice> {
+    use crate::store::SS_METHODS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select method…")];
+    for method in SS_METHODS {
+        items.push((method, method));
+    }
+    panel_choices("ss-method-option", &items)
+}
+
+/// Config-completeness T03: shadowsocks plugin names (`""` = none; any
+/// non-empty pick fails generate naming `plugin` until its executable sits
+/// beside the engine — the page footer says so, Throne parity).
+fn ss_plugin_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "ss-plugin-option",
+        &[
+            ("", "No plugin"),
+            ("obfs-local", "obfs-local"),
+            ("v2ray-plugin", "v2ray-plugin"),
+        ],
+    )
+}
+
+/// Config-completeness T03: one echoed dropdown for the collapse path —
+/// panel state, read keys, and the default that counts as blank.
+type EchoSelect<'a> = (
+    &'a Entity<SelectState<PanelChoiceList>>,
+    &'a [&'a str],
+    &'a str,
+);
 
 /// Config-completeness T02: UUIDv4 for the VLESS generate button — OS
 /// CSPRNG via the existing `getrandom` dep (no new crates); the clash-secret
@@ -17683,6 +18382,698 @@ mod tests {
         });
         let value: serde_json::Value = serde_json::from_str(&folded).expect("brutal fold is JSON");
         assert_eq!(value["mux"], "on", "brutal forces mux on in the fold");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T03: new dropdown sizes — vmess security 5,
+    /// packet_encoding 3, ss method 18 (plus the blank "no selection" row),
+    /// ss plugin 3. Pure constructors, no window needed.
+    #[test]
+    fn t03_dropdown_counts() {
+        assert_eq!(
+            crate::vmess_security_choices().len(),
+            5,
+            "vmess security lists 5 ciphers"
+        );
+        assert_eq!(
+            crate::packet_encoding_choices().len(),
+            3,
+            "packet_encoding lists 3"
+        );
+        let methods = crate::ss_method_choices();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|choice| !choice.value.is_empty())
+                .count(),
+            18,
+            "ss method lists 18 ciphers"
+        );
+        assert_eq!(crate::ss_plugin_choices().len(), 3, "ss plugin lists 3");
+    }
+
+    /// Config-completeness T03: VMess Edit renders uuid (+uuidgen) + aid +
+    /// cipher + packet_encoding + S1–S4 as kit primitives with pinned ids;
+    /// every cipher and packet spelling resolves through the delegate.
+    #[gpui_kit::test]
+    fn t03_vmess_page_paints(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let params = "{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"alter_id\":\"0\",\
+            \"security\":\"auto\",\"tls\":true,\"sni\":\"a.example.com\",\"network\":\"ws\",\
+            \"path\":\"/w\",\"mux\":\"on\"}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "VmessRow".to_string(),
+                protocol: "vmess".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Edit opens on the raw JSON (Advanced expanded) — collapse into
+        // the guided page, then expand the VMess disclosure.
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "vmess-section-caption");
+        assert_absent(cx, "vmess-uuid".to_string());
+        cx.update(|window, cx| {
+            window.click("vmess-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "vmess-uuid",
+            "vmess-uuid-generate",
+            "vmess-aid",
+            "vmess-security",
+            "vmess-packet-encoding",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // Foreign pages never paint here.
+        for id in [
+            "ss-method",
+            "trojan-password",
+            "vless-flow",
+            "s3-vision-note",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "s1-network",
+            "s1-path",
+            "s2-enable",
+            "s2-sni",
+            "s3-mux-group",
+            "s4-reuse",
+            "s4-timeout",
+        ] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: every cipher (5) and packet spelling (3)
+        // resolves through `set_selected_value` (virtualized popups only
+        // paint visible rows, so counts pin here, not in the tree).
+        let row = ProxyConfig {
+            id: "t03-v".to_string(),
+            name: "V".to_string(),
+            protocol: "vmess".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                for cipher in crate::store::VMESS_CIPHERS {
+                    form.vmess_security.update(cx, |state, cx| {
+                        state.set_selected_value(&cipher.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.vmess_security
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        cipher,
+                        "cipher {cipher} resolves"
+                    );
+                }
+                for choice in crate::packet_encoding_choices() {
+                    form.vmess_packet_encoding.update(cx, |state, cx| {
+                        state.set_selected_value(&choice.value.clone(), window, cx);
+                    });
+                    assert_eq!(
+                        form.vmess_packet_encoding
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        choice.value,
+                        "packet spelling resolves"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T03: Trojan Edit renders the masked password +
+    /// full S1+S2+S3+S4 as kit primitives; nothing from the other pages.
+    #[gpui_kit::test]
+    fn t03_trojan_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "TrojanRow".to_string(),
+                protocol: "trojan".to_string(),
+                params: "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
+                    \"password\":\"secret\",\"security\":\"tls\",\"sni\":\"a.example.com\",\
+                    \"network\":\"ws\",\"path\":\"/w\",\"mux\":\"on\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "trojan-section-caption");
+        cx.update(|window, cx| {
+            window.click("trojan-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "trojan-password",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in ["vmess-aid", "ss-method", "vless-uuid", "s3-vision-note"] {
+            assert_absent(cx, id.to_string());
+        }
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "s1-network",
+            "s2-enable",
+            "s2-pbk",
+            "s3-mux-group",
+            "s3-brutal",
+            "s4-reuse",
+        ] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T03: Shadowsocks Edit renders method, password,
+    /// plugin, plugin_opts and uot with Mux-only Settings (no
+    /// Network/Security panels — Throne HasMux parity); Advanced shows the
+    /// dial fields with no TLS section (HasTLS gating). All 18 methods and
+    /// all 3 plugin spellings resolve through the delegate.
+    #[gpui_kit::test]
+    fn t03_ss_page_paints_mux_only(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let params = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+            \"method\":\"aes-128-gcm\",\"password\":\"pw\",\"mux\":\"on\"}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "SsRow".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "ss-section-caption");
+        cx.update(|window, cx| {
+            window.click("ss-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "ss-method",
+            "ss-password",
+            "ss-plugin",
+            "ss-plugin-opts",
+            "ss-uot",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // Mux-only Settings: no Transport/TLS panels; nothing from the
+        // other pages; no plugin footer on a plugin-less row.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s2-enable",
+            "trojan-password",
+            "vmess-aid",
+            "ss-plugin-note",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        for toggle in ["s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Advanced dial paints with no TLS section (HasTLS gating holds —
+        // the dial half carries no TLS extras by construction).
+        for id in ["s3-mux-group", "s4-reuse", "s4-timeout", "s4-bind"] {
+            assert_painted(cx, id);
+        }
+        for id in ["s1-caption", "s2-caption", "s2-enable", "s2-pbk"] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: all 18 methods + all 3 plugin spellings.
+        let row = ProxyConfig {
+            id: "t03-s".to_string(),
+            name: "S".to_string(),
+            protocol: "shadowsocks".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                for method in crate::store::SS_METHODS {
+                    form.ss_method.update(cx, |state, cx| {
+                        state.set_selected_value(&method.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.ss_method
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        method,
+                        "method {method} resolves"
+                    );
+                }
+                for plugin in ["", "obfs-local", "v2ray-plugin"] {
+                    form.ss_plugin.update(cx, |state, cx| {
+                        state.set_selected_value(&plugin.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.ss_plugin
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        plugin,
+                        "plugin spellings resolve"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T03: picking a plugin paints the honest footer
+    /// (the executable must sit beside the engine); back to none hides it.
+    /// Driven through the real picker (3 rows fit — clicks reach them).
+    #[gpui_kit::test]
+    fn t03_ss_plugin_note_paints_on_pick(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "SsPluginRow".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params:
+                    "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+                    \"method\":\"aes-128-gcm\",\"password\":\"pw\"}"
+                        .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("ss-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "ss-plugin-note".to_string());
+        cx.update(|window, cx| {
+            window.click("ss-plugin", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("ss-plugin-option-obfs-local", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "ss-plugin-note");
+        cx.update(|window, cx| {
+            window.click("ss-plugin", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("ss-plugin-option-default", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "ss-plugin-note".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T03: an imported legacy `vmess://` link (boolean
+    /// `tls`, cipher in `security` — exactly what the grammar writes)
+    /// prefills every inner field and refolds byte-identical — untouched
+    /// Edit commits zero spurious patch.
+    #[gpui_kit::test]
+    fn t03_legacy_vmess_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::import::import_text;
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let link = "vmess://eyJ2IjoiMiIsInBzIjoibGVnYWN5LXZtZXNzIiwiYWRkIjoiYS5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidHlwZSI6Im5vbmUiLCJ0bHMiOiJ0bHMiLCJzbmkiOiJhLmV4YW1wbGUuY29tIn0=";
+        let mut batch = import_text(link);
+        assert!(
+            batch.failures.is_empty(),
+            "link imports: {:?}",
+            batch.failures
+        );
+        assert_eq!(batch.configs.len(), 1, "one row");
+        let parsed = batch.configs.remove(0);
+        assert_eq!(parsed.protocol, "vmess");
+        let row = ProxyConfig {
+            id: "t03".to_string(),
+            name: parsed.name.clone(),
+            protocol: parsed.protocol.clone(),
+            params: parsed.params.clone(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let (uuid, aid, cipher, enable, sni, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                let uuid = form.vmess_uuid.read(cx).value().to_string();
+                let aid = form.vmess_aid.read(cx).value().to_string();
+                let cipher = form
+                    .vmess_security
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .unwrap_or_default();
+                let enable = *form.s2_enable.borrow();
+                let sni = form.s2_sni.read(cx).value().to_string();
+                let folded = form.effective_params(cx);
+                (uuid, aid, cipher, enable, sni, folded)
+            })
+        });
+        assert_eq!(
+            uuid, "11111111-2222-4333-8444-555555555555",
+            "uuid prefills"
+        );
+        assert_eq!(aid, "0", "aid prefills");
+        assert_eq!(cipher, "auto", "legacy cipher prefills");
+        assert!(enable, "legacy boolean enables TLS");
+        assert_eq!(sni, "a.example.com", "sni prefills");
+        assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
+    }
+
+    /// Config-completeness T03: seeded trojan/shadowsocks rows prefill and
+    /// refold byte-identical (passwords, method, plugin opts, uot, mux).
+    #[gpui_kit::test]
+    fn t03_trojan_ss_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let trojan_params =
+            "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"password\":\"secret\",\"security\":\"tls\",\"sni\":\"a.example.com\",\
+            \"network\":\"ws\",\"path\":\"/w\",\"mux\":\"on\"}";
+        let ss_params =
+            "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+            \"method\":\"chacha20-ietf-poly1305\",\"password\":\"pw\",\
+            \"plugin_opts\":\"obfs=http\",\"udp_over_tcp\":true,\"mux\":\"on\"}";
+        let rows = [
+            ("t03-t", "T", "trojan", trojan_params),
+            ("t03-s", "S", "shadowsocks", ss_params),
+        ];
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        for (id, name, protocol, params) in rows {
+            let row = ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let (password, extra, folded) = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    let password = if protocol == "trojan" {
+                        form.trojan_password.read(cx).value().to_string()
+                    } else {
+                        form.ss_password.read(cx).value().to_string()
+                    };
+                    let extra = if protocol == "trojan" {
+                        form.s2_sni.read(cx).value().to_string()
+                    } else {
+                        form.ss_method
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    (password, extra, form.effective_params(cx))
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "{protocol} untouched refold is byte-identical"
+            );
+            if protocol == "trojan" {
+                assert_eq!(password, "secret", "trojan password prefills");
+                assert_eq!(extra, "a.example.com", "trojan sni prefills");
+            } else {
+                assert_eq!(password, "pw", "ss password prefills");
+                assert_eq!(extra, "chacha20-ietf-poly1305", "ss method prefills");
+            }
+        }
+    }
+
+    /// Config-completeness T03 ENTER-guard (audit §10.9 incident regression
+    /// per dropdown ticket): Confirm from inside a new picker popup stops
+    /// at the picker wrapper — the dialog never commits a half-filled row.
+    /// Driven through the real protocol picker with keyboard navigation
+    /// (virtualized list — arrows + Enter is the honest path, T01
+    /// precedent), then into the ss method popup. Validation-sensitive by
+    /// construction like the T01 guard test: a broken guard would run the
+    /// commit on the untouched (invalid) ss template and fire exactly one
+    /// error toast.
+    #[gpui_kit::test]
+    fn t03_enter_in_ss_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to shadowsocks through the real picker (cursor starts
+        // at `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("shadowsocks");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The Shadowsocks page renders (Add wiring holds for the new page).
+        assert_painted(cx, "ss-section-caption");
+        cx.update(|window, cx| {
+            window.click("ss-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "ss-method");
+        // Open the method popup, then Enter: the pick lands, the commit
+        // must not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("ss-method", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("ss-method-option-default".to_string())
+                .is_some()),
+            "method popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "method Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "method Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "method Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "ss-method-option-default".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 

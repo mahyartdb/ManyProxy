@@ -1015,6 +1015,63 @@ pub struct TlsOptionalFold {
     pub sid: String,
 }
 
+/// Config-completeness T03: the `security` enable/disable half of the
+/// optional TLS fold — enabling writes `tls` (or `reality` with a public
+/// key), disabling removes the key. Shared by the standard fold and the
+/// vmess legacy-aware variant below (one rule, two callers).
+fn fold_tls_security(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    fold: &TlsOptionalFold,
+) -> bool {
+    if fold.enable {
+        let want = if fold.pbk.trim().is_empty() {
+            "tls"
+        } else {
+            "reality"
+        };
+        match obj.get("security") {
+            Some(serde_json::Value::String(current)) if current.eq_ignore_ascii_case(want) => false,
+            _ => {
+                obj.insert(
+                    "security".to_string(),
+                    serde_json::Value::String(want.to_string()),
+                );
+                true
+            }
+        }
+    } else {
+        obj.remove("security").is_some()
+    }
+}
+
+/// Config-completeness T03: the credential half of the optional TLS fold
+/// (`sni`/`alpn`/`fp`/`insecure`/`pbk`/`sid`) — blank-safe, alias-aware,
+/// byte-identical on no-ops. Shared by the standard fold and the vmess
+/// legacy-aware variant below.
+fn fold_tls_details(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    fold: &TlsOptionalFold,
+) -> bool {
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "sni", &["sni", "peer"], &fold.sni);
+    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
+    changed |= fold_text_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
+    changed |= fold_bool_aliases(
+        obj,
+        "insecure",
+        &[
+            "insecure",
+            "allowInsecure",
+            "allow_insecure",
+            "allowinsecure",
+        ],
+        fold.insecure,
+    );
+    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
+    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    changed
+}
+
 /// Config-completeness T02: shared Mux+Brutal panel (S3). `mode` is
 /// `""` (keep default) | `"on"` | `"off"`; speeds are raw UI text (Mbps).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1231,42 +1288,8 @@ pub fn fold_tls_optional_into_params(params_raw: &str, fold: &TlsOptionalFold) -
         Some(obj) => obj,
         None => return params_raw.to_string(),
     };
-    let mut changed = false;
-    if fold.enable {
-        let want = if fold.pbk.trim().is_empty() {
-            "tls"
-        } else {
-            "reality"
-        };
-        match obj.get("security") {
-            Some(serde_json::Value::String(current)) if current.eq_ignore_ascii_case(want) => {}
-            _ => {
-                obj.insert(
-                    "security".to_string(),
-                    serde_json::Value::String(want.to_string()),
-                );
-                changed = true;
-            }
-        }
-    } else {
-        changed |= obj.remove("security").is_some();
-    }
-    changed |= fold_text_aliases(obj, "sni", &["sni", "peer"], &fold.sni);
-    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
-    changed |= fold_text_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
-    changed |= fold_bool_aliases(
-        obj,
-        "insecure",
-        &[
-            "insecure",
-            "allowInsecure",
-            "allow_insecure",
-            "allowinsecure",
-        ],
-        fold.insecure,
-    );
-    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
-    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    let mut changed = fold_tls_security(obj, fold);
+    changed |= fold_tls_details(obj, fold);
     if changed {
         value.to_string()
     } else {
@@ -1376,6 +1399,284 @@ pub fn fold_vless_inner_into_params(
     changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], uuid);
     changed |= fold_select_key(obj, "flow", flow, "");
     changed |= fold_select_key(obj, "packet_encoding", packet_encoding, "");
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: sing-box vmess packet ciphers (the `security`
+/// Select on the VMess page). One source for the picker, the prefill reader
+/// and the fold below — a value the UI cannot pick is a value the fold
+/// cannot write. `auto` leads: it is the sing-box default (the engine's
+/// new-style arm falls back to it), so it folds to absent on new-style rows.
+pub const VMESS_CIPHERS: [&str; 5] = ["auto", "zero", "none", "chacha20-poly1305", "aes-128-gcm"];
+
+/// Config-completeness T03: sing-box 1.14.2 shadowsocks ciphers (the
+/// `method` Select on the Shadowsocks page — all 18 incl. `2022-blake3-*`,
+/// `none`, `aes-*-gcm/ctr/cfb`, `chacha20-ietf*`, `xchacha20*`, `rc4-md5`).
+/// One source for the picker and the fold below.
+pub const SS_METHODS: [&str; 18] = [
+    "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+    "none",
+    "aes-128-gcm",
+    "aes-192-gcm",
+    "aes-256-gcm",
+    "aes-128-ctr",
+    "aes-192-ctr",
+    "aes-256-ctr",
+    "aes-128-cfb",
+    "aes-192-cfb",
+    "aes-256-cfb",
+    "chacha20-ietf-poly1305",
+    "xchacha20-ietf-poly1305",
+    "chacha20-ietf",
+    "xchacha20",
+    "rc4-md5",
+];
+
+/// Config-completeness T03: raw-object half of [`vmess_has_legacy_tls`]
+/// (the folds below already hold the parsed object — no re-parse).
+fn vmess_has_legacy_tls_raw(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("tls").is_some_and(|tls| tls.is_boolean())
+}
+
+/// Config-completeness T03: true when a vmess params text carries the legacy
+/// link grammar — a boolean `tls` key (import always writes it for
+/// `vmess://` links) with the packet cipher in `security`. New-style rows
+/// carry tls-ness in `security` and the cipher in `encryption` instead.
+/// The folds below branch on this so neither grammar clobbers the other.
+pub fn vmess_has_legacy_tls(params_raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|obj| vmess_has_legacy_tls_raw(&obj))
+}
+
+/// Config-completeness T03: read the vmess packet cipher for the `security`
+/// Select — `encryption` first (new-style), then `security` when it holds a
+/// cipher (legacy import shape, or an ambiguous hand-written row the fold
+/// pair heals toward new-style on save). A tls-ness `security`
+/// (`tls`/`reality`) reads blank so the picker falls back to `auto`, never
+/// to a cipher the row does not have.
+pub fn vmess_cipher_value(params_raw: &str) -> String {
+    let encryption = guided_prefill_value(params_raw, &["encryption"]);
+    if !encryption.trim().is_empty() {
+        return encryption;
+    }
+    let security = guided_prefill_value(params_raw, &["security"]);
+    if VMESS_CIPHERS
+        .iter()
+        .any(|cipher| security.eq_ignore_ascii_case(cipher))
+    {
+        return security;
+    }
+    if vmess_has_legacy_tls(params_raw) {
+        return security;
+    }
+    String::new()
+}
+
+/// Config-completeness T03: read the vmess TLS toggle — the `security`
+/// on-values the engine maps, plus the legacy boolean `tls` import writes
+/// for `vmess://` links (the shared S2 prefill only reads `security`).
+pub fn vmess_tls_enabled(params_raw: &str) -> bool {
+    let security = guided_prefill_value(params_raw, &["security"]);
+    if matches!(
+        security.to_ascii_lowercase().as_str(),
+        "tls" | "xtls" | "reality"
+    ) {
+        return true;
+    }
+    guided_prefill_bool(params_raw, &["tls"])
+}
+
+/// Config-completeness T03: fold the VMess inner fields — uuid, aid, cipher
+/// and packet_encoding — into a params JSON text. `uuid`/`aid` follow T05
+/// identity semantics as strings (the engine coerces `alter_id` to a number,
+/// so import string spellings echo byte-identical); `packet_encoding` blank
+/// restores the default. The cipher is grammar-aware: legacy rows (boolean
+/// `tls`) keep it in `security` (always written — `auto` is explicit there,
+/// never a removal); new-style rows write `encryption` (`auto` restores the
+/// sing-box default). A cipher must never land in a tls-ness `security` —
+/// `apply_tls` fails those with `unknown security`. Byte-identical when
+/// nothing differs.
+pub fn fold_vmess_inner_into_params(
+    params_raw: &str,
+    uuid: &str,
+    aid: &str,
+    cipher: &str,
+    packet_encoding: &str,
+) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], uuid);
+    changed |= fold_text_aliases(obj, "alter_id", &["alter_id", "aid"], aid);
+    if vmess_has_legacy_tls_raw(obj) {
+        changed |= fold_text_aliases(obj, "security", &["security"], cipher);
+    } else {
+        changed |= fold_select_key(obj, "encryption", cipher, "auto");
+    }
+    changed |= fold_select_key(obj, "packet_encoding", packet_encoding, "");
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: fold the Trojan inner field (password) into a
+/// params JSON text. The trojan page's dedicated secret and the guided
+/// mini-form fold the same key (vless-uuid precedent: both no-op untouched,
+/// either one writes). Byte-identical when nothing differs.
+pub fn fold_trojan_inner_into_params(params_raw: &str, password: &str) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    if fold_text_aliases(obj, "password", &["password"], password) {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: write one select value that has no valid
+/// default — blank never touches the object (no fabrication, no strip of
+/// values the picker cannot represent); non-blank writes when different.
+/// Returns true when the object changed (callers reserialize only then).
+fn fold_select_keep_blank(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    match obj.get(key) {
+        Some(serde_json::Value::String(current)) if current == value => false,
+        _ => {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            true
+        }
+    }
+}
+
+/// Config-completeness T03: fold the Shadowsocks inner fields into a params
+/// JSON text. `method`/`plugin` blank never touches the object: `method`
+/// has no valid default (a blank pick would fabricate a cipher — the commit
+/// gate names the missing method instead) and a stored `plugin` can carry
+/// SIP002 `;`-tails the picker cannot represent (stripping them would be
+/// data loss; the engine already fails non-empty plugins naming the field,
+/// so nothing hides). `plugin_opts` is blank-safe text; `uot` folds the
+/// `udp_over_tcp` bool (the sing-box name — the socks arm already consumes
+/// that flat) reading the `uot` spelling too. Byte-identical on no-ops.
+pub fn fold_shadowsocks_inner_into_params(
+    params_raw: &str,
+    method: &str,
+    password: &str,
+    plugin: &str,
+    plugin_opts: &str,
+    uot: bool,
+) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_keep_blank(obj, "method", method);
+    changed |= fold_text_aliases(obj, "password", &["password"], password);
+    changed |= fold_select_keep_blank(obj, "plugin", plugin);
+    changed |= fold_text_aliases(
+        obj,
+        "plugin_opts",
+        &["plugin_opts", "plugin-opts", "pluginOpts"],
+        plugin_opts,
+    );
+    changed |= fold_bool_aliases(obj, "udp_over_tcp", &["udp_over_tcp", "uot"], uot);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: fold the shared TLS panel (S2) on vmess rows —
+/// legacy-aware. Legacy rows (boolean `tls`) keep their cipher in
+/// `security`, so the toggle mirrors into the boolean instead (the standard
+/// fold would strip the cipher); every other field folds exactly as the
+/// standard panel. Typing a reality key (`pbk`) with TLS on migrates the row
+/// to the new-style grammar (boolean dropped, cipher moved to `encryption`,
+/// `security` becomes `reality`) — otherwise the engine's legacy arm would
+/// silently drop the key and run the row without REALITY. Untouched rows
+/// fold byte-identical either way; non-legacy rows fold exactly like
+/// [`fold_tls_optional_into_params`].
+pub fn fold_tls_vmess_into_params(params_raw: &str, fold: &TlsOptionalFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    if vmess_has_legacy_tls_raw(obj) && fold.enable && !fold.pbk.trim().is_empty() {
+        // Reality intent on a legacy row: migrate to new-style first (the
+        // legacy arm drops `pbk`/`sid`, so emitting them there would lie).
+        obj.remove("tls");
+        changed = true;
+        if let Some(serde_json::Value::String(security)) = obj.get("security").cloned() {
+            if VMESS_CIPHERS
+                .iter()
+                .any(|cipher| security.eq_ignore_ascii_case(cipher))
+            {
+                obj.remove("security");
+                obj.insert(
+                    "encryption".to_string(),
+                    serde_json::Value::String(security),
+                );
+            }
+        }
+    }
+    if vmess_has_legacy_tls_raw(obj) {
+        // Legacy grammar still owns the row: mirror the toggle into the
+        // boolean, never touch the cipher in `security`.
+        let current = obj
+            .get("tls")
+            .and_then(|tls| tls.as_bool())
+            .unwrap_or(false);
+        if current != fold.enable {
+            obj.insert("tls".to_string(), serde_json::Value::Bool(fold.enable));
+            changed = true;
+        }
+        changed |= fold_tls_details(obj, fold);
+    } else {
+        changed |= fold_tls_security(obj, fold);
+        changed |= fold_tls_details(obj, fold);
+    }
     if changed {
         value.to_string()
     } else {
@@ -9533,6 +9834,284 @@ mod tests {
         ] {
             assert_eq!(fold_it, "{{{");
         }
+    }
+
+    /// Config-completeness T03: vmess inner fold is grammar-aware — legacy
+    /// rows (boolean `tls`) keep the cipher in `security`, new-style rows
+    /// write `encryption`; untouched rows echo byte-identical; `aid` stays a
+    /// string (the engine coerces); `packet_encoding` restores on blank.
+    #[test]
+    fn t03_vmess_inner_fold_keeps_grammar() {
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        // Legacy import shape: boolean `tls` owns the row, cipher in
+        // `security` (exactly what `parse_vmess` writes).
+        let legacy = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"alter_id\":\"0\",\"security\":\"auto\",\"tls\":true}}"
+        );
+        assert!(vmess_has_legacy_tls(&legacy));
+        assert!(!vmess_has_legacy_tls("{\"security\":\"tls\"}"));
+        assert_eq!(vmess_cipher_value(&legacy), "auto", "legacy cipher reads");
+        assert!(vmess_tls_enabled(&legacy), "legacy boolean enables");
+        assert_eq!(
+            fold_vmess_inner_into_params(&legacy, uuid, "0", "auto", ""),
+            legacy,
+            "untouched legacy echoes byte-identical"
+        );
+        // Cipher switch on a legacy row rewrites `security`, never
+        // `encryption`; the boolean stands.
+        let switched = fold_vmess_inner_into_params(&legacy, uuid, "0", "chacha20-poly1305", "");
+        let switched_value: serde_json::Value =
+            serde_json::from_str(&switched).expect("switched folds");
+        assert_eq!(switched_value["security"], "chacha20-poly1305");
+        assert!(
+            switched_value.get("encryption").is_none(),
+            "no new-style key on legacy rows"
+        );
+        assert_eq!(switched_value["tls"], true, "boolean untouched");
+        assert_eq!(switched_value["alter_id"], "0", "aid stays a string");
+        // New-style reality row: cipher goes to `encryption`, tls-ness stays.
+        let modern = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"alter_id\":\"2\",\"security\":\"reality\",\
+            \"encryption\":\"aes-128-gcm\",\"pbk\":\"k\"}}"
+        );
+        assert!(!vmess_has_legacy_tls(&modern));
+        assert_eq!(vmess_cipher_value(&modern), "aes-128-gcm");
+        assert!(vmess_tls_enabled(&modern));
+        assert_eq!(
+            fold_vmess_inner_into_params(&modern, uuid, "2", "aes-128-gcm", ""),
+            modern,
+            "untouched new-style echoes byte-identical"
+        );
+        // A tls-ness `security` never reads as a cipher (the picker falls
+        // back to `auto`, never to a cipher the row does not have).
+        assert_eq!(vmess_cipher_value("{\"security\":\"tls\"}"), "");
+        assert_eq!(vmess_cipher_value("{\"security\":\"reality\"}"), "");
+        assert!(vmess_tls_enabled("{\"security\":\"tls\"}"));
+        assert!(!vmess_tls_enabled("{\"security\":\"auto\"}"));
+        assert!(!vmess_tls_enabled("{}"));
+        // Ambiguous hand-written row (cipher in `security`, no boolean):
+        // the reader shows the cipher; the inner fold stages `encryption`
+        // and the S2 fold drops the ambiguous `security` — healed together.
+        let ambiguous = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"security\":\"auto\"}}"
+        );
+        assert_eq!(vmess_cipher_value(&ambiguous), "auto");
+        let staged = fold_vmess_inner_into_params(&ambiguous, uuid, "", "auto", "xudp");
+        let staged_value: serde_json::Value = serde_json::from_str(&staged).expect("staged folds");
+        assert_eq!(staged_value["packet_encoding"], "xudp");
+        let healed = fold_tls_vmess_into_params(
+            &staged,
+            &TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+        );
+        let healed_value: serde_json::Value = serde_json::from_str(&healed).expect("healed folds");
+        assert!(
+            healed_value.get("security").is_none(),
+            "ambiguous tls-ness cleared"
+        );
+        assert!(
+            healed_value.get("encryption").is_none(),
+            "default cipher stays absent"
+        );
+        assert_eq!(healed_value["packet_encoding"], "xudp");
+        // Garbage JSON stands untouched through every new fold.
+        for fold_it in [
+            fold_vmess_inner_into_params("{{{", uuid, "0", "auto", ""),
+            fold_trojan_inner_into_params("{{{", "secret"),
+            fold_shadowsocks_inner_into_params("{{{", "aes-128-gcm", "pw", "", "", false),
+            fold_tls_vmess_into_params("{{{", &TlsOptionalFold::default()),
+        ] {
+            assert_eq!(fold_it, "{{{");
+        }
+    }
+
+    /// Config-completeness T03: the vmess TLS fold mirrors the toggle into
+    /// the legacy boolean (cipher never stripped), migrates to new-style on
+    /// reality intent, and matches the standard fold off legacy rows.
+    #[test]
+    fn t03_tls_vmess_fold_mirrors_bool_and_migrates_reality() {
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let legacy = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"alter_id\":\"0\",\"security\":\"auto\",\"tls\":true}}"
+        );
+        // Untouched legacy echoes byte-identical (cipher never stripped).
+        let echo = fold_tls_vmess_into_params(
+            &legacy,
+            &TlsOptionalFold {
+                enable: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(echo, legacy, "untouched legacy echoes byte-identical");
+        // Toggle off flips the boolean, keeps the cipher and every key.
+        let off = fold_tls_vmess_into_params(
+            &legacy,
+            &TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+        );
+        let off_value: serde_json::Value = serde_json::from_str(&off).expect("off folds");
+        assert_eq!(off_value["tls"], false, "boolean mirrors the toggle");
+        assert_eq!(off_value["security"], "auto", "cipher preserved");
+        // Reality intent migrates: boolean dropped, cipher moved to
+        // `encryption`, `security` becomes `reality`.
+        let migrated = fold_tls_vmess_into_params(
+            &legacy,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "a.example.com".to_string(),
+                pbk: "pubkey".to_string(),
+                sid: "short".to_string(),
+                ..Default::default()
+            },
+        );
+        let migrated_value: serde_json::Value =
+            serde_json::from_str(&migrated).expect("migrated folds");
+        assert!(
+            migrated_value.get("tls").is_none(),
+            "boolean dropped on migration"
+        );
+        assert_eq!(migrated_value["encryption"], "auto", "cipher moved");
+        assert_eq!(migrated_value["security"], "reality");
+        assert_eq!(migrated_value["sni"], "a.example.com");
+        assert_eq!(migrated_value["pbk"], "pubkey");
+        // Migrating twice is stable (second fold is a no-op echo).
+        let twice = fold_tls_vmess_into_params(
+            &migrated,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "a.example.com".to_string(),
+                pbk: "pubkey".to_string(),
+                sid: "short".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(twice, migrated, "migration is idempotent");
+        // Off legacy rows: every standard detail still folds (sni lands,
+        // cipher stands, boolean flips only when the toggle differs).
+        let modern = "{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443}";
+        for fold in [
+            TlsOptionalFold {
+                enable: true,
+                sni: "s.example.com".to_string(),
+                ..Default::default()
+            },
+            TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+            TlsOptionalFold {
+                enable: true,
+                pbk: "pubkey".to_string(),
+                insecure: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                fold_tls_vmess_into_params(modern, &fold),
+                fold_tls_optional_into_params(modern, &fold),
+                "non-legacy matches the standard fold"
+            );
+        }
+    }
+
+    /// Config-completeness T03: trojan/shadowsocks inner folds — secrets
+    /// echo, blank method/plugin never fabricate or strip, `uot` folds the
+    /// `udp_over_tcp` bool across both spellings.
+    #[test]
+    fn t03_ss_and_trojan_inner_folds() {
+        // Trojan: password echoes, writes, blanks never wipe.
+        let trojan = "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"password\":\"secret\"}";
+        assert_eq!(
+            fold_trojan_inner_into_params(trojan, "secret"),
+            trojan,
+            "untouched password echoes"
+        );
+        let rotated = fold_trojan_inner_into_params(trojan, "rotated");
+        let rotated_value: serde_json::Value =
+            serde_json::from_str(&rotated).expect("rotated folds");
+        assert_eq!(rotated_value["password"], "rotated");
+        assert_eq!(
+            fold_trojan_inner_into_params(trojan, ""),
+            trojan,
+            "blank never wipes"
+        );
+        assert_eq!(
+            fold_trojan_inner_into_params(trojan, "  "),
+            trojan,
+            "whitespace never wipes"
+        );
+        // Shadowsocks pristine template: blank method/plugin stand — no
+        // fabricated cipher, no stripped key (the commit gate names the
+        // missing method instead).
+        let template = protocol_params_template("shadowsocks");
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(&template, "", "", "", "", false),
+            template,
+            "pristine template stands"
+        );
+        // Populated row echoes byte-identical.
+        let ss = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+            \"method\":\"aes-128-gcm\",\"password\":\"pw\",\"udp_over_tcp\":true}";
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(ss, "aes-128-gcm", "pw", "", "", true),
+            ss,
+            "untouched ss echoes byte-identical"
+        );
+        // Method switch writes; plugin pick writes; plugin_opts lands;
+        // `uot:true` echoes (the engine folds that spelling — same rule as
+        // every aliased toggle), while a false→true flip retires the alias
+        // to the canonical bool.
+        let uot_legacy = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
+            \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\"uot\":true}";
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(uot_legacy, "aes-128-gcm", "pw", "", "", true),
+            uot_legacy,
+            "matching uot echoes (engine folds the spelling)"
+        );
+        let uot_off = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
+            \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\"uot\":false}";
+        let normalized = fold_shadowsocks_inner_into_params(
+            uot_off,
+            "chacha20-ietf-poly1305",
+            "pw",
+            "obfs-local",
+            "obfs=http",
+            true,
+        );
+        let normalized_value: serde_json::Value =
+            serde_json::from_str(&normalized).expect("normalized folds");
+        assert_eq!(normalized_value["method"], "chacha20-ietf-poly1305");
+        assert_eq!(normalized_value["plugin"], "obfs-local");
+        assert_eq!(normalized_value["plugin_opts"], "obfs=http");
+        assert_eq!(normalized_value["udp_over_tcp"], true);
+        assert!(
+            normalized_value.get("uot").is_none(),
+            "alias retired on write"
+        );
+        // Stored SIP002 `;`-tails survive a blank pick (never stripped).
+        let tailed = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
+            \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\
+            \"plugin\":\"obfs-local;obfs=http\"}";
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(tailed, "aes-128-gcm", "pw", "", "", false),
+            tailed,
+            "unrepresentable plugin preserved"
+        );
+        // `uot` off clears the canonical bool.
+        let cleared = fold_shadowsocks_inner_into_params(ss, "aes-128-gcm", "pw", "", "", false);
+        let cleared_value: serde_json::Value =
+            serde_json::from_str(&cleared).expect("cleared folds");
+        assert!(cleared_value.get("udp_over_tcp").is_none(), "false clears");
+        assert_eq!(cleared_value["method"], "aes-128-gcm", "method kept");
     }
 
     /// Config-completeness T02: toggle prefill reads truthy spellings

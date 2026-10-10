@@ -3464,9 +3464,30 @@ fn translate_outbound(
                     let server_name = take_flat(params, &["sni"]);
                     let fingerprint = take_flat(params, &["fp", "fingerprint"]);
                     let alpn = split_alpn(take_flat(params, &["alpn"]));
+                    // Config-completeness T03: the S2 panel folds `insecure`
+                    // on every TLS-capable page incl. legacy vmess rows —
+                    // honor it here instead of dropping it (rows without the
+                    // flat keep the old shape).
+                    let insecure = take_truthy(
+                        params,
+                        &[
+                            "allowInsecure",
+                            "allow_insecure",
+                            "allowinsecure",
+                            "insecure",
+                        ],
+                    );
                     params.insert(
                         "tls".to_string(),
-                        tls_object(&server, server_name, fingerprint, alpn, None, false, None),
+                        tls_object(
+                            &server,
+                            server_name,
+                            fingerprint,
+                            alpn,
+                            None,
+                            insecure,
+                            None,
+                        ),
                     );
                 }
                 // `security` stays: it is the sing-box packet cipher here.
@@ -3478,6 +3499,17 @@ fn translate_outbound(
                 params.insert("security".to_string(), serde_json::Value::String(cipher));
             }
             // `alter_id` is numeric in sing-box; intake keeps strings.
+            // Config-completeness T03: `aid` is the link/Throne spelling of
+            // the same field (the VMess page reads both, writes `alter_id`)
+            // — fold it so hand JSON keeps working; the canonical key wins
+            // when both disagree, and the alias never leaks (t32 precedent:
+            // folded, not duplicated).
+            let aid = take_flat(params, &["aid"]);
+            if params.get("alter_id").is_none() {
+                if let Some(aid) = aid {
+                    params.insert("alter_id".to_string(), serde_json::Value::String(aid));
+                }
+            }
             match params.remove("alter_id") {
                 None => {}
                 Some(serde_json::Value::Number(number)) => {
@@ -3985,6 +4017,15 @@ fn translate_outbound(
             // mux arm runs FIRST (it consumes the flats `drop_foreign_flats`
             // would otherwise eat).
             apply_mux(name, params)?;
+            // Config-completeness T03: `uot` is the v2ray/Throne flat
+            // spelling of sing-box `udp_over_tcp` (the socks arm already
+            // consumes that flat; the Shadowsocks page reads both, writes
+            // the canonical bool) — fold it so hand JSON keeps working; the
+            // canonical key wins when both disagree, and the alias never
+            // leaks (t32 precedent: folded, not duplicated).
+            if take_truthy(params, &["uot"]) && params.get("udp_over_tcp").is_none() {
+                params.insert("udp_over_tcp".to_string(), serde_json::Value::Bool(true));
+            }
             drop_foreign_flats(params, &["method"]);
         }
         _ => {}
@@ -12629,6 +12670,117 @@ Active Connections\r
             node.get("brutal_enable").is_none(),
             "brutal flat dropped: {node}"
         );
+    }
+
+    /// Config-completeness T03: panel-produced vmess/trojan/shadowsocks rows
+    /// generate — per-key emission shapes the new pages rely on (cipher
+    /// grammars, `aid`/`uot` intake folds, legacy insecure, ss extras ride).
+    #[test]
+    fn t03_panel_rows_generate_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        // VMess new-style (the page writes `encryption` + string `alter_id`
+        // + `packet_encoding` + mux): cipher lands in `security`, aid
+        // coerces, packet_encoding rides, mux emits.
+        let modern = fixture(
+            "31",
+            "VmessModern",
+            "vmess",
+            json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "alter_id": "3",
+                   "encryption": "chacha20-poly1305", "packet_encoding": "xudp",
+                   "mux": "on"}),
+            "127.0.0.1",
+            10831,
+        );
+        let node = node_of(&modern, "vmess");
+        assert_eq!(node["security"], json!("chacha20-poly1305"));
+        assert_eq!(node["alter_id"], json!(3), "string aid coerces");
+        assert_eq!(node["packet_encoding"], json!("xudp"), "rides to check");
+        assert_eq!(node["multiplex"], json!({"enabled": true}));
+        // VMess legacy link shape (boolean `tls`, cipher in `security`):
+        // the tls object builds, the cipher stays, insecure honored (T03).
+        let legacy = fixture(
+            "32",
+            "VmessLegacy",
+            "vmess",
+            json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "alter_id": "0",
+                   "security": "auto", "tls": true, "sni": "198.51.100.9",
+                   "insecure": true}),
+            "127.0.0.1",
+            10832,
+        );
+        let node = node_of(&legacy, "vmess");
+        assert_eq!(node["security"], json!("auto"), "legacy cipher stays");
+        assert_eq!(node["tls"]["server_name"], json!("198.51.100.9"));
+        assert_eq!(node["tls"]["insecure"], json!(true), "legacy insecure maps");
+        assert!(node.get("encryption").is_none(), "no new-style key");
+        // Hand-written `aid` spelling folds to `alter_id` (t32 precedent).
+        let aided = fixture(
+            "33",
+            "VmessAid",
+            "vmess",
+            json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "aid": "2"}),
+            "127.0.0.1",
+            10833,
+        );
+        let node = node_of(&aided, "vmess");
+        assert_eq!(node["alter_id"], json!(2), "`aid` folds");
+        assert!(node.get("aid").is_none(), "alias never leaks");
+        // Trojan page shape (password + S1/S2/S3 keys) generates with tls,
+        // transport and mux emitted.
+        let trojan = fixture(
+            "34",
+            "TrojanPage",
+            "trojan",
+            json!({"type": "trojan", "server": "198.51.100.9", "server_port": 443,
+                   "password": "secret", "security": "tls", "sni": "198.51.100.9",
+                   "network": "ws", "path": "/w", "mux": "on"}),
+            "127.0.0.1",
+            10834,
+        );
+        let node = node_of(&trojan, "trojan");
+        assert_eq!(node["password"], json!("secret"));
+        assert_eq!(node["tls"]["server_name"], json!("198.51.100.9"));
+        assert_eq!(node["transport"]["type"], json!("ws"));
+        assert_eq!(node["multiplex"], json!({"enabled": true}));
+        // Shadowsocks page shape (method + password + uot spelling +
+        // plugin_opts + mux): cipher/secret land, `uot` folds to the
+        // sing-box bool, extras ride, mux emits.
+        let mut ss = ss_params("pass1");
+        ss.as_object_mut()
+            .expect("object")
+            .insert("uot".to_string(), serde_json::Value::Bool(true));
+        ss.as_object_mut().expect("object").insert(
+            "plugin_opts".to_string(),
+            json!("obfs=http;obfs-host=h.example.com"),
+        );
+        ss.as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("on"));
+        let row = fixture("35", "SsPage", "shadowsocks", ss, "127.0.0.1", 10835);
+        let node = node_of(&row, "shadowsocks");
+        assert_eq!(node["method"], json!("aes-128-gcm"));
+        assert_eq!(node["password"], json!("pass1"));
+        assert_eq!(node["udp_over_tcp"], json!(true), "`uot` folds");
+        assert!(node.get("uot").is_none(), "alias never leaks");
+        assert_eq!(
+            node["plugin_opts"],
+            json!("obfs=http;obfs-host=h.example.com"),
+            "plugin_opts rides"
+        );
+        assert_eq!(node["multiplex"], json!({"enabled": true}));
     }
 
     /// Two custom replacements binding one port conflict naming both.
