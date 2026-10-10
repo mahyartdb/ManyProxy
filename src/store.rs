@@ -951,6 +951,44 @@ pub fn protocol_params_template(protocol: &str) -> String {
     serde_json::Value::Object(params).to_string()
 }
 
+/// Config-completeness T01: virtual row types carry no endpoint address of
+/// their own (`chain` hops and `custom-*`/`extra-core` payloads name it in
+/// JSON) — the guided Server/Server port inputs hide for these, matching
+/// Throne's address/port gating. In-memory flag table only (no migration,
+/// no `user_version` bump); aliases fold through [`canonical_protocol`] so
+/// dialog text can never dodge the gate.
+pub fn is_virtual_protocol(protocol: &str) -> bool {
+    matches!(
+        canonical_protocol(protocol).as_deref(),
+        Some("chain" | "custom-outbound" | "custom-config" | "extra-core")
+    )
+}
+
+/// Config-completeness T01: true when a params box still holds the untouched
+/// starter for `protocol` — byte-identical to [`protocol_params_template`]
+/// output, never a semantic compare (whitespace or key order already means
+/// the user touched it, so the rewrite below stands off).
+pub fn is_pristine_template(params_raw: &str, protocol: &str) -> bool {
+    params_raw == protocol_params_template(protocol)
+}
+
+/// Config-completeness T01: type-switch template rule (contract C1). A
+/// protocol switch rewrites the params box to the new type's starter ONLY
+/// when the box still holds the old type's pristine starter; user-typed or
+/// otherwise dirty JSON stands untouched and the new page prefills whatever
+/// keys overlap instead. Pure (no I/O) so headless tests pin it directly.
+pub fn pristine_template_rewrite(
+    params_raw: &str,
+    old_protocol: &str,
+    new_protocol: &str,
+) -> String {
+    if is_pristine_template(params_raw, old_protocol) {
+        protocol_params_template(new_protocol)
+    } else {
+        params_raw.to_string()
+    }
+}
+
 /// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
 /// `None` means unknown protocol (the commit names it through the normal
 /// validation path). `key = None` means a known protocol with no link
@@ -8828,6 +8866,70 @@ mod tests {
         assert!(
             fallback.contains("server"),
             "fallback still guides, got {fallback}"
+        );
+    }
+
+    /// Config-completeness T01: the picker lists exactly the 23 canonical
+    /// stored types (contract: no free-text typos); the virtual set is the
+    /// four address-less types (Throne gating parity); pristine detection is
+    /// byte-identical; the switch rewrite fires on pristine JSON only.
+    #[test]
+    fn t01_picker_virtual_and_pristine_rules() {
+        assert_eq!(
+            VALID_PROTOCOLS.len(),
+            23,
+            "picker lists exactly the canonical types"
+        );
+        for virtual_proto in ["chain", "custom-outbound", "custom-config", "extra-core"] {
+            assert!(
+                is_virtual_protocol(virtual_proto),
+                "{virtual_proto} hides Server/Port"
+            );
+        }
+        for endpoint_proto in [
+            "vless",
+            "vmess",
+            "trojan",
+            "shadowsocks",
+            "socks",
+            "wireguard",
+            "xray",
+        ] {
+            assert!(
+                !is_virtual_protocol(endpoint_proto),
+                "{endpoint_proto} keeps Server/Port"
+            );
+        }
+        assert!(!is_virtual_protocol("bogus"), "unknown is not virtual");
+        // Pristine: byte-identical starter only (any edit dirties it).
+        let vless_starter = protocol_params_template("vless");
+        assert!(is_pristine_template(&vless_starter, "vless"));
+        assert!(!is_pristine_template(&format!("{vless_starter} "), "vless"));
+        assert!(!is_pristine_template(&vless_starter, "chain"));
+        // Switch on pristine JSON rewrites to the new starter.
+        assert_eq!(
+            pristine_template_rewrite(&vless_starter, "vless", "chain"),
+            protocol_params_template("chain"),
+            "pristine switch rewrites"
+        );
+        // Switch on dirty JSON stands (server filled, hand-typed object,
+        // garbage text all survive the switch).
+        let dirty = vless_starter.replace("\"server\":\"\"", "\"server\":\"a.example.com\"");
+        assert_eq!(
+            pristine_template_rewrite(&dirty, "vless", "chain"),
+            dirty,
+            "dirty switch preserves"
+        );
+        let hand_typed = "{\"type\":\"vless\",\"server\":\"b.example.com\"}";
+        assert_eq!(
+            pristine_template_rewrite(hand_typed, "vless", "socks"),
+            hand_typed,
+            "hand-typed JSON stands"
+        );
+        assert_eq!(
+            pristine_template_rewrite("{{{", "vless", "socks"),
+            "{{{",
+            "garbage stands"
         );
     }
 

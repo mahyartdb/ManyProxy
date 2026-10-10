@@ -22,7 +22,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::description_list::DescriptionList;
-use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
+use gpui_kit::component::dialog::{Confirm, Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::form::{field, v_form, Field};
 use gpui_kit::component::group_box::GroupBox;
@@ -73,9 +73,10 @@ use import::{
 use store::{
     count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
     export_confirm_description, fold_guided_into_params, guided_identity_fields,
-    guided_prefill_value, now_unix, protocol_params_template, proxy_urls, ConfigPatch,
-    HealthSnapshot, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
-    Subscription as ProxySubscription, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    guided_prefill_value, is_virtual_protocol, now_unix, pristine_template_rewrite,
+    protocol_params_template, proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig,
+    RestoreOutcome, Store, StoreError, Subscription as ProxySubscription, DEFAULT_BIND,
+    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -1599,7 +1600,23 @@ fn advanced_toggle_button(
 #[derive(Clone)]
 struct ConfigForm {
     name: Entity<InputState>,
-    protocol: Entity<InputState>,
+    /// Config-completeness T01: protocol picker state (Add only — Edit
+    /// renders [`ConfigForm::protocol_locked`] text instead, Throne §7.7
+    /// parity). Created once in [`ConfigForm::blank`]/[`ConfigForm::prefilled`]
+    /// (never in render); the selection drives the guided hint, the
+    /// virtual-type gate, and the pristine-only template sync below.
+    protocol_select: Entity<SelectState<ProtocolChoiceList>>,
+    /// Config-completeness T01: last protocol the template sync applied.
+    /// Compared against the live selection in the dialog builder (the only
+    /// window-holding frame scope) so a switch rewrites pristine JSON once
+    /// and dirty JSON never.
+    last_protocol: Rc<RefCell<String>>,
+    /// Config-completeness T01: true on Edit — the type control renders as
+    /// read-only text (`protocol-lock`) and commits keep the baseline type.
+    protocol_locked: bool,
+    /// Config-completeness T01: baseline protocol text shown (and committed)
+    /// while locked.
+    locked_protocol: String,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -1682,6 +1699,55 @@ impl ConfigForm {
         })
     }
 
+    /// Config-completeness T01: live protocol text — the picker selection on
+    /// Add, the baseline on Edit (locked). Falls back to the last-seen
+    /// protocol when the Select holds no selection (unknown legacy type on a
+    /// locked row), so reads never invent a type.
+    fn protocol_text(&self, cx: &App) -> String {
+        if self.protocol_locked {
+            return self.locked_protocol.clone();
+        }
+        self.protocol_select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .unwrap_or_else(|| self.last_protocol.borrow().clone())
+    }
+
+    /// Config-completeness T01: pristine-only template sync (contract C1).
+    /// Runs at the top of the Add/Edit dialog builders — the only frame scope
+    /// holding a `Window` outside kit internals (kit `SelectState::set_value`
+    /// needs one, and the Confirm subscription has none). When the picker
+    /// selection moved since the last sync, the params box rewrites to the
+    /// new starter only via [`pristine_template_rewrite`] (dirty JSON stands);
+    /// the tracker advances either way so the rewrite fires exactly once per
+    /// switch. No-op on locked (Edit) rows.
+    fn sync_protocol_template(&self, window: &mut Window, cx: &mut App) {
+        if self.protocol_locked {
+            return;
+        }
+        let current = self
+            .protocol_select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .unwrap_or_else(|| self.last_protocol.borrow().clone());
+        let mut last = self.last_protocol.borrow_mut();
+        if current == *last {
+            return;
+        }
+        let old = last.clone();
+        *last = current.clone();
+        drop(last);
+        let box_text = self.params.read(cx).value().to_string();
+        let next = pristine_template_rewrite(&box_text, &old, &current);
+        if next != box_text {
+            self.params.update(cx, |state, cx| {
+                state.set_value(next, window, cx);
+            });
+        }
+    }
+
     fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
         // Ticket 31: the params box opens with the per-protocol field
         // template (guided add, not raw JSON first). Submitting it untouched
@@ -1689,9 +1755,18 @@ impl ConfigForm {
         // Ticket 05: the guided mini-form opens blank (fold no-ops, so the
         // template stands) under a collapsed Advanced disclosure.
         let template = protocol_params_template(DEFAULT_PROTOCOL);
+        let selected = protocol_choices()
+            .iter()
+            .position(|choice| choice.value == DEFAULT_PROTOCOL)
+            .map(IndexPath::new);
         Self {
             name: Self::field(window, cx, "Name", None),
-            protocol: Self::field(window, cx, "Protocol", Some(DEFAULT_PROTOCOL)),
+            protocol_select: cx.new(|cx| {
+                SelectState::new(ProtocolChoiceList(protocol_choices()), selected, window, cx)
+            }),
+            last_protocol: Rc::new(RefCell::new(DEFAULT_PROTOCOL.to_string())),
+            protocol_locked: false,
+            locked_protocol: DEFAULT_PROTOCOL.to_string(),
             params: Self::area(
                 window,
                 cx,
@@ -1721,9 +1796,18 @@ impl ConfigForm {
         let read_keys: &[&str] = guided_identity_fields(&config.protocol)
             .map(|guided| guided.read_keys)
             .unwrap_or(&[]);
+        let selected = protocol_choices()
+            .iter()
+            .position(|choice| choice.value == config.protocol)
+            .map(IndexPath::new);
         Self {
             name: Self::field(window, cx, "Name", Some(config.name.as_str())),
-            protocol: Self::field(window, cx, "Protocol", Some(config.protocol.as_str())),
+            protocol_select: cx.new(|cx| {
+                SelectState::new(ProtocolChoiceList(protocol_choices()), selected, window, cx)
+            }),
+            last_protocol: Rc::new(RefCell::new(config.protocol.clone())),
+            protocol_locked: true,
+            locked_protocol: config.protocol.clone(),
             params: Self::area(
                 window,
                 cx,
@@ -1816,13 +1900,17 @@ impl ConfigForm {
         port_budget: Option<String>,
     ) -> impl IntoElement {
         let bind = self.bind.read(cx).value().to_string();
-        let protocol_text = self.protocol.read(cx).value().to_string();
+        let protocol_text = self.protocol_text(cx);
         let guided = guided_identity_fields(&protocol_text);
+        // Config-completeness T01: virtual rows (chain/custom-*/extra-core)
+        // carry no endpoint address — the guided Server/Server port inputs
+        // hide for these (Throne gating parity).
+        let virtual_row = is_virtual_protocol(&protocol_text);
         let format_view = view.clone();
         let format_params = self.params.clone();
         let template_view = view.clone();
         let template_params = self.params.clone();
-        let template_protocol = self.protocol.clone();
+        let template_form = self.clone();
         let validate_view = view.clone();
         let validate_params = self.params.clone();
         let expanded = *self.advanced.borrow();
@@ -1879,7 +1967,7 @@ impl ConfigForm {
                                 template_view.update(cx, |view, cx| {
                                     view.template_dialog_params(
                                         &template_params,
-                                        &template_protocol,
+                                        &template_form,
                                         window,
                                         cx,
                                     );
@@ -1909,8 +1997,59 @@ impl ConfigForm {
         // hint row when collapsed and the params buttons row when expanded.
         let mut form = v_form()
             .small()
-            .child(dialog_field("field-name", "Name", self.name))
-            .child(dialog_field("field-protocol", "Protocol", self.protocol));
+            .child(dialog_field("field-name", "Name", self.name));
+        // Config-completeness T01: protocol is a kit `Select` over the 23
+        // canonical types on Add (no free-text typos possible) and read-only
+        // `protocol-lock` text on Edit (type locked once created, Throne §7.7
+        // parity). Kit constructors/builders: `Select::new(&state)` +
+        // `.id().small().accessibility_label()`; the hover copy rides an outer
+        // wrapper (kit `Select` has no tooltip slot — facet-bar precedent).
+        if self.protocol_locked {
+            let locked = self.locked_protocol.clone();
+            form = form.child(
+                field().label("Protocol".to_string()).child(
+                    div()
+                        .id("protocol-lock")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| Tooltip::new("Type is locked after creation".to_string()))
+                                .into()
+                        })
+                        .child(Label::new(format!("{locked} (locked)"))),
+                ),
+            );
+        } else {
+            let select = self.protocol_select.clone();
+            form = form.child(
+                field().label("Protocol".to_string()).child(
+                    div()
+                        .id("protocol-select-tip")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| Tooltip::new("Protocol (locked after creation)".to_string()))
+                                .into()
+                        })
+                        // T01 ENTER-guard: kit `BaseSelect` propagates Confirm even
+                        // with its popup open (verified gpui-base 0.6.6
+                        // `select.rs`: the Confirm handler calls `cx.propagate()`
+                        // before the open check, while Cancel stops) and the dialog
+                        // host commits on any bubbled Confirm — without this stop
+                        // the picker's Enter pick would also commit a half-filled
+                        // row (audit §10.9 incident). The inner kit handlers (list
+                        // pick, popup close, trigger refocus) already ran, so only
+                        // the dialog commit is suppressed here.
+                        .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            Select::new(&select)
+                                .id("protocol-select")
+                                .small()
+                                .accessibility_label("Protocol"),
+                        ),
+                ),
+            );
+        }
         if expanded {
             form = form.child(
                 field()
@@ -1923,32 +2062,39 @@ impl ConfigForm {
             // + Advanced toggle row — so the guided block costs a single grid
             // row set instead of three.
             let mut guided_block = div().flex().flex_col().gap_1();
-            guided_block = guided_block.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        div().flex_1().child(
-                            field().label("Server").child(
-                                div()
-                                    .id("field-guided-server")
-                                    .test_support()
-                                    .child(Input::new(&self.guided_server)),
+            // Config-completeness T01: virtual rows hide the endpoint inputs
+            // (see `virtual_row` above); Identity already hides for these via
+            // the `guided.key` gate below, and the params JSON keeps its slots
+            // for explicit edits. Hidden values are never wiped (fold no-ops
+            // on blank inputs).
+            if !virtual_row {
+                guided_block = guided_block.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            div().flex_1().child(
+                                field().label("Server").child(
+                                    div()
+                                        .id("field-guided-server")
+                                        .test_support()
+                                        .child(Input::new(&self.guided_server)),
+                                ),
+                            ),
+                        )
+                        .child(
+                            div().flex_1().child(
+                                field().label("Server port").child(
+                                    div()
+                                        .id("field-guided-port")
+                                        .test_support()
+                                        .child(Input::new(&self.guided_port)),
+                                ),
                             ),
                         ),
-                    )
-                    .child(
-                        div().flex_1().child(
-                            field().label("Server port").child(
-                                div()
-                                    .id("field-guided-port")
-                                    .test_support()
-                                    .child(Input::new(&self.guided_port)),
-                            ),
-                        ),
-                    ),
-            );
+                );
+            }
             if guided.is_some_and(|guided| guided.key.is_some()) {
                 guided_block = guided_block.child(
                     field()
@@ -2050,12 +2196,21 @@ impl ConfigForm {
     /// Ticket 31: move keyboard focus to the named field's input
     /// (`name`/`protocol`/`params`/`group`/`bind_ip`/`port`). Unknown names
     /// focus nothing (never a wrong field).
+    /// Config-completeness T01: `protocol` is a kit `Select`, not a text
+    /// input — focus its trigger on Add; a locked Edit row focuses nothing.
     fn focus_field(&self, field: &str, window: &mut Window, cx: &mut App) {
+        if field == "protocol" {
+            if !self.protocol_locked {
+                self.protocol_select.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            }
+            return;
+        }
         // Ticket 43: `params` is a textarea state — every arm converts to
         // the shared [`AnyInputState`] (the match cannot mix entity types).
         let target: Option<AnyInputState> = match field {
             "name" => Some(AnyInputState::from(self.name.clone())),
-            "protocol" => Some(AnyInputState::from(self.protocol.clone())),
             "params" => Some(AnyInputState::from(self.params.clone())),
             "group" => Some(AnyInputState::from(self.group.clone())),
             "bind_ip" => Some(AnyInputState::from(self.bind.clone())),
@@ -2071,7 +2226,7 @@ impl ConfigForm {
     fn as_new(&self, cx: &App) -> NewConfig {
         NewConfig {
             name: self.name.read(cx).value().to_string(),
-            protocol: self.protocol.read(cx).value().to_string(),
+            protocol: self.protocol_text(cx),
             params: self.effective_params(cx),
             group: self.group.read(cx).value().to_string(),
             bind_ip: self.bind.read(cx).value().to_string(),
@@ -2086,7 +2241,7 @@ impl ConfigForm {
     /// params (validation still names every missing field inline).
     fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
-        let protocol = self.protocol.read(cx).value().to_string();
+        let protocol = self.protocol_text(cx);
         let identity = guided_identity_fields(&protocol)
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
         fold_guided_into_params(
@@ -2104,7 +2259,7 @@ impl ConfigForm {
     /// nothing is ever lost (the commit fold reports that error instead).
     fn expand_merge(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
-        let protocol = self.protocol.read(cx).value().to_string();
+        let protocol = self.protocol_text(cx);
         let identity = guided_identity_fields(&protocol)
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
         let merged = fold_guided_into_params(
@@ -2142,7 +2297,7 @@ impl ConfigForm {
     /// across a garbage box).
     fn collapse_echo(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
-        let protocol = self.protocol.read(cx).value().to_string();
+        let protocol = self.protocol_text(cx);
         let read_keys: &[&str] = guided_identity_fields(&protocol)
             .map(|guided| guided.read_keys)
             .unwrap_or(&[]);
@@ -4675,6 +4830,96 @@ impl FacetPicker {
     }
 }
 
+/// Config-completeness T01: one row of the Add-dialog protocol picker. `title`
+/// is the dropdown row, `display` is the trigger text (`Protocol: vless`),
+/// `value` is the canonical stored type, `id` is the stable headless anchor
+/// (`protocol-option-vless`, …). Mirrors the facet `Select` composition (same
+/// delegate shape, same stable-id rows) so the picker needs no new kit API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtocolChoice {
+    id: String,
+    title: String,
+    display: String,
+    value: String,
+}
+
+impl SearchableListItem for ProtocolChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.title.clone().into()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(self.display.clone().into_any_element())
+    }
+
+    fn value(&self) -> &String {
+        &self.value
+    }
+}
+
+/// Config-completeness T01: the item data behind the protocol `Select` — a
+/// dedicated delegate (not `SearchableVec`) so option rows render with stable
+/// observed ids (`protocol-option-<type>`) that headless tests can find.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProtocolChoiceList(Vec<ProtocolChoice>);
+
+impl SearchableListDelegate for ProtocolChoiceList {
+    type Item = ProtocolChoice;
+
+    fn items_count(&self, _section: usize) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&ProtocolChoice> {
+        self.0.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        ProtocolChoice: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0
+            .iter()
+            .position(|choice| choice.value() == value)
+            .map(IndexPath::new)
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &ProtocolChoice,
+        _checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .id(item.id.clone())
+                .test_support()
+                .child(item.title.clone())
+                .into_any_element(),
+        )
+    }
+}
+
+/// Config-completeness T01: the 23 canonical stored types as picker rows, in
+/// [`VALID_PROTOCOLS`] order (the store owns the list — the dialog never
+/// forks it, so a typo'd protocol is unrepresentable).
+fn protocol_choices() -> Vec<ProtocolChoice> {
+    VALID_PROTOCOLS
+        .iter()
+        .map(|protocol| ProtocolChoice {
+            id: format!("protocol-option-{protocol}"),
+            title: protocol.to_string(),
+            display: format!("Protocol: {protocol}"),
+            value: protocol.to_string(),
+        })
+        .collect()
+}
+
 /// Command palette (Ctrl-K): one searchable surface over the whole
 /// action set — every key-bound action plus every menu-only destination.
 /// Sections below are the dispatch table: keep the group/item order and
@@ -5348,14 +5593,20 @@ impl AppView {
     /// per-protocol starter for the current protocol field (overwrites the
     /// box; Format/undo restores typing). The toast names the protocol so a
     /// stale-field fill is never mysterious.
+    /// Config-completeness T01: the protocol comes from the picker's live
+    /// selection (Add) or the locked baseline (Edit). This button stays an
+    /// EXPLICIT overwrite (the click is consent); the pristine-only rule
+    /// covers the AUTOMATIC type-switch rewrite instead (see
+    /// [`ConfigForm::sync_protocol_template`]) — refusing an explicit reset
+    /// would defeat the button's purpose.
     fn template_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
-        protocol: &Entity<InputState>,
+        form: &ConfigForm,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let name = protocol.read(cx).value().to_string();
+        let name = form.protocol_text(cx);
         let template = protocol_params_template(&name);
         params.update(cx, |state, cx| {
             state.set_value(template, window, cx);
@@ -8595,7 +8846,13 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        window.open_dialog(cx, move |dialog: Dialog, window, cx| {
+            // Config-completeness T01: pristine-only template sync — a picker
+            // switch rewrites an untouched starter once via
+            // `pristine_template_rewrite`, dirty JSON never. The builder is the
+            // only window-holding frame scope (the kit Confirm subscription
+            // has no Window, and render has no &mut).
+            form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             // Ticket 31: live warning inputs — the builder re-runs every
@@ -8679,7 +8936,10 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        window.open_dialog(cx, move |dialog: Dialog, window, cx| {
+            // Config-completeness T01: template sync (no-op on locked Edit
+            // rows — kept at both builders so the rule lives in one place).
+            form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let live = form.clone();
@@ -15345,12 +15605,301 @@ mod tests {
         });
 
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        for field in ["field-name", "field-protocol", "field-bind", "field-port"] {
+        // Config-completeness T01: the protocol free-text input is a kit
+        // `Select` now (`protocol-select`); `field-protocol` is retired.
+        for field in ["field-name", "protocol-select", "field-bind", "field-port"] {
             assert!(
                 cx.update(|window, _| window.try_find(field).is_some()),
                 "add dialog renders {field}"
             );
         }
+    }
+
+    /// Config-completeness T01: Add renders the kit protocol `Select` listing
+    /// exactly the 23 canonical types as stable option rows — no free-text
+    /// protocol input remains, so a typo'd protocol is unrepresentable.
+    /// Kit: `Select::new(&state)` + `.id().small().accessibility_label()`.
+    /// The popup list virtualizes (only visible rows paint), so paint asserts
+    /// cover the opened popup's top rows while full 23-membership is pinned
+    /// through the delegate (`set_selected_value` resolves every canonical
+    /// type — a missing row would come back `None`).
+    #[gpui_kit::test]
+    fn t01_protocol_picker_lists_23_canonical_types(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "protocol-select");
+        // Open the popup — the top rows paint with stable option ids.
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        for protocol in ["vless", "vmess", "trojan"] {
+            assert_painted(cx, &format!("protocol-option-{protocol}"));
+        }
+        // Enter confirms the highlight and closes the popup (guard-covered).
+        let keystroke = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert_absent(cx, "protocol-option-vless".to_string());
+        // Full membership: every canonical type resolves through the picker
+        // delegate (23 rows, `VALID_PROTOCOLS` order — the store owns it).
+        assert_eq!(
+            VALID_PROTOCOLS.len(),
+            23,
+            "picker covers the canonical list"
+        );
+        assert_eq!(
+            crate::protocol_choices().len(),
+            23,
+            "one picker row per canonical type"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                for protocol in VALID_PROTOCOLS {
+                    form.protocol_select.update(cx, |state, cx| {
+                        state.set_selected_value(&protocol.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.protocol_select.read(cx).selected_value(),
+                        Some(&protocol.to_string()),
+                        "{protocol} resolves in the picker"
+                    );
+                }
+            })
+        });
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T01: Edit locks the type — read-only
+    /// `protocol-lock` paints, the picker is absent, and committing an
+    /// edited row keeps the baseline type (Throne §7.7 parity).
+    #[gpui_kit::test]
+    fn t01_edit_locks_protocol_type(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "protocol-lock");
+        assert_absent(cx, "protocol-select".to_string());
+        // An untouched edit carries no protocol change.
+        let untouched = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &seeded, None);
+                form.as_patch_vs(cx, &seeded).protocol.is_none()
+            })
+        });
+        assert!(untouched, "locked edit changes no type");
+        // A real commit (name edited) keeps the baseline type.
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::prefilled(window, cx, &seeded, None);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("Work2", window, cx);
+                });
+                let patch = form.as_patch_vs(cx, &seeded);
+                assert!(patch.protocol.is_none(), "rename carries no type change");
+                view.commit_edit_with_focus(&seeded.id, patch, &form, &form_error, window, cx)
+            })
+        });
+        assert!(committed, "rename commits");
+        let row = view.read_with(cx, |view, _| {
+            view.store
+                .get(&seeded.id)
+                .expect("get works")
+                .expect("row kept")
+        });
+        assert_eq!(row.name, "Work2", "rename lands");
+        assert_eq!(row.protocol, "vless", "baseline type kept");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T01: virtual types (`chain`, `custom-outbound`,
+    /// `custom-config`, `extra-core`) hide the guided Server/Server port
+    /// inputs (Throne gating parity); endpoint types keep them. Driven
+    /// through the real picker with keyboard navigation (the popup list
+    /// virtualizes — off-screen rows never paint, so clicks can't reach
+    /// them; arrows + Enter is the honest path) so the builder sync runs
+    /// each switch. Cursor starts at `vless` (row 0); deltas track it.
+    #[gpui_kit::test]
+    fn t01_virtual_types_hide_server_port(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        use gpui_kit::VisualTestContext;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        // Default (vless) keeps the endpoint inputs.
+        assert_painted(cx, "field-guided-server");
+        assert_painted(cx, "field-guided-port");
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let mut cursor = row_of("vless");
+        let pick = |cx: &mut VisualTestContext, target: usize, cursor: &mut usize| {
+            cx.update(|window, cx| {
+                window.click("protocol-select", cx);
+            });
+            cx.run_until_parked();
+            paint_dialog_open(cx);
+            let (key, steps) = if target >= *cursor {
+                ("down", target - *cursor)
+            } else {
+                ("up", *cursor - target)
+            };
+            let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+            for _ in 0..steps {
+                cx.update(|window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                });
+                cx.run_until_parked();
+            }
+            let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(enter, cx);
+            });
+            cx.run_until_parked();
+            paint_dialog_open(cx);
+            *cursor = target;
+        };
+        for virtual_proto in ["chain", "custom-outbound", "custom-config", "extra-core"] {
+            pick(cx, row_of(virtual_proto), &mut cursor);
+            assert_absent(cx, "field-guided-server".to_string());
+            assert_absent(cx, "field-guided-port".to_string());
+            assert_painted(cx, "protocol-select");
+            assert_painted(cx, "guided-hint");
+        }
+        // Switching back to an endpoint type restores the inputs.
+        pick(cx, row_of("vless"), &mut cursor);
+        assert_painted(cx, "field-guided-server");
+        assert_painted(cx, "field-guided-port");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T01: the picker switch rewrites pristine JSON to
+    /// the new starter and preserves dirty JSON (contract C1), wired through
+    /// [`ConfigForm::sync_protocol_template`] — the builder-called seam.
+    #[gpui_kit::test]
+    fn t01_template_sync_rewrites_pristine_only(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let (pristine_after, dirty_after) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                // Pristine starter + switch rewrites to the new starter.
+                let form = ConfigForm::blank(window, cx);
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"chain".to_string(), window, cx);
+                });
+                form.sync_protocol_template(window, cx);
+                let pristine_after = form.params.read(cx).value().to_string();
+                // User-typed JSON + switch stands untouched.
+                form.params.update(cx, |state, cx| {
+                    state.set_value(
+                        "{\"type\":\"vless\",\"server\":\"a.example.com\"}",
+                        window,
+                        cx,
+                    );
+                });
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"socks".to_string(), window, cx);
+                });
+                form.sync_protocol_template(window, cx);
+                let dirty_after = form.params.read(cx).value().to_string();
+                (pristine_after, dirty_after)
+            })
+        });
+        assert_eq!(
+            pristine_after,
+            protocol_params_template("chain"),
+            "pristine switch rewrites"
+        );
+        assert_eq!(
+            dirty_after, "{\"type\":\"vless\",\"server\":\"a.example.com\"}",
+            "dirty switch preserves"
+        );
+    }
+
+    /// Config-completeness T01 ENTER-guard: Confirm from inside the protocol
+    /// picker popup stops at the picker wrapper — the dialog never commits a
+    /// half-filled row (audit §10.9 incident regression). The test is
+    /// validation-sensitive by construction: a broken guard would run the
+    /// commit on the untouched (invalid) template and fire exactly one error
+    /// toast, so zero toasts plus an open dialog plus zero rows pins the
+    /// guard rather than the validator.
+    #[gpui_kit::test]
+    fn t01_enter_in_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("protocol-option-socks".to_string())
+                .is_some()),
+            "picker popup opened"
+        );
+        let keystroke = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "picker Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "picker Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "picker Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "protocol-option-socks".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Ticket 02: edit dialog and delete confirm open for a stored config.
@@ -30197,7 +30746,9 @@ mod tests {
         );
         for id in [
             "field-name",
-            "field-protocol",
+            // Config-completeness T01: protocol picker replaces the free-text
+            // `field-protocol` input (same row, kit `Select` trigger).
+            "protocol-select",
             "field-guided-server",
             "field-guided-port",
             "field-guided-identity",
