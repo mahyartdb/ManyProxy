@@ -72,15 +72,16 @@ use import::{
 };
 use store::{
     count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
-    export_confirm_description, fold_dial_into_params, fold_guided_into_params,
-    fold_mux_into_params, fold_shadowsocks_inner_into_params, fold_tls_optional_into_params,
-    fold_tls_vmess_into_params, fold_transport_into_params, fold_trojan_inner_into_params,
-    fold_vless_inner_into_params, fold_vmess_inner_into_params, guided_identity_fields,
-    guided_prefill_bool, guided_prefill_value, is_virtual_protocol, now_unix,
-    pristine_template_rewrite, protocol_params_template, proxy_urls, vmess_cipher_value,
-    vmess_tls_enabled, ConfigPatch, DialFold, HealthSnapshot, MuxFold, NewConfig, ProxyConfig,
-    RestoreOutcome, Store, StoreError, Subscription as ProxySubscription, TlsOptionalFold,
-    TransportFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    export_confirm_description, fold_amneziawg_into_params, fold_dial_into_params,
+    fold_guided_into_params, fold_mux_into_params, fold_shadowsocks_inner_into_params,
+    fold_tls_optional_into_params, fold_tls_vmess_into_params, fold_transport_into_params,
+    fold_trojan_inner_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
+    fold_wireguard_into_params, guided_identity_fields, guided_prefill_bool, guided_prefill_value,
+    is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
+    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, ConfigPatch, DialFold, HealthSnapshot,
+    MuxFold, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
+    Subscription as ProxySubscription, TlsOptionalFold, TransportFold, WireguardFold, DEFAULT_BIND,
+    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -1726,6 +1727,70 @@ struct ConfigForm {
     /// Config-completeness T03: outer Shadowsocks disclosure (see
     /// [`ConfigForm::shadowsocks_block`]) — collapsed by default like VLESS.
     ss_open: Rc<RefCell<bool>>,
+    /// Config-completeness T04: WireGuard inner fields — masked private-key
+    /// secret + keygen, peer public/preshared keys, reserved/keepalive/
+    /// local-addr/dns/mtu/workers texts, sys_ifc cell. Rendered (and folded)
+    /// only while the live protocol is `wireguard`; the page carries S4
+    /// only (no Transport/TLS/Mux — endpoint parity).
+    wg_private: Entity<InputState>,
+    wg_public: Entity<InputState>,
+    wg_preshared: Entity<InputState>,
+    wg_reserved: Entity<InputState>,
+    wg_keepalive: Entity<InputState>,
+    wg_local_addr: Entity<InputState>,
+    wg_dns: Entity<InputState>,
+    wg_mtu: Entity<InputState>,
+    wg_workers: Entity<InputState>,
+    wg_sys_ifc: Rc<RefCell<bool>>,
+    /// Config-completeness T04: outer WireGuard disclosure (see
+    /// [`ConfigForm::wireguard_block`]) — collapsed by default like VLESS.
+    wg_open: Rc<RefCell<bool>>,
+    /// Config-completeness T04: AmneziaWG inner fields — the full WG set
+    /// above (separate entities so unmerged typing never crosses pages —
+    /// T03 protocol-scoping) plus the AWG matrix: enable marker, version
+    /// picker, junk-train Jc/Jmin/Jmax, S-lengths, H-ranges, I-chains, v3
+    /// fields, trailers/cookies cells. Rendered (and folded) only while the
+    /// live protocol is `amneziawg`; the page carries S4 only.
+    awg_private: Entity<InputState>,
+    awg_public: Entity<InputState>,
+    awg_preshared: Entity<InputState>,
+    awg_reserved: Entity<InputState>,
+    awg_keepalive: Entity<InputState>,
+    awg_local_addr: Entity<InputState>,
+    awg_dns: Entity<InputState>,
+    awg_mtu: Entity<InputState>,
+    awg_workers: Entity<InputState>,
+    awg_sys_ifc: Rc<RefCell<bool>>,
+    awg_version: Entity<SelectState<PanelChoiceList>>,
+    awg_enable: Rc<RefCell<bool>>,
+    awg_jc: Entity<InputState>,
+    awg_jmin: Entity<InputState>,
+    awg_jmax: Entity<InputState>,
+    awg_s1: Entity<InputState>,
+    awg_s2: Entity<InputState>,
+    awg_s3: Entity<InputState>,
+    awg_s4: Entity<InputState>,
+    awg_h1: Entity<InputState>,
+    awg_h2: Entity<InputState>,
+    awg_h3: Entity<InputState>,
+    awg_h4: Entity<InputState>,
+    awg_i1: Entity<InputState>,
+    awg_i2: Entity<InputState>,
+    awg_i3: Entity<InputState>,
+    awg_i4: Entity<InputState>,
+    awg_i5: Entity<InputState>,
+    awg_hpk: Entity<InputState>,
+    awg_pad: Entity<InputState>,
+    awg_rekey_after: Entity<InputState>,
+    awg_rekey_timeout: Entity<InputState>,
+    awg_reject_after: Entity<InputState>,
+    awg_keepalive_timeout: Entity<InputState>,
+    awg_max_handshake: Entity<InputState>,
+    awg_trailers: Rc<RefCell<bool>>,
+    awg_cookies: Rc<RefCell<bool>>,
+    /// Config-completeness T04: outer AmneziaWG disclosure (see
+    /// [`ConfigForm::amneziawg_block`]) — collapsed by default like VLESS.
+    awg_open: Rc<RefCell<bool>>,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -1956,6 +2021,57 @@ impl ConfigForm {
             ss_plugin_opts: Self::field(window, cx, "Plugin options", None),
             ss_uot: Rc::new(RefCell::new(false)),
             ss_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T04: WG/AWG pages open blank (every fold
+            // no-ops, so the template stands) under collapsed disclosures.
+            wg_private: Self::secret_field(window, cx, "Private key", None),
+            wg_public: Self::field(window, cx, "Peer public key", None),
+            wg_preshared: Self::secret_field(window, cx, "Preshared key", None),
+            wg_reserved: Self::field(window, cx, "Reserved (comma ints)", None),
+            wg_keepalive: Self::field(window, cx, "Keepalive (seconds)", None),
+            wg_local_addr: Self::field(window, cx, "Local address (comma CIDRs)", None),
+            wg_dns: Self::field(window, cx, "DNS", None),
+            wg_mtu: Self::field(window, cx, "MTU", None),
+            wg_workers: Self::field(window, cx, "Workers", None),
+            wg_sys_ifc: Rc::new(RefCell::new(false)),
+            wg_open: Rc::new(RefCell::new(false)),
+            awg_private: Self::secret_field(window, cx, "Private key", None),
+            awg_public: Self::field(window, cx, "Peer public key", None),
+            awg_preshared: Self::secret_field(window, cx, "Preshared key", None),
+            awg_reserved: Self::field(window, cx, "Reserved (comma ints)", None),
+            awg_keepalive: Self::field(window, cx, "Keepalive (seconds)", None),
+            awg_local_addr: Self::field(window, cx, "Local address (comma CIDRs)", None),
+            awg_dns: Self::field(window, cx, "DNS", None),
+            awg_mtu: Self::field(window, cx, "MTU", None),
+            awg_workers: Self::field(window, cx, "Workers", None),
+            awg_sys_ifc: Rc::new(RefCell::new(false)),
+            awg_version: Self::panel_select(window, cx, awg_version_choices(), ""),
+            awg_enable: Rc::new(RefCell::new(false)),
+            awg_jc: Self::field(window, cx, "Jc", None),
+            awg_jmin: Self::field(window, cx, "Jmin", None),
+            awg_jmax: Self::field(window, cx, "Jmax", None),
+            awg_s1: Self::field(window, cx, "S1", None),
+            awg_s2: Self::field(window, cx, "S2", None),
+            awg_s3: Self::field(window, cx, "S3", None),
+            awg_s4: Self::field(window, cx, "S4", None),
+            awg_h1: Self::field(window, cx, "H1", None),
+            awg_h2: Self::field(window, cx, "H2", None),
+            awg_h3: Self::field(window, cx, "H3", None),
+            awg_h4: Self::field(window, cx, "H4", None),
+            awg_i1: Self::field(window, cx, "I1", None),
+            awg_i2: Self::field(window, cx, "I2", None),
+            awg_i3: Self::field(window, cx, "I3", None),
+            awg_i4: Self::field(window, cx, "I4", None),
+            awg_i5: Self::field(window, cx, "I5", None),
+            awg_hpk: Self::field(window, cx, "Header protection key", None),
+            awg_pad: Self::field(window, cx, "Content padding addition", None),
+            awg_rekey_after: Self::field(window, cx, "Rekey after time", None),
+            awg_rekey_timeout: Self::field(window, cx, "Rekey timeout", None),
+            awg_reject_after: Self::field(window, cx, "Reject after time", None),
+            awg_keepalive_timeout: Self::field(window, cx, "Keepalive timeout", None),
+            awg_max_handshake: Self::field(window, cx, "Max handshake attempts", None),
+            awg_trailers: Rc::new(RefCell::new(false)),
+            awg_cookies: Rc::new(RefCell::new(false)),
+            awg_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -2261,6 +2377,310 @@ impl ConfigForm {
                 &["udp_over_tcp", "uot"],
             ))),
             ss_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T04: WG/AWG inner pages echo the row's
+            // params JSON (untouched values fold back byte-identical — no
+            // spurious patch). The version picker reads `awg_version` else
+            // the legacy `version`; anything outside 2.0|3.x echoes as no
+            // selection and round-trips byte-identical (the engine accepts
+            // `2`/`3`/`3.0`/`3.1` too).
+            wg_private: Self::secret_field(
+                window,
+                cx,
+                "Private key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key", "privatekey"],
+                )),
+            ),
+            wg_public: Self::field(
+                window,
+                cx,
+                "Peer public key",
+                Some(&guided_prefill_value(params, &["public_key", "publickey"])),
+            ),
+            wg_preshared: Self::secret_field(
+                window,
+                cx,
+                "Preshared key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["pre_shared_key", "presharedkey", "preshared_key"],
+                )),
+            ),
+            wg_reserved: Self::field(
+                window,
+                cx,
+                "Reserved (comma ints)",
+                Some(&guided_prefill_value(params, &["reserved"])),
+            ),
+            wg_keepalive: Self::field(
+                window,
+                cx,
+                "Keepalive (seconds)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["persistent_keepalive", "persistent_keepalive_interval"],
+                )),
+            ),
+            wg_local_addr: Self::field(
+                window,
+                cx,
+                "Local address (comma CIDRs)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["address", "local_address", "local_addr"],
+                )),
+            ),
+            wg_dns: Self::field(
+                window,
+                cx,
+                "DNS",
+                Some(&guided_prefill_value(params, &["dns"])),
+            ),
+            wg_mtu: Self::field(
+                window,
+                cx,
+                "MTU",
+                Some(&guided_prefill_value(params, &["mtu"])),
+            ),
+            wg_workers: Self::field(
+                window,
+                cx,
+                "Workers",
+                Some(&guided_prefill_value(params, &["workers"])),
+            ),
+            wg_sys_ifc: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["system", "sys_ifc"],
+            ))),
+            wg_open: Rc::new(RefCell::new(false)),
+            awg_private: Self::secret_field(
+                window,
+                cx,
+                "Private key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key", "privatekey"],
+                )),
+            ),
+            awg_public: Self::field(
+                window,
+                cx,
+                "Peer public key",
+                Some(&guided_prefill_value(params, &["public_key", "publickey"])),
+            ),
+            awg_preshared: Self::secret_field(
+                window,
+                cx,
+                "Preshared key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["pre_shared_key", "presharedkey", "preshared_key"],
+                )),
+            ),
+            awg_reserved: Self::field(
+                window,
+                cx,
+                "Reserved (comma ints)",
+                Some(&guided_prefill_value(params, &["reserved"])),
+            ),
+            awg_keepalive: Self::field(
+                window,
+                cx,
+                "Keepalive (seconds)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["persistent_keepalive", "persistent_keepalive_interval"],
+                )),
+            ),
+            awg_local_addr: Self::field(
+                window,
+                cx,
+                "Local address (comma CIDRs)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["address", "local_address", "local_addr"],
+                )),
+            ),
+            awg_dns: Self::field(
+                window,
+                cx,
+                "DNS",
+                Some(&guided_prefill_value(params, &["dns"])),
+            ),
+            awg_mtu: Self::field(
+                window,
+                cx,
+                "MTU",
+                Some(&guided_prefill_value(params, &["mtu"])),
+            ),
+            awg_workers: Self::field(
+                window,
+                cx,
+                "Workers",
+                Some(&guided_prefill_value(params, &["workers"])),
+            ),
+            awg_sys_ifc: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["system", "sys_ifc"],
+            ))),
+            awg_version: Self::panel_select(
+                window,
+                cx,
+                awg_version_choices(),
+                &guided_prefill_value(params, &["awg_version", "version"]),
+            ),
+            awg_enable: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["enable_amnezia"],
+            ))),
+            awg_jc: Self::field(
+                window,
+                cx,
+                "Jc",
+                Some(&guided_prefill_value(params, &["jc"])),
+            ),
+            awg_jmin: Self::field(
+                window,
+                cx,
+                "Jmin",
+                Some(&guided_prefill_value(params, &["jmin"])),
+            ),
+            awg_jmax: Self::field(
+                window,
+                cx,
+                "Jmax",
+                Some(&guided_prefill_value(params, &["jmax"])),
+            ),
+            awg_s1: Self::field(
+                window,
+                cx,
+                "S1",
+                Some(&guided_prefill_value(params, &["s1"])),
+            ),
+            awg_s2: Self::field(
+                window,
+                cx,
+                "S2",
+                Some(&guided_prefill_value(params, &["s2"])),
+            ),
+            awg_s3: Self::field(
+                window,
+                cx,
+                "S3",
+                Some(&guided_prefill_value(params, &["s3"])),
+            ),
+            awg_s4: Self::field(
+                window,
+                cx,
+                "S4",
+                Some(&guided_prefill_value(params, &["s4"])),
+            ),
+            awg_h1: Self::field(
+                window,
+                cx,
+                "H1",
+                Some(&guided_prefill_value(params, &["h1"])),
+            ),
+            awg_h2: Self::field(
+                window,
+                cx,
+                "H2",
+                Some(&guided_prefill_value(params, &["h2"])),
+            ),
+            awg_h3: Self::field(
+                window,
+                cx,
+                "H3",
+                Some(&guided_prefill_value(params, &["h3"])),
+            ),
+            awg_h4: Self::field(
+                window,
+                cx,
+                "H4",
+                Some(&guided_prefill_value(params, &["h4"])),
+            ),
+            awg_i1: Self::field(
+                window,
+                cx,
+                "I1",
+                Some(&guided_prefill_value(params, &["i1"])),
+            ),
+            awg_i2: Self::field(
+                window,
+                cx,
+                "I2",
+                Some(&guided_prefill_value(params, &["i2"])),
+            ),
+            awg_i3: Self::field(
+                window,
+                cx,
+                "I3",
+                Some(&guided_prefill_value(params, &["i3"])),
+            ),
+            awg_i4: Self::field(
+                window,
+                cx,
+                "I4",
+                Some(&guided_prefill_value(params, &["i4"])),
+            ),
+            awg_i5: Self::field(
+                window,
+                cx,
+                "I5",
+                Some(&guided_prefill_value(params, &["i5"])),
+            ),
+            awg_hpk: Self::field(
+                window,
+                cx,
+                "Header protection key",
+                Some(&guided_prefill_value(params, &["headerprotectionkey"])),
+            ),
+            awg_pad: Self::field(
+                window,
+                cx,
+                "Content padding addition",
+                Some(&guided_prefill_value(params, &["contentpaddingaddition"])),
+            ),
+            awg_rekey_after: Self::field(
+                window,
+                cx,
+                "Rekey after time",
+                Some(&guided_prefill_value(params, &["rekeyaftertime"])),
+            ),
+            awg_rekey_timeout: Self::field(
+                window,
+                cx,
+                "Rekey timeout",
+                Some(&guided_prefill_value(params, &["rekeytimeout"])),
+            ),
+            awg_reject_after: Self::field(
+                window,
+                cx,
+                "Reject after time",
+                Some(&guided_prefill_value(params, &["rejectaftertime"])),
+            ),
+            awg_keepalive_timeout: Self::field(
+                window,
+                cx,
+                "Keepalive timeout",
+                Some(&guided_prefill_value(params, &["keepalivetimeout"])),
+            ),
+            awg_max_handshake: Self::field(
+                window,
+                cx,
+                "Max handshake attempts",
+                Some(&guided_prefill_value(params, &["maxhandshakeattempts"])),
+            ),
+            awg_trailers: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["randomtrailers", "random_trailers"],
+            ))),
+            awg_cookies: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["disablecookies", "disable_cookies"],
+            ))),
+            awg_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(true)),
         }
     }
@@ -3091,6 +3511,361 @@ impl ConfigForm {
         )
     }
 
+    /// Config-completeness T04: the nine shared WireGuard peer/net rows
+    /// (private key + keygen, peer public/preshared keys, reserved,
+    /// keepalive, local address, DNS, MTU, workers, sys_ifc) — one helper
+    /// behind the WG and AWG pages (separate entities per page, one render
+    /// rule). Kit constructors/builders: masked `Input` + `mask_toggle`,
+    /// `.small()` `Button` generator (uuid-row precedent), `Switch`
+    /// (`checked` + `on_change` over the shared cell), `Field` layout.
+    fn wg_peer_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        peer: WgPeerRefs<'_>,
+    ) -> impl IntoElement {
+        let prefix = peer.prefix;
+        let secret_entity = peer.private_key.clone();
+        let keygen_view = view.clone();
+        let sys_cell = peer.sys_ifc.clone();
+        let sys_repaint = repaint.clone();
+        let row = |id: String, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        let masked_row = |id: String, label: &str, state: &Entity<InputState>| {
+            field().label(label.to_string()).child(
+                div()
+                    .id(id)
+                    .test_support()
+                    .child(Input::new(state).mask_toggle()),
+            )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                field().label("Private key".to_string()).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id(format!("{prefix}-private-key"))
+                                .test_support()
+                                .child(Input::new(peer.private_key).mask_toggle()),
+                        )
+                        .child(
+                            Button::new(format!("{prefix}-private-key-generate"))
+                                .small()
+                                .label("Generate")
+                                .tooltip(
+                                    "Generate a fresh WireGuard private key (local only — no WARP registration)",
+                                )
+                                .accessibility_label("Generate a fresh WireGuard private key")
+                                .on_click(move |_, window, cx| {
+                                    let generated = generate_wireguard_key();
+                                    keygen_view.update(cx, |_, cx| {
+                                        secret_entity.update(cx, |state, cx| {
+                                            state.set_value(generated, &mut *window, cx);
+                                        });
+                                    });
+                                    window.push_notification(
+                                        Notification::info("Generated a new WireGuard private key"),
+                                        cx,
+                                    );
+                                }),
+                        ),
+                ),
+            )
+            .child(row(
+                format!("{prefix}-public-key"),
+                "Public key (peer)",
+                peer.public_key,
+            ))
+            .child(masked_row(
+                format!("{prefix}-preshared-key"),
+                "Preshared key",
+                peer.pre_shared_key,
+            ))
+            .child(row(
+                format!("{prefix}-reserved"),
+                "Reserved (comma ints)",
+                peer.reserved,
+            ))
+            .child(row(
+                format!("{prefix}-keepalive"),
+                "Keepalive (seconds)",
+                peer.keepalive,
+            ))
+            .child(row(
+                format!("{prefix}-local-addr"),
+                "Local address (comma CIDRs)",
+                peer.local_addr,
+            ))
+            .child(row(format!("{prefix}-dns"), "DNS", peer.dns))
+            .child(row(format!("{prefix}-mtu"), "MTU", peer.mtu))
+            .child(row(
+                format!("{prefix}-workers"),
+                "Workers",
+                peer.workers,
+            ))
+            .child(
+                field().label_indent(false).child(
+                    div()
+                        .id(format!("{prefix}-sys-ifc"))
+                        .test_support()
+                        .child(
+                            Switch::new(format!("{prefix}-sys-ifc-switch"))
+                                .small()
+                                .checked(*peer.sys_ifc.borrow())
+                                .label("System interface (sys_ifc)")
+                                .tooltip("Use the system WireGuard interface (stores as system)")
+                                .accessibility_label("Use the system WireGuard interface")
+                                .on_change(move |next: &bool, window, cx| {
+                                    *sys_cell.borrow_mut() = *next;
+                                    sys_repaint(window, cx);
+                                }),
+                        ),
+                ),
+            )
+    }
+
+    /// Config-completeness T04: WireGuard guided page — the shared peer/net
+    /// rows plus the shared S4 dial panel (no Transport/TLS/Mux — endpoint
+    /// parity). Rendered only while the live protocol is `wireguard`. Same
+    /// outer-disclosure contract as [`ConfigForm::vmess_block`].
+    fn wireguard_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.wg_peer_block(
+            view,
+            repaint,
+            WgPeerRefs {
+                prefix: "wg",
+                private_key: &self.wg_private,
+                public_key: &self.wg_public,
+                pre_shared_key: &self.wg_preshared,
+                reserved: &self.wg_reserved,
+                keepalive: &self.wg_keepalive,
+                local_addr: &self.wg_local_addr,
+                dns: &self.wg_dns,
+                mtu: &self.wg_mtu,
+                workers: &self.wg_workers,
+                sys_ifc: &self.wg_sys_ifc,
+            },
+        ));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("wg-notes").test_support().child(
+                "WireGuard rows become endpoints[] at generate. Blank AllowedIPs defaults to \
+                 0.0.0.0/0; DNS is stored but never emitted; udp_timeout stays JSON-only.",
+            ),
+        ));
+        Self::page_disclosure(
+            "WireGuard settings",
+            "wg-section-caption",
+            "wg-section-toggle",
+            "wg-section",
+            &self.wg_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T04: AmneziaWG guided page (headline) — all WG
+    /// peer/net rows + enable marker + `awg_version` 2.0|3.x picker + the
+    /// full J/S/H/I matrix + v3 fields + trailers/cookies switches, plus
+    /// the shared S4 dial panel. The v3 section hides unless 3.x is picked
+    /// (entities persist, the fold always folds — R5 hide-preserve, never a
+    /// wipe). Rendered only while the live protocol is `amneziawg`. Same
+    /// kit set and outer-disclosure contract as
+    /// [`ConfigForm::wireguard_block`].
+    fn amneziawg_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let caption = |id: &'static str, text: &str| {
+            div()
+                .id(id)
+                .test_support()
+                .child(Label::new(text.to_string()))
+        };
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.wg_peer_block(
+            view,
+            repaint,
+            WgPeerRefs {
+                prefix: "awg",
+                private_key: &self.awg_private,
+                public_key: &self.awg_public,
+                pre_shared_key: &self.awg_preshared,
+                reserved: &self.awg_reserved,
+                keepalive: &self.awg_keepalive,
+                local_addr: &self.awg_local_addr,
+                dns: &self.awg_dns,
+                mtu: &self.awg_mtu,
+                workers: &self.awg_workers,
+                sys_ifc: &self.awg_sys_ifc,
+            },
+        ));
+        block = block.child(switch_row(
+            "awg-enable",
+            "awg-enable-switch".to_string(),
+            "Enable Amnezia",
+            "AmneziaWG obfuscation marker (UI state — stripped at generate, like brutal speeds)",
+            &self.awg_enable,
+            repaint,
+        ));
+        block = block.child(Self::panel_select_row(
+            "AWG version",
+            "awg-version-tip",
+            "AmneziaWG version (2.0 or 3.x — gates the v3 fields below)",
+            "awg-version",
+            "AmneziaWG version",
+            &self.awg_version,
+        ));
+        block = block.child(caption("awg-junk-caption", "Junk train"));
+        block = block
+            .child(row("awg-jc", "Jc", &self.awg_jc))
+            .child(row("awg-jmin", "Jmin", &self.awg_jmin))
+            .child(row("awg-jmax", "Jmax", &self.awg_jmax));
+        block = block.child(caption("awg-length-caption", "Length prefixes (S1–S4)"));
+        block = block
+            .child(row("awg-s1", "S1", &self.awg_s1))
+            .child(row("awg-s2", "S2", &self.awg_s2))
+            .child(row("awg-s3", "S3", &self.awg_s3))
+            .child(row("awg-s4", "S4", &self.awg_s4));
+        block = block.child(caption("awg-header-caption", "Header ranges (H1–H4)"));
+        block = block
+            .child(row("awg-h1", "H1", &self.awg_h1))
+            .child(row("awg-h2", "H2", &self.awg_h2))
+            .child(row("awg-h3", "H3", &self.awg_h3))
+            .child(row("awg-h4", "H4", &self.awg_h4));
+        block = block.child(caption("awg-chain-caption", "CPS chains (I1–I5)"));
+        block = block
+            .child(row("awg-i1", "I1", &self.awg_i1))
+            .child(row("awg-i2", "I2", &self.awg_i2))
+            .child(row("awg-i3", "I3", &self.awg_i3))
+            .child(row("awg-i4", "I4", &self.awg_i4))
+            .child(row("awg-i5", "I5", &self.awg_i5));
+        // Version-gated v3 section: hidden inputs persist (entities stand,
+        // the fold always folds) — hiding never wipes per R5.
+        if Self::panel_value(&self.awg_version, cx, "") == "3.x" {
+            block = block.child(caption("awg-v3-caption", "v3-only fields"));
+            block = block
+                .child(row("awg-hpk", "Header protection key", &self.awg_hpk))
+                .child(row("awg-pad", "Content padding addition", &self.awg_pad))
+                .child(row(
+                    "awg-rekey-after",
+                    "Rekey after time",
+                    &self.awg_rekey_after,
+                ))
+                .child(row(
+                    "awg-rekey-timeout",
+                    "Rekey timeout",
+                    &self.awg_rekey_timeout,
+                ))
+                .child(row(
+                    "awg-reject-after",
+                    "Reject after time",
+                    &self.awg_reject_after,
+                ))
+                .child(row(
+                    "awg-keepalive-timeout",
+                    "Keepalive timeout",
+                    &self.awg_keepalive_timeout,
+                ))
+                .child(row(
+                    "awg-max-handshake",
+                    "Max handshake attempts",
+                    &self.awg_max_handshake,
+                ));
+            block = block.child(switch_row(
+                "awg-trailers",
+                "awg-trailers-switch".to_string(),
+                "Random trailers",
+                "Append random trailers (v3-only — passes through for the fork check)",
+                &self.awg_trailers,
+                repaint,
+            ));
+            block = block.child(switch_row(
+                "awg-cookies",
+                "awg-cookies-switch".to_string(),
+                "Disable cookies",
+                "Disable handshake cookies (v3-only — passes through for the fork check)",
+                &self.awg_cookies,
+                repaint,
+            ));
+        } else {
+            block = block.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("awg-v3-note")
+                        .test_support()
+                        .child("v3-only fields hidden — stored values preserved (never wiped)."),
+                ),
+            );
+        }
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("awg-notes").test_support().child(
+                "AmneziaWG rows run in the fork sidecar (sing-box-awg). v3-only keys on a 2.0 row \
+                 fail generate naming the field; udp_timeout stays JSON-only.",
+            ),
+        ));
+        Self::page_disclosure(
+            "AmneziaWG settings",
+            "awg-section-caption",
+            "awg-section-toggle",
+            "awg-section",
+            &self.awg_open,
+            view,
+            block,
+        )
+    }
+
     /// Config-completeness T02: VLESS guided page — inner fields plus the
     /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
     /// `open`, no motion id — closed content unmounts, entities persist, so
@@ -3225,6 +4000,8 @@ impl ConfigForm {
                     self.shadowsocks_block(&view, &repaint, cx)
                         .into_any_element(),
                 ),
+                "wireguard" => Some(self.wireguard_block(&view, &repaint, cx).into_any_element()),
+                "amneziawg" => Some(self.amneziawg_block(&view, &repaint, cx).into_any_element()),
                 _ => None,
             }
         };
@@ -3617,6 +4394,17 @@ impl ConfigForm {
                 let params = fold_mux_into_params(&params, &self.mux_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
             }
+            "wireguard" => {
+                let params =
+                    fold_wireguard_into_params(&params, &self.wireguard_fold(cx, "wireguard"));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "amneziawg" => {
+                let params =
+                    fold_wireguard_into_params(&params, &self.wireguard_fold(cx, "amneziawg"));
+                let params = fold_amneziawg_into_params(&params, &self.amnezia_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
             _ => params,
         }
     }
@@ -3669,6 +4457,101 @@ impl ConfigForm {
             self.ss_plugin_opts.read(cx).value().to_string(),
             *self.ss_uot.borrow(),
         )
+    }
+
+    /// Config-completeness T04: WireGuard inner texts in fold order — read
+    /// from the WG page (`page == "wireguard"`) or the AWG page (same slots,
+    /// separate entities). The version/matrix half reads through
+    /// [`ConfigForm::amnezia_fold`].
+    fn wireguard_fold(&self, cx: &App, page: &str) -> WireguardFold {
+        let awg = page == "amneziawg";
+        WireguardFold {
+            private_key: if awg {
+                self.awg_private.read(cx).value().to_string()
+            } else {
+                self.wg_private.read(cx).value().to_string()
+            },
+            public_key: if awg {
+                self.awg_public.read(cx).value().to_string()
+            } else {
+                self.wg_public.read(cx).value().to_string()
+            },
+            pre_shared_key: if awg {
+                self.awg_preshared.read(cx).value().to_string()
+            } else {
+                self.wg_preshared.read(cx).value().to_string()
+            },
+            reserved: if awg {
+                self.awg_reserved.read(cx).value().to_string()
+            } else {
+                self.wg_reserved.read(cx).value().to_string()
+            },
+            persistent_keepalive: if awg {
+                self.awg_keepalive.read(cx).value().to_string()
+            } else {
+                self.wg_keepalive.read(cx).value().to_string()
+            },
+            local_addr: if awg {
+                self.awg_local_addr.read(cx).value().to_string()
+            } else {
+                self.wg_local_addr.read(cx).value().to_string()
+            },
+            dns: if awg {
+                self.awg_dns.read(cx).value().to_string()
+            } else {
+                self.wg_dns.read(cx).value().to_string()
+            },
+            mtu: if awg {
+                self.awg_mtu.read(cx).value().to_string()
+            } else {
+                self.wg_mtu.read(cx).value().to_string()
+            },
+            workers: if awg {
+                self.awg_workers.read(cx).value().to_string()
+            } else {
+                self.wg_workers.read(cx).value().to_string()
+            },
+            sys_ifc: if awg {
+                *self.awg_sys_ifc.borrow()
+            } else {
+                *self.wg_sys_ifc.borrow()
+            },
+        }
+    }
+
+    /// Config-completeness T04: AmneziaWG matrix UI state as a store fold.
+    /// Always reads every field regardless of the live version selection —
+    /// the fold never branches on version (R5 hide-preserve).
+    fn amnezia_fold(&self, cx: &App) -> AmneziaFold {
+        AmneziaFold {
+            enable_amnezia: *self.awg_enable.borrow(),
+            version: Self::panel_value(&self.awg_version, cx, ""),
+            jc: self.awg_jc.read(cx).value().to_string(),
+            jmin: self.awg_jmin.read(cx).value().to_string(),
+            jmax: self.awg_jmax.read(cx).value().to_string(),
+            s1: self.awg_s1.read(cx).value().to_string(),
+            s2: self.awg_s2.read(cx).value().to_string(),
+            s3: self.awg_s3.read(cx).value().to_string(),
+            s4: self.awg_s4.read(cx).value().to_string(),
+            h1: self.awg_h1.read(cx).value().to_string(),
+            h2: self.awg_h2.read(cx).value().to_string(),
+            h3: self.awg_h3.read(cx).value().to_string(),
+            h4: self.awg_h4.read(cx).value().to_string(),
+            i1: self.awg_i1.read(cx).value().to_string(),
+            i2: self.awg_i2.read(cx).value().to_string(),
+            i3: self.awg_i3.read(cx).value().to_string(),
+            i4: self.awg_i4.read(cx).value().to_string(),
+            i5: self.awg_i5.read(cx).value().to_string(),
+            header_protection_key: self.awg_hpk.read(cx).value().to_string(),
+            content_padding_addition: self.awg_pad.read(cx).value().to_string(),
+            rekey_after_time: self.awg_rekey_after.read(cx).value().to_string(),
+            rekey_timeout: self.awg_rekey_timeout.read(cx).value().to_string(),
+            reject_after_time: self.awg_reject_after.read(cx).value().to_string(),
+            keepalive_timeout: self.awg_keepalive_timeout.read(cx).value().to_string(),
+            max_handshake_attempts: self.awg_max_handshake.read(cx).value().to_string(),
+            random_trailers: *self.awg_trailers.borrow(),
+            disable_cookies: *self.awg_cookies.borrow(),
+        }
     }
 
     /// Config-completeness T02: S1 UI state as a store fold.
@@ -3754,7 +4637,7 @@ impl ConfigForm {
         // foreign rows); the clear below resets exactly what was merged.
         let page = matches!(
             protocol.as_str(),
-            "vless" | "vmess" | "trojan" | "shadowsocks"
+            "vless" | "vmess" | "trojan" | "shadowsocks" | "wireguard" | "amneziawg"
         );
         if page {
             match protocol.as_str() {
@@ -3803,6 +4686,17 @@ impl ConfigForm {
                     merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
                 }
+                "wireguard" => {
+                    merged =
+                        fold_wireguard_into_params(&merged, &self.wireguard_fold(cx, "wireguard"));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "amneziawg" => {
+                    merged =
+                        fold_wireguard_into_params(&merged, &self.wireguard_fold(cx, "amneziawg"));
+                    merged = fold_amneziawg_into_params(&merged, &self.amnezia_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
                 _ => {}
             }
         }
@@ -3839,9 +4733,11 @@ impl ConfigForm {
     /// the shared panels it folds (shadowsocks folds S3+S4 only, so S1/S2
     /// inputs — possibly holding another page's unmerged typing — stand).
     fn clear_panels(&self, window: &mut Window, cx: &mut Context<AppView>, protocol: &str) {
+        // S4 (dial) merges on every guided page; S3 (mux) only on the
+        // vless/vmess/trojan/shadowsocks pages (T03 scoping: a page resets
+        // exactly what it merged, so another page's unmerged typing stands —
+        // wireguard/amneziawg never touch S3).
         let mut texts: Vec<&Entity<InputState>> = vec![
-            &self.s3_up,
-            &self.s3_down,
             &self.s4_timeout,
             &self.s4_bind,
             &self.s4_inet4,
@@ -3849,12 +4745,16 @@ impl ConfigForm {
         ];
         let mut selects: Vec<(&Entity<SelectState<PanelChoiceList>>, &'static str)> = vec![];
         let mut cells: Vec<&Rc<RefCell<bool>>> = vec![
-            &self.s3_brutal,
             &self.s4_reuse,
             &self.s4_fastopen,
             &self.s4_fragment,
             &self.s4_multipath,
         ];
+        let mux_page = matches!(protocol, "vless" | "vmess" | "trojan" | "shadowsocks");
+        if mux_page {
+            texts.extend([&self.s3_up, &self.s3_down]);
+            cells.push(&self.s3_brutal);
+        }
         if protocol != "shadowsocks" {
             texts.extend([
                 &self.s1_path,
@@ -3889,6 +4789,63 @@ impl ConfigForm {
                 selects.extend([(&self.ss_method, ""), (&self.ss_plugin, "")]);
                 cells.push(&self.ss_uot);
             }
+            "wireguard" => {
+                texts.extend([
+                    &self.wg_private,
+                    &self.wg_public,
+                    &self.wg_preshared,
+                    &self.wg_reserved,
+                    &self.wg_keepalive,
+                    &self.wg_local_addr,
+                    &self.wg_dns,
+                    &self.wg_mtu,
+                    &self.wg_workers,
+                ]);
+                cells.push(&self.wg_sys_ifc);
+            }
+            "amneziawg" => {
+                texts.extend([
+                    &self.awg_private,
+                    &self.awg_public,
+                    &self.awg_preshared,
+                    &self.awg_reserved,
+                    &self.awg_keepalive,
+                    &self.awg_local_addr,
+                    &self.awg_dns,
+                    &self.awg_mtu,
+                    &self.awg_workers,
+                    &self.awg_jc,
+                    &self.awg_jmin,
+                    &self.awg_jmax,
+                    &self.awg_s1,
+                    &self.awg_s2,
+                    &self.awg_s3,
+                    &self.awg_s4,
+                    &self.awg_h1,
+                    &self.awg_h2,
+                    &self.awg_h3,
+                    &self.awg_h4,
+                    &self.awg_i1,
+                    &self.awg_i2,
+                    &self.awg_i3,
+                    &self.awg_i4,
+                    &self.awg_i5,
+                    &self.awg_hpk,
+                    &self.awg_pad,
+                    &self.awg_rekey_after,
+                    &self.awg_rekey_timeout,
+                    &self.awg_reject_after,
+                    &self.awg_keepalive_timeout,
+                    &self.awg_max_handshake,
+                ]);
+                selects.extend([(&self.awg_version, "")]);
+                cells.extend([
+                    &self.awg_sys_ifc,
+                    &self.awg_enable,
+                    &self.awg_trailers,
+                    &self.awg_cookies,
+                ]);
+            }
             _ => {}
         }
         for entity in texts {
@@ -3905,7 +4862,9 @@ impl ConfigForm {
         for cell in cells {
             *cell.borrow_mut() = false;
         }
-        *self.s3_mode.borrow_mut() = String::new();
+        if mux_page {
+            *self.s3_mode.borrow_mut() = String::new();
+        }
     }
 
     /// Ticket 05: collapse direction of the Advanced swap — echo the JSON
@@ -3944,7 +4903,7 @@ impl ConfigForm {
         }
         if matches!(
             protocol.as_str(),
-            "vless" | "vmess" | "trojan" | "shadowsocks"
+            "vless" | "vmess" | "trojan" | "shadowsocks" | "wireguard" | "amneziawg"
         ) {
             self.echo_panels(window, cx, &box_text, &protocol);
         }
@@ -3962,22 +4921,36 @@ impl ConfigForm {
         box_text: &str,
         protocol: &str,
     ) {
-        for (entity, keys) in [
-            (&self.s1_path, &["path"][..]),
-            (&self.s1_host, &["host"][..]),
-            (&self.s1_method, &["method"][..]),
-            (&self.s1_service_name, &["service_name", "serviceName"][..]),
-            (&self.s2_sni, &["sni", "peer"][..]),
-            (&self.s2_alpn, &["alpn"][..]),
-            (&self.s2_pbk, &["pbk"][..]),
-            (&self.s2_sid, &["sid"][..]),
-            (&self.s3_up, &["brutal_up_mbps", "brutal_up"][..]),
-            (&self.s3_down, &["brutal_down_mbps", "brutal_down"][..]),
+        // Shared panels echo only what the page merged (clear-scoping
+        // mirror): S4 dial on every guided page; S1/S2/S3 only on the pages
+        // that fold them (wireguard/amneziawg take S4 alone).
+        let full_panels = matches!(protocol, "vless" | "vmess" | "trojan");
+        let mux_page = matches!(protocol, "vless" | "vmess" | "trojan" | "shadowsocks");
+        let mut shared_texts: Vec<(&Entity<InputState>, &[&str])> = vec![
             (&self.s4_timeout, &["connect_timeout"][..]),
             (&self.s4_bind, &["bind_interface"][..]),
             (&self.s4_inet4, &["inet4_bind_address"][..]),
             (&self.s4_inet6, &["inet6_bind_address"][..]),
-        ] {
+        ];
+        if full_panels {
+            shared_texts.extend([
+                (&self.s1_path, &["path"][..]),
+                (&self.s1_host, &["host"][..]),
+                (&self.s1_method, &["method"][..]),
+                (&self.s1_service_name, &["service_name", "serviceName"][..]),
+                (&self.s2_sni, &["sni", "peer"][..]),
+                (&self.s2_alpn, &["alpn"][..]),
+                (&self.s2_pbk, &["pbk"][..]),
+                (&self.s2_sid, &["sid"][..]),
+            ]);
+        }
+        if mux_page {
+            shared_texts.extend([
+                (&self.s3_up, &["brutal_up_mbps", "brutal_up"][..]),
+                (&self.s3_down, &["brutal_down_mbps", "brutal_down"][..]),
+            ]);
+        }
+        for (entity, keys) in shared_texts {
             let value = guided_prefill_value(box_text, keys);
             let blank = entity.read(cx).value().to_string().trim().is_empty();
             if blank && !value.is_empty() {
@@ -4001,6 +4974,71 @@ impl ConfigForm {
                     &["plugin_opts", "plugin-opts", "pluginOpts"][..],
                 ),
             ],
+            // Config-completeness T04: WG peer/net rows echo on both pages
+            // (separate entities per page — T03 scoping).
+            "wireguard" => &[
+                (&self.wg_private, &["private_key", "privatekey"][..]),
+                (&self.wg_public, &["public_key", "publickey"][..]),
+                (
+                    &self.wg_preshared,
+                    &["pre_shared_key", "presharedkey", "preshared_key"][..],
+                ),
+                (&self.wg_reserved, &["reserved"][..]),
+                (
+                    &self.wg_keepalive,
+                    &["persistent_keepalive", "persistent_keepalive_interval"][..],
+                ),
+                (
+                    &self.wg_local_addr,
+                    &["address", "local_address", "local_addr"][..],
+                ),
+                (&self.wg_dns, &["dns"][..]),
+                (&self.wg_mtu, &["mtu"][..]),
+                (&self.wg_workers, &["workers"][..]),
+            ],
+            "amneziawg" => &[
+                (&self.awg_private, &["private_key", "privatekey"][..]),
+                (&self.awg_public, &["public_key", "publickey"][..]),
+                (
+                    &self.awg_preshared,
+                    &["pre_shared_key", "presharedkey", "preshared_key"][..],
+                ),
+                (&self.awg_reserved, &["reserved"][..]),
+                (
+                    &self.awg_keepalive,
+                    &["persistent_keepalive", "persistent_keepalive_interval"][..],
+                ),
+                (
+                    &self.awg_local_addr,
+                    &["address", "local_address", "local_addr"][..],
+                ),
+                (&self.awg_dns, &["dns"][..]),
+                (&self.awg_mtu, &["mtu"][..]),
+                (&self.awg_workers, &["workers"][..]),
+                (&self.awg_jc, &["jc"][..]),
+                (&self.awg_jmin, &["jmin"][..]),
+                (&self.awg_jmax, &["jmax"][..]),
+                (&self.awg_s1, &["s1"][..]),
+                (&self.awg_s2, &["s2"][..]),
+                (&self.awg_s3, &["s3"][..]),
+                (&self.awg_s4, &["s4"][..]),
+                (&self.awg_h1, &["h1"][..]),
+                (&self.awg_h2, &["h2"][..]),
+                (&self.awg_h3, &["h3"][..]),
+                (&self.awg_h4, &["h4"][..]),
+                (&self.awg_i1, &["i1"][..]),
+                (&self.awg_i2, &["i2"][..]),
+                (&self.awg_i3, &["i3"][..]),
+                (&self.awg_i4, &["i4"][..]),
+                (&self.awg_i5, &["i5"][..]),
+                (&self.awg_hpk, &["headerprotectionkey"][..]),
+                (&self.awg_pad, &["contentpaddingaddition"][..]),
+                (&self.awg_rekey_after, &["rekeyaftertime"][..]),
+                (&self.awg_rekey_timeout, &["rekeytimeout"][..]),
+                (&self.awg_reject_after, &["rejectaftertime"][..]),
+                (&self.awg_keepalive_timeout, &["keepalivetimeout"][..]),
+                (&self.awg_max_handshake, &["maxhandshakeattempts"][..]),
+            ],
             _ => &[],
         };
         for (entity, keys) in inner_texts {
@@ -4012,20 +5050,22 @@ impl ConfigForm {
                 });
             }
         }
-        for (entity, keys, default) in [
-            (&self.s1_network, &["network"][..], "tcp"),
-            (&self.s2_fp, &["fp", "fingerprint"][..], ""),
-        ] {
-            let value = guided_prefill_value(box_text, keys);
-            let current = entity
-                .read(cx)
-                .selected_value()
-                .cloned()
-                .unwrap_or_default();
-            if current == default && !value.is_empty() && value != default {
-                entity.update(cx, |state, cx| {
-                    state.set_selected_value(&value, window, cx);
-                });
+        if full_panels {
+            for (entity, keys, default) in [
+                (&self.s1_network, &["network"][..], "tcp"),
+                (&self.s2_fp, &["fp", "fingerprint"][..], ""),
+            ] {
+                let value = guided_prefill_value(box_text, keys);
+                let current = entity
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .unwrap_or_default();
+                if current == default && !value.is_empty() && value != default {
+                    entity.update(cx, |state, cx| {
+                        state.set_selected_value(&value, window, cx);
+                    });
+                }
             }
         }
         // Inner dropdowns per page (a default counts as blank, same rule).
@@ -4047,6 +5087,10 @@ impl ConfigForm {
                 (&self.ss_method, &["method"][..], ""),
                 (&self.ss_plugin, &["plugin"][..], ""),
             ],
+            // Config-completeness T04: the AWG version reads `awg_version`
+            // else the legacy `version` (a non-2.0|3.x spelling echoes as no
+            // selection and round-trips byte-identical).
+            "amneziawg" => &[(&self.awg_version, &["awg_version", "version"][..], "")],
             _ => &[],
         };
         for (entity, keys, default) in inner_selects {
@@ -4078,8 +5122,14 @@ impl ConfigForm {
                 });
             }
         }
-        for (cell, keys) in [
-            (
+        let mut shared_cells: Vec<(&Rc<RefCell<bool>>, &[&str])> = vec![
+            (&self.s4_reuse, &["reuse_addr"][..]),
+            (&self.s4_fastopen, &["tcp_fast_open"][..]),
+            (&self.s4_fragment, &["udp_fragment"][..]),
+            (&self.s4_multipath, &["tcp_multi_path"][..]),
+        ];
+        if full_panels {
+            shared_cells.push((
                 &self.s2_insecure,
                 &[
                     "insecure",
@@ -4087,13 +5137,12 @@ impl ConfigForm {
                     "allow_insecure",
                     "allowinsecure",
                 ][..],
-            ),
-            (&self.s3_brutal, &["brutal_enable"][..]),
-            (&self.s4_reuse, &["reuse_addr"][..]),
-            (&self.s4_fastopen, &["tcp_fast_open"][..]),
-            (&self.s4_fragment, &["udp_fragment"][..]),
-            (&self.s4_multipath, &["tcp_multi_path"][..]),
-        ] {
+            ));
+        }
+        if mux_page {
+            shared_cells.push((&self.s3_brutal, &["brutal_enable"][..]));
+        }
+        for (cell, keys) in shared_cells {
             if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
                 *cell.borrow_mut() = true;
             }
@@ -4101,7 +5150,7 @@ impl ConfigForm {
         // `security: "tls"` is not a truthy spelling — the enable toggle
         // echoes the on-values the engine maps (same rule as prefill;
         // vmess rows read grammar-aware for the legacy boolean).
-        if !*self.s2_enable.borrow() {
+        if full_panels && !*self.s2_enable.borrow() {
             let on = if protocol == "vmess" {
                 vmess_tls_enabled(box_text)
             } else {
@@ -4121,7 +5170,33 @@ impl ConfigForm {
         {
             *self.ss_uot.borrow_mut() = true;
         }
-        if self.s3_mode.borrow().is_empty() {
+        // Config-completeness T04: WG/AWG toggles echo the same way (off
+        // counts as blank).
+        if protocol == "wireguard"
+            && !*self.wg_sys_ifc.borrow()
+            && guided_prefill_bool(box_text, &["system", "sys_ifc"])
+        {
+            *self.wg_sys_ifc.borrow_mut() = true;
+        }
+        if protocol == "amneziawg" {
+            for (cell, keys) in [
+                (&self.awg_sys_ifc, &["system", "sys_ifc"][..]),
+                (&self.awg_enable, &["enable_amnezia"][..]),
+                (
+                    &self.awg_trailers,
+                    &["randomtrailers", "random_trailers"][..],
+                ),
+                (
+                    &self.awg_cookies,
+                    &["disablecookies", "disable_cookies"][..],
+                ),
+            ] {
+                if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                    *cell.borrow_mut() = true;
+                }
+            }
+        }
+        if mux_page && self.s3_mode.borrow().is_empty() {
             let mode = guided_prefill_value(box_text, &["mux"]);
             if !mode.is_empty() {
                 *self.s3_mode.borrow_mut() = mode;
@@ -6930,6 +8005,38 @@ fn ss_plugin_choices() -> Vec<PanelChoice> {
     )
 }
 
+/// Config-completeness T04: AmneziaWG versions (exactly
+/// [`crate::store::AWG_VERSIONS`]) behind one blank "Select version…" row.
+/// Version has no valid default — the blank row stands for "no selection"
+/// (the fold never fabricates nor strips — contract C2; the engine names a
+/// missing version at start instead).
+fn awg_version_choices() -> Vec<PanelChoice> {
+    use crate::store::AWG_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version…")];
+    for version in AWG_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("awg-version-option", &items)
+}
+
+/// Config-completeness T04: borrowed entity set for the nine shared
+/// WireGuard peer/net rows — the WG and AWG pages hold separate entities
+/// (T03 protocol-scoping: unmerged typing never crosses pages) but render
+/// the same rows through [`ConfigForm::wg_peer_block`].
+struct WgPeerRefs<'a> {
+    prefix: &'static str,
+    private_key: &'a Entity<InputState>,
+    public_key: &'a Entity<InputState>,
+    pre_shared_key: &'a Entity<InputState>,
+    reserved: &'a Entity<InputState>,
+    keepalive: &'a Entity<InputState>,
+    local_addr: &'a Entity<InputState>,
+    dns: &'a Entity<InputState>,
+    mtu: &'a Entity<InputState>,
+    workers: &'a Entity<InputState>,
+    sys_ifc: &'a Rc<RefCell<bool>>,
+}
+
 /// Config-completeness T03: one echoed dropdown for the collapse path —
 /// panel state, read keys, and the default that counts as blank.
 type EchoSelect<'a> = (
@@ -6975,6 +8082,37 @@ fn generate_uuid_v4() -> String {
         out.extend(hex(*byte));
     }
     out
+}
+
+/// Config-completeness T04: WireGuard private key for the WG/AWG keygen
+/// button — 32 OS-random bytes, base64 (exactly what `wg genkey` emits; no
+/// new crates: `getrandom` + `base64` are already deps). The hash fallback
+/// mirrors [`generate_uuid_v4`] (pid + wall clock + atomic nonce across two
+/// hashers for 32 bytes) so generation never panics, never logs. Local-only
+/// by construction: this fills local key material only — there is no WARP
+/// account registration (that needs network; Throne's `warp_autogen`
+/// endpoint-filling stays out per local-only).
+fn generate_wireguard_key() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now();
+        for (slot, tag) in bytes.chunks_mut(8).zip([
+            "manyproxy-wg-1",
+            "manyproxy-wg-2",
+            "manyproxy-wg-3",
+            "manyproxy-wg-4",
+        ]) {
+            let mut hasher = DefaultHasher::new();
+            (tag, std::process::id(), now, n).hash(&mut hasher);
+            slot.copy_from_slice(&hasher.finish().to_be_bytes());
+        }
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Command palette (Ctrl-K): one searchable surface over the whole
@@ -19075,6 +20213,584 @@ mod tests {
         );
         assert_absent(cx, "ss-method-option-default".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T04: WireGuard Edit renders the nine peer/net
+    /// rows + keygen + S4 as kit primitives with pinned ids; no
+    /// Transport/TLS/Mux panels (endpoint parity) and nothing from the
+    /// other pages.
+    #[gpui_kit::test]
+    fn t04_wireguard_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "WgRow".to_string(),
+                protocol: "wireguard".to_string(),
+                params: "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+                    \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"address\":\"10.0.0.2/32\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "wg-section-caption");
+        assert_absent(cx, "wg-private-key".to_string());
+        cx.update(|window, cx| {
+            window.click("wg-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "wg-private-key",
+            "wg-private-key-generate",
+            "wg-public-key",
+            "wg-preshared-key",
+            "wg-reserved",
+            "wg-keepalive",
+            "wg-local-addr",
+            "wg-dns",
+            "wg-mtu",
+            "wg-workers",
+            "wg-sys-ifc",
+            "wg-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No Transport/TLS/Mux panels; nothing from the other pages.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "awg-version",
+            "vmess-aid",
+            "ss-method",
+            "trojan-password",
+            "vless-uuid",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| {
+            window.click("s4-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in ["s4-reuse", "s4-timeout"] {
+            assert_painted(cx, id);
+        }
+        // Keygen toasts once and keeps the dialog open (the key backend is
+        // pinned by `t04_generate_wireguard_key_shape`).
+        assert_eq!(notification_count(cx), 0, "no toast before Generate");
+        cx.update(|window, cx| {
+            window.click("wg-private-key-generate", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(notification_count(cx), 1, "Generate toasts once");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog stays open after Generate"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T04: AmneziaWG Edit renders WG rows + enable +
+    /// version + the J/S/H/I matrix + S4; the v3 section hides until 3.x is
+    /// picked (entities persist — hide-preserve is pinned at fold level by
+    /// `t04_awg_version_toggle_hide_preserves`). The page is the longest
+    /// guided page, so it paints jumbo-tall (the t11 minimum-frame contract
+    /// pins the collapsed core, not open pages).
+    #[gpui_kit::test]
+    fn t04_amneziawg_page_paints_and_version_gates(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // Jumbo paint: the full AWG page (peer rows + matrix + v3) needs
+        // more than the shared 1800px tall paint to be visible in-frame.
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "AwgRow".to_string(),
+                protocol: "amneziawg".to_string(),
+                params: "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+                    \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\
+                    \"awg_version\":\"2.0\",\"jc\":\"5\",\"s1\":\"20\",\"h1\":\"1-100\",\"i1\":\"x\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "awg-section-caption");
+        cx.update(|window, cx| {
+            window.click("awg-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "awg-private-key",
+            "awg-private-key-generate",
+            "awg-public-key",
+            "awg-preshared-key",
+            "awg-reserved",
+            "awg-keepalive",
+            "awg-local-addr",
+            "awg-dns",
+            "awg-mtu",
+            "awg-workers",
+            "awg-sys-ifc",
+            "awg-enable",
+            "awg-version",
+            "awg-jc",
+            "awg-jmin",
+            "awg-jmax",
+            "awg-s1",
+            "awg-h1",
+            "awg-i1",
+            "awg-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // 2.0 rows hide the v3 section (with the honest note); nothing from
+        // the other pages and no Transport/TLS/Mux panels.
+        assert_painted(cx, "awg-v3-note");
+        for id in [
+            "awg-hpk",
+            "awg-pad",
+            "awg-rekey-after",
+            "awg-trailers",
+            "awg-cookies",
+            "wg-private-key",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "ss-method",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        // Picking 3.x mounts the v3 section live (option-click precedent:
+        // small lists paint every row, like the ss plugin note test).
+        cx.update(|window, cx| {
+            window.click("awg-version", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("awg-version-option-3.x", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "awg-v3-caption",
+            "awg-hpk",
+            "awg-pad",
+            "awg-rekey-after",
+            "awg-rekey-timeout",
+            "awg-reject-after",
+            "awg-keepalive-timeout",
+            "awg-max-handshake",
+            "awg-trailers",
+            "awg-cookies",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "awg-v3-note".to_string());
+        // Picking back to no-selection unmounts it again (values persist —
+        // fold-level proof below).
+        cx.update(|window, cx| {
+            window.click("awg-version", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("awg-version-option-default", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "awg-v3-note");
+        assert_absent(cx, "awg-hpk".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: blank + both versions resolve (virtualized
+        // popups only paint visible rows, so membership pins here).
+        let row = crate::store::ProxyConfig {
+            id: "t04-a".to_string(),
+            name: "A".to_string(),
+            protocol: "amneziawg".to_string(),
+            params: "{\"type\":\"amneziawg\"}".to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                for version in ["", "2.0", "3.x"] {
+                    form.awg_version.update(cx, |state, cx| {
+                        state.set_selected_value(&version.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.awg_version
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        version,
+                        "version {version:?} resolves"
+                    );
+                }
+            })
+        });
+        assert_eq!(
+            crate::awg_version_choices().len(),
+            3,
+            "version lists blank + 2.0 + 3.x"
+        );
+    }
+
+    /// Config-completeness T04: version-toggle hide-preserves at the fold
+    /// level — a v3 matrix survives a 2.0 refold byte-identical (R5); the
+    /// engine version gate (not the fold) is what rejects v3 keys on 2.0
+    /// rows at generate (pinned by `t04_awg_markers_strip_…` in engine).
+    #[gpui_kit::test]
+    fn t04_awg_version_toggle_hide_preserves(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let params = "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"awg_version\":\"3.x\",\
+            \"jc\":\"5\",\"headerprotectionkey\":\"HPK\",\"randomtrailers\":true}";
+        let row = ProxyConfig {
+            id: "t04-h".to_string(),
+            name: "H".to_string(),
+            protocol: "amneziawg".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let folded = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                assert_eq!(
+                    form.effective_params(cx),
+                    params,
+                    "untouched v3 row refolds byte-identical"
+                );
+                // Hide the v3 section (toggle to 2.0) with v3 values still
+                // typed: the refold keeps every v3 key (never wiped).
+                form.awg_version.update(cx, |state, cx| {
+                    state.set_selected_value(&"2.0".to_string(), window, cx);
+                });
+                form.effective_params(cx)
+            })
+        });
+        let folded_value: serde_json::Value = serde_json::from_str(&folded).expect("refold parses");
+        assert_eq!(folded_value["awg_version"], "2.0", "version switched");
+        assert_eq!(
+            folded_value["headerprotectionkey"], "HPK",
+            "hidden v3 value preserved"
+        );
+        assert_eq!(
+            folded_value["randomtrailers"], true,
+            "hidden switch preserved"
+        );
+        assert_eq!(folded_value["jc"], "5", "visible matrix kept");
+    }
+
+    /// Config-completeness T04: `.conf` imports land in kit fields (nothing
+    /// JSON-only) — reserved/keepalive/MTU/DNS round-trip on WG, the full
+    /// J/S/H/I matrix + version on AWG; untouched refolds stay
+    /// byte-identical (zero spurious patch).
+    #[gpui_kit::test]
+    fn t04_conf_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::import::import_text;
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let conf = "[Interface]\nPrivateKey = LOCAL-KEY\nAddress = 10.0.0.2/32\n\
+            DNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = REMOTE-KEY\n\
+            PresharedKey = PSK\nAllowedIPs = 0.0.0.0/0\n\
+            Endpoint = 192.0.2.44:51820\nPersistentKeepalive = 25\nReserved = 1,2,3\n";
+        let awg_conf = "[Interface]\nPrivateKey = LOCAL-KEY\nAddress = 10.0.0.2/32\n\
+            Jc = 5\nJmin = 30\nJmax = 1000\nS1 = 20\nH1 = 1-100\nI1 = x\n\n[Peer]\n\
+            PublicKey = REMOTE-KEY\nEndpoint = 192.0.2.90:51820\n";
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let mut batch = import_text(conf);
+        assert!(batch.failures.is_empty(), "wg conf imports");
+        assert_eq!(batch.configs.len(), 1, "one wg row");
+        let wg = batch.configs.remove(0);
+        assert_eq!(wg.protocol, "wireguard");
+        let mut awg_batch = import_text(awg_conf);
+        assert!(awg_batch.failures.is_empty(), "awg conf imports");
+        assert_eq!(awg_batch.configs.len(), 1, "one awg row");
+        let awg = awg_batch.configs.remove(0);
+        assert_eq!(awg.protocol, "amneziawg");
+        for parsed in [wg, awg] {
+            let protocol = parsed.protocol.clone();
+            let params = parsed.params.clone();
+            let row = ProxyConfig {
+                id: "t04-c".to_string(),
+                name: parsed.name.clone(),
+                protocol: protocol.clone(),
+                params: params.clone(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let (fields, folded) = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    let fields: Vec<String> = if protocol == "wireguard" {
+                        vec![
+                            form.wg_private.read(cx).value().to_string(),
+                            form.wg_public.read(cx).value().to_string(),
+                            form.wg_preshared.read(cx).value().to_string(),
+                            form.wg_reserved.read(cx).value().to_string(),
+                            form.wg_keepalive.read(cx).value().to_string(),
+                            form.wg_local_addr.read(cx).value().to_string(),
+                            form.wg_dns.read(cx).value().to_string(),
+                            form.wg_mtu.read(cx).value().to_string(),
+                        ]
+                    } else {
+                        vec![
+                            form.awg_private.read(cx).value().to_string(),
+                            form.awg_public.read(cx).value().to_string(),
+                            form.awg_local_addr.read(cx).value().to_string(),
+                            form.awg_jc.read(cx).value().to_string(),
+                            form.awg_jmin.read(cx).value().to_string(),
+                            form.awg_jmax.read(cx).value().to_string(),
+                            form.awg_s1.read(cx).value().to_string(),
+                            form.awg_h1.read(cx).value().to_string(),
+                            form.awg_i1.read(cx).value().to_string(),
+                            form.awg_version
+                                .read(cx)
+                                .selected_value()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ]
+                    };
+                    (fields, form.effective_params(cx))
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "{protocol} untouched refold is byte-identical"
+            );
+            if protocol == "wireguard" {
+                assert_eq!(
+                    fields,
+                    vec![
+                        "LOCAL-KEY",
+                        "REMOTE-KEY",
+                        "PSK",
+                        "1,2,3",
+                        "25",
+                        "10.0.0.2/32",
+                        "1.1.1.1",
+                        "1420",
+                    ],
+                    "wg conf values sit in kit fields"
+                );
+            } else {
+                assert_eq!(
+                    fields,
+                    vec![
+                        "LOCAL-KEY",
+                        "REMOTE-KEY",
+                        "10.0.0.2/32",
+                        "5",
+                        "30",
+                        "1000",
+                        "20",
+                        "1-100",
+                        "x",
+                        "2.0",
+                    ],
+                    "awg conf values sit in kit fields"
+                );
+            }
+        }
+    }
+
+    /// Config-completeness T04 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside the AWG version popup stops at the picker wrapper — the
+    /// dialog never commits a half-filled row. Validation-sensitive by
+    /// construction like the T01/T03 guard tests: a broken guard would run
+    /// the commit on the untouched (invalid) awg template and fire exactly
+    /// one error toast.
+    #[gpui_kit::test]
+    fn t04_enter_in_awg_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to amneziawg through the real picker (cursor starts at
+        // `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("amneziawg");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The AmneziaWG page renders (Add wiring holds for the new page).
+        assert_painted(cx, "awg-section-caption");
+        cx.update(|window, cx| {
+            window.click("awg-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "awg-version");
+        // Open the version popup, then Enter: the pick lands, the commit
+        // must not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("awg-version", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("awg-version-option-default".to_string())
+                .is_some()),
+            "version popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "version Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "version Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "version Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "awg-version-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T04: wireguard key shape (base64 32 bytes —
+    /// exactly what `wg genkey` emits — unique) — pure unit test for the
+    /// keygen backend.
+    #[test]
+    fn t04_generate_wireguard_key_shape() {
+        use crate::generate_wireguard_key;
+        use base64::Engine as _;
+        for _ in 0..8 {
+            let key = generate_wireguard_key();
+            assert_eq!(key.len(), 44, "base64 32 bytes: {key}");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&key)
+                .expect("key decodes");
+            assert_eq!(bytes.len(), 32, "32 key bytes: {key}");
+        }
+        assert_ne!(generate_wireguard_key(), generate_wireguard_key(), "unique");
     }
 
     /// Ticket 02: edit dialog and delete confirm open for a stored config.

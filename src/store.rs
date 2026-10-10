@@ -1684,6 +1684,206 @@ pub fn fold_tls_vmess_into_params(params_raw: &str, fold: &TlsOptionalFold) -> S
     }
 }
 
+/// Config-completeness T04: sing-box AmneziaWG versions (the `awg_version`
+/// Select on the AmneziaWG page). One source for the picker, the prefill
+/// reader and the fold below — a value the UI cannot pick is a value the
+/// fold cannot write. The blank "Select version…" row stands for "no
+/// selection" (the fold never fabricates nor strips — contract C2; the
+/// engine names a missing version at start).
+pub const AWG_VERSIONS: [&str; 2] = ["2.0", "3.x"];
+
+/// Config-completeness T04: WireGuard inner fold state — raw UI strings
+/// exactly as the page controls hold them. `local_addr` is the Throne name;
+/// it stores as `address` (the conf/URI/engine spelling —
+/// `reshape_wireguard_endpoint` coerces it to the endpoint list, while a
+/// verbatim `local_addr` would ride to the endpoint as an unknown field).
+/// `sys_ifc` stores as `system` (same reason). `dns` is form-preserved but
+/// never emitted (the engine strips it as a client setting — pre-existing).
+/// `udp_timeout` stays import-only: no UI writes it, no fold strips it.
+/// Every numeric-ish field folds as TEXT (aid precedent): import string
+/// spellings echo byte-identical and the engine coerces the ones it knows
+/// (`mtu`, `reserved`, keepalive); `workers` joins the engine coercion loop
+/// this ticket so its string spelling is check-safe too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireguardFold {
+    pub private_key: String,
+    pub public_key: String,
+    pub pre_shared_key: String,
+    pub reserved: String,
+    pub persistent_keepalive: String,
+    pub local_addr: String,
+    pub dns: String,
+    pub mtu: String,
+    pub workers: String,
+    pub sys_ifc: bool,
+}
+
+/// Config-completeness T04: fold the WireGuard inner fields into a params
+/// JSON text. `pre_shared_key` is the canonical stored spelling (the engine
+/// moves it to `peers[]`; the `preshared_key`/`presharedkey` spellings read
+/// as aliases but are never written — an unknown-cased key would ride to
+/// the endpoint verbatim and fail `check`). `address` likewise reads
+/// `local_address`/`local_addr` but writes the engine spelling. Byte-identical
+/// on no-ops.
+pub fn fold_wireguard_into_params(params_raw: &str, fold: &WireguardFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(
+        obj,
+        "private_key",
+        &["private_key", "privatekey"],
+        &fold.private_key,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "public_key",
+        &["public_key", "publickey"],
+        &fold.public_key,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "pre_shared_key",
+        &["pre_shared_key", "presharedkey", "preshared_key"],
+        &fold.pre_shared_key,
+    );
+    changed |= fold_text_aliases(obj, "reserved", &["reserved"], &fold.reserved);
+    changed |= fold_text_aliases(
+        obj,
+        "persistent_keepalive",
+        &["persistent_keepalive", "persistent_keepalive_interval"],
+        &fold.persistent_keepalive,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "address",
+        &["address", "local_address", "local_addr"],
+        &fold.local_addr,
+    );
+    changed |= fold_text_aliases(obj, "dns", &["dns"], &fold.dns);
+    changed |= fold_text_aliases(obj, "mtu", &["mtu"], &fold.mtu);
+    changed |= fold_text_aliases(obj, "workers", &["workers"], &fold.workers);
+    changed |= fold_bool_aliases(obj, "system", &["system", "sys_ifc"], fold.sys_ifc);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T04: AmneziaWG matrix fold state — raw UI strings.
+/// `version` is the keep-blank Select value (`""` = no selection, never
+/// fabricated, never stripped). Junk-train numerics, S-lengths, H-ranges,
+/// I-chains and v3 texts all fold as text (engine coercion + fork `check`
+/// judge shapes; a failed parse stays verbatim for `check` to name loudly).
+/// `enable_amnezia` is a UI-state marker (Throne parity) — the engine
+/// consumes it without emission (brutal-speeds precedent). Trailers/cookies
+/// pass through for the fork `check` (R7 — hermetic shape proof in-ledger).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AmneziaFold {
+    pub enable_amnezia: bool,
+    pub version: String,
+    pub jc: String,
+    pub jmin: String,
+    pub jmax: String,
+    pub s1: String,
+    pub s2: String,
+    pub s3: String,
+    pub s4: String,
+    pub h1: String,
+    pub h2: String,
+    pub h3: String,
+    pub h4: String,
+    pub i1: String,
+    pub i2: String,
+    pub i3: String,
+    pub i4: String,
+    pub i5: String,
+    pub header_protection_key: String,
+    pub content_padding_addition: String,
+    pub rekey_after_time: String,
+    pub rekey_timeout: String,
+    pub reject_after_time: String,
+    pub keepalive_timeout: String,
+    pub max_handshake_attempts: String,
+    pub random_trailers: bool,
+    pub disable_cookies: bool,
+}
+
+/// Config-completeness T04: fold the AmneziaWG matrix into a params JSON
+/// text. Always folds every key regardless of the live `awg_version`
+/// selection — hiding the v3 section hides inputs but preserves stored
+/// values (R5); a v3 key on a 2.0 row fails generate naming the field
+/// (engine version gate, never a silent strip). Byte-identical on no-ops.
+pub fn fold_amneziawg_into_params(params_raw: &str, fold: &AmneziaFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_bool_aliases(
+        obj,
+        "enable_amnezia",
+        &["enable_amnezia"],
+        fold.enable_amnezia,
+    );
+    changed |= fold_select_keep_blank(obj, "awg_version", &fold.version);
+    for (key, value) in [
+        ("jc", &fold.jc),
+        ("jmin", &fold.jmin),
+        ("jmax", &fold.jmax),
+        ("s1", &fold.s1),
+        ("s2", &fold.s2),
+        ("s3", &fold.s3),
+        ("s4", &fold.s4),
+        ("h1", &fold.h1),
+        ("h2", &fold.h2),
+        ("h3", &fold.h3),
+        ("h4", &fold.h4),
+        ("i1", &fold.i1),
+        ("i2", &fold.i2),
+        ("i3", &fold.i3),
+        ("i4", &fold.i4),
+        ("i5", &fold.i5),
+        ("headerprotectionkey", &fold.header_protection_key),
+        ("contentpaddingaddition", &fold.content_padding_addition),
+        ("rekeyaftertime", &fold.rekey_after_time),
+        ("rekeytimeout", &fold.rekey_timeout),
+        ("rejectaftertime", &fold.reject_after_time),
+        ("keepalivetimeout", &fold.keepalive_timeout),
+        ("maxhandshakeattempts", &fold.max_handshake_attempts),
+    ] {
+        changed |= fold_text_aliases(obj, key, &[key], value);
+    }
+    changed |= fold_bool_aliases(
+        obj,
+        "randomtrailers",
+        &["randomtrailers", "random_trailers"],
+        fold.random_trailers,
+    );
+    changed |= fold_bool_aliases(
+        obj,
+        "disablecookies",
+        &["disablecookies", "disable_cookies"],
+        fold.disable_cookies,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
 /// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
 /// `None` means unknown protocol (the commit names it through the normal
 /// validation path). `key = None` means a known protocol with no link
@@ -10112,6 +10312,231 @@ mod tests {
             serde_json::from_str(&cleared).expect("cleared folds");
         assert!(cleared_value.get("udp_over_tcp").is_none(), "false clears");
         assert_eq!(cleared_value["method"], "aes-128-gcm", "method kept");
+    }
+
+    /// Config-completeness T04: wireguard inner fold — canonical engine
+    /// spellings win (`pre_shared_key`, `address`), Throne spellings read
+    /// as aliases but are never written; numerics stay text (aid precedent —
+    /// the engine coerces); `udp_timeout` (import-only) is never stripped.
+    #[test]
+    fn t04_wireguard_inner_fold() {
+        let full = WireguardFold {
+            private_key: "LOCAL".to_string(),
+            public_key: "REMOTE".to_string(),
+            pre_shared_key: "PSK".to_string(),
+            reserved: "1,2,3".to_string(),
+            persistent_keepalive: "25".to_string(),
+            local_addr: "10.0.0.2/32".to_string(),
+            dns: "1.1.1.1".to_string(),
+            mtu: "1420".to_string(),
+            workers: "4".to_string(),
+            sys_ifc: true,
+        };
+        let bare = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+            \"private_key\":\"\",\"public_key\":\"\"}";
+        let folded = fold_wireguard_into_params(bare, &full);
+        let folded_value: serde_json::Value = serde_json::from_str(&folded).expect("wg folds");
+        assert_eq!(folded_value["private_key"], "LOCAL");
+        assert_eq!(folded_value["public_key"], "REMOTE");
+        assert_eq!(folded_value["pre_shared_key"], "PSK");
+        assert!(
+            folded_value.get("preshared_key").is_none(),
+            "Throne spelling never written"
+        );
+        assert_eq!(folded_value["reserved"], "1,2,3", "comma ints stay text");
+        assert_eq!(folded_value["persistent_keepalive"], "25");
+        assert_eq!(
+            folded_value["address"], "10.0.0.2/32",
+            "local_addr stores as address"
+        );
+        assert!(
+            folded_value.get("local_addr").is_none(),
+            "Throne spelling never written"
+        );
+        assert_eq!(folded_value["dns"], "1.1.1.1");
+        assert_eq!(
+            folded_value["mtu"], "1420",
+            "mtu stays text (engine coerces)"
+        );
+        assert_eq!(folded_value["workers"], "4");
+        assert_eq!(folded_value["system"], true, "sys_ifc stores as system");
+        assert!(
+            folded_value.get("sys_ifc").is_none(),
+            "Throne spelling never written"
+        );
+        // Echoed fold is byte-identical (no spurious patch).
+        let echo = WireguardFold {
+            private_key: "LOCAL".to_string(),
+            public_key: "REMOTE".to_string(),
+            pre_shared_key: "PSK".to_string(),
+            reserved: "1,2,3".to_string(),
+            persistent_keepalive: "25".to_string(),
+            local_addr: "10.0.0.2/32".to_string(),
+            dns: "1.1.1.1".to_string(),
+            mtu: "1420".to_string(),
+            workers: "4".to_string(),
+            sys_ifc: true,
+        };
+        assert_eq!(
+            fold_wireguard_into_params(&folded, &echo),
+            folded,
+            "untouched wg echoes byte-identical"
+        );
+        // Throne/legacy spellings echo without duplicating the canonical key.
+        let throne = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"preshared_key\":\"PSK\",\
+            \"local_addr\":\"10.0.0.2/32\",\"sys_ifc\":true}";
+        let throne_fold = WireguardFold {
+            private_key: "LOCAL".to_string(),
+            public_key: "REMOTE".to_string(),
+            pre_shared_key: "PSK".to_string(),
+            local_addr: "10.0.0.2/32".to_string(),
+            sys_ifc: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_wireguard_into_params(throne, &throne_fold),
+            throne,
+            "matching aliases echo (engine-adjacent spellings retire only on write)"
+        );
+        // Pristine template stands through a blank fold.
+        let template = protocol_params_template("wireguard");
+        assert_eq!(
+            fold_wireguard_into_params(&template, &WireguardFold::default()),
+            template,
+            "pristine template stands"
+        );
+        // Import-only extras ride through untouched (preserved, never
+        // stripped, no UI): `udp_timeout`, verbatim conf keys, AllowedIPs.
+        let imported = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"udp_timeout\":\"30\",\
+            \"allowed_ips\":\"10.0.0.0/8\",\"fwmark\":\"100\",\"keepalive\":\"25\"}";
+        let kept = fold_wireguard_into_params(
+            imported,
+            &WireguardFold {
+                private_key: "LOCAL".to_string(),
+                public_key: "REMOTE".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(kept, imported, "import-only keys preserved");
+        let kept_value: serde_json::Value = serde_json::from_str(&kept).expect("kept parses");
+        assert_eq!(kept_value["udp_timeout"], "30");
+        // `system` off clears the canonical bool (and the Throne alias).
+        let sys_off = fold_wireguard_into_params(
+            &folded,
+            &WireguardFold {
+                sys_ifc: false,
+                ..Default::default()
+            },
+        );
+        // Blank texts never wipe — only the toggle flips.
+        let sys_off_value: serde_json::Value =
+            serde_json::from_str(&sys_off).expect("sys off folds");
+        assert!(sys_off_value.get("system").is_none(), "false clears");
+        assert_eq!(
+            sys_off_value["private_key"], "LOCAL",
+            "blank texts never wipe"
+        );
+        assert_eq!(fold_wireguard_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T04: amneziawg matrix fold — version keep-blank
+    /// (never fabricated, never stripped), full J/S/H/I + v3 texts,
+    /// trailers/cookies bools, enable marker; hidden-version folds still
+    /// preserve (R5 — the fold never branches on version).
+    #[test]
+    fn t04_amneziawg_matrix_fold() {
+        assert_eq!(AWG_VERSIONS, ["2.0", "3.x"]);
+        let matrix = AmneziaFold {
+            enable_amnezia: true,
+            version: "3.x".to_string(),
+            jc: "5".to_string(),
+            jmin: "30".to_string(),
+            jmax: "1000".to_string(),
+            s1: "20".to_string(),
+            h1: "1-100".to_string(),
+            i1: "<b 0xd100><r 50>".to_string(),
+            header_protection_key: "HPK".to_string(),
+            content_padding_addition: "PAD".to_string(),
+            rekey_after_time: "120".to_string(),
+            rekey_timeout: "30".to_string(),
+            reject_after_time: "180".to_string(),
+            keepalive_timeout: "60".to_string(),
+            max_handshake_attempts: "3".to_string(),
+            random_trailers: true,
+            disable_cookies: true,
+            ..Default::default()
+        };
+        let bare = "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\"}";
+        let folded = fold_amneziawg_into_params(bare, &matrix);
+        let folded_value: serde_json::Value = serde_json::from_str(&folded).expect("awg folds");
+        assert_eq!(folded_value["enable_amnezia"], true);
+        assert_eq!(folded_value["awg_version"], "3.x");
+        assert_eq!(folded_value["jc"], "5", "junk stays text (engine coerces)");
+        assert_eq!(folded_value["jmin"], "30");
+        assert_eq!(folded_value["jmax"], "1000");
+        assert_eq!(folded_value["s1"], "20");
+        assert_eq!(folded_value["h1"], "1-100", "h-range verbatim");
+        assert_eq!(folded_value["i1"], "<b 0xd100><r 50>", "i-chain verbatim");
+        assert_eq!(folded_value["headerprotectionkey"], "HPK");
+        assert_eq!(folded_value["contentpaddingaddition"], "PAD");
+        assert_eq!(folded_value["rekeyaftertime"], "120");
+        assert_eq!(folded_value["maxhandshakeattempts"], "3");
+        assert_eq!(folded_value["randomtrailers"], true);
+        assert_eq!(folded_value["disablecookies"], true);
+        assert_eq!(
+            fold_amneziawg_into_params(&folded, &matrix),
+            folded,
+            "untouched matrix echoes byte-identical"
+        );
+        // Blank version never fabricates (contract C2) and a blank-text
+        // echo never strips stored values (R5 hide-preserve); toggles echo
+        // explicitly (off counts as blank and clears — same rule as S4).
+        let noversion = fold_amneziawg_into_params(bare, &AmneziaFold::default());
+        let noversion_value: serde_json::Value =
+            serde_json::from_str(&noversion).expect("no-version folds");
+        assert!(
+            noversion_value.get("awg_version").is_none(),
+            "blank never fabricates"
+        );
+        let keeper = AmneziaFold {
+            enable_amnezia: true,
+            version: "3.x".to_string(),
+            random_trailers: true,
+            disable_cookies: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_amneziawg_into_params(&folded, &keeper),
+            folded,
+            "echoed toggles+version keep, blank texts never strip"
+        );
+        // The fold never branches on version: v3 keys fold onto a 2.0 row
+        // untouched (R5 hide-preserve — the engine gate names them loudly).
+        let v2row = "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"awg_version\":\"2.0\",\
+            \"headerprotectionkey\":\"HPK\"}";
+        assert_eq!(
+            fold_amneziawg_into_params(v2row, &AmneziaFold::default()),
+            v2row,
+            "hidden-version values preserved, never wiped"
+        );
+        // Toggles off clear; unparseable JSON stands.
+        let off = fold_amneziawg_into_params(
+            &folded,
+            &AmneziaFold {
+                version: "3.x".to_string(),
+                ..Default::default()
+            },
+        );
+        let off_value: serde_json::Value = serde_json::from_str(&off).expect("off folds");
+        assert!(off_value.get("enable_amnezia").is_none(), "marker clears");
+        assert!(off_value.get("randomtrailers").is_none(), "trailers clear");
+        assert!(off_value.get("disablecookies").is_none(), "cookies clear");
+        assert_eq!(off_value["awg_version"], "3.x", "version kept");
+        assert_eq!(fold_amneziawg_into_params("{{{", &matrix), "{{{");
     }
 
     /// Config-completeness T02: toggle prefill reads truthy spellings

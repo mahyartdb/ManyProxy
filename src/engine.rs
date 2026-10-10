@@ -810,6 +810,11 @@ const AWG_BASE_KEYS: &[&str] = &[
     "peers",
     "awg_version",
     "version",
+    // Config-completeness T04: `enable_amnezia` is a UI-state marker
+    // (Throne parity) — allowed on the row so the version matrix keeps it,
+    // stripped at reshape (brutal-speeds precedent: preserved in stored
+    // JSON, never emitted).
+    "enable_amnezia",
 ];
 
 /// Xray-side noise semantics (research 02: "Amnezia Noise" ≠ "Xray Noise").
@@ -4145,6 +4150,9 @@ fn reshape_wireguard_endpoint(
     params.remove("server_port");
     // Internal classification markers never reach the engine.
     params.remove("awg_version");
+    // Config-completeness T04: `enable_amnezia` is dialog state, not an
+    // endpoint field (brutal-speeds precedent — stored JSON keeps it).
+    params.remove("enable_amnezia");
     // Client-side resolver setting from conf files: not an endpoint field.
     params.remove("dns");
     // Ticket 42 (US-25): conf/URI intake keeps `reserved` bytes as a
@@ -4185,8 +4193,24 @@ fn reshape_wireguard_endpoint(
     // coerce the plain-numeric fields. H-ranges ("1-100") and i-chains
     // ("<b …><r …>") are truly opaque and pass through verbatim for the
     // fork to judge (a failed parse keeps the original string).
+    // Config-completeness T04: `workers` and `maxhandshakeattempts` join
+    // the loop — the T04 pages fold every numeric as text (aid precedent:
+    // import spellings echo byte-identical), so string spellings must be
+    // check-safe here rather than canonicalized at fold time.
     for key in [
-        "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4",
+        "jc",
+        "jmin",
+        "jmax",
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "workers",
+        "maxhandshakeattempts",
     ] {
         let number = params
             .get(key)
@@ -9551,6 +9575,87 @@ mod tests {
             "i-chain verbatim"
         );
         assert_eq!(endpoint["i2"], json!("5"), "i-chain never coerced");
+    }
+
+    /// Config-completeness T04 (R7): `enable_amnezia` is UI state (stripped
+    /// like brutal speeds — never emitted); trailers/cookies + the v3 matrix
+    /// pass through verbatim for the fork `check`; WG peer/net keys land
+    /// endpoint-shaped; import-only `udp_timeout` is preserved, never
+    /// stripped. Hermetic `generate()`-shape proof (no fork binary in dev —
+    /// T02 precedent); the fork's own `check` stays authoritative for value
+    /// shapes (live-gate).
+    #[test]
+    fn t04_awg_markers_strip_and_matrix_passes_through() {
+        let params = awg_params(
+            "3.x",
+            json!({"private_key": "LOCAL", "public_key": "REMOTE",
+            "pre_shared_key": "PSK", "allowed_ips": "10.0.0.0/8",
+            "persistent_keepalive": "25", "reserved": "1,2,3",
+            "address": "10.0.0.2/32", "dns": "198.18.0.1", "mtu": "1280",
+            "workers": "4", "system": true, "udp_timeout": "30",
+            "enable_amnezia": true,
+            "jc": "5", "jmin": "30", "jmax": "1000",
+            "s1": "20", "h1": "1-100", "i1": "<b 0xd100><r 50>",
+            "headerprotectionkey": "HPK", "contentpaddingaddition": "PAD",
+            "rekeyaftertime": "120", "rekeytimeout": "30",
+            "rejectaftertime": "180", "keepalivetimeout": "60",
+            "maxhandshakeattempts": "3",
+            "randomtrailers": true, "disablecookies": true}),
+        );
+        let configs = vec![awg_fixture("7", "AwgFull", params, 10807)];
+        let generated = generate(&configs).expect("AWG v3 generates");
+        let endpoint = generated.value()["endpoints"][0].clone();
+        assert!(
+            endpoint.get("enable_amnezia").is_none(),
+            "UI marker stripped"
+        );
+        assert!(endpoint.get("awg_version").is_none(), "no internal marker");
+        assert!(endpoint.get("dns").is_none(), "no client setting");
+        assert_eq!(endpoint["private_key"], json!("LOCAL"));
+        assert_eq!(endpoint["address"], json!(["10.0.0.2/32"]));
+        assert_eq!(endpoint["mtu"], json!(1280), "mtu coerced");
+        assert_eq!(endpoint["workers"], json!(4), "workers coerced");
+        assert_eq!(endpoint["system"], json!(true), "system passes through");
+        assert_eq!(
+            endpoint["udp_timeout"],
+            json!("30"),
+            "import-only preserved, never stripped"
+        );
+        assert_eq!(endpoint["reserved"], json!([1, 2, 3]), "reserved coerced");
+        assert_eq!(endpoint["jc"], json!(5));
+        assert_eq!(endpoint["h1"], json!("1-100"), "h-range verbatim");
+        assert_eq!(endpoint["headerprotectionkey"], json!("HPK"), "v3 verbatim");
+        assert_eq!(
+            endpoint["maxhandshakeattempts"],
+            json!(3),
+            "v3 numeric coerced"
+        );
+        assert_eq!(
+            endpoint["randomtrailers"],
+            json!(true),
+            "trailers pass through for fork check"
+        );
+        assert_eq!(
+            endpoint["disablecookies"],
+            json!(true),
+            "cookies pass through for fork check"
+        );
+        let peer = endpoint["peers"]
+            .as_array()
+            .expect("peers array")
+            .first()
+            .expect("one peer");
+        assert_eq!(peer["public_key"], json!("REMOTE"));
+        assert_eq!(peer["pre_shared_key"], json!("PSK"));
+        assert_eq!(peer["allowed_ips"], json!(["10.0.0.0/8"]));
+        assert_eq!(peer["persistent_keepalive_interval"], json!(25));
+        // The version gate still holds: a v3-only key on a 2.0 row fails
+        // naming the field (hide-preserve never smuggles it past).
+        let bad = awg_params("2.0", json!({"randomtrailers": true}));
+        let error =
+            generate(&[awg_fixture("8", "AwgOld", bad, 10808)]).expect_err("v3 key on 2.0 fails");
+        let text = error.to_string();
+        assert!(text.contains("randomtrailers"), "names the field: {text}");
     }
 
     /// Ticket 32 (live): every standard row shape the app emits passes the
