@@ -73,15 +73,16 @@ use import::{
 use store::{
     count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
     export_confirm_description, fold_amneziawg_into_params, fold_dial_into_params,
-    fold_guided_into_params, fold_mux_into_params, fold_shadowsocks_inner_into_params,
-    fold_tls_optional_into_params, fold_tls_vmess_into_params, fold_transport_into_params,
-    fold_trojan_inner_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
+    fold_guided_into_params, fold_hysteria_into_params, fold_mux_into_params,
+    fold_shadowsocks_inner_into_params, fold_tls_forced_into_params, fold_tls_optional_into_params,
+    fold_tls_vmess_into_params, fold_transport_into_params, fold_trojan_inner_into_params,
+    fold_tuic_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
     fold_wireguard_into_params, guided_identity_fields, guided_prefill_bool, guided_prefill_value,
     is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
     vmess_cipher_value, vmess_tls_enabled, AmneziaFold, ConfigPatch, DialFold, HealthSnapshot,
-    MuxFold, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
-    Subscription as ProxySubscription, TlsOptionalFold, TransportFold, WireguardFold, DEFAULT_BIND,
-    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    HysteriaFold, MuxFold, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
+    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
+    WireguardFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -1791,6 +1792,41 @@ struct ConfigForm {
     /// Config-completeness T04: outer AmneziaWG disclosure (see
     /// [`ConfigForm::amneziawg_block`]) — collapsed by default like VLESS.
     awg_open: Rc<RefCell<bool>>,
+    /// Config-completeness T05: Hysteria inner fields — common texts
+    /// (server_ports/hop_interval/up/down/obfs), v1-only auth_type picker +
+    /// auth secret + recv_window(_conn) + mtu-disvery cell, v2-only password
+    /// secret. One page serves both `hysteria` and `hysteria2` (the version
+    /// RadioGroup switches the protocol on Add, locked on Edit); hidden
+    /// halves persist in their entities (R5 hide-preserve).
+    hy_server_ports: Entity<InputState>,
+    hy_hop_interval: Entity<InputState>,
+    hy_up: Entity<InputState>,
+    hy_down: Entity<InputState>,
+    hy_obfs: Entity<InputState>,
+    hy_auth_type: Entity<SelectState<PanelChoiceList>>,
+    hy_auth: Entity<InputState>,
+    hy_recv_conn: Entity<InputState>,
+    hy_recv: Entity<InputState>,
+    hy_mtu: Rc<RefCell<bool>>,
+    hy_password: Entity<InputState>,
+    /// Config-completeness T05: outer Hysteria disclosure (see
+    /// [`ConfigForm::hysteria_block`]) — collapsed by default like VLESS.
+    hy_open: Rc<RefCell<bool>>,
+    /// Config-completeness T05: TUIC inner fields — uuid secret (+uuidgen
+    /// button, uuid-row precedent) + password secret, congestion_control +
+    /// udp_relay_mode keep-blank pickers, udp_over_stream + zero_rtt cells,
+    /// heartbeat text. Rendered (and folded) only while the live protocol is
+    /// `tuic`; the page carries S2-forced + S4.
+    tuic_uuid: Entity<InputState>,
+    tuic_password: Entity<InputState>,
+    tuic_cc: Entity<SelectState<PanelChoiceList>>,
+    tuic_relay: Entity<SelectState<PanelChoiceList>>,
+    tuic_uot: Rc<RefCell<bool>>,
+    tuic_zero_rtt: Rc<RefCell<bool>>,
+    tuic_heartbeat: Entity<InputState>,
+    /// Config-completeness T05: outer TUIC disclosure (see
+    /// [`ConfigForm::tuic_block`]) — collapsed by default like VLESS.
+    tuic_open: Rc<RefCell<bool>>,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -2072,6 +2108,29 @@ impl ConfigForm {
             awg_trailers: Rc::new(RefCell::new(false)),
             awg_cookies: Rc::new(RefCell::new(false)),
             awg_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T05: Hysteria/TUIC pages open blank (every
+            // fold no-ops, so the template stands) under collapsed
+            // disclosures.
+            hy_server_ports: Self::field(window, cx, "Server ports (e.g. 9000-9010)", None),
+            hy_hop_interval: Self::field(window, cx, "Hop interval (e.g. 30s)", None),
+            hy_up: Self::field(window, cx, "Up Mbps", None),
+            hy_down: Self::field(window, cx, "Down Mbps", None),
+            hy_obfs: Self::field(window, cx, "Obfs", None),
+            hy_auth_type: Self::panel_select(window, cx, hy_auth_type_choices(), ""),
+            hy_auth: Self::secret_field(window, cx, "Auth secret", None),
+            hy_recv_conn: Self::field(window, cx, "Recv window conn", None),
+            hy_recv: Self::field(window, cx, "Recv window", None),
+            hy_mtu: Rc::new(RefCell::new(false)),
+            hy_password: Self::secret_field(window, cx, "Password", None),
+            hy_open: Rc::new(RefCell::new(false)),
+            tuic_uuid: Self::secret_field(window, cx, "UUID", None),
+            tuic_password: Self::secret_field(window, cx, "Password", None),
+            tuic_cc: Self::panel_select(window, cx, tuic_cc_choices(), ""),
+            tuic_relay: Self::panel_select(window, cx, tuic_relay_choices(), ""),
+            tuic_uot: Rc::new(RefCell::new(false)),
+            tuic_zero_rtt: Rc::new(RefCell::new(false)),
+            tuic_heartbeat: Self::field(window, cx, "Heartbeat (e.g. 10s)", None),
+            tuic_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -2681,6 +2740,119 @@ impl ConfigForm {
                 &["disablecookies", "disable_cookies"],
             ))),
             awg_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T05: Hysteria/TUIC pages echo the row's
+            // params JSON (untouched values fold back byte-identical — no
+            // spurious patch). Speeds read the engine `up`/`down` flats else
+            // the Throne `up_mbps` spellings; the v1 auth reads `auth` only
+            // (a `password` on a v1 row stays preserved for the v2 layout,
+            // never duplicated into `auth`).
+            hy_server_ports: Self::field(
+                window,
+                cx,
+                "Server ports (e.g. 9000-9010)",
+                Some(&guided_prefill_value(params, &["server_ports"])),
+            ),
+            hy_hop_interval: Self::field(
+                window,
+                cx,
+                "Hop interval (e.g. 30s)",
+                Some(&guided_prefill_value(params, &["hop_interval"])),
+            ),
+            hy_up: Self::field(
+                window,
+                cx,
+                "Up Mbps",
+                Some(&guided_prefill_value(params, &["up", "up_mbps", "upmbps"])),
+            ),
+            hy_down: Self::field(
+                window,
+                cx,
+                "Down Mbps",
+                Some(&guided_prefill_value(
+                    params,
+                    &["down", "down_mbps", "downmbps"],
+                )),
+            ),
+            hy_obfs: Self::field(
+                window,
+                cx,
+                "Obfs",
+                Some(&guided_prefill_value(params, &["obfs"])),
+            ),
+            hy_auth_type: Self::panel_select(
+                window,
+                cx,
+                hy_auth_type_choices(),
+                &guided_prefill_value(params, &["auth_type"]),
+            ),
+            hy_auth: Self::secret_field(
+                window,
+                cx,
+                "Auth secret",
+                Some(&guided_prefill_value(params, &["auth"])),
+            ),
+            hy_recv_conn: Self::field(
+                window,
+                cx,
+                "Recv window conn",
+                Some(&guided_prefill_value(params, &["recv_window_conn"])),
+            ),
+            hy_recv: Self::field(
+                window,
+                cx,
+                "Recv window",
+                Some(&guided_prefill_value(params, &["recv_window"])),
+            ),
+            hy_mtu: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["disable_mtu_discovery"],
+            ))),
+            hy_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            hy_open: Rc::new(RefCell::new(false)),
+            tuic_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            tuic_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            tuic_cc: Self::panel_select(
+                window,
+                cx,
+                tuic_cc_choices(),
+                &guided_prefill_value(params, &["congestion_control"]),
+            ),
+            tuic_relay: Self::panel_select(
+                window,
+                cx,
+                tuic_relay_choices(),
+                &guided_prefill_value(params, &["udp_relay_mode"]),
+            ),
+            tuic_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_stream"],
+            ))),
+            tuic_zero_rtt: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["zero_rtt_handshake", "zero_rtt"],
+            ))),
+            tuic_heartbeat: Self::field(
+                window,
+                cx,
+                "Heartbeat (e.g. 10s)",
+                Some(&guided_prefill_value(params, &["heartbeat"])),
+            ),
+            tuic_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(true)),
         }
     }
@@ -2935,21 +3107,38 @@ impl ConfigForm {
     /// the exact T02 section (enable toggle plus credential inputs;
     /// disabling folds `security` away while every other key stays
     /// preserved), shared by the vless/vmess/trojan pages.
+    /// Config-completeness T05: `forced` renders the MustTLS variant (same
+    /// credential inputs over the shared entities, no enable toggle — the
+    /// forced fold locks `security` to tls/reality instead); the caption
+    /// names the lock honestly.
     fn s2_section(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
         cx: &App,
+        forced: bool,
     ) -> impl IntoElement {
         // S2: TLS, optional variant — enable toggle plus credential inputs.
         // Disabling folds `security` away; every other key stays preserved.
+        // Forced variant: no toggle (the fold locks security instead).
         let _ = cx;
-        let s2_enable = self.s2_enable.clone();
-        let s2_repaint = repaint.clone();
         let s2_insecure = self.s2_insecure.clone();
         let s2_repaint_insecure = repaint.clone();
         let fp_select = self.s2_fp.clone();
-        let mut s2_body = div().flex().flex_col().gap_1().child(
+        let mut s2_body = div().flex().flex_col().gap_1();
+        if forced {
+            s2_body = s2_body.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("s2-forced-note")
+                        .test_support()
+                        .child("TLS is always on for this protocol (security locked tls)."),
+                ),
+            );
+        } else {
+            let s2_enable = self.s2_enable.clone();
+            let s2_repaint = repaint.clone();
+            s2_body = s2_body.child(
             field().label_indent(false).child(
                 div().id("s2-enable").test_support().child(
                     Switch::new("s2-enable-switch")
@@ -2967,6 +3156,7 @@ impl ConfigForm {
                 ),
             ),
         );
+        }
         s2_body = s2_body
             .child(
                 field().label("SNI".to_string()).child(
@@ -3050,7 +3240,9 @@ impl ConfigForm {
                                 .flex_1()
                                 .id("s2-caption")
                                 .test_support()
-                                .child(Label::new("TLS")),
+                                .child(Label::new(
+                                    if forced { "TLS (always on)" } else { "TLS" }.to_string(),
+                                )),
                         )
                         .child(panel_toggle_button(
                             "s2-toggle",
@@ -3378,7 +3570,7 @@ impl ConfigForm {
             &self.vmess_packet_encoding,
         ));
         block = block.child(self.s1_section(view, cx));
-        block = block.child(self.s2_section(view, repaint, cx));
+        block = block.child(self.s2_section(view, repaint, cx, false));
         block = block.child(self.s3_section(view, repaint, cx, false));
         block = block.child(self.s4_section(view, repaint, cx));
         Self::page_disclosure(
@@ -3412,7 +3604,7 @@ impl ConfigForm {
             ),
         );
         block = block.child(self.s1_section(view, cx));
-        block = block.child(self.s2_section(view, repaint, cx));
+        block = block.child(self.s2_section(view, repaint, cx, false));
         block = block.child(self.s3_section(view, repaint, cx, false));
         block = block.child(self.s4_section(view, repaint, cx));
         Self::page_disclosure(
@@ -3866,6 +4058,289 @@ impl ConfigForm {
         )
     }
 
+    /// Config-completeness T05: Hysteria guided page — one page for both
+    /// `hysteria` (v1) and `hysteria2` (v2). The version RadioGroup switches
+    /// the protocol on Add (pristine-template machinery does the rewrite);
+    /// on Edit the type is locked so the version renders as read-only text
+    /// (Throne §7.7 parity). Common rows (server_ports/hop_interval/
+    /// up/down/obfs) persist across the toggle; v1-only (auth_type/auth/
+    /// recv_window(_conn)/disable_mtu_discovery) vs v2-only (password)
+    /// layouts swap as kit primitives with hidden halves preserved in their
+    /// entities (R5 — the fold always folds both halves, credentials excepted:
+    /// each folds only where its engine arm consumes it). Plus the shared
+    /// S2-forced + S4 panels. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::wireguard_block`]: `RadioGroup` (`selected_index` +
+    /// `on_change`), `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, masked `Input` +
+    /// `mask_toggle`, `Switch` (`checked` + `on_change`), `Field` layout,
+    /// outer-wrapper `Tooltip`s, `Label` captions, honest footer.
+    fn hysteria_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let protocol = self.protocol_text(cx);
+        let is_v2 = protocol == "hysteria2";
+        let mut block = div().flex().flex_col().gap_2();
+        if self.protocol_locked {
+            block = block.child(
+                field().label("Protocol version".to_string()).child(
+                    div()
+                        .id("hy-version-locked")
+                        .test_support()
+                        .child(if is_v2 { "2 (locked)" } else { "1 (locked)" }),
+                ),
+            );
+        } else {
+            let picker = self.protocol_select.clone();
+            let version_repaint = repaint.clone();
+            let selected = Some(if is_v2 { 1 } else { 0 });
+            let mut group = RadioGroup::horizontal("hy-version-options")
+                .selected_index(selected)
+                .on_change(move |ix, window, cx| {
+                    let want = if *ix == 1 { "hysteria2" } else { "hysteria" };
+                    let next = want.to_string();
+                    picker.update(cx, |state, cx| {
+                        state.set_selected_value(&next, window, cx);
+                    });
+                    version_repaint(window, cx);
+                });
+            for label in ["1", "2"] {
+                group = group.child(
+                    Radio::new(label)
+                        .small()
+                        .label(label)
+                        .tooltip(format!("Hysteria version {label}")),
+                );
+            }
+            block = block.child(
+                field().label("Protocol version".to_string()).child(
+                    div()
+                        .id("hy-version-tip")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                Tooltip::new(
+                                    "Hysteria protocol version (switches layout)".to_string(),
+                                )
+                            })
+                            .into()
+                        })
+                        .child(div().id("hy-version-group").test_support().child(group)),
+                ),
+            );
+        }
+        block = block
+            .child(row(
+                "hy-server-ports",
+                "Server ports (e.g. 9000-9010)",
+                &self.hy_server_ports,
+            ))
+            .child(row(
+                "hy-hop-interval",
+                "Hop interval (e.g. 30s)",
+                &self.hy_hop_interval,
+            ))
+            .child(row("hy-up", "Up Mbps", &self.hy_up))
+            .child(row("hy-down", "Down Mbps", &self.hy_down))
+            .child(row("hy-obfs", "Obfs", &self.hy_obfs));
+        if is_v2 {
+            block = block.child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("hy-password")
+                        .test_support()
+                        .child(Input::new(&self.hy_password).mask_toggle()),
+                ),
+            );
+        } else {
+            block = block.child(Self::panel_select_row(
+                "Auth type",
+                "hy-auth-type-tip",
+                "v1 auth marker (blank leaves it unset)",
+                "hy-auth-type",
+                "Hysteria auth type",
+                &self.hy_auth_type,
+            ));
+            block = block.child(
+                field().label("Auth".to_string()).child(
+                    div()
+                        .id("hy-auth")
+                        .test_support()
+                        .child(Input::new(&self.hy_auth).mask_toggle()),
+                ),
+            );
+            block = block
+                .child(row(
+                    "hy-recv-window-conn",
+                    "Recv window conn",
+                    &self.hy_recv_conn,
+                ))
+                .child(row("hy-recv-window", "Recv window", &self.hy_recv));
+            block = block.child(switch_row(
+                "hy-mtu",
+                "hy-mtu-switch".to_string(),
+                "Disable MTU discovery",
+                "Disable MTU discovery on v1 (folds disable_mtu_discovery)",
+                &self.hy_mtu,
+                repaint,
+            ));
+        }
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("hy-notes").test_support().child(
+                "Hysteria v1 rows require up/down (blank refuses naming up_mbps/down_mbps); \
+                 v2 omits them for BBR. v1-only keys on a v2 row fail generate naming the field.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Hysteria settings",
+            "hy-section-caption",
+            "hy-section-toggle",
+            "hy-section",
+            &self.hy_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T05: TUIC guided page — uuid (+uuidgen button) +
+    /// password secrets, congestion_control + udp_relay_mode keep-blank
+    /// pickers, udp_over_stream + zero_rtt switches, heartbeat text, plus the
+    /// shared S2-forced + S4 panels. Rendered only while the live protocol is
+    /// `tuic`. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::hysteria_block`].
+    fn tuic_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.uuid_row(view, &self.tuic_uuid, "tuic"));
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("tuic-password")
+                    .test_support()
+                    .child(Input::new(&self.tuic_password).mask_toggle()),
+            ),
+        );
+        block = block.child(Self::panel_select_row(
+            "Congestion control",
+            "tuic-cc-tip",
+            "TUIC congestion control (blank leaves it unset)",
+            "tuic-cc",
+            "TUIC congestion control",
+            &self.tuic_cc,
+        ));
+        block = block.child(Self::panel_select_row(
+            "UDP relay mode",
+            "tuic-relay-tip",
+            "TUIC relay mode (blank leaves it unset)",
+            "tuic-relay",
+            "TUIC UDP relay mode",
+            &self.tuic_relay,
+        ));
+        block = block.child(switch_row(
+            "tuic-uot",
+            "tuic-uot-switch".to_string(),
+            "UDP over stream",
+            "UDP over stream (folds udp_over_stream)",
+            &self.tuic_uot,
+            repaint,
+        ));
+        block = block.child(switch_row(
+            "tuic-zero-rtt",
+            "tuic-zero-rtt-switch".to_string(),
+            "Zero RTT",
+            "Zero-RTT handshake (folds zero_rtt_handshake)",
+            &self.tuic_zero_rtt,
+            repaint,
+        ));
+        block = block.child(
+            field().label("Heartbeat".to_string()).child(
+                div()
+                    .id("tuic-heartbeat")
+                    .test_support()
+                    .child(Input::new(&self.tuic_heartbeat)),
+            ),
+        );
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("tuic-notes").test_support().child(
+                "TUIC runs TLS always-on (security locked tls). Blank congestion/relay stay unset.",
+            ),
+        ));
+        Self::page_disclosure(
+            "TUIC settings",
+            "tuic-section-caption",
+            "tuic-section-toggle",
+            "tuic-section",
+            &self.tuic_open,
+            view,
+            block,
+        )
+    }
+
     /// Config-completeness T02: VLESS guided page — inner fields plus the
     /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
     /// `open`, no motion id — closed content unmounts, entities persist, so
@@ -3934,7 +4409,7 @@ impl ConfigForm {
         // S1: Transport (shared section — see `s1_section`).
         block = block.child(self.s1_section(view, cx));
         // S2: TLS, optional variant (shared section — see `s2_section`).
-        block = block.child(self.s2_section(view, repaint, cx));
+        block = block.child(self.s2_section(view, repaint, cx, false));
         // S3: Mux+Brutal (shared section — see `s3_section`).
         let flow = Self::panel_value(&self.vless_flow, cx, "");
         block = block.child(self.s3_section(view, repaint, cx, flow == "xtls-rprx-vision"));
@@ -4002,6 +4477,10 @@ impl ConfigForm {
                 ),
                 "wireguard" => Some(self.wireguard_block(&view, &repaint, cx).into_any_element()),
                 "amneziawg" => Some(self.amneziawg_block(&view, &repaint, cx).into_any_element()),
+                "hysteria" | "hysteria2" => {
+                    Some(self.hysteria_block(&view, &repaint, cx).into_any_element())
+                }
+                "tuic" => Some(self.tuic_block(&view, &repaint, cx).into_any_element()),
                 _ => None,
             }
         };
@@ -4405,6 +4884,20 @@ impl ConfigForm {
                 let params = fold_amneziawg_into_params(&params, &self.amnezia_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
             }
+            "hysteria" | "hysteria2" => {
+                let params = fold_hysteria_into_params(
+                    &params,
+                    &self.hysteria_fold(cx),
+                    protocol == "hysteria2",
+                );
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "tuic" => {
+                let params = fold_tuic_into_params(&params, &self.tuic_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
             _ => params,
         }
     }
@@ -4554,6 +5047,52 @@ impl ConfigForm {
         }
     }
 
+    /// Config-completeness T05: Hysteria inner UI state as a store fold.
+    /// Reads every field regardless of the live layout — the store fold
+    /// branches only on the credential (R5 hide-preserve).
+    fn hysteria_fold(&self, cx: &App) -> HysteriaFold {
+        HysteriaFold {
+            server_ports: self.hy_server_ports.read(cx).value().to_string(),
+            hop_interval: self.hy_hop_interval.read(cx).value().to_string(),
+            up: self.hy_up.read(cx).value().to_string(),
+            down: self.hy_down.read(cx).value().to_string(),
+            obfs: self.hy_obfs.read(cx).value().to_string(),
+            auth_type: Self::panel_value(&self.hy_auth_type, cx, ""),
+            auth: self.hy_auth.read(cx).value().to_string(),
+            recv_window_conn: self.hy_recv_conn.read(cx).value().to_string(),
+            recv_window: self.hy_recv.read(cx).value().to_string(),
+            disable_mtu_discovery: *self.hy_mtu.borrow(),
+            password: self.hy_password.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T05: TUIC inner UI state as a store fold.
+    fn tuic_fold(&self, cx: &App) -> TuicFold {
+        TuicFold {
+            uuid: self.tuic_uuid.read(cx).value().to_string(),
+            password: self.tuic_password.read(cx).value().to_string(),
+            congestion_control: Self::panel_value(&self.tuic_cc, cx, ""),
+            udp_relay_mode: Self::panel_value(&self.tuic_relay, cx, ""),
+            udp_over_stream: *self.tuic_uot.borrow(),
+            zero_rtt_handshake: *self.tuic_zero_rtt.borrow(),
+            heartbeat: self.tuic_heartbeat.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T05: S2-forced UI state as a store fold — the
+    /// shared S2 entities (the enable cell never renders on forced pages, so
+    /// it never folds there either).
+    fn tls_forced_fold(&self, cx: &App) -> TlsForcedFold {
+        TlsForcedFold {
+            sni: self.s2_sni.read(cx).value().to_string(),
+            alpn: self.s2_alpn.read(cx).value().to_string(),
+            fp: Self::panel_value(&self.s2_fp, cx, ""),
+            insecure: *self.s2_insecure.borrow(),
+            pbk: self.s2_pbk.read(cx).value().to_string(),
+            sid: self.s2_sid.read(cx).value().to_string(),
+        }
+    }
+
     /// Config-completeness T02: S1 UI state as a store fold.
     fn transport_fold(&self, cx: &App) -> TransportFold {
         TransportFold {
@@ -4637,7 +5176,15 @@ impl ConfigForm {
         // foreign rows); the clear below resets exactly what was merged.
         let page = matches!(
             protocol.as_str(),
-            "vless" | "vmess" | "trojan" | "shadowsocks" | "wireguard" | "amneziawg"
+            "vless"
+                | "vmess"
+                | "trojan"
+                | "shadowsocks"
+                | "wireguard"
+                | "amneziawg"
+                | "hysteria"
+                | "hysteria2"
+                | "tuic"
         );
         if page {
             match protocol.as_str() {
@@ -4695,6 +5242,20 @@ impl ConfigForm {
                     merged =
                         fold_wireguard_into_params(&merged, &self.wireguard_fold(cx, "amneziawg"));
                     merged = fold_amneziawg_into_params(&merged, &self.amnezia_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "hysteria" | "hysteria2" => {
+                    merged = fold_hysteria_into_params(
+                        &merged,
+                        &self.hysteria_fold(cx),
+                        protocol == "hysteria2",
+                    );
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "tuic" => {
+                    merged = fold_tuic_into_params(&merged, &self.tuic_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
                 }
                 _ => {}
@@ -4756,18 +5317,23 @@ impl ConfigForm {
             cells.push(&self.s3_brutal);
         }
         if protocol != "shadowsocks" {
-            texts.extend([
-                &self.s1_path,
-                &self.s1_host,
-                &self.s1_method,
-                &self.s1_service_name,
-                &self.s2_sni,
-                &self.s2_alpn,
-                &self.s2_pbk,
-                &self.s2_sid,
-            ]);
-            selects.extend([(&self.s1_network, "tcp"), (&self.s2_fp, "")]);
-            cells.extend([&self.s2_enable, &self.s2_insecure]);
+            // Config-completeness T05: forced-TLS pages (hysteria/tuic)
+            // merge the S2 credential inputs only — S1/S3 and the enable
+            // toggle ride other pages, so their unmerged typing stands.
+            let forced_tls = matches!(protocol, "hysteria" | "hysteria2" | "tuic");
+            if !forced_tls {
+                texts.extend([
+                    &self.s1_path,
+                    &self.s1_host,
+                    &self.s1_method,
+                    &self.s1_service_name,
+                ]);
+                selects.extend([(&self.s1_network, "tcp")]);
+                cells.extend([&self.s2_enable]);
+            }
+            texts.extend([&self.s2_sni, &self.s2_alpn, &self.s2_pbk, &self.s2_sid]);
+            selects.extend([(&self.s2_fp, "")]);
+            cells.extend([&self.s2_insecure]);
         }
         match protocol {
             "vless" => {
@@ -4788,6 +5354,26 @@ impl ConfigForm {
                 texts.extend([&self.ss_password, &self.ss_plugin_opts]);
                 selects.extend([(&self.ss_method, ""), (&self.ss_plugin, "")]);
                 cells.push(&self.ss_uot);
+            }
+            "hysteria" | "hysteria2" => {
+                texts.extend([
+                    &self.hy_server_ports,
+                    &self.hy_hop_interval,
+                    &self.hy_up,
+                    &self.hy_down,
+                    &self.hy_obfs,
+                    &self.hy_auth,
+                    &self.hy_recv_conn,
+                    &self.hy_recv,
+                    &self.hy_password,
+                ]);
+                selects.extend([(&self.hy_auth_type, "")]);
+                cells.push(&self.hy_mtu);
+            }
+            "tuic" => {
+                texts.extend([&self.tuic_uuid, &self.tuic_password, &self.tuic_heartbeat]);
+                selects.extend([(&self.tuic_cc, ""), (&self.tuic_relay, "")]);
+                cells.extend([&self.tuic_uot, &self.tuic_zero_rtt]);
             }
             "wireguard" => {
                 texts.extend([
@@ -4903,7 +5489,15 @@ impl ConfigForm {
         }
         if matches!(
             protocol.as_str(),
-            "vless" | "vmess" | "trojan" | "shadowsocks" | "wireguard" | "amneziawg"
+            "vless"
+                | "vmess"
+                | "trojan"
+                | "shadowsocks"
+                | "wireguard"
+                | "amneziawg"
+                | "hysteria"
+                | "hysteria2"
+                | "tuic"
         ) {
             self.echo_panels(window, cx, &box_text, &protocol);
         }
@@ -4932,12 +5526,19 @@ impl ConfigForm {
             (&self.s4_inet4, &["inet4_bind_address"][..]),
             (&self.s4_inet6, &["inet6_bind_address"][..]),
         ];
+        // Config-completeness T05: forced-TLS pages echo the S2 credential
+        // inputs (never the enable toggle or S1 — those ride other pages).
+        let forced_tls = matches!(protocol, "hysteria" | "hysteria2" | "tuic");
         if full_panels {
             shared_texts.extend([
                 (&self.s1_path, &["path"][..]),
                 (&self.s1_host, &["host"][..]),
                 (&self.s1_method, &["method"][..]),
                 (&self.s1_service_name, &["service_name", "serviceName"][..]),
+            ]);
+        }
+        if full_panels || forced_tls {
+            shared_texts.extend([
                 (&self.s2_sni, &["sni", "peer"][..]),
                 (&self.s2_alpn, &["alpn"][..]),
                 (&self.s2_pbk, &["pbk"][..]),
@@ -4973,6 +5574,26 @@ impl ConfigForm {
                     &self.ss_plugin_opts,
                     &["plugin_opts", "plugin-opts", "pluginOpts"][..],
                 ),
+            ],
+            // Config-completeness T05: Hysteria inner texts echo on both
+            // layouts (one page, two protocols — the v1 auth reads `auth`
+            // only so a v2 `password` never duplicates into it); TUIC inner
+            // texts echo the seven tuning fields.
+            "hysteria" | "hysteria2" => &[
+                (&self.hy_server_ports, &["server_ports"][..]),
+                (&self.hy_hop_interval, &["hop_interval"][..]),
+                (&self.hy_up, &["up", "up_mbps", "upmbps"][..]),
+                (&self.hy_down, &["down", "down_mbps", "downmbps"][..]),
+                (&self.hy_obfs, &["obfs"][..]),
+                (&self.hy_auth, &["auth"][..]),
+                (&self.hy_recv_conn, &["recv_window_conn"][..]),
+                (&self.hy_recv, &["recv_window"][..]),
+                (&self.hy_password, &["password"][..]),
+            ],
+            "tuic" => &[
+                (&self.tuic_uuid, &["uuid", "id"][..]),
+                (&self.tuic_password, &["password"][..]),
+                (&self.tuic_heartbeat, &["heartbeat"][..]),
             ],
             // Config-completeness T04: WG peer/net rows echo on both pages
             // (separate entities per page — T03 scoping).
@@ -5050,22 +5671,29 @@ impl ConfigForm {
                 });
             }
         }
-        if full_panels {
-            for (entity, keys, default) in [
+        // S1 echoes on the transport pages; the S2 fingerprint echoes on the
+        // optional and forced TLS pages alike (shared entities, one rule).
+        let panel_selects: &[EchoSelect] = if full_panels {
+            &[
                 (&self.s1_network, &["network"][..], "tcp"),
                 (&self.s2_fp, &["fp", "fingerprint"][..], ""),
-            ] {
-                let value = guided_prefill_value(box_text, keys);
-                let current = entity
-                    .read(cx)
-                    .selected_value()
-                    .cloned()
-                    .unwrap_or_default();
-                if current == default && !value.is_empty() && value != default {
-                    entity.update(cx, |state, cx| {
-                        state.set_selected_value(&value, window, cx);
-                    });
-                }
+            ]
+        } else if forced_tls {
+            &[(&self.s2_fp, &["fp", "fingerprint"][..], "")]
+        } else {
+            &[]
+        };
+        for (entity, keys, default) in panel_selects {
+            let value = guided_prefill_value(box_text, keys);
+            let current = entity
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == *default && !value.is_empty() && value != *default {
+                entity.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
             }
         }
         // Inner dropdowns per page (a default counts as blank, same rule).
@@ -5091,6 +5719,14 @@ impl ConfigForm {
             // else the legacy `version` (a non-2.0|3.x spelling echoes as no
             // selection and round-trips byte-identical).
             "amneziawg" => &[(&self.awg_version, &["awg_version", "version"][..], "")],
+            // Config-completeness T05: the v1 auth marker and the TUIC
+            // modes echo the same way (a non-pickable spelling echoes as no
+            // selection and round-trips byte-identical).
+            "hysteria" | "hysteria2" => &[(&self.hy_auth_type, &["auth_type"][..], "")],
+            "tuic" => &[
+                (&self.tuic_cc, &["congestion_control"][..], ""),
+                (&self.tuic_relay, &["udp_relay_mode"][..], ""),
+            ],
             _ => &[],
         };
         for (entity, keys, default) in inner_selects {
@@ -5128,7 +5764,9 @@ impl ConfigForm {
             (&self.s4_fragment, &["udp_fragment"][..]),
             (&self.s4_multipath, &["tcp_multi_path"][..]),
         ];
-        if full_panels {
+        // The S2 insecure toggle echoes on the optional and forced TLS
+        // pages alike (the forced page has no enable toggle to echo).
+        if full_panels || forced_tls {
             shared_cells.push((
                 &self.s2_insecure,
                 &[
@@ -5169,6 +5807,24 @@ impl ConfigForm {
             && guided_prefill_bool(box_text, &["udp_over_tcp", "uot"])
         {
             *self.ss_uot.borrow_mut() = true;
+        }
+        // Config-completeness T05: Hysteria/TUIC toggles echo the same way
+        // (off counts as blank).
+        if matches!(protocol, "hysteria" | "hysteria2")
+            && !*self.hy_mtu.borrow()
+            && guided_prefill_bool(box_text, &["disable_mtu_discovery"])
+        {
+            *self.hy_mtu.borrow_mut() = true;
+        }
+        if protocol == "tuic" {
+            for (cell, keys) in [
+                (&self.tuic_uot, &["udp_over_stream"][..]),
+                (&self.tuic_zero_rtt, &["zero_rtt_handshake", "zero_rtt"][..]),
+            ] {
+                if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                    *cell.borrow_mut() = true;
+                }
+            }
         }
         // Config-completeness T04: WG/AWG toggles echo the same way (off
         // counts as blank).
@@ -8017,6 +8673,43 @@ fn awg_version_choices() -> Vec<PanelChoice> {
         items.push((version, version));
     }
     panel_choices("awg-version-option", &items)
+}
+
+/// Config-completeness T05: hysteria v1 `auth_type` marker (exactly
+/// [`crate::store::HY_AUTH_TYPES`]) behind one blank "Default" row. The
+/// marker has no valid default — blank stands for "no selection" (the fold
+/// never fabricates nor strips — contract C2).
+fn hy_auth_type_choices() -> Vec<PanelChoice> {
+    use crate::store::HY_AUTH_TYPES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Default")];
+    for marker in HY_AUTH_TYPES {
+        items.push((marker, marker));
+    }
+    panel_choices("hy-auth-type-option", &items)
+}
+
+/// Config-completeness T05: TUIC `congestion_control` modes (exactly
+/// [`crate::store::TUIC_CC_MODES`]) behind one blank "Select…" row
+/// (keep-blank — contract C2).
+fn tuic_cc_choices() -> Vec<PanelChoice> {
+    use crate::store::TUIC_CC_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
+    for mode in TUIC_CC_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("tuic-cc-option", &items)
+}
+
+/// Config-completeness T05: TUIC `udp_relay_mode` modes (exactly
+/// [`crate::store::TUIC_RELAY_MODES`]) behind one blank "Select…" row
+/// (keep-blank — contract C2).
+fn tuic_relay_choices() -> Vec<PanelChoice> {
+    use crate::store::TUIC_RELAY_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
+    for mode in TUIC_RELAY_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("tuic-relay-option", &items)
 }
 
 /// Config-completeness T04: borrowed entity set for the nine shared
@@ -20791,6 +21484,589 @@ mod tests {
             assert_eq!(bytes.len(), 32, "32 key bytes: {key}");
         }
         assert_ne!(generate_wireguard_key(), generate_wireguard_key(), "unique");
+    }
+
+    /// Config-completeness T05: picker option counts — hysteria `auth_type`
+    /// (blank + STRING + BASE64), tuic cc (blank + 3) and relay (blank + 2).
+    /// One source behind picker, prefill and fold (store consts).
+    #[test]
+    fn t05_dropdown_counts() {
+        use crate::store::{HY_AUTH_TYPES, TUIC_CC_MODES, TUIC_RELAY_MODES};
+        assert_eq!(HY_AUTH_TYPES, ["STRING", "BASE64"]);
+        assert_eq!(TUIC_CC_MODES, ["bbr", "cubic", "new_reno"]);
+        assert_eq!(TUIC_RELAY_MODES, ["native", "quic"]);
+        assert_eq!(
+            crate::hy_auth_type_choices().len(),
+            3,
+            "auth_type lists blank + 2"
+        );
+        assert_eq!(crate::tuic_cc_choices().len(), 4, "cc lists blank + 3");
+        assert_eq!(
+            crate::tuic_relay_choices().len(),
+            3,
+            "relay lists blank + 2"
+        );
+    }
+
+    /// Config-completeness T05: Hysteria Add toggles the v1/v2 layouts —
+    /// common rows persist while v1-only (auth family) vs v2-only (password)
+    /// swap as kit primitives; the forced-TLS section carries no enable
+    /// toggle. The page is long, so it paints jumbo-tall (the t11
+    /// minimum-frame contract pins the collapsed core, not open pages).
+    #[gpui_kit::test]
+    fn t05_hysteria_add_toggles_layouts(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        // Drive the picker through real keystrokes (T01 precedent: cursor
+        // starts at `vless`; deltas track it; Enter picks, never commits).
+        let pick = |cx: &mut VisualTestContext, target: &str, current: &str| {
+            let start = row_of(current);
+            let end = row_of(target);
+            cx.update(|window, cx| {
+                window.click("protocol-select", cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            let (key, steps) = if end >= start {
+                ("down", end - start)
+            } else {
+                ("up", start - end)
+            };
+            let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+            for _ in 0..steps {
+                cx.update(|window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                });
+                cx.run_until_parked();
+            }
+            let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(enter.clone(), cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+        };
+        pick(cx, "hysteria", "vless");
+        assert_painted(cx, "hy-section-caption");
+        cx.update(|window, cx| {
+            window.click("hy-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        // v1 layout: version switch + common + auth family; no password, no
+        // edit lock, no Transport/Mux panels.
+        for id in [
+            "hy-version-group",
+            "hy-server-ports",
+            "hy-hop-interval",
+            "hy-up",
+            "hy-down",
+            "hy-obfs",
+            "hy-auth-type",
+            "hy-auth",
+            "hy-recv-window-conn",
+            "hy-recv-window",
+            "hy-mtu",
+            "hy-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "hy-password",
+            "hy-version-locked",
+            "s2-enable",
+            "s1-caption",
+            "s3-caption",
+            "tuic-cc",
+            "ss-method",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        // The forced-TLS section opens with the lock note (never a toggle).
+        cx.update(|window, cx| {
+            window.click("s2-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "s2-forced-note",
+            "s2-sni",
+            "s2-alpn",
+            "s2-fp",
+            "s2-insecure",
+            "s2-pbk",
+            "s2-sid",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "s2-enable".to_string());
+        // Toggle to v2: the auth family unmounts, the password mounts,
+        // common rows persist.
+        pick(cx, "hysteria2", "hysteria");
+        for id in [
+            "hy-version-group",
+            "hy-server-ports",
+            "hy-hop-interval",
+            "hy-up",
+            "hy-down",
+            "hy-obfs",
+            "hy-password",
+            "s2-forced-note",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "hy-auth-type",
+            "hy-auth",
+            "hy-recv-window-conn",
+            "hy-recv-window",
+            "hy-mtu",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        // Toggle back: the v1 layout returns (entities persist — the
+        // fold-level proof below pins hide-preserve byte-identical).
+        pick(cx, "hysteria", "hysteria2");
+        for id in ["hy-auth-type", "hy-auth", "hy-mtu", "hy-version-group"] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "hy-password".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T05: layout-toggle hide-preserves at the fold
+    /// level — v1-only values survive a v2 refold (R5; the exclusive
+    /// credential is the only branch) and an untouched row refolds
+    /// byte-identical on both layouts.
+    #[gpui_kit::test]
+    fn t05_hysteria_toggle_hide_preserves(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let params = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"secret\",\"auth_type\":\"STRING\",\"up\":\"100\",\"down\":\"100\",\
+            \"recv_window\":2048,\"disable_mtu_discovery\":true}";
+        let row = ProxyConfig {
+            id: "t05-h".to_string(),
+            name: "H".to_string(),
+            protocol: "hysteria".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let folded = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                assert_eq!(
+                    form.effective_params(cx),
+                    params,
+                    "untouched v1 row refolds byte-identical"
+                );
+                // Hide the v1 half (refold as v2): every v1-only value stays
+                // in the JSON (never wiped); only the credential swaps.
+                let as_v2 = crate::store::fold_hysteria_into_params(
+                    params,
+                    &crate::store::HysteriaFold {
+                        password: "v2secret".to_string(),
+                        ..Default::default()
+                    },
+                    true,
+                );
+                let as_v2_value: serde_json::Value =
+                    serde_json::from_str(&as_v2).expect("v2 refold parses");
+                assert_eq!(as_v2_value["password"], "v2secret", "v2 credential folds");
+                assert_eq!(as_v2_value["auth"], "secret", "hidden v1 auth preserved");
+                assert_eq!(
+                    as_v2_value["auth_type"], "STRING",
+                    "hidden v1 marker preserved"
+                );
+                assert_eq!(
+                    as_v2_value["recv_window"], 2048,
+                    "hidden tunables preserved"
+                );
+                assert_eq!(as_v2_value["up"], "100", "common speeds kept");
+                form.effective_params(cx)
+            })
+        });
+        assert_eq!(folded, params, "v1 refold still byte-identical");
+    }
+
+    /// Config-completeness T05 scenario (v1 commit blank up/down): save
+    /// refuses naming up_mbps/down_mbps with zero rows stored; filling the
+    /// speeds on the same form then commits.
+    #[gpui_kit::test]
+    fn t05_hysteria_v1_blank_up_down_refuses_commit(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let (closed, message, closed2) = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("Hy", window, cx);
+                });
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"hysteria".to_string(), window, cx);
+                });
+                // The dialog builder rewrites the pristine starter on switch
+                // — mirror it (dirty JSON would stand instead).
+                form.params.update(cx, |state, cx| {
+                    state.set_value(protocol_params_template("hysteria"), window, cx);
+                });
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value("192.0.2.14", window, cx);
+                });
+                form.hy_auth.update(cx, |state, cx| {
+                    state.set_value("secret", window, cx);
+                });
+                let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
+                let message = form_error
+                    .borrow()
+                    .clone()
+                    .map(|(_, message)| message)
+                    .unwrap_or_default();
+                form.hy_up.update(cx, |state, cx| {
+                    state.set_value("100", window, cx);
+                });
+                form.hy_down.update(cx, |state, cx| {
+                    state.set_value("100", window, cx);
+                });
+                let closed2 = view.commit_add_with_focus(&form, &form_error, window, cx);
+                (closed, message, closed2)
+            })
+        });
+        assert!(!closed, "blank speeds keep the dialog open");
+        assert!(
+            message.contains("up_mbps") && message.contains("down_mbps"),
+            "refusal names the page fields: {message}"
+        );
+        assert!(closed2, "speeds filled commits");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "exactly one row lands"
+        );
+    }
+
+    /// Config-completeness T05: TUIC Edit renders uuid (+uuidgen) + password
+    /// + cc/relay + uot/zero-rtt/heartbeat + S2-forced + S4, all kit; an
+    /// untouched row refolds byte-identical.
+    #[gpui_kit::test]
+    fn t05_tuic_edit_round_trips(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let params = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"password\":\"secret\",\
+            \"congestion_control\":\"bbr\",\"udp_relay_mode\":\"quic\",\
+            \"udp_over_stream\":true,\"zero_rtt_handshake\":true,\"heartbeat\":\"10s\",\
+            \"sni\":\"example.com\",\"fp\":\"chrome\",\"insecure\":true}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "TuicRow".to_string(),
+                protocol: "tuic".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "tuic-section-caption");
+        cx.update(|window, cx| {
+            window.click("tuic-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "tuic-uuid",
+            "tuic-uuid-generate",
+            "tuic-password",
+            "tuic-cc",
+            "tuic-relay",
+            "tuic-uot",
+            "tuic-zero-rtt",
+            "tuic-heartbeat",
+            "tuic-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No enable toggle, no Transport/Mux panels, nothing from the other
+        // pages.
+        for id in [
+            "s2-enable",
+            "s1-caption",
+            "s3-caption",
+            "hy-auth",
+            "hy-password",
+            "ss-method",
+            "trojan-password",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| {
+            window.click("s2-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in ["s2-forced-note", "s2-sni", "s2-fp", "s2-insecure"] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Prefill + refold at the form level (no typing simulation).
+        let row = ProxyConfig {
+            id: "t05-t".to_string(),
+            name: "T".to_string(),
+            protocol: "tuic".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let (fields, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                let fields = vec![
+                    form.tuic_uuid.read(cx).value().to_string(),
+                    form.tuic_password.read(cx).value().to_string(),
+                    form.tuic_cc
+                        .read(cx)
+                        .selected_value()
+                        .cloned()
+                        .unwrap_or_default(),
+                    form.tuic_relay
+                        .read(cx)
+                        .selected_value()
+                        .cloned()
+                        .unwrap_or_default(),
+                    form.tuic_heartbeat.read(cx).value().to_string(),
+                ];
+                (fields, form.effective_params(cx))
+            })
+        });
+        assert_eq!(
+            fields,
+            vec![
+                "11111111-2222-4333-8444-555555555555",
+                "secret",
+                "bbr",
+                "quic",
+                "10s",
+            ],
+            "tuic values sit in kit fields"
+        );
+        assert_eq!(folded, params, "untouched tuic refolds byte-identical");
+        // Delegate membership: blank + every mode resolves (virtualized
+        // popups only paint visible rows, so membership pins here).
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                for mode in ["", "bbr", "cubic", "new_reno"] {
+                    form.tuic_cc.update(cx, |state, cx| {
+                        state.set_selected_value(&mode.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.tuic_cc
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        mode,
+                        "cc {mode:?} resolves"
+                    );
+                }
+                for mode in ["", "native", "quic"] {
+                    form.tuic_relay.update(cx, |state, cx| {
+                        state.set_selected_value(&mode.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.tuic_relay
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        mode,
+                        "relay {mode:?} resolves"
+                    );
+                }
+            })
+        });
+        assert_eq!(crate::tuic_cc_choices().len(), 4, "cc lists blank + 3");
+        assert_eq!(
+            crate::tuic_relay_choices().len(),
+            3,
+            "relay lists blank + 2"
+        );
+    }
+
+    /// Config-completeness T05 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside a TUIC picker popup stops at the wrapper — the dialog
+    /// never commits a half-filled row. Validation-sensitive by construction
+    /// like the T01/T03/T04 guard tests.
+    #[gpui_kit::test]
+    fn t05_enter_in_tuic_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to tuic through the real picker (cursor starts at
+        // `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("tuic");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The TUIC page renders (Add wiring holds for the new page).
+        assert_painted(cx, "tuic-section-caption");
+        cx.update(|window, cx| {
+            window.click("tuic-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "tuic-cc");
+        // Open the cc popup, then Enter: the pick lands, the commit must
+        // not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("tuic-cc", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("tuic-cc-option-default".to_string())
+                .is_some()),
+            "cc popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "cc Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "cc Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "cc Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "tuic-cc-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Ticket 02: edit dialog and delete confirm open for a stored config.

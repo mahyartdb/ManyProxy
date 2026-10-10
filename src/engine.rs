@@ -3583,10 +3583,19 @@ fn translate_outbound(
             if canonical == "hysteria" {
                 // sing-box holds the plaintext credential in `auth_str`;
                 // `auth` is base64 bytes there, never the link secret.
+                // Config-completeness T05: a v2-layout `password` also folds
+                // here when no v1 `auth` is present (hy2-arm precedent) — the
+                // guided page folds exactly one credential per layout, and a
+                // toggled row must still start with the typed secret instead
+                // of running auth-less. Canonical `auth` wins on conflict;
+                // the alias never leaks to `check` either way.
                 let auth = take_flat(params, &["auth"]);
+                let password = take_flat(params, &["password"]);
                 if params.get("auth_str").is_none() {
                     if let Some(auth) = auth {
                         params.insert("auth_str".to_string(), serde_json::Value::String(auth));
+                    } else if let Some(password) = password {
+                        params.insert("auth_str".to_string(), serde_json::Value::String(password));
                     }
                 }
                 // Live-probed: 1.14.2 fails initialize without upload and
@@ -3613,6 +3622,17 @@ fn translate_outbound(
                 // Ticket 42 (US-26): tuic extras validate against the 1.14.2
                 // shape — wild keys fail typed naming the field instead of
                 // dying inside `check`.
+                // Config-completeness T05: the Throne `zero_rtt` spelling
+                // folds to the sing-box `zero_rtt_handshake` bool (a stored
+                // false drops — the schema default — so the alias never
+                // leaks; WG t32 precedent: folded, not duplicated, canonical
+                // wins).
+                if take_truthy(params, &["zero_rtt_handshake", "zero_rtt"]) {
+                    params.insert(
+                        "zero_rtt_handshake".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
                 reject_unknown_params(
                     name,
                     "tuic",
@@ -12886,6 +12906,117 @@ Active Connections\r
             "plugin_opts rides"
         );
         assert_eq!(node["multiplex"], json!({"enabled": true}));
+    }
+
+    /// Config-completeness T05: hysteria v1 + tuic page rows generate clean —
+    /// v1 maps `auth` to `auth_str` (a v2-layout `password` falls back when no
+    /// v1 auth is present; the alias never leaks), speeds ride as the native
+    /// `up`/`down` flats, v1 without speeds fails naming the field, and the
+    /// tuic seven tune the 1.14.2 shape (the `zero_rtt` alias folds to
+    /// `zero_rtt_handshake`).
+    #[test]
+    fn t05_hysteria_v1_and_tuic_page_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        // Hysteria v1 page shape (auth + string speeds + v1 tunables).
+        let v1 = fixture(
+            "51",
+            "HyOne",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "auth": "secret", "up": "100", "down": "50 Mbps",
+                   "server_ports": "9000-9010", "hop_interval": "30s",
+                   "obfs": "obfspw", "auth_type": "STRING",
+                   "recv_window_conn": 1024, "recv_window": 2048,
+                   "disable_mtu_discovery": true}),
+            "127.0.0.1",
+            10851,
+        );
+        let node = node_of(&v1, "hysteria");
+        assert_eq!(node["auth_str"], json!("secret"), "`auth` maps");
+        assert!(node.get("auth").is_none(), "link spelling never leaks");
+        assert_eq!(node["up"], json!("100"), "v1 speeds ride");
+        assert_eq!(node["down"], json!("50 Mbps"));
+        assert_eq!(node["server_ports"], json!("9000-9010"), "v1 tunables ride");
+        assert_eq!(node["disable_mtu_discovery"], json!(true));
+        // A v2-layout `password` on a v1 row still starts (falls back to
+        // `auth_str` when no v1 `auth` is present) and never leaks.
+        let toggled = fixture(
+            "52",
+            "HyToggled",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "password": "v2secret", "up": "100", "down": "100"}),
+            "127.0.0.1",
+            10852,
+        );
+        let node = node_of(&toggled, "hysteria");
+        assert_eq!(node["auth_str"], json!("v2secret"), "password falls back");
+        assert!(node.get("password").is_none(), "alias never leaks");
+        // Canonical `auth` wins when both spellings disagree.
+        let both = fixture(
+            "53",
+            "HyBoth",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "auth": "v1secret", "password": "v2secret",
+                   "up": "100", "down": "100"}),
+            "127.0.0.1",
+            10853,
+        );
+        let node = node_of(&both, "hysteria");
+        assert_eq!(node["auth_str"], json!("v1secret"), "canonical wins");
+        assert!(node.get("password").is_none(), "alias never leaks");
+        // v1 without speeds fails at generate naming the field (the store
+        // gate refuses earlier at commit; this is the backstop).
+        let nospeed = fixture(
+            "54",
+            "HyNoSpeed",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "auth": "secret"}),
+            "127.0.0.1",
+            10854,
+        );
+        let error = generate(std::slice::from_ref(&nospeed)).expect_err("v1 needs speeds");
+        assert!(
+            error.to_string().contains("up") || error.to_string().contains("down"),
+            "names the missing speed, got {error}"
+        );
+        // TUIC page shape (all seven tuning fields + forced TLS).
+        let tuic = fixture(
+            "55",
+            "TuicPage",
+            "tuic",
+            json!({"type": "tuic", "server": "192.0.2.12", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "password": "secret",
+                   "congestion_control": "bbr", "udp_relay_mode": "quic",
+                   "udp_over_stream": true, "zero_rtt": true, "heartbeat": "10s",
+                   "security": "tls", "sni": "192.0.2.12"}),
+            "127.0.0.1",
+            10855,
+        );
+        let node = node_of(&tuic, "tuic");
+        assert_eq!(node["congestion_control"], json!("bbr"));
+        assert_eq!(node["udp_relay_mode"], json!("quic"));
+        assert_eq!(node["udp_over_stream"], json!(true));
+        assert_eq!(
+            node["zero_rtt_handshake"],
+            json!(true),
+            "`zero_rtt` alias folds"
+        );
+        assert!(node.get("zero_rtt").is_none(), "alias never leaks");
+        assert_eq!(node["heartbeat"], json!("10s"));
+        assert_eq!(node["tls"]["server_name"], json!("192.0.2.12"));
     }
 
     /// Two custom replacements binding one port conflict naming both.

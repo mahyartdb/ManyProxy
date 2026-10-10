@@ -1884,6 +1884,216 @@ pub fn fold_amneziawg_into_params(params_raw: &str, fold: &AmneziaFold) -> Strin
     }
 }
 
+/// Config-completeness T05: hysteria `auth_type` marker (the Throne
+/// `""|STRING|BASE64` spelling; `""` is the blank picker row) and the TUIC
+/// `congestion_control` / `udp_relay_mode` spellings (the engine allowlists).
+/// One source for picker, prefill and fold — a value the UI cannot pick is a
+/// value the fold cannot write.
+pub const HY_AUTH_TYPES: [&str; 2] = ["STRING", "BASE64"];
+pub const TUIC_CC_MODES: [&str; 3] = ["bbr", "cubic", "new_reno"];
+pub const TUIC_RELAY_MODES: [&str; 2] = ["native", "quic"];
+
+/// Config-completeness T05: shared TLS panel, forced variant (S2-forced).
+/// Same credential fields as [`TlsOptionalFold`] minus the enable toggle —
+/// security is locked `tls` (or `reality` with a public key). Raw UI strings
+/// exactly as the panel controls hold them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsForcedFold {
+    pub sni: String,
+    pub alpn: String,
+    pub fp: String,
+    pub insecure: bool,
+    pub pbk: String,
+    pub sid: String,
+}
+
+/// Config-completeness T05: fold the shared TLS panel, forced variant
+/// (S2-forced), into a params JSON text. Details fold blank-safe like the
+/// optional panel; `security` writes `reality` with a public key, `tls` when
+/// another detail was touched (locking the panel intent onto the row), and
+/// stands off untouched rows entirely (the engine defaults these protocols
+/// to TLS on, so an untouched page stays byte-identical). A stored
+/// `security=none` survives an untouched fold and fails at the engine naming
+/// the field — never silently repaired, never silently kept.
+pub fn fold_tls_forced_into_params(params_raw: &str, fold: &TlsForcedFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "sni", &["sni", "peer"], &fold.sni);
+    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
+    changed |= fold_text_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
+    changed |= fold_bool_aliases(
+        obj,
+        "insecure",
+        &[
+            "insecure",
+            "allowInsecure",
+            "allow_insecure",
+            "allowinsecure",
+        ],
+        fold.insecure,
+    );
+    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
+    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    if !fold.pbk.trim().is_empty() {
+        match obj.get("security") {
+            Some(serde_json::Value::String(current)) if current.eq_ignore_ascii_case("reality") => {
+            }
+            _ => {
+                obj.insert(
+                    "security".to_string(),
+                    serde_json::Value::String("reality".to_string()),
+                );
+                changed = true;
+            }
+        }
+    } else if changed
+        && !matches!(
+            lookup_case_insensitive(obj, &["security"])
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "tls" | "xtls" | "reality"
+        )
+    {
+        obj.insert(
+            "security".to_string(),
+            serde_json::Value::String("tls".to_string()),
+        );
+        changed = true;
+    }
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T05: Hysteria inner fold state — raw UI strings
+/// exactly as the page controls hold them. Speeds fold as the engine
+/// `up`/`down` flats (v1 requires them, v2 `take_speed` coerces them to
+/// `up_mbps`/`down_mbps` — one input shape serves both wire grammars).
+/// `auth` is the v1 secret, `password` the v2 secret; the fold writes exactly
+/// one of them per `is_v2` (each credential folds only where its engine arm
+/// consumes it — a v2 `password` riding a v1 row would fail `check` as an
+/// unknown field). Every other key folds on both layouts (R5 hide-preserve —
+/// the layout toggle never wipes); v1-only tunables on a v2 row fail at the
+/// engine naming the field (AWG v2-negative precedent). Numerics fold as TEXT
+/// (aid precedent — the engine coerces); `auth_type` is keep-blank (no
+/// fabricated marker, contract C2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HysteriaFold {
+    pub server_ports: String,
+    pub hop_interval: String,
+    pub up: String,
+    pub down: String,
+    pub obfs: String,
+    pub auth_type: String,
+    pub auth: String,
+    pub recv_window_conn: String,
+    pub recv_window: String,
+    pub disable_mtu_discovery: bool,
+    pub password: String,
+}
+
+/// Config-completeness T05: fold the Hysteria inner fields into a params JSON
+/// text. `is_v2` selects the credential (`password` on v2, `auth` on v1);
+/// blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_hysteria_into_params(params_raw: &str, fold: &HysteriaFold, is_v2: bool) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "server_ports", &["server_ports"], &fold.server_ports);
+    changed |= fold_text_aliases(obj, "hop_interval", &["hop_interval"], &fold.hop_interval);
+    changed |= fold_text_aliases(obj, "up", &["up", "up_mbps", "upmbps"], &fold.up);
+    changed |= fold_text_aliases(obj, "down", &["down", "down_mbps", "downmbps"], &fold.down);
+    changed |= fold_text_aliases(obj, "obfs", &["obfs"], &fold.obfs);
+    changed |= fold_select_keep_blank(obj, "auth_type", &fold.auth_type);
+    if is_v2 {
+        changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    } else {
+        changed |= fold_text_aliases(obj, "auth", &["auth"], &fold.auth);
+    }
+    changed |= fold_number_text(obj, "recv_window_conn", &fold.recv_window_conn);
+    changed |= fold_number_text(obj, "recv_window", &fold.recv_window);
+    changed |= fold_bool_aliases(
+        obj,
+        "disable_mtu_discovery",
+        &["disable_mtu_discovery"],
+        fold.disable_mtu_discovery,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T05: TUIC inner fold state — raw UI strings exactly as
+/// the page controls hold them. `congestion_control` / `udp_relay_mode` are
+/// keep-blank selects (no fabricated mode, contract C2); `zero_rtt_handshake`
+/// is the sing-box spelling (the Throne `zero_rtt` reads as an alias but is
+/// never written — a verbatim key would ride to the endpoint as an unknown
+/// field). `heartbeat` stays text (a duration like `10s`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TuicFold {
+    pub uuid: String,
+    pub password: String,
+    pub congestion_control: String,
+    pub udp_relay_mode: String,
+    pub udp_over_stream: bool,
+    pub zero_rtt_handshake: bool,
+    pub heartbeat: String,
+}
+
+/// Config-completeness T05: fold the TUIC inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_tuic_into_params(params_raw: &str, fold: &TuicFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], &fold.uuid);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_select_keep_blank(obj, "congestion_control", &fold.congestion_control);
+    changed |= fold_select_keep_blank(obj, "udp_relay_mode", &fold.udp_relay_mode);
+    changed |= fold_bool_aliases(
+        obj,
+        "udp_over_stream",
+        &["udp_over_stream"],
+        fold.udp_over_stream,
+    );
+    changed |= fold_bool_aliases(
+        obj,
+        "zero_rtt_handshake",
+        &["zero_rtt_handshake", "zero_rtt"],
+        fold.zero_rtt_handshake,
+    );
+    changed |= fold_text_aliases(obj, "heartbeat", &["heartbeat"], &fold.heartbeat);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
 /// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
 /// `None` means unknown protocol (the commit names it through the normal
 /// validation path). `key = None` means a known protocol with no link
@@ -2258,6 +2468,17 @@ fn validate_protocol_params(
                 _ => "credentials",
             };
             errors.push(missing(what));
+            return None;
+        }
+        // Config-completeness T05: hysteria v1 rows cannot start without
+        // upload/download speeds (the engine hard-requires the `up`/`down`
+        // flats) — refuse at commit naming the page fields instead of
+        // producing a parse-ok/start-fail row. v2 leaves them optional
+        // (BBR-by-omission), so no gate there.
+        if canonical == "hysteria"
+            && !(has(&["up", "up_mbps", "upmbps"]) && has(&["down", "down_mbps", "downmbps"]))
+        {
+            errors.push(missing("up_mbps and down_mbps"));
             return None;
         }
         if lookup_case_insensitive(obj, &["security"])
@@ -10537,6 +10758,277 @@ mod tests {
         assert!(off_value.get("disablecookies").is_none(), "cookies clear");
         assert_eq!(off_value["awg_version"], "3.x", "version kept");
         assert_eq!(fold_amneziawg_into_params("{{{", &matrix), "{{{");
+    }
+
+    /// Config-completeness T05: hysteria fold — common fields on both
+    /// layouts, engine spellings only (`up`/`down`, never `up_mbps`; recv
+    /// windows as numbers), keep-blank `auth_type`, exclusive credentials
+    /// per `is_v2` (auth on v1, password on v2); pristine templates stand
+    /// through blank folds.
+    #[test]
+    fn t05_hysteria_fold_common_and_version_halves() {
+        assert_eq!(HY_AUTH_TYPES, ["STRING", "BASE64"]);
+        let v1 = HysteriaFold {
+            server_ports: "9000-9010".to_string(),
+            hop_interval: "30s".to_string(),
+            up: "100".to_string(),
+            down: "50 Mbps".to_string(),
+            obfs: "obfspw".to_string(),
+            auth_type: "STRING".to_string(),
+            auth: "secret".to_string(),
+            recv_window_conn: "1024".to_string(),
+            recv_window: "2048".to_string(),
+            disable_mtu_discovery: true,
+            password: "NEVER-FOLDS-ON-V1".to_string(),
+        };
+        let bare_v1 = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"\"}";
+        let folded = fold_hysteria_into_params(bare_v1, &v1, false);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("hy folds");
+        assert_eq!(value["server_ports"], "9000-9010");
+        assert_eq!(value["hop_interval"], "30s");
+        assert_eq!(value["up"], "100", "speeds fold as up/down flats");
+        assert_eq!(value["down"], "50 Mbps");
+        assert!(
+            value.get("up_mbps").is_none() && value.get("down_mbps").is_none(),
+            "Throne spellings never written"
+        );
+        assert_eq!(value["obfs"], "obfspw");
+        assert_eq!(value["auth_type"], "STRING");
+        assert_eq!(value["auth"], "secret");
+        assert_eq!(
+            value["recv_window_conn"], 1024,
+            "recv windows land as numbers"
+        );
+        assert_eq!(value["recv_window"], 2048);
+        assert_eq!(value["disable_mtu_discovery"], true);
+        assert!(
+            value.get("password").is_none(),
+            "v1 never folds the v2 credential"
+        );
+        // Echoed fold is byte-identical (numbers echo as their text).
+        let echo = HysteriaFold {
+            server_ports: "9000-9010".to_string(),
+            hop_interval: "30s".to_string(),
+            up: "100".to_string(),
+            down: "50 Mbps".to_string(),
+            obfs: "obfspw".to_string(),
+            auth_type: "STRING".to_string(),
+            auth: "secret".to_string(),
+            recv_window_conn: "1024".to_string(),
+            recv_window: "2048".to_string(),
+            disable_mtu_discovery: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_hysteria_into_params(&folded, &echo, false),
+            folded,
+            "untouched v1 echoes byte-identical"
+        );
+        // v2 folds the password and never the v1 auth.
+        let v2 = HysteriaFold {
+            up: "100".to_string(),
+            down: "100".to_string(),
+            auth: "NEVER-FOLDS-ON-V2".to_string(),
+            password: "v2secret".to_string(),
+            ..Default::default()
+        };
+        let bare_v2 = "{\"type\":\"hysteria2\",\"server\":\"192.0.2.13\",\"server_port\":443,\
+            \"password\":\"\"}";
+        let folded2 = fold_hysteria_into_params(bare_v2, &v2, true);
+        let value2: serde_json::Value = serde_json::from_str(&folded2).expect("hy2 folds");
+        assert_eq!(value2["password"], "v2secret");
+        assert_eq!(value2["up"], "100");
+        assert!(value2.get("auth").is_none(), "v2 never folds the v1 auth");
+        // Throne `up_mbps` spellings echo through the up/down readers.
+        let throne = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"s\",\"up_mbps\":100,\"down_mbps\":50}";
+        let throne_echo = HysteriaFold {
+            auth: "s".to_string(),
+            up: "100".to_string(),
+            down: "50".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_hysteria_into_params(throne, &throne_echo, false),
+            throne,
+            "matching aliases echo"
+        );
+        // Pristine templates stand through blank folds on both layouts.
+        for proto in ["hysteria", "hysteria2"] {
+            let template = protocol_params_template(proto);
+            assert_eq!(
+                fold_hysteria_into_params(
+                    &template,
+                    &HysteriaFold::default(),
+                    proto == "hysteria2"
+                ),
+                template,
+                "{proto} pristine template stands"
+            );
+        }
+        assert_eq!(fold_hysteria_into_params("{{{", &v1, false), "{{{");
+    }
+
+    /// Config-completeness T05: v1 commits refuse blank up/down naming the
+    /// page fields; v1 with speeds lands; v2 without speeds lands
+    /// (BBR-by-omission).
+    #[test]
+    fn t05_hysteria_v1_up_down_gate_names_fields() {
+        fn add(
+            store: &mut Store,
+            name: &str,
+            protocol: &str,
+            params: &str,
+        ) -> Result<String, String> {
+            store
+                .add(NewConfig {
+                    name: name.to_string(),
+                    protocol: protocol.to_string(),
+                    params: params.to_string(),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .map(|created| created.id)
+                .map_err(|error| error.to_string())
+        }
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let no_speeds = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"secret\"}";
+        let error = add(&mut store, "HyNoSpeed", "hysteria", no_speeds)
+            .expect_err("v1 without speeds must fail");
+        assert!(
+            error.contains("up_mbps") && error.contains("down_mbps"),
+            "names the page fields, got {error}"
+        );
+        let speeds = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"secret\",\"up\":\"100\",\"down\":\"100\"}";
+        add(&mut store, "HySpeed", "hysteria", speeds).expect("v1 with speeds lands");
+        let bbr = "{\"type\":\"hysteria2\",\"server\":\"192.0.2.13\",\"server_port\":443,\
+            \"password\":\"secret\"}";
+        add(&mut store, "Hy2Bbr", "hysteria2", bbr).expect("v2 omits speeds for BBR");
+        assert_eq!(
+            store.list().expect("list works").len(),
+            2,
+            "the refused row wrote nothing"
+        );
+    }
+
+    /// Config-completeness T05: tuic fold — all seven tuning fields land in
+    /// engine spellings (`zero_rtt_handshake`, never `zero_rtt`; keep-blank
+    /// selects never fabricate); pristine template stands through a blank.
+    #[test]
+    fn t05_tuic_fold_seven_fields_engine_spellings() {
+        assert_eq!(TUIC_CC_MODES, ["bbr", "cubic", "new_reno"]);
+        assert_eq!(TUIC_RELAY_MODES, ["native", "quic"]);
+        let full = TuicFold {
+            uuid: "11111111-2222-4333-8444-555555555555".to_string(),
+            password: "secret".to_string(),
+            congestion_control: "bbr".to_string(),
+            udp_relay_mode: "quic".to_string(),
+            udp_over_stream: true,
+            zero_rtt_handshake: true,
+            heartbeat: "10s".to_string(),
+        };
+        let bare = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"\",\"password\":\"\"}";
+        let folded = fold_tuic_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("tuic folds");
+        assert_eq!(value["uuid"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["congestion_control"], "bbr");
+        assert_eq!(value["udp_relay_mode"], "quic");
+        assert_eq!(value["udp_over_stream"], true);
+        assert_eq!(
+            value["zero_rtt_handshake"], true,
+            "sing-box spelling written"
+        );
+        assert!(
+            value.get("zero_rtt").is_none(),
+            "Throne spelling never written"
+        );
+        assert_eq!(value["heartbeat"], "10s");
+        assert_eq!(
+            fold_tuic_into_params(&folded, &full),
+            folded,
+            "untouched tuic echoes byte-identical"
+        );
+        // The Throne `zero_rtt` spelling echoes into the handshake switch.
+        let throne = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"u\",\"password\":\"p\",\"zero_rtt\":true}";
+        let throne_echo = TuicFold {
+            uuid: "u".to_string(),
+            password: "p".to_string(),
+            zero_rtt_handshake: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_tuic_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes"
+        );
+        // Blank selects never fabricate; pristine template stands.
+        let template = protocol_params_template("tuic");
+        assert_eq!(
+            fold_tuic_into_params(&template, &TuicFold::default()),
+            template,
+            "tuic pristine template stands"
+        );
+        assert_eq!(fold_tuic_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T05: forced-TLS fold — untouched rows stay
+    /// byte-identical (no fabricated `security`); details fold blank-safe;
+    /// a public key locks `reality`; any other touched detail locks `tls`;
+    /// a stored `security=none` survives untouched (the engine names it).
+    #[test]
+    fn t05_tls_forced_fold_locks_only_when_touched() {
+        let bare = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"u\",\"password\":\"p\"}";
+        assert_eq!(
+            fold_tls_forced_into_params(bare, &TlsForcedFold::default()),
+            bare,
+            "untouched forced page stays byte-identical"
+        );
+        let sni = TlsForcedFold {
+            sni: "example.com".to_string(),
+            ..Default::default()
+        };
+        let sni_value: serde_json::Value =
+            serde_json::from_str(&fold_tls_forced_into_params(bare, &sni)).expect("sni folds");
+        assert_eq!(sni_value["sni"], "example.com");
+        assert_eq!(sni_value["security"], "tls", "touched detail locks tls");
+        let pbk = TlsForcedFold {
+            pbk: "PUBKEY".to_string(),
+            sid: "SID".to_string(),
+            ..Default::default()
+        };
+        let pbk_value: serde_json::Value =
+            serde_json::from_str(&fold_tls_forced_into_params(bare, &pbk)).expect("pbk folds");
+        assert_eq!(pbk_value["security"], "reality", "public key locks reality");
+        assert_eq!(pbk_value["pbk"], "PUBKEY");
+        // An existing tls marker is kept, never rewritten.
+        let tls_row =
+            "{\"type\":\"tuic\",\"server\":\"s\",\"server_port\":443,\"security\":\"tls\"}";
+        let kept = fold_tls_forced_into_params(
+            tls_row,
+            &TlsForcedFold {
+                sni: "example.com".to_string(),
+                ..Default::default()
+            },
+        );
+        let kept_value: serde_json::Value = serde_json::from_str(&kept).expect("kept parses");
+        assert_eq!(kept_value["security"], "tls");
+        // A stored `security=none` survives an untouched fold (engine names it).
+        let none_row =
+            "{\"type\":\"tuic\",\"server\":\"s\",\"server_port\":443,\"security\":\"none\"}";
+        assert_eq!(
+            fold_tls_forced_into_params(none_row, &TlsForcedFold::default()),
+            none_row,
+            "broken security never silently repaired"
+        );
+        assert_eq!(fold_tls_forced_into_params("{{{", &sni), "{{{");
     }
 
     /// Config-completeness T02: toggle prefill reads truthy spellings
