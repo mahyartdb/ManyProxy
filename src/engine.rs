@@ -3292,6 +3292,68 @@ fn apply_transport(
     Ok(())
 }
 
+/// Config-completeness T02 (S3): v2ray-flat mux keys → stock sing-box
+/// 1.14.2 `multiplex` outbound object, for ss/trojan/vless/vmess only.
+/// Per-key contract (live-probed shape, recorded here):
+/// - `mux` ""/absent → omit `multiplex` (sing-box default: disabled).
+/// - `mux` "on" (case-insensitive) → `{"enabled": true}`.
+/// - `mux` "off" → `{"enabled": false}` (explicitly disables).
+/// - any other `mux` spelling → typed `bad_option` (the UI constrains to
+///   the three; hand JSON garbage fails naming the field, never emits a
+///   shape `check` would reject opaquely).
+/// - `brutal_enable` + `brutal_up_mbps`/`brutal_down_mbps` (plus
+///   `brutal_up`/`brutal_down` intake spellings): consumed here, preserved
+///   in stored JSON (generation works on a clone), NEVER emitted — stock
+///   sing-box 1.14.2 has no brutal mapping. The mux-force behavior still
+///   holds: the panel writes `mux: "on"` alongside brutal (UI-forced), so
+///   emission sees it. `flow=vision` does not veto here (the VLESS page
+///   disables S3 with reason instead — dumb engine, smart UI).
+///
+/// sing-box 1.14.2 `multiplex` also knows `protocol`, `max_connections`,
+///   `min_streams`, `max_streams`, `padding` — none have panel controls in
+///   this ticket, so none emit (never invent keys the UI cannot explain).
+fn apply_mux(
+    name: &str,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    let mode = take_flat(params, &["mux"]);
+    // Brutal speeds are panel state, not emission: consume every spelling
+    // so provider/import junk in these keys can never fail `check`.
+    take_truthy(params, &["brutal_enable"]);
+    take_flat(
+        params,
+        &[
+            "brutal_up_mbps",
+            "brutal_down_mbps",
+            "brutal_up",
+            "brutal_down",
+            "brutal_upmbps",
+            "brutal_downmbps",
+        ],
+    );
+    let mode = mode.unwrap_or_default();
+    if mode.trim().is_empty() {
+        return Ok(());
+    }
+    let mut multiplex = serde_json::Map::new();
+    if mode.eq_ignore_ascii_case("on") {
+        multiplex.insert("enabled".to_string(), serde_json::Value::Bool(true));
+    } else if mode.eq_ignore_ascii_case("off") {
+        multiplex.insert("enabled".to_string(), serde_json::Value::Bool(false));
+    } else {
+        return Err(bad_option(
+            name,
+            "mux",
+            "\"mux\" must be \"\" (default), \"on\" or \"off\"",
+        ));
+    }
+    params.insert(
+        "multiplex".to_string(),
+        serde_json::Value::Object(multiplex),
+    );
+    Ok(())
+}
+
 /// Ticket 32: keys that carry no meaning for protocols without TLS or
 /// stream transports (intake spellings from other protocols' links).
 /// Dropped so provider junk never fails `check`; anything meaningful but
@@ -3326,10 +3388,21 @@ fn drop_foreign_flats(params: &mut serde_json::Map<String, serde_json::Value>, k
         // protocols without TLS or those shapes — drop them here so they
         // never reach `check` as unknown fields (the TLS-capable and
         // strict arms consume or judge their own copies first).
+        // Config-completeness T02 (S3): mux flats are meaningless outside
+        // ss/trojan/vless/vmess (those arms consume them in `apply_mux`
+        // first) — drop them here for the same reason.
         "allowInsecure",
         "allow_insecure",
         "allowinsecure",
         "insecure",
+        "mux",
+        "brutal_enable",
+        "brutal_up_mbps",
+        "brutal_down_mbps",
+        "brutal_up",
+        "brutal_down",
+        "brutal_upmbps",
+        "brutal_downmbps",
         "ech",
         "ech_config",
         "echconfig",
@@ -3374,6 +3447,9 @@ fn translate_outbound(
         "vless" | "trojan" => {
             apply_tls(name, params, &server, canonical == "trojan", false)?;
             apply_transport(name, params)?;
+            // Config-completeness T02 (S3): mux emission ships with the UI
+            // (never UI-first with dead keys).
+            apply_mux(name, params)?;
         }
         "vmess" => {
             // Legacy links carry a `tls` bool plus a cipher `security`;
@@ -3433,6 +3509,8 @@ fn translate_outbound(
                 ));
             }
             apply_transport(name, params)?;
+            // Config-completeness T02 (S3): same mux arm as vless/trojan.
+            apply_mux(name, params)?;
         }
         "tuic" | "hysteria" | "anytls" => {
             apply_tls(name, params, &server, true, true)?;
@@ -3903,6 +3981,10 @@ fn translate_outbound(
                     "shadowsocks plugins need their executable beside the engine (stock check fails without it)",
                 ));
             }
+            // Config-completeness T02 (S3): mux-only Settings panel — the
+            // mux arm runs FIRST (it consumes the flats `drop_foreign_flats`
+            // would otherwise eat).
+            apply_mux(name, params)?;
             drop_foreign_flats(params, &["method"]);
         }
         _ => {}
@@ -12420,6 +12502,133 @@ Active Connections\r
         let row = fixture("1", "Typo", "vless", params, "127.0.0.1", 10801);
         let plan = validate_activation(std::slice::from_ref(&row)).expect("warns, not fails");
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    }
+
+    /// Config-completeness T02 (S3): panel-produced mux flats emit the
+    /// stock sing-box 1.14.2 `multiplex` object on ss/trojan/vless/vmess.
+    /// Per-key shape: `mux:"on"` → `{"enabled": true}`; brutal keys are
+    /// consumed (never leak into the emission) while staying preserved in
+    /// stored JSON (generation works on a clone).
+    #[test]
+    fn t02_mux_emission_shape_on_four_protocols() {
+        fn muxed(protocol: &str, params: serde_json::Value) -> ProxyConfig {
+            let mut params = params;
+            let obj = params.as_object_mut().expect("object");
+            obj.insert("mux".to_string(), json!("on"));
+            obj.insert("brutal_enable".to_string(), json!(true));
+            obj.insert("brutal_up_mbps".to_string(), json!(100));
+            obj.insert("brutal_down_mbps".to_string(), json!(50));
+            fixture("9", "Muxed", protocol, params, "127.0.0.1", 10809)
+        }
+        for (protocol, params) in [
+            ("vless", vless_params()),
+            (
+                "trojan",
+                json!({"type": "trojan", "server": "198.51.100.9", "server_port": 443,
+                       "password": "secret"}),
+            ),
+            (
+                "vmess",
+                json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                       "uuid": "11111111-2222-4333-8444-555555555555"}),
+            ),
+            ("shadowsocks", ss_params("pass1")),
+        ] {
+            let row = muxed(protocol, params);
+            let stored = row.params.clone();
+            let generated = generate(std::slice::from_ref(&row)).expect("mux row generates");
+            let value = generated.value();
+            let node = value["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(protocol))
+                .unwrap_or_else(|| panic!("{protocol} egress present"));
+            assert_eq!(
+                node["multiplex"],
+                json!({"enabled": true}),
+                "{protocol} emits the 1.14.2 shape"
+            );
+            for leaked in ["mux", "brutal_enable", "brutal_up_mbps", "brutal_down_mbps"] {
+                assert!(
+                    node.get(leaked).is_none(),
+                    "{protocol} emission leaks no {leaked}: {node}"
+                );
+            }
+            assert!(
+                stored.contains("brutal_up_mbps"),
+                "stored JSON preserves brutal speeds"
+            );
+        }
+    }
+
+    /// Config-completeness T02 (S3): default omits `multiplex`, explicit
+    /// off disables it, garbage fails typed naming the field.
+    #[test]
+    fn t02_mux_default_omits_off_disables_garbage_fails() {
+        let plain = fixture("9", "Plain", "vless", vless_params(), "127.0.0.1", 10809);
+        let generated = generate(std::slice::from_ref(&plain)).expect("plain generates");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == json!("vless"))
+            .expect("vless egress present");
+        assert!(
+            node.get("multiplex").is_none(),
+            "default emits no multiplex key"
+        );
+        let mut off_params = vless_params();
+        off_params
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("off"));
+        let off = fixture("9", "Off", "vless", off_params, "127.0.0.1", 10809);
+        let generated = generate(std::slice::from_ref(&off)).expect("off generates");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == json!("vless"))
+            .expect("vless egress present");
+        assert_eq!(node["multiplex"], json!({"enabled": false}));
+        let mut junk_params = vless_params();
+        junk_params
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("sometimes"));
+        let junk = fixture("9", "Junk", "vless", junk_params, "127.0.0.1", 10809);
+        let error = generate(std::slice::from_ref(&junk)).expect_err("garbage mux fails");
+        let text = error.to_string();
+        assert!(text.contains("mux"), "names the field, got {text}");
+    }
+
+    /// Config-completeness T02 (S3): mux flats on non-mux protocols drop
+    /// so provider junk can never fail `check` (established
+    /// `drop_foreign_flats` semantics, extended to the new keys).
+    #[test]
+    fn t02_mux_flats_dropped_on_non_mux_protocol() {
+        let mut params = json!({"type": "socks", "server": "198.51.100.9", "server_port": 1080});
+        let obj = params.as_object_mut().expect("object");
+        obj.insert("mux".to_string(), json!("on"));
+        obj.insert("brutal_enable".to_string(), json!(true));
+        let row = fixture("9", "SocksJunk", "socks", params, "127.0.0.1", 10809);
+        let generated = generate(std::slice::from_ref(&row)).expect("socks junk generates");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == json!("socks"))
+            .expect("socks egress present");
+        assert!(node.get("multiplex").is_none(), "no mux arm on socks");
+        assert!(node.get("mux").is_none(), "mux flat dropped: {node}");
+        assert!(
+            node.get("brutal_enable").is_none(),
+            "brutal flat dropped: {node}"
+        );
     }
 
     /// Two custom replacements binding one port conflict naming both.

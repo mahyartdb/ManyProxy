@@ -72,11 +72,13 @@ use import::{
 };
 use store::{
     count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
-    export_confirm_description, fold_guided_into_params, guided_identity_fields,
+    export_confirm_description, fold_dial_into_params, fold_guided_into_params,
+    fold_mux_into_params, fold_tls_optional_into_params, fold_transport_into_params,
+    fold_vless_inner_into_params, guided_identity_fields, guided_prefill_bool,
     guided_prefill_value, is_virtual_protocol, now_unix, pristine_template_rewrite,
-    protocol_params_template, proxy_urls, ConfigPatch, HealthSnapshot, NewConfig, ProxyConfig,
-    RestoreOutcome, Store, StoreError, Subscription as ProxySubscription, DEFAULT_BIND,
-    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    protocol_params_template, proxy_urls, ConfigPatch, DialFold, HealthSnapshot, MuxFold,
+    NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError, Subscription as ProxySubscription,
+    TlsOptionalFold, TransportFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -1595,6 +1597,30 @@ fn advanced_toggle_button(
         })
 }
 
+/// Config-completeness T02: one shared-panel disclosure toggle — the same
+/// behavior as [`advanced_toggle_button`] (the cell flips, the owning view
+/// notifies, the next frame rebuilds) with a per-panel stable id so
+/// headless tests can expand each section. Labels name the open action.
+fn panel_toggle_button(
+    id: &'static str,
+    label: &'static str,
+    view: &Entity<AppView>,
+    open: &Rc<RefCell<bool>>,
+) -> impl IntoElement {
+    let toggle_view = view.clone();
+    let toggle_cell = open.clone();
+    Button::new(id)
+        .small()
+        .label(label)
+        .on_click(move |_, _, cx| {
+            toggle_view.update(cx, |_, cx| {
+                let expanded = !*toggle_cell.borrow();
+                *toggle_cell.borrow_mut() = expanded;
+                cx.notify();
+            });
+        })
+}
+
 /// Handles to the add/edit dialog inputs. Entities are created once in the
 /// button handler (never in render) and cloned into the dialog builder.
 #[derive(Clone)]
@@ -1617,6 +1643,57 @@ struct ConfigForm {
     /// Config-completeness T01: baseline protocol text shown (and committed)
     /// while locked.
     locked_protocol: String,
+    /// Config-completeness T02: VLESS inner fields — masked uuid secret,
+    /// flow + packet_encoding pickers. Prefilled from params on Edit;
+    /// rendered (and folded) only while the live protocol is `vless`.
+    vless_uuid: Entity<InputState>,
+    vless_flow: Entity<SelectState<PanelChoiceList>>,
+    vless_packet_encoding: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T02: shared Transport panel (S1) — network
+    /// picker plus conditional text inputs. Entities persist while hidden
+    /// (R5: hiding never wipes), so ws→tcp keeps path/host for reopen.
+    s1_network: Entity<SelectState<PanelChoiceList>>,
+    s1_path: Entity<InputState>,
+    s1_host: Entity<InputState>,
+    s1_method: Entity<InputState>,
+    s1_service_name: Entity<InputState>,
+    s1_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: shared TLS panel, optional variant (S2) —
+    /// enable toggle plus credential inputs. Disabling folds `security`
+    /// away while every other key stays preserved (R5).
+    s2_enable: Rc<RefCell<bool>>,
+    s2_sni: Entity<InputState>,
+    s2_alpn: Entity<InputState>,
+    s2_fp: Entity<SelectState<PanelChoiceList>>,
+    s2_insecure: Rc<RefCell<bool>>,
+    s2_pbk: Entity<InputState>,
+    s2_sid: Entity<InputState>,
+    s2_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: shared Mux+Brutal panel (S3) — mode cell
+    /// (`""`|`on`|`off`, RadioGroup-driven) plus brutal state. `flow=vision`
+    /// unmounts the section with reason text (values preserved, fold
+    /// skipped); brutal forces the effective mode On.
+    s3_mode: Rc<RefCell<String>>,
+    s3_brutal: Rc<RefCell<bool>>,
+    s3_up: Entity<InputState>,
+    s3_down: Entity<InputState>,
+    s3_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: shared Advanced dial panel (S4, dial half) —
+    /// four toggles plus timeout/bind text inputs (TLS extras are a later
+    /// ticket with their own engine `tls{}` mapping).
+    s4_reuse: Rc<RefCell<bool>>,
+    s4_fastopen: Rc<RefCell<bool>>,
+    s4_fragment: Rc<RefCell<bool>>,
+    s4_multipath: Rc<RefCell<bool>>,
+    s4_timeout: Entity<InputState>,
+    s4_bind: Entity<InputState>,
+    s4_inet4: Entity<InputState>,
+    s4_inet6: Entity<InputState>,
+    s4_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: outer VLESS disclosure (see
+    /// [`ConfigForm::vless_block`]) — collapsed by default per the t11
+    /// minimum-frame contract.
+    vless_open: Rc<RefCell<bool>>,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -1680,6 +1757,23 @@ impl ConfigForm {
                 None => state,
             }
         })
+    }
+
+    /// Config-completeness T02: one picker builder behind the panel
+    /// dropdowns — `choices` from the option tables above, `current`
+    /// preselected (fallback: first row). States are created once in
+    /// [`ConfigForm::blank`]/[`ConfigForm::prefilled`], never in render.
+    fn panel_select(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        choices: Vec<PanelChoice>,
+        current: &str,
+    ) -> Entity<SelectState<PanelChoiceList>> {
+        let selected = choices
+            .iter()
+            .position(|choice| choice.value == current)
+            .map(IndexPath::new);
+        cx.new(|cx| SelectState::new(PanelChoiceList(choices), selected, window, cx))
     }
 
     /// Ticket 43: one multiline builder for the params box (same
@@ -1780,6 +1874,41 @@ impl ConfigForm {
             guided_server: Self::field(window, cx, "Upstream server", None),
             guided_port: Self::field(window, cx, "Upstream port", None),
             guided_identity: Self::secret_field(window, cx, "Identity secret", None),
+            // Config-completeness T02: panels open blank (every fold
+            // no-ops, so the template stands) under collapsed disclosures
+            // (the 880x620 minimum fits the guided core; t11 pins it).
+            vless_uuid: Self::secret_field(window, cx, "UUID", None),
+            vless_flow: Self::panel_select(window, cx, flow_choices(), ""),
+            vless_packet_encoding: Self::panel_select(window, cx, packet_encoding_choices(), ""),
+            s1_network: Self::panel_select(window, cx, network_choices(), "tcp"),
+            s1_path: Self::field(window, cx, "Path", None),
+            s1_host: Self::field(window, cx, "Host", None),
+            s1_method: Self::field(window, cx, "Method", None),
+            s1_service_name: Self::field(window, cx, "Service name", None),
+            s1_open: Rc::new(RefCell::new(false)),
+            s2_enable: Rc::new(RefCell::new(false)),
+            s2_sni: Self::field(window, cx, "SNI", None),
+            s2_alpn: Self::field(window, cx, "ALPN (comma list)", None),
+            s2_fp: Self::panel_select(window, cx, fp_choices(), ""),
+            s2_insecure: Rc::new(RefCell::new(false)),
+            s2_pbk: Self::field(window, cx, "Reality public key", None),
+            s2_sid: Self::field(window, cx, "Reality short id", None),
+            s2_open: Rc::new(RefCell::new(false)),
+            s3_mode: Rc::new(RefCell::new(String::new())),
+            s3_brutal: Rc::new(RefCell::new(false)),
+            s3_up: Self::field(window, cx, "Brutal up Mbps", None),
+            s3_down: Self::field(window, cx, "Brutal down Mbps", None),
+            s3_open: Rc::new(RefCell::new(false)),
+            s4_reuse: Rc::new(RefCell::new(false)),
+            s4_fastopen: Rc::new(RefCell::new(false)),
+            s4_fragment: Rc::new(RefCell::new(false)),
+            s4_multipath: Rc::new(RefCell::new(false)),
+            s4_timeout: Self::field(window, cx, "Connect timeout (e.g. 5s)", None),
+            s4_bind: Self::field(window, cx, "Bind interface", None),
+            s4_inet4: Self::field(window, cx, "IPv4 bind address", None),
+            s4_inet6: Self::field(window, cx, "IPv6 bind address", None),
+            s4_open: Rc::new(RefCell::new(false)),
+            vless_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -1800,6 +1929,20 @@ impl ConfigForm {
             .iter()
             .position(|choice| choice.value == config.protocol)
             .map(IndexPath::new);
+        // Config-completeness T02: panels echo the row's params JSON
+        // (untouched values fold back byte-identical — no spurious patch).
+        let params = config.params.as_str();
+        let network_value = guided_prefill_value(params, &["network"]);
+        let network = if network_value.is_empty() {
+            "tcp".to_string()
+        } else {
+            network_value
+        };
+        let security = guided_prefill_value(params, &["security"]);
+        let tls_on = matches!(
+            security.to_ascii_lowercase().as_str(),
+            "tls" | "xtls" | "reality"
+        );
         Self {
             name: Self::field(window, cx, "Name", Some(config.name.as_str())),
             protocol_select: cx.new(|cx| {
@@ -1847,6 +1990,154 @@ impl ConfigForm {
                 "Identity secret",
                 Some(&guided_prefill_value(&config.params, read_keys)),
             ),
+            vless_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            vless_flow: Self::panel_select(
+                window,
+                cx,
+                flow_choices(),
+                &guided_prefill_value(params, &["flow"]),
+            ),
+            vless_packet_encoding: Self::panel_select(
+                window,
+                cx,
+                packet_encoding_choices(),
+                &guided_prefill_value(params, &["packet_encoding", "packetEncoding"]),
+            ),
+            s1_network: Self::panel_select(window, cx, network_choices(), &network),
+            s1_path: Self::field(
+                window,
+                cx,
+                "Path",
+                Some(&guided_prefill_value(params, &["path"])),
+            ),
+            s1_host: Self::field(
+                window,
+                cx,
+                "Host",
+                Some(&guided_prefill_value(params, &["host"])),
+            ),
+            s1_method: Self::field(
+                window,
+                cx,
+                "Method",
+                Some(&guided_prefill_value(params, &["method"])),
+            ),
+            s1_service_name: Self::field(
+                window,
+                cx,
+                "Service name",
+                Some(&guided_prefill_value(
+                    params,
+                    &["service_name", "serviceName"],
+                )),
+            ),
+            s1_open: Rc::new(RefCell::new(false)),
+            s2_enable: Rc::new(RefCell::new(tls_on)),
+            s2_sni: Self::field(
+                window,
+                cx,
+                "SNI",
+                Some(&guided_prefill_value(params, &["sni", "peer"])),
+            ),
+            s2_alpn: Self::field(
+                window,
+                cx,
+                "ALPN (comma list)",
+                Some(&guided_prefill_value(params, &["alpn"])),
+            ),
+            s2_fp: Self::panel_select(
+                window,
+                cx,
+                fp_choices(),
+                &guided_prefill_value(params, &["fp", "fingerprint"]),
+            ),
+            s2_insecure: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &[
+                    "insecure",
+                    "allowInsecure",
+                    "allow_insecure",
+                    "allowinsecure",
+                ],
+            ))),
+            s2_pbk: Self::field(
+                window,
+                cx,
+                "Reality public key",
+                Some(&guided_prefill_value(params, &["pbk"])),
+            ),
+            s2_sid: Self::field(
+                window,
+                cx,
+                "Reality short id",
+                Some(&guided_prefill_value(params, &["sid"])),
+            ),
+            s2_open: Rc::new(RefCell::new(false)),
+            s3_mode: Rc::new(RefCell::new(guided_prefill_value(params, &["mux"]))),
+            s3_brutal: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["brutal_enable"],
+            ))),
+            s3_up: Self::field(
+                window,
+                cx,
+                "Brutal up Mbps",
+                Some(&guided_prefill_value(
+                    params,
+                    &["brutal_up_mbps", "brutal_up"],
+                )),
+            ),
+            s3_down: Self::field(
+                window,
+                cx,
+                "Brutal down Mbps",
+                Some(&guided_prefill_value(
+                    params,
+                    &["brutal_down_mbps", "brutal_down"],
+                )),
+            ),
+            s3_open: Rc::new(RefCell::new(false)),
+            s4_reuse: Rc::new(RefCell::new(guided_prefill_bool(params, &["reuse_addr"]))),
+            s4_fastopen: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["tcp_fast_open"],
+            ))),
+            s4_fragment: Rc::new(RefCell::new(guided_prefill_bool(params, &["udp_fragment"]))),
+            s4_multipath: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["tcp_multi_path"],
+            ))),
+            s4_timeout: Self::field(
+                window,
+                cx,
+                "Connect timeout (e.g. 5s)",
+                Some(&guided_prefill_value(params, &["connect_timeout"])),
+            ),
+            s4_bind: Self::field(
+                window,
+                cx,
+                "Bind interface",
+                Some(&guided_prefill_value(params, &["bind_interface"])),
+            ),
+            s4_inet4: Self::field(
+                window,
+                cx,
+                "IPv4 bind address",
+                Some(&guided_prefill_value(params, &["inet4_bind_address"])),
+            ),
+            s4_inet6: Self::field(
+                window,
+                cx,
+                "IPv6 bind address",
+                Some(&guided_prefill_value(params, &["inet6_bind_address"])),
+            ),
+            s4_open: Rc::new(RefCell::new(false)),
+            vless_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(true)),
         }
     }
@@ -1890,6 +2181,591 @@ impl ConfigForm {
         format!("Auto ports: {used} of {total} in use (10801–10999, spill 18081–18380)")
     }
 
+    /// Config-completeness T02: VLESS guided page — inner fields plus the
+    /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
+    /// `open`, no motion id — closed content unmounts, entities persist, so
+    /// hiding never wipes per R5). Rendered only while the live protocol is
+    /// `vless`; every other protocol keeps the T01 form byte-for-byte.
+    /// The whole page rides ONE outer collapsed disclosure (a single header
+    /// row at the 880x620 minimum — t11 pins the core form in-frame; seven
+    /// open rows would push it out).
+    /// Kit constructors/builders: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, `Input` (+ masked `uuid` with
+    /// `mask_toggle`), `Button` (+ `.small()` generators), `RadioGroup`
+    /// (`selected_index` + `on_change`, interval-picker precedent),
+    /// `Switch` (`checked` + `on_change` over shared cells), `Field` +
+    /// `v_form` layout, outer-wrapper `Tooltip`s, `Label` captions.
+    fn vless_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        // Inner: uuid (masked + generate) + flow + packet_encoding.
+        let uuid_entity = self.vless_uuid.clone();
+        let uuid_view = view.clone();
+        block = block.child(
+            field().label("UUID".to_string()).child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .id("vless-uuid")
+                            .test_support()
+                            .child(Input::new(&self.vless_uuid).mask_toggle()),
+                    )
+                    .child(
+                        Button::new("vless-uuid-generate")
+                            .small()
+                            .label("Generate")
+                            .tooltip("Generate a random UUIDv4")
+                            .accessibility_label("Generate a random UUIDv4")
+                            .on_click(move |_, window, cx| {
+                                let generated = generate_uuid_v4();
+                                uuid_view.update(cx, |_, cx| {
+                                    uuid_entity.update(cx, |state, cx| {
+                                        state.set_value(generated, &mut *window, cx);
+                                    });
+                                });
+                                window.push_notification(
+                                    Notification::info("Generated a new UUID"),
+                                    cx,
+                                );
+                            }),
+                    ),
+            ),
+        );
+        let flow_select = self.vless_flow.clone();
+        let packet_select = self.vless_packet_encoding.clone();
+        block = block.child(
+            field().label("Flow".to_string()).child(
+                div()
+                    .id("vless-flow-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("VLESS flow (vision disables mux)".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&flow_select)
+                            .id("vless-flow")
+                            .small()
+                            .accessibility_label("VLESS flow"),
+                    ),
+            ),
+        );
+        block = block.child(
+            field().label("Packet encoding".to_string()).child(
+                div()
+                    .id("vless-packet-encoding-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("VLESS packet encoding".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&packet_select)
+                            .id("vless-packet-encoding")
+                            .small()
+                            .accessibility_label("VLESS packet encoding"),
+                    ),
+            ),
+        );
+        // S1: Transport — network picker plus per-network conditionals
+        // (only keys `apply_transport` maps; `headers`/early-data stay
+        // JSON-only so the engine never drops them on the floor).
+        let network = Self::panel_value(&self.s1_network, cx, "tcp");
+        let network_select = self.s1_network.clone();
+        let mut s1_body = div().flex().flex_col().gap_1().child(
+            field().label("Network".to_string()).child(
+                div()
+                    .id("s1-network-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("Stream transport network".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&network_select)
+                            .id("s1-network")
+                            .small()
+                            .accessibility_label("Stream transport network"),
+                    ),
+            ),
+        );
+        let conditional = |id: &'static str, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        match network.as_str() {
+            "ws" => {
+                s1_body = s1_body
+                    .child(conditional("s1-path", "Path", &self.s1_path))
+                    .child(conditional("s1-host", "Host", &self.s1_host));
+            }
+            "httpupgrade" | "http" => {
+                s1_body = s1_body
+                    .child(conditional("s1-host", "Host", &self.s1_host))
+                    .child(conditional("s1-path", "Path", &self.s1_path));
+                if network == "http" {
+                    s1_body = s1_body.child(conditional("s1-method", "Method", &self.s1_method));
+                }
+            }
+            "grpc" => {
+                s1_body = s1_body.child(conditional(
+                    "s1-service-name",
+                    "Service name",
+                    &self.s1_service_name,
+                ));
+            }
+            _ => {}
+        }
+        block = block.child(
+            field().label_indent(false).child(
+                Collapsible::new()
+                    .open(*self.s1_open.borrow())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("s1-caption")
+                                    .test_support()
+                                    .child(Label::new("Transport")),
+                            )
+                            .child(panel_toggle_button(
+                                "s1-toggle",
+                                if *self.s1_open.borrow() {
+                                    "Hide"
+                                } else {
+                                    "Show"
+                                },
+                                view,
+                                &self.s1_open,
+                            )),
+                    )
+                    .content(div().id("s1-section").test_support().child(s1_body)),
+            ),
+        );
+        // S2: TLS, optional variant — enable toggle plus credential inputs.
+        // Disabling folds `security` away; every other key stays preserved.
+        let s2_enable = self.s2_enable.clone();
+        let s2_repaint = repaint.clone();
+        let s2_insecure = self.s2_insecure.clone();
+        let s2_repaint_insecure = repaint.clone();
+        let fp_select = self.s2_fp.clone();
+        let mut s2_body = div().flex().flex_col().gap_1().child(
+            field().label_indent(false).child(
+                div().id("s2-enable").test_support().child(
+                    Switch::new("s2-enable-switch")
+                        .small()
+                        .checked(*self.s2_enable.borrow())
+                        .label("Enable TLS")
+                        .tooltip(
+                            "Wrap the stream in TLS (security=tls, or reality with a public key)",
+                        )
+                        .accessibility_label("Enable TLS for this row")
+                        .on_change(move |next: &bool, window, cx| {
+                            *s2_enable.borrow_mut() = *next;
+                            s2_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        s2_body = s2_body
+            .child(
+                field().label("SNI".to_string()).child(
+                    div()
+                        .id("s2-sni")
+                        .test_support()
+                        .child(Input::new(&self.s2_sni)),
+                ),
+            )
+            .child(
+                field().label("ALPN (comma list)".to_string()).child(
+                    div()
+                        .id("s2-alpn")
+                        .test_support()
+                        .child(Input::new(&self.s2_alpn)),
+                ),
+            )
+            .child(
+                field().label("Fingerprint".to_string()).child(
+                    div()
+                        .id("s2-fp-tip")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| Tooltip::new("uTLS fingerprint".to_string()))
+                                .into()
+                        })
+                        .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            Select::new(&fp_select)
+                                .id("s2-fp")
+                                .small()
+                                .accessibility_label("uTLS fingerprint"),
+                        ),
+                ),
+            )
+            .child(
+                field().label_indent(false).child(
+                    div().id("s2-insecure").test_support().child(
+                        Switch::new("s2-insecure-switch")
+                            .small()
+                            .checked(*self.s2_insecure.borrow())
+                            .label("Allow insecure")
+                            .tooltip("Skip certificate verification (testing only)")
+                            .accessibility_label("Skip TLS certificate verification")
+                            .on_change(move |next: &bool, window, cx| {
+                                *s2_insecure.borrow_mut() = *next;
+                                s2_repaint_insecure(window, cx);
+                            }),
+                    ),
+                ),
+            )
+            .child(
+                field().label("Reality public key".to_string()).child(
+                    div()
+                        .id("s2-pbk")
+                        .test_support()
+                        .child(Input::new(&self.s2_pbk)),
+                ),
+            )
+            .child(
+                field().label("Reality short id".to_string()).child(
+                    div()
+                        .id("s2-sid")
+                        .test_support()
+                        .child(Input::new(&self.s2_sid)),
+                ),
+            );
+        block = block.child(
+            field().label_indent(false).child(
+                Collapsible::new()
+                    .open(*self.s2_open.borrow())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("s2-caption")
+                                    .test_support()
+                                    .child(Label::new("TLS")),
+                            )
+                            .child(panel_toggle_button(
+                                "s2-toggle",
+                                if *self.s2_open.borrow() {
+                                    "Hide"
+                                } else {
+                                    "Show"
+                                },
+                                view,
+                                &self.s2_open,
+                            )),
+                    )
+                    .content(div().id("s2-section").test_support().child(s2_body)),
+            ),
+        );
+        // S3: Mux+Brutal — `flow=vision` unmounts the section with reason
+        // text (stored keys preserved, fold skipped); brutal forces On.
+        let flow = Self::panel_value(&self.vless_flow, cx, "");
+        if flow == "xtls-rprx-vision" {
+            block = block.child(field().label_indent(false).child(
+                div()
+                    .id("s3-vision-note")
+                    .test_support()
+                    .child("Mux is unavailable with the xtls-rprx-vision flow — stored mux keys are preserved."),
+            ));
+        } else {
+            let effective = self.s3_effective_mode();
+            let selected = ["", "on", "off"].iter().position(|mode| *mode == effective);
+            let mode_labels = ["Keep Default", "On", "Off"];
+            let mode_cell = self.s3_mode.clone();
+            let mode_repaint = repaint.clone();
+            let mut group = RadioGroup::horizontal("s3-mux-options")
+                .selected_index(selected)
+                .on_change(move |ix, window, cx| {
+                    if let Some(mode) = ["", "on", "off"].get(*ix) {
+                        *mode_cell.borrow_mut() = mode.to_string();
+                    }
+                    mode_repaint(window, cx);
+                });
+            for label in mode_labels {
+                group = group.child(
+                    Radio::new(label)
+                        .small()
+                        .label(label)
+                        .tooltip(format!("Mux mode {label}")),
+                );
+            }
+            let mut s3_body = div().flex().flex_col().gap_1().child(
+                field().label("Multiplex mode".to_string()).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("s3-mux-caption")
+                                .test_support()
+                                .child(Label::new("Multiplex mode")),
+                        )
+                        .child(div().id("s3-mux-group").test_support().child(group)),
+                ),
+            );
+            if *self.s3_brutal.borrow()
+                && effective == "on"
+                && self.s3_mode.borrow().as_str() != "on"
+            {
+                s3_body = s3_body.child(
+                    div()
+                        .id("s3-brutal-note")
+                        .test_support()
+                        .child("Brutal requires mux (forced On)."),
+                );
+            }
+            let brutal_cell = self.s3_brutal.clone();
+            let brutal_repaint = repaint.clone();
+            s3_body = s3_body
+                .child(
+                    field().label_indent(false).child(
+                        div().id("s3-brutal").test_support().child(
+                            Switch::new("s3-brutal-switch")
+                                .small()
+                                .checked(*self.s3_brutal.borrow())
+                                .label("Brutal (forces mux On)")
+                                .tooltip("Brutal congestion speeds (Mbps); enabling forces mux On")
+                                .accessibility_label("Enable Brutal speeds (forces mux On)")
+                                .on_change(move |next: &bool, window, cx| {
+                                    *brutal_cell.borrow_mut() = *next;
+                                    brutal_repaint(window, cx);
+                                }),
+                        ),
+                    ),
+                )
+                .child(
+                    field().label("Brutal up Mbps".to_string()).child(
+                        div()
+                            .id("s3-up")
+                            .test_support()
+                            .child(Input::new(&self.s3_up)),
+                    ),
+                )
+                .child(
+                    field().label("Brutal down Mbps".to_string()).child(
+                        div()
+                            .id("s3-down")
+                            .test_support()
+                            .child(Input::new(&self.s3_down)),
+                    ),
+                );
+            block = block.child(
+                field().label_indent(false).child(
+                    Collapsible::new()
+                        .open(*self.s3_open.borrow())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .id("s3-caption")
+                                        .test_support()
+                                        .child(Label::new("Mux")),
+                                )
+                                .child(panel_toggle_button(
+                                    "s3-toggle",
+                                    if *self.s3_open.borrow() {
+                                        "Hide"
+                                    } else {
+                                        "Show"
+                                    },
+                                    view,
+                                    &self.s3_open,
+                                )),
+                        )
+                        .content(div().id("s3-section").test_support().child(s3_body)),
+                ),
+            );
+        }
+        // S4: Advanced dial — toggles plus timeout/bind inputs (TLS extras
+        // are a later ticket with their own engine `tls{}` mapping).
+        let dial_switch = |id: &'static str,
+                           switch_id: &'static str,
+                           label: &str,
+                           tip: &str,
+                           cell: &Rc<RefCell<bool>>| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let tip = tip.to_string();
+            let label = label.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let mut s4_body = div().flex().flex_col().gap_1();
+        s4_body = s4_body
+            .child(dial_switch(
+                "s4-reuse",
+                "s4-reuse-switch",
+                "Reuse address",
+                "SO_REUSEADDR on the upstream socket",
+                &self.s4_reuse,
+            ))
+            .child(dial_switch(
+                "s4-fastopen",
+                "s4-fastopen-switch",
+                "TCP fast open",
+                "TCP Fast Open on the upstream socket",
+                &self.s4_fastopen,
+            ))
+            .child(dial_switch(
+                "s4-fragment",
+                "s4-fragment-switch",
+                "UDP fragment",
+                "Fragment upstream UDP packets",
+                &self.s4_fragment,
+            ))
+            .child(dial_switch(
+                "s4-multipath",
+                "s4-multipath-switch",
+                "TCP multipath",
+                "Multipath TCP on the upstream socket",
+                &self.s4_multipath,
+            ))
+            .child(
+                field().label("Connect timeout".to_string()).child(
+                    div()
+                        .id("s4-timeout")
+                        .test_support()
+                        .child(Input::new(&self.s4_timeout)),
+                ),
+            )
+            .child(
+                field().label("Bind interface".to_string()).child(
+                    div()
+                        .id("s4-bind")
+                        .test_support()
+                        .child(Input::new(&self.s4_bind)),
+                ),
+            )
+            .child(
+                field().label("IPv4 bind address".to_string()).child(
+                    div()
+                        .id("s4-inet4")
+                        .test_support()
+                        .child(Input::new(&self.s4_inet4)),
+                ),
+            )
+            .child(
+                field().label("IPv6 bind address".to_string()).child(
+                    div()
+                        .id("s4-inet6")
+                        .test_support()
+                        .child(Input::new(&self.s4_inet6)),
+                ),
+            );
+        block = block.child(
+            field().label_indent(false).child(
+                Collapsible::new()
+                    .open(*self.s4_open.borrow())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("s4-caption")
+                                    .test_support()
+                                    .child(Label::new("Advanced dial")),
+                            )
+                            .child(panel_toggle_button(
+                                "s4-toggle",
+                                if *self.s4_open.borrow() {
+                                    "Hide"
+                                } else {
+                                    "Show"
+                                },
+                                view,
+                                &self.s4_open,
+                            )),
+                    )
+                    .content(div().id("s4-section").test_support().child(s4_body)),
+            ),
+        );
+        // One outer collapsed disclosure: a single header row at the minimum
+        // frame (t11), the full page one click away.
+        Collapsible::new()
+            .open(*self.vless_open.borrow())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .id("vless-section-caption")
+                            .test_support()
+                            .child(Label::new("VLESS settings")),
+                    )
+                    .child(panel_toggle_button(
+                        "vless-section-toggle",
+                        if *self.vless_open.borrow() {
+                            "Hide"
+                        } else {
+                            "Show"
+                        },
+                        view,
+                        &self.vless_open,
+                    )),
+            )
+            .content(div().id("vless-section").test_support().child(block))
+    }
+
     fn element(
         self,
         view: Entity<AppView>,
@@ -1917,6 +2793,19 @@ impl ConfigForm {
         // Pre-clone for the toggle buttons (both placements borrow this,
         // never `self` — the assembly below moves `self`'s fields).
         let toggle_form = self.clone();
+        // Config-completeness T02: the VLESS page builds here, before the
+        // assembly below moves `self`'s fields (`vless_block` borrows
+        // `&self`; the built element owns entity/Rc clones, so the borrow
+        // ends before the first move).
+        let vless_panels = if protocol_text == "vless" && !expanded {
+            let repaint_view = view.clone();
+            let repaint: DialogRepaint = Rc::new(move |_window, cx| {
+                repaint_view.update(cx, |_, cx| cx.notify());
+            });
+            Some(self.vless_block(&view, &repaint, cx))
+        } else {
+            None
+        };
         // Ticket 05: guided and JSON swap (never stack) — each mode stays
         // near the old form's height, so no mode pushes content below the
         // fold. Server + Server port share one row; the toggle rides the
@@ -2049,6 +2938,12 @@ impl ConfigForm {
                         ),
                 ),
             );
+        }
+        // Config-completeness T02: VLESS guided page (inner + S1–S4,
+        // prebuilt above) between the protocol row and the guided/JSON
+        // swap — other protocols keep the T01 form byte-for-byte.
+        if let Some(panels) = vless_panels {
+            form = form.child(field().label_indent(false).child(panels));
         }
         if expanded {
             form = form.child(
@@ -2239,36 +3134,151 @@ impl ConfigForm {
     /// protocol's identity key). Blank guided inputs change nothing, so an
     /// untouched template and an untouched edit row commit byte-identical
     /// params (validation still names every missing field inline).
+    /// Config-completeness T02: on `vless` rows the inner fields plus the
+    /// S1/S2/S4 panels (and S3 unless vision-disabled) fold in the same
+    /// byte-identical way; any other protocol skips the panels outright so
+    /// a type switch can never smear VLESS keys onto foreign rows.
     fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
         let identity = guided_identity_fields(&protocol)
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
-        fold_guided_into_params(
+        let params = fold_guided_into_params(
             &params,
             self.guided_server.read(cx).value().as_ref(),
             self.guided_port.read(cx).value().as_ref(),
             identity,
             self.guided_identity.read(cx).value().as_ref(),
+        );
+        if protocol != "vless" {
+            return params;
+        }
+        let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
+        let params = fold_vless_inner_into_params(&params, &uuid, &flow, &packet_encoding);
+        let params = fold_transport_into_params(&params, &self.transport_fold(cx));
+        let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
+        let params = if flow == "xtls-rprx-vision" {
+            params
+        } else {
+            fold_mux_into_params(&params, &self.mux_fold(cx))
+        };
+        fold_dial_into_params(&params, &self.dial_fold(cx))
+    }
+
+    /// Config-completeness T02: read one panel dropdown (default when the
+    /// Select holds no selection, so reads never invent a type).
+    fn panel_value(
+        select: &Entity<SelectState<PanelChoiceList>>,
+        cx: &App,
+        default: &str,
+    ) -> String {
+        select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// Config-completeness T02: VLESS inner texts in fold order
+    /// (uuid, flow, packet_encoding).
+    fn vless_inner_values(&self, cx: &App) -> (String, String, String) {
+        (
+            self.vless_uuid.read(cx).value().to_string(),
+            Self::panel_value(&self.vless_flow, cx, ""),
+            Self::panel_value(&self.vless_packet_encoding, cx, ""),
         )
+    }
+
+    /// Config-completeness T02: S1 UI state as a store fold.
+    fn transport_fold(&self, cx: &App) -> TransportFold {
+        TransportFold {
+            network: Self::panel_value(&self.s1_network, cx, "tcp"),
+            path: self.s1_path.read(cx).value().to_string(),
+            host: self.s1_host.read(cx).value().to_string(),
+            method: self.s1_method.read(cx).value().to_string(),
+            service_name: self.s1_service_name.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T02: S2 UI state as a store fold.
+    fn tls_optional_fold(&self, cx: &App) -> TlsOptionalFold {
+        TlsOptionalFold {
+            enable: *self.s2_enable.borrow(),
+            sni: self.s2_sni.read(cx).value().to_string(),
+            alpn: self.s2_alpn.read(cx).value().to_string(),
+            fp: Self::panel_value(&self.s2_fp, cx, ""),
+            insecure: *self.s2_insecure.borrow(),
+            pbk: self.s2_pbk.read(cx).value().to_string(),
+            sid: self.s2_sid.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T02: effective S3 mode — brutal forces On
+    /// (Throne parity); the stored cell is untouched so unsetting brutal
+    /// restores the picked mode.
+    fn s3_effective_mode(&self) -> String {
+        if *self.s3_brutal.borrow() {
+            "on".to_string()
+        } else {
+            self.s3_mode.borrow().clone()
+        }
+    }
+
+    /// Config-completeness T02: S3 UI state as a store fold (effective
+    /// mode — brutal-forced On folds as `on`).
+    fn mux_fold(&self, cx: &App) -> MuxFold {
+        MuxFold {
+            mode: self.s3_effective_mode(),
+            brutal_enable: *self.s3_brutal.borrow(),
+            brutal_up_mbps: self.s3_up.read(cx).value().to_string(),
+            brutal_down_mbps: self.s3_down.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T02: S4 UI state as a store fold.
+    fn dial_fold(&self, cx: &App) -> DialFold {
+        DialFold {
+            reuse_addr: *self.s4_reuse.borrow(),
+            tcp_fast_open: *self.s4_fastopen.borrow(),
+            udp_fragment: *self.s4_fragment.borrow(),
+            tcp_multi_path: *self.s4_multipath.borrow(),
+            connect_timeout: self.s4_timeout.read(cx).value().to_string(),
+            bind_interface: self.s4_bind.read(cx).value().to_string(),
+            inet4_bind_address: self.s4_inet4.read(cx).value().to_string(),
+            inet6_bind_address: self.s4_inet6.read(cx).value().to_string(),
+        }
     }
 
     /// Ticket 05: expand direction of the Advanced swap — merge non-blank
     /// guided values into the JSON box, then clear the guided inputs when
     /// the box parses as an object. A garbage box keeps the inputs, so
     /// nothing is ever lost (the commit fold reports that error instead).
+    /// Config-completeness T02: on `vless` rows the panels merge and clear
+    /// the same way (one truth after expand); other protocols keep the
+    /// guided-only behavior byte-for-byte.
     fn expand_merge(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
         let identity = guided_identity_fields(&protocol)
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
-        let merged = fold_guided_into_params(
+        let mut merged = fold_guided_into_params(
             &box_text,
             self.guided_server.read(cx).value().as_ref(),
             self.guided_port.read(cx).value().as_ref(),
             identity,
             self.guided_identity.read(cx).value().as_ref(),
         );
+        let vless = protocol == "vless";
+        if vless {
+            let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
+            merged = fold_vless_inner_into_params(&merged, &uuid, &flow, &packet_encoding);
+            merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
+            merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
+            if flow != "xtls-rprx-vision" {
+                merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+            }
+            merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+        }
         let parseable = merged.trim().is_empty()
             || serde_json::from_str::<serde_json::Value>(&merged)
                 .ok()
@@ -2289,12 +3299,68 @@ impl ConfigForm {
                     state.set_value(String::new(), window, cx);
                 });
             }
+            if vless {
+                self.clear_panels(window, cx);
+            }
         }
+    }
+
+    /// Config-completeness T02: collapse counterpart of [`ConfigForm::expand_merge`]
+    /// for the panels — reset text inputs, dropdowns (to their defaults),
+    /// toggles and the mux mode cell.
+    fn clear_panels(&self, window: &mut Window, cx: &mut Context<AppView>) {
+        for entity in [
+            &self.vless_uuid,
+            &self.s1_path,
+            &self.s1_host,
+            &self.s1_method,
+            &self.s1_service_name,
+            &self.s2_sni,
+            &self.s2_alpn,
+            &self.s2_pbk,
+            &self.s2_sid,
+            &self.s3_up,
+            &self.s3_down,
+            &self.s4_timeout,
+            &self.s4_bind,
+            &self.s4_inet4,
+            &self.s4_inet6,
+        ] {
+            entity.update(cx, |state, cx| {
+                state.set_value(String::new(), window, cx);
+            });
+        }
+        for (entity, default) in [
+            (&self.vless_flow, ""),
+            (&self.vless_packet_encoding, ""),
+            (&self.s1_network, "tcp"),
+            (&self.s2_fp, ""),
+        ] {
+            let next = default.to_string();
+            entity.update(cx, |state, cx| {
+                state.set_selected_value(&next, window, cx);
+            });
+        }
+        for cell in [
+            &self.s2_enable,
+            &self.s2_insecure,
+            &self.s3_brutal,
+            &self.s4_reuse,
+            &self.s4_fastopen,
+            &self.s4_fragment,
+            &self.s4_multipath,
+        ] {
+            *cell.borrow_mut() = false;
+        }
+        *self.s3_mode.borrow_mut() = String::new();
     }
 
     /// Ticket 05: collapse direction of the Advanced swap — echo the JSON
     /// box into blank guided inputs only (never clobbers values kept
     /// across a garbage box).
+    /// Config-completeness T02: on `vless` rows the panels echo the same
+    /// way (defaults count as blank for dropdowns, off counts as blank
+    /// for toggles).
     fn collapse_echo(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -2321,6 +3387,99 @@ impl ConfigForm {
                 entity.update(cx, |state, cx| {
                     state.set_value(next, window, cx);
                 });
+            }
+        }
+        if protocol == "vless" {
+            self.echo_panels(window, cx, &box_text);
+        }
+    }
+
+    /// Config-completeness T02: collapse counterpart of
+    /// [`ConfigForm::clear_panels`] — echo the JSON box into blank/default
+    /// panel inputs only (never clobbers values kept across a garbage box).
+    fn echo_panels(&self, window: &mut Window, cx: &mut Context<AppView>, box_text: &str) {
+        for (entity, keys) in [
+            (&self.vless_uuid, &["uuid", "id"][..]),
+            (&self.s1_path, &["path"][..]),
+            (&self.s1_host, &["host"][..]),
+            (&self.s1_method, &["method"][..]),
+            (&self.s1_service_name, &["service_name", "serviceName"][..]),
+            (&self.s2_sni, &["sni", "peer"][..]),
+            (&self.s2_alpn, &["alpn"][..]),
+            (&self.s2_pbk, &["pbk"][..]),
+            (&self.s2_sid, &["sid"][..]),
+            (&self.s3_up, &["brutal_up_mbps", "brutal_up"][..]),
+            (&self.s3_down, &["brutal_down_mbps", "brutal_down"][..]),
+            (&self.s4_timeout, &["connect_timeout"][..]),
+            (&self.s4_bind, &["bind_interface"][..]),
+            (&self.s4_inet4, &["inet4_bind_address"][..]),
+            (&self.s4_inet6, &["inet6_bind_address"][..]),
+        ] {
+            let value = guided_prefill_value(box_text, keys);
+            let blank = entity.read(cx).value().to_string().trim().is_empty();
+            if blank && !value.is_empty() {
+                entity.update(cx, |state, cx| {
+                    state.set_value(value.clone(), window, cx);
+                });
+            }
+        }
+        for (entity, keys, default) in [
+            (&self.vless_flow, &["flow"][..], ""),
+            (
+                &self.vless_packet_encoding,
+                &["packet_encoding", "packetEncoding"][..],
+                "",
+            ),
+            (&self.s1_network, &["network"][..], "tcp"),
+            (&self.s2_fp, &["fp", "fingerprint"][..], ""),
+        ] {
+            let value = guided_prefill_value(box_text, keys);
+            let current = entity
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == default && !value.is_empty() && value != default {
+                entity.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
+        for (cell, keys) in [
+            (
+                &self.s2_insecure,
+                &[
+                    "insecure",
+                    "allowInsecure",
+                    "allow_insecure",
+                    "allowinsecure",
+                ][..],
+            ),
+            (&self.s3_brutal, &["brutal_enable"][..]),
+            (&self.s4_reuse, &["reuse_addr"][..]),
+            (&self.s4_fastopen, &["tcp_fast_open"][..]),
+            (&self.s4_fragment, &["udp_fragment"][..]),
+            (&self.s4_multipath, &["tcp_multi_path"][..]),
+        ] {
+            if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                *cell.borrow_mut() = true;
+            }
+        }
+        // `security: "tls"` is not a truthy spelling — the enable toggle
+        // echoes the on-values the engine maps (same rule as prefill).
+        if !*self.s2_enable.borrow() {
+            let security = guided_prefill_value(box_text, &["security"]);
+            if matches!(
+                security.to_ascii_lowercase().as_str(),
+                "tls" | "xtls" | "reality"
+            ) {
+                *self.s2_enable.borrow_mut() = true;
+            }
+        }
+        if self.s3_mode.borrow().is_empty() {
+            let mode = guided_prefill_value(box_text, &["mux"]);
+            if !mode.is_empty() {
+                *self.s3_mode.borrow_mut() = mode;
             }
         }
     }
@@ -4918,6 +6077,205 @@ fn protocol_choices() -> Vec<ProtocolChoice> {
             value: protocol.to_string(),
         })
         .collect()
+}
+
+/// Config-completeness T02: the item data behind one panel `Select`
+/// (flow, packet_encoding, network, fp). Same delegate shape as the
+/// protocol picker (stable `SelectedListItem` rows); one shared type for
+/// all panel dropdowns so each new select needs no new delegate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelChoice {
+    id: String,
+    title: String,
+    display: String,
+    value: String,
+}
+
+impl SearchableListItem for PanelChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.title.clone().into()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(self.display.clone().into_any_element())
+    }
+
+    fn value(&self) -> &String {
+        &self.value
+    }
+}
+
+/// Config-completeness T02: the item data behind panel `Select`s — a
+/// dedicated delegate (not `SearchableVec`) so option rows render with
+/// stable observed ids (`<prefix>-<value>`) that headless tests can find.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PanelChoiceList(Vec<PanelChoice>);
+
+impl SearchableListDelegate for PanelChoiceList {
+    type Item = PanelChoice;
+
+    fn items_count(&self, _section: usize) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&PanelChoice> {
+        self.0.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        PanelChoice: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0
+            .iter()
+            .position(|choice| choice.value() == value)
+            .map(IndexPath::new)
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &PanelChoice,
+        _checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .id(item.id.clone())
+                .test_support()
+                .child(item.title.clone())
+                .into_any_element(),
+        )
+    }
+}
+
+/// Config-completeness T02: picker rows for one panel dropdown — `items`
+/// are `(value, title)` pairs; ids read `<prefix>-<slug>` where blank
+/// values slug to `default`.
+fn panel_choices(prefix: &str, items: &[(&str, &str)]) -> Vec<PanelChoice> {
+    items
+        .iter()
+        .map(|(value, title)| {
+            let slug = if value.trim().is_empty() {
+                "default".to_string()
+            } else {
+                value.to_string()
+            };
+            PanelChoice {
+                id: format!("{prefix}-{slug}"),
+                title: title.to_string(),
+                display: title.to_string(),
+                value: value.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Config-completeness T02: option tables for the panel dropdowns (one
+/// source — render, prefill and fold all read these, so a value the UI
+/// cannot pick is a value the fold cannot write).
+fn flow_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "vless-flow-option",
+        &[
+            ("", "Default (no flow)"),
+            ("xtls-rprx-vision", "xtls-rprx-vision"),
+        ],
+    )
+}
+
+/// Config-completeness T02: sing-box 1.14.2 vless `packet_encoding`
+/// spellings (the engine passes them through; `check` judges).
+fn packet_encoding_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "vless-packet-encoding-option",
+        &[
+            ("", "Default"),
+            ("packetaddr", "packetaddr"),
+            ("xudp", "xudp"),
+        ],
+    )
+}
+
+/// Config-completeness T02: sing-box stream networks the engine maps
+/// (`apply_transport`); `raw`/`none`/`gun` intake spellings keep working
+/// through JSON, they just get no picker row.
+fn network_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "s1-network-option",
+        &[
+            ("tcp", "tcp"),
+            ("ws", "ws"),
+            ("httpupgrade", "httpupgrade"),
+            ("http", "http"),
+            ("grpc", "grpc"),
+            ("quic", "quic"),
+        ],
+    )
+}
+
+/// Config-completeness T02: uTLS fingerprints the engine forwards
+/// (`tls.utls.fingerprint`; `check` judges).
+fn fp_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "s2-fp-option",
+        &[
+            ("", "Default (no fingerprint)"),
+            ("chrome", "chrome"),
+            ("firefox", "firefox"),
+            ("edge", "edge"),
+            ("safari", "safari"),
+            ("360", "360"),
+            ("qq", "qq"),
+            ("ios", "ios"),
+            ("android", "android"),
+            ("random", "random"),
+            ("randomized", "randomized"),
+        ],
+    )
+}
+
+/// Config-completeness T02: UUIDv4 for the VLESS generate button — OS
+/// CSPRNG via the existing `getrandom` dep (no new crates); the clash-secret
+/// hash fallback (pid + wall clock + atomic nonce) so generation never
+/// panics, never logs. Version/variant bits set per RFC 4122.
+fn generate_uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now();
+        let mut first = DefaultHasher::new();
+        ("manyproxy-uuid-v1", std::process::id(), now, n).hash(&mut first);
+        let mut second = DefaultHasher::new();
+        ("manyproxy-uuid-v2", n, now, std::process::id()).hash(&mut second);
+        let (a, b) = (first.finish().to_be_bytes(), second.finish().to_be_bytes());
+        bytes[..8].copy_from_slice(&a);
+        bytes[8..].copy_from_slice(&b);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex = |byte: u8| {
+        [
+            HEX[(byte >> 4) as usize] as char,
+            HEX[(byte & 0x0f) as usize] as char,
+        ]
+    };
+    let mut out = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.extend(hex(*byte));
+    }
+    out
 }
 
 /// Command palette (Ctrl-K): one searchable surface over the whole
@@ -15899,6 +17257,432 @@ mod tests {
             "picker Enter runs no commit (a broken guard would toast the template error)"
         );
         assert_absent(cx, "protocol-option-socks".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Tall frame fitting the full VLESS page (the 880x620 minimum shows
+    /// the top; t11 pins that contract separately).
+    fn paint_tall_dialog(cx: &mut VisualTestContext) {
+        cx.simulate_resize(size(px(1000.), px(1800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+    }
+
+    /// Config-completeness T02: VLESS Add renders inner + S1–S4 as kit
+    /// primitives with pinned ids; default tcp shows no conditionals.
+    /// The page rides one outer collapsed disclosure (t11 minimum-frame
+    /// contract) with per-panel sections inside — the test pins the
+    /// collapsed default, then expands outer + panels and paints bodies.
+    #[gpui_kit::test]
+    fn t02_vless_panels_paint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Collapsed default: outer caption paints, everything inside stays
+        // unmounted (one header row at the minimum frame).
+        assert_painted(cx, "vless-section-caption");
+        assert_absent(cx, "s1-caption".to_string());
+        assert_absent(cx, "vless-uuid".to_string());
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Inner fields paint; panel sections stay collapsed inside.
+        for id in [
+            "vless-uuid",
+            "vless-uuid-generate",
+            "vless-flow",
+            "vless-packet-encoding",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "vless-uuid",
+            "vless-uuid-generate",
+            "vless-flow",
+            "vless-packet-encoding",
+            "s1-caption",
+            "s1-network",
+            "s2-caption",
+            "s2-enable",
+            "s2-sni",
+            "s2-fp",
+            "s2-insecure",
+            "s2-pbk",
+            "s3-caption",
+            "s3-mux-group",
+            "s3-brutal",
+            "s3-up",
+            "s3-down",
+            "s4-caption",
+            "s4-reuse",
+            "s4-timeout",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "s1-path".to_string());
+        assert_absent(cx, "s3-vision-note".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: the uuid Generate button fills + toasts
+    /// (the masked value itself is unreadable headless by design).
+    #[gpui_kit::test]
+    fn t02_uuid_generate_button_toasts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_eq!(notification_count(cx), 0, "no toast before Generate");
+        // The Generate button lives inside the outer VLESS disclosure.
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("vless-uuid-generate", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(notification_count(cx), 1, "Generate toasts once");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog stays open after Generate"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: uuid v4 shape (RFC 4122 bits, hyphenated,
+    /// unique) — pure unit test for the Generate backend.
+    #[test]
+    fn t02_generate_uuid_v4_shape() {
+        use crate::generate_uuid_v4;
+        for _ in 0..8 {
+            let uuid = generate_uuid_v4();
+            assert_eq!(uuid.len(), 36, "hyphenated length: {uuid}");
+            assert_eq!(
+                uuid.chars().filter(|c| *c == '-').count(),
+                4,
+                "four hyphens: {uuid}"
+            );
+            assert_eq!(uuid.chars().nth(14), Some('4'), "version nibble: {uuid}");
+            assert!(
+                matches!(uuid.chars().nth(19), Some('8' | '9' | 'a' | 'b')),
+                "variant nibble: {uuid}"
+            );
+            assert!(
+                uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+                "hex only: {uuid}"
+            );
+        }
+        assert_ne!(generate_uuid_v4(), generate_uuid_v4(), "unique");
+    }
+
+    /// Config-completeness T02: ws shows path/host; back to tcp hides them
+    /// (entities persist, JSON preserved per the store fold tests); the
+    /// round trip restores the inputs. Driven through the real picker.
+    #[gpui_kit::test]
+    fn t02_ws_to_tcp_hides_and_restores(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "WsRow".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"network\":\"ws\",\
+                    \"path\":\"/w\",\"host\":\"h.example.com\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Edit opens on the raw JSON (Advanced expanded) — collapse into
+        // the guided page before asserting panel gating.
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Expand the outer VLESS disclosure, then the Transport section
+        // (both collapsed by default per t11).
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Expand the Transport section (collapsed by default per t11).
+        cx.update(|window, cx| {
+            window.click("s1-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s1-path");
+        assert_painted(cx, "s1-host");
+        // ws (row 1) → tcp (row 0): option click commits.
+        cx.update(|window, cx| {
+            window.click("s1-network", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s1-network-option-tcp", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "s1-path".to_string());
+        assert_absent(cx, "s1-host".to_string());
+        // Back to ws: inputs repaint (entities + JSON values preserved).
+        cx.update(|window, cx| {
+            window.click("s1-network", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s1-network-option-ws", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s1-path");
+        assert_painted(cx, "s1-host");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: an imported Reality+Vision link prefills
+    /// every panel (uuid/flow/TLS/transport) and refolds byte-identical —
+    /// untouched Edit commits zero spurious patch.
+    #[gpui_kit::test]
+    fn t02_reality_vision_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::import::import_text;
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let link = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443\
+            ?encryption=none&security=reality&pbk=9p5voorXr3Y8kZ7Q6W5E4R3T2Y1U0I9O8P7O6&fp=chrome\
+            &sni=a.example.com&sid=9f8e7d&spx=%2F&flow=xtls-rprx-vision&type=tcp#RealityVision";
+        let mut batch = import_text(&link.replace(' ', ""));
+        assert!(
+            batch.failures.is_empty(),
+            "link imports: {:?}",
+            batch.failures
+        );
+        assert_eq!(batch.configs.len(), 1, "one row");
+        let parsed = batch.configs.remove(0);
+        assert_eq!(parsed.protocol, "vless");
+        let row = ProxyConfig {
+            id: "t02".to_string(),
+            name: parsed.name.clone(),
+            protocol: parsed.protocol.clone(),
+            params: parsed.params.clone(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let (uuid, flow, enable, pbk, sni, fp, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                let uuid = form.vless_uuid.read(cx).value().to_string();
+                let flow = form
+                    .vless_flow
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .unwrap_or_default();
+                let enable = *form.s2_enable.borrow();
+                let pbk = form.s2_pbk.read(cx).value().to_string();
+                let sni = form.s2_sni.read(cx).value().to_string();
+                let fp = form
+                    .s2_fp
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .unwrap_or_default();
+                let folded = form.effective_params(cx);
+                (uuid, flow, enable, pbk, sni, fp, folded)
+            })
+        });
+        assert_eq!(
+            uuid, "11111111-2222-4333-8444-555555555555",
+            "uuid prefills"
+        );
+        assert_eq!(flow, "xtls-rprx-vision", "flow prefills");
+        assert!(enable, "reality enables TLS");
+        assert!(!pbk.is_empty(), "pbk prefills");
+        assert_eq!(sni, "a.example.com", "sni prefills");
+        assert_eq!(fp, "chrome", "fp prefills");
+        assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
+    }
+
+    /// Config-completeness T02: `flow=vision` unmounts S3 with reason text
+    /// (Throne parity); back to default restores the section.
+    #[gpui_kit::test]
+    fn t02_vision_disables_mux_with_reason(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Expand the outer VLESS disclosure, then Mux (both collapsed by
+        // default per t11).
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s3-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-mux-group");
+        cx.update(|window, cx| {
+            window.click("vless-flow", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("vless-flow-option-xtls-rprx-vision", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-vision-note");
+        assert_absent(cx, "s3-mux-group".to_string());
+        cx.update(|window, cx| {
+            window.click("vless-flow", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("vless-flow-option-default", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-mux-group");
+        assert_absent(cx, "s3-vision-note".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: brutal on forces mux On — the reason note
+    /// paints and the fold writes `mux:"on"` even with a default cell.
+    #[gpui_kit::test]
+    fn t02_brutal_forces_mux_on(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "s3-brutal-note".to_string());
+        // Expand the outer VLESS disclosure, then the Mux section (both
+        // collapsed by default per t11), then flip the brutal switch.
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s3-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s3-brutal-switch", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-brutal-note");
+        let folded = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                *form.s3_brutal.borrow_mut() = true;
+                form.effective_params(cx)
+            })
+        });
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("brutal fold is JSON");
+        assert_eq!(value["mux"], "on", "brutal forces mux on in the fold");
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 

@@ -989,6 +989,400 @@ pub fn pristine_template_rewrite(
     }
 }
 
+/// Config-completeness T02: shared Transport panel (S1) fold state — raw UI
+/// strings exactly as the panel controls hold them. `network` is the panel
+/// default (`tcp`) when the row carries none; every other blank means
+/// untouched (never wiped, R5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportFold {
+    pub network: String,
+    pub path: String,
+    pub host: String,
+    pub method: String,
+    pub service_name: String,
+}
+
+/// Config-completeness T02: shared TLS panel, optional variant (S2). `enable`
+/// mirrors the toggle; `pbk` non-blank means REALITY (Throne parity).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsOptionalFold {
+    pub enable: bool,
+    pub sni: String,
+    pub alpn: String,
+    pub fp: String,
+    pub insecure: bool,
+    pub pbk: String,
+    pub sid: String,
+}
+
+/// Config-completeness T02: shared Mux+Brutal panel (S3). `mode` is
+/// `""` (keep default) | `"on"` | `"off"`; speeds are raw UI text (Mbps).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MuxFold {
+    pub mode: String,
+    pub brutal_enable: bool,
+    pub brutal_up_mbps: String,
+    pub brutal_down_mbps: String,
+}
+
+/// Config-completeness T02: shared Advanced dial panel (S4, dial half — TLS
+/// extras are a later ticket with their own engine `tls{}` mapping).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DialFold {
+    pub reuse_addr: bool,
+    pub tcp_fast_open: bool,
+    pub udp_fragment: bool,
+    pub tcp_multi_path: bool,
+    pub connect_timeout: String,
+    pub bind_interface: String,
+    pub inet4_bind_address: String,
+    pub inet6_bind_address: String,
+}
+
+/// Config-completeness T02: write one select/control value into a params
+/// object — an unchanged value (including an echoed default) no-ops;
+/// `default_value` (and `""`) otherwise restore the default by REMOVING the
+/// key; any other value sets it. Returns true when the object changed
+/// (callers reserialize only then, so no-op folds stay byte-identical and
+/// never produce spurious edit patches).
+fn fold_select_key(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+    default_value: &str,
+) -> bool {
+    let value = value.trim();
+    let current = match obj.get(key) {
+        Some(serde_json::Value::String(current)) => Some(current.clone()),
+        _ => None,
+    };
+    if current.as_deref() == Some(value) {
+        return false;
+    }
+    if value.is_empty() || value == default_value {
+        return obj.remove(key).is_some();
+    }
+    obj.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    true
+}
+
+/// Config-completeness T02: write one boolean into a params object across
+/// alias spellings — `false` removes every alias, `true` sets the canonical
+/// key (dropping stale aliases) only when the effective value changed.
+/// Untouched inputs compare equal through prefill, so they no-op.
+fn fold_bool_aliases(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    aliases: &[&str],
+    value: bool,
+) -> bool {
+    let current = aliases.iter().any(|key| truthy_flat(obj.get(*key)));
+    if current == value {
+        return false;
+    }
+    for key in aliases {
+        obj.remove(*key);
+    }
+    if value {
+        obj.insert(canonical.to_string(), serde_json::Value::Bool(true));
+    }
+    true
+}
+
+/// Config-completeness T02: truthy flat spelling (`1`/`true`/`yes`/`on`,
+/// JSON bools/numbers included) — mirrors the engine's `take_truthy` so
+/// prefill and fold agree on what a stored value means.
+fn truthy_flat(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(number)) => number.as_u64().is_some_and(|n| n != 0),
+        Some(serde_json::Value::String(text)) => {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Config-completeness T02: write one text value across read aliases —
+/// blank never touches the object (T05 blank semantics); non-blank writes
+/// the canonical key only when no alias already holds it.
+fn fold_text_aliases(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    read_keys: &[&str],
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if lookup_case_insensitive(obj, read_keys).as_deref() == Some(value) {
+        return false;
+    }
+    obj.insert(
+        canonical.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    true
+}
+
+/// Config-completeness T02: write one numeric text value — blank no-ops,
+/// parseable integers land as numbers, anything else lands as a string so
+/// validation fails loudly naming the field instead of silently keeping the
+/// old value (T05 port semantics, generalized).
+fn fold_number_text(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let next = match value.parse::<u64>() {
+        Ok(number) => serde_json::Value::from(number),
+        Err(_) => serde_json::Value::String(value.to_string()),
+    };
+    match obj.get(key) {
+        Some(current) if current == &next => false,
+        _ => {
+            obj.insert(key.to_string(), next);
+            true
+        }
+    }
+}
+
+/// Config-completeness T02: value lookup matching
+/// [`lookup_case_insensitive`] but borrowing the JSON value (for
+/// bool-aware prefill — the stringifying lookup skips `false`).
+fn get_case_insensitive<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    obj.get(key).or_else(|| {
+        obj.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    })
+}
+
+/// Config-completeness T02: prefill one panel toggle from a params JSON
+/// object (liberal truthy read across `keys`, mirroring [`truthy_flat`]).
+/// Blank for unparseable JSON or missing keys — the JSON stays the source
+/// of truth, the panel only echoes it.
+pub fn guided_prefill_bool(params_raw: &str, keys: &[&str]) -> bool {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    match obj {
+        Some(obj) => keys
+            .iter()
+            .any(|key| truthy_flat(get_case_insensitive(&obj, key))),
+        None => false,
+    }
+}
+
+/// Config-completeness T02: fold the shared Transport panel (S1) into a
+/// params JSON text. `network: "tcp"` restores the default (key removed);
+/// conditional blanks never wipe (R5). Byte-identical when nothing differs.
+pub fn fold_transport_into_params(params_raw: &str, fold: &TransportFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_key(obj, "network", &fold.network, "tcp");
+    changed |= fold_text_aliases(obj, "path", &["path"], &fold.path);
+    changed |= fold_text_aliases(obj, "host", &["host"], &fold.host);
+    changed |= fold_text_aliases(obj, "method", &["method"], &fold.method);
+    changed |= fold_text_aliases(
+        obj,
+        "service_name",
+        &["service_name", "serviceName"],
+        &fold.service_name,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the shared TLS panel, optional variant
+/// (S2), into a params JSON text. Disabling removes `security` only (sni,
+/// pbk and friends stay preserved per R5); enabling writes `tls`, or
+/// `reality` when `pbk` is non-blank. Byte-identical when nothing differs.
+pub fn fold_tls_optional_into_params(params_raw: &str, fold: &TlsOptionalFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    if fold.enable {
+        let want = if fold.pbk.trim().is_empty() {
+            "tls"
+        } else {
+            "reality"
+        };
+        match obj.get("security") {
+            Some(serde_json::Value::String(current)) if current.eq_ignore_ascii_case(want) => {}
+            _ => {
+                obj.insert(
+                    "security".to_string(),
+                    serde_json::Value::String(want.to_string()),
+                );
+                changed = true;
+            }
+        }
+    } else {
+        changed |= obj.remove("security").is_some();
+    }
+    changed |= fold_text_aliases(obj, "sni", &["sni", "peer"], &fold.sni);
+    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
+    changed |= fold_text_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
+    changed |= fold_bool_aliases(
+        obj,
+        "insecure",
+        &[
+            "insecure",
+            "allowInsecure",
+            "allow_insecure",
+            "allowinsecure",
+        ],
+        fold.insecure,
+    );
+    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
+    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the shared Mux+Brutal panel (S3) into a
+/// params JSON text. `mode` `""` restores the default (key removed);
+/// `brutal_*` keys are panel state preserved in stored JSON — the engine
+/// consumes them without stock emission (no sing-box 1.14.2 mapping; the
+/// mux-force behavior still holds at emission). Byte-identical on no-ops.
+pub fn fold_mux_into_params(params_raw: &str, fold: &MuxFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    // `""` (and the explicit `"default"`) restore the panel default; the
+    // shared select rule keeps echoed values byte-identical.
+    changed |= fold_select_key(obj, "mux", &fold.mode, "default");
+    changed |= fold_bool_aliases(obj, "brutal_enable", &["brutal_enable"], fold.brutal_enable);
+    changed |= fold_number_text(obj, "brutal_up_mbps", &fold.brutal_up_mbps);
+    changed |= fold_number_text(obj, "brutal_down_mbps", &fold.brutal_down_mbps);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the shared Advanced dial panel (S4, dial
+/// half) into a params JSON text. Toggles clear to absent (sing-box omits);
+/// timeout/bind texts are blank-safe. Byte-identical on no-ops.
+pub fn fold_dial_into_params(params_raw: &str, fold: &DialFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    for (key, value) in [
+        ("reuse_addr", fold.reuse_addr),
+        ("tcp_fast_open", fold.tcp_fast_open),
+        ("udp_fragment", fold.udp_fragment),
+        ("tcp_multi_path", fold.tcp_multi_path),
+    ] {
+        changed |= fold_bool_aliases(obj, key, &[key], value);
+    }
+    changed |= fold_text_aliases(
+        obj,
+        "connect_timeout",
+        &["connect_timeout"],
+        &fold.connect_timeout,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "bind_interface",
+        &["bind_interface"],
+        &fold.bind_interface,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "inet4_bind_address",
+        &["inet4_bind_address"],
+        &fold.inet4_bind_address,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "inet6_bind_address",
+        &["inet6_bind_address"],
+        &fold.inet6_bind_address,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the VLESS inner fields (uuid + flow +
+/// packet_encoding) into a params JSON text. `flow`/`packet_encoding` blank
+/// restores defaults (keys removed); uuid follows T05 identity semantics
+/// (aliases echoed, never wiped, never duplicated by untouched folds).
+pub fn fold_vless_inner_into_params(
+    params_raw: &str,
+    uuid: &str,
+    flow: &str,
+    packet_encoding: &str,
+) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], uuid);
+    changed |= fold_select_key(obj, "flow", flow, "");
+    changed |= fold_select_key(obj, "packet_encoding", packet_encoding, "");
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
 /// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
 /// `None` means unknown protocol (the commit names it through the normal
 /// validation path). `key = None` means a known protocol with no link
@@ -8931,6 +9325,234 @@ mod tests {
             "{{{",
             "garbage stands"
         );
+    }
+
+    /// Config-completeness T02: shared-panel folds are byte-identical
+    /// no-ops on untouched values and write minimal diffs on changes —
+    /// never a spurious patch, never a wipe of hidden keys.
+    #[test]
+    fn t02_panel_folds_noop_untouched_and_write_minimal() {
+        // Transport: untouched import row (network=tcp echoed) folds back
+        // byte-identical; ws sets network+path+host; back to tcp removes
+        // the network key instead of writing a default.
+        let shaped = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"network\":\"tcp\"}";
+        let echoed = TransportFold {
+            network: "tcp".to_string(),
+            path: String::new(),
+            host: String::new(),
+            method: String::new(),
+            service_name: String::new(),
+        };
+        assert_eq!(fold_transport_into_params(shaped, &echoed), shaped);
+        let ws = fold_transport_into_params(
+            shaped,
+            &TransportFold {
+                network: "ws".to_string(),
+                path: "/w".to_string(),
+                host: "h.example.com".to_string(),
+                ..Default::default()
+            },
+        );
+        let ws_value: serde_json::Value = serde_json::from_str(&ws).expect("ws folds to JSON");
+        assert_eq!(ws_value["network"], "ws");
+        assert_eq!(ws_value["path"], "/w");
+        assert_eq!(ws_value["host"], "h.example.com");
+        let back = fold_transport_into_params(
+            &ws,
+            &TransportFold {
+                network: "tcp".to_string(),
+                ..Default::default()
+            },
+        );
+        let back_value: serde_json::Value = serde_json::from_str(&back).expect("back folds");
+        assert!(back_value.get("network").is_none(), "tcp restores default");
+        assert_eq!(back_value["path"], "/w", "conditional values preserved");
+        assert_eq!(back_value["server"], "a.example.com", "row untouched");
+        // TLS optional: enabling writes tls, pbk flips to reality,
+        // disabling removes security only (sni stays per R5).
+        let bare = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443}";
+        let on = fold_tls_optional_into_params(
+            bare,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "s.example.com".to_string(),
+                ..Default::default()
+            },
+        );
+        let on_value: serde_json::Value = serde_json::from_str(&on).expect("tls on folds");
+        assert_eq!(on_value["security"], "tls");
+        assert_eq!(on_value["sni"], "s.example.com");
+        let reality = fold_tls_optional_into_params(
+            &on,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "s.example.com".to_string(),
+                pbk: "pubkey".to_string(),
+                sid: "short".to_string(),
+                ..Default::default()
+            },
+        );
+        let reality_value: serde_json::Value =
+            serde_json::from_str(&reality).expect("reality folds");
+        assert_eq!(
+            reality_value["security"], "reality",
+            "non-empty pbk means REALITY"
+        );
+        let off = fold_tls_optional_into_params(
+            &reality,
+            &TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+        );
+        let off_value: serde_json::Value = serde_json::from_str(&off).expect("tls off folds");
+        assert!(
+            off_value.get("security").is_none(),
+            "disable drops security"
+        );
+        assert_eq!(off_value["sni"], "s.example.com", "sni preserved");
+        assert_eq!(off_value["pbk"], "pubkey", "pbk preserved");
+        // insecure across alias spellings: untouched alias no-ops, toggle
+        // writes canonical and clears the alias.
+        let aliased = "{\"security\":\"tls\",\"allowInsecure\":true}";
+        let kept = fold_tls_optional_into_params(
+            aliased,
+            &TlsOptionalFold {
+                enable: true,
+                insecure: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(kept, aliased, "aliased true no-ops");
+        let cleared = fold_tls_optional_into_params(
+            aliased,
+            &TlsOptionalFold {
+                enable: true,
+                insecure: false,
+                ..Default::default()
+            },
+        );
+        let cleared_value: serde_json::Value =
+            serde_json::from_str(&cleared).expect("insecure off folds");
+        assert!(cleared_value.get("allowInsecure").is_none());
+        assert!(cleared_value.get("insecure").is_none());
+        // Mux: modes round-trip, brutal speeds land as numbers, garbage
+        // speeds land as strings (loud downstream, never silent).
+        let mux_on = fold_mux_into_params(
+            bare,
+            &MuxFold {
+                mode: "on".to_string(),
+                brutal_enable: true,
+                brutal_up_mbps: "100".to_string(),
+                brutal_down_mbps: "fast".to_string(),
+            },
+        );
+        let mux_value: serde_json::Value = serde_json::from_str(&mux_on).expect("mux folds");
+        assert_eq!(mux_value["mux"], "on");
+        assert_eq!(mux_value["brutal_enable"], true);
+        assert_eq!(mux_value["brutal_up_mbps"], 100);
+        assert_eq!(mux_value["brutal_down_mbps"], "fast");
+        let mux_default = fold_mux_into_params(
+            &mux_on,
+            &MuxFold {
+                mode: String::new(),
+                brutal_enable: true,
+                brutal_up_mbps: "100".to_string(),
+                brutal_down_mbps: "fast".to_string(),
+            },
+        );
+        let default_value: serde_json::Value =
+            serde_json::from_str(&mux_default).expect("mux default folds");
+        assert!(
+            default_value.get("mux").is_none(),
+            "default removes the key"
+        );
+        assert_eq!(default_value["brutal_enable"], true, "brutal preserved");
+        // Dial: toggles clear to absent, texts are blank-safe, untouched
+        // echoes stay byte-identical.
+        let dialed = fold_dial_into_params(
+            bare,
+            &DialFold {
+                reuse_addr: true,
+                bind_interface: "eth0".to_string(),
+                ..Default::default()
+            },
+        );
+        let dial_value: serde_json::Value = serde_json::from_str(&dialed).expect("dial folds");
+        assert_eq!(dial_value["reuse_addr"], true);
+        assert_eq!(dial_value["bind_interface"], "eth0");
+        let dial_echo = DialFold {
+            reuse_addr: true,
+            bind_interface: "eth0".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(fold_dial_into_params(&dialed, &dial_echo), dialed);
+        let dial_off = fold_dial_into_params(
+            &dialed,
+            &DialFold {
+                bind_interface: "eth0".to_string(),
+                ..Default::default()
+            },
+        );
+        let dial_off_value: serde_json::Value =
+            serde_json::from_str(&dial_off).expect("dial off folds");
+        assert!(dial_off_value.get("reuse_addr").is_none(), "false clears");
+        // VLESS inner: uuid/flow/packet_encoding with default-restore.
+        let inner = fold_vless_inner_into_params(
+            bare,
+            "11111111-2222-4333-8444-555555555555",
+            "xtls-rprx-vision",
+            "xudp",
+        );
+        let inner_value: serde_json::Value = serde_json::from_str(&inner).expect("inner folds");
+        assert_eq!(inner_value["uuid"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(inner_value["flow"], "xtls-rprx-vision");
+        assert_eq!(inner_value["packet_encoding"], "xudp");
+        let inner_echo = fold_vless_inner_into_params(
+            &inner,
+            "11111111-2222-4333-8444-555555555555",
+            "xtls-rprx-vision",
+            "xudp",
+        );
+        assert_eq!(inner_echo, inner, "echoed inner folds byte-identical");
+        let inner_plain =
+            fold_vless_inner_into_params(&inner, "11111111-2222-4333-8444-555555555555", "", "");
+        let plain_value: serde_json::Value =
+            serde_json::from_str(&inner_plain).expect("inner plain folds");
+        assert!(
+            plain_value.get("flow").is_none(),
+            "blank flow restores default"
+        );
+        assert!(plain_value.get("packet_encoding").is_none());
+        // Garbage JSON stands untouched through every fold.
+        for fold_it in [
+            fold_transport_into_params("{{{", &TransportFold::default()),
+            fold_mux_into_params("{{{", &MuxFold::default()),
+            fold_dial_into_params("{{{", &DialFold::default()),
+        ] {
+            assert_eq!(fold_it, "{{{");
+        }
+    }
+
+    /// Config-completeness T02: toggle prefill reads truthy spellings
+    /// (bools, numbers, liberal strings) and stays false on garbage.
+    #[test]
+    fn t02_prefill_bool_reads_truthy_spellings() {
+        assert!(guided_prefill_bool(
+            "{\"reuse_addr\":true}",
+            &["reuse_addr"]
+        ));
+        assert!(guided_prefill_bool("{\"reuse_addr\":1}", &["reuse_addr"]));
+        assert!(guided_prefill_bool("{\"a\":\"ON\"}", &["a"]));
+        assert!(!guided_prefill_bool(
+            "{\"reuse_addr\":false}",
+            &["reuse_addr"]
+        ));
+        assert!(!guided_prefill_bool("{\"reuse_addr\":0}", &["reuse_addr"]));
+        assert!(!guided_prefill_bool("{\"other\":true}", &["reuse_addr"]));
+        assert!(!guided_prefill_bool("{{{", &["reuse_addr"]));
+        assert!(!guided_prefill_bool("", &["reuse_addr"]));
     }
 
     /// Ticket 05: guided identity mapping mirrors the commit gate (same
