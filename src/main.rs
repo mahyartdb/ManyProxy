@@ -32,11 +32,15 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::separator::Separator;
+use gpui_kit::component::sheet::Sheet;
+use gpui_kit::component::shimmer::ShimmerText;
+use gpui_kit::component::skeleton::Skeleton;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::switch::Switch;
@@ -76,8 +80,9 @@ use store::{
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
 // [`bind_app_keys`]; the shell div handles them via `.on_action(...)`.
-// Every handler is a no-op while any dialog is open, so shortcut keys never
-// steal dialog input (the dialog keeps its own Confirm/Cancel keys).
+// Every handler is a no-op while any overlay is open (see
+// [`overlay_open`]), so shortcut keys never steal sheet/dialog input
+// (the overlay keeps its own Confirm/Cancel keys).
 // Ticket 44: `ClearChecked` lets Escape empty the multi-select set.
 actions!(
     manyproxy,
@@ -1468,6 +1473,61 @@ fn dialog_footer(
                 .on_click(move |_, window, cx| {
                     if commit_click(window, cx) {
                         window.close_all_dialogs(cx);
+                    }
+                }),
+        )
+}
+
+/// T08 (gpui-18-sweep CAP-9): true while any overlay owns the screen — a
+/// `Dialog` or a `Sheet` (`WindowExt::open_sheet`). Sheets occlude the shell
+/// exactly like dialogs (the kit overlay covers the viewport and stops mouse
+/// input), so every key-action guard uses this: shortcuts must never punch
+/// through a reference sheet into the library behind it (F5 starting an
+/// endpoint while the subscriptions URL field holds focus, Delete clearing
+/// the checked set on sheet Escape, drops stacking an import dialog over a
+/// sheet). Verified 0.6.6: `Root::open_sheet_at` captures the previously
+/// focused handle and `Root::close_sheet` restores it, so Escape (kit
+/// `Cancel` → `request_close`) closes the topmost layer with focus returning
+/// to its trigger — the guards only keep shell keys out of the way.
+fn overlay_open(window: &mut Window, cx: &mut App) -> bool {
+    window.has_active_dialog(cx) || window.has_active_sheet(cx)
+}
+
+/// T08 (gpui-18-sweep CAP-9): sheet footer — the same honest verbs, stable
+/// ids, and shared-`Rc`-commit shape as [`dialog_footer`], but wired for
+/// `WindowExt::open_sheet` chrome. Differences are kit-forced (verified
+/// `sheet.rs`: `Sheet` offers `title/footer/size/on_close` only — no
+/// `button_props.on_ok` Confirm-key path, and `on_close` takes
+/// `Fn(&ClickEvent, &mut Window, &mut App)`): Cancel closes only the sheet
+/// (`close_sheet` never touches a dialog stacked above it), and the commit
+/// button is the single commit path (keyboard users reach it by tabbing —
+/// kit buttons activate on Enter when focused — instead of a global
+/// Confirm key). Both buttons ride `.small()` like dialog footers.
+fn sheet_footer(
+    ok_id: &'static str,
+    cancel_id: &'static str,
+    ok_label: &'static str,
+    commit: DialogCommit,
+) -> DialogFooter {
+    debug_assert!(
+        !ok_label.eq_ignore_ascii_case("ok") && !ok_label.eq_ignore_ascii_case("okay"),
+        "Ticket 05: honest footers never use a bare OK label"
+    );
+    let commit_click = commit.clone();
+    DialogFooter::new()
+        .child(
+            Button::new(cancel_id)
+                .small()
+                .label("Cancel")
+                .on_click(|_, window, cx| window.close_sheet(cx)),
+        )
+        .child(
+            Button::new(ok_id)
+                .small()
+                .label(ok_label)
+                .on_click(move |_, window, cx| {
+                    if commit_click(window, cx) {
+                        window.close_sheet(cx);
                     }
                 }),
         )
@@ -3961,10 +4021,17 @@ fn subscription_row(
     count: usize,
     expanded: bool,
     members: Vec<String>,
+    refreshing: bool,
 ) -> impl IntoElement {
     let mut row = div()
         .flex()
         .flex_row()
+        // T08 (gpui-18-sweep CAP-9): wrapped, never clipped — the manager
+        // now lives in a 520px sheet (narrower than the old dialog), and a
+        // nowrap row would push the Refresh/Auto/Remove actions past the
+        // sheet body's clip. Same No-Sideways-Scroll rule as every crowded
+        // action set; ids, labels, and handlers unchanged.
+        .flex_wrap()
         .items_center()
         .gap_2()
         .child(Label::new(sub.label.clone()))
@@ -4061,16 +4128,47 @@ fn subscription_row(
     }
     let refresh_view = view.clone();
     let refresh_id = sub.id.clone();
-    row = row.child(
-        Button::new(format!("sub-refresh-{}", sub.id))
-            .label("Refresh")
-            .on_click(move |_, window, cx| {
-                let sub_id = refresh_id.clone();
-                refresh_view.update(cx, |view, cx| {
-                    view.refresh_subscription_by_id(&sub_id, window, cx);
-                });
-            }),
-    );
+    // T08 (gpui-18-sweep CAP-10): in-flight refresh reads label + spinner
+    // (`Button.loading`, like Start/Test/Ping) and ignores double-activation
+    // through the existing [`AppView::note_refresh_started`] guard — a second
+    // press while the fetch runs starts nothing.
+    let mut refresh_button = Button::new(format!("sub-refresh-{}", sub.id))
+        .label("Refresh")
+        .loading(refreshing)
+        .on_click(move |_, window, cx| {
+            let sub_id = refresh_id.clone();
+            refresh_view.update(cx, |view, cx| {
+                view.refresh_subscription_by_id(&sub_id, window, cx);
+            });
+        });
+    if refreshing {
+        refresh_button = refresh_button.child(
+            div()
+                .id(format!("sub-refresh-spinner-{}", sub.id))
+                .test_support()
+                .child(Spinner::new().small()),
+        );
+    }
+    row = row.child(refresh_button);
+    // T08 (gpui-18-sweep CAP-10): streaming rows (fetch in flight, outcome +
+    // duration unknown) compose `Skeleton` + `ShimmerText` — no invented
+    // `Skeleton::shimmer`, theme tokens only. The row rebuilds on start
+    // (reopen) and on completion, so the shimmer tracks the real fetch.
+    if refreshing {
+        row = row.child(
+            div()
+                .id(format!("sub-refreshing-{}", sub.id))
+                .test_support()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(Skeleton::new().max_w(px(120.)))
+                .child(
+                    ShimmerText::new("Refreshing…").id(format!("sub-refreshing-text-{}", sub.id)),
+                ),
+        );
+    }
     let auto_view = view.clone();
     let auto_id = sub.id.clone();
     let auto_now = sub.auto_refresh;
@@ -4605,6 +4703,8 @@ enum PaletteOp {
     StartAll,
     StopAll,
     TestAll,
+    ImportClipboard,
+    ExportLibrary,
 }
 
 /// Ticket 05: bottom-inspector tab over the existing detail builders.
@@ -5001,15 +5101,17 @@ impl AppView {
         if let Err(error) = self.reload_inner_no_poll(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
-        // Ticket 43: live-tail — the logs dialog follows new sidecar lines
-        // unless paused. Only our own dialog reopens (the `logs_open` proof);
-        // a paused dialog or a foreign screen is never touched.
+        // Ticket 43: live-tail — the logs sheet follows new sidecar lines
+        // unless paused. Only our own sheet reopens (the `logs_open` proof);
+        // a paused sheet or a foreign screen is never touched. T08: the
+        // sheet closes alone (`close_sheet` never drops a dialog stacked
+        // above it).
         if self.logs_open
             && self.log_tail
             && self.logs.all().len() != self.logs_seen
-            && window.has_active_dialog(cx)
+            && window.has_active_sheet(cx)
         {
-            window.close_all_dialogs(cx);
+            window.close_sheet(cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
             return;
@@ -7210,7 +7312,7 @@ impl AppView {
         });
     }
 
-    /// Map a palette (section, row) to its op. Section 0 is Library (13
+    /// Map a palette (section, row) to its op. Section 0 is Library (15
     /// rows), section 1 is Manage (9 rows) — the same order the dialog
     /// builds below.
     fn palette_op_at(index: IndexPath) -> Option<PaletteOp> {
@@ -7228,6 +7330,11 @@ impl AppView {
             (0, 10) => Some(PaletteOp::DetailsTab),
             (0, 11) => Some(PaletteOp::HealthTab),
             (0, 12) => Some(PaletteOp::PresetsTab),
+            // T08 (gpui-18-sweep CAP-9): the two menu-only Library
+            // destinations ride the same rows so every toolbar + menu
+            // destination resolves through the palette too.
+            (0, 13) => Some(PaletteOp::ImportClipboard),
+            (0, 14) => Some(PaletteOp::ExportLibrary),
             (1, 0) => Some(PaletteOp::Subscriptions),
             (1, 1) => Some(PaletteOp::PresetManager),
             (1, 2) => Some(PaletteOp::Groups),
@@ -7242,9 +7349,9 @@ impl AppView {
     }
 
     /// Open the palette (single dialog — the Ctrl-K handler guards against
-    /// stacking it over another dialog).
+    /// stacking it over another overlay; see [`overlay_open`]).
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.has_active_dialog(cx) {
+        if overlay_open(window, cx) {
             return;
         }
         let state = cx.new(|cx| CommandState::new(window, cx));
@@ -7296,6 +7403,16 @@ impl AppView {
                             CommandItem::new()
                                 .label("Show Presets tab")
                                 .keywords(["preset", "tab"]),
+                            // T08 (gpui-18-sweep CAP-9): the Library menu's
+                            // two menu-only destinations (same handlers as
+                            // the `import-clipboard` / `export-library`
+                            // menu items — dispatched, not duplicated).
+                            CommandItem::new()
+                                .label("Import from clipboard")
+                                .keywords(["clipboard", "paste", "import"]),
+                            CommandItem::new()
+                                .label("Export library")
+                                .keywords(["export", "backup", "json"]),
                         ]))
                     .group(CommandGroup::new().label("Manage").items(vec![
                             CommandItem::new()
@@ -7366,6 +7483,10 @@ impl AppView {
             PaletteOp::TestAll => {
                 self.test_all_health(window, cx);
             }
+            // T08 (gpui-18-sweep CAP-9): menu-only twins dispatch through
+            // the same handlers the Library menu items use.
+            PaletteOp::ImportClipboard => self.open_import_from_clipboard(window, cx),
+            PaletteOp::ExportLibrary => self.open_export_dialog(window, cx),
         }
     }
 
@@ -7772,8 +7893,8 @@ impl AppView {
         );
     }
 
-    /// Ticket 43: set the logs-dialog severity filter and re-render the open
-    /// dialog around the new filter (the filter text is preserved).
+    /// Ticket 43: set the logs-sheet severity filter and re-render the open
+    /// sheet around the new filter (the filter text is preserved).
     fn set_log_level(
         &mut self,
         level: Option<LogLevel>,
@@ -7781,8 +7902,8 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.log_level = level;
-        if self.logs_open && window.has_active_dialog(cx) {
-            window.close_all_dialogs(cx);
+        if self.logs_open && window.has_active_sheet(cx) {
+            window.close_sheet(cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
         } else {
@@ -7791,7 +7912,7 @@ impl AppView {
     }
 
     /// Ticket 43: pause/resume the live tail. Resuming reopens around the
-    /// latest lines so the dialog catches up; the toast names the state.
+    /// latest lines so the sheet catches up; the toast names the state.
     fn toggle_log_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.log_tail = !self.log_tail;
         window.push_notification(
@@ -7802,8 +7923,8 @@ impl AppView {
             }),
             cx,
         );
-        if self.logs_open && window.has_active_dialog(cx) {
-            window.close_all_dialogs(cx);
+        if self.logs_open && window.has_active_sheet(cx) {
+            window.close_sheet(cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
         } else {
@@ -7813,14 +7934,14 @@ impl AppView {
 
     /// T04 (gpui-18-sweep CAP-5): clear the log text filter + level back to
     /// All, behind the no-lines Empty's working button. Same close + reopen
-    /// rhythm as [`toggle_log_tail`](Self::toggle_log_tail) so the dialog
+    /// rhythm as [`toggle_log_tail`](Self::toggle_log_tail) so the sheet
     /// repaints around the restored tail; no toast (the reopen is the
     /// confirmation).
     fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.log_filter.clear();
         self.log_level = None;
-        if self.logs_open && window.has_active_dialog(cx) {
-            window.close_all_dialogs(cx);
+        if self.logs_open && window.has_active_sheet(cx) {
+            window.close_sheet(cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
         } else {
@@ -7887,8 +8008,7 @@ impl AppView {
             });
             true
         });
-        let commit_key = commit.clone();
-        // Ticket 43: mark the dialog live (tail watermark = stored records).
+        // Ticket 43: mark the sheet live (tail watermark = stored records).
         self.logs_open = true;
         self.logs_seen = self.logs.all().len();
         // Ticket 43: dialog-chrome snapshot for the level/tail buttons (the
@@ -7902,11 +8022,18 @@ impl AppView {
         // T04 (CAP-5): the no-lines Empty names whether a filter is active
         // so the copy stays honest (empty tail vs filtered-out tail).
         let chrome_filter_active = !self.log_filter.trim().is_empty();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            let commit_key = commit_key.clone();
+        // T08 (gpui-18-sweep CAP-9): reference flow — the logs viewer is a
+        // `Sheet` via `WindowExt::open_sheet` (there is no `Sheet::open`),
+        // so the library stays visible behind it. True commits (Add/Edit/
+        // Import/Export/confirms) stay `Dialog`s. The sheet keeps the same
+        // body, ids, and footer verbs; the `button_props.on_ok` Confirm-key
+        // path has no sheet equivalent (kit-forced), so Apply-filter commits
+        // through the footer button only. Escape closes the topmost layer
+        // with focus returning to the trigger (kit `Root`, verified 0.6.6).
+        window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
             // Ticket 43: severity filter row + Copy/tail row. Each button
-            // re-renders this same dialog around its new state.
+            // re-renders this same sheet around its new state.
             let (current_level, tail_on) = (chrome_level, chrome_tail);
             // Lane B (B9): the single level control — labels map through
             // `LogLevel::from_label` (one source, never a hand-duplicated
@@ -7927,7 +8054,7 @@ impl AppView {
             let mut level_group = RadioGroup::horizontal("log-level-options")
                 .selected_index(selected_level)
                 .on_change({
-                    // Per-render clone — the dialog builder is `Fn`.
+                    // Per-render clone — the sheet builder is `Fn`.
                     let group_view = chrome_view.clone();
                     move |ix, window, cx| {
                         let level = LOG_LEVEL_LABELS
@@ -8098,20 +8225,16 @@ impl AppView {
             }
             body = body.child(list);
             let close_view = chrome_view.clone();
-            dialog
+            sheet
                 .title(title.clone())
                 .child(body)
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
+                .size(px(520.))
                 .on_close(move |_, _, cx| {
                     close_view.update(cx, |view, _| {
                         view.logs_open = false;
                     });
                 })
-                .footer(dialog_footer(
+                .footer(sheet_footer(
                     "logs-dialog-ok",
                     "logs-dialog-cancel",
                     // Ticket 05: filter commit is distinct from discarding via Cancel.
@@ -8787,10 +8910,10 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         // Signal-box 03: drops never stack import dialogs — while any
-        // dialog is open the drop is refused with an honest toast (the
+        // overlay is open the drop is refused with an honest toast (the
         // drop hint names the same precondition), never silently
         // swallowed and never stacked.
-        if window.has_active_dialog(cx) {
+        if overlay_open(window, cx) {
             window.push_notification(
                 Notification::warning(
                     "Close the open dialog first — dropped files were not imported",
@@ -9361,6 +9484,27 @@ impl AppView {
         self.refresh_batch_members.contains(sub_id)
     }
 
+    /// T08 (gpui-18-sweep CAP-10): honest bounded progress over the open
+    /// refresh batch — `(completed, total)` while members are still in
+    /// flight, `None` when no batch is open. Completions land through
+    /// [`AppView::accumulate_batch_member`] (which removes the member but
+    /// keeps the total) and the adopt-first retry path (which removes the
+    /// member and returns its slot), so `total - members` always counts
+    /// finished fetches — never a fabricated fraction. The subscriptions
+    /// sheet renders this as a kit `Progress`.
+    fn refresh_batch_progress(&self) -> Option<(usize, usize)> {
+        if self.refresh_batch_members.is_empty() {
+            return None;
+        }
+        let total = self
+            .refresh_batch_total
+            .max(self.refresh_batch_members.len());
+        Some((
+            total.saturating_sub(self.refresh_batch_members.len()),
+            total,
+        ))
+    }
+
     /// Ticket 17: close one batch slot, flushing the single coalesced toast
     /// when the last member lands. No-op for non-members.
     fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
@@ -9449,7 +9593,7 @@ impl AppView {
         if self.refresh_batch_members.remove(sub_id) {
             self.refresh_batch_total = self.refresh_batch_total.saturating_sub(1);
         }
-        match self.store.get_subscription(sub_id) {
+        let started = match self.store.get_subscription(sub_id) {
             Ok(Some(sub)) => self.start_subscription_refresh(sub, cx),
             Ok(None) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
@@ -9462,7 +9606,14 @@ impl AppView {
                 );
                 false
             }
+        };
+        // T08 (gpui-18-sweep CAP-10): a started fetch rebuilds the open
+        // sheet so the row's streaming shimmer paints immediately (a no-op
+        // with no stash — foreign overlays are never touched).
+        if started {
+            self.reopen_subscriptions_if_open(window, cx);
         }
+        started
     }
 
     /// Ticket 14: auto-refresh toggle with truthful outcomes (never a dead
@@ -9764,23 +9915,26 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    /// Ticket 04: re-render the subscriptions dialog after an action, but
+    /// Ticket 04: re-render the subscriptions sheet after an action, but
     /// only if the user still has it open.
-    /// Ticket 26: never touch a foreign dialog. The reopen fires only while
-    /// the subscriptions dialog itself owns the screen — tracked by the
+    /// Ticket 26: never touch a foreign overlay. The reopen fires only while
+    /// the subscriptions sheet itself owns the screen — tracked by the
     /// stashed [`SubForm`], which every dismiss path (OK, Cancel, Escape,
     /// backdrop/X via `.on_close`) clears. A background refresh completing
     /// while the user types in Add/Import/Edit/Export/Logs finds no stash
-    /// and leaves that dialog and its input intact. A genuine reopen carries
+    /// and leaves that overlay and its input intact. A genuine reopen carries
     /// the in-progress add-form text across instead of rebuilding it blank.
+    /// T08: the sheet closes through `close_sheet` (after any stacked
+    /// dialogs, which owned the old `close_all_dialogs`-only path the same
+    /// way) before the restored sheet opens.
     fn reopen_subscriptions_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !window.has_active_dialog(cx) {
-            // No dialog at all: drop any stale stash and leave.
+        if !window.has_active_dialog(cx) && !window.has_active_sheet(cx) {
+            // No overlay at all: drop any stale stash and leave.
             self.subs_form = None;
             return;
         }
         let Some(form) = &self.subs_form else {
-            // Some other dialog owns the screen — leave it alone.
+            // Some other overlay owns the screen — leave it alone.
             return;
         };
         let label = form.label.read(cx).value().to_string();
@@ -9789,6 +9943,7 @@ impl AppView {
         let auto = *form.auto_refresh.borrow();
         let interval = *form.interval_secs.borrow();
         window.close_all_dialogs(cx);
+        window.close_sheet(cx);
         self.open_subscriptions_dialog_restored(&label, &url, &group, auto, interval, window, cx);
     }
 
@@ -10773,7 +10928,6 @@ impl AppView {
                 view.commit_subscription_add(label, url, group, auto, interval, window, cx)
             })
         });
-        let commit_key = commit.clone();
         // Ticket 45: header state snapshots — the global kill-switch position
         // and the manual due count (explicit consent, ignores the switch).
         let auto_all = self.store.subs_auto_refresh_enabled();
@@ -10782,19 +10936,31 @@ impl AppView {
             .iter()
             .filter(|sub| due_for_refresh_for(sub, now))
             .count();
+        // T08 (gpui-18-sweep CAP-10): loading snapshots for the builder —
+        // the open batch's bounded progress plus the per-row in-flight set.
+        // The builder is `Fn` and re-runs per render, so snapshots (never
+        // live view reads) feed it, like `expanded` above.
+        let batch_progress = self.refresh_batch_progress();
+        let refreshing_rows = self.inflight_refreshes.clone();
         let kill_view = view.clone();
         let due_view = view.clone();
         // Ticket 26: every dismiss path (OK-close, Cancel, Escape,
         // backdrop/X) clears the stashed form through `.on_close`, so a
-        // later foreign dialog can never be mistaken for this one.
+        // later foreign overlay can never be mistaken for this one.
         let close_view = view.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
-            let commit_key = commit_key.clone();
+        // T08 (gpui-18-sweep CAP-9): reference flow — subscriptions manage
+        // in a `Sheet` via `WindowExt::open_sheet` (no `Sheet::open`), with
+        // the same body, ids, and footer verbs. The `button_props.on_ok`
+        // Confirm-key path has no sheet equivalent (kit-forced): the Add
+        // commit runs through the footer button only.
+        window.open_sheet(cx, move |sheet: Sheet, _, cx| {
             let commit_click = commit.clone();
             let view_for_rows = view.clone();
             let close_subs = close_view.clone();
             let kill_buttons = kill_view.clone();
             let due_buttons = due_view.clone();
+            let batch_progress = batch_progress;
+            let refreshing_rows = refreshing_rows.clone();
             let mut body = div().flex().flex_col().gap_2();
             // Ticket 45: controllable auto-update — the kill-switch gates
             // the automatic pass only; Refresh-all-due is explicit consent.
@@ -10840,6 +11006,31 @@ impl AppView {
             if subs.is_empty() {
                 body = body.child("No subscriptions yet — paste a subscription URL below");
             }
+            // T08 (gpui-18-sweep CAP-10): bounded work reads a kit
+            // `Progress` — the open refresh batch's real completed/total
+            // (see [`AppView::refresh_batch_progress`]), painted only while
+            // members are still in flight. Never a fabricated fraction.
+            if let Some((done, total)) = batch_progress {
+                let percent =
+                    (done as f32 / total.max(1) as f32 * 100.0).clamp(0.0, 100.0);
+                body = body.child(
+                    div()
+                        .id("subs-refresh-progress")
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            Progress::new("subs-refresh-progress-bar")
+                                .small()
+                                .value(percent)
+                                .accessibility_label(format!(
+                                    "Refreshing subscriptions: {done} of {total}"
+                                )),
+                        )
+                        .child(format!("Refreshing {done} of {total} subscriptions")),
+                );
+            }
             for sub in &subs {
                 body = body.child(subscription_row(
                     view_for_rows.clone(),
@@ -10847,23 +11038,20 @@ impl AppView {
                     counts.get(&sub.id).copied().unwrap_or(0),
                     expanded.contains(&sub.id),
                     subscription_member_names(&member_rows, &sub.id),
+                    refreshing_rows.contains(&sub.id),
                 ));
             }
             body = body.child(form.clone().element(view_for_rows.clone(), cx));
-            dialog
+            sheet
                 .title("Subscriptions")
                 .child(body)
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
+                .size(px(520.))
                 .on_close(move |_, _, cx| {
                     close_subs.update(cx, |view, _| {
                         view.subs_form = None;
                     });
                 })
-                .footer(dialog_footer(
+                .footer(sheet_footer(
                     "subscriptions-dialog-ok",
                     "subscriptions-dialog-cancel",
                     // Ticket 05: manager create names its verb (empty form closes).
@@ -12719,13 +12907,12 @@ impl AppView {
             .map(|row| row.port)
             .collect();
         let ports_text = serving_ports_text(&ports);
-        // throne-density 04: three regions inside the single `left()` slot
-        // (kit `StatusBar` pins only `left`/`right` — with just `left`, its
-        // center end-aligns, so the spread lives here). `flex_1` spacers
-        // push `status-left` (stored + enabled counts) / `status-center`
-        // (engine + health) / `status-right` (usage totals) across the
-        // strip. Separators split the regions so the segments still read
-        // as one strip.
+        // T08 (gpui-18-sweep CAP-10): the three regions feed the kit
+        // `StatusBar` directly — `left()` pins the counts, `child()` feeds
+        // the center (no `.center()` exists), `right()` pins the totals.
+        // With both ends pinned the kit centers the middle itself, so no
+        // manual spacers. Separators split the regions so the segments
+        // still read as one strip.
         // Ticket 45: summed usage totals ride the right region (absent on
         // a broken read — never a lying zero).
         // Ticket 10: fixed slots — each region reserves its width (`min_w`
@@ -12855,19 +13042,15 @@ impl AppView {
                     .child(totals)
             });
         }
-        let bar = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .child(left)
-            .child(Separator::vertical())
-            .child(div().flex_1())
-            .child(center)
-            .child(div().flex_1())
-            .child(right);
-        StatusBar::new().left(bar)
+        // T08 (gpui-18-sweep CAP-10): the kit `StatusBar` owns the spread —
+        // `left()` pins the counts, `child()` feeds the center region
+        // (verified `status_bar.rs`: no `.center()` method exists —
+        // `ParentElement::child/children` is the center path), `right()`
+        // pins the usage totals. With both ends pinned the kit centers the
+        // middle region itself, so the manual `flex_1` spacers retire. The
+        // `min_w` floors + `max_w` truncate + tooltips on every segment are
+        // unchanged, so values still reflow inside their slots.
+        StatusBar::new().left(left).child(center).right(right)
     }
 
     /// Ticket 30: `N of M` search count above the list.
@@ -13260,10 +13443,10 @@ impl AppView {
     }
 
     /// Ticket 44: Escape path for the multi-select set. False while any
-    /// dialog is open (the set is preserved — the dialog keeps Escape for
-    /// its own dismiss); otherwise clears and returns true.
+    /// overlay is open (the set is preserved — the sheet/dialog keeps
+    /// Escape for its own dismiss); otherwise clears and returns true.
     fn clear_checked_unless_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if window.has_active_dialog(cx) {
+        if overlay_open(window, cx) {
             return false;
         }
         self.clear_checked(window, cx);
@@ -13717,9 +13900,11 @@ impl AppView {
         let view = cx.entity();
         let groups = self.store.group_counts().unwrap_or_default();
         let commit: DialogCommit = Rc::new(|_, _| true);
-        let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            let commit_key = commit_key.clone();
+        // T08 (gpui-18-sweep CAP-9): reference flow — the groups manager is
+        // a `Sheet` via `WindowExt::open_sheet` (no `Sheet::open`), with the
+        // same form body, row ids, and footer verbs. Pure-close manager:
+        // `Close`, never `Done` (Ticket 05).
+        window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
             // Ticket T03 (gpui-18-sweep CAP-3): the manager body composes on
             // kit `v_form` + `field()` — each group row is a labeled field
@@ -13773,15 +13958,11 @@ impl AppView {
                     ),
                 );
             }
-            dialog
+            sheet
                 .title("Groups")
                 .child(form)
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .on_ok(move |_, window, cx| commit_key(window, cx)),
-                )
-                .footer(dialog_footer(
+                .size(px(520.))
+                .footer(sheet_footer(
                     "groups-dialog-ok",
                     "groups-dialog-cancel",
                     // Ticket 05: pure-close manager — `Close`, never `Done`.
@@ -13987,35 +14168,36 @@ impl AppView {
             .track_focus(&self.focus)
             .key_context(APP_KEY_CONTEXT)
             // Ticket 26: app shortcuts (Add/Import/Start/Stop/Test). Each
-            // handler no-ops while any dialog is open, so shortcut keys
-            // never steal dialog input.
+            // handler no-ops while any overlay is open (see
+            // [`overlay_open`]), so shortcut keys never steal sheet or
+            // dialog input.
             // Ticket 44: Escape clears the checked set through the same guard.
             .on_action(cx.listener(|view, _: &AddConfig, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.open_add_dialog(window, cx);
             }))
             .on_action(cx.listener(|view, _: &ImportConfigs, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
             }))
             .on_action(cx.listener(|view, _: &StartSelected, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.start_selected_engine(window, cx);
             }))
             .on_action(cx.listener(|view, _: &StopSelected, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.stop_selected_engine(window, cx);
             }))
             .on_action(cx.listener(|view, _: &TestSelected, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.test_selected_health(window, cx);
@@ -14024,23 +14206,23 @@ impl AppView {
                 view.clear_checked_unless_dialog(window, cx);
             }))
             .on_action(cx.listener(|view, _: &OpenPalette, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.open_palette(window, cx);
             }))
             .on_action(cx.listener(|view, _: &CopyUrls, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.copy_selected_urls(window, cx);
             }))
             // Lane B (B9): row edit/delete + search focus + inspector tabs.
-            // Each handler no-ops while any dialog is open (same guard as
+            // Each handler no-ops while any overlay is open (same guard as
             // the Ticket 26 actions); Delete opens the naming confirm and
             // Edit opens the edit dialog, so neither ever acts silently.
             .on_action(cx.listener(|view, _: &EditSelected, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 if let Some(config) = view.selected_config(cx) {
@@ -14050,7 +14232,7 @@ impl AppView {
                 }
             }))
             .on_action(cx.listener(|view, _: &DeleteSelected, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 if let Some(config) = view.selected_config(cx) {
@@ -14060,27 +14242,27 @@ impl AppView {
                 }
             }))
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.focus_library_search(window, cx);
             }))
             .on_action(cx.listener(|view, _: &InspectorDetails, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.set_inspector_tab(InspectorTab::Details);
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &InspectorHealth, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.set_inspector_tab(InspectorTab::Health);
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &InspectorPresets, window, cx| {
-                if window.has_active_dialog(cx) {
+                if overlay_open(window, cx) {
                     return;
                 }
                 view.set_inspector_tab(InspectorTab::Presets);
@@ -16128,7 +16310,9 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): logs opens as a sheet, never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("log-lines").is_some()));
     }
 
@@ -16162,7 +16346,10 @@ mod tests {
             window.render_frame(cx);
         });
 
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): subscriptions opens as a sheet
+        // (reference flow), never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-sub-label").is_some()));
         assert!(cx.update(|window, _| window.try_find("field-sub-url").is_some()));
         assert!(cx.update(|window, _| window.try_find("field-sub-group").is_some()));
@@ -16434,7 +16621,9 @@ mod tests {
             window.render_frame(cx);
         });
 
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): logs opens as a sheet, never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-log-filter").is_some()));
         assert!(cx.update(|window, _| window.try_find("log-lines").is_some()));
     }
@@ -17073,7 +17262,7 @@ mod tests {
         assert_eq!(notification_count(cx), 1);
     }
 
-    /// Scenario: subscriptions dialog with a broken store → dialog still
+    /// Scenario: subscriptions sheet with a broken store → sheet still
     /// opens (form usable) plus an error notification, never a lying empty
     /// state.
     #[gpui_kit::test]
@@ -17094,7 +17283,9 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(notification_count(cx) >= 1, "listing failure notifies");
     }
 
@@ -17672,7 +17863,9 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-sub-auto").is_some()));
         assert!(
             cx.update(move |window, _| window.try_find(format!("sub-failures-{sub_id}")).is_some()),
@@ -17734,7 +17927,9 @@ mod tests {
             view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         // One static group caption, never a repeating summary of the value.
         assert_painted(cx, "sub-interval-add-caption");
         // Exactly one group hosting the six preset choices.
@@ -17769,7 +17964,7 @@ mod tests {
             86_400,
             "clicking 24h moves the single mark (exclusive)"
         );
-        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| window.close_sheet(cx));
     }
 
     /// Ticket 08: the six interval presets render six distinct labels
@@ -21470,8 +21665,9 @@ mod tests {
         assert_eq!(notification_count(cx), 0, "Cancel fires no toast");
     }
 
-    /// Scenario: every `open_dialog` call site renders a footer with stable
-    /// button ids — no dialog relies on the key-only commit path.
+    /// Scenario: every overlay call site renders a footer with stable
+    /// button ids — no dialog relies on the key-only commit path, and no
+    /// sheet invents one (footer buttons are the sheet commit path).
     #[gpui_kit::test]
     fn dialog_footers_audit_every_plain_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -21507,10 +21703,25 @@ mod tests {
                 });
             });
             paint_dialog_open(cx);
-            assert!(
-                cx.update(|window, cx| window.has_active_dialog(cx)),
-                "{open} dialog opens"
-            );
+            // T08 (gpui-18-sweep CAP-9): subscriptions + logs open as
+            // sheets (reference flows), never dialogs; true commits stay
+            // dialogs. Every overlay still renders its footer verbs.
+            let is_sheet = open == "subscriptions" || open == "logs";
+            if is_sheet {
+                assert!(
+                    cx.update(|window, cx| window.has_active_sheet(cx)),
+                    "{open} opens as a sheet"
+                );
+                assert!(
+                    !cx.update(|window, cx| window.has_active_dialog(cx)),
+                    "{open} opens no dialog"
+                );
+            } else {
+                assert!(
+                    cx.update(|window, cx| window.has_active_dialog(cx)),
+                    "{open} dialog opens"
+                );
+            }
             assert!(
                 cx.update(|window, _| window.try_find(ok).is_some()),
                 "{open} dialog renders footer OK ({ok})"
@@ -21519,7 +21730,10 @@ mod tests {
                 cx.update(|window, _| window.try_find(cancel).is_some()),
                 "{open} dialog renders footer Cancel ({cancel})"
             );
-            cx.update(|window, cx| window.close_all_dialogs(cx));
+            cx.update(|window, cx| {
+                window.close_all_dialogs(cx);
+                window.close_sheet(cx);
+            });
             cx.run_until_parked();
         }
     }
@@ -21657,7 +21871,10 @@ mod tests {
             view.update(cx, |view, cx| view.open_groups_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): groups opens as a sheet (reference
+        // flow), never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         let before = notification_count(cx);
         cx.update(|window, cx| {
             window.click("groups-dialog-ok", cx);
@@ -21668,7 +21885,7 @@ mod tests {
             window.render_frame(cx);
         });
         assert!(
-            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            !cx.update(|window, cx| window.has_active_sheet(cx)),
             "Groups footer closes"
         );
         assert_eq!(notification_count(cx), before, "Groups footer is silent");
@@ -21791,7 +22008,10 @@ mod tests {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): logs opens as a sheet (reference
+        // flow), never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("logs-dialog-ok").is_some()));
         assert!(cx.update(|window, _| window.try_find("logs-dialog-cancel").is_some()));
         cx.update(|window, cx| {
@@ -21803,7 +22023,7 @@ mod tests {
             window.render_frame(cx);
         });
         assert!(
-            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            !cx.update(|window, cx| window.has_active_sheet(cx)),
             "Cancel closes"
         );
         assert_eq!(
@@ -23218,6 +23438,10 @@ mod tests {
             PaletteOp::DetailsTab,
             PaletteOp::HealthTab,
             PaletteOp::PresetsTab,
+            // T08 (gpui-18-sweep CAP-9): the Library menu's menu-only
+            // destinations ride the same rows (dispatched, not duplicated).
+            PaletteOp::ImportClipboard,
+            PaletteOp::ExportLibrary,
         ];
         for (row, want) in library.into_iter().enumerate() {
             assert_eq!(
@@ -23244,7 +23468,7 @@ mod tests {
                 "manage row {row}"
             );
         }
-        assert_eq!(AppView::palette_op_at(IndexPath::new(13).section(0)), None);
+        assert_eq!(AppView::palette_op_at(IndexPath::new(15).section(0)), None);
         assert_eq!(AppView::palette_op_at(IndexPath::new(9).section(1)), None);
         assert_eq!(AppView::palette_op_at(IndexPath::new(0).section(2)), None);
     }
@@ -23278,6 +23502,324 @@ mod tests {
             "Add op opens the Add dialog"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// T08 (gpui-18-sweep CAP-9): Logs/Subscriptions/Groups open as sheets
+    /// via `WindowExt::open_sheet` — never dialogs — with the library still
+    /// behind them; Escape closes the topmost sheet and the trigger paints
+    /// again. Focus return rides the kit (`Root` captures the previously
+    /// focused handle on open and restores it on close — verified 0.6.6
+    /// `root.rs:379-423`); headless pins open/close plus trigger presence.
+    #[gpui_kit::test]
+    fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        // Groups opens from its real trigger button, so the sheet captures
+        // the trigger's focus for its return.
+        cx.update(|window, cx| {
+            window.click("groups-dialog", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_sheet(cx)),
+            "Groups opens a sheet"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Groups opens no dialog"
+        );
+        assert_painted(cx, "groups-dialog-ok");
+        assert!(
+            cx.update(|window, _| window.try_find("config-list").is_some()),
+            "library stays behind the sheet"
+        );
+        // Escape closes the topmost sheet; the trigger paints again.
+        cx.update(|window, cx| {
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !cx.update(|window, cx| window.has_active_sheet(cx)),
+            "Escape closes the sheet"
+        );
+        assert_painted(cx, "groups-dialog");
+        // Logs + Subscriptions open the same way (direct calls — their
+        // trigger paths need selections/menu hops pinned elsewhere).
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_sheet(cx)),
+            "Logs opens a sheet"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Logs opens no dialog"
+        );
+        assert_painted(cx, "logs-dialog-ok");
+        cx.update(|window, cx| window.close_sheet(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_sheet(cx)),
+            "Subscriptions opens a sheet"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Subscriptions opens no dialog"
+        );
+        assert_painted(cx, "subscriptions-dialog-ok");
+        cx.update(|window, cx| window.close_sheet(cx));
+    }
+
+    /// T08 (gpui-18-sweep CAP-9): the palette covers the Library menu's
+    /// menu-only destinations through the same handlers the menu items use
+    /// (dispatched, not duplicated).
+    #[gpui_kit::test]
+    fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Export op opens the export dialog (same handler as the
+        // `export-library` menu item).
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.run_palette_op(IndexPath::new(14).section(0), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "palette Export opens the export dialog"
+        );
+        assert_painted(cx, "export-warning");
+        assert_painted(cx, "export-preview");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // From-clipboard op with an empty clipboard warns exactly like the
+        // `import-clipboard` menu item (same handler, no overlay).
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.run_palette_op(IndexPath::new(13).section(0), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "empty clipboard warns once"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "no dialog on empty clipboard"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_sheet(cx)),
+            "no sheet on empty clipboard"
+        );
+    }
+
+    /// T08 (gpui-18-sweep CAP-10): the status strip reads left/center/right
+    /// through the kit `StatusBar` (`left()`/`right()` pin the ends, center
+    /// rides `children()` — no `.center()` exists), with `min_w` floors
+    /// holding each region so value changes reflow inside their slots.
+    #[gpui_kit::test]
+    fn t08_status_bar_regions_hold_order_and_floors(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in ["status-left", "status-center", "status-right"] {
+            assert_painted(cx, id);
+        }
+        let (origins, widths) = cx.update(|window, _| {
+            let mut origins = Vec::new();
+            let mut widths = Vec::new();
+            for id in ["status-left", "status-center", "status-right"] {
+                let snapshot = window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"));
+                origins.push(snapshot.bounds().origin.x);
+                widths.push(snapshot.bounds().size.width);
+            }
+            (origins, widths)
+        });
+        assert!(
+            origins[0] < origins[1] && origins[1] < origins[2],
+            "left/center/right read in order: {origins:?}"
+        );
+        for (width, floor) in widths.iter().zip([px(210.), px(430.), px(150.)]) {
+            assert!(
+                *width >= floor,
+                "region holds its min_w floor ({width:?} >= {floor:?})"
+            );
+        }
+    }
+
+    /// T08 (gpui-18-sweep CAP-10): bounded refresh work reads a kit
+    /// `Progress` driven by the real batch counts, and rows with a fetch in
+    /// flight compose `Skeleton` + `ShimmerText` for the streaming wait (no
+    /// `Skeleton::shimmer` — composed per 0.6.6 API). Every transition here
+    /// is pure state (no network headlessly).
+    #[gpui_kit::test]
+    fn t08_refresh_batch_progress_and_streaming_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let first = store
+            .add_subscription("Nightly", "https://example.com/a.txt", "travel", true)
+            .expect("seed works");
+        let second = store
+            .add_subscription("Daily", "https://example.com/b.txt", "travel", true)
+            .expect("seed works");
+        let (a, b) = (first.id.clone(), second.id.clone());
+        let (view, cx) = mount_view(store, cx);
+        // Pure seam: no batch → None; opened batch → (done, total).
+        assert_eq!(
+            view.read_with(cx, |view, _| view.refresh_batch_progress()),
+            None,
+            "no batch open"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.begin_refresh_batch(&[a.clone(), b.clone()]);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.refresh_batch_progress()),
+            Some((0, 2)),
+            "opened batch starts at 0 of 2"
+        );
+        // The open sheet paints the bounded progress.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "subs-refresh-progress");
+        // One member completion moves the fraction while the batch is open.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                assert!(
+                    !view.accumulate_batch_member(&a, 1, 0, 0, 0, 0),
+                    "first of two keeps the batch open"
+                );
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.refresh_batch_progress()),
+            Some((1, 2)),
+            "one completion reads 1 of 2"
+        );
+        // A row with a fetch in flight renders the streaming compose on
+        // reopen (loading button + spinner + Skeleton/ShimmerText row).
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                assert!(view.note_refresh_started(&b), "fetch starts");
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reopen_subscriptions_if_open(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "subs-refresh-progress");
+        assert_painted(cx, format!("sub-refresh-spinner-{b}").as_str());
+        assert_painted(cx, format!("sub-refreshing-{b}").as_str());
+        // Tidy: land the last member (batch closes → progress leaves) and
+        // drop the in-flight mark, then close the sheet.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                assert!(
+                    view.accumulate_batch_member(&b, 0, 0, 0, 0, 0),
+                    "last member closes the batch"
+                );
+                view.inflight_refreshes.remove(&b);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.refresh_batch_progress()),
+            None,
+            "closed batch reads None"
+        );
+        cx.update(|window, cx| window.close_sheet(cx));
+    }
+
+    /// T08 (gpui-18-sweep CAP-10): a dead row renders the error `Alert`
+    /// with the same operate row inline beside it.
+    #[gpui_kit::test]
+    fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        use gpui_kit::component::IndexPath;
+        use gpui_kit::point;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        // Select the row so the detail pane renders it, on the Health pane.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+                view.inspector_tab = crate::InspectorTab::Health;
+                cx.notify();
+            });
+        });
+        // Dead outcome: errored sample, no success.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _cx| {
+                view.health_store.record_outcome(&TestOutcome {
+                    sample: HealthSample {
+                        config_id: seeded.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: None,
+                        error: Some("timeout".to_string()),
+                    },
+                    success: None,
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        // T06 handoff: the frozen pane order puts the alert below the fold
+        // of the 240px panel — scroll first, then assert paints.
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "config-health-alert");
+        assert_painted(cx, "detail-operate");
     }
 
     /// Lane B (B6): one serving-evidence rule — dead-while-serving reads
@@ -25447,8 +25989,8 @@ mod tests {
         assert_eq!(notification_count(cx), 0, "no toast for a non-event");
     }
 
-    /// Scenario: subscriptions dialog open with typed text + background
-    /// refresh → the dialog reopens with the text intact, not blank.
+    /// Scenario: subscriptions sheet open with typed text + background
+    /// refresh → the sheet reopens with the text intact, not blank.
     #[gpui_kit::test]
     fn subs_dialog_reopen_preserves_form_text(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -25458,7 +26000,9 @@ mod tests {
             view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         // Type into the add form (the stashed live entities).
         cx.update(|window, cx| {
             let form = view.read_with(cx, |view, _| view.subs_form.clone());
@@ -25473,8 +26017,8 @@ mod tests {
         });
         paint_dialog_open(cx);
         assert!(
-            cx.update(|window, cx| window.has_active_dialog(cx)),
-            "subs dialog reopens"
+            cx.update(|window, cx| window.has_active_sheet(cx)),
+            "subs sheet reopens"
         );
         let url = view.read_with(cx, |view, cx| {
             view.subs_form
@@ -26069,7 +26613,9 @@ mod tests {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+        assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         cx.update(|window, cx| {
             window.click("logs-dialog-ok", cx);
         });
@@ -27668,8 +28214,12 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert!(
-            cx.update(|window, cx| window.has_active_dialog(cx)),
-            "logs dialog open"
+            cx.update(|window, cx| window.has_active_sheet(cx)),
+            "logs sheet open"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "logs opens no dialog"
         );
         assert_painted(cx, "log-lines");
         assert_painted(cx, "log-copy-visible");
@@ -27689,8 +28239,12 @@ mod tests {
             "Clear filter restores the full tail"
         );
         assert!(
-            cx.update(|window, cx| window.has_active_dialog(cx)),
-            "dialog reopens around the restored tail"
+            cx.update(|window, cx| window.has_active_sheet(cx)),
+            "sheet reopens around the restored tail"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "reopen opens no dialog"
         );
         assert_painted(cx, "log-lines");
     }
