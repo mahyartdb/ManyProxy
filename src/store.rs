@@ -2094,6 +2094,378 @@ pub fn fold_tuic_into_params(params_raw: &str, fold: &TuicFold) -> String {
     }
 }
 
+/// Config-completeness T06: SOCKS versions (the `version` Select on the
+/// SOCKS page) and Naïve congestion modes (the `congestion_control` Select
+/// on the Naïve page, sing-box `quic_congestion_control` values per the
+/// 1.14.2 naive schema). One source for picker, prefill and fold — a value
+/// the UI cannot pick is a value the fold cannot write.
+pub const SOCKS_VERSIONS: [&str; 2] = ["5", "4"];
+pub const NAIVE_CC_MODES: [&str; 4] = ["bbr", "bbr2", "cubic", "reno"];
+
+/// Config-completeness T06: prefill one comma-list value (ssh `host_key` /
+/// `host_key_algorithms`) — string arrays join with ", " so a stored list
+/// echoes into its text input; anything else reads like
+/// [`guided_prefill_value`] (import query strings echo verbatim). Blank for
+/// unparseable JSON or missing keys.
+pub fn guided_prefill_list(params_raw: &str, keys: &[&str]) -> String {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    let Some(obj) = obj else {
+        return String::new();
+    };
+    for wanted in keys {
+        let hit = obj
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted));
+        if let Some((_, value)) = hit {
+            if let Some(items) = value.as_array() {
+                let joined = items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !joined.is_empty() {
+                    return joined;
+                }
+            }
+        }
+    }
+    guided_prefill_value(params_raw, keys)
+}
+
+/// Config-completeness T06: write one comma-list text value as a JSON string
+/// array (sing-box `host_key` / `host_key_algorithms` are lists — a bare
+/// string would fail `check`). Blank never touches the object; a value whose
+/// comma-split already matches the stored spelling (array or comma string)
+/// no-ops, so untouched echoes stay byte-identical. Anything else writes the
+/// canonical array. Returns true when the object changed.
+fn fold_comma_list(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    read_keys: &[&str],
+    value: &str,
+) -> bool {
+    let next: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if next.is_empty() {
+        return false;
+    }
+    let current: Option<Vec<String>> = read_keys.iter().find_map(|key| {
+        let hit = obj
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)?;
+        match hit {
+            serde_json::Value::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            serde_json::Value::String(text) => Some(
+                text.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            serde_json::Value::Number(number) => Some(vec![number.to_string()]),
+            _ => None,
+        }
+    });
+    if current.as_deref() == Some(next.as_slice()) {
+        return false;
+    }
+    obj.insert(
+        canonical.to_string(),
+        serde_json::Value::Array(next.into_iter().map(serde_json::Value::String).collect()),
+    );
+    true
+}
+
+/// Config-completeness T06: write one keep-blank select value across read
+/// aliases — blank never touches the object (no fabrication, no strip);
+/// non-blank no-ops when any alias already holds it (import spellings echo
+/// byte-identical, the engine folds them at generate); otherwise writes the
+/// canonical key. Returns true when the object changed. (The single-key
+/// [`fold_select_keep_blank`] cannot do the alias half without changing its
+/// T03/T05 call sites.)
+fn fold_select_keep_blank_aliases(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    read_keys: &[&str],
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if lookup_case_insensitive(obj, read_keys).as_deref() == Some(value) {
+        return false;
+    }
+    obj.insert(
+        canonical.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    true
+}
+
+/// Config-completeness T06: SOCKS inner fold state — raw UI strings exactly
+/// as the page controls hold them. `version` is keep-blank (blank leaves the
+/// stock default 5 — the engine omits it; "4" folds and fails generate naming
+/// the field, never a guessed emission). `network` follows the S1 rule
+/// ("tcp" restores the default by removing the key; the engine allows
+/// tcp|udp only). `udp_over_tcp` folds the sing-box bool reading the `uot`
+/// spelling too (ss-page precedent).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SocksFold {
+    pub version: String,
+    pub username: String,
+    pub password: String,
+    pub network: String,
+    pub udp_over_tcp: bool,
+}
+
+/// Config-completeness T06: fold the SOCKS inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_socks_into_params(params_raw: &str, fold: &SocksFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_keep_blank(obj, "version", &fold.version);
+    changed |= fold_text_aliases(obj, "username", &["username"], &fold.username);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_select_key(obj, "network", &fold.network, "tcp");
+    changed |= fold_bool_aliases(
+        obj,
+        "udp_over_tcp",
+        &["udp_over_tcp", "uot"],
+        fold.udp_over_tcp,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: HTTP/HTTPS inner fold state — raw UI strings.
+/// `path`/`headers` are parity+ (Throne `edit_http.ui` lacks them, both
+/// engines accept them): they fold as text and `check` judges the shape
+/// loudly. Blank inputs never touch the object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpFold {
+    pub username: String,
+    pub password: String,
+    pub path: String,
+    pub headers: String,
+}
+
+/// Config-completeness T06: fold the HTTP/HTTPS inner fields into a params
+/// JSON text. Byte-identical on no-ops.
+pub fn fold_http_into_params(params_raw: &str, fold: &HttpFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "username", &["username"], &fold.username);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_text_aliases(obj, "path", &["path"], &fold.path);
+    changed |= fold_text_aliases(obj, "headers", &["headers"], &fold.headers);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: AnyTLS inner fold state — raw UI strings exactly
+/// as the page controls hold them. `interval`/`timeout` fold the sing-box
+/// duration texts (`idle_session_check_interval` / `idle_session_timeout`,
+/// e.g. "30s") reading the Throne short names too; `min` folds the count
+/// (`min_idle_session`) as a number (garbage stays a string for `check` to
+/// name loudly).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnytlsFold {
+    pub password: String,
+    pub interval: String,
+    pub timeout: String,
+    pub min: String,
+}
+
+/// Config-completeness T06: fold the AnyTLS inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_anytls_into_params(params_raw: &str, fold: &AnytlsFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_text_aliases(
+        obj,
+        "idle_session_check_interval",
+        &["idle_session_check_interval", "interval"],
+        &fold.interval,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "idle_session_timeout",
+        &["idle_session_timeout", "timeout"],
+        &fold.timeout,
+    );
+    changed |= fold_number_text(obj, "min_idle_session", &fold.min);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: Naïve inner fold state — raw UI strings exactly
+/// as the page controls hold them. `udp_over_tcp` folds the sing-box bool
+/// (docs: replaceable with a boolean) reading the Throne `uot` spelling too;
+/// `quic` folds the bool; `congestion_control` is keep-blank over the
+/// sing-box `quic_congestion_control` (blank leaves the chromium default
+/// cubic — contract C2, never fabricated).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NaiveFold {
+    pub username: String,
+    pub password: String,
+    pub udp_over_tcp: bool,
+    pub quic: bool,
+    pub congestion_control: String,
+}
+
+/// Config-completeness T06: fold the Naïve inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_naive_into_params(params_raw: &str, fold: &NaiveFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "username", &["username"], &fold.username);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_bool_aliases(
+        obj,
+        "udp_over_tcp",
+        &["udp_over_tcp", "uot"],
+        fold.udp_over_tcp,
+    );
+    changed |= fold_bool_aliases(obj, "quic", &["quic"], fold.quic);
+    changed |= fold_select_keep_blank_aliases(
+        obj,
+        "quic_congestion_control",
+        &["quic_congestion_control", "congestion_control"],
+        &fold.congestion_control,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: SSH inner fold state — raw UI strings exactly as
+/// the page controls hold them. `user` is the sing-box spelling (the engine
+/// folds `username` at generate, canonical wins); `private_key_passphrase`
+/// is the sing-box spelling (reads the Throne `private_key_pass` too);
+/// `host_key` / `host_key_algorithms` fold comma-lists to arrays (a bare
+/// string would fail `check`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshFold {
+    pub user: String,
+    pub password: String,
+    pub private_key: String,
+    pub private_key_path: String,
+    pub private_key_passphrase: String,
+    pub host_key: String,
+    pub host_key_algorithms: String,
+    pub client_version: String,
+}
+
+/// Config-completeness T06: fold the SSH inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_ssh_into_params(params_raw: &str, fold: &SshFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "user", &["user", "username"], &fold.user);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_text_aliases(
+        obj,
+        "private_key",
+        &["private_key", "privatekey"],
+        &fold.private_key,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "private_key_path",
+        &["private_key_path"],
+        &fold.private_key_path,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "private_key_passphrase",
+        &["private_key_passphrase", "private_key_pass"],
+        &fold.private_key_passphrase,
+    );
+    changed |= fold_comma_list(obj, "host_key", &["host_key"], &fold.host_key);
+    changed |= fold_comma_list(
+        obj,
+        "host_key_algorithms",
+        &["host_key_algorithms"],
+        &fold.host_key_algorithms,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "client_version",
+        &["client_version"],
+        &fold.client_version,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
 /// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
 /// `None` means unknown protocol (the commit names it through the normal
 /// validation path). `key = None` means a known protocol with no link
@@ -11029,6 +11401,299 @@ mod tests {
             "broken security never silently repaired"
         );
         assert_eq!(fold_tls_forced_into_params("{{{", &sni), "{{{");
+    }
+
+    /// Config-completeness T06: SOCKS fold — version keep-blank (blank
+    /// leaves the stock 5; "4" folds for the engine to reject naming the
+    /// field), S1-rule network ("tcp" removes), uot bool; pristine template
+    /// stands through a blank.
+    #[test]
+    fn t06_socks_fold_version_network_uot() {
+        assert_eq!(SOCKS_VERSIONS, ["5", "4"]);
+        let full = SocksFold {
+            version: "5".to_string(),
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            network: "udp".to_string(),
+            udp_over_tcp: true,
+        };
+        let bare = "{\"type\":\"socks\",\"server\":\"192.0.2.20\",\"server_port\":1080}";
+        let folded = fold_socks_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("socks folds");
+        assert_eq!(value["version"], "5");
+        assert_eq!(value["username"], "user");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["network"], "udp");
+        assert_eq!(value["udp_over_tcp"], true);
+        assert_eq!(
+            fold_socks_into_params(&folded, &full),
+            folded,
+            "untouched socks echoes byte-identical"
+        );
+        // A stored v4 survives the fold (the engine rejects it naming
+        // `version` — never a guessed emission).
+        let v4 = "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080,\"version\":\"4\"}";
+        let v4_echo = SocksFold {
+            version: "4".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_socks_into_params(v4, &v4_echo),
+            v4,
+            "v4 echoes for the engine gate"
+        );
+        // The Throne `uot` spelling echoes into the sing-box bool.
+        let throne = "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080,\"uot\":true}";
+        let throne_echo = SocksFold {
+            udp_over_tcp: true,
+            network: "tcp".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_socks_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes (tcp removes nothing absent)"
+        );
+        // Pristine template stands through a blank fold.
+        let template = protocol_params_template("socks");
+        assert_eq!(
+            fold_socks_into_params(&template, &SocksFold::default()),
+            template,
+            "socks pristine template stands"
+        );
+        assert_eq!(fold_socks_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: HTTP/HTTPS fold — username/password/path/
+    /// headers parity+ as blank-safe text; pristine templates stand.
+    #[test]
+    fn t06_http_fold_parity_plus() {
+        let full = HttpFold {
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            path: "/p".to_string(),
+            headers: "Host: h.example.com".to_string(),
+        };
+        let bare = "{\"type\":\"http\",\"server\":\"192.0.2.21\",\"server_port\":8080}";
+        let folded = fold_http_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("http folds");
+        assert_eq!(value["username"], "user");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["path"], "/p");
+        assert_eq!(value["headers"], "Host: h.example.com");
+        assert_eq!(
+            fold_http_into_params(&folded, &full),
+            folded,
+            "untouched http echoes byte-identical"
+        );
+        for proto in ["http", "https"] {
+            let template = protocol_params_template(proto);
+            assert_eq!(
+                fold_http_into_params(&template, &HttpFold::default()),
+                template,
+                "{proto} pristine template stands"
+            );
+        }
+        assert_eq!(fold_http_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: AnyTLS fold — password plus the session
+    /// tunables in sing-box spellings (interval/timeout texts, min as a
+    /// number); Throne short names echo without duplication; pristine
+    /// template stands.
+    #[test]
+    fn t06_anytls_fold_interval_timeout_min() {
+        let full = AnytlsFold {
+            password: "secret".to_string(),
+            interval: "30s".to_string(),
+            timeout: "60s".to_string(),
+            min: "5".to_string(),
+        };
+        let bare = "{\"type\":\"anytls\",\"server\":\"192.0.2.15\",\"server_port\":8443,\
+            \"password\":\"\"}";
+        let folded = fold_anytls_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("anytls folds");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["idle_session_check_interval"], "30s");
+        assert_eq!(value["idle_session_timeout"], "60s");
+        assert_eq!(value["min_idle_session"], 5, "min lands as a number");
+        assert!(
+            value.get("interval").is_none() && value.get("timeout").is_none(),
+            "Throne spellings never written"
+        );
+        assert_eq!(
+            fold_anytls_into_params(&folded, &full),
+            folded,
+            "untouched anytls echoes byte-identical"
+        );
+        // Throne short names echo into the long inputs without duplicating.
+        let throne = "{\"type\":\"anytls\",\"server\":\"s\",\"server_port\":8443,\
+            \"password\":\"p\",\"interval\":\"30s\",\"timeout\":\"60s\"}";
+        let throne_echo = AnytlsFold {
+            password: "p".to_string(),
+            interval: "30s".to_string(),
+            timeout: "60s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_anytls_into_params(throne, &throne_echo),
+            throne,
+            "matching aliases echo"
+        );
+        let template = protocol_params_template("anytls");
+        assert_eq!(
+            fold_anytls_into_params(&template, &AnytlsFold::default()),
+            template,
+            "anytls pristine template stands"
+        );
+        assert_eq!(fold_anytls_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: Naïve fold — username/password plus uot/quic
+    /// bools and the keep-blank cc (never fabricated); the Throne
+    /// `congestion_control` spelling echoes without duplicating; pristine
+    /// template stands.
+    #[test]
+    fn t06_naive_fold_uot_quic_cc() {
+        assert_eq!(NAIVE_CC_MODES, ["bbr", "bbr2", "cubic", "reno"]);
+        let full = NaiveFold {
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            udp_over_tcp: true,
+            quic: true,
+            congestion_control: "bbr2".to_string(),
+        };
+        let bare = "{\"type\":\"naive\",\"server\":\"192.0.2.22\",\"server_port\":443,\
+            \"username\":\"\",\"password\":\"\"}";
+        let folded = fold_naive_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("naive folds");
+        assert_eq!(value["username"], "user");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["udp_over_tcp"], true);
+        assert_eq!(value["quic"], true);
+        assert_eq!(
+            value["quic_congestion_control"], "bbr2",
+            "sing-box spelling written"
+        );
+        assert!(
+            value.get("uot").is_none() && value.get("congestion_control").is_none(),
+            "Throne spellings never written"
+        );
+        assert_eq!(
+            fold_naive_into_params(&folded, &full),
+            folded,
+            "untouched naive echoes byte-identical"
+        );
+        // The Throne spellings echo without duplicating (the engine folds
+        // them at generate, canonical wins).
+        let throne = "{\"type\":\"naive\",\"server\":\"s\",\"server_port\":443,\
+            \"username\":\"u\",\"password\":\"p\",\"uot\":true,\"congestion_control\":\"cubic\"}";
+        let throne_echo = NaiveFold {
+            username: "u".to_string(),
+            password: "p".to_string(),
+            udp_over_tcp: true,
+            congestion_control: "cubic".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_naive_into_params(throne, &throne_echo),
+            throne,
+            "matching aliases echo"
+        );
+        // Blank cc never fabricates; pristine template stands.
+        let template = protocol_params_template("naive");
+        assert_eq!(
+            fold_naive_into_params(&template, &NaiveFold::default()),
+            template,
+            "naive pristine template stands"
+        );
+        assert_eq!(fold_naive_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: SSH fold — user/password/key blob/path/pass
+    /// plus host-key lists (comma text in, string arrays out) and
+    /// client_version; engine spellings written, Throne spellings read;
+    /// pristine template stands.
+    #[test]
+    fn t06_ssh_fold_user_key_hostlists() {
+        let full = SshFold {
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            private_key: "KEY-BLOB".to_string(),
+            private_key_path: "/home/u/.ssh/id_rsa".to_string(),
+            private_key_passphrase: "pp".to_string(),
+            host_key: "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB".to_string(),
+            host_key_algorithms: "ssh-ed25519".to_string(),
+            client_version: "SSH-2.0-OpenSSH_7.4p1".to_string(),
+        };
+        let bare = "{\"type\":\"ssh\",\"server\":\"192.0.2.23\",\"server_port\":22,\
+            \"username\":\"\",\"password\":\"\"}";
+        let folded = fold_ssh_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("ssh folds");
+        assert_eq!(value["user"], "root", "sing-box spelling written");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["private_key"], "KEY-BLOB");
+        assert_eq!(value["private_key_path"], "/home/u/.ssh/id_rsa");
+        assert_eq!(value["private_key_passphrase"], "pp");
+        assert_eq!(
+            value["host_key"],
+            serde_json::json!(["ecdsa-sha2-nistp256 AAAA", "ssh-ed25519 BBBB"]),
+            "host_key lands as an array"
+        );
+        assert_eq!(
+            value["host_key_algorithms"],
+            serde_json::json!(["ssh-ed25519"]),
+            "algs land as an array"
+        );
+        assert_eq!(value["client_version"], "SSH-2.0-OpenSSH_7.4p1");
+        assert!(
+            value.get("username").is_some_and(|name| name == ""),
+            "template username slot untouched (engine drops it when user wins)"
+        );
+        // Untouched echoes stay byte-identical — arrays echo through the
+        // list reader, the Throne `username`/`privatekey` spellings echo
+        // through the text readers.
+        let echo = SshFold {
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            private_key: "KEY-BLOB".to_string(),
+            private_key_path: "/home/u/.ssh/id_rsa".to_string(),
+            private_key_passphrase: "pp".to_string(),
+            host_key: "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB".to_string(),
+            host_key_algorithms: "ssh-ed25519".to_string(),
+            client_version: "SSH-2.0-OpenSSH_7.4p1".to_string(),
+        };
+        assert_eq!(
+            fold_ssh_into_params(&folded, &echo),
+            folded,
+            "untouched ssh echoes byte-identical"
+        );
+        assert_eq!(
+            guided_prefill_list(&folded, &["host_key"]),
+            "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB",
+            "stored arrays echo as comma text"
+        );
+        // Throne spellings echo without duplicating.
+        let throne = "{\"type\":\"ssh\",\"server\":\"s\",\"server_port\":22,\
+            \"username\":\"root\",\"privatekey\":\"K\",\"private_key_pass\":\"pp\"}";
+        let throne_echo = SshFold {
+            user: "root".to_string(),
+            private_key: "K".to_string(),
+            private_key_passphrase: "pp".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_ssh_into_params(throne, &throne_echo),
+            throne,
+            "matching aliases echo"
+        );
+        let template = protocol_params_template("ssh");
+        assert_eq!(
+            fold_ssh_into_params(&template, &SshFold::default()),
+            template,
+            "ssh pristine template stands"
+        );
+        assert_eq!(fold_ssh_into_params("{{{", &full), "{{{");
     }
 
     /// Config-completeness T02: toggle prefill reads truthy spellings

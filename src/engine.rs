@@ -3580,6 +3580,45 @@ fn translate_outbound(
                     ],
                 );
             }
+            // Config-completeness T06: AnyTLS session tunables — the Throne
+            // short names (`interval`/`timeout`/`min`) fold to the sing-box
+            // session fields (docs-verified 1.14.2 shapes: durations stay
+            // text, the count coerces to a number; t32 precedent: folded,
+            // not duplicated, canonical wins). Other protocols never see
+            // these keys (wrong layer would hide a mistyped row).
+            if canonical == "anytls" {
+                if params.get("idle_session_check_interval").is_none() {
+                    if let Some(interval) = take_flat(params, &["interval"]) {
+                        params.insert(
+                            "idle_session_check_interval".to_string(),
+                            serde_json::Value::String(interval),
+                        );
+                    }
+                } else {
+                    params.remove("interval");
+                }
+                if params.get("idle_session_timeout").is_none() {
+                    if let Some(timeout) = take_flat(params, &["timeout"]) {
+                        params.insert(
+                            "idle_session_timeout".to_string(),
+                            serde_json::Value::String(timeout),
+                        );
+                    }
+                } else {
+                    params.remove("timeout");
+                }
+                if params.get("min_idle_session").is_none() {
+                    if let Some(min) = take_flat(params, &["min"]) {
+                        let coerced = match min.trim().parse::<u64>() {
+                            Ok(number) => serde_json::Value::Number(number.into()),
+                            Err(_) => serde_json::Value::String(min),
+                        };
+                        params.insert("min_idle_session".to_string(), coerced);
+                    }
+                } else {
+                    params.remove("min");
+                }
+            }
             if canonical == "hysteria" {
                 // sing-box holds the plaintext credential in `auth_str`;
                 // `auth` is base64 bytes there, never the link secret.
@@ -3892,12 +3931,52 @@ fn translate_outbound(
                 }
             }
             apply_tls(name, params, &server, true, true)?;
-            drop_foreign_flats(params, &["username", "password", "network", "tls"]);
+            // Config-completeness T06: the Naïve page writes the docs-verified
+            // 1.14.2 tunables (`udp_over_tcp` bool-or-object, `quic` bool,
+            // `quic_congestion_control` bbr|bbr2|cubic|reno) — the strict gate
+            // below allows them so the page never writes a key generate
+            // rejects (T02 mux-arm precedent: UI ships with its engine arm).
+            // The Throne `uot`/`congestion_control` spellings fold to the
+            // sing-box names (t32 precedent: folded, not duplicated,
+            // canonical wins).
+            if take_truthy(params, &["uot"]) && params.get("udp_over_tcp").is_none() {
+                params.insert("udp_over_tcp".to_string(), serde_json::Value::Bool(true));
+            }
+            if params.get("quic_congestion_control").is_none() {
+                if let Some(congestion) = take_flat(params, &["congestion_control"]) {
+                    params.insert(
+                        "quic_congestion_control".to_string(),
+                        serde_json::Value::String(congestion),
+                    );
+                }
+            } else {
+                params.remove("congestion_control");
+            }
+            drop_foreign_flats(
+                params,
+                &[
+                    "username",
+                    "password",
+                    "network",
+                    "tls",
+                    "udp_over_tcp",
+                    "quic",
+                    "quic_congestion_control",
+                ],
+            );
             reject_unknown_params(
                 name,
                 "naive",
                 params,
-                &["username", "password", "network", "tls"],
+                &[
+                    "username",
+                    "password",
+                    "network",
+                    "tls",
+                    "udp_over_tcp",
+                    "quic",
+                    "quic_congestion_control",
+                ],
             )?;
         }
         "snell" => {
@@ -4018,6 +4097,20 @@ fn translate_outbound(
                 }
             } else {
                 params.remove("username");
+            }
+            // Config-completeness T06: the Throne `private_key_pass` spelling
+            // folds to sing-box `private_key_passphrase` (t32 precedent:
+            // folded, not duplicated, canonical wins — the alias never leaks
+            // to `check` either way).
+            if params.get("private_key_passphrase").is_none() {
+                if let Some(pass) = take_flat(params, &["private_key_pass"]) {
+                    params.insert(
+                        "private_key_passphrase".to_string(),
+                        serde_json::Value::String(pass),
+                    );
+                }
+            } else {
+                params.remove("private_key_pass");
             }
             drop_foreign_flats(params, &["user"]);
         }
@@ -13017,6 +13110,234 @@ Active Connections\r
         assert!(node.get("zero_rtt").is_none(), "alias never leaks");
         assert_eq!(node["heartbeat"], json!("10s"));
         assert_eq!(node["tls"]["server_name"], json!("192.0.2.12"));
+    }
+
+    /// Config-completeness T06: naive/anytls/ssh page rows generate clean —
+    /// the naive tunables ride the strict gate (Throne spellings fold,
+    /// canonical wins, aliases never leak), anytls short names fold to the
+    /// session fields, and the ssh passphrase alias folds.
+    #[test]
+    fn t06_naive_anytls_ssh_page_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        // Naïve page shape (sing-box spellings): uot/quic bools + cc ride.
+        let naive = fixture(
+            "61",
+            "NaivePage",
+            "naive",
+            json!({"type": "naive", "server": "192.0.2.22", "server_port": 443,
+                   "username": "u", "password": "p", "udp_over_tcp": true,
+                   "quic": true, "quic_congestion_control": "bbr2",
+                   "security": "tls", "sni": "192.0.2.22"}),
+            "127.0.0.1",
+            10861,
+        );
+        let node = node_of(&naive, "naive");
+        assert_eq!(node["udp_over_tcp"], json!(true));
+        assert_eq!(node["quic"], json!(true));
+        assert_eq!(node["quic_congestion_control"], json!("bbr2"));
+        assert_eq!(node["tls"]["server_name"], json!("192.0.2.22"));
+        // Throne spellings fold (canonical wins, aliases never leak).
+        let throne = fixture(
+            "62",
+            "NaiveThrone",
+            "naive",
+            json!({"type": "naive", "server": "192.0.2.22", "server_port": 443,
+                   "username": "u", "password": "p", "uot": true,
+                   "quic_congestion_control": "cubic", "congestion_control": "bbr",
+                   "security": "tls", "sni": "192.0.2.22"}),
+            "127.0.0.1",
+            10862,
+        );
+        let node = node_of(&throne, "naive");
+        assert_eq!(node["udp_over_tcp"], json!(true), "`uot` folds");
+        assert!(node.get("uot").is_none(), "alias never leaks");
+        assert_eq!(
+            node["quic_congestion_control"],
+            json!("cubic"),
+            "canonical wins"
+        );
+        assert!(
+            node.get("congestion_control").is_none(),
+            "alias never leaks"
+        );
+        // A bare `congestion_control` (no canonical) folds too.
+        let bare_cc = fixture(
+            "63",
+            "NaiveBareCc",
+            "naive",
+            json!({"type": "naive", "server": "192.0.2.22", "server_port": 443,
+                   "username": "u", "password": "p", "congestion_control": "reno",
+                   "security": "tls", "sni": "192.0.2.22"}),
+            "127.0.0.1",
+            10863,
+        );
+        let node = node_of(&bare_cc, "naive");
+        assert_eq!(node["quic_congestion_control"], json!("reno"));
+        assert!(
+            node.get("congestion_control").is_none(),
+            "alias never leaks"
+        );
+        // AnyTLS page shape (session tunables in sing-box spellings).
+        let anytls = fixture(
+            "64",
+            "AnytlsPage",
+            "anytls",
+            json!({"type": "anytls", "server": "192.0.2.15", "server_port": 8443,
+                   "password": "secret", "idle_session_check_interval": "30s",
+                   "idle_session_timeout": "60s", "min_idle_session": 5,
+                   "security": "tls", "sni": "192.0.2.15"}),
+            "127.0.0.1",
+            10864,
+        );
+        let node = node_of(&anytls, "anytls");
+        assert_eq!(node["idle_session_check_interval"], json!("30s"));
+        assert_eq!(node["idle_session_timeout"], json!("60s"));
+        assert_eq!(node["min_idle_session"], json!(5));
+        // Throne short names fold (canonical wins, aliases never leak).
+        let short = fixture(
+            "65",
+            "AnytlsShort",
+            "anytls",
+            json!({"type": "anytls", "server": "192.0.2.15", "server_port": 8443,
+                   "password": "secret", "interval": "30s", "timeout": "60s",
+                   "min": "5", "security": "tls", "sni": "192.0.2.15"}),
+            "127.0.0.1",
+            10865,
+        );
+        let node = node_of(&short, "anytls");
+        assert_eq!(node["idle_session_check_interval"], json!("30s"));
+        assert_eq!(node["idle_session_timeout"], json!("60s"));
+        assert_eq!(node["min_idle_session"], json!(5), "count coerces");
+        for leaked in ["interval", "timeout", "min"] {
+            assert!(node.get(leaked).is_none(), "alias never leaks: {leaked}");
+        }
+        // SSH passphrase alias folds (canonical wins, alias never leaks).
+        let ssh = fixture(
+            "66",
+            "SshPass",
+            "ssh",
+            json!({"type": "ssh", "server": "192.0.2.23", "server_port": 22,
+                   "user": "root", "password": "p", "private_key_pass": "pp"}),
+            "127.0.0.1",
+            10866,
+        );
+        let node = node_of(&ssh, "ssh");
+        assert_eq!(node["private_key_passphrase"], json!("pp"));
+        assert!(node.get("private_key_pass").is_none(), "alias never leaks");
+        let both = fixture(
+            "67",
+            "SshBoth",
+            "ssh",
+            json!({"type": "ssh", "server": "192.0.2.23", "server_port": 22,
+                   "user": "root", "password": "p",
+                   "private_key_passphrase": "canon", "private_key_pass": "alias"}),
+            "127.0.0.1",
+            10867,
+        );
+        let node = node_of(&both, "ssh");
+        assert_eq!(node["private_key_passphrase"], json!("canon"));
+        assert!(node.get("private_key_pass").is_none(), "alias never leaks");
+    }
+
+    /// Config-completeness T06: socks/http page rows generate — version 5
+    /// (string or number) and blank networks ride, udp_over_tcp rides, http
+    /// path/headers ride, https rows serve TLS-on.
+    #[test]
+    fn t06_socks_http_page_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        let socks = fixture(
+            "68",
+            "SocksPage",
+            "socks",
+            json!({"type": "socks", "server": "192.0.2.20", "server_port": 1080,
+                   "version": "5", "username": "u", "password": "p",
+                   "network": "udp", "udp_over_tcp": true}),
+            "127.0.0.1",
+            10868,
+        );
+        let node = node_of(&socks, "socks");
+        assert_eq!(node["username"], json!("u"));
+        assert_eq!(node["network"], json!("udp"));
+        assert_eq!(node["udp_over_tcp"], json!(true));
+        assert!(node.get("version").is_none(), "stock default omits");
+        let http = fixture(
+            "69",
+            "HttpPage",
+            "http",
+            json!({"type": "http", "server": "192.0.2.21", "server_port": 8080,
+                   "username": "u", "password": "p", "path": "/p",
+                   "headers": "Host: h.example.com",
+                   "security": "tls", "sni": "192.0.2.21"}),
+            "127.0.0.1",
+            10869,
+        );
+        let node = node_of(&http, "http");
+        assert_eq!(node["path"], json!("/p"));
+        assert_eq!(node["headers"], json!("Host: h.example.com"));
+        assert_eq!(node["tls"]["server_name"], json!("192.0.2.21"));
+        // An `https` row without TLS markers still serves TLS-on.
+        let https = fixture(
+            "70",
+            "HttpsPlain",
+            "https",
+            json!({"type": "https", "server": "192.0.2.21", "server_port": 443,
+                   "username": "u", "password": "p"}),
+            "127.0.0.1",
+            10870,
+        );
+        let node = node_of(&https, "http");
+        assert!(node.get("tls").is_some(), "https serves TLS-on: {node}");
+    }
+
+    /// Config-completeness T06: version gates stay typed engine errors —
+    /// socks≠5 and any http `version` presence fail naming the field (never
+    /// a guessed emission, never an opaque `check` failure).
+    #[test]
+    fn t06_version_gates_keep_typed_errors() {
+        let v4 = fixture(
+            "71",
+            "SocksFour",
+            "socks",
+            json!({"type": "socks", "server": "192.0.2.20", "server_port": 1080,
+                   "version": "4"}),
+            "127.0.0.1",
+            10871,
+        );
+        let error = generate(std::slice::from_ref(&v4)).expect_err("socks v4 fails");
+        let text = error.to_string();
+        assert!(text.contains("version"), "names the field, got {text}");
+        let http_v = fixture(
+            "72",
+            "HttpVersion",
+            "http",
+            json!({"type": "http", "server": "192.0.2.21", "server_port": 8080,
+                   "version": "h2"}),
+            "127.0.0.1",
+            10872,
+        );
+        let error = generate(std::slice::from_ref(&http_v)).expect_err("http version fails");
+        let text = error.to_string();
+        assert!(text.contains("version"), "names the field, got {text}");
     }
 
     /// Two custom replacements binding one port conflict naming both.

@@ -72,17 +72,20 @@ use import::{
 };
 use store::{
     count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
-    export_confirm_description, fold_amneziawg_into_params, fold_dial_into_params,
-    fold_guided_into_params, fold_hysteria_into_params, fold_mux_into_params,
-    fold_shadowsocks_inner_into_params, fold_tls_forced_into_params, fold_tls_optional_into_params,
-    fold_tls_vmess_into_params, fold_transport_into_params, fold_trojan_inner_into_params,
-    fold_tuic_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
-    fold_wireguard_into_params, guided_identity_fields, guided_prefill_bool, guided_prefill_value,
+    export_confirm_description, fold_amneziawg_into_params, fold_anytls_into_params,
+    fold_dial_into_params, fold_guided_into_params, fold_http_into_params,
+    fold_hysteria_into_params, fold_mux_into_params, fold_naive_into_params,
+    fold_shadowsocks_inner_into_params, fold_socks_into_params, fold_ssh_into_params,
+    fold_tls_forced_into_params, fold_tls_optional_into_params, fold_tls_vmess_into_params,
+    fold_transport_into_params, fold_trojan_inner_into_params, fold_tuic_into_params,
+    fold_vless_inner_into_params, fold_vmess_inner_into_params, fold_wireguard_into_params,
+    guided_identity_fields, guided_prefill_bool, guided_prefill_list, guided_prefill_value,
     is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
-    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, ConfigPatch, DialFold, HealthSnapshot,
-    HysteriaFold, MuxFold, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
-    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
-    WireguardFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, ConfigPatch, DialFold,
+    HealthSnapshot, HttpFold, HysteriaFold, MuxFold, NaiveFold, NewConfig, ProxyConfig,
+    RestoreOutcome, SocksFold, SshFold, Store, StoreError, Subscription as ProxySubscription,
+    TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold, WireguardFold, DEFAULT_BIND,
+    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -1827,6 +1830,69 @@ struct ConfigForm {
     /// Config-completeness T05: outer TUIC disclosure (see
     /// [`ConfigForm::tuic_block`]) — collapsed by default like VLESS.
     tuic_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: SOCKS inner fields — version + network
+    /// pickers, username/password texts, udp_over_tcp cell. Rendered (and
+    /// folded) only while the live protocol is `socks`; the page carries S4
+    /// only (no Transport/TLS/Mux — inner parity).
+    socks_version: Entity<SelectState<PanelChoiceList>>,
+    socks_username: Entity<InputState>,
+    socks_password: Entity<InputState>,
+    socks_network: Entity<SelectState<PanelChoiceList>>,
+    socks_uot: Rc<RefCell<bool>>,
+    /// Config-completeness T06: outer SOCKS disclosure (see
+    /// [`ConfigForm::socks_block`]) — collapsed by default like VLESS.
+    socks_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: HTTP/HTTPS inner fields — username/password/
+    /// path/headers texts (path/headers are parity+). One entity set serves
+    /// both `http` and `https` (hysteria v1/v2 precedent); rendered (and
+    /// folded) only while the live protocol is either; the page carries
+    /// S2-optional + S4.
+    http_username: Entity<InputState>,
+    http_password: Entity<InputState>,
+    http_path: Entity<InputState>,
+    http_headers: Entity<InputState>,
+    /// Config-completeness T06: outer HTTP disclosure (see
+    /// [`ConfigForm::http_block`]) — collapsed by default like VLESS.
+    http_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: AnyTLS inner fields — masked password secret
+    /// plus the idle-session tunables (interval/timeout durations, min
+    /// count). Rendered (and folded) only while the live protocol is
+    /// `anytls`; the page carries S2-forced + S4.
+    anytls_password: Entity<InputState>,
+    anytls_interval: Entity<InputState>,
+    anytls_timeout: Entity<InputState>,
+    anytls_min: Entity<InputState>,
+    /// Config-completeness T06: outer AnyTLS disclosure (see
+    /// [`ConfigForm::anytls_block`]) — collapsed by default like VLESS.
+    anytls_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: Naïve inner fields — username + masked
+    /// password secrets, uot/quic cells, congestion_control picker.
+    /// Rendered (and folded) only while the live protocol is `naive`; the
+    /// page carries S2-forced + S4.
+    naive_username: Entity<InputState>,
+    naive_password: Entity<InputState>,
+    naive_uot: Rc<RefCell<bool>>,
+    naive_quic: Rc<RefCell<bool>>,
+    naive_cc: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T06: outer Naïve disclosure (see
+    /// [`ConfigForm::naive_block`]) — collapsed by default like VLESS.
+    naive_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: SSH inner fields — user text, masked password
+    /// secret, private-key blob area + path input + Browse picker + masked
+    /// passphrase, host-key + algs comma lists, client version. Rendered (and
+    /// folded) only while the live protocol is `ssh`; the page carries S4
+    /// only (no TLS — inner parity).
+    ssh_user: Entity<InputState>,
+    ssh_password: Entity<InputState>,
+    ssh_private_key: Entity<TextareaState>,
+    ssh_key_path: Entity<InputState>,
+    ssh_key_pass: Entity<InputState>,
+    ssh_host_key: Entity<InputState>,
+    ssh_host_key_algs: Entity<InputState>,
+    ssh_client_version: Entity<InputState>,
+    /// Config-completeness T06: outer SSH disclosure (see
+    /// [`ConfigForm::ssh_block`]) — collapsed by default like VLESS.
+    ssh_open: Rc<RefCell<bool>>,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -2131,6 +2197,40 @@ impl ConfigForm {
             tuic_zero_rtt: Rc::new(RefCell::new(false)),
             tuic_heartbeat: Self::field(window, cx, "Heartbeat (e.g. 10s)", None),
             tuic_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T06: SOCKS/HTTP(S)/AnyTLS/Naïve/SSH pages
+            // open blank (every fold no-ops, so the template stands) under
+            // collapsed disclosures.
+            socks_version: Self::panel_select(window, cx, socks_version_choices(), ""),
+            socks_username: Self::field(window, cx, "Username", None),
+            socks_password: Self::secret_field(window, cx, "Password", None),
+            socks_network: Self::panel_select(window, cx, socks_network_choices(), "tcp"),
+            socks_uot: Rc::new(RefCell::new(false)),
+            socks_open: Rc::new(RefCell::new(false)),
+            http_username: Self::field(window, cx, "Username", None),
+            http_password: Self::secret_field(window, cx, "Password", None),
+            http_path: Self::field(window, cx, "Path", None),
+            http_headers: Self::field(window, cx, "Headers", None),
+            http_open: Rc::new(RefCell::new(false)),
+            anytls_password: Self::secret_field(window, cx, "Password", None),
+            anytls_interval: Self::field(window, cx, "Idle check interval (e.g. 30s)", None),
+            anytls_timeout: Self::field(window, cx, "Idle timeout (e.g. 30s)", None),
+            anytls_min: Self::field(window, cx, "Min idle sessions", None),
+            anytls_open: Rc::new(RefCell::new(false)),
+            naive_username: Self::field(window, cx, "Username", None),
+            naive_password: Self::secret_field(window, cx, "Password", None),
+            naive_uot: Rc::new(RefCell::new(false)),
+            naive_quic: Rc::new(RefCell::new(false)),
+            naive_cc: Self::panel_select(window, cx, naive_cc_choices(), ""),
+            naive_open: Rc::new(RefCell::new(false)),
+            ssh_user: Self::field(window, cx, "User", None),
+            ssh_password: Self::secret_field(window, cx, "Password", None),
+            ssh_private_key: Self::area(window, cx, "Private key (paste or Browse…)", None),
+            ssh_key_path: Self::field(window, cx, "Private key path", None),
+            ssh_key_pass: Self::secret_field(window, cx, "Private key passphrase", None),
+            ssh_host_key: Self::field(window, cx, "Host key (comma list)", None),
+            ssh_host_key_algs: Self::field(window, cx, "Host key algorithms (comma list)", None),
+            ssh_client_version: Self::field(window, cx, "Client version", None),
+            ssh_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -2853,6 +2953,175 @@ impl ConfigForm {
                 Some(&guided_prefill_value(params, &["heartbeat"])),
             ),
             tuic_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T06: small-matrix pages echo the row's
+            // params JSON (untouched values fold back byte-identical — no
+            // spurious patch). The socks version/network, naive cc and ssh
+            // host-key lists read alias-aware like the T03–T05 pickers; the
+            // http block serves both `http` and `https` on one entity set.
+            socks_version: Self::panel_select(
+                window,
+                cx,
+                socks_version_choices(),
+                &guided_prefill_value(params, &["version"]),
+            ),
+            socks_username: Self::field(
+                window,
+                cx,
+                "Username",
+                Some(&guided_prefill_value(params, &["username"])),
+            ),
+            socks_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            socks_network: Self::panel_select(
+                window,
+                cx,
+                socks_network_choices(),
+                &guided_prefill_value(params, &["network"]),
+            ),
+            socks_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_tcp", "uot"],
+            ))),
+            socks_open: Rc::new(RefCell::new(false)),
+            http_username: Self::field(
+                window,
+                cx,
+                "Username",
+                Some(&guided_prefill_value(params, &["username"])),
+            ),
+            http_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            http_path: Self::field(
+                window,
+                cx,
+                "Path",
+                Some(&guided_prefill_value(params, &["path"])),
+            ),
+            http_headers: Self::field(
+                window,
+                cx,
+                "Headers",
+                Some(&guided_prefill_value(params, &["headers"])),
+            ),
+            http_open: Rc::new(RefCell::new(false)),
+            anytls_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            anytls_interval: Self::field(
+                window,
+                cx,
+                "Idle check interval (e.g. 30s)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["idle_session_check_interval", "interval"],
+                )),
+            ),
+            anytls_timeout: Self::field(
+                window,
+                cx,
+                "Idle timeout (e.g. 30s)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["idle_session_timeout", "timeout"],
+                )),
+            ),
+            anytls_min: Self::field(
+                window,
+                cx,
+                "Min idle sessions",
+                Some(&guided_prefill_value(params, &["min_idle_session", "min"])),
+            ),
+            anytls_open: Rc::new(RefCell::new(false)),
+            naive_username: Self::field(
+                window,
+                cx,
+                "Username",
+                Some(&guided_prefill_value(params, &["username"])),
+            ),
+            naive_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            naive_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_tcp", "uot"],
+            ))),
+            naive_quic: Rc::new(RefCell::new(guided_prefill_bool(params, &["quic"]))),
+            naive_cc: Self::panel_select(
+                window,
+                cx,
+                naive_cc_choices(),
+                &guided_prefill_value(params, &["quic_congestion_control", "congestion_control"]),
+            ),
+            naive_open: Rc::new(RefCell::new(false)),
+            ssh_user: Self::field(
+                window,
+                cx,
+                "User",
+                Some(&guided_prefill_value(params, &["user", "username"])),
+            ),
+            ssh_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            ssh_private_key: Self::area(
+                window,
+                cx,
+                "Private key (paste or Browse…)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key", "privatekey"],
+                )),
+            ),
+            ssh_key_path: Self::field(
+                window,
+                cx,
+                "Private key path",
+                Some(&guided_prefill_value(params, &["private_key_path"])),
+            ),
+            ssh_key_pass: Self::secret_field(
+                window,
+                cx,
+                "Private key passphrase",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key_passphrase", "private_key_pass"],
+                )),
+            ),
+            ssh_host_key: Self::field(
+                window,
+                cx,
+                "Host key (comma list)",
+                Some(&guided_prefill_list(params, &["host_key"])),
+            ),
+            ssh_host_key_algs: Self::field(
+                window,
+                cx,
+                "Host key algorithms (comma list)",
+                Some(&guided_prefill_list(params, &["host_key_algorithms"])),
+            ),
+            ssh_client_version: Self::field(
+                window,
+                cx,
+                "Client version",
+                Some(&guided_prefill_value(params, &["client_version"])),
+            ),
+            ssh_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(true)),
         }
     }
@@ -4341,6 +4610,452 @@ impl ConfigForm {
         )
     }
 
+    /// Config-completeness T06: SOCKS guided page — version + network
+    /// keep-blank/S1-rule pickers, username/password texts, udp_over_tcp
+    /// switch, plus the shared S4 dial panel (no Transport/TLS/Mux — inner
+    /// parity). Rendered only while the live protocol is `socks`. The footer
+    /// is honest: blank version leaves the stock 5, and 4 fails generate
+    /// naming the field. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::tuic_block`]: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, masked `Input` +
+    /// `mask_toggle`, `Switch` (`checked` + `on_change`), `Field` layout,
+    /// outer-wrapper `Tooltip`s, `Label` captions.
+    fn socks_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let uot_cell = self.socks_uot.clone();
+        let uot_repaint = repaint.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(Self::panel_select_row(
+            "Version",
+            "socks-version-tip",
+            "SOCKS version (blank leaves the stock default 5)",
+            "socks-version",
+            "SOCKS version",
+            &self.socks_version,
+        ));
+        block = block.child(
+            field().label("Username".to_string()).child(
+                div()
+                    .id("socks-username")
+                    .test_support()
+                    .child(Input::new(&self.socks_username)),
+            ),
+        );
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("socks-password")
+                    .test_support()
+                    .child(Input::new(&self.socks_password).mask_toggle()),
+            ),
+        );
+        block = block.child(Self::panel_select_row(
+            "Network",
+            "socks-network-tip",
+            "SOCKS network (tcp is the default)",
+            "socks-network",
+            "SOCKS network",
+            &self.socks_network,
+        ));
+        block = block.child(
+            field().label_indent(false).child(
+                div().id("socks-uot").test_support().child(
+                    Switch::new("socks-uot-switch")
+                        .small()
+                        .checked(*self.socks_uot.borrow())
+                        .label("UDP over TCP (uot)")
+                        .tooltip("UDP over TCP for socks (folds the uot flat)")
+                        .accessibility_label("UDP over TCP for socks")
+                        .on_change(move |next: &bool, window, cx| {
+                            *uot_cell.borrow_mut() = *next;
+                            uot_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("socks-notes").test_support().child(
+                "SOCKS serves version 5 stock (blank leaves the default); 4 fails generate \
+                 naming version. Blank network leaves tcp.",
+            ),
+        ));
+        Self::page_disclosure(
+            "SOCKS settings",
+            "socks-section-caption",
+            "socks-section-toggle",
+            "socks-section",
+            &self.socks_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: HTTP/HTTPS guided page — username/password/
+    /// path/headers texts (path/headers are parity+: Throne `edit_http.ui`
+    /// lacks them, both engines accept them) plus the shared S2-optional +
+    /// S4 panels. One block serves both `http` and `https` (hysteria v1/v2
+    /// precedent — one entity set, two protocols). The footer is honest:
+    /// `https` rows serve TLS-on even with the panel off, and `check` judges
+    /// the headers shape. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::socks_block`].
+    fn http_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("Username".to_string()).child(
+                    div()
+                        .id("http-username")
+                        .test_support()
+                        .child(Input::new(&self.http_username)),
+                ),
+            )
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("http-password")
+                        .test_support()
+                        .child(Input::new(&self.http_password).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Path".to_string()).child(
+                    div()
+                        .id("http-path")
+                        .test_support()
+                        .child(Input::new(&self.http_path)),
+                ),
+            )
+            .child(
+                field().label("Headers".to_string()).child(
+                    div()
+                        .id("http-headers")
+                        .test_support()
+                        .child(Input::new(&self.http_headers)),
+                ),
+            );
+        block = block.child(self.s2_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("http-notes").test_support().child(
+                "HTTPS rows serve TLS-on (security=tls) even with the panel off. \
+                 Path/headers ride the http outbound — check judges the headers shape.",
+            ),
+        ));
+        Self::page_disclosure(
+            "HTTP settings",
+            "http-section-caption",
+            "http-section-toggle",
+            "http-section",
+            &self.http_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: AnyTLS guided page — masked password secret
+    /// plus the idle-session tunables (interval/timeout durations, min
+    /// count), plus the shared S2-forced + S4 panels. Rendered only while the
+    /// live protocol is `anytls`. The footer is honest about the duration
+    /// shapes. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::socks_block`].
+    fn anytls_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("anytls-password")
+                        .test_support()
+                        .child(Input::new(&self.anytls_password).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Idle check interval".to_string()).child(
+                    div()
+                        .id("anytls-interval")
+                        .test_support()
+                        .child(Input::new(&self.anytls_interval)),
+                ),
+            )
+            .child(
+                field().label("Idle timeout".to_string()).child(
+                    div()
+                        .id("anytls-timeout")
+                        .test_support()
+                        .child(Input::new(&self.anytls_timeout)),
+                ),
+            )
+            .child(
+                field().label("Min idle sessions".to_string()).child(
+                    div()
+                        .id("anytls-min")
+                        .test_support()
+                        .child(Input::new(&self.anytls_min)),
+                ),
+            );
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("anytls-notes").test_support().child(
+                "AnyTLS runs TLS always-on (security locked tls). Interval/timeout are \
+                 durations (e.g. 30s); min is a session count.",
+            ),
+        ));
+        Self::page_disclosure(
+            "AnyTLS settings",
+            "anytls-section-caption",
+            "anytls-section-toggle",
+            "anytls-section",
+            &self.anytls_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: Naïve guided page — username + masked
+    /// password secrets, uot/quic switches, congestion_control keep-blank
+    /// picker, plus the shared S2-forced + S4 panels. Rendered only while the
+    /// live protocol is `naive`. The footer is honest about the 1.14.2
+    /// shapes. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::socks_block`].
+    fn naive_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("Username".to_string()).child(
+                    div()
+                        .id("naive-username")
+                        .test_support()
+                        .child(Input::new(&self.naive_username)),
+                ),
+            )
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("naive-password")
+                        .test_support()
+                        .child(Input::new(&self.naive_password).mask_toggle()),
+                ),
+            );
+        block = block.child(switch_row(
+            "naive-uot",
+            "naive-uot-switch".to_string(),
+            "UDP over TCP (uot)",
+            "UDP over TCP for naive (folds the uot flat)",
+            &self.naive_uot,
+            repaint,
+        ));
+        block = block.child(switch_row(
+            "naive-quic",
+            "naive-quic-switch".to_string(),
+            "QUIC",
+            "Run naive over QUIC instead of HTTP/2",
+            &self.naive_quic,
+            repaint,
+        ));
+        block = block.child(Self::panel_select_row(
+            "Congestion control",
+            "naive-cc-tip",
+            "QUIC congestion control (blank leaves the chromium default cubic)",
+            "naive-cc",
+            "Naive congestion control",
+            &self.naive_cc,
+        ));
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("naive-notes").test_support().child(
+                "Naïve runs TLS always-on (security locked tls). Blank congestion control \
+                 leaves the default (cubic).",
+            ),
+        ));
+        Self::page_disclosure(
+            "Naïve settings",
+            "naive-section-caption",
+            "naive-section-toggle",
+            "naive-section",
+            &self.naive_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: SSH guided page — user text, masked password
+    /// secret, private-key blob area + path input + Browse picker + masked
+    /// passphrase, host-key + algs comma lists, client version, plus the
+    /// shared S4 dial panel (no TLS — inner parity). Rendered only while the
+    /// live protocol is `ssh`. The key area is a kit `Textarea` (Throne
+    /// text-area parity; `Input::mask_toggle` exists only on `Input` in kit
+    /// 0.6.6, so the blob stays visible while both secrets stay masked). The
+    /// footer is honest about the JSON-only remainder. Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn ssh_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let browse_view = view.clone();
+        let browse_path = self.ssh_key_path.clone();
+        let browse_key = self.ssh_private_key.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("User".to_string()).child(
+                    div()
+                        .id("ssh-user")
+                        .test_support()
+                        .child(Input::new(&self.ssh_user)),
+                ),
+            )
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("ssh-password")
+                        .test_support()
+                        .child(Input::new(&self.ssh_password).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Private key".to_string()).child(
+                    div()
+                        .id("ssh-private-key")
+                        .test_support()
+                        .child(Textarea::new(&self.ssh_private_key).h(px(96.))),
+                ),
+            )
+            .child(
+                field().label("Private key path".to_string()).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("ssh-key-path")
+                                .test_support()
+                                .child(Input::new(&self.ssh_key_path)),
+                        )
+                        .child(
+                            Button::new("ssh-key-browse")
+                                .small()
+                                .label("Browse…")
+                                .tooltip(
+                                    "Pick a private-key file — fills the path and loads the key",
+                                )
+                                .accessibility_label("Browse for an SSH private-key file")
+                                .on_click(move |_, window, cx| {
+                                    browse_view.update(cx, |view, cx| {
+                                        view.browse_for_ssh_key(
+                                            browse_path.clone(),
+                                            browse_key.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        ),
+                ),
+            )
+            .child(
+                field().label("Private key passphrase".to_string()).child(
+                    div()
+                        .id("ssh-key-pass")
+                        .test_support()
+                        .child(Input::new(&self.ssh_key_pass).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Host key (comma list)".to_string()).child(
+                    div()
+                        .id("ssh-host-key")
+                        .test_support()
+                        .child(Input::new(&self.ssh_host_key)),
+                ),
+            )
+            .child(
+                field()
+                    .label("Host key algorithms (comma list)".to_string())
+                    .child(
+                        div()
+                            .id("ssh-host-key-algs")
+                            .test_support()
+                            .child(Input::new(&self.ssh_host_key_algs)),
+                    ),
+            )
+            .child(
+                field().label("Client version".to_string()).child(
+                    div()
+                        .id("ssh-client-version")
+                        .test_support()
+                        .child(Input::new(&self.ssh_client_version)),
+                ),
+            );
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("ssh-notes").test_support().child(
+                "Browse fills the path and loads the key file (no hand-paste). Host key \
+                 lists are comma-separated; cipher/mac/kex stay JSON-only.",
+            ),
+        ));
+        Self::page_disclosure(
+            "SSH settings",
+            "ssh-section-caption",
+            "ssh-section-toggle",
+            "ssh-section",
+            &self.ssh_open,
+            view,
+            block,
+        )
+    }
+
     /// Config-completeness T02: VLESS guided page — inner fields plus the
     /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
     /// `open`, no motion id — closed content unmounts, entities persist, so
@@ -4481,6 +5196,13 @@ impl ConfigForm {
                     Some(self.hysteria_block(&view, &repaint, cx).into_any_element())
                 }
                 "tuic" => Some(self.tuic_block(&view, &repaint, cx).into_any_element()),
+                // Config-completeness T06: small matrices — one page per
+                // protocol (http/https share one block, hysteria precedent).
+                "socks" => Some(self.socks_block(&view, &repaint, cx).into_any_element()),
+                "http" | "https" => Some(self.http_block(&view, &repaint, cx).into_any_element()),
+                "anytls" => Some(self.anytls_block(&view, &repaint, cx).into_any_element()),
+                "naive" => Some(self.naive_block(&view, &repaint, cx).into_any_element()),
+                "ssh" => Some(self.ssh_block(&view, &repaint, cx).into_any_element()),
                 _ => None,
             }
         };
@@ -4818,6 +5540,9 @@ impl ConfigForm {
     /// vless), shadowsocks takes S3+S4 only (Mux-only Settings, Throne
     /// HasMux parity); any other protocol skips the panels outright so a
     /// type switch can never smear guided keys onto foreign rows.
+    /// Config-completeness T06: socks/ssh take S4 alone, http/https take
+    /// S2-optional + S4, anytls/naive take S2-forced + S4 (see
+    /// [`ConfigForm::effective_params`]).
     fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -4896,6 +5621,33 @@ impl ConfigForm {
             "tuic" => {
                 let params = fold_tuic_into_params(&params, &self.tuic_fold(cx));
                 let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            // Config-completeness T06: small matrices — each page folds
+            // exactly what it renders (never smears keys onto foreign rows).
+            // SOCKS/SSH take S4 alone; HTTP(S) takes S2-optional; AnyTLS and
+            // Naïve take S2-forced.
+            "socks" => {
+                let params = fold_socks_into_params(&params, &self.socks_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "http" | "https" => {
+                let params = fold_http_into_params(&params, &self.http_fold(cx));
+                let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "anytls" => {
+                let params = fold_anytls_into_params(&params, &self.anytls_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "naive" => {
+                let params = fold_naive_into_params(&params, &self.naive_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "ssh" => {
+                let params = fold_ssh_into_params(&params, &self.ssh_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
             }
             _ => params,
@@ -5079,6 +5831,66 @@ impl ConfigForm {
         }
     }
 
+    /// Config-completeness T06: SOCKS inner UI state as a store fold. The
+    /// version/network pickers fall back to blank/"tcp" (the fold never
+    /// fabricates a version; "tcp" restores the S1-rule default).
+    fn socks_fold(&self, cx: &App) -> SocksFold {
+        SocksFold {
+            version: Self::panel_value(&self.socks_version, cx, ""),
+            username: self.socks_username.read(cx).value().to_string(),
+            password: self.socks_password.read(cx).value().to_string(),
+            network: Self::panel_value(&self.socks_network, cx, "tcp"),
+            udp_over_tcp: *self.socks_uot.borrow(),
+        }
+    }
+
+    /// Config-completeness T06: HTTP/HTTPS inner UI state as a store fold
+    /// (one entity set, both protocols — hysteria v1/v2 precedent).
+    fn http_fold(&self, cx: &App) -> HttpFold {
+        HttpFold {
+            username: self.http_username.read(cx).value().to_string(),
+            password: self.http_password.read(cx).value().to_string(),
+            path: self.http_path.read(cx).value().to_string(),
+            headers: self.http_headers.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T06: AnyTLS inner UI state as a store fold.
+    fn anytls_fold(&self, cx: &App) -> AnytlsFold {
+        AnytlsFold {
+            password: self.anytls_password.read(cx).value().to_string(),
+            interval: self.anytls_interval.read(cx).value().to_string(),
+            timeout: self.anytls_timeout.read(cx).value().to_string(),
+            min: self.anytls_min.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T06: Naïve inner UI state as a store fold. The cc
+    /// picker falls back to blank (never fabricated — contract C2).
+    fn naive_fold(&self, cx: &App) -> NaiveFold {
+        NaiveFold {
+            username: self.naive_username.read(cx).value().to_string(),
+            password: self.naive_password.read(cx).value().to_string(),
+            udp_over_tcp: *self.naive_uot.borrow(),
+            quic: *self.naive_quic.borrow(),
+            congestion_control: Self::panel_value(&self.naive_cc, cx, ""),
+        }
+    }
+
+    /// Config-completeness T06: SSH inner UI state as a store fold.
+    fn ssh_fold(&self, cx: &App) -> SshFold {
+        SshFold {
+            user: self.ssh_user.read(cx).value().to_string(),
+            password: self.ssh_password.read(cx).value().to_string(),
+            private_key: self.ssh_private_key.read(cx).value().to_string(),
+            private_key_path: self.ssh_key_path.read(cx).value().to_string(),
+            private_key_passphrase: self.ssh_key_pass.read(cx).value().to_string(),
+            host_key: self.ssh_host_key.read(cx).value().to_string(),
+            host_key_algorithms: self.ssh_host_key_algs.read(cx).value().to_string(),
+            client_version: self.ssh_client_version.read(cx).value().to_string(),
+        }
+    }
+
     /// Config-completeness T05: S2-forced UI state as a store fold — the
     /// shared S2 entities (the enable cell never renders on forced pages, so
     /// it never folds there either).
@@ -5185,6 +5997,12 @@ impl ConfigForm {
                 | "hysteria"
                 | "hysteria2"
                 | "tuic"
+                | "socks"
+                | "http"
+                | "https"
+                | "anytls"
+                | "naive"
+                | "ssh"
         );
         if page {
             match protocol.as_str() {
@@ -5258,6 +6076,31 @@ impl ConfigForm {
                     merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
                 }
+                // Config-completeness T06: small matrices merge exactly what
+                // their pages render (same scoping as `effective_params`).
+                "socks" => {
+                    merged = fold_socks_into_params(&merged, &self.socks_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "http" | "https" => {
+                    merged = fold_http_into_params(&merged, &self.http_fold(cx));
+                    merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "anytls" => {
+                    merged = fold_anytls_into_params(&merged, &self.anytls_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "naive" => {
+                    merged = fold_naive_into_params(&merged, &self.naive_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "ssh" => {
+                    merged = fold_ssh_into_params(&merged, &self.ssh_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
                 _ => {}
             }
         }
@@ -5320,8 +6163,16 @@ impl ConfigForm {
             // Config-completeness T05: forced-TLS pages (hysteria/tuic)
             // merge the S2 credential inputs only — S1/S3 and the enable
             // toggle ride other pages, so their unmerged typing stands.
-            let forced_tls = matches!(protocol, "hysteria" | "hysteria2" | "tuic");
-            if !forced_tls {
+            // Config-completeness T06: anytls/naive join the forced set;
+            // http/https merge the optional-S2 panel but never S1; socks/ssh
+            // merge no shared panel (S4 alone).
+            let forced_tls = matches!(
+                protocol,
+                "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive"
+            );
+            let inner_only = matches!(protocol, "socks" | "ssh");
+            let no_transport = matches!(protocol, "http" | "https");
+            if !forced_tls && !inner_only && !no_transport {
                 texts.extend([
                     &self.s1_path,
                     &self.s1_host,
@@ -5331,9 +6182,14 @@ impl ConfigForm {
                 selects.extend([(&self.s1_network, "tcp")]);
                 cells.extend([&self.s2_enable]);
             }
-            texts.extend([&self.s2_sni, &self.s2_alpn, &self.s2_pbk, &self.s2_sid]);
-            selects.extend([(&self.s2_fp, "")]);
-            cells.extend([&self.s2_insecure]);
+            if !inner_only {
+                if no_transport {
+                    cells.extend([&self.s2_enable]);
+                }
+                texts.extend([&self.s2_sni, &self.s2_alpn, &self.s2_pbk, &self.s2_sid]);
+                selects.extend([(&self.s2_fp, "")]);
+                cells.extend([&self.s2_insecure]);
+            }
         }
         match protocol {
             "vless" => {
@@ -5374,6 +6230,51 @@ impl ConfigForm {
                 texts.extend([&self.tuic_uuid, &self.tuic_password, &self.tuic_heartbeat]);
                 selects.extend([(&self.tuic_cc, ""), (&self.tuic_relay, "")]);
                 cells.extend([&self.tuic_uot, &self.tuic_zero_rtt]);
+            }
+            // Config-completeness T06: small matrices reset exactly what
+            // their pages merged (shared-panel scope above mirrors the same
+            // rule). The ssh key area clears like any text input.
+            "socks" => {
+                texts.extend([&self.socks_username, &self.socks_password]);
+                selects.extend([(&self.socks_version, ""), (&self.socks_network, "tcp")]);
+                cells.push(&self.socks_uot);
+            }
+            "http" | "https" => {
+                texts.extend([
+                    &self.http_username,
+                    &self.http_password,
+                    &self.http_path,
+                    &self.http_headers,
+                ]);
+            }
+            "anytls" => {
+                texts.extend([
+                    &self.anytls_password,
+                    &self.anytls_interval,
+                    &self.anytls_timeout,
+                    &self.anytls_min,
+                ]);
+            }
+            "naive" => {
+                texts.extend([&self.naive_username, &self.naive_password]);
+                selects.extend([(&self.naive_cc, "")]);
+                cells.extend([&self.naive_uot, &self.naive_quic]);
+            }
+            "ssh" => {
+                texts.extend([
+                    &self.ssh_user,
+                    &self.ssh_password,
+                    &self.ssh_key_path,
+                    &self.ssh_key_pass,
+                    &self.ssh_host_key,
+                    &self.ssh_host_key_algs,
+                    &self.ssh_client_version,
+                ]);
+                // The key blob area is a `TextareaState`, not an `InputState`
+                // (it cannot ride the `texts` vec) — cleared the same way.
+                self.ssh_private_key.update(cx, |state, cx| {
+                    state.set_value(String::new(), window, cx);
+                });
             }
             "wireguard" => {
                 texts.extend([
@@ -5498,6 +6399,12 @@ impl ConfigForm {
                 | "hysteria"
                 | "hysteria2"
                 | "tuic"
+                | "socks"
+                | "http"
+                | "https"
+                | "anytls"
+                | "naive"
+                | "ssh"
         ) {
             self.echo_panels(window, cx, &box_text, &protocol);
         }
@@ -5528,7 +6435,13 @@ impl ConfigForm {
         ];
         // Config-completeness T05: forced-TLS pages echo the S2 credential
         // inputs (never the enable toggle or S1 — those ride other pages).
-        let forced_tls = matches!(protocol, "hysteria" | "hysteria2" | "tuic");
+        // Config-completeness T06: anytls/naive join the forced set;
+        // http/https echo the full optional-S2 panel (enable included).
+        let forced_tls = matches!(
+            protocol,
+            "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive"
+        );
+        let optional_tls = matches!(protocol, "http" | "https");
         if full_panels {
             shared_texts.extend([
                 (&self.s1_path, &["path"][..]),
@@ -5537,7 +6450,7 @@ impl ConfigForm {
                 (&self.s1_service_name, &["service_name", "serviceName"][..]),
             ]);
         }
-        if full_panels || forced_tls {
+        if full_panels || forced_tls || optional_tls {
             shared_texts.extend([
                 (&self.s2_sni, &["sni", "peer"][..]),
                 (&self.s2_alpn, &["alpn"][..]),
@@ -5594,6 +6507,46 @@ impl ConfigForm {
                 (&self.tuic_uuid, &["uuid", "id"][..]),
                 (&self.tuic_password, &["password"][..]),
                 (&self.tuic_heartbeat, &["heartbeat"][..]),
+            ],
+            // Config-completeness T06: small-matrix inner texts echo on
+            // blank inputs only (same rule). The ssh host-key lists read
+            // through the list reader (stored arrays echo as comma text);
+            // the key blob area echoes like any text input.
+            "socks" => &[
+                (&self.socks_username, &["username"][..]),
+                (&self.socks_password, &["password"][..]),
+            ],
+            "http" | "https" => &[
+                (&self.http_username, &["username"][..]),
+                (&self.http_password, &["password"][..]),
+                (&self.http_path, &["path"][..]),
+                (&self.http_headers, &["headers"][..]),
+            ],
+            "anytls" => &[
+                (&self.anytls_password, &["password"][..]),
+                (
+                    &self.anytls_interval,
+                    &["idle_session_check_interval", "interval"][..],
+                ),
+                (
+                    &self.anytls_timeout,
+                    &["idle_session_timeout", "timeout"][..],
+                ),
+                (&self.anytls_min, &["min_idle_session", "min"][..]),
+            ],
+            "naive" => &[
+                (&self.naive_username, &["username"][..]),
+                (&self.naive_password, &["password"][..]),
+            ],
+            "ssh" => &[
+                (&self.ssh_user, &["user", "username"][..]),
+                (&self.ssh_password, &["password"][..]),
+                (&self.ssh_key_path, &["private_key_path"][..]),
+                (
+                    &self.ssh_key_pass,
+                    &["private_key_passphrase", "private_key_pass"][..],
+                ),
+                (&self.ssh_client_version, &["client_version"][..]),
             ],
             // Config-completeness T04: WG peer/net rows echo on both pages
             // (separate entities per page — T03 scoping).
@@ -5671,6 +6624,52 @@ impl ConfigForm {
                 });
             }
         }
+        // Config-completeness T06: the ssh host-key lists echo through the
+        // list reader (stored arrays read as comma text) and the key blob
+        // echoes into its area — blank inputs only, same rule.
+        if protocol == "ssh" {
+            for (entity, keys) in [
+                (&self.ssh_host_key, &["host_key"][..]),
+                (&self.ssh_host_key_algs, &["host_key_algorithms"][..]),
+            ] {
+                let value = guided_prefill_list(box_text, keys);
+                let blank = entity.read(cx).value().to_string().trim().is_empty();
+                if blank && !value.is_empty() {
+                    entity.update(cx, |state, cx| {
+                        state.set_value(value.clone(), window, cx);
+                    });
+                }
+            }
+            let key_value = guided_prefill_value(box_text, &["private_key", "privatekey"]);
+            let key_blank = self
+                .ssh_private_key
+                .read(cx)
+                .value()
+                .to_string()
+                .trim()
+                .is_empty();
+            if key_blank && !key_value.is_empty() {
+                self.ssh_private_key.update(cx, |state, cx| {
+                    state.set_value(key_value.clone(), window, cx);
+                });
+            }
+        }
+        // Config-completeness T06: the socks network echoes S1-rule (the
+        // default counts as blank, like the transport pages).
+        if protocol == "socks" {
+            let value = guided_prefill_value(box_text, &["network"]);
+            let current = self
+                .socks_network
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == "tcp" && !value.is_empty() && value != "tcp" {
+                self.socks_network.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
         // S1 echoes on the transport pages; the S2 fingerprint echoes on the
         // optional and forced TLS pages alike (shared entities, one rule).
         let panel_selects: &[EchoSelect] = if full_panels {
@@ -5678,7 +6677,7 @@ impl ConfigForm {
                 (&self.s1_network, &["network"][..], "tcp"),
                 (&self.s2_fp, &["fp", "fingerprint"][..], ""),
             ]
-        } else if forced_tls {
+        } else if forced_tls || optional_tls {
             &[(&self.s2_fp, &["fp", "fingerprint"][..], "")]
         } else {
             &[]
@@ -5722,11 +6721,19 @@ impl ConfigForm {
             // Config-completeness T05: the v1 auth marker and the TUIC
             // modes echo the same way (a non-pickable spelling echoes as no
             // selection and round-trips byte-identical).
+            // Config-completeness T06: the socks version and naive cc echo
+            // the same way (the socks network echoes S1-rule below).
             "hysteria" | "hysteria2" => &[(&self.hy_auth_type, &["auth_type"][..], "")],
             "tuic" => &[
                 (&self.tuic_cc, &["congestion_control"][..], ""),
                 (&self.tuic_relay, &["udp_relay_mode"][..], ""),
             ],
+            "socks" => &[(&self.socks_version, &["version"][..], "")],
+            "naive" => &[(
+                &self.naive_cc,
+                &["quic_congestion_control", "congestion_control"][..],
+                "",
+            )],
             _ => &[],
         };
         for (entity, keys, default) in inner_selects {
@@ -5766,7 +6773,7 @@ impl ConfigForm {
         ];
         // The S2 insecure toggle echoes on the optional and forced TLS
         // pages alike (the forced page has no enable toggle to echo).
-        if full_panels || forced_tls {
+        if full_panels || forced_tls || optional_tls {
             shared_cells.push((
                 &self.s2_insecure,
                 &[
@@ -5787,8 +6794,9 @@ impl ConfigForm {
         }
         // `security: "tls"` is not a truthy spelling — the enable toggle
         // echoes the on-values the engine maps (same rule as prefill;
-        // vmess rows read grammar-aware for the legacy boolean).
-        if full_panels && !*self.s2_enable.borrow() {
+        // vmess rows read grammar-aware for the legacy boolean). HTTP(S)
+        // rows echo it too (optional-TLS pages, same rule).
+        if (full_panels || optional_tls) && !*self.s2_enable.borrow() {
             let on = if protocol == "vmess" {
                 vmess_tls_enabled(box_text)
             } else {
@@ -5807,6 +6815,24 @@ impl ConfigForm {
             && guided_prefill_bool(box_text, &["udp_over_tcp", "uot"])
         {
             *self.ss_uot.borrow_mut() = true;
+        }
+        // Config-completeness T06: SOCKS/Naïve toggles echo the same way
+        // (off counts as blank).
+        if protocol == "socks"
+            && !*self.socks_uot.borrow()
+            && guided_prefill_bool(box_text, &["udp_over_tcp", "uot"])
+        {
+            *self.socks_uot.borrow_mut() = true;
+        }
+        if protocol == "naive" {
+            for (cell, keys) in [
+                (&self.naive_uot, &["udp_over_tcp", "uot"][..]),
+                (&self.naive_quic, &["quic"][..]),
+            ] {
+                if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                    *cell.borrow_mut() = true;
+                }
+            }
         }
         // Config-completeness T05: Hysteria/TUIC toggles echo the same way
         // (off counts as blank).
@@ -8710,6 +9736,45 @@ fn tuic_relay_choices() -> Vec<PanelChoice> {
         items.push((mode, mode));
     }
     panel_choices("tuic-relay-option", &items)
+}
+
+/// Config-completeness T06: SOCKS versions (exactly
+/// [`crate::store::SOCKS_VERSIONS`]) behind one blank "Select version…" row.
+/// Version has no valid default — blank leaves the stock default 5 (the
+/// engine omits it); "4" folds for generate to reject naming the field.
+fn socks_version_choices() -> Vec<PanelChoice> {
+    use crate::store::SOCKS_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 5)")];
+    for version in SOCKS_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("socks-version-option", &items)
+}
+
+/// Config-completeness T06: SOCKS networks the engine maps (tcp|udp only —
+/// anything else fails generate naming `network`). `tcp` leads as the
+/// sing-box default (the fold removes it, S1-rule).
+fn socks_network_choices() -> Vec<PanelChoice> {
+    panel_choices("socks-network-option", &[("tcp", "tcp"), ("udp", "udp")])
+}
+
+/// Config-completeness T06: Naïve `quic_congestion_control` modes (exactly
+/// [`crate::store::NAIVE_CC_MODES`]) behind one blank "Select…" row
+/// (keep-blank — blank leaves the chromium default cubic, contract C2).
+fn naive_cc_choices() -> Vec<PanelChoice> {
+    use crate::store::NAIVE_CC_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
+    for mode in NAIVE_CC_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("naive-cc-option", &items)
+}
+
+/// Config-completeness T06: SSH Browse failure text — names the full picked
+/// path (a wrong path must say which path: never a basename, never silent).
+/// Pure so headless tests pin it without a file picker.
+fn ssh_key_pick_error(path: &str) -> String {
+    format!("SSH key file unreadable: {path} (check the path and pick again)")
 }
 
 /// Config-completeness T04: borrowed entity set for the nine shared
@@ -13168,6 +14233,73 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Config-completeness T06: Browse button behind the SSH page — the
+    /// platform file picker (single-select, Import-Browse pattern); the
+    /// picked key bytes fill the path input and load into the key textarea
+    /// (no hand-paste). Cancelling picks nothing and changes nothing; a
+    /// wrong path toasts naming the full path via
+    /// [`ssh_key_pick_error`].
+    fn browse_for_ssh_key(
+        &mut self,
+        path_entity: Entity<InputState>,
+        key_entity: Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        let view = cx.entity();
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                _ => return,
+            };
+            let path = paths.into_iter().next().expect("non-empty checked");
+            let display = path.to_string_lossy().into_owned();
+            let content = std::fs::read_to_string(&path).ok();
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.finish_ssh_key_pick(path_entity, key_entity, display, content, window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Config-completeness T06: SSH Browse completion (windowed) — success
+    /// fills the path input and loads the key bytes into the textarea
+    /// (overwrite, so path and content never disagree); failure toasts
+    /// naming the full path and changes nothing.
+    fn finish_ssh_key_pick(
+        &mut self,
+        path_entity: Entity<InputState>,
+        key_entity: Entity<TextareaState>,
+        path: String,
+        content: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(content) = content else {
+            window.push_notification(Notification::warning(ssh_key_pick_error(&path)), cx);
+            return;
+        };
+        path_entity.update(cx, |state, cx| {
+            state.set_value(path.clone(), window, cx);
+        });
+        key_entity.update(cx, |state, cx| {
+            state.set_value(content, window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Loaded SSH key from {path}")),
+            cx,
+        );
     }
 
     /// Ticket 43: Browse completion (windowed) — unreadable files toast by
@@ -22066,6 +23198,781 @@ mod tests {
             "cc Enter runs no commit (a broken guard would toast the template error)"
         );
         assert_absent(cx, "tuic-cc-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T06: panel dropdown counts — socks version lists
+    /// blank + 2, socks network lists tcp + udp, naive cc lists blank + 4.
+    #[test]
+    fn t06_dropdown_counts() {
+        use crate::store::{NAIVE_CC_MODES, SOCKS_VERSIONS};
+        assert_eq!(SOCKS_VERSIONS, ["5", "4"]);
+        assert_eq!(NAIVE_CC_MODES, ["bbr", "bbr2", "cubic", "reno"]);
+        assert_eq!(
+            crate::socks_version_choices().len(),
+            3,
+            "version lists blank + 2"
+        );
+        assert_eq!(
+            crate::socks_network_choices().len(),
+            2,
+            "network lists tcp + udp"
+        );
+        assert_eq!(crate::naive_cc_choices().len(), 5, "cc lists blank + 4");
+    }
+
+    /// Config-completeness T06: SOCKS Add renders version + credentials +
+    /// network + uot + S4-only as kit primitives; a stored "5" echoes into
+    /// the picker and delegate membership covers blank + both versions
+    /// (virtualized popups paint visible rows only, so membership pins here).
+    #[gpui_kit::test]
+    fn t06_socks_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("socks");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "socks-section-caption");
+        cx.update(|window, cx| {
+            window.click("socks-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "socks-version",
+            "socks-username",
+            "socks-password",
+            "socks-network",
+            "socks-uot",
+            "socks-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // S4-only page: no Transport/TLS/Mux panels, nothing from the other
+        // small pages.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "http-username",
+            "anytls-password",
+            "naive-cc",
+            "ssh-user",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: blank + both versions resolve.
+        let row = crate::store::ProxyConfig {
+            id: "t06-s".to_string(),
+            name: "S".to_string(),
+            protocol: "socks".to_string(),
+            params: "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080}".to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                for version in ["", "5", "4"] {
+                    form.socks_version.update(cx, |state, cx| {
+                        state.set_selected_value(&version.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.socks_version
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        version,
+                        "version {version:?} resolves"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T06: HTTP Add renders username/password/path/
+    /// headers + S2-optional + S4; HTTPS renders the same block (one entity
+    /// set, two protocols) with the enable toggle present.
+    #[gpui_kit::test]
+    fn t06_http_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let mut current = "vless".to_string();
+        let mut pick = |cx: &mut VisualTestContext, target: &str| {
+            let start = row_of(current.as_str());
+            let end = row_of(target);
+            current = target.to_string();
+            cx.update(|window, cx| {
+                window.click("protocol-select", cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            let (key, steps) = if end >= start {
+                ("down", end - start)
+            } else {
+                ("up", start - end)
+            };
+            let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+            for _ in 0..steps {
+                cx.update(|window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                });
+                cx.run_until_parked();
+            }
+            let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(enter.clone(), cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+        };
+        let mut first = true;
+        for target in ["http", "https"] {
+            pick(cx, target);
+            assert_painted(cx, "http-section-caption");
+            // Section-open states persist across the protocol switch (T05
+            // precedent), so toggles open once — re-clicking would close them.
+            if first {
+                cx.update(|window, cx| {
+                    window.click("http-section-toggle", cx);
+                });
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+            }
+            for id in [
+                "http-username",
+                "http-password",
+                "http-path",
+                "http-headers",
+                "http-notes",
+                "s2-caption",
+                "s4-caption",
+            ] {
+                assert_painted(cx, id);
+            }
+            // The optional-TLS section opens with the enable toggle (never
+            // the forced lock note).
+            if first {
+                cx.update(|window, cx| {
+                    window.click("s2-toggle", cx);
+                });
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+            }
+            for id in ["s2-enable", "s2-sni", "s2-fp"] {
+                assert_painted(cx, id);
+            }
+            assert_absent(cx, "s2-forced-note".to_string());
+            for id in ["s1-caption", "s3-caption", "socks-version", "naive-cc"] {
+                assert_absent(cx, id.to_string());
+            }
+            first = false;
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T06: AnyTLS Add renders password + the three
+    /// session tunables + S2-forced + S4, all kit; no enable toggle anywhere.
+    #[gpui_kit::test]
+    fn t06_anytls_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("anytls");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "anytls-section-caption");
+        cx.update(|window, cx| {
+            window.click("anytls-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "anytls-password",
+            "anytls-interval",
+            "anytls-timeout",
+            "anytls-min",
+            "anytls-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| {
+            window.click("s2-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "s2-forced-note");
+        for id in ["s2-enable", "s1-caption", "s3-caption", "ssh-user"] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T06: Naïve Add renders username/password/uot/
+    /// quic/cc + S2-forced + S4, all kit; delegate membership covers blank +
+    /// all four modes.
+    #[gpui_kit::test]
+    fn t06_naive_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("naive");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "naive-section-caption");
+        cx.update(|window, cx| {
+            window.click("naive-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "naive-username",
+            "naive-password",
+            "naive-uot",
+            "naive-quic",
+            "naive-cc",
+            "naive-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in ["s2-enable", "s1-caption", "s3-caption", "tuic-cc"] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: blank + every mode resolves.
+        let row = crate::store::ProxyConfig {
+            id: "t06-n".to_string(),
+            name: "N".to_string(),
+            protocol: "naive".to_string(),
+            params: "{\"type\":\"naive\",\"server\":\"s\",\"server_port\":443}".to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                for mode in ["", "bbr", "bbr2", "cubic", "reno"] {
+                    form.naive_cc.update(cx, |state, cx| {
+                        state.set_selected_value(&mode.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.naive_cc
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        mode,
+                        "cc {mode:?} resolves"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T06: SSH Edit renders user/password/key blob +
+    /// path picker + passphrase + host-key lists + client version + S4-only;
+    /// an untouched row refolds byte-identical (stored host-key arrays echo
+    /// as comma text); simulating the Browse completion fills the path and
+    /// loads the key without hand-paste.
+    #[gpui_kit::test]
+    fn t06_ssh_edit_round_trips_and_key_pick(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let params = "{\"type\":\"ssh\",\"server\":\"192.0.2.23\",\"server_port\":22,\
+            \"user\":\"root\",\"password\":\"secret\",\"private_key\":\"KEY-BLOB\",\
+            \"host_key\":[\"ecdsa-sha2-nistp256 AAAA\",\"ssh-ed25519 BBBB\"],\
+            \"host_key_algorithms\":[\"ssh-ed25519\"],\"client_version\":\"SSH-2.0-X\"}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "SshRow".to_string(),
+                protocol: "ssh".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "ssh-section-caption");
+        cx.update(|window, cx| {
+            window.click("ssh-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "ssh-user",
+            "ssh-password",
+            "ssh-private-key",
+            "ssh-key-path",
+            "ssh-key-browse",
+            "ssh-key-pass",
+            "ssh-host-key",
+            "ssh-host-key-algs",
+            "ssh-client-version",
+            "ssh-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No TLS/Transport/Mux panels, nothing from the other small pages.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "socks-version",
+            "http-username",
+            "anytls-password",
+            "naive-cc",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Prefill + refold at the form level (no typing simulation).
+        let row = ProxyConfig {
+            id: "t06-k".to_string(),
+            name: "K".to_string(),
+            protocol: "ssh".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let (fields, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                let fields = vec![
+                    form.ssh_user.read(cx).value().to_string(),
+                    form.ssh_password.read(cx).value().to_string(),
+                    form.ssh_private_key.read(cx).value().to_string(),
+                    form.ssh_host_key.read(cx).value().to_string(),
+                    form.ssh_host_key_algs.read(cx).value().to_string(),
+                    form.ssh_client_version.read(cx).value().to_string(),
+                ];
+                (fields, form.effective_params(cx))
+            })
+        });
+        assert_eq!(
+            fields,
+            vec![
+                "root",
+                "secret",
+                "KEY-BLOB",
+                "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB",
+                "ssh-ed25519",
+                "SSH-2.0-X",
+            ],
+            "ssh values sit in kit fields (arrays echo as comma text)"
+        );
+        assert_eq!(folded, params, "untouched ssh refolds byte-identical");
+        // The Browse completion fills the path and loads the key (the same
+        // two entity writes `finish_ssh_key_pick` performs).
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                form.ssh_key_path.update(cx, |state, cx| {
+                    state.set_value("/home/u/.ssh/id_rsa".to_string(), window, cx);
+                });
+                form.ssh_private_key.update(cx, |state, cx| {
+                    state.set_value("PICKED-KEY-BLOB".to_string(), window, cx);
+                });
+                let folded = form.effective_params(cx);
+                let value: serde_json::Value =
+                    serde_json::from_str(&folded).expect("picked key folds");
+                assert_eq!(value["private_key_path"], "/home/u/.ssh/id_rsa");
+                assert_eq!(value["private_key"], "PICKED-KEY-BLOB");
+            })
+        });
+    }
+
+    /// Config-completeness T06: small-matrix round-trips at the form level —
+    /// socks/http/anytls/naive rows echo their fields and refold
+    /// byte-identical (no paint needed).
+    #[gpui_kit::test]
+    fn t06_small_pages_round_trip(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let cases = [
+            (
+                "socks",
+                "{\"type\":\"socks\",\"server\":\"192.0.2.20\",\"server_port\":1080,\
+                \"version\":\"5\",\"username\":\"u\",\"password\":\"p\",\
+                \"network\":\"udp\",\"udp_over_tcp\":true}",
+            ),
+            (
+                "http",
+                "{\"type\":\"http\",\"server\":\"192.0.2.21\",\"server_port\":8080,\
+                \"username\":\"u\",\"password\":\"p\",\"path\":\"/p\",\
+                \"headers\":\"Host: h.example.com\",\"security\":\"tls\",\
+                \"sni\":\"example.com\"}",
+            ),
+            (
+                "anytls",
+                "{\"type\":\"anytls\",\"server\":\"192.0.2.15\",\"server_port\":8443,\
+                \"password\":\"p\",\"idle_session_check_interval\":\"30s\",\
+                \"idle_session_timeout\":\"60s\",\"min_idle_session\":5,\
+                \"sni\":\"example.com\"}",
+            ),
+            (
+                "naive",
+                "{\"type\":\"naive\",\"server\":\"192.0.2.22\",\"server_port\":443,\
+                \"username\":\"u\",\"password\":\"p\",\"udp_over_tcp\":true,\
+                \"quic\":true,\"quic_congestion_control\":\"bbr2\",\
+                \"sni\":\"example.com\"}",
+            ),
+        ];
+        for (protocol, params) in cases {
+            let row = ProxyConfig {
+                id: format!("t06-{protocol}"),
+                name: protocol.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let folded = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    form.effective_params(cx)
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "untouched {protocol} refolds byte-identical"
+            );
+        }
+    }
+
+    /// Config-completeness T06: the SSH key-file Browse failure names the
+    /// full picked path (never a basename, never silent).
+    #[test]
+    fn t06_ssh_key_pick_error_names_path() {
+        let error = crate::ssh_key_pick_error("C:\\keys\\missing_rsa");
+        assert!(
+            error.contains("C:\\keys\\missing_rsa"),
+            "wrong path names the path, got {error}"
+        );
+    }
+
+    /// Config-completeness T06 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside a Naïve picker popup stops at the wrapper — the dialog
+    /// never commits a half-filled row. Validation-sensitive by construction
+    /// like the T01/T03/T04/T05 guard tests.
+    #[gpui_kit::test]
+    fn t06_enter_in_naive_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to naive through the real picker (cursor starts at
+        // `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("naive");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The Naïve page renders (Add wiring holds for the new page).
+        assert_painted(cx, "naive-section-caption");
+        cx.update(|window, cx| {
+            window.click("naive-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "naive-cc");
+        // Open the cc popup, then Enter: the pick lands, the commit must
+        // not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("naive-cc", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("naive-cc-option-default".to_string())
+                .is_some()),
+            "cc popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "cc Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "cc Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "cc Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "naive-cc-option-default".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
