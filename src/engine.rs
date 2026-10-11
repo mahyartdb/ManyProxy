@@ -1845,12 +1845,17 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
             let mut stream = serde_json::Map::new();
             // Ticket 29: `packetEncoding` stays camelCase per the xray schema
             // (`streamSettings.packetEncoding`, accepted by `xray run -test`).
+            // Config-completeness T07: `spiderx` rides the same flat
+            // passthrough (the Xray page folds it; the sidecar judges the
+            // shape — without this the page would write a key the bridge
+            // drops, T02 dead-key precedent).
             for key in [
                 "network",
                 "security",
                 "sni",
                 "pbk",
                 "sid",
+                "spiderx",
                 "path",
                 "host",
                 "mode",
@@ -1872,6 +1877,33 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                 serde_json::Value::String(egress.egress_tag.clone()),
             );
             node.insert("settings".to_string(), serde_json::Value::Object(settings));
+            // Config-completeness T07: the Xray page's `xray_mux` keep-blank
+            // select (`""` | `enabled` | `disabled`) maps to the outbound
+            // `mux` object (absent on default — never fabricated). Anything
+            // else fails typed naming the field (the page constrains its
+            // picks; hand JSON garbage must not silently become mux-off).
+            match egress
+                .params
+                .get("xray_mux")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+            {
+                None | Some("") => {}
+                Some("enabled") => {
+                    node.insert("mux".to_string(), serde_json::json!({"enabled": true}));
+                }
+                Some("disabled") => {
+                    node.insert("mux".to_string(), serde_json::json!({"enabled": false}));
+                }
+                Some(_) => {
+                    return Err(EngineError::BadCustom {
+                        name: egress.owner.clone(),
+                        field: "xray_mux".to_string(),
+                        detail: "xray_mux must be \"\" (default), \"enabled\" or \"disabled\""
+                            .to_string(),
+                    });
+                }
+            }
             if !stream.is_empty() {
                 node.insert(
                     "streamSettings".to_string(),

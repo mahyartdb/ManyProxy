@@ -71,21 +71,24 @@ use import::{
     parse_addsub_link, AddSubRequest, ImportError,
 };
 use store::{
-    count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
-    export_confirm_description, fold_amneziawg_into_params, fold_anytls_into_params,
-    fold_dial_into_params, fold_guided_into_params, fold_http_into_params,
-    fold_hysteria_into_params, fold_mux_into_params, fold_naive_into_params,
-    fold_shadowsocks_inner_into_params, fold_socks_into_params, fold_ssh_into_params,
-    fold_tls_forced_into_params, fold_tls_optional_into_params, fold_tls_vmess_into_params,
-    fold_transport_into_params, fold_trojan_inner_into_params, fold_tuic_into_params,
-    fold_vless_inner_into_params, fold_vmess_inner_into_params, fold_wireguard_into_params,
-    guided_identity_fields, guided_prefill_bool, guided_prefill_list, guided_prefill_value,
-    is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
-    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, ConfigPatch, DialFold,
-    HealthSnapshot, HttpFold, HysteriaFold, MuxFold, NaiveFold, NewConfig, ProxyConfig,
-    RestoreOutcome, SocksFold, SshFold, Store, StoreError, Subscription as ProxySubscription,
-    TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold, WireguardFold, DEFAULT_BIND,
-    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    chain_hop_rejection, chain_nodes_of, count_importable, delete_confirm_text,
+    delete_running_confirm_text, due_for_refresh_for, export_confirm_description,
+    extra_config_prefill, fold_amneziawg_into_params, fold_anytls_into_params,
+    fold_chain_nodes_into_params, fold_dial_into_params, fold_extra_into_params,
+    fold_guided_into_params, fold_http_into_params, fold_hysteria_into_params,
+    fold_mux_into_params, fold_naive_into_params, fold_shadowsocks_inner_into_params,
+    fold_shadowtls_into_params, fold_snell_into_params, fold_socks_into_params,
+    fold_ssh_into_params, fold_tls_forced_into_params, fold_tls_optional_into_params,
+    fold_tls_vmess_into_params, fold_transport_into_params, fold_trojan_inner_into_params,
+    fold_tuic_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
+    fold_wireguard_into_params, fold_xray_into_params, guided_identity_fields, guided_prefill_bool,
+    guided_prefill_list, guided_prefill_value, is_virtual_protocol, now_unix,
+    pristine_template_rewrite, protocol_params_template, proxy_urls, validate_extra_params,
+    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, ChainHopSlot, ConfigPatch,
+    DialFold, ExtraFold, HealthSnapshot, HttpFold, HysteriaFold, MuxFold, NaiveFold, NewConfig,
+    ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SshFold, Store, StoreError,
+    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
+    WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -1893,6 +1896,82 @@ struct ConfigForm {
     /// Config-completeness T06: outer SSH disclosure (see
     /// [`ConfigForm::ssh_block`]) — collapsed by default like VLESS.
     ssh_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: Snell inner fields — masked psk secret,
+    /// version picker (4|6), obfs_mode/host + userkey + network + mode texts,
+    /// reuse cell. Engine-driven list (no Throne editor exists); rendered
+    /// (and folded) only while the live protocol is `snell`; the page carries
+    /// S4 only (no Transport/TLS/Mux — inner parity).
+    snell_psk: Entity<InputState>,
+    snell_version: Entity<SelectState<PanelChoiceList>>,
+    snell_obfs_mode: Entity<InputState>,
+    snell_obfs_host: Entity<InputState>,
+    snell_userkey: Entity<InputState>,
+    snell_reuse: Rc<RefCell<bool>>,
+    snell_network: Entity<InputState>,
+    snell_mode: Entity<InputState>,
+    /// Config-completeness T07: outer Snell disclosure (see
+    /// [`ConfigForm::snell_block`]) — collapsed by default like VLESS.
+    snell_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: ShadowTLS inner fields — version picker
+    /// (1|2|3) + password text (v2/v3-only; v1 rows omit it). Rendered (and
+    /// folded) only while the live protocol is `shadowtls`; the page carries
+    /// S2-forced + S4.
+    shadowtls_version: Entity<SelectState<PanelChoiceList>>,
+    shadowtls_password: Entity<InputState>,
+    /// Config-completeness T07: outer ShadowTLS disclosure (see
+    /// [`ConfigForm::shadowtls_block`]) — collapsed by default like VLESS.
+    shadowtls_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: Xray-VLESS Ph1 inner fields (uuid with
+    /// uuidgen, encryption, flow picker, sni/fp/alpn, REALITY pbk/sid/spiderx,
+    /// Xray-network picker, mode text, xray-mux picker). Ph2-only keys stay
+    /// JSON-only (preserved, never stripped); rendered (and folded) only
+    /// while the live protocol is `xray`; no shared panels (the bridge serves
+    /// the Ph1 subset, so S4 dial keys would be dead there).
+    xray_uuid: Entity<InputState>,
+    xray_enc: Entity<InputState>,
+    xray_flow: Entity<SelectState<PanelChoiceList>>,
+    xray_sni: Entity<InputState>,
+    xray_fp: Entity<SelectState<PanelChoiceList>>,
+    xray_alpn: Entity<InputState>,
+    xray_pbk: Entity<InputState>,
+    xray_sid: Entity<InputState>,
+    xray_spiderx: Entity<InputState>,
+    xray_network: Entity<SelectState<PanelChoiceList>>,
+    xray_mode: Entity<InputState>,
+    xray_mux: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T07: outer Xray disclosure (see
+    /// [`ConfigForm::xray_block`]) — collapsed by default like VLESS.
+    xray_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: chain hop-list editor state — ordered `nodes`
+    /// (id-reference strings or inline outbound objects, exactly the stored
+    /// shape). The cell is NEVER reset by `clear_panels` (kept, so the
+    /// expand→commit path refolds idempotently) and `echo_panels` always
+    /// re-syncs it from the box on collapse (hand-edited box JSON wins over
+    /// stale picks — expanding always merges first, so no unmerged typing
+    /// can be clobbered). Rendered (and folded) only while the live protocol
+    /// is `chain`.
+    chain_hops: Rc<RefCell<Vec<serde_json::Value>>>,
+    /// Config-completeness T07: the library picker behind the hop editor —
+    /// choices rebuilt with the row list at dialog open (tests keep the
+    /// blank placeholder; the selection is transient UI, never folded).
+    chain_pick: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T07: library snapshot (id, name, protocol) behind
+    /// the hop picker + hop labels + add/replace rejection. Set at dialog
+    /// open alongside `chain_pick`; empty for direct test forms.
+    chain_library: Rc<RefCell<Vec<ChainLibraryEntry>>>,
+    /// Config-completeness T07: outer chain disclosure (see
+    /// [`ConfigForm::chain_block`]) — collapsed by default like VLESS.
+    chain_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: extra-core inner fields — exe path text +
+    /// Browse picker, args text, config textarea. Rendered (and folded) only
+    /// while the live protocol is `extra-core`. Deliberately no `no_logs`
+    /// control anywhere (Throne non-persist bug — never copied).
+    extra_exe: Entity<InputState>,
+    extra_args: Entity<InputState>,
+    extra_config: Entity<TextareaState>,
+    /// Config-completeness T07: outer extra-core disclosure (see
+    /// [`ConfigForm::extra_block`]) — collapsed by default like VLESS.
+    extra_open: Rc<RefCell<bool>>,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -2231,6 +2310,39 @@ impl ConfigForm {
             ssh_host_key_algs: Self::field(window, cx, "Host key algorithms (comma list)", None),
             ssh_client_version: Self::field(window, cx, "Client version", None),
             ssh_open: Rc::new(RefCell::new(false)),
+            snell_psk: Self::secret_field(window, cx, "PSK", None),
+            snell_version: Self::panel_select(window, cx, snell_version_choices(), ""),
+            snell_obfs_mode: Self::field(window, cx, "Obfs mode", None),
+            snell_obfs_host: Self::field(window, cx, "Obfs host", None),
+            snell_userkey: Self::field(window, cx, "User key", None),
+            snell_reuse: Rc::new(RefCell::new(false)),
+            snell_network: Self::field(window, cx, "Network", None),
+            snell_mode: Self::field(window, cx, "Mode", None),
+            snell_open: Rc::new(RefCell::new(false)),
+            shadowtls_version: Self::panel_select(window, cx, shadowtls_version_choices(), ""),
+            shadowtls_password: Self::secret_field(window, cx, "Password", None),
+            shadowtls_open: Rc::new(RefCell::new(false)),
+            xray_uuid: Self::secret_field(window, cx, "UUID", None),
+            xray_enc: Self::field(window, cx, "Encryption (default none)", None),
+            xray_flow: Self::panel_select(window, cx, xray_flow_choices(), ""),
+            xray_sni: Self::field(window, cx, "SNI", None),
+            xray_fp: Self::panel_select(window, cx, fp_choices(), ""),
+            xray_alpn: Self::field(window, cx, "ALPN (comma list)", None),
+            xray_pbk: Self::field(window, cx, "REALITY public key (pbk)", None),
+            xray_sid: Self::field(window, cx, "REALITY short id (sid)", None),
+            xray_spiderx: Self::field(window, cx, "REALITY spiderX path", None),
+            xray_network: Self::panel_select(window, cx, xray_network_choices(), ""),
+            xray_mode: Self::field(window, cx, "Mode", None),
+            xray_mux: Self::panel_select(window, cx, xray_mux_choices(), ""),
+            xray_open: Rc::new(RefCell::new(false)),
+            chain_hops: Rc::new(RefCell::new(Vec::new())),
+            chain_pick: Self::panel_select(window, cx, chain_pick_choices(&[]), ""),
+            chain_library: Rc::new(RefCell::new(Vec::new())),
+            chain_open: Rc::new(RefCell::new(false)),
+            extra_exe: Self::field(window, cx, "Executable (app dir file name)", None),
+            extra_args: Self::field(window, cx, "Args", None),
+            extra_config: Self::area(window, cx, "Config JSON (passed as -c <file>)", None),
+            extra_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -3122,6 +3234,159 @@ impl ConfigForm {
                 Some(&guided_prefill_value(params, &["client_version"])),
             ),
             ssh_open: Rc::new(RefCell::new(false)),
+            snell_psk: Self::secret_field(
+                window,
+                cx,
+                "PSK",
+                Some(&guided_prefill_value(params, &["psk"])),
+            ),
+            snell_version: Self::panel_select(
+                window,
+                cx,
+                snell_version_choices(),
+                &guided_prefill_value(params, &["version"]),
+            ),
+            snell_obfs_mode: Self::field(
+                window,
+                cx,
+                "Obfs mode",
+                Some(&guided_prefill_value(params, &["obfs_mode", "obfs"])),
+            ),
+            snell_obfs_host: Self::field(
+                window,
+                cx,
+                "Obfs host",
+                Some(&guided_prefill_value(params, &["obfs_host", "obfs-host"])),
+            ),
+            snell_userkey: Self::field(
+                window,
+                cx,
+                "User key",
+                Some(&guided_prefill_value(params, &["userkey"])),
+            ),
+            snell_reuse: Rc::new(RefCell::new(guided_prefill_bool(params, &["reuse"]))),
+            snell_network: Self::field(
+                window,
+                cx,
+                "Network",
+                Some(&guided_prefill_value(params, &["network"])),
+            ),
+            snell_mode: Self::field(
+                window,
+                cx,
+                "Mode",
+                Some(&guided_prefill_value(params, &["mode"])),
+            ),
+            snell_open: Rc::new(RefCell::new(false)),
+            shadowtls_version: Self::panel_select(
+                window,
+                cx,
+                shadowtls_version_choices(),
+                &guided_prefill_value(params, &["version"]),
+            ),
+            shadowtls_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            shadowtls_open: Rc::new(RefCell::new(false)),
+            xray_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            xray_enc: Self::field(
+                window,
+                cx,
+                "Encryption (default none)",
+                Some(&guided_prefill_value(params, &["encryption"])),
+            ),
+            xray_flow: Self::panel_select(
+                window,
+                cx,
+                xray_flow_choices(),
+                &guided_prefill_value(params, &["flow"]),
+            ),
+            xray_sni: Self::field(
+                window,
+                cx,
+                "SNI",
+                Some(&guided_prefill_value(params, &["sni"])),
+            ),
+            xray_fp: Self::panel_select(
+                window,
+                cx,
+                fp_choices(),
+                &guided_prefill_value(params, &["fp", "fingerprint"]),
+            ),
+            xray_alpn: Self::field(
+                window,
+                cx,
+                "ALPN (comma list)",
+                Some(&guided_prefill_value(params, &["alpn"])),
+            ),
+            xray_pbk: Self::field(
+                window,
+                cx,
+                "REALITY public key (pbk)",
+                Some(&guided_prefill_value(params, &["pbk"])),
+            ),
+            xray_sid: Self::field(
+                window,
+                cx,
+                "REALITY short id (sid)",
+                Some(&guided_prefill_value(params, &["sid"])),
+            ),
+            xray_spiderx: Self::field(
+                window,
+                cx,
+                "REALITY spiderX path",
+                Some(&guided_prefill_value(params, &["spiderx"])),
+            ),
+            xray_network: Self::panel_select(
+                window,
+                cx,
+                xray_network_choices(),
+                &guided_prefill_value(params, &["network"]),
+            ),
+            xray_mode: Self::field(
+                window,
+                cx,
+                "Mode",
+                Some(&guided_prefill_value(params, &["mode"])),
+            ),
+            xray_mux: Self::panel_select(
+                window,
+                cx,
+                xray_mux_choices(),
+                &guided_prefill_value(params, &["xray_mux"]),
+            ),
+            xray_open: Rc::new(RefCell::new(false)),
+            chain_hops: Rc::new(RefCell::new(chain_nodes_of(params))),
+            chain_pick: Self::panel_select(window, cx, chain_pick_choices(&[]), ""),
+            chain_library: Rc::new(RefCell::new(Vec::new())),
+            chain_open: Rc::new(RefCell::new(false)),
+            extra_exe: Self::field(
+                window,
+                cx,
+                "Executable (app dir file name)",
+                Some(&guided_prefill_value(params, &["exe", "binary"])),
+            ),
+            extra_args: Self::field(
+                window,
+                cx,
+                "Args",
+                Some(&guided_prefill_value(params, &["args"])),
+            ),
+            extra_config: Self::area(
+                window,
+                cx,
+                "Config JSON (passed as -c <file>)",
+                Some(&extra_config_prefill(params)),
+            ),
+            extra_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(true)),
         }
     }
@@ -5056,6 +5321,523 @@ impl ConfigForm {
         )
     }
 
+    /// Config-completeness T07: Snell guided page — masked psk secret +
+    /// version picker + obfs_mode/host + userkey + reuse Switch + network +
+    /// mode texts, plus the shared S4 panel. Engine-driven list (the Throne
+    /// source snapshot has zero `snell` hits, so there is no Throne editor to
+    /// copy — fields come from `engine.rs` + `import.rs`). Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn snell_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let reuse_cell = self.snell_reuse.clone();
+        let reuse_repaint = repaint.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("PSK".to_string()).child(
+                    div()
+                        .id("snell-psk")
+                        .test_support()
+                        .child(Input::new(&self.snell_psk).mask_toggle()),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Version",
+                "snell-version-tip",
+                "Snell version (blank leaves the engine default 4)",
+                "snell-version",
+                "Snell version",
+                &self.snell_version,
+            ))
+            .child(
+                field().label("Obfs mode".to_string()).child(
+                    div()
+                        .id("snell-obfs-mode")
+                        .test_support()
+                        .child(Input::new(&self.snell_obfs_mode)),
+                ),
+            )
+            .child(
+                field().label("Obfs host".to_string()).child(
+                    div()
+                        .id("snell-obfs-host")
+                        .test_support()
+                        .child(Input::new(&self.snell_obfs_host)),
+                ),
+            )
+            .child(
+                field().label("User key".to_string()).child(
+                    div()
+                        .id("snell-userkey")
+                        .test_support()
+                        .child(Input::new(&self.snell_userkey)),
+                ),
+            )
+            .child(
+                field().label("Network".to_string()).child(
+                    div()
+                        .id("snell-network")
+                        .test_support()
+                        .child(Input::new(&self.snell_network)),
+                ),
+            )
+            .child(
+                field().label("Mode".to_string()).child(
+                    div()
+                        .id("snell-mode")
+                        .test_support()
+                        .child(Input::new(&self.snell_mode)),
+                ),
+            );
+        block = block.child(
+            field().label_indent(false).child(
+                div().id("snell-reuse").test_support().child(
+                    Switch::new("snell-reuse-switch")
+                        .small()
+                        .checked(*self.snell_reuse.borrow())
+                        .label("Reuse")
+                        .tooltip("Reuse sessions for snell (folds the reuse flat)")
+                        .accessibility_label("Reuse sessions for snell")
+                        .on_change(move |next: &bool, window, cx| {
+                            *reuse_cell.borrow_mut() = *next;
+                            reuse_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("snell-notes").test_support().child(
+                "Snell serves version 4 when blank; 6 needs a v6 peer. \
+                 Obfs/userkey/reuse/network/mode ride the snell outbound — check judges their shapes.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Snell settings",
+            "snell-section-caption",
+            "snell-section-toggle",
+            "snell-section",
+            &self.snell_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: ShadowTLS guided page (version picker 1|2|3
+    /// with password text, plus the shared S2-forced and S4 panels). Rendered
+    /// only while the live protocol is `shadowtls`. Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn shadowtls_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(Self::panel_select_row(
+                "Version",
+                "shadowtls-version-tip",
+                "ShadowTLS version (blank takes the schema default 1; v1 rows omit the password)",
+                "shadowtls-version",
+                "ShadowTLS version",
+                &self.shadowtls_version,
+            ))
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("shadowtls-password")
+                        .test_support()
+                        .child(Input::new(&self.shadowtls_password).mask_toggle()),
+                ),
+            );
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("shadowtls-notes").test_support().child(
+                "ShadowTLS runs TLS always-on (security locked tls). Version blank takes \
+                 the schema default 1; v1 rows omit the password.",
+            ),
+        ));
+        Self::page_disclosure(
+            "ShadowTLS settings",
+            "shadowtls-section-caption",
+            "shadowtls-section-toggle",
+            "shadowtls-section",
+            &self.shadowtls_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: Xray-VLESS Ph1 guided page (uuid with uuidgen,
+    /// encryption, flow picker, sni/fp/alpn, REALITY pbk/sid/spiderx,
+    /// Xray-network picker, mode text, xray-mux picker). No shared panels
+    /// (the bridge serves the Ph1 subset, so S4 dial keys would be dead there;
+    /// the footer says what stays JSON-only). Ph2-only keys already in the
+    /// box are preserved untouched (never stripped). Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn xray_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        _cx: &App,
+    ) -> impl IntoElement {
+        let _ = repaint;
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.uuid_row(view, &self.xray_uuid, "xray"));
+        block = block
+            .child(
+                field().label("Encryption".to_string()).child(
+                    div()
+                        .id("xray-enc")
+                        .test_support()
+                        .child(Input::new(&self.xray_enc)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Flow",
+                "xray-flow-tip",
+                "Xray flow (blank leaves the default)",
+                "xray-flow",
+                "Xray flow",
+                &self.xray_flow,
+            ))
+            .child(
+                field().label("SNI".to_string()).child(
+                    div()
+                        .id("xray-sni")
+                        .test_support()
+                        .child(Input::new(&self.xray_sni)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Fingerprint",
+                "xray-fp-tip",
+                "Xray fingerprint (blank leaves the default)",
+                "xray-fp",
+                "Xray fingerprint",
+                &self.xray_fp,
+            ))
+            .child(
+                field().label("ALPN (comma list)".to_string()).child(
+                    div()
+                        .id("xray-alpn")
+                        .test_support()
+                        .child(Input::new(&self.xray_alpn)),
+                ),
+            )
+            .child(
+                field().label("REALITY public key (pbk)".to_string()).child(
+                    div()
+                        .id("xray-pbk")
+                        .test_support()
+                        .child(Input::new(&self.xray_pbk)),
+                ),
+            )
+            .child(
+                field().label("REALITY short id (sid)".to_string()).child(
+                    div()
+                        .id("xray-sid")
+                        .test_support()
+                        .child(Input::new(&self.xray_sid)),
+                ),
+            )
+            .child(
+                field().label("REALITY spiderX path".to_string()).child(
+                    div()
+                        .id("xray-spiderx")
+                        .test_support()
+                        .child(Input::new(&self.xray_spiderx)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Network",
+                "xray-network-tip",
+                "Xray stream network (raw|xhttp|ws|httpupgrade|grpc)",
+                "xray-network",
+                "Xray network",
+                &self.xray_network,
+            ))
+            .child(
+                field().label("Mode".to_string()).child(
+                    div()
+                        .id("xray-mode")
+                        .test_support()
+                        .child(Input::new(&self.xray_mode)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Mux",
+                "xray-mux-tip",
+                "Xray mux (Keep default leaves the sidecar default)",
+                "xray-mux",
+                "Xray mux",
+                &self.xray_mux,
+            ));
+        block = block.child(field().label_indent(false).child(
+            div().id("xray-notes").test_support().child(
+                "Ph1 subset only — XHTTP/xmux/session keys (xPaddingBytes, maxConcurrency, \
+                 downloadSettings…) stay JSON-only and are preserved, never stripped.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Xray settings",
+            "xray-section-caption",
+            "xray-section-toggle",
+            "xray-section",
+            &self.xray_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: chain hop-list editor — ordered hop rows
+    /// (name + protocol labels, per-hop Replace/Remove) plus the library
+    /// picker + Add, with Throne rejection rules (no chain hops, at most one
+    /// extracore hop at index 0 — refusals toast naming the rule). Empty hops
+    /// render a kit `Empty`, never a hand-rolled placeholder. Same kit set
+    /// and outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn chain_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        _cx: &App,
+    ) -> impl IntoElement {
+        let hops = self.chain_hops.borrow().clone();
+        let library = self.chain_library.borrow().clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(Self::panel_select_row(
+            "Hop from library",
+            "chain-pick-tip",
+            "Add or replace hops from your row list (chain and off-index-0 extracore hops are rejected)",
+            "chain-pick",
+            "Chain hop from library",
+            &self.chain_pick,
+        ));
+        {
+            let add_view = view.clone();
+            let add_hops = self.chain_hops.clone();
+            let add_library = self.chain_library.clone();
+            let add_pick = self.chain_pick.clone();
+            let add_repaint = repaint.clone();
+            block = block.child(
+                field().label_indent(false).child(
+                    div().id("chain-hop-add-row").test_support().child(
+                        Button::new("chain-hop-add")
+                            .small()
+                            .label("Add hop")
+                            .tooltip("Append the picked row to the chain")
+                            .accessibility_label("Add the picked row to the chain")
+                            .on_click(move |_, window, cx| {
+                                let picked = add_pick.read(cx).selected_value().cloned();
+                                let picked = picked.as_deref().unwrap_or("").to_string();
+                                add_view.update(cx, |view, cx| {
+                                    view.chain_add_hop(
+                                        &add_hops,
+                                        &add_library,
+                                        &add_pick,
+                                        &picked,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                                add_repaint(window, cx);
+                            }),
+                    ),
+                ),
+            );
+        }
+        if hops.is_empty() {
+            block = block.child(
+                div().id("chain-hops-empty").test_support().child(
+                    Empty::new().header(
+                        EmptyHeader::new()
+                            .title(EmptyTitle::new().child("No hops yet"))
+                            .description(EmptyDescription::new().child(
+                                "Add hops from the library — the first hop may be an extra-core row.",
+                            )),
+                    ),
+                ),
+            );
+        } else {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .id("chain-hops-list")
+                .test_support();
+            for (index, node) in hops.iter().enumerate() {
+                let label = chain_hop_label(node, index, &library);
+                let replace_view = view.clone();
+                let replace_hops = self.chain_hops.clone();
+                let replace_library = self.chain_library.clone();
+                let replace_pick = self.chain_pick.clone();
+                let replace_repaint = repaint.clone();
+                let remove_hops = self.chain_hops.clone();
+                let remove_repaint = repaint.clone();
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id(format!("chain-hop-{index}"))
+                                .test_support()
+                                .child(Label::new(label)),
+                        )
+                        .child(
+                            Button::new(format!("chain-hop-replace-{index}"))
+                                .small()
+                                .label("Replace")
+                                .tooltip("Replace this hop with the picked row")
+                                .accessibility_label(format!("Replace hop {}", index + 1))
+                                .on_click(move |_, window, cx| {
+                                    let picked = replace_pick.read(cx).selected_value().cloned();
+                                    let picked = picked.as_deref().unwrap_or("").to_string();
+                                    replace_view.update(cx, |view, cx| {
+                                        view.chain_replace_hop(
+                                            &replace_hops,
+                                            &replace_library,
+                                            &replace_pick,
+                                            index,
+                                            &picked,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    replace_repaint(window, cx);
+                                }),
+                        )
+                        .child(
+                            Button::new(format!("chain-hop-remove-{index}"))
+                                .small()
+                                .label("Remove")
+                                .tooltip("Remove this hop from the chain")
+                                .accessibility_label(format!("Remove hop {}", index + 1))
+                                .on_click(move |_, window, cx| {
+                                    let mut hops = remove_hops.borrow_mut();
+                                    if index < hops.len() {
+                                        hops.remove(index);
+                                    }
+                                    drop(hops);
+                                    remove_repaint(window, cx);
+                                }),
+                        ),
+                );
+            }
+            block = block.child(list);
+        }
+        block = block.child(field().label_indent(false).child(
+            div().id("chain-notes").test_support().child(
+                "V1 chains are flat: no chain hops; at most one extra-core hop, first only. \
+                 Extra/Custom/Xray hops must be last — the engine names violations at start.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Chain settings",
+            "chain-section-caption",
+            "chain-section-toggle",
+            "chain-section",
+            &self.chain_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: extra-core picker page — exe path text +
+    /// Browse (fills the path, never reads the binary) + args text + config
+    /// textarea. Deliberately no `no_logs` control anywhere (Throne
+    /// non-persist bug — never copied). Same kit set and outer-disclosure
+    /// contract as [`ConfigForm::socks_block`].
+    fn extra_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let _ = (repaint, cx);
+        let browse_view = view.clone();
+        let browse_path = self.extra_exe.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field()
+                    .label("Executable (app dir file name)".to_string())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("extra-exe")
+                                    .test_support()
+                                    .child(Input::new(&self.extra_exe)),
+                            )
+                            .child(
+                                Button::new("extra-exe-browse")
+                                    .small()
+                                    .label("Browse…")
+                                    .tooltip("Pick the sidecar executable — fills the path")
+                                    .accessibility_label("Browse for the extra-core executable")
+                                    .on_click(move |_, window, cx| {
+                                        browse_view.update(cx, |view, cx| {
+                                            view.browse_for_extra_exe(
+                                                browse_path.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                field().label("Args".to_string()).child(
+                    div()
+                        .id("extra-args")
+                        .test_support()
+                        .child(Input::new(&self.extra_args)),
+                ),
+            )
+            .child(
+                field()
+                    .label("Config (passed as -c <file>)".to_string())
+                    .child(
+                        div()
+                            .id("extra-config")
+                            .test_support()
+                            .child(Textarea::new(&self.extra_config).h(px(96.))),
+                    ),
+            );
+        block = block.child(field().label_indent(false).child(
+            div().id("extra-notes").test_support().child(
+                "Spawned unprivileged as <exe> -c <config-file> (v1 convention — extra flags \
+                 ride args with the row). Validate checks exe + config shape before commit; \
+                 there is no logs toggle by design.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Extra-core settings",
+            "extra-section-caption",
+            "extra-section-toggle",
+            "extra-section",
+            &self.extra_open,
+            view,
+            block,
+        )
+    }
+
     /// Config-completeness T02: VLESS guided page — inner fields plus the
     /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
     /// `open`, no motion id — closed content unmounts, entities persist, so
@@ -5166,6 +5948,7 @@ impl ConfigForm {
         let template_form = self.clone();
         let validate_view = view.clone();
         let validate_params = self.params.clone();
+        let validate_form = self.clone();
         let expanded = *self.advanced.borrow();
         // Pre-clone for the toggle buttons (both placements borrow this,
         // never `self` — the assembly below moves `self`'s fields).
@@ -5203,6 +5986,13 @@ impl ConfigForm {
                 "anytls" => Some(self.anytls_block(&view, &repaint, cx).into_any_element()),
                 "naive" => Some(self.naive_block(&view, &repaint, cx).into_any_element()),
                 "ssh" => Some(self.ssh_block(&view, &repaint, cx).into_any_element()),
+                // Config-completeness T07: edge pages (Snell/ShadowTLS engine
+                // shapes, Xray Ph1 subset, chain hops, extra-core picker).
+                "snell" => Some(self.snell_block(&view, &repaint, cx).into_any_element()),
+                "shadowtls" => Some(self.shadowtls_block(&view, &repaint, cx).into_any_element()),
+                "xray" => Some(self.xray_block(&view, &repaint, cx).into_any_element()),
+                "chain" => Some(self.chain_block(&view, &repaint, cx).into_any_element()),
+                "extra-core" => Some(self.extra_block(&view, &repaint, cx).into_any_element()),
                 _ => None,
             }
         };
@@ -5266,7 +6056,13 @@ impl ConfigForm {
                     .child(Button::new("params-validate").label("Validate").on_click(
                         move |_, window, cx| {
                             validate_view.update(cx, |view, cx| {
-                                view.validate_dialog_params(&validate_params, window, cx);
+                                let protocol = validate_form.protocol_text(cx);
+                                view.validate_dialog_params(
+                                    &validate_params,
+                                    &protocol,
+                                    window,
+                                    cx,
+                                );
                             });
                         },
                     )),
@@ -5543,6 +6339,10 @@ impl ConfigForm {
     /// Config-completeness T06: socks/ssh take S4 alone, http/https take
     /// S2-optional + S4, anytls/naive take S2-forced + S4 (see
     /// [`ConfigForm::effective_params`]).
+    /// Config-completeness T07: snell takes S4 alone, shadowtls takes
+    /// S2-forced + S4, xray/chain/extra-core take no shared panels (the xray
+    /// bridge serves the Ph1 subset — S4 dial keys would be dead there; the
+    /// chain/extra rows carry no endpoint tuning).
     fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -5650,6 +6450,21 @@ impl ConfigForm {
                 let params = fold_ssh_into_params(&params, &self.ssh_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
             }
+            // Config-completeness T07: edge pages fold exactly what they
+            // render (same scoping rule as T06 — never smear keys onto
+            // foreign rows).
+            "snell" => {
+                let params = fold_snell_into_params(&params, &self.snell_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "shadowtls" => {
+                let params = fold_shadowtls_into_params(&params, &self.shadowtls_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "xray" => fold_xray_into_params(&params, &self.xray_fold(cx)),
+            "chain" => fold_chain_nodes_into_params(&params, &self.chain_hops.borrow()),
+            "extra-core" => fold_extra_into_params(&params, &self.extra_fold(cx)),
             _ => params,
         }
     }
@@ -5891,6 +6706,59 @@ impl ConfigForm {
         }
     }
 
+    /// Config-completeness T07: Snell inner UI state as a store fold. The
+    /// version picker falls back to blank (engine default 4 — never
+    /// fabricated, contract C2).
+    fn snell_fold(&self, cx: &App) -> SnellFold {
+        SnellFold {
+            psk: self.snell_psk.read(cx).value().to_string(),
+            version: Self::panel_value(&self.snell_version, cx, ""),
+            obfs_mode: self.snell_obfs_mode.read(cx).value().to_string(),
+            obfs_host: self.snell_obfs_host.read(cx).value().to_string(),
+            userkey: self.snell_userkey.read(cx).value().to_string(),
+            reuse: *self.snell_reuse.borrow(),
+            network: self.snell_network.read(cx).value().to_string(),
+            mode: self.snell_mode.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T07: ShadowTLS inner UI state as a store fold
+    /// (version keep-blank, password text — the page adds S2-forced + S4).
+    fn shadowtls_fold(&self, cx: &App) -> ShadowTlsFold {
+        ShadowTlsFold {
+            version: Self::panel_value(&self.shadowtls_version, cx, ""),
+            password: self.shadowtls_password.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T07: Xray-VLESS Ph1 UI state as a store fold. All
+    /// three pickers fall back to blank (never fabricated — contract C2).
+    fn xray_fold(&self, cx: &App) -> XrayFold {
+        XrayFold {
+            uuid: self.xray_uuid.read(cx).value().to_string(),
+            encryption: self.xray_enc.read(cx).value().to_string(),
+            flow: Self::panel_value(&self.xray_flow, cx, ""),
+            sni: self.xray_sni.read(cx).value().to_string(),
+            fp: Self::panel_value(&self.xray_fp, cx, ""),
+            alpn: self.xray_alpn.read(cx).value().to_string(),
+            pbk: self.xray_pbk.read(cx).value().to_string(),
+            sid: self.xray_sid.read(cx).value().to_string(),
+            spiderx: self.xray_spiderx.read(cx).value().to_string(),
+            network: Self::panel_value(&self.xray_network, cx, ""),
+            mode: self.xray_mode.read(cx).value().to_string(),
+            mux: Self::panel_value(&self.xray_mux, cx, ""),
+        }
+    }
+
+    /// Config-completeness T07: extra-core inner UI state as a store fold.
+    fn extra_fold(&self, cx: &App) -> ExtraFold {
+        ExtraFold {
+            exe: self.extra_exe.read(cx).value().to_string(),
+            args: self.extra_args.read(cx).value().to_string(),
+            config: self.extra_config.read(cx).value().to_string(),
+        }
+    }
+
     /// Config-completeness T05: S2-forced UI state as a store fold — the
     /// shared S2 entities (the enable cell never renders on forced pages, so
     /// it never folds there either).
@@ -6003,6 +6871,11 @@ impl ConfigForm {
                 | "anytls"
                 | "naive"
                 | "ssh"
+                | "snell"
+                | "shadowtls"
+                | "xray"
+                | "chain"
+                | "extra-core"
         );
         if page {
             match protocol.as_str() {
@@ -6101,6 +6974,26 @@ impl ConfigForm {
                     merged = fold_ssh_into_params(&merged, &self.ssh_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
                 }
+                // Config-completeness T07: edge pages merge exactly what
+                // their pages render (same scoping as `effective_params`).
+                "snell" => {
+                    merged = fold_snell_into_params(&merged, &self.snell_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "shadowtls" => {
+                    merged = fold_shadowtls_into_params(&merged, &self.shadowtls_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "xray" => {
+                    merged = fold_xray_into_params(&merged, &self.xray_fold(cx));
+                }
+                "chain" => {
+                    merged = fold_chain_nodes_into_params(&merged, &self.chain_hops.borrow());
+                }
+                "extra-core" => {
+                    merged = fold_extra_into_params(&merged, &self.extra_fold(cx));
+                }
                 _ => {}
             }
         }
@@ -6166,11 +7059,17 @@ impl ConfigForm {
             // Config-completeness T06: anytls/naive join the forced set;
             // http/https merge the optional-S2 panel but never S1; socks/ssh
             // merge no shared panel (S4 alone).
+            // Config-completeness T07: shadowtls joins the forced set; snell /
+            // xray / chain / extra-core merge no shared panel (S4 alone for
+            // snell, none for the rest).
             let forced_tls = matches!(
                 protocol,
-                "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive"
+                "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls"
             );
-            let inner_only = matches!(protocol, "socks" | "ssh");
+            let inner_only = matches!(
+                protocol,
+                "socks" | "ssh" | "snell" | "xray" | "chain" | "extra-core"
+            );
             let no_transport = matches!(protocol, "http" | "https");
             if !forced_tls && !inner_only && !no_transport {
                 texts.extend([
@@ -6273,6 +7172,55 @@ impl ConfigForm {
                 // The key blob area is a `TextareaState`, not an `InputState`
                 // (it cannot ride the `texts` vec) — cleared the same way.
                 self.ssh_private_key.update(cx, |state, cx| {
+                    state.set_value(String::new(), window, cx);
+                });
+            }
+            // Config-completeness T07: edge pages reset exactly what their
+            // pages merged (shared-panel scope above mirrors the same rule).
+            // The chain hop cell is deliberately NOT reset here: the fold is
+            // idempotent, so keeping it makes the expand→commit path refold
+            // byte-identical instead of wiping merged hops (the collapse echo
+            // below re-syncs it from the box instead).
+            "snell" => {
+                texts.extend([
+                    &self.snell_psk,
+                    &self.snell_obfs_mode,
+                    &self.snell_obfs_host,
+                    &self.snell_userkey,
+                    &self.snell_network,
+                    &self.snell_mode,
+                ]);
+                selects.extend([(&self.snell_version, "")]);
+                cells.push(&self.snell_reuse);
+            }
+            "shadowtls" => {
+                texts.push(&self.shadowtls_password);
+                selects.extend([(&self.shadowtls_version, "")]);
+            }
+            "xray" => {
+                texts.extend([
+                    &self.xray_uuid,
+                    &self.xray_enc,
+                    &self.xray_sni,
+                    &self.xray_alpn,
+                    &self.xray_pbk,
+                    &self.xray_sid,
+                    &self.xray_spiderx,
+                    &self.xray_mode,
+                ]);
+                selects.extend([
+                    (&self.xray_flow, ""),
+                    (&self.xray_fp, ""),
+                    (&self.xray_network, ""),
+                    (&self.xray_mux, ""),
+                ]);
+            }
+            "chain" => {}
+            "extra-core" => {
+                texts.extend([&self.extra_exe, &self.extra_args]);
+                // The config area is a `TextareaState` — cleared like the ssh
+                // key blob above.
+                self.extra_config.update(cx, |state, cx| {
                     state.set_value(String::new(), window, cx);
                 });
             }
@@ -6405,6 +7353,11 @@ impl ConfigForm {
                 | "anytls"
                 | "naive"
                 | "ssh"
+                | "snell"
+                | "shadowtls"
+                | "xray"
+                | "chain"
+                | "extra-core"
         ) {
             self.echo_panels(window, cx, &box_text, &protocol);
         }
@@ -6437,9 +7390,11 @@ impl ConfigForm {
         // inputs (never the enable toggle or S1 — those ride other pages).
         // Config-completeness T06: anytls/naive join the forced set;
         // http/https echo the full optional-S2 panel (enable included).
+        // Config-completeness T07: shadowtls joins the forced set (S2
+        // credentials echo; the enable toggle rides other pages).
         let forced_tls = matches!(
             protocol,
-            "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive"
+            "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls"
         );
         let optional_tls = matches!(protocol, "http" | "https");
         if full_panels {
@@ -6548,6 +7503,33 @@ impl ConfigForm {
                 ),
                 (&self.ssh_client_version, &["client_version"][..]),
             ],
+            // Config-completeness T07: edge inner texts echo on blank inputs
+            // only (same rule). The extra config area echoes through its own
+            // reader below (stored objects read as JSON text); chain hops
+            // re-sync from the box unconditionally (see below).
+            "snell" => &[
+                (&self.snell_psk, &["psk"][..]),
+                (&self.snell_obfs_mode, &["obfs_mode", "obfs"][..]),
+                (&self.snell_obfs_host, &["obfs_host", "obfs-host"][..]),
+                (&self.snell_userkey, &["userkey"][..]),
+                (&self.snell_network, &["network"][..]),
+                (&self.snell_mode, &["mode"][..]),
+            ],
+            "shadowtls" => &[(&self.shadowtls_password, &["password"][..])],
+            "xray" => &[
+                (&self.xray_uuid, &["uuid", "id"][..]),
+                (&self.xray_enc, &["encryption"][..]),
+                (&self.xray_sni, &["sni"][..]),
+                (&self.xray_alpn, &["alpn"][..]),
+                (&self.xray_pbk, &["pbk"][..]),
+                (&self.xray_sid, &["sid"][..]),
+                (&self.xray_spiderx, &["spiderx"][..]),
+                (&self.xray_mode, &["mode"][..]),
+            ],
+            "extra-core" => &[
+                (&self.extra_exe, &["exe", "binary"][..]),
+                (&self.extra_args, &["args"][..]),
+            ],
             // Config-completeness T04: WG peer/net rows echo on both pages
             // (separate entities per page — T03 scoping).
             "wireguard" => &[
@@ -6654,6 +7636,30 @@ impl ConfigForm {
                 });
             }
         }
+        // Config-completeness T07: the extra config area echoes through its
+        // reader (stored objects read as JSON text) — blank inputs only.
+        if protocol == "extra-core" {
+            let config_value = extra_config_prefill(box_text);
+            let config_blank = self
+                .extra_config
+                .read(cx)
+                .value()
+                .to_string()
+                .trim()
+                .is_empty();
+            if config_blank && !config_value.is_empty() {
+                self.extra_config.update(cx, |state, cx| {
+                    state.set_value(config_value.clone(), window, cx);
+                });
+            }
+        }
+        // Config-completeness T07: the hop cell always re-syncs from the box
+        // on collapse (hand-edited box JSON wins — expanding always merges
+        // first, so no unmerged editor typing can be clobbered; and the cell
+        // is never cleared, so the expand→commit path refolds idempotently).
+        if protocol == "chain" {
+            *self.chain_hops.borrow_mut() = chain_nodes_of(box_text);
+        }
         // Config-completeness T06: the socks network echoes S1-rule (the
         // default counts as blank, like the transport pages).
         if protocol == "socks" {
@@ -6734,6 +7740,17 @@ impl ConfigForm {
                 &["quic_congestion_control", "congestion_control"][..],
                 "",
             )],
+            // Config-completeness T07: edge dropdowns echo the same way (a
+            // non-pickable spelling echoes as no selection and round-trips
+            // byte-identical — the folds never strip).
+            "snell" => &[(&self.snell_version, &["version"][..], "")],
+            "shadowtls" => &[(&self.shadowtls_version, &["version"][..], "")],
+            "xray" => &[
+                (&self.xray_flow, &["flow"][..], ""),
+                (&self.xray_fp, &["fp", "fingerprint"][..], ""),
+                (&self.xray_network, &["network"][..], ""),
+                (&self.xray_mux, &["xray_mux"][..], ""),
+            ],
             _ => &[],
         };
         for (entity, keys, default) in inner_selects {
@@ -9777,6 +10794,172 @@ fn ssh_key_pick_error(path: &str) -> String {
     format!("SSH key file unreadable: {path} (check the path and pick again)")
 }
 
+/// Config-completeness T07: Snell versions the engine maps (exactly
+/// [`crate::store::SNELL_VERSIONS`]) behind one blank row (keep-blank —
+/// blank leaves the engine default 4, contract C2).
+fn snell_version_choices() -> Vec<PanelChoice> {
+    use crate::store::SNELL_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 4)")];
+    for version in SNELL_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("snell-version-option", &items)
+}
+
+/// Config-completeness T07: ShadowTLS versions the engine maps (exactly
+/// [`crate::store::SHADOWTLS_VERSIONS`]) behind one blank row (keep-blank —
+/// blank leaves the schema default 1; import omits it on v1 rows).
+fn shadowtls_version_choices() -> Vec<PanelChoice> {
+    use crate::store::SHADOWTLS_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 1)")];
+    for version in SHADOWTLS_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("shadowtls-version-option", &items)
+}
+
+/// Config-completeness T07: Xray stream networks (exactly
+/// [`crate::store::XRAY_NETWORKS`]) behind one blank row (keep-blank — no
+/// fabricated default; the sidecar judges).
+fn xray_network_choices() -> Vec<PanelChoice> {
+    use crate::store::XRAY_NETWORKS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select network…")];
+    for network in XRAY_NETWORKS {
+        items.push((network, network));
+    }
+    panel_choices("xray-network-option", &items)
+}
+
+/// Config-completeness T07: Xray VLESS flows (exactly
+/// [`crate::store::XRAY_FLOWS`]) behind one blank row (keep-blank — blank
+/// leaves the default, like the sing-box flow picker).
+fn xray_flow_choices() -> Vec<PanelChoice> {
+    use crate::store::XRAY_FLOWS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Default (no flow)")];
+    for flow in XRAY_FLOWS {
+        items.push((flow, flow));
+    }
+    panel_choices("xray-flow-option", &items)
+}
+
+/// Config-completeness T07: Xray mux modes (exactly
+/// [`crate::store::XRAY_MUX_MODES`]) behind one blank Keep-Default row (the
+/// blank stands for default — the fold never fabricates nor strips).
+fn xray_mux_choices() -> Vec<PanelChoice> {
+    use crate::store::XRAY_MUX_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Keep default")];
+    for mode in XRAY_MUX_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("xray-mux-option", &items)
+}
+
+/// Config-completeness T07: one chain-library row for the hop picker —
+/// values are row ids (stable, never reused); titles read `name (protocol)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainLibraryEntry {
+    id: String,
+    name: String,
+    protocol: String,
+}
+
+/// Config-completeness T07: hop-picker rows for the chain library — one blank
+/// "Select a row…" head plus one row per library entry (id values, human
+/// titles). Rebuilt with the row list at dialog open; the blank form keeps
+/// the head only.
+fn chain_pick_choices(library: &[ChainLibraryEntry]) -> Vec<PanelChoice> {
+    let mut owned: Vec<(String, String)> = Vec::with_capacity(library.len() + 1);
+    owned.push((String::new(), "Select a row…".to_string()));
+    for entry in library {
+        owned.push((
+            entry.id.clone(),
+            format!("{} ({})", entry.name, entry.protocol),
+        ));
+    }
+    let items: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(value, title)| (value.as_str(), title.as_str()))
+        .collect();
+    panel_choices("chain-pick-option", &items)
+}
+
+/// Config-completeness T07: chain→rule mapping for one hop candidate —
+/// canonical protocol to the [`ChainHopSlot`] the rejection rule matches on
+/// (`autoselector` has no row type here — matched literally so the Throne
+/// rule holds verbatim even for hand JSON).
+fn chain_slot_kind(protocol: &str) -> ChainHopSlot {
+    use crate::engine::{is_chain_protocol, is_extra_core_protocol};
+    if protocol.trim().eq_ignore_ascii_case("autoselector") {
+        return ChainHopSlot::Autoselector;
+    }
+    if is_chain_protocol(protocol) {
+        ChainHopSlot::Chain
+    } else if is_extra_core_protocol(protocol) {
+        ChainHopSlot::Extra
+    } else {
+        ChainHopSlot::Other
+    }
+}
+
+/// Config-completeness T07: kinds of the current editor hops in order —
+/// id references resolve through the library (unknown ids read `Other` —
+/// the engine names them at generate), inline objects classify by their
+/// `type`/`protocol` marker. Pure so headless tests pin it without a dialog.
+fn chain_existing_kinds(
+    hops: &[serde_json::Value],
+    library: &[ChainLibraryEntry],
+) -> Vec<ChainHopSlot> {
+    hops.iter()
+        .map(|node| match node {
+            serde_json::Value::String(id) => library
+                .iter()
+                .find(|entry| entry.id == id.trim())
+                .map(|entry| chain_slot_kind(&entry.protocol))
+                .unwrap_or(ChainHopSlot::Other),
+            serde_json::Value::Object(map) => {
+                let marker = map
+                    .get("type")
+                    .or_else(|| map.get("protocol"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                chain_slot_kind(marker)
+            }
+            _ => ChainHopSlot::Other,
+        })
+        .collect()
+}
+
+/// Config-completeness T07: one hop row label — id references show the
+/// library `name (protocol)` (bare id when unknown — never params contents);
+/// inline objects show their marker + `(inline)`. Pure so headless tests pin
+/// it without a dialog.
+fn chain_hop_label(
+    node: &serde_json::Value,
+    index: usize,
+    library: &[ChainLibraryEntry],
+) -> String {
+    match node {
+        serde_json::Value::String(id) => {
+            let id = id.trim();
+            match library.iter().find(|entry| entry.id == id) {
+                Some(entry) => format!("{}. {} ({})", index + 1, entry.name, entry.protocol),
+                None => format!("{}. {id}", index + 1),
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let marker = map
+                .get("type")
+                .or_else(|| map.get("protocol"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|marker| !marker.is_empty())
+                .unwrap_or("outbound");
+            format!("{}. {marker} (inline)", index + 1)
+        }
+        _ => format!("{}. hop", index + 1),
+    }
+}
+
 /// Config-completeness T04: borrowed entity set for the nine shared
 /// WireGuard peer/net rows — the WG and AWG pages hold separate entities
 /// (T03 protocol-scoping: unmerged typing never crosses pages) but render
@@ -10486,6 +11669,20 @@ impl AppView {
             cx.notify();
             return false;
         }
+        // Config-completeness T07: extra-core rows gate on exe + config shape
+        // at dialog commit (the Validate button surfaces the same errors
+        // pre-commit; the store/import path stays untouched so imported rows
+        // keep landing disabled and failing at start through the engine gate).
+        if input.protocol == "extra-core" {
+            if let Err(reason) = validate_extra_params(&input.params) {
+                *form_error.borrow_mut() = Some(("params".to_string(), reason.clone()));
+                *form.advanced.borrow_mut() = true;
+                form.focus_field("params", window, cx);
+                window.push_notification(Notification::error(reason), cx);
+                cx.notify();
+                return false;
+            }
+        }
         match self.store.add(input) {
             Ok(created) => {
                 *form_error.borrow_mut() = None;
@@ -10580,25 +11777,36 @@ impl AppView {
     fn validate_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
+        protocol: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let current = params.read(cx).value().to_string();
         match validate_params_json(&current) {
-            Ok(()) => {
-                window.push_notification(
-                    Notification::success(if current.trim().is_empty() {
-                        "Params blank — the protocol default applies"
-                    } else {
-                        "Params are valid JSON"
-                    }),
-                    cx,
-                );
-            }
+            Ok(()) => {}
             Err(reason) => {
                 window.push_notification(Notification::error(reason), cx);
+                return false;
             }
         }
+        // Config-completeness T07: extra-core rows gate on exe + config shape
+        // (the engine names the same fields at start; the button surfaces
+        // them pre-commit instead). Other protocols keep the JSON-only check.
+        if protocol == "extra-core" {
+            if let Err(reason) = validate_extra_params(&current) {
+                window.push_notification(Notification::error(reason), cx);
+                return false;
+            }
+        }
+        window.push_notification(
+            Notification::success(if current.trim().is_empty() {
+                "Params blank — the protocol default applies"
+            } else {
+                "Params are valid JSON"
+            }),
+            cx,
+        );
+        true
     }
 
     /// Ticket 26: re-read the row at commit. A row deleted while the dialog
@@ -10707,6 +11915,21 @@ impl AppView {
                     window.push_notification(Notification::error(reason), cx);
                     cx.notify();
                     return false;
+                }
+                // Config-completeness T07: extra-core rows gate on exe +
+                // config shape when the dialog actually rewrote params
+                // (untouched legacy rows pass through; the store/import path
+                // stays untouched — see `commit_add_with_focus`).
+                if patch.params.is_some() && existing.protocol == "extra-core" {
+                    let params = patch.params.as_deref().unwrap_or(&existing.params);
+                    if let Err(reason) = validate_extra_params(params) {
+                        *form_error.borrow_mut() = Some(("params".to_string(), reason.clone()));
+                        *form.advanced.borrow_mut() = true;
+                        form.focus_field("params", window, cx);
+                        window.push_notification(Notification::error(reason), cx);
+                        cx.notify();
+                        return false;
+                    }
                 }
                 match self.store.update(id, patch) {
                     Ok(updated) => {
@@ -13776,9 +14999,8 @@ impl AppView {
     }
 
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let form = ConfigForm::blank(window, cx);
+        let mut form = ConfigForm::blank(window, cx);
         let view = cx.entity();
-        let reader = form.clone();
         // Ticket 31: the shared first-error slot — the commit records it and
         // the builder renders it inline under the fields on the next frame.
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
@@ -13786,6 +15008,19 @@ impl AppView {
         // Ticket 31: rows snapshot for the live bind/port collision warning
         // (a broken database warns nothing — the commit still reports it).
         let rows = self.store.list().unwrap_or_default();
+        // Config-completeness T07: the chain hop picker + labels read this
+        // dialog-open snapshot (id, name, protocol per row).
+        let library: Vec<ChainLibraryEntry> = rows
+            .iter()
+            .map(|row| ChainLibraryEntry {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                protocol: row.protocol.clone(),
+            })
+            .collect();
+        form.chain_library = Rc::new(RefCell::new(library.clone()));
+        form.chain_pick = ConfigForm::panel_select(window, cx, chain_pick_choices(&library), "");
+        let reader = form.clone();
         // Port budget readout rides the dialog (auto-assign draws from it).
         let budget = ConfigForm::port_budget_text(&rows);
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
@@ -13846,14 +15081,13 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = ConfigForm::prefilled(
+        let mut form = ConfigForm::prefilled(
             window,
             cx,
             &config,
             self.store.row_test_url(&config.id).as_deref(),
         );
         let view = cx.entity();
-        let reader = form.clone();
         let id = config.id.clone();
         let title = format!("Edit {}", config.name);
         // Ticket 31: the shared first-error slot (see `open_add_dialog`).
@@ -13862,6 +15096,20 @@ impl AppView {
         // Ticket 31: rows snapshot for the live collision warning; the edited
         // row itself is excluded.
         let rows = self.store.list().unwrap_or_default();
+        // Config-completeness T07: the chain hop picker + labels read this
+        // dialog-open snapshot (the edited row stays listed — adding it back
+        // is refused naming the flat-chain rule).
+        let library: Vec<ChainLibraryEntry> = rows
+            .iter()
+            .map(|row| ChainLibraryEntry {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                protocol: row.protocol.clone(),
+            })
+            .collect();
+        form.chain_library = Rc::new(RefCell::new(library.clone()));
+        form.chain_pick = ConfigForm::panel_select(window, cx, chain_pick_choices(&library), "");
+        let reader = form.clone();
         // Port budget readout rides the dialog (auto-assign draws from it).
         let budget = ConfigForm::port_budget_text(&rows);
         let exclude = id.clone();
@@ -14298,6 +15546,158 @@ impl AppView {
         });
         window.push_notification(
             Notification::success(format!("Loaded SSH key from {path}")),
+            cx,
+        );
+    }
+
+    /// Config-completeness T07: chain hop-list Add behind the editor button —
+    /// resolves the picked id through the library, applies the Throne
+    /// rejection rules (refusals toast naming the rule and change nothing),
+    /// appends the id reference on success and resets the picker. Returns
+    /// whether the hop landed (headless tests pin the state directly).
+    fn chain_add_hop(
+        &mut self,
+        hops: &Rc<RefCell<Vec<serde_json::Value>>>,
+        library: &Rc<RefCell<Vec<ChainLibraryEntry>>>,
+        pick: &Entity<SelectState<PanelChoiceList>>,
+        picked_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let picked_id = picked_id.trim();
+        let entry = library
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == picked_id)
+            .cloned();
+        let Some(entry) = entry else {
+            window.push_notification(
+                Notification::warning("Pick a library row first — hops reference rows by id"),
+                cx,
+            );
+            return false;
+        };
+        let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
+        if let Some(rule) =
+            chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), kinds.len(), false)
+        {
+            window.push_notification(Notification::warning(rule), cx);
+            return false;
+        }
+        hops.borrow_mut()
+            .push(serde_json::Value::String(entry.id.clone()));
+        pick.update(cx, |state, cx| {
+            state.set_selected_value(&String::new(), window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Added {} to the chain", entry.name)),
+            cx,
+        );
+        true
+    }
+
+    /// Config-completeness T07: chain hop-list Replace behind the per-hop
+    /// button — same resolution + rules as
+    /// [`AppView::chain_add_hop`] against the target index (replacing the
+    /// index-0 extracore with another extracore is allowed; anything else
+    /// follows the add rules). Returns whether the hop landed.
+    #[allow(clippy::too_many_arguments)]
+    fn chain_replace_hop(
+        &mut self,
+        hops: &Rc<RefCell<Vec<serde_json::Value>>>,
+        library: &Rc<RefCell<Vec<ChainLibraryEntry>>>,
+        pick: &Entity<SelectState<PanelChoiceList>>,
+        index: usize,
+        picked_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let picked_id = picked_id.trim();
+        let entry = library
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == picked_id)
+            .cloned();
+        let Some(entry) = entry else {
+            window.push_notification(
+                Notification::warning("Pick a library row first — hops reference rows by id"),
+                cx,
+            );
+            return false;
+        };
+        let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
+        if let Some(rule) =
+            chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), index, true)
+        {
+            window.push_notification(Notification::warning(rule), cx);
+            return false;
+        }
+        hops.borrow_mut()[index] = serde_json::Value::String(entry.id.clone());
+        pick.update(cx, |state, cx| {
+            state.set_selected_value(&String::new(), window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Replaced hop {} with {}", index + 1, entry.name)),
+            cx,
+        );
+        true
+    }
+
+    /// Config-completeness T07: extra-core Browse (windowed) — fills the exe
+    /// input with the picked FILE NAME (the engine resolves it in the app
+    /// directory and refuses paths, so the full pick never lands verbatim).
+    /// The binary is never read (unlike the SSH key text). Nothing picked
+    /// changes nothing.
+    fn browse_for_extra_exe(
+        &mut self,
+        path_entity: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        let view = cx.entity();
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                _ => return,
+            };
+            let path = paths.into_iter().next().expect("non-empty checked");
+            let display = path.to_string_lossy().into_owned();
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.finish_extra_exe_pick(path_entity, display, window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Config-completeness T07: extra-core Browse completion (windowed) —
+    /// stores the file name (see [`AppView::browse_for_extra_exe`]) and
+    /// toasts it. Pure enough for headless tests to pin without a picker.
+    fn finish_extra_exe_pick(
+        &mut self,
+        path_entity: Entity<InputState>,
+        display: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stored = std::path::Path::new(&display)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| display.clone());
+        path_entity.update(cx, |state, cx| {
+            state.set_value(stored.clone(), window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Picked extra-core executable {stored}")),
             cx,
         );
     }
@@ -23973,6 +25373,547 @@ mod tests {
             "cc Enter runs no commit (a broken guard would toast the template error)"
         );
         assert_absent(cx, "naive-cc-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: open Add switched to `protocol` through the
+    /// real picker (cursor starts at `vless`, row 0), painted tall.
+    fn t07_open_add_on(view: &Entity<AppView>, cx: &mut VisualTestContext, protocol: &str) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of(protocol);
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+    }
+
+    /// Config-completeness T07: picker tables behind the new dropdowns —
+    /// blank head + every engine-mapped value, nothing else.
+    #[test]
+    fn t07_dropdown_counts() {
+        use crate::store::{
+            SHADOWTLS_VERSIONS, SNELL_VERSIONS, XRAY_FLOWS, XRAY_MUX_MODES, XRAY_NETWORKS,
+        };
+        assert_eq!(SNELL_VERSIONS, ["4", "6"]);
+        assert_eq!(SHADOWTLS_VERSIONS, ["1", "2", "3"]);
+        assert_eq!(XRAY_NETWORKS, ["raw", "xhttp", "ws", "httpupgrade", "grpc"]);
+        assert_eq!(XRAY_FLOWS, ["xtls-rprx-vision", "xtls-rprx-vision-udp443"]);
+        assert_eq!(XRAY_MUX_MODES, ["enabled", "disabled"]);
+        assert_eq!(
+            crate::snell_version_choices().len(),
+            3,
+            "version lists blank + 2"
+        );
+        assert_eq!(
+            crate::shadowtls_version_choices().len(),
+            4,
+            "version lists blank + 3"
+        );
+        assert_eq!(
+            crate::xray_network_choices().len(),
+            6,
+            "network lists blank + 5"
+        );
+        assert_eq!(crate::xray_flow_choices().len(), 3, "flow lists blank + 2");
+        assert_eq!(crate::xray_mux_choices().len(), 3, "mux lists blank + 2");
+    }
+
+    /// Config-completeness T07: Snell Add renders psk + version + obfs/host +
+    /// userkey + reuse + network + mode + S4-only as kit primitives, all with
+    /// pinned ids; no Transport/TLS/Mux panels, nothing from sibling pages.
+    #[gpui_kit::test]
+    fn t07_snell_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "snell");
+        assert_painted(cx, "snell-section-caption");
+        cx.update(|window, cx| {
+            window.click("snell-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "snell-psk",
+            "snell-version",
+            "snell-obfs-mode",
+            "snell-obfs-host",
+            "snell-userkey",
+            "snell-reuse",
+            "snell-network",
+            "snell-mode",
+            "snell-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "shadowtls-version",
+            "xray-uuid",
+            "chain-pick",
+            "extra-exe",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: ShadowTLS Add renders version + password +
+    /// S2-forced + S4 as kit primitives; the TLS panel reads forced (no
+    /// enable toggle page), S1/S3 stay off.
+    #[gpui_kit::test]
+    fn t07_shadowtls_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "shadowtls");
+        assert_painted(cx, "shadowtls-section-caption");
+        cx.update(|window, cx| {
+            window.click("shadowtls-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "shadowtls-version",
+            "shadowtls-password",
+            "shadowtls-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "s1-caption",
+            "s3-caption",
+            "snell-psk",
+            "xray-uuid",
+            "chain-pick",
+            "extra-exe",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: Xray-VLESS Add renders the Ph1 subset (uuid
+    /// +generate, enc, flow, sni/fp/alpn, pbk/sid/spiderx, network, mode, mux)
+    /// with pinned ids and the honest Ph1 footer; no shared panels ride the
+    /// bridge page.
+    #[gpui_kit::test]
+    fn t07_xray_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "xray");
+        assert_painted(cx, "xray-section-caption");
+        cx.update(|window, cx| {
+            window.click("xray-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "xray-uuid",
+            "xray-uuid-generate",
+            "xray-enc",
+            "xray-flow",
+            "xray-sni",
+            "xray-fp",
+            "xray-alpn",
+            "xray-pbk",
+            "xray-sid",
+            "xray-spiderx",
+            "xray-network",
+            "xray-mode",
+            "xray-mux",
+            "xray-notes",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+            "snell-psk",
+            "shadowtls-version",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: edge round-trips at the form level —
+    /// snell/shadowtls/xray/chain/extra rows echo their fields and refold
+    /// byte-identical (no paint needed). The xray case carries Ph2-only keys
+    /// to pin preserve-not-strip through the real echo path.
+    #[gpui_kit::test]
+    fn t07_small_pages_round_trip(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let cases = [
+            (
+                "snell",
+                "{\"type\":\"snell\",\"server\":\"192.0.2.30\",\"server_port\":8080,\
+                \"psk\":\"secret\",\"version\":\"6\",\"obfs_mode\":\"http\",\
+                \"obfs_host\":\"example.com\",\"userkey\":\"key\",\"reuse\":true,\
+                \"network\":\"tcp\",\"mode\":\"multi\"}",
+            ),
+            (
+                "shadowtls",
+                "{\"type\":\"shadowtls\",\"server\":\"192.0.2.31\",\"server_port\":443,\
+                \"version\":\"2\",\"password\":\"secret\",\
+                \"sni\":\"example.com\",\"fp\":\"chrome\",\"insecure\":true}",
+            ),
+            (
+                "xray",
+                "{\"type\":\"xray\",\"server\":\"192.0.2.32\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"flow\":\"xtls-rprx-vision\",\"sni\":\"example.com\",\"fp\":\"chrome\",\
+                \"alpn\":\"h2\",\"pbk\":\"pubkey\",\"sid\":\"shortid\",\"spiderx\":\"/\",\
+                \"network\":\"xhttp\",\"mode\":\"auto\",\"xray_mux\":\"enabled\",\
+                \"xPaddingBytes\":\"100-200\",\"maxConcurrency\":16,\
+                \"downloadSettings\":{\"address\":\"d.example.com\"}}",
+            ),
+            (
+                "chain",
+                "{\"type\":\"chain\",\"server\":\"\",\"server_port\":443,\
+                \"nodes\":[\"row-a\",\"row-b\"]}",
+            ),
+            (
+                "extra-core",
+                "{\"type\":\"extra-core\",\"server\":\"\",\"server_port\":443,\
+                \"exe\":\"core.exe\",\"args\":\"--fast\",\"config\":{\"inbounds\":[]}}",
+            ),
+        ];
+        for (protocol, params) in cases {
+            let row = ProxyConfig {
+                id: format!("t07-{protocol}"),
+                name: protocol.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 11801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let folded = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    form.effective_params(cx)
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "untouched {protocol} refolds byte-identical"
+            );
+        }
+    }
+
+    /// Config-completeness T07: chain Add renders the hop picker + Add over a
+    /// kit `Empty` (never a hand-rolled placeholder); the Throne add/replace
+    /// rules hold behind the buttons with rule-naming refusals that change
+    /// nothing; labels read `name (protocol)`, never params contents.
+    #[gpui_kit::test]
+    fn t07_chain_page_paints_empty_and_rules(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "chain");
+        assert_painted(cx, "chain-section-caption");
+        cx.update(|window, cx| {
+            window.click("chain-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "chain-pick",
+            "chain-hop-add",
+            "chain-hops-empty",
+            "chain-notes",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "chain-hops-list".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Hop rules behind the buttons, no dialog needed.
+        let (landed, refused_chain, refused_off_index, refused_second, replaced) =
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    let library = vec![
+                        crate::ChainLibraryEntry {
+                            id: "a".to_string(),
+                            name: "VlessOne".to_string(),
+                            protocol: "vless".to_string(),
+                        },
+                        crate::ChainLibraryEntry {
+                            id: "b".to_string(),
+                            name: "ChainOne".to_string(),
+                            protocol: "chain".to_string(),
+                        },
+                        crate::ChainLibraryEntry {
+                            id: "c".to_string(),
+                            name: "CoreOne".to_string(),
+                            protocol: "extra-core".to_string(),
+                        },
+                    ];
+                    let library = Rc::new(RefCell::new(library));
+                    let hops: Rc<RefCell<Vec<serde_json::Value>>> =
+                        Rc::new(RefCell::new(Vec::new()));
+                    let pick = ConfigForm::panel_select(
+                        window,
+                        cx,
+                        crate::chain_pick_choices(&library.borrow()),
+                        "",
+                    );
+                    // The picker id rides along for the UI path; the rules
+                    // below drive the same fns the Add/Replace buttons call
+                    // with the picked row id directly.
+                    let refused_chain = view.chain_add_hop(&hops, &library, &pick, "b", window, cx);
+                    let landed_extra = view.chain_add_hop(&hops, &library, &pick, "c", window, cx);
+                    let refused_second =
+                        view.chain_add_hop(&hops, &library, &pick, "c", window, cx);
+                    let landed = view.chain_add_hop(&hops, &library, &pick, "a", window, cx);
+                    let refused_off_index =
+                        view.chain_replace_hop(&hops, &library, &pick, 1, "c", window, cx);
+                    let refused_replace_chain =
+                        view.chain_replace_hop(&hops, &library, &pick, 1, "b", window, cx);
+                    let replaced = hops.borrow().clone();
+                    assert_eq!(
+                        crate::chain_hop_label(&replaced[0], 0, &library.borrow()),
+                        "1. CoreOne (extra-core)"
+                    );
+                    assert_eq!(
+                        crate::chain_existing_kinds(&replaced, &library.borrow()),
+                        vec![
+                            crate::store::ChainHopSlot::Extra,
+                            crate::store::ChainHopSlot::Other
+                        ]
+                    );
+                    (
+                        landed_extra && landed,
+                        !refused_chain,
+                        !refused_off_index,
+                        !refused_second,
+                        !refused_replace_chain && replaced.len() == 2,
+                    )
+                })
+            });
+        assert!(landed, "legal hops land (extra at 0, vless after)");
+        assert!(refused_chain, "chain→chain add refused");
+        assert!(refused_off_index, "off-index-0 extracore replace refused");
+        assert!(refused_second, "second extracore add refused");
+        assert!(replaced, "chain replace refused, hops unchanged");
+    }
+
+    /// Config-completeness T07: extra-core Add renders exe + Browse + args +
+    /// config with pinned ids and deliberately no `no_logs` control; Browse
+    /// completion stores the file name; dialog commit refuses an exeless row
+    /// naming the field and lands once exe + config shape hold.
+    #[gpui_kit::test]
+    fn t07_extra_page_paints_validates_and_gates_commit(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "extra-core");
+        assert_painted(cx, "extra-section-caption");
+        cx.update(|window, cx| {
+            window.click("extra-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "extra-exe",
+            "extra-exe-browse",
+            "extra-args",
+            "extra-config",
+            "extra-notes",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No `no_logs` control anywhere on the page (Throne non-persist bug —
+        // never copied).
+        assert_absent(cx, "extra-no-logs".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Browse completion stores the file name (the engine resolves it in
+        // the app directory and refuses paths).
+        let stored = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                view.finish_extra_exe_pick(
+                    form.extra_exe.clone(),
+                    "C:\\cores\\my-core.exe".to_string(),
+                    window,
+                    cx,
+                );
+                form.extra_exe.read(cx).value().to_string()
+            })
+        });
+        assert_eq!(stored, "my-core.exe", "Browse stores the file name");
+        // Validate gates commit: the pristine template (no exe/config)
+        // refuses naming exe; filling both lands exactly one row.
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let (closed, message, closed2) = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("EC", window, cx);
+                });
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"extra-core".to_string(), window, cx);
+                });
+                form.params.update(cx, |state, cx| {
+                    state.set_value(protocol_params_template("extra-core"), window, cx);
+                });
+                let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
+                let message = form_error
+                    .borrow()
+                    .clone()
+                    .map(|(_, message)| message)
+                    .unwrap_or_default();
+                form.extra_exe.update(cx, |state, cx| {
+                    state.set_value("core.exe", window, cx);
+                });
+                form.extra_config.update(cx, |state, cx| {
+                    state.set_value("{}", window, cx);
+                });
+                form.params.update(cx, |state, cx| {
+                    state.set_value(
+                        "{\"type\":\"extra-core\",\"server\":\"127.0.0.1\",\
+                        \"server_port\":443}"
+                            .to_string(),
+                        window,
+                        cx,
+                    );
+                });
+                let closed2 = view.commit_add_with_focus(&form, &form_error, window, cx);
+                (closed, message, closed2)
+            })
+        });
+        assert!(!closed, "exeless row keeps the dialog open");
+        assert!(
+            message.contains("exe"),
+            "refusal names the exe field: {message}"
+        );
+        assert!(closed2, "exe + config shape commits");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "exactly one row lands"
+        );
+    }
+
+    /// Config-completeness T07 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside an Xray picker popup stops at the wrapper — the dialog
+    /// never commits a half-filled row.
+    #[gpui_kit::test]
+    fn t07_enter_in_xray_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "xray");
+        cx.update(|window, cx| {
+            window.click("xray-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "xray-network");
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("xray-network", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("xray-network-option-default".to_string())
+                .is_some()),
+            "network popup opened"
+        );
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "network Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "network Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "network Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "xray-network-option-default".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 

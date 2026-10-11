@@ -2466,6 +2466,392 @@ pub fn fold_ssh_into_params(params_raw: &str, fold: &SshFold) -> String {
     }
 }
 
+/// Config-completeness T07: Snell versions the engine maps (4|6 — absent
+/// means 4, anything else fails generate naming `version`). One source for
+/// the picker, the prefill reader and the fold below.
+pub const SNELL_VERSIONS: [&str; 2] = ["4", "6"];
+
+/// Config-completeness T07: ShadowTLS versions the engine maps (1|2|3 —
+/// absent takes the schema default 1; v1 rows omit the password). One source
+/// for the picker, the prefill reader and the fold below.
+pub const SHADOWTLS_VERSIONS: [&str; 3] = ["1", "2", "3"];
+
+/// Config-completeness T07: Xray stream networks (verified
+/// `xrayStreamSetting.h:5` via the audit — no tcp/quic on the Xray page).
+/// One source for the picker, the prefill reader and the fold below.
+pub const XRAY_NETWORKS: [&str; 5] = ["raw", "xhttp", "ws", "httpupgrade", "grpc"];
+
+/// Config-completeness T07: Xray VLESS flows (audit §3: the sing-box flow
+/// plus `xtls-rprx-vision-udp443`). One source for the picker and the fold.
+pub const XRAY_FLOWS: [&str; 2] = ["xtls-rprx-vision", "xtls-rprx-vision-udp443"];
+
+/// Config-completeness T07: Xray mux modes (audit §3 `xray_mux` — Keep
+/// Default is the blank row, never a stored value). One source for the
+/// picker, the prefill reader and the fold below.
+pub const XRAY_MUX_MODES: [&str; 2] = ["enabled", "disabled"];
+
+/// Config-completeness T07: Snell inner fold state — raw UI strings exactly
+/// as the page controls hold them. Engine-driven field list (Throne source
+/// has zero `snell` hits — no Throne editor to copy): `psk` text (required),
+/// `version` keep-blank over 4|6 (blank leaves the engine default 4 —
+/// contract C2, never fabricated), `obfs_mode`/`obfs_host`/`userkey` /
+/// `network`/`mode` as text (the engine passes them through for stock
+/// `check` to judge), `reuse` as a bool Switch. Blank inputs never touch the
+/// object (keep-blank — a stored value survives a blank pick for the engine
+/// gate to name, R5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnellFold {
+    pub psk: String,
+    pub version: String,
+    pub obfs_mode: String,
+    pub obfs_host: String,
+    pub userkey: String,
+    pub reuse: bool,
+    pub network: String,
+    pub mode: String,
+}
+
+/// Config-completeness T07: fold the Snell inner fields into a params JSON
+/// text. Byte-identical on no-ops (including unparseable input, which
+/// returns unchanged so validation names that error).
+pub fn fold_snell_into_params(params_raw: &str, fold: &SnellFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "psk", &["psk"], &fold.psk);
+    changed |= fold_select_keep_blank(obj, "version", &fold.version);
+    changed |= fold_text_aliases(obj, "obfs_mode", &["obfs_mode", "obfs"], &fold.obfs_mode);
+    changed |= fold_text_aliases(
+        obj,
+        "obfs_host",
+        &["obfs_host", "obfs-host"],
+        &fold.obfs_host,
+    );
+    changed |= fold_text_aliases(obj, "userkey", &["userkey"], &fold.userkey);
+    changed |= fold_bool_aliases(obj, "reuse", &["reuse"], fold.reuse);
+    changed |= fold_text_aliases(obj, "network", &["network"], &fold.network);
+    changed |= fold_text_aliases(obj, "mode", &["mode"], &fold.mode);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: ShadowTLS inner fold state — `version`
+/// keep-blank over 1|2|3 (blank leaves the schema default 1; import omits it
+/// on passwordless v1 rows) plus the v2/v3 `password` text. The page adds
+/// the shared S2-forced + S4 panels around these two fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowTlsFold {
+    pub version: String,
+    pub password: String,
+}
+
+/// Config-completeness T07: fold the ShadowTLS inner fields into a params
+/// JSON text. Byte-identical on no-ops.
+pub fn fold_shadowtls_into_params(params_raw: &str, fold: &ShadowTlsFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_keep_blank(obj, "version", &fold.version);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: Xray-VLESS Ph1 inner fold state — the common
+/// subset only (`uuid`/`encryption`/`flow` + `sni`/`fp`/`alpn` + REALITY
+/// `pbk`/`sid`/`spiderx` + `network`/`mode` + `xray_mux`). Selects are
+/// keep-blank over their closed sets (never fabricated, never stripped);
+/// every other key already in the object — Ph2-only `xray_*`, `path`/`host`,
+/// `security`, `packetEncoding` — is never touched (preserved byte-identical
+/// for the bridge to pass through or the sidecar to judge). No Ph2 matrix
+/// smuggling: XHTTP/xmux/session keys get no inputs here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XrayFold {
+    pub uuid: String,
+    pub encryption: String,
+    pub flow: String,
+    pub sni: String,
+    pub fp: String,
+    pub alpn: String,
+    pub pbk: String,
+    pub sid: String,
+    pub spiderx: String,
+    pub network: String,
+    pub mode: String,
+    pub mux: String,
+}
+
+/// Config-completeness T07: fold the Xray-VLESS Ph1 fields into a params
+/// JSON text. Byte-identical on no-ops; unknown keys (Ph2 matrix included)
+/// round-trip untouched.
+pub fn fold_xray_into_params(params_raw: &str, fold: &XrayFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], &fold.uuid);
+    changed |= fold_text_aliases(obj, "encryption", &["encryption"], &fold.encryption);
+    changed |= fold_select_keep_blank(obj, "flow", &fold.flow);
+    changed |= fold_text_aliases(obj, "sni", &["sni"], &fold.sni);
+    changed |= fold_select_keep_blank_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
+    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
+    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
+    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    changed |= fold_text_aliases(obj, "spiderx", &["spiderx"], &fold.spiderx);
+    changed |= fold_select_keep_blank(obj, "network", &fold.network);
+    changed |= fold_text_aliases(obj, "mode", &["mode"], &fold.mode);
+    changed |= fold_select_keep_blank(obj, "xray_mux", &fold.mux);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: extra-core inner fold state — `exe` path text
+/// (reads the `binary` spelling too, writes `exe`), `args` text (stored with
+/// the row — the v1 spawn convention is `<exe> -c <file>`, so the footer
+/// says so honestly), `config` text (a JSON string or object — the sidecar
+/// file body). Blank inputs never touch the object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtraFold {
+    pub exe: String,
+    pub args: String,
+    pub config: String,
+}
+
+/// Config-completeness T07: fold one extra-core `config` text — blank never
+/// touches the object; text that parses as JSON compares against the stored
+/// value (object or string) so untouched echoes stay byte-identical;
+/// anything else lands as a string for the engine to name loudly (never a
+/// silently kept old value). Returns true when the object changed.
+fn fold_extra_config(obj: &mut serde_json::Map<String, serde_json::Value>, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let next = serde_json::from_str::<serde_json::Value>(value)
+        .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+    match obj.get("config") {
+        Some(current) if current == &next => false,
+        _ => {
+            obj.insert("config".to_string(), next);
+            true
+        }
+    }
+}
+
+/// Config-completeness T07: fold the extra-core inner fields into a params
+/// JSON text. Byte-identical on no-ops. Never writes `no_logs` (Throne
+/// non-persist bug — no such control exists anywhere).
+pub fn fold_extra_into_params(params_raw: &str, fold: &ExtraFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "exe", &["exe", "binary"], &fold.exe);
+    changed |= fold_text_aliases(obj, "args", &["args"], &fold.args);
+    changed |= fold_extra_config(obj, &fold.config);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: echo one extra-core `config` value into its
+/// textarea — strings read verbatim, objects/arrays read as compact JSON
+/// (the fold re-parses them, so untouched echoes refold byte-identical).
+/// Blank for unparseable JSON or a missing key.
+pub fn extra_config_prefill(params_raw: &str) -> String {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    let Some(obj) = obj else {
+        return String::new();
+    };
+    let hit = obj
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("config"))
+        .map(|(_, value)| value);
+    match hit {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => {
+            hit.expect("config value present").to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Config-completeness T07: dialog-Validate shape for extra-core rows —
+/// `exe` present plus a present, JSON-valid `config` (string or object).
+/// Field-naming errors for the Validate button (the commit path keeps the
+/// import contract untouched — import rows land disabled and fail at start
+/// naming the same fields through the engine gate, never newly rejected at
+/// intake). The executable NAME hygiene (`is_bad_extra_exe_name`) stays
+/// single-owned by the engine (no drifted duplicate here).
+pub fn validate_extra_params(params_raw: &str) -> Result<(), String> {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| "extra-core params must be JSON object".to_string())?;
+    let exe_ok = ["exe", "binary"].iter().any(|wanted| {
+        obj.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case(wanted)
+                && matches!(value, serde_json::Value::String(text) if !text.trim().is_empty())
+        })
+    });
+    if !exe_ok {
+        return Err("extra-core params need exe (pick the executable with Browse)".to_string());
+    }
+    let config = obj
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("config"))
+        .map(|(_, value)| value);
+    match config {
+        None => {
+            Err("extra-core params need config (passed to the executable as -c <file>)".to_string())
+        }
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => {
+            Err("extra-core params need config (passed to the executable as -c <file>)".to_string())
+        }
+        Some(serde_json::Value::String(text)) => serde_json::from_str::<serde_json::Value>(text)
+            .map(|_| ())
+            .map_err(|_| "extra-core config string must be valid JSON".to_string()),
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => Ok(()),
+        Some(_) => Err("extra-core config must be a JSON object or a JSON string".to_string()),
+    }
+}
+
+/// Config-completeness T07: chain hop kinds for the hop-list editor —
+/// `Other` covers standard rows, unknown ids and inline objects alike (the
+/// engine judges those at generate, loudly; the editor only gates what the
+/// ticket names: nested chains and misplaced extracore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainHopSlot {
+    Chain,
+    Autoselector,
+    Extra,
+    Other,
+}
+
+/// Config-completeness T07: Throne hop rule for one add/replace — `existing`
+/// holds the current hops' kinds in order, `candidate` the picked row's
+/// kind, `index` the insert (add) or target (replace) position. Returns the
+/// rule-naming refusal, or `None` when the hop may land. Rules (Throne
+/// `edit_chain.ui` parity): v1 chains are flat (no chain/autoselector hops
+/// ever), at most one extracore hop and only at index 0. Engine egress-only
+/// placement (Extra/Custom/Xray last) is NOT gated here — generate names it
+/// at start.
+pub fn chain_hop_rejection(
+    existing: &[ChainHopSlot],
+    candidate: ChainHopSlot,
+    index: usize,
+    replacing: bool,
+) -> Option<String> {
+    if candidate == ChainHopSlot::Chain {
+        return Some(
+            "chain hops cannot nest a chain (v1 chains are flat — pick a non-chain row)"
+                .to_string(),
+        );
+    }
+    if candidate == ChainHopSlot::Autoselector {
+        return Some(
+            "chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)"
+                .to_string(),
+        );
+    }
+    let len = existing.len();
+    if (!replacing && index > len) || (replacing && index >= len) {
+        return Some("hop index is out of range (pick the hop to replace)".to_string());
+    }
+    if candidate == ChainHopSlot::Extra {
+        if index != 0 {
+            return Some(
+                "extracore hops must sit at index 0 (first hop only — off-index-0 rejected)"
+                    .to_string(),
+            );
+        }
+        let surviving = existing
+            .iter()
+            .enumerate()
+            .any(|(slot, kind)| *kind == ChainHopSlot::Extra && (!replacing || slot != index));
+        if surviving {
+            return Some("at most one extracore hop per chain".to_string());
+        }
+    }
+    None
+}
+
+/// Config-completeness T07: read one chain row's `nodes` array — id
+/// references stay strings, inline outbound objects stay objects. Empty for
+/// unparseable JSON, a missing key, or a non-array value (the JSON stays the
+/// source of truth; the editor only echoes it).
+pub fn chain_nodes_of(params_raw: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .and_then(|obj| obj.get("nodes").cloned())
+        .and_then(|nodes| nodes.as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// Config-completeness T07: fold the hop-list editor state into a params
+/// JSON text — writes the full `nodes` array when it differs (an explicit
+/// clear-all writes `[]`, which generate refuses naming `nodes`); untouched
+/// editors stay byte-identical (the empty editor over a nodeless template is
+/// a no-op, so fresh chain rows commit without a fabricated key).
+pub fn fold_chain_nodes_into_params(params_raw: &str, nodes: &[serde_json::Value]) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let current: Vec<serde_json::Value> = obj
+        .get("nodes")
+        .and_then(|nodes| nodes.as_array().cloned())
+        .unwrap_or_default();
+    if current == nodes {
+        return params_raw.to_string();
+    }
+    obj.insert(
+        "nodes".to_string(),
+        serde_json::Value::Array(nodes.to_vec()),
+    );
+    value.to_string()
+}
+
 /// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
 /// `None` means unknown protocol (the commit names it through the normal
 /// validation path). `key = None` means a known protocol with no link
@@ -11694,6 +12080,337 @@ mod tests {
             "ssh pristine template stands"
         );
         assert_eq!(fold_ssh_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: Snell fold — engine-driven fields (the engine
+    /// maps exactly psk/version/userkey/reuse/network/obfs_mode/obfs_host/
+    /// mode; version keep-blank leaves the engine default 4). Blank folds
+    /// never touch the object; the Throne `obfs` spelling echoes.
+    #[test]
+    fn t07_snell_fold_engine_driven_fields() {
+        assert_eq!(SNELL_VERSIONS, ["4", "6"]);
+        let full = SnellFold {
+            psk: "secret".to_string(),
+            version: "6".to_string(),
+            obfs_mode: "http".to_string(),
+            obfs_host: "example.com".to_string(),
+            userkey: "key".to_string(),
+            reuse: true,
+            network: "tcp".to_string(),
+            mode: "multi".to_string(),
+        };
+        let bare = "{\"type\":\"snell\",\"server\":\"192.0.2.30\",\"server_port\":8080}";
+        let folded = fold_snell_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("snell folds");
+        assert_eq!(value["psk"], "secret");
+        assert_eq!(value["version"], "6");
+        assert_eq!(value["obfs_mode"], "http");
+        assert_eq!(value["obfs_host"], "example.com");
+        assert_eq!(value["userkey"], "key");
+        assert_eq!(value["reuse"], true);
+        assert_eq!(value["network"], "tcp");
+        assert_eq!(value["mode"], "multi");
+        assert_eq!(
+            fold_snell_into_params(&folded, &full),
+            folded,
+            "untouched snell echoes byte-identical"
+        );
+        // A stored version survives a blank pick (the engine default applies
+        // only when the key is absent — the fold never strips).
+        let v6 = "{\"type\":\"snell\",\"server\":\"s\",\"server_port\":8080,\
+            \"psk\":\"secret\",\"version\":\"6\"}";
+        assert_eq!(
+            fold_snell_into_params(v6, &SnellFold::default()),
+            v6,
+            "stored version survives blank picks"
+        );
+        // The Throne `obfs` spelling echoes without duplicating.
+        let throne = "{\"type\":\"snell\",\"server\":\"s\",\"server_port\":8080,\"obfs\":\"http\"}";
+        let throne_echo = SnellFold {
+            obfs_mode: "http".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_snell_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes"
+        );
+        let template = protocol_params_template("snell");
+        assert_eq!(
+            fold_snell_into_params(&template, &SnellFold::default()),
+            template,
+            "snell pristine template stands"
+        );
+        assert_eq!(fold_snell_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: ShadowTLS fold — version keep-blank over
+    /// 1|2|3 (blank leaves the schema default 1; v1 rows omit the password)
+    /// plus the v2/v3 password text. Blank folds never touch the object.
+    #[test]
+    fn t07_shadowtls_fold_version_password() {
+        assert_eq!(SHADOWTLS_VERSIONS, ["1", "2", "3"]);
+        let full = ShadowTlsFold {
+            version: "2".to_string(),
+            password: "secret".to_string(),
+        };
+        let bare = "{\"type\":\"shadowtls\",\"server\":\"192.0.2.31\",\"server_port\":443}";
+        let folded = fold_shadowtls_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("shadowtls folds");
+        assert_eq!(value["version"], "2");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(
+            fold_shadowtls_into_params(&folded, &full),
+            folded,
+            "untouched shadowtls echoes byte-identical"
+        );
+        // A passwordless v1 row stands through a blank fold.
+        let v1 = "{\"type\":\"shadowtls\",\"server\":\"s\",\"server_port\":443}";
+        assert_eq!(
+            fold_shadowtls_into_params(v1, &ShadowTlsFold::default()),
+            v1,
+            "v1 rows omit the password"
+        );
+        let template = protocol_params_template("shadowtls");
+        assert_eq!(
+            fold_shadowtls_into_params(&template, &ShadowTlsFold::default()),
+            template,
+            "shadowtls pristine template stands"
+        );
+        assert_eq!(fold_shadowtls_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: Xray-VLESS Ph1 fold — the common subset lands
+    /// in bridge spellings while Ph2-only keys (`xPaddingBytes`,
+    /// `maxConcurrency`, `downloadSettings`, …) and unknown `xray_*` keys are
+    /// preserved byte-identical, never stripped. No Ph2 matrix smuggling: the
+    /// fold writes no XHTTP/xmux/session keys.
+    #[test]
+    fn t07_xray_fold_ph1_preserves_ph2() {
+        assert_eq!(XRAY_NETWORKS, ["raw", "xhttp", "ws", "httpupgrade", "grpc"]);
+        assert_eq!(XRAY_FLOWS, ["xtls-rprx-vision", "xtls-rprx-vision-udp443"]);
+        assert_eq!(XRAY_MUX_MODES, ["enabled", "disabled"]);
+        let full = XrayFold {
+            uuid: "11111111-2222-4333-8444-555555555555".to_string(),
+            encryption: "none".to_string(),
+            flow: "xtls-rprx-vision".to_string(),
+            sni: "example.com".to_string(),
+            fp: "chrome".to_string(),
+            alpn: "h2".to_string(),
+            pbk: "pubkey".to_string(),
+            sid: "shortid".to_string(),
+            spiderx: "/".to_string(),
+            network: "xhttp".to_string(),
+            mode: "auto".to_string(),
+            mux: "enabled".to_string(),
+        };
+        let bare = "{\"type\":\"xray\",\"server\":\"192.0.2.32\",\"server_port\":443}";
+        let folded = fold_xray_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("xray folds");
+        assert_eq!(value["uuid"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(value["encryption"], "none");
+        assert_eq!(value["flow"], "xtls-rprx-vision");
+        assert_eq!(value["sni"], "example.com");
+        assert_eq!(value["fp"], "chrome");
+        assert_eq!(value["alpn"], "h2");
+        assert_eq!(value["pbk"], "pubkey");
+        assert_eq!(value["sid"], "shortid");
+        assert_eq!(value["spiderx"], "/");
+        assert_eq!(value["network"], "xhttp");
+        assert_eq!(value["mode"], "auto");
+        assert_eq!(value["xray_mux"], "enabled");
+        assert_eq!(
+            fold_xray_into_params(&folded, &full),
+            folded,
+            "untouched xray echoes byte-identical"
+        );
+        // Hand-added Ph2-only keys survive a matching Ph1 fold untouched.
+        let ph2 = "{\"type\":\"xray\",\"server\":\"s\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+            \"flow\":\"xtls-rprx-vision\",\"sni\":\"example.com\",\"fp\":\"chrome\",\
+            \"alpn\":\"h2\",\"pbk\":\"pubkey\",\"sid\":\"shortid\",\"spiderx\":\"/\",\
+            \"network\":\"xhttp\",\"mode\":\"auto\",\"xray_mux\":\"enabled\",\
+            \"xPaddingBytes\":\"100-200\",\"maxConcurrency\":16,\
+            \"downloadSettings\":{\"address\":\"d.example.com\"},\
+            \"xray_custom_future\":\"kept\"}";
+        assert_eq!(
+            fold_xray_into_params(ph2, &full),
+            ph2,
+            "Ph2-only and unknown xray_* keys round-trip untouched (preserve-not-strip)"
+        );
+        // The `fingerprint` spelling echoes without duplicating.
+        let throne = "{\"type\":\"xray\",\"server\":\"s\",\"server_port\":443,\
+            \"fingerprint\":\"chrome\"}";
+        let throne_echo = XrayFold {
+            fp: "chrome".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_xray_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes"
+        );
+        assert!(
+            !folded.contains("xPaddingBytes") && !folded.contains("maxConcurrency"),
+            "the fold writes no Ph2 matrix keys"
+        );
+        assert_eq!(fold_xray_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: chain hop rules — Throne rejections verbatim
+    /// (flat v1 chains: no chain/autoselector hops ever; at most one
+    /// extracore hop, only at index 0). Every refusal names the rule; legal
+    /// hops land with `None`. The nodes reader/fold round-trips the editor
+    /// state byte-identically.
+    #[test]
+    fn t07_chain_hop_rules_name_throne_rejections() {
+        use ChainHopSlot::{Autoselector, Chain, Extra, Other};
+        let none: &[ChainHopSlot] = &[];
+        let one_other: &[ChainHopSlot] = &[Other];
+        let extra_first: &[ChainHopSlot] = &[Extra, Other];
+        // Nested chains and autoselectors never land, at any index.
+        for candidate in [Chain, Autoselector] {
+            let rule = chain_hop_rejection(none, candidate, 0, false).expect("rejected");
+            assert!(
+                rule.contains("chain") || rule.contains("autoselector"),
+                "refusal names the flat-chain rule: {rule}"
+            );
+            assert!(chain_hop_rejection(one_other, candidate, 1, false).is_some());
+        }
+        // Extracore hops sit at index 0 only.
+        let off_index = chain_hop_rejection(one_other, Extra, 1, false).expect("rejected");
+        assert!(
+            off_index.contains("index 0"),
+            "off-index-0 extracore refusal names the rule: {off_index}"
+        );
+        assert!(chain_hop_rejection(none, Extra, 0, false).is_none());
+        assert!(chain_hop_rejection(one_other, Extra, 0, false).is_none());
+        // At most one extracore hop per chain (replacing the index-0
+        // extracore with another extracore is the one legal overlap).
+        let second = chain_hop_rejection(extra_first, Extra, 0, false).expect("rejected");
+        assert!(
+            second.contains("at most one"),
+            "second extracore refusal names the rule: {second}"
+        );
+        assert!(chain_hop_rejection(extra_first, Extra, 0, true).is_none());
+        assert!(chain_hop_rejection(extra_first, Other, 1, true).is_none());
+        // Out-of-range replaces name the index rule.
+        let oob = chain_hop_rejection(one_other, Other, 1, true).expect("rejected");
+        assert!(
+            oob.contains("out of range"),
+            "out-of-range replace names the rule: {oob}"
+        );
+        // Ordinary hops land anywhere, including beside an extracore first hop.
+        assert!(chain_hop_rejection(none, Other, 0, false).is_none());
+        assert!(chain_hop_rejection(extra_first, Other, 2, false).is_none());
+        // The nodes reader echoes the editor state; the fold is a no-op when
+        // nothing differs and writes explicit clear-alls.
+        let params = "{\"type\":\"chain\",\"nodes\":[\"a\",\"b\"]}";
+        assert_eq!(
+            chain_nodes_of(params),
+            vec![
+                serde_json::Value::String("a".to_string()),
+                serde_json::Value::String("b".to_string())
+            ]
+        );
+        assert!(chain_nodes_of("{\"type\":\"chain\"}").is_empty());
+        assert!(chain_nodes_of("{{{").is_empty());
+        assert_eq!(
+            fold_chain_nodes_into_params(
+                params,
+                &[
+                    serde_json::Value::String("a".to_string()),
+                    serde_json::Value::String("b".to_string())
+                ]
+            ),
+            params,
+            "untouched hops refold byte-identical"
+        );
+        let cleared = fold_chain_nodes_into_params(params, &[]);
+        let cleared_value: serde_json::Value =
+            serde_json::from_str(&cleared).expect("clear-all folds");
+        assert_eq!(cleared_value["nodes"], serde_json::json!([]));
+        let template = protocol_params_template("chain");
+        assert_eq!(
+            fold_chain_nodes_into_params(&template, &[]),
+            template,
+            "empty editor over a nodeless template is a no-op"
+        );
+        assert_eq!(fold_chain_nodes_into_params("{{{", &[]), "{{{");
+    }
+
+    /// Config-completeness T07: extra-core fold + Validate — exe/args/config
+    /// land in engine spellings, untouched echoes stay byte-identical, and
+    /// the shape gate names exe/config fields. `no_logs` is never written
+    /// (Throne non-persist bug — no such control exists anywhere).
+    #[test]
+    fn t07_extra_fold_validate_never_no_logs() {
+        let full = ExtraFold {
+            exe: "core.exe".to_string(),
+            args: "--fast".to_string(),
+            config: "{\"inbounds\":[]}".to_string(),
+        };
+        let bare = "{\"type\":\"extra-core\"}";
+        let folded = fold_extra_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("extra folds");
+        assert_eq!(value["exe"], "core.exe");
+        assert_eq!(value["args"], "--fast");
+        assert_eq!(value["config"], serde_json::json!({"inbounds":[]}));
+        assert!(
+            value.get("no_logs").is_none() && !folded.contains("no_logs"),
+            "the fold never writes no_logs"
+        );
+        assert_eq!(
+            fold_extra_into_params(&folded, &full),
+            folded,
+            "untouched extra echoes byte-identical"
+        );
+        // Stored objects echo as JSON text through the reader and refold
+        // byte-identically; strings read verbatim.
+        assert_eq!(
+            extra_config_prefill(&folded),
+            "{\"inbounds\":[]}",
+            "stored objects echo as JSON text"
+        );
+        let with_string = "{\"type\":\"extra-core\",\"config\":\"{\\\"a\\\":1}\"}";
+        assert_eq!(extra_config_prefill(with_string), "{\"a\":1}");
+        assert_eq!(extra_config_prefill("{\"type\":\"extra-core\"}"), "");
+        assert_eq!(extra_config_prefill("{{{"), "");
+        // The `binary` spelling echoes into `exe` without duplicating.
+        let alias = "{\"type\":\"extra-core\",\"binary\":\"core.exe\"}";
+        let alias_echo = ExtraFold {
+            exe: "core.exe".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_extra_into_params(alias, &alias_echo),
+            alias,
+            "matching alias echoes"
+        );
+        // Validate names the missing shape before commit.
+        assert!(validate_extra_params(&folded).is_ok());
+        let no_exe = validate_extra_params("{\"config\":\"{}\"}").expect_err("exe required");
+        assert!(no_exe.contains("exe"), "missing exe names exe: {no_exe}");
+        let no_config =
+            validate_extra_params("{\"exe\":\"core.exe\"}").expect_err("config required");
+        assert!(
+            no_config.contains("config"),
+            "missing config names config: {no_config}"
+        );
+        let bad_config = validate_extra_params("{\"exe\":\"core.exe\",\"config\":\"{oops\"}")
+            .expect_err("config must be JSON");
+        assert!(
+            bad_config.contains("config"),
+            "bad config names config: {bad_config}"
+        );
+        let scalar_config =
+            validate_extra_params("{\"exe\":\"core.exe\",\"config\":7}").expect_err("shape gated");
+        assert!(
+            scalar_config.contains("config"),
+            "scalar config names config: {scalar_config}"
+        );
+        assert!(validate_extra_params("not json").is_err());
+        assert_eq!(fold_extra_into_params("{{{", &full), "{{{");
     }
 
     /// Config-completeness T02: toggle prefill reads truthy spellings
