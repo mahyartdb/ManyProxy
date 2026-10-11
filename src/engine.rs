@@ -1874,6 +1874,69 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                     stream.insert(key.to_string(), value.clone());
                 }
             }
+            // Config-completeness review: Throne spellings the page reads as
+            // aliases also emit — `fingerprint` falls back to `fp`, either
+            // `serviceName`/`service_name` lands as Xray's `serviceName`
+            // (grpc links import these spellings; without this the reject
+            // below would break rows the dialog itself maintains).
+            if stream.get("fp").is_none() {
+                if let Some(fp) = egress.params.get("fingerprint") {
+                    stream.insert("fp".to_string(), fp.clone());
+                }
+            }
+            if stream.get("serviceName").is_none() {
+                if let Some(svc) = egress
+                    .params
+                    .get("serviceName")
+                    .or_else(|| egress.params.get("service_name"))
+                {
+                    stream.insert("serviceName".to_string(), svc.clone());
+                }
+            }
+            // Config-completeness review: keys the bridge never sees fail
+            // typed naming the field instead of riding silently past it
+            // (stored JSON still preserves them — fold-level preserve — but a
+            // Ph2 XHTTP/xmux key the sidecar ignores must never look
+            // configured). The `xray_shaped` full-config branch above is
+            // untouched: the sidecar judges that JSON itself.
+            const XRAY_FLAT_KEYS: &[&str] = &[
+                "type",
+                "address",
+                "server",
+                "server_port",
+                "port",
+                "uuid",
+                "id",
+                "encryption",
+                "flow",
+                "network",
+                "security",
+                "sni",
+                "pbk",
+                "sid",
+                "spiderx",
+                "path",
+                "host",
+                "mode",
+                "fp",
+                "fingerprint",
+                "alpn",
+                "packetEncoding",
+                "serviceName",
+                "service_name",
+                "xray_mux",
+            ];
+            if let Some(unknown) = egress
+                .params
+                .keys()
+                .find(|key| !XRAY_FLAT_KEYS.contains(&key.as_str()))
+            {
+                return Err(bad_option(
+                    &egress.owner,
+                    unknown,
+                    "has no Xray bridge mapping (the Ph2 XHTTP/xmux matrix is not served; use custom-config for full Xray control)",
+                ));
+            }
             let mut node = serde_json::Map::new();
             node.insert(
                 "protocol".to_string(),
@@ -3253,6 +3316,27 @@ fn apply_transport(
     let network = take_flat(params, &["network"]).unwrap_or_default();
     let path = take_flat(params, &["path"]);
     let host = take_flat(params, &["host"]);
+    // Config-completeness review: a custom `headers` map has no transport
+    // mapping on this path (only `host` survives below as the Host header)
+    // — fail typed naming the field instead of consuming it silently
+    // (ticket-42 kcp/header_type precedent: meaningful but unmappable
+    // errors at its own site). Blank and empty shapes stay no-ops so
+    // untouched rows keep working; the `http`-protocol arm never reaches
+    // here (it keeps path/headers via its own allowlist).
+    let headers_trivial = match params.get("headers") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(text)) => text.trim().is_empty(),
+        Some(serde_json::Value::Object(map)) => map.is_empty(),
+        Some(serde_json::Value::Array(items)) => items.is_empty(),
+        Some(_) => false,
+    };
+    if !headers_trivial {
+        return Err(bad_option(
+            name,
+            "headers",
+            "custom transport headers have no sing-box 1.14.2 mapping on this protocol (only `host` maps to the Host header)",
+        ));
+    }
     take_flat(params, &["headers"]);
     let service_name = take_flat(params, &["serviceName", "service_name"]).or(path.clone());
     let method = take_flat(params, &["method"]);
@@ -12977,6 +13061,96 @@ Active Connections\r
             node.get("brutal_enable").is_none(),
             "brutal flat dropped: {node}"
         );
+    }
+
+    /// Config-completeness review: flat-built Xray rows fail typed on keys
+    /// the bridge never copies (Ph2 XHTTP/xmux matrix) instead of looking
+    /// configured while the sidecar ignores them. Stored JSON still
+    /// preserves them (fold-level preserve); real link spellings
+    /// (`fingerprint`, `serviceName`) keep emitting; full-config
+    /// (`xray_shaped`) rows stay sidecar-judged.
+    #[test]
+    fn review_xray_flat_unknown_keys_reject_loud() {
+        let mut ph2 = xray_params();
+        ph2.as_object_mut()
+            .expect("object")
+            .insert("xPaddingBytes".to_string(), json!("100-200"));
+        let rows = vec![fixture("2", "XrayPh2", "xray", ph2, "127.0.0.1", 10802)];
+        let plan = validate_activation(&rows).expect("ph2 set plans");
+        let error = generate_xray_config(&plan.egresses).expect_err("Ph2 key fails typed");
+        let text = error.to_string();
+        assert!(
+            text.contains("xPaddingBytes"),
+            "names the field, got {text}"
+        );
+        // Real link spellings emit through the flat branch.
+        let mut aliases = xray_params();
+        let obj = aliases.as_object_mut().expect("object");
+        obj.remove("fp");
+        obj.insert("fingerprint".to_string(), json!("firefox"));
+        obj.insert("service_name".to_string(), json!("svc"));
+        let rows = vec![fixture(
+            "2",
+            "XrayAlias",
+            "xray",
+            aliases,
+            "127.0.0.1",
+            10802,
+        )];
+        let plan = validate_activation(&rows).expect("alias set plans");
+        let sidecar = generate_xray_config(&plan.egresses).expect("alias row generates");
+        let value = sidecar.value();
+        let stream = &value["outbounds"]
+            .as_array()
+            .expect("xray outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(xray_egress_tag("2")))
+            .expect("xray egress present")["streamSettings"];
+        assert_eq!(
+            stream["fp"],
+            json!("firefox"),
+            "fingerprint falls back to fp"
+        );
+        assert_eq!(
+            stream["serviceName"],
+            json!("svc"),
+            "service_name lands as serviceName"
+        );
+    }
+
+    /// Config-completeness review: a custom `headers` map has no transport
+    /// mapping on vless/trojan/vmess (only `host` survives as the Host
+    /// header) — generate fails typed naming the field instead of dropping
+    /// it silently. Blank and empty shapes stay no-ops so untouched rows
+    /// keep working; the `http`-protocol arm never reaches this path (own
+    /// allowlist keeps path/headers).
+    #[test]
+    fn review_transport_headers_reject_loud() {
+        let mut params = vless_params();
+        params
+            .as_object_mut()
+            .expect("object")
+            .insert("headers".to_string(), json!({"X-Custom": "1"}));
+        let row = fixture("9", "HeadersMap", "vless", params, "127.0.0.1", 10809);
+        let error = generate(std::slice::from_ref(&row)).expect_err("custom headers fail");
+        assert!(
+            error.to_string().contains("headers"),
+            "names the field, got {error}"
+        );
+        let mut blank = vless_params();
+        blank
+            .as_object_mut()
+            .expect("object")
+            .insert("headers".to_string(), json!(""));
+        let blank_row = fixture("9", "HeadersBlank", "vless", blank, "127.0.0.1", 10809);
+        generate(std::slice::from_ref(&blank_row)).expect("blank headers stay a no-op");
+        let mut empty = vless_params();
+        empty
+            .as_object_mut()
+            .expect("object")
+            .insert("headers".to_string(), json!({}));
+        let empty_row = fixture("9", "HeadersEmpty", "vless", empty, "127.0.0.1", 10809);
+        generate(std::slice::from_ref(&empty_row)).expect("empty headers stay a no-op");
     }
 
     /// Config-completeness T03: panel-produced vmess/trojan/shadowsocks rows

@@ -58,3 +58,21 @@ Constraints: AGENTS.md (local-only, app-dir sidecars, DPAPI+redaction, hermetic 
 - Ruling: paste-intake is one new action, not a new path — `PasteImport` (`ctrl-v`) runs the overlay guard then `open_import_from_clipboard` (the exact handler behind the palette `ImportClipboard` op and the Library-menu item). Inert while typing (the focused input keeps native paste) and under dialogs, like every other binding. Kit-maximal: the `From clipboard` menu item gains the `Ctrl-V` `aria_keyshortcuts` + `shortcut_kbd` chip (Import-item precedent); `Kbd` appears only on this bound action. `SHORTCUT_LINES` + the keyboard-test pin list grow one line (About stays in sync by construction).
 - Ruling: `Clone` is an alias, not a feature — `commit_clone` delegates to `commit_duplicate` (disabled copy, fresh auto port, identical params, verified by the T08 clone test mirroring the ticket-43 duplicate asserts); the row menu paints both items (`clone-config` beside `duplicate-config`, no `Kbd` — unbound by the kit-maximal rule).
 - Ruling: `direct` is the 24th stored type (appended last — picker order never shifts; the two T01 count pins move 23→24 same-ticket with this rationale). Starter is the bare `{"type":"direct"}` marker (an import-shaped template with a blank server would fail the commit gate, and there is nothing to fill — extra-core bare-shape precedent); the guided identity is secret-free (`No secret needed for direct.`) and Server/Port hide via `is_virtual_protocol` (Throne label-only parity, pinned through the extended T01 virtual loop). Import lands on all three paths (link `direct://[#name]`, JSON `{"type":"direct"}`, Clash `type: direct` — each with its own server/port-gate carve-out); the engine serves a bare 2-key direct outbound under the row's own tag (row isolation rule routes its inbound there; `validate_activation` carves it out of the `UnsupportedProtocol` gate). Stored extras are ignored at emission, never emitted. Guidance tails now name the `"custom-config"` row explicitly (spec CAP-12 wording; no test pinned the old `custom full-config` tail). 8 new T08 tests (1 store incl. bare-save, 1 import incl. 8-scheme guidance + 3-path direct intake, 1 engine incl. bare-final shape + activation, 3 UI incl. key-prefill/first-failure proof + clone + form-level bare commit, plus the extended T01 virtual loop and the row-menu/About/a11y pin updates).
+- Review (pre-PR, NOT READY → fixes in this commit): independent read-only review of
+  ef5117d..cc52b86 returned 3 Critical + 2 Required findings; all fixed here, no rebuttals:
+  (1) `headers` silently dropped on the vless/trojan/vmess transport path → non-trivial maps now
+  fail typed at generate naming the field (blank/empty stay no-ops; `http`-protocol arm untouched,
+  own allowlist); imports never write `headers` (verified zero hits in import.rs), so no import
+  path changes behavior. (2) Flat-built Xray rows silently ignored unmapped keys → anything
+  outside the consumed set now fails typed naming the key (full-config `xray_shaped` rows stay
+  sidecar-judged); `fingerprint`→`fp` and `serviceName`/`service_name`→`serviceName` alias copies
+  added so real link spellings keep emitting. (3) Virtual guided rows un-committable (template
+  carried blank server/Potr the hidden inputs could never fill) → `chain`/`custom-outbound`/
+  `custom-config`/`extra-core` starters are bare like `direct` (T08 precedent); hand JSON with
+  server keys validates exactly as before; the T07 extra-core test now commits without the dummy
+  server injection. (4) `brutal_*` dead keys → speeds are commit-validated numeric (garbage fails
+  naming the field; JSON numbers + blanks pass); emission stays preserved-not-emitted per
+  follow-up (no 1.14.2 mapping). (5) Spec/CAP wording gap → CAP-2/constraints/success-signal now
+  name the decided-deferred sets with a pointer to the follow-ups doc; S1 false comment fixed.
+  tuic/hysteria/anytls wrong-layer drops stay as designed (ticket-42 doctrine, out of scope).
+  SSH-blob-visibility + conditional-input-a11y nits acknowledged, kit-limited, no action.

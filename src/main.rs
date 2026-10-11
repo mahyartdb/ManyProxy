@@ -3557,12 +3557,13 @@ impl ConfigForm {
 
     /// Config-completeness T03: shared Transport panel (S1) — the exact T02
     /// section (network picker plus per-network conditionals; `headers` /
-    /// early-data stay JSON-only so the engine never drops them), shared by
-    /// the vless/vmess/trojan pages (one rule, three pages).
+    /// early-data have no inputs by decision — hand JSON carrying them fails
+    /// typed at generate, never silently), shared by the
+    /// vless/vmess/trojan pages (one rule, three pages).
     fn s1_section(&self, view: &Entity<AppView>, cx: &App) -> impl IntoElement {
         // S1: Transport — network picker plus per-network conditionals
-        // (only keys `apply_transport` maps; `headers`/early-data stay
-        // JSON-only so the engine never drops them on the floor).
+        // (only keys `apply_transport` maps; `headers`/early-data have no
+        // inputs, and hand JSON carrying them fails typed at generate).
         let network = Self::panel_value(&self.s1_network, cx, "tcp");
         let network_select = self.s1_network.clone();
         let mut s1_body = div().flex().flex_col().gap_1().child(
@@ -25912,15 +25913,10 @@ mod tests {
                 form.extra_config.update(cx, |state, cx| {
                     state.set_value("{}", window, cx);
                 });
-                form.params.update(cx, |state, cx| {
-                    state.set_value(
-                        "{\"type\":\"extra-core\",\"server\":\"127.0.0.1\",\
-                        \"server_port\":443}"
-                            .to_string(),
-                        window,
-                        cx,
-                    );
-                });
+                // Review: the bare extra-core starter needs no dummy server —
+                // the folded exe/config over it commits clean (virtual rows
+                // carry no endpoint address; the store gate only constrains
+                // import-shaped rows).
                 let closed2 = view.commit_add_with_focus(&form, &form_error, window, cx);
                 (closed, message, closed2)
             })

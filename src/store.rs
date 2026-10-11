@@ -897,22 +897,33 @@ fn canonical_protocol(raw: &str) -> Option<String> {
 }
 
 /// Ticket 31: per-protocol starter params for the guided add dialog (never
-/// raw JSON first). Every template is a JSON object with the upstream
+/// raw JSON first). Endpoint templates are JSON objects with the upstream
 /// `server`/`server_port` slots plus the protocol's credential slot(s) left
-/// blank — submitting it untouched fails in [`validate_protocol_params`]
-/// naming the missing field, never silently. Unknown input falls back to a
-/// bare server/port object (the commit then names the valid protocols).
+/// blank — submitting one untouched fails in [`validate_protocol_params`]
+/// naming the missing field, never silently. Virtual types (`chain`,
+/// `custom-*`, `extra-core`, `direct`) start bare (`{"type":...}` with no
+/// server/port slots): their guided Server/Port inputs hide (Throne gating
+/// parity), and an import-shaped template with a blank server would fail the
+/// commit gate with nothing for the user to fill. Unknown input falls back
+/// to a bare server/port object (the commit then names the valid protocols).
 pub fn protocol_params_template(protocol: &str) -> String {
     fn blank(params: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
         params.insert(key.to_string(), serde_json::Value::String(String::new()));
     }
     let canonical = canonical_protocol(protocol).unwrap_or_else(|| protocol.trim().to_string());
-    // Config-completeness T08 (CAP-12): `direct` rows carry no fields, so the
-    // starter is the bare kind marker (no server/port slots — an import-shaped
-    // template with a blank server would fail the commit gate, and there is
-    // nothing for the user to fill). Extra-core bare-shape precedent.
-    if canonical == "direct" {
-        return "{\"type\":\"direct\"}".to_string();
+    // Config-completeness T08 (CAP-12) + review: virtual rows carry no
+    // endpoint address of their own (chain hops and custom/extra-core
+    // payloads name it in JSON), so the starter is the bare kind marker.
+    // `direct` led (T08); `chain`/`custom-*`/`extra-core` follow — the guided
+    // commit folds blank hidden inputs to a no-op, and the bare object is
+    // not import-shaped, so it clears the server gate the hidden inputs
+    // could never satisfy. Hand JSON with server keys still validates as
+    // before (import-shaped path unchanged).
+    if matches!(
+        canonical.as_str(),
+        "direct" | "chain" | "custom-outbound" | "custom-config" | "extra-core"
+    ) {
+        return format!("{{\"type\":\"{canonical}\"}}");
     }
     let port: u16 = match canonical.as_str() {
         "wireguard" | "amneziawg" => 51820,
@@ -3253,6 +3264,36 @@ fn validate_protocol_params(
         {
             errors.push(missing("up_mbps and down_mbps"));
             return None;
+        }
+        // Config-completeness review: brutal speeds are panel state the
+        // engine preserves but never emits (no 1.14.2 mapping — follow-up),
+        // so garbage here would ride silently forever. Blank stays a
+        // no-op (untouched panels); JSON numbers pass; anything else must
+        // parse as Mbps, else the commit names the field.
+        for key in [
+            "brutal_up_mbps",
+            "brutal_down_mbps",
+            "brutal_up",
+            "brutal_down",
+            "brutal_upmbps",
+            "brutal_downmbps",
+        ] {
+            let numeric_ok = match obj.get(key) {
+                None | Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::Number(_)) => true,
+                Some(serde_json::Value::String(text)) if text.trim().is_empty() => true,
+                Some(serde_json::Value::String(text)) => {
+                    text.trim().parse::<f64>().is_ok_and(f64::is_finite)
+                }
+                Some(_) => false,
+            };
+            if !numeric_ok {
+                errors.push(FieldError::new(
+                    "params",
+                    format!("{canonical} params need {key} as a number (Mbps)"),
+                ));
+                return None;
+            }
         }
         if lookup_case_insensitive(obj, &["security"])
             .is_some_and(|security| security.eq_ignore_ascii_case("reality"))
@@ -10758,6 +10799,75 @@ mod tests {
         );
     }
 
+    /// Config-completeness review: virtual starters are bare (no server/port
+    /// slots — the guided inputs hide for these) and commit clean; brutal
+    /// garbage fails naming the field instead of riding silently.
+    #[test]
+    fn review_virtual_templates_commit_and_brutal_gate() {
+        for virtual_proto in [
+            "chain",
+            "custom-outbound",
+            "custom-config",
+            "extra-core",
+            "direct",
+        ] {
+            let template = protocol_params_template(virtual_proto);
+            let value: serde_json::Value =
+                serde_json::from_str(&template).expect("virtual template is JSON");
+            assert!(
+                value.get("server").is_none() && value.get("server_port").is_none(),
+                "{virtual_proto} starter is bare: {template}"
+            );
+            assert!(
+                !is_import_shaped_params(&template),
+                "{virtual_proto} starter skips the server gate"
+            );
+        }
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for virtual_proto in ["chain", "custom-config", "direct"] {
+            store
+                .add(NewConfig {
+                    name: format!("{virtual_proto} row"),
+                    protocol: virtual_proto.to_string(),
+                    params: protocol_params_template(virtual_proto),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .unwrap_or_else(|error| panic!("bare {virtual_proto} starter commits: {error}"));
+        }
+        // Brutal garbage fails at commit naming the field; numerics pass the
+        // gate (emission stays preserved-not-emitted per follow-up).
+        let bad = "{\"type\":\"vless\",\"server\":\"s.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\
+            \"brutal_down_mbps\":\"fast\"}";
+        let error = store
+            .add(NewConfig {
+                name: "Bad brutal".to_string(),
+                protocol: "vless".to_string(),
+                params: bad.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("garbage brutal speed must fail");
+        assert!(
+            error.to_string().contains("brutal_down_mbps"),
+            "names the field, got {error}"
+        );
+        let numeric = bad.replace("\"fast\"", "100");
+        store
+            .add(NewConfig {
+                name: "Numeric brutal".to_string(),
+                protocol: "vless".to_string(),
+                params: numeric,
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("numeric brutal speed commits");
+    }
+
     /// Config-completeness T01: the picker lists exactly the 24 canonical
     /// stored types (contract: no free-text typos); the virtual set is the
     /// four address-less types plus trivial `direct` (T08, Throne label-only
@@ -10969,7 +11079,8 @@ mod tests {
         assert!(cleared_value.get("allowInsecure").is_none());
         assert!(cleared_value.get("insecure").is_none());
         // Mux: modes round-trip, brutal speeds land as numbers, garbage
-        // speeds land as strings (loud downstream, never silent).
+        // speeds land as strings at fold time and fail at the commit gate
+        // naming the field (never silent at either level).
         let mux_on = fold_mux_into_params(
             bare,
             &MuxFold {
