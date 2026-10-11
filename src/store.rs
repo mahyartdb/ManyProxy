@@ -47,6 +47,10 @@ pub const VALID_PROTOCOLS: &[&str] = &[
     "custom-config",
     "extra-core",
     "chain",
+    // Config-completeness T08 (CAP-12): trivial `direct` rows (no fields —
+    // verified `edit_direct.ui` label-only) save and serve as a bare direct
+    // final. Appended last so the existing picker order never shifts.
+    "direct",
 ];
 /// Inclusive auto-port range for configs created without an explicit port.
 pub const AUTO_PORT_START: u16 = 10801;
@@ -886,6 +890,8 @@ fn canonical_protocol(raw: &str) -> Option<String> {
         | "custom-full-config" => Some("custom-config".to_string()),
         "extra" | "extra-core" | "extra_core" | "extracore" => Some("extra-core".to_string()),
         "chain" | "chained" | "chain-outbound" | "chain_outbound" => Some("chain".to_string()),
+        // Config-completeness T08 (CAP-12): trivial `direct` final.
+        "direct" => Some("direct".to_string()),
         _ => None,
     }
 }
@@ -901,6 +907,13 @@ pub fn protocol_params_template(protocol: &str) -> String {
         params.insert(key.to_string(), serde_json::Value::String(String::new()));
     }
     let canonical = canonical_protocol(protocol).unwrap_or_else(|| protocol.trim().to_string());
+    // Config-completeness T08 (CAP-12): `direct` rows carry no fields, so the
+    // starter is the bare kind marker (no server/port slots — an import-shaped
+    // template with a blank server would fail the commit gate, and there is
+    // nothing for the user to fill). Extra-core bare-shape precedent.
+    if canonical == "direct" {
+        return "{\"type\":\"direct\"}".to_string();
+    }
     let port: u16 = match canonical.as_str() {
         "wireguard" | "amneziawg" => 51820,
         "ssh" => 22,
@@ -957,10 +970,12 @@ pub fn protocol_params_template(protocol: &str) -> String {
 /// Throne's address/port gating. In-memory flag table only (no migration,
 /// no `user_version` bump); aliases fold through [`canonical_protocol`] so
 /// dialog text can never dodge the gate.
+/// Config-completeness T08: `direct` joins (Throne `edit_direct.ui` is
+/// label-only — a trivial final has no address to show).
 pub fn is_virtual_protocol(protocol: &str) -> bool {
     matches!(
         canonical_protocol(protocol).as_deref(),
-        Some("chain" | "custom-outbound" | "custom-config" | "extra-core")
+        Some("chain" | "custom-outbound" | "custom-config" | "extra-core" | "direct")
     )
 }
 
@@ -2933,7 +2948,7 @@ pub fn guided_identity_fields(protocol: &str) -> Option<GuidedIdentity> {
             read_keys: &["psk"],
             needs: "psk",
         },
-        "socks" | "http" | "https" | "shadowtls" => GuidedIdentity {
+        "socks" | "http" | "https" | "shadowtls" | "direct" => GuidedIdentity {
             key: None,
             read_keys: &[],
             needs: "no secret",
@@ -10743,18 +10758,25 @@ mod tests {
         );
     }
 
-    /// Config-completeness T01: the picker lists exactly the 23 canonical
+    /// Config-completeness T01: the picker lists exactly the 24 canonical
     /// stored types (contract: no free-text typos); the virtual set is the
-    /// four address-less types (Throne gating parity); pristine detection is
-    /// byte-identical; the switch rewrite fires on pristine JSON only.
+    /// four address-less types plus trivial `direct` (T08, Throne label-only
+    /// parity); pristine detection is byte-identical; the switch rewrite
+    /// fires on pristine JSON only.
     #[test]
     fn t01_picker_virtual_and_pristine_rules() {
         assert_eq!(
             VALID_PROTOCOLS.len(),
-            23,
+            24,
             "picker lists exactly the canonical types"
         );
-        for virtual_proto in ["chain", "custom-outbound", "custom-config", "extra-core"] {
+        for virtual_proto in [
+            "chain",
+            "custom-outbound",
+            "custom-config",
+            "extra-core",
+            "direct",
+        ] {
             assert!(
                 is_virtual_protocol(virtual_proto),
                 "{virtual_proto} hides Server/Port"
@@ -10805,6 +10827,35 @@ mod tests {
             "{{{",
             "garbage stands"
         );
+    }
+
+    /// Config-completeness T08 (CAP-12): trivial `direct` rows — the starter
+    /// is the bare kind marker (no fields to fill), the guided identity is
+    /// secret-free, and the untouched starter saves (opaque passthrough, no
+    /// credential gate).
+    #[test]
+    fn t08_direct_template_saves_with_no_fields() {
+        assert_eq!(
+            protocol_params_template("direct"),
+            "{\"type\":\"direct\"}",
+            "direct starter is the bare marker"
+        );
+        let guided = guided_identity_fields("direct").expect("direct has a guided row");
+        assert!(guided.key.is_none(), "direct takes no secret");
+        assert_eq!(guided.needs, "no secret");
+        assert!(is_virtual_protocol("direct"), "direct hides Server/Port");
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store
+            .add(NewConfig {
+                name: "Direct".to_string(),
+                protocol: "direct".to_string(),
+                params: protocol_params_template("direct"),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("bare direct row saves");
+        assert_eq!(created.protocol, "direct");
     }
 
     /// Config-completeness T02: shared-panel folds are byte-identical

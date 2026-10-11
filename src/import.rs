@@ -34,7 +34,8 @@ pub struct ImportedConfig {
     /// `http`, `https`, `naive`, `xray` (ticket 08: Xray-only VLESS),
     /// `custom-outbound` / `custom-config` (ticket 08: custom JSON rows),
     /// `extra-core` (ticket 08: user executable slot),
-    /// `chain` (ticket 08: chained outbounds)).
+    /// `chain` (ticket 08: chained outbounds),
+    /// `direct` (config-completeness T08: trivial final, no endpoint).
     pub protocol: String,
     /// Deterministic JSON object with sing-box outbound field names
     /// (`type`, `server`, `server_port`, …).
@@ -1164,14 +1165,45 @@ fn parse_shadowtls(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// name the scheme and the gap only — never userinfo or hosts.
 fn unsupported_protocol_guidance(scheme: &str) -> ImportError {
     let detail = match scheme {
-        "mieru" => "mieru has no sing-box 1.14.2 outbound schema (only the third-party mbox fork serves mieru) — import rejected; serve it via a custom full-config row on a fork core instead",
-        "juicity" => "juicity has no sing-box outbound schema (upstream feature request, never merged) — import rejected; serve it via a custom full-config row instead",
-        "openvpn" => "openvpn is a sing-box endpoint (openvpn-client), not a 1.14.2 outbound — import rejected; serve it via a custom full-config row instead",
-        "masque" => "masque-client is a sing-box 1.15.0+ endpoint, not a 1.14.2 outbound — import rejected; serve it via a custom full-config row on a newer core instead",
-        "trusttunnel" => "trusttunnel has no sing-box 1.14.2 outbound schema — import rejected; serve it via a custom full-config row instead",
+        "mieru" => "mieru has no sing-box 1.14.2 outbound schema (only the third-party mbox fork serves mieru) — import rejected; serve it via a \"custom-config\" row on a fork core instead",
+        "juicity" => "juicity has no sing-box outbound schema (upstream feature request, never merged) — import rejected; serve it via a \"custom-config\" row instead",
+        "openvpn" => "openvpn is a sing-box endpoint (openvpn-client), not a 1.14.2 outbound — import rejected; serve it via a \"custom-config\" row instead",
+        "masque" => "masque-client is a sing-box 1.15.0+ endpoint, not a 1.14.2 outbound — import rejected; serve it via a \"custom-config\" row on a newer core instead",
+        "trusttunnel" => "trusttunnel has no sing-box 1.14.2 outbound schema — import rejected; serve it via a \"custom-config\" row instead",
+        // Config-completeness T08 (CAP-12): the remaining exotic fates stay
+        // guidance-only (never fabricated editors, never 1.15.0 emission).
+        "tailscale" => "tailscale is a sing-box endpoint, not a 1.14.2 outbound — import rejected; serve it via a \"custom-config\" row instead",
+        "openconnect" => "openconnect has no sing-box 1.14.2 outbound schema — import rejected; serve it via a \"custom-config\" row instead",
+        "autoselector" => "autoselector is a group/failover construct, not a sing-box 1.14.2 outbound — import rejected; serve the concrete rows directly or via a \"custom-config\" row instead",
         _ => "this protocol has no sing-box 1.14.2 outbound schema — import rejected",
     };
     unknown_scheme(format!("unsupported scheme '{scheme}' ({detail})"))
+}
+
+/// Config-completeness T08 (CAP-12): trivial `direct://` links carry no
+/// endpoint — the `#fragment` names the row (default `direct`), authority
+/// or query parts are meaningless on a final and ignored rather than
+/// rejected. Stored params match the dialog starter byte-for-byte.
+fn parse_direct_link(rest: &str) -> Result<ImportedConfig, ImportError> {
+    let fragment = rest.find('#').map(|i| &rest[i + 1..]).unwrap_or("");
+    let remark = percent_decode(fragment, false);
+    let name = if remark.trim().is_empty() {
+        "direct".to_string()
+    } else {
+        cap_name(remark)
+    };
+    let mut params = Params::new();
+    params.insert(
+        "type".to_string(),
+        serde_json::Value::String("direct".to_string()),
+    );
+    Ok(ImportedConfig {
+        name,
+        protocol: "direct".to_string(),
+        params: finish(params),
+        host: String::new(),
+        port: 0,
+    })
 }
 
 /// Legacy Hysteria v1 (`hysteria://auth@host:port?…`): auth and port required.
@@ -1593,6 +1625,8 @@ pub const VALID_OUTBOUND_TYPES: &[&str] = &[
     "custom-config",
     "extra-core",
     "chain",
+    // Config-completeness T08 (CAP-12): trivial `direct` final.
+    "direct",
 ];
 
 /// Ticket 31: accepted link schemes (lowercase, as matched in
@@ -1631,6 +1665,8 @@ pub const VALID_LINK_SCHEMES: &[&str] = &[
     "https",
     "naive",
     "naive+https",
+    // Config-completeness T08 (CAP-12): trivial `direct` final.
+    "direct",
 ];
 fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
@@ -1661,6 +1697,8 @@ fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
         | "custom-full-config" => Ok("custom-config".to_string()),
         "extra" | "extra-core" | "extra_core" | "extracore" => Ok("extra-core".to_string()),
         "chain" | "chained" | "chain-outbound" | "chain_outbound" => Ok("chain".to_string()),
+        // Config-completeness T08 (CAP-12): trivial `direct` final.
+        "direct" => Ok("direct".to_string()),
         "" => Err(invalid_json("item is missing outbound \"type\"")),
         // Ticket 24 (LOW scheme casing): echo the input's case, not the
         // lowered form, and cap the echo (no unbounded input in errors).
@@ -1715,6 +1753,31 @@ fn json_outbound(_index: usize, value: &serde_json::Value) -> Result<ImportedCon
         .and_then(|value| value.as_str())
         .unwrap_or("");
     let protocol = normalize_outbound_type(type_raw)?;
+    // Config-completeness T08 (CAP-12): trivial `direct` rows carry no
+    // endpoint — skip the server/port/credential gates (they would demand an
+    // address a final must not have). Extras ride verbatim for the engine to
+    // ignore; the stored shape matches the dialog starter.
+    if protocol == "direct" {
+        let name = json_string(obj, &["tag", "remark", "remarks", "ps", "name"])
+            .map(cap_name)
+            .unwrap_or_else(|| "direct".to_string());
+        let mut params = obj.clone();
+        params.insert(
+            "type".to_string(),
+            serde_json::Value::String(protocol.clone()),
+        );
+        params.insert(
+            "protocol".to_string(),
+            serde_json::Value::String(protocol.clone()),
+        );
+        return Ok(ImportedConfig {
+            name,
+            protocol,
+            params: finish(params),
+            host: String::new(),
+            port: 0,
+        });
+    }
     // Ticket 24 (M2): trim/bracket-strip so JSON servers agree with decoded
     // link hosts before identity.
     let host_raw = json_string(obj, &["server", "address"])
@@ -2362,11 +2425,16 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         "shadowtls" | "shadow-tls" | "shadow_tls" => {
             parse_shadowtls(&split_uri(&scheme, rest)?)
         }
+        // Config-completeness T08 (CAP-12): trivial `direct` final — no
+        // endpoint, so no authority parsing (a bad port must not fail a
+        // row that has no address); the fragment names the row.
+        "direct" => parse_direct_link(rest),
         // Ticket 42 (US-24): no upstream 1.14.2 schema (or endpoint-only /
         // 1.15+-only) — loud import reject with per-protocol guidance.
-        "mieru" | "juicity" | "openvpn" | "masque" | "trusttunnel" => {
-            Err(unsupported_protocol_guidance(&scheme))
-        }
+        // Config-completeness T08 (CAP-12): tailscale/openconnect/
+        // autoselector join the guidance-only set (never fabricated editors).
+        "mieru" | "juicity" | "openvpn" | "masque" | "trusttunnel" | "tailscale" | "openconnect"
+        | "autoselector" => Err(unsupported_protocol_guidance(&scheme)),
         // Ticket 31: a typo scheme names the valid schemes.
         _ => Err(unknown_scheme(format!(
             "unknown scheme '{}' (valid: {})",
@@ -2981,6 +3049,15 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             | "custom-full-config" => Ok("custom-config".to_string()),
             "extra" | "extra-core" | "extra_core" | "extracore" => Ok("extra-core".to_string()),
             "chain" | "chained" | "chain-outbound" | "chain_outbound" => Ok("chain".to_string()),
+            // Config-completeness T08 (CAP-12): trivial `direct` final.
+            "direct" => Ok("direct".to_string()),
+            // Config-completeness T08 (CAP-12): exotic Clash types reject
+            // with the same guidance as links (never fabricated editors).
+            "mieru" | "juicity" | "openvpn" | "masque" | "trusttunnel" | "tailscale"
+            | "openconnect" | "autoselector" => Err(unknown_scheme(format!(
+                "unsupported clash type '{lower}' ({})",
+                unsupported_protocol_guidance(&lower).message,
+            ))),
             "" => Err(invalid_json("clash entry is missing \"type\"")),
             // Ticket 24 (LOW scheme casing): echo the input's case, capped.
             _ => Err(unknown_scheme(format!(
@@ -3142,6 +3219,30 @@ fn import_clash_proxies(content: &str) -> BatchResult {
                 .map(|(_, value)| value.clone())
                 .unwrap_or_default();
             let protocol = clash_type(&raw_type)?;
+            // Config-completeness T08 (CAP-12): trivial `direct` entries
+            // need no server/port (a final has no address to name).
+            if protocol == "direct" {
+                let name = cap_name(
+                    fields
+                        .iter()
+                        .find(|(key, _)| key == "name")
+                        .map(|(_, value)| value.clone())
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| "direct".to_string()),
+                );
+                let mut params = Params::new();
+                params.insert(
+                    "type".to_string(),
+                    serde_json::Value::String(protocol.clone()),
+                );
+                return Ok(ImportedConfig {
+                    name,
+                    protocol,
+                    params: finish(params),
+                    host: String::new(),
+                    port: 0,
+                });
+            }
             let host = fields
                 .iter()
                 .find(|(key, _)| key == "server")
@@ -5189,6 +5290,64 @@ mod tests {
                 "names the gap: {error}"
             );
         }
+    }
+
+    /// Config-completeness T08 (CAP-12): every exotic fate rejects with
+    /// guidance naming the `custom-config` row (never a fabricated editor),
+    /// and trivial `direct` rows land from links, JSON, and Clash alike.
+    #[test]
+    fn t08_exotic_fates_reject_direct_lands() {
+        for link in [
+            "mieru://user:pass@example.com:1080#m",
+            "juicity://uuid:pass@example.com:23142#j",
+            "trusttunnel://x@example.com:443#t",
+            "tailscale://x@example.com:443#t",
+            "openvpn://user:pass@example.com:1194#o",
+            "openconnect://user:pass@example.com:443#o",
+            "autoselector://x#auto",
+            "MASQUE://user@example.com:443#m",
+        ] {
+            let error = parse_link(link).expect_err(&format!("{link} rejects"));
+            assert_eq!(error.kind, ImportErrorKind::UnknownScheme, "link {link}");
+            assert!(
+                error.message.contains("custom-config"),
+                "guidance names the supported row: {error:?}"
+            );
+        }
+        // Clash intake rejects the same fates with the same guidance.
+        let clash = import_text(
+            "proxies:\n  - name: t\n    type: tailscale\n    server: a.example.com\n    port: 443\n",
+        );
+        assert!(
+            clash.configs.is_empty() && clash.failures.len() == 1,
+            "tailscale clash entry fails: {clash:?}"
+        );
+        assert!(
+            clash.failures[0].reason.contains("custom-config"),
+            "clash guidance names the row: {:?}",
+            clash.failures[0]
+        );
+        // direct:// links: the fragment names the row, no endpoint needed.
+        let named = parse_link("direct://#office").expect("direct link parses");
+        assert_eq!(named.protocol, "direct");
+        assert_eq!(named.name, "office");
+        assert_eq!(named.params, "{\"type\":\"direct\"}");
+        let bare = parse_link("direct://").expect("bare direct parses");
+        assert_eq!(bare.protocol, "direct");
+        assert_eq!(bare.name, "direct");
+        assert_eq!(bare.params, "{\"type\":\"direct\"}");
+        // JSON intake: {"type":"direct"} needs no server.
+        let batch = import_text("{\"type\":\"direct\",\"tag\":\"d1\"}");
+        assert!(batch.failures.is_empty(), "failures: {:?}", batch.failures);
+        assert_eq!(batch.configs.len(), 1);
+        assert_eq!(batch.configs[0].protocol, "direct");
+        assert_eq!(batch.configs[0].name, "d1");
+        // Clash intake agrees (no server/port demanded).
+        let clash = import_text("proxies:\n  - name: d\n    type: direct\n");
+        assert!(clash.failures.is_empty(), "failures: {:?}", clash.failures);
+        assert_eq!(clash.configs.len(), 1);
+        assert_eq!(clash.configs[0].protocol, "direct");
+        assert_eq!(clash.configs[0].name, "d");
     }
 
     /// Ticket 42 (US-25): `.conf` key parity with URI intake — reserved and

@@ -356,6 +356,13 @@ pub fn is_egress_only_protocol(protocol: &str) -> bool {
         || is_xray_protocol(protocol)
 }
 
+/// Config-completeness T08 (CAP-12): trivial `direct` rows (no fields —
+/// Throne `edit_direct.ui` label-only) serve as a bare direct final under
+/// the row's own tag. Case folds like every other kind predicate.
+pub fn is_direct_protocol(protocol: &str) -> bool {
+    matches_protocol_aliases(protocol, &["direct"])
+}
+
 /// Ticket 08: which generated config owns a custom row. Stock is the
 /// default; unknown values name the `core` field instead of guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2163,6 +2170,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             if canonical_type(&config.protocol).is_none()
                 && !is_awg_protocol(&config.protocol)
                 && !is_noise_protocol(&config.protocol)
+                && !is_direct_protocol(&config.protocol)
             {
                 return Err(EngineError::UnsupportedProtocol {
                     name: config.name.clone(),
@@ -2686,6 +2694,14 @@ fn build_standard_node(
     params: &mut serde_json::Map<String, serde_json::Value>,
     out_tag: &str,
 ) -> Result<(serde_json::Value, bool, bool), EngineError> {
+    // Config-completeness T08 (CAP-12): trivial `direct` rows carry no
+    // endpoint — serve a bare direct outbound under the row's tag (the
+    // row's own isolation rule routes its inbound there). Stored extras
+    // are ignored, never emitted (a final takes no fields).
+    if is_direct_protocol(&config.protocol) {
+        let node = serde_json::json!({"type": "direct", "tag": out_tag});
+        return Ok((node, false, false));
+    }
     str_field(params, "server").ok_or(EngineError::BadParams {
         name: config.name.clone(),
         field: "server",
@@ -11498,6 +11514,47 @@ mod tests {
             matches!(error, EngineError::BadParams { .. }),
             "typed, got {error}"
         );
+    }
+
+    /// Config-completeness T08 (CAP-12): trivial `direct` rows serve as a
+    /// bare direct final under their own tag (no endpoint, no fork, no
+    /// bridge) and pass activation validation with field-less params.
+    #[test]
+    fn t08_direct_serves_bare_final() {
+        assert!(is_direct_protocol("Direct"));
+        let row = fixture(
+            "7",
+            "DirectOne",
+            "direct",
+            json!({"type": "direct"}),
+            "127.0.0.1",
+            10807,
+        );
+        assert!(!needs_fork(&row), "stock, not fork");
+        let generated = generate(std::slice::from_ref(&row)).expect("direct generates");
+        assert!(!generated.requires_fork, "no fork");
+        assert!(!generated.requires_xray, "no bridge");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("7")))
+            .expect("direct outbound present");
+        assert_eq!(node["type"], json!("direct"));
+        assert_eq!(
+            node.as_object().expect("object").len(),
+            2,
+            "bare final carries no fields: {node}"
+        );
+        let rule = value["route"]["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["inbound"] == json!([inbound_tag("7")]))
+            .expect("direct rule present");
+        assert_eq!(rule["outbound"], json!(outbound_tag("7")));
+        validate_activation(std::slice::from_ref(&row)).expect("direct activates");
     }
 
     /// Standalone Noise rows ride the fork sidecar with explicit AWG-vs-Noise

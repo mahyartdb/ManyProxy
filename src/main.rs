@@ -102,6 +102,7 @@ actions!(
     [
         AddConfig,
         ImportConfigs,
+        PasteImport,
         StartSelected,
         StopSelected,
         TestSelected,
@@ -130,10 +131,15 @@ pub const APP_KEY_CONTEXT: &str = "manyproxy-library";
 /// Delete/Ctrl-E/Ctrl-F are inert while typing in a field (the focused
 /// input consumes the keystroke before the shell sees it) and while any
 /// dialog is open.
+/// Config-completeness T08 (CAP-11): Ctrl-V pastes clipboard text into the
+/// Import dialog (same handler as the palette `ImportClipboard` op and the
+/// Library-menu item). Like every other shortcut it is inert while typing
+/// (the focused input keeps native paste) and while any dialog is open.
 pub fn bind_app_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-n", AddConfig, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-o", ImportConfigs, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteImport, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("f5", StartSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("shift-f5", StopSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-t", TestSelected, Some(APP_KEY_CONTEXT)),
@@ -211,6 +217,7 @@ pub const GIT_HASH: &str = match option_env!("MANYPROXY_GIT_HASH") {
 pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Add configuration", "Ctrl-N"),
     ("Import configurations", "Ctrl-O"),
+    ("Paste clipboard into Import", "Ctrl-V"),
     ("Start selected", "F5"),
     ("Stop selected", "Shift-F5"),
     ("Test selected", "Ctrl-T"),
@@ -10483,9 +10490,10 @@ impl SearchableListDelegate for ProtocolChoiceList {
     }
 }
 
-/// Config-completeness T01: the 23 canonical stored types as picker rows, in
+/// Config-completeness T01: the 24 canonical stored types as picker rows, in
 /// [`VALID_PROTOCOLS`] order (the store owns the list — the dialog never
 /// forks it, so a typo'd protocol is unrepresentable).
+/// Config-completeness T08: `direct` rides last (trivial final, CAP-12).
 fn protocol_choices() -> Vec<ProtocolChoice> {
     VALID_PROTOCOLS
         .iter()
@@ -12054,6 +12062,13 @@ impl AppView {
                 self.report_save_error(error, window, cx);
             }
         }
+    }
+
+    /// Config-completeness T08 (CAP-11): `Clone` is an alias over
+    /// [`AppView::commit_duplicate`] — same disabled copy, fresh auto port,
+    /// identical params. No new dupe logic lives here by construction.
+    fn commit_clone(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_duplicate(id, window, cx);
     }
     /// Ticket 43: reset one row's traffic totals (post-confirm). Store and
     /// session mirror zero together, then the rows repaint; the toast names
@@ -19480,6 +19495,41 @@ impl AppView {
                         }
                     }),
                 )
+                // Config-completeness T08 (CAP-11): `Clone` alias over the
+                // same `commit_duplicate` handler (no new dupe logic; the
+                // row menu names both spellings). No shortcut bound, so no
+                // `Kbd` chip and no `Name (Key)` suffix (kit-maximal rule).
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("clone-config")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("Clone the selected row (disabled copy)"))
+                                    .into()
+                            })
+                            .child("Clone")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.commit_clone(&config.id, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            });
+                        }
+                    }),
+                )
                 .item(
                     PopupMenuItem::element(|_, _| {
                         div()
@@ -20864,6 +20914,15 @@ impl AppView {
                 }
                 view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
             }))
+            // Config-completeness T08 (CAP-11): paste-intake binding — the
+            // same handler as the palette `ImportClipboard` op and the
+            // Library-menu "From clipboard" item (same guard, no new path).
+            .on_action(cx.listener(|view, _: &PasteImport, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.open_import_from_clipboard(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &StartSelected, window, cx| {
                 if overlay_open(window, cx) {
                     return;
@@ -21155,10 +21214,15 @@ impl AppView {
                                 div()
                                     .id("import-clipboard")
                                     .test_support()
-                                    // Ticket 02: expose role + name (no
-                                    // shortcut bound, so no keyshortcuts).
+                                    // Ticket 02: expose role + name.
+                                    // Config-completeness T08 (CAP-11): Ctrl-V
+                                    // is bound (see `bind_app_keys`), so the
+                                    // binding rides the shortcut property as
+                                    // well as the visible chip (Import-item
+                                    // precedent — `Kbd` only on bound actions).
                                     .role(Role::MenuItem)
-                                    .aria_label("From clipboard")
+                                    .aria_label("From clipboard (Ctrl-V)")
+                                    .aria_keyshortcuts("Ctrl-V")
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -21168,6 +21232,7 @@ impl AppView {
                                             .into()
                                     })
                                     .child("From clipboard")
+                                    .child(shortcut_kbd("ctrl-v", "(Ctrl-V)"))
                             })
                             .on_click({
                                 let view = library_view.clone();
@@ -22036,15 +22101,17 @@ mod tests {
     }
 
     /// Config-completeness T01: Add renders the kit protocol `Select` listing
-    /// exactly the 23 canonical types as stable option rows — no free-text
+    /// exactly the 24 canonical types as stable option rows — no free-text
     /// protocol input remains, so a typo'd protocol is unrepresentable.
     /// Kit: `Select::new(&state)` + `.id().small().accessibility_label()`.
     /// The popup list virtualizes (only visible rows paint), so paint asserts
-    /// cover the opened popup's top rows while full 23-membership is pinned
+    /// cover the opened popup's top rows while full 24-membership is pinned
     /// through the delegate (`set_selected_value` resolves every canonical
     /// type — a missing row would come back `None`).
+    /// Config-completeness T08: `direct` (CAP-12 trivial final) is the 24th
+    /// row, appended last so the existing order never shifts.
     #[gpui_kit::test]
-    fn t01_protocol_picker_lists_23_canonical_types(cx: &mut TestAppContext) {
+    fn t01_protocol_picker_lists_24_canonical_types(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
         use crate::ConfigForm;
         cx.update(gpui_kit::init);
@@ -22074,15 +22141,15 @@ mod tests {
         paint_dialog_open(cx);
         assert_absent(cx, "protocol-option-vless".to_string());
         // Full membership: every canonical type resolves through the picker
-        // delegate (23 rows, `VALID_PROTOCOLS` order — the store owns it).
+        // delegate (24 rows, `VALID_PROTOCOLS` order — the store owns it).
         assert_eq!(
             VALID_PROTOCOLS.len(),
-            23,
+            24,
             "picker covers the canonical list"
         );
         assert_eq!(
             crate::protocol_choices().len(),
-            23,
+            24,
             "one picker row per canonical type"
         );
         cx.update(|window, cx| {
@@ -22209,7 +22276,15 @@ mod tests {
             paint_dialog_open(cx);
             *cursor = target;
         };
-        for virtual_proto in ["chain", "custom-outbound", "custom-config", "extra-core"] {
+        for virtual_proto in [
+            "chain",
+            "custom-outbound",
+            "custom-config",
+            "extra-core",
+            // Config-completeness T08: `direct` is label-only (CAP-12), so
+            // it hides the endpoint inputs like the other virtual types.
+            "direct",
+        ] {
             pick(cx, row_of(virtual_proto), &mut cursor);
             assert_absent(cx, "field-guided-server".to_string());
             assert_absent(cx, "field-guided-port".to_string());
@@ -29200,6 +29275,100 @@ mod tests {
         assert_eq!(copy.params, alpha.params);
     }
 
+    /// Config-completeness T08 (CAP-11): the `Clone` alias duplicates
+    /// through the existing `commit_duplicate` logic — new disabled row,
+    /// fresh auto port, identical params (no rebuilt dupe path).
+    #[gpui_kit::test]
+    fn t08_clone_alias_duplicates_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10854"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_clone(&alpha.id, window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 1, "clone toasts");
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert_eq!(rows.len(), 2, "copy lands");
+        let copy = rows
+            .iter()
+            .find(|row| row.id != alpha.id)
+            .expect("copy there");
+        assert_eq!(copy.name, "Alpha copy");
+        assert!(!copy.enabled, "copy lands disabled");
+        assert_ne!(copy.port, alpha.port, "fresh auto port");
+        assert!(crate::store::is_auto_port(copy.port), "port is auto-range");
+        assert_eq!(copy.protocol, alpha.protocol);
+        assert_eq!(copy.params, alpha.params);
+    }
+
+    /// Config-completeness T08 (CAP-11): a share link on the clipboard +
+    /// the paste-intake binding opens the Import dialog prefilled with the
+    /// live valid/invalid preview — the same handler as the palette
+    /// `ImportClipboard` op (no regression, no new path). The
+    /// first-failure line paints only for a non-empty prefill, so it pins
+    /// the clipboard text landed in the box (an empty box stays neutral).
+    #[gpui_kit::test]
+    fn t08_paste_binding_opens_import_prefilled(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x"
+                    .to_string(),
+            ));
+        });
+        // Focus the shell so the library key context matches (keyboard-test
+        // precedent); the binding stays inert while typing or under a dialog.
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let paste = Keystroke::parse("ctrl-v").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(paste, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "paste opens the import dialog"
+        );
+        assert_painted(cx, "field-import-text");
+        assert_painted(cx, "import-preview");
+        assert_painted(cx, "import-first-failure");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T08 (CAP-12): the `direct` page is label-only —
+    /// switching to it rewrites the box to the bare marker and the dialog
+    /// commit carries no endpoint fields (form-level; the T01 virtual test
+    /// pins the Server/Port hiding through the real picker).
+    #[gpui_kit::test]
+    fn t08_direct_form_commits_bare_marker(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let params = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"direct".to_string(), window, cx);
+                });
+                form.sync_protocol_template(window, cx);
+                form.effective_params(cx)
+            })
+        });
+        assert_eq!(params, protocol_params_template("direct"));
+        assert_eq!(params, "{\"type\":\"direct\"}");
+    }
+
     /// Scenario: edited concrete port → "auto" returns to auto-assign (US-3).
     #[gpui_kit::test]
     fn ticket43_reauto_port_via_auto_word(cx: &mut TestAppContext) {
@@ -29980,7 +30149,9 @@ mod tests {
                 "library-menu",
                 &[
                     ("menu-import-config", "Import (Ctrl-O)"),
-                    ("import-clipboard", "From clipboard"),
+                    // Config-completeness T08: Ctrl-V is now bound, so the
+                    // pinned `Name (Key)` string moves onto this item.
+                    ("import-clipboard", "From clipboard (Ctrl-V)"),
                     ("export-library", "Export"),
                 ][..],
             ),
@@ -34906,6 +35077,7 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
+            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -35154,6 +35326,8 @@ mod tests {
     /// Ticket 05 (CAP-6): management hides behind exactly one disclosed
     /// `Row actions…` trigger — the five items stay unmounted while closed
     /// (t04 pins the closed half) and all five paint once opened.
+    /// Config-completeness T08: the `Clone` alias paints beside `Duplicate`
+    /// (same handler, no new dupe logic).
     #[gpui_kit::test]
     fn t05_row_menu_opens_management_items(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -35180,6 +35354,7 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
+            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -35196,6 +35371,7 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
+            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -40817,6 +40993,9 @@ mod tests {
         let expected = [
             ("Add configuration", "Ctrl-N"),
             ("Import configurations", "Ctrl-O"),
+            // Config-completeness T08: paste-intake binding (same handler as
+            // the palette `ImportClipboard` op).
+            ("Paste clipboard into Import", "Ctrl-V"),
             ("Start selected", "F5"),
             ("Stop selected", "Shift-F5"),
             ("Test selected", "Ctrl-T"),
