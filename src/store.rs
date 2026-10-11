@@ -47,6 +47,10 @@ pub const VALID_PROTOCOLS: &[&str] = &[
     "custom-config",
     "extra-core",
     "chain",
+    // Config-completeness T08 (CAP-12): trivial `direct` rows (no fields —
+    // verified `edit_direct.ui` label-only) save and serve as a bare direct
+    // final. Appended last so the existing picker order never shifts.
+    "direct",
 ];
 /// Inclusive auto-port range for configs created without an explicit port.
 pub const AUTO_PORT_START: u16 = 10801;
@@ -886,21 +890,41 @@ fn canonical_protocol(raw: &str) -> Option<String> {
         | "custom-full-config" => Some("custom-config".to_string()),
         "extra" | "extra-core" | "extra_core" | "extracore" => Some("extra-core".to_string()),
         "chain" | "chained" | "chain-outbound" | "chain_outbound" => Some("chain".to_string()),
+        // Config-completeness T08 (CAP-12): trivial `direct` final.
+        "direct" => Some("direct".to_string()),
         _ => None,
     }
 }
 
 /// Ticket 31: per-protocol starter params for the guided add dialog (never
-/// raw JSON first). Every template is a JSON object with the upstream
+/// raw JSON first). Endpoint templates are JSON objects with the upstream
 /// `server`/`server_port` slots plus the protocol's credential slot(s) left
-/// blank — submitting it untouched fails in [`validate_protocol_params`]
-/// naming the missing field, never silently. Unknown input falls back to a
-/// bare server/port object (the commit then names the valid protocols).
+/// blank — submitting one untouched fails in [`validate_protocol_params`]
+/// naming the missing field, never silently. Virtual types (`chain`,
+/// `custom-*`, `extra-core`, `direct`) start bare (`{"type":...}` with no
+/// server/port slots): their guided Server/Port inputs hide (Throne gating
+/// parity), and an import-shaped template with a blank server would fail the
+/// commit gate with nothing for the user to fill. Unknown input falls back
+/// to a bare server/port object (the commit then names the valid protocols).
 pub fn protocol_params_template(protocol: &str) -> String {
     fn blank(params: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
         params.insert(key.to_string(), serde_json::Value::String(String::new()));
     }
     let canonical = canonical_protocol(protocol).unwrap_or_else(|| protocol.trim().to_string());
+    // Config-completeness T08 (CAP-12) + review: virtual rows carry no
+    // endpoint address of their own (chain hops and custom/extra-core
+    // payloads name it in JSON), so the starter is the bare kind marker.
+    // `direct` led (T08); `chain`/`custom-*`/`extra-core` follow — the guided
+    // commit folds blank hidden inputs to a no-op, and the bare object is
+    // not import-shaped, so it clears the server gate the hidden inputs
+    // could never satisfy. Hand JSON with server keys still validates as
+    // before (import-shaped path unchanged).
+    if matches!(
+        canonical.as_str(),
+        "direct" | "chain" | "custom-outbound" | "custom-config" | "extra-core"
+    ) {
+        return format!("{{\"type\":\"{canonical}\"}}");
+    }
     let port: u16 = match canonical.as_str() {
         "wireguard" | "amneziawg" => 51820,
         "ssh" => 22,
@@ -949,6 +973,1909 @@ pub fn protocol_params_template(protocol: &str) -> String {
         _ => {}
     }
     serde_json::Value::Object(params).to_string()
+}
+
+/// Config-completeness T01: virtual row types carry no endpoint address of
+/// their own (`chain` hops and `custom-*`/`extra-core` payloads name it in
+/// JSON) — the guided Server/Server port inputs hide for these, matching
+/// Throne's address/port gating. In-memory flag table only (no migration,
+/// no `user_version` bump); aliases fold through [`canonical_protocol`] so
+/// dialog text can never dodge the gate.
+/// Config-completeness T08: `direct` joins (Throne `edit_direct.ui` is
+/// label-only — a trivial final has no address to show).
+pub fn is_virtual_protocol(protocol: &str) -> bool {
+    matches!(
+        canonical_protocol(protocol).as_deref(),
+        Some("chain" | "custom-outbound" | "custom-config" | "extra-core" | "direct")
+    )
+}
+
+/// Config-completeness T01: true when a params box still holds the untouched
+/// starter for `protocol` — byte-identical to [`protocol_params_template`]
+/// output, never a semantic compare (whitespace or key order already means
+/// the user touched it, so the rewrite below stands off).
+pub fn is_pristine_template(params_raw: &str, protocol: &str) -> bool {
+    params_raw == protocol_params_template(protocol)
+}
+
+/// Config-completeness T01: type-switch template rule (contract C1). A
+/// protocol switch rewrites the params box to the new type's starter ONLY
+/// when the box still holds the old type's pristine starter; user-typed or
+/// otherwise dirty JSON stands untouched and the new page prefills whatever
+/// keys overlap instead. Pure (no I/O) so headless tests pin it directly.
+pub fn pristine_template_rewrite(
+    params_raw: &str,
+    old_protocol: &str,
+    new_protocol: &str,
+) -> String {
+    if is_pristine_template(params_raw, old_protocol) {
+        protocol_params_template(new_protocol)
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: shared Transport panel (S1) fold state — raw UI
+/// strings exactly as the panel controls hold them. `network` is the panel
+/// default (`tcp`) when the row carries none; every other blank means
+/// untouched (never wiped, R5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportFold {
+    pub network: String,
+    pub path: String,
+    pub host: String,
+    pub method: String,
+    pub service_name: String,
+}
+
+/// Config-completeness T02: shared TLS panel, optional variant (S2). `enable`
+/// mirrors the toggle; `pbk` non-blank means REALITY (Throne parity).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsOptionalFold {
+    pub enable: bool,
+    pub sni: String,
+    pub alpn: String,
+    pub fp: String,
+    pub insecure: bool,
+    pub pbk: String,
+    pub sid: String,
+}
+
+/// Config-completeness T03: the `security` enable/disable half of the
+/// optional TLS fold — enabling writes `tls` (or `reality` with a public
+/// key), disabling removes the key. Shared by the standard fold and the
+/// vmess legacy-aware variant below (one rule, two callers).
+fn fold_tls_security(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    fold: &TlsOptionalFold,
+) -> bool {
+    if fold.enable {
+        let want = if fold.pbk.trim().is_empty() {
+            "tls"
+        } else {
+            "reality"
+        };
+        match obj.get("security") {
+            Some(serde_json::Value::String(current)) if current.eq_ignore_ascii_case(want) => false,
+            _ => {
+                obj.insert(
+                    "security".to_string(),
+                    serde_json::Value::String(want.to_string()),
+                );
+                true
+            }
+        }
+    } else {
+        obj.remove("security").is_some()
+    }
+}
+
+/// Config-completeness T03: the credential half of the optional TLS fold
+/// (`sni`/`alpn`/`fp`/`insecure`/`pbk`/`sid`) — blank-safe, alias-aware,
+/// byte-identical on no-ops. Shared by the standard fold and the vmess
+/// legacy-aware variant below.
+fn fold_tls_details(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    fold: &TlsOptionalFold,
+) -> bool {
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "sni", &["sni", "peer"], &fold.sni);
+    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
+    changed |= fold_text_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
+    changed |= fold_bool_aliases(
+        obj,
+        "insecure",
+        &[
+            "insecure",
+            "allowInsecure",
+            "allow_insecure",
+            "allowinsecure",
+        ],
+        fold.insecure,
+    );
+    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
+    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    changed
+}
+
+/// Config-completeness T02: shared Mux+Brutal panel (S3). `mode` is
+/// `""` (keep default) | `"on"` | `"off"`; speeds are raw UI text (Mbps).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MuxFold {
+    pub mode: String,
+    pub brutal_enable: bool,
+    pub brutal_up_mbps: String,
+    pub brutal_down_mbps: String,
+}
+
+/// Config-completeness T02: shared Advanced dial panel (S4, dial half — TLS
+/// extras are a later ticket with their own engine `tls{}` mapping).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DialFold {
+    pub reuse_addr: bool,
+    pub tcp_fast_open: bool,
+    pub udp_fragment: bool,
+    pub tcp_multi_path: bool,
+    pub connect_timeout: String,
+    pub bind_interface: String,
+    pub inet4_bind_address: String,
+    pub inet6_bind_address: String,
+}
+
+/// Config-completeness T02: write one select/control value into a params
+/// object — an unchanged value (including an echoed default) no-ops;
+/// `default_value` (and `""`) otherwise restore the default by REMOVING the
+/// key; any other value sets it. Returns true when the object changed
+/// (callers reserialize only then, so no-op folds stay byte-identical and
+/// never produce spurious edit patches).
+fn fold_select_key(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+    default_value: &str,
+) -> bool {
+    let value = value.trim();
+    let current = match obj.get(key) {
+        Some(serde_json::Value::String(current)) => Some(current.clone()),
+        _ => None,
+    };
+    if current.as_deref() == Some(value) {
+        return false;
+    }
+    if value.is_empty() || value == default_value {
+        return obj.remove(key).is_some();
+    }
+    obj.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    true
+}
+
+/// Config-completeness T02: write one boolean into a params object across
+/// alias spellings — `false` removes every alias, `true` sets the canonical
+/// key (dropping stale aliases) only when the effective value changed.
+/// Untouched inputs compare equal through prefill, so they no-op.
+fn fold_bool_aliases(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    aliases: &[&str],
+    value: bool,
+) -> bool {
+    let current = aliases.iter().any(|key| truthy_flat(obj.get(*key)));
+    if current == value {
+        return false;
+    }
+    for key in aliases {
+        obj.remove(*key);
+    }
+    if value {
+        obj.insert(canonical.to_string(), serde_json::Value::Bool(true));
+    }
+    true
+}
+
+/// Config-completeness T02: truthy flat spelling (`1`/`true`/`yes`/`on`,
+/// JSON bools/numbers included) — mirrors the engine's `take_truthy` so
+/// prefill and fold agree on what a stored value means.
+fn truthy_flat(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(number)) => number.as_u64().is_some_and(|n| n != 0),
+        Some(serde_json::Value::String(text)) => {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Config-completeness T02: write one text value across read aliases —
+/// blank never touches the object (T05 blank semantics); non-blank writes
+/// the canonical key only when no alias already holds it.
+fn fold_text_aliases(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    read_keys: &[&str],
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if lookup_case_insensitive(obj, read_keys).as_deref() == Some(value) {
+        return false;
+    }
+    obj.insert(
+        canonical.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    true
+}
+
+/// Config-completeness T02: write one numeric text value — blank no-ops,
+/// parseable integers land as numbers, anything else lands as a string so
+/// validation fails loudly naming the field instead of silently keeping the
+/// old value (T05 port semantics, generalized).
+fn fold_number_text(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let next = match value.parse::<u64>() {
+        Ok(number) => serde_json::Value::from(number),
+        Err(_) => serde_json::Value::String(value.to_string()),
+    };
+    match obj.get(key) {
+        Some(current) if current == &next => false,
+        _ => {
+            obj.insert(key.to_string(), next);
+            true
+        }
+    }
+}
+
+/// Config-completeness T02: value lookup matching
+/// [`lookup_case_insensitive`] but borrowing the JSON value (for
+/// bool-aware prefill — the stringifying lookup skips `false`).
+fn get_case_insensitive<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    obj.get(key).or_else(|| {
+        obj.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    })
+}
+
+/// Config-completeness T02: prefill one panel toggle from a params JSON
+/// object (liberal truthy read across `keys`, mirroring [`truthy_flat`]).
+/// Blank for unparseable JSON or missing keys — the JSON stays the source
+/// of truth, the panel only echoes it.
+pub fn guided_prefill_bool(params_raw: &str, keys: &[&str]) -> bool {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    match obj {
+        Some(obj) => keys
+            .iter()
+            .any(|key| truthy_flat(get_case_insensitive(&obj, key))),
+        None => false,
+    }
+}
+
+/// Config-completeness T02: fold the shared Transport panel (S1) into a
+/// params JSON text. `network: "tcp"` restores the default (key removed);
+/// conditional blanks never wipe (R5). Byte-identical when nothing differs.
+pub fn fold_transport_into_params(params_raw: &str, fold: &TransportFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_key(obj, "network", &fold.network, "tcp");
+    changed |= fold_text_aliases(obj, "path", &["path"], &fold.path);
+    changed |= fold_text_aliases(obj, "host", &["host"], &fold.host);
+    changed |= fold_text_aliases(obj, "method", &["method"], &fold.method);
+    changed |= fold_text_aliases(
+        obj,
+        "service_name",
+        &["service_name", "serviceName"],
+        &fold.service_name,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the shared TLS panel, optional variant
+/// (S2), into a params JSON text. Disabling removes `security` only (sni,
+/// pbk and friends stay preserved per R5); enabling writes `tls`, or
+/// `reality` when `pbk` is non-blank. Byte-identical when nothing differs.
+pub fn fold_tls_optional_into_params(params_raw: &str, fold: &TlsOptionalFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = fold_tls_security(obj, fold);
+    changed |= fold_tls_details(obj, fold);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the shared Mux+Brutal panel (S3) into a
+/// params JSON text. `mode` `""` restores the default (key removed);
+/// `brutal_*` keys are panel state preserved in stored JSON — the engine
+/// consumes them without stock emission (no sing-box 1.14.2 mapping; the
+/// mux-force behavior still holds at emission). Byte-identical on no-ops.
+pub fn fold_mux_into_params(params_raw: &str, fold: &MuxFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    // `""` (and the explicit `"default"`) restore the panel default; the
+    // shared select rule keeps echoed values byte-identical.
+    changed |= fold_select_key(obj, "mux", &fold.mode, "default");
+    changed |= fold_bool_aliases(obj, "brutal_enable", &["brutal_enable"], fold.brutal_enable);
+    changed |= fold_number_text(obj, "brutal_up_mbps", &fold.brutal_up_mbps);
+    changed |= fold_number_text(obj, "brutal_down_mbps", &fold.brutal_down_mbps);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the shared Advanced dial panel (S4, dial
+/// half) into a params JSON text. Toggles clear to absent (sing-box omits);
+/// timeout/bind texts are blank-safe. Byte-identical on no-ops.
+pub fn fold_dial_into_params(params_raw: &str, fold: &DialFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    for (key, value) in [
+        ("reuse_addr", fold.reuse_addr),
+        ("tcp_fast_open", fold.tcp_fast_open),
+        ("udp_fragment", fold.udp_fragment),
+        ("tcp_multi_path", fold.tcp_multi_path),
+    ] {
+        changed |= fold_bool_aliases(obj, key, &[key], value);
+    }
+    changed |= fold_text_aliases(
+        obj,
+        "connect_timeout",
+        &["connect_timeout"],
+        &fold.connect_timeout,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "bind_interface",
+        &["bind_interface"],
+        &fold.bind_interface,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "inet4_bind_address",
+        &["inet4_bind_address"],
+        &fold.inet4_bind_address,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "inet6_bind_address",
+        &["inet6_bind_address"],
+        &fold.inet6_bind_address,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T02: fold the VLESS inner fields (uuid + flow +
+/// packet_encoding) into a params JSON text. `flow`/`packet_encoding` blank
+/// restores defaults (keys removed); uuid follows T05 identity semantics
+/// (aliases echoed, never wiped, never duplicated by untouched folds).
+pub fn fold_vless_inner_into_params(
+    params_raw: &str,
+    uuid: &str,
+    flow: &str,
+    packet_encoding: &str,
+) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], uuid);
+    changed |= fold_select_key(obj, "flow", flow, "");
+    changed |= fold_select_key(obj, "packet_encoding", packet_encoding, "");
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: sing-box vmess packet ciphers (the `security`
+/// Select on the VMess page). One source for the picker, the prefill reader
+/// and the fold below — a value the UI cannot pick is a value the fold
+/// cannot write. `auto` leads: it is the sing-box default (the engine's
+/// new-style arm falls back to it), so it folds to absent on new-style rows.
+pub const VMESS_CIPHERS: [&str; 5] = ["auto", "zero", "none", "chacha20-poly1305", "aes-128-gcm"];
+
+/// Config-completeness T03: sing-box 1.14.2 shadowsocks ciphers (the
+/// `method` Select on the Shadowsocks page — all 18 incl. `2022-blake3-*`,
+/// `none`, `aes-*-gcm/ctr/cfb`, `chacha20-ietf*`, `xchacha20*`, `rc4-md5`).
+/// One source for the picker and the fold below.
+pub const SS_METHODS: [&str; 18] = [
+    "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+    "none",
+    "aes-128-gcm",
+    "aes-192-gcm",
+    "aes-256-gcm",
+    "aes-128-ctr",
+    "aes-192-ctr",
+    "aes-256-ctr",
+    "aes-128-cfb",
+    "aes-192-cfb",
+    "aes-256-cfb",
+    "chacha20-ietf-poly1305",
+    "xchacha20-ietf-poly1305",
+    "chacha20-ietf",
+    "xchacha20",
+    "rc4-md5",
+];
+
+/// Config-completeness T03: raw-object half of [`vmess_has_legacy_tls`]
+/// (the folds below already hold the parsed object — no re-parse).
+fn vmess_has_legacy_tls_raw(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("tls").is_some_and(|tls| tls.is_boolean())
+}
+
+/// Config-completeness T03: true when a vmess params text carries the legacy
+/// link grammar — a boolean `tls` key (import always writes it for
+/// `vmess://` links) with the packet cipher in `security`. New-style rows
+/// carry tls-ness in `security` and the cipher in `encryption` instead.
+/// The folds below branch on this so neither grammar clobbers the other.
+pub fn vmess_has_legacy_tls(params_raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|obj| vmess_has_legacy_tls_raw(&obj))
+}
+
+/// Config-completeness T03: read the vmess packet cipher for the `security`
+/// Select — `encryption` first (new-style), then `security` when it holds a
+/// cipher (legacy import shape, or an ambiguous hand-written row the fold
+/// pair heals toward new-style on save). A tls-ness `security`
+/// (`tls`/`reality`) reads blank so the picker falls back to `auto`, never
+/// to a cipher the row does not have.
+pub fn vmess_cipher_value(params_raw: &str) -> String {
+    let encryption = guided_prefill_value(params_raw, &["encryption"]);
+    if !encryption.trim().is_empty() {
+        return encryption;
+    }
+    let security = guided_prefill_value(params_raw, &["security"]);
+    if VMESS_CIPHERS
+        .iter()
+        .any(|cipher| security.eq_ignore_ascii_case(cipher))
+    {
+        return security;
+    }
+    if vmess_has_legacy_tls(params_raw) {
+        return security;
+    }
+    String::new()
+}
+
+/// Config-completeness T03: read the vmess TLS toggle — the `security`
+/// on-values the engine maps, plus the legacy boolean `tls` import writes
+/// for `vmess://` links (the shared S2 prefill only reads `security`).
+pub fn vmess_tls_enabled(params_raw: &str) -> bool {
+    let security = guided_prefill_value(params_raw, &["security"]);
+    if matches!(
+        security.to_ascii_lowercase().as_str(),
+        "tls" | "xtls" | "reality"
+    ) {
+        return true;
+    }
+    guided_prefill_bool(params_raw, &["tls"])
+}
+
+/// Config-completeness T03: fold the VMess inner fields — uuid, aid, cipher
+/// and packet_encoding — into a params JSON text. `uuid`/`aid` follow T05
+/// identity semantics as strings (the engine coerces `alter_id` to a number,
+/// so import string spellings echo byte-identical); `packet_encoding` blank
+/// restores the default. The cipher is grammar-aware: legacy rows (boolean
+/// `tls`) keep it in `security` (always written — `auto` is explicit there,
+/// never a removal); new-style rows write `encryption` (`auto` restores the
+/// sing-box default). A cipher must never land in a tls-ness `security` —
+/// `apply_tls` fails those with `unknown security`. Byte-identical when
+/// nothing differs.
+pub fn fold_vmess_inner_into_params(
+    params_raw: &str,
+    uuid: &str,
+    aid: &str,
+    cipher: &str,
+    packet_encoding: &str,
+) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], uuid);
+    changed |= fold_text_aliases(obj, "alter_id", &["alter_id", "aid"], aid);
+    if vmess_has_legacy_tls_raw(obj) {
+        changed |= fold_text_aliases(obj, "security", &["security"], cipher);
+    } else {
+        changed |= fold_select_key(obj, "encryption", cipher, "auto");
+    }
+    changed |= fold_select_key(obj, "packet_encoding", packet_encoding, "");
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: fold the Trojan inner field (password) into a
+/// params JSON text. The trojan page's dedicated secret and the guided
+/// mini-form fold the same key (vless-uuid precedent: both no-op untouched,
+/// either one writes). Byte-identical when nothing differs.
+pub fn fold_trojan_inner_into_params(params_raw: &str, password: &str) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    if fold_text_aliases(obj, "password", &["password"], password) {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: write one select value that has no valid
+/// default — blank never touches the object (no fabrication, no strip of
+/// values the picker cannot represent); non-blank writes when different.
+/// Returns true when the object changed (callers reserialize only then).
+fn fold_select_keep_blank(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    match obj.get(key) {
+        Some(serde_json::Value::String(current)) if current == value => false,
+        _ => {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            true
+        }
+    }
+}
+
+/// Config-completeness T03: fold the Shadowsocks inner fields into a params
+/// JSON text. `method`/`plugin` blank never touches the object: `method`
+/// has no valid default (a blank pick would fabricate a cipher — the commit
+/// gate names the missing method instead) and a stored `plugin` can carry
+/// SIP002 `;`-tails the picker cannot represent (stripping them would be
+/// data loss; the engine already fails non-empty plugins naming the field,
+/// so nothing hides). `plugin_opts` is blank-safe text; `uot` folds the
+/// `udp_over_tcp` bool (the sing-box name — the socks arm already consumes
+/// that flat) reading the `uot` spelling too. Byte-identical on no-ops.
+pub fn fold_shadowsocks_inner_into_params(
+    params_raw: &str,
+    method: &str,
+    password: &str,
+    plugin: &str,
+    plugin_opts: &str,
+    uot: bool,
+) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_keep_blank(obj, "method", method);
+    changed |= fold_text_aliases(obj, "password", &["password"], password);
+    changed |= fold_select_keep_blank(obj, "plugin", plugin);
+    changed |= fold_text_aliases(
+        obj,
+        "plugin_opts",
+        &["plugin_opts", "plugin-opts", "pluginOpts"],
+        plugin_opts,
+    );
+    changed |= fold_bool_aliases(obj, "udp_over_tcp", &["udp_over_tcp", "uot"], uot);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T03: fold the shared TLS panel (S2) on vmess rows —
+/// legacy-aware. Legacy rows (boolean `tls`) keep their cipher in
+/// `security`, so the toggle mirrors into the boolean instead (the standard
+/// fold would strip the cipher); every other field folds exactly as the
+/// standard panel. Typing a reality key (`pbk`) with TLS on migrates the row
+/// to the new-style grammar (boolean dropped, cipher moved to `encryption`,
+/// `security` becomes `reality`) — otherwise the engine's legacy arm would
+/// silently drop the key and run the row without REALITY. Untouched rows
+/// fold byte-identical either way; non-legacy rows fold exactly like
+/// [`fold_tls_optional_into_params`].
+pub fn fold_tls_vmess_into_params(params_raw: &str, fold: &TlsOptionalFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    if vmess_has_legacy_tls_raw(obj) && fold.enable && !fold.pbk.trim().is_empty() {
+        // Reality intent on a legacy row: migrate to new-style first (the
+        // legacy arm drops `pbk`/`sid`, so emitting them there would lie).
+        obj.remove("tls");
+        changed = true;
+        if let Some(serde_json::Value::String(security)) = obj.get("security").cloned() {
+            if VMESS_CIPHERS
+                .iter()
+                .any(|cipher| security.eq_ignore_ascii_case(cipher))
+            {
+                obj.remove("security");
+                obj.insert(
+                    "encryption".to_string(),
+                    serde_json::Value::String(security),
+                );
+            }
+        }
+    }
+    if vmess_has_legacy_tls_raw(obj) {
+        // Legacy grammar still owns the row: mirror the toggle into the
+        // boolean, never touch the cipher in `security`.
+        let current = obj
+            .get("tls")
+            .and_then(|tls| tls.as_bool())
+            .unwrap_or(false);
+        if current != fold.enable {
+            obj.insert("tls".to_string(), serde_json::Value::Bool(fold.enable));
+            changed = true;
+        }
+        changed |= fold_tls_details(obj, fold);
+    } else {
+        changed |= fold_tls_security(obj, fold);
+        changed |= fold_tls_details(obj, fold);
+    }
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T04: sing-box AmneziaWG versions (the `awg_version`
+/// Select on the AmneziaWG page). One source for the picker, the prefill
+/// reader and the fold below — a value the UI cannot pick is a value the
+/// fold cannot write. The blank "Select version…" row stands for "no
+/// selection" (the fold never fabricates nor strips — contract C2; the
+/// engine names a missing version at start).
+pub const AWG_VERSIONS: [&str; 2] = ["2.0", "3.x"];
+
+/// Config-completeness T04: WireGuard inner fold state — raw UI strings
+/// exactly as the page controls hold them. `local_addr` is the Throne name;
+/// it stores as `address` (the conf/URI/engine spelling —
+/// `reshape_wireguard_endpoint` coerces it to the endpoint list, while a
+/// verbatim `local_addr` would ride to the endpoint as an unknown field).
+/// `sys_ifc` stores as `system` (same reason). `dns` is form-preserved but
+/// never emitted (the engine strips it as a client setting — pre-existing).
+/// `udp_timeout` stays import-only: no UI writes it, no fold strips it.
+/// Every numeric-ish field folds as TEXT (aid precedent): import string
+/// spellings echo byte-identical and the engine coerces the ones it knows
+/// (`mtu`, `reserved`, keepalive); `workers` joins the engine coercion loop
+/// this ticket so its string spelling is check-safe too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireguardFold {
+    pub private_key: String,
+    pub public_key: String,
+    pub pre_shared_key: String,
+    pub reserved: String,
+    pub persistent_keepalive: String,
+    pub local_addr: String,
+    pub dns: String,
+    pub mtu: String,
+    pub workers: String,
+    pub sys_ifc: bool,
+}
+
+/// Config-completeness T04: fold the WireGuard inner fields into a params
+/// JSON text. `pre_shared_key` is the canonical stored spelling (the engine
+/// moves it to `peers[]`; the `preshared_key`/`presharedkey` spellings read
+/// as aliases but are never written — an unknown-cased key would ride to
+/// the endpoint verbatim and fail `check`). `address` likewise reads
+/// `local_address`/`local_addr` but writes the engine spelling. Byte-identical
+/// on no-ops.
+pub fn fold_wireguard_into_params(params_raw: &str, fold: &WireguardFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(
+        obj,
+        "private_key",
+        &["private_key", "privatekey"],
+        &fold.private_key,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "public_key",
+        &["public_key", "publickey"],
+        &fold.public_key,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "pre_shared_key",
+        &["pre_shared_key", "presharedkey", "preshared_key"],
+        &fold.pre_shared_key,
+    );
+    changed |= fold_text_aliases(obj, "reserved", &["reserved"], &fold.reserved);
+    changed |= fold_text_aliases(
+        obj,
+        "persistent_keepalive",
+        &["persistent_keepalive", "persistent_keepalive_interval"],
+        &fold.persistent_keepalive,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "address",
+        &["address", "local_address", "local_addr"],
+        &fold.local_addr,
+    );
+    changed |= fold_text_aliases(obj, "dns", &["dns"], &fold.dns);
+    changed |= fold_text_aliases(obj, "mtu", &["mtu"], &fold.mtu);
+    changed |= fold_text_aliases(obj, "workers", &["workers"], &fold.workers);
+    changed |= fold_bool_aliases(obj, "system", &["system", "sys_ifc"], fold.sys_ifc);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T04: AmneziaWG matrix fold state — raw UI strings.
+/// `version` is the keep-blank Select value (`""` = no selection, never
+/// fabricated, never stripped). Junk-train numerics, S-lengths, H-ranges,
+/// I-chains and v3 texts all fold as text (engine coercion + fork `check`
+/// judge shapes; a failed parse stays verbatim for `check` to name loudly).
+/// `enable_amnezia` is a UI-state marker (Throne parity) — the engine
+/// consumes it without emission (brutal-speeds precedent). Trailers/cookies
+/// pass through for the fork `check` (R7 — hermetic shape proof in-ledger).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AmneziaFold {
+    pub enable_amnezia: bool,
+    pub version: String,
+    pub jc: String,
+    pub jmin: String,
+    pub jmax: String,
+    pub s1: String,
+    pub s2: String,
+    pub s3: String,
+    pub s4: String,
+    pub h1: String,
+    pub h2: String,
+    pub h3: String,
+    pub h4: String,
+    pub i1: String,
+    pub i2: String,
+    pub i3: String,
+    pub i4: String,
+    pub i5: String,
+    pub header_protection_key: String,
+    pub content_padding_addition: String,
+    pub rekey_after_time: String,
+    pub rekey_timeout: String,
+    pub reject_after_time: String,
+    pub keepalive_timeout: String,
+    pub max_handshake_attempts: String,
+    pub random_trailers: bool,
+    pub disable_cookies: bool,
+}
+
+/// Config-completeness T04: fold the AmneziaWG matrix into a params JSON
+/// text. Always folds every key regardless of the live `awg_version`
+/// selection — hiding the v3 section hides inputs but preserves stored
+/// values (R5); a v3 key on a 2.0 row fails generate naming the field
+/// (engine version gate, never a silent strip). Byte-identical on no-ops.
+pub fn fold_amneziawg_into_params(params_raw: &str, fold: &AmneziaFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_bool_aliases(
+        obj,
+        "enable_amnezia",
+        &["enable_amnezia"],
+        fold.enable_amnezia,
+    );
+    changed |= fold_select_keep_blank(obj, "awg_version", &fold.version);
+    for (key, value) in [
+        ("jc", &fold.jc),
+        ("jmin", &fold.jmin),
+        ("jmax", &fold.jmax),
+        ("s1", &fold.s1),
+        ("s2", &fold.s2),
+        ("s3", &fold.s3),
+        ("s4", &fold.s4),
+        ("h1", &fold.h1),
+        ("h2", &fold.h2),
+        ("h3", &fold.h3),
+        ("h4", &fold.h4),
+        ("i1", &fold.i1),
+        ("i2", &fold.i2),
+        ("i3", &fold.i3),
+        ("i4", &fold.i4),
+        ("i5", &fold.i5),
+        ("headerprotectionkey", &fold.header_protection_key),
+        ("contentpaddingaddition", &fold.content_padding_addition),
+        ("rekeyaftertime", &fold.rekey_after_time),
+        ("rekeytimeout", &fold.rekey_timeout),
+        ("rejectaftertime", &fold.reject_after_time),
+        ("keepalivetimeout", &fold.keepalive_timeout),
+        ("maxhandshakeattempts", &fold.max_handshake_attempts),
+    ] {
+        changed |= fold_text_aliases(obj, key, &[key], value);
+    }
+    changed |= fold_bool_aliases(
+        obj,
+        "randomtrailers",
+        &["randomtrailers", "random_trailers"],
+        fold.random_trailers,
+    );
+    changed |= fold_bool_aliases(
+        obj,
+        "disablecookies",
+        &["disablecookies", "disable_cookies"],
+        fold.disable_cookies,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T05: hysteria `auth_type` marker (the Throne
+/// `""|STRING|BASE64` spelling; `""` is the blank picker row) and the TUIC
+/// `congestion_control` / `udp_relay_mode` spellings (the engine allowlists).
+/// One source for picker, prefill and fold — a value the UI cannot pick is a
+/// value the fold cannot write.
+pub const HY_AUTH_TYPES: [&str; 2] = ["STRING", "BASE64"];
+pub const TUIC_CC_MODES: [&str; 3] = ["bbr", "cubic", "new_reno"];
+pub const TUIC_RELAY_MODES: [&str; 2] = ["native", "quic"];
+
+/// Config-completeness T05: shared TLS panel, forced variant (S2-forced).
+/// Same credential fields as [`TlsOptionalFold`] minus the enable toggle —
+/// security is locked `tls` (or `reality` with a public key). Raw UI strings
+/// exactly as the panel controls hold them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsForcedFold {
+    pub sni: String,
+    pub alpn: String,
+    pub fp: String,
+    pub insecure: bool,
+    pub pbk: String,
+    pub sid: String,
+}
+
+/// Config-completeness T05: fold the shared TLS panel, forced variant
+/// (S2-forced), into a params JSON text. Details fold blank-safe like the
+/// optional panel; `security` writes `reality` with a public key, `tls` when
+/// another detail was touched (locking the panel intent onto the row), and
+/// stands off untouched rows entirely (the engine defaults these protocols
+/// to TLS on, so an untouched page stays byte-identical). A stored
+/// `security=none` survives an untouched fold and fails at the engine naming
+/// the field — never silently repaired, never silently kept.
+pub fn fold_tls_forced_into_params(params_raw: &str, fold: &TlsForcedFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "sni", &["sni", "peer"], &fold.sni);
+    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
+    changed |= fold_text_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
+    changed |= fold_bool_aliases(
+        obj,
+        "insecure",
+        &[
+            "insecure",
+            "allowInsecure",
+            "allow_insecure",
+            "allowinsecure",
+        ],
+        fold.insecure,
+    );
+    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
+    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    if !fold.pbk.trim().is_empty() {
+        match obj.get("security") {
+            Some(serde_json::Value::String(current)) if current.eq_ignore_ascii_case("reality") => {
+            }
+            _ => {
+                obj.insert(
+                    "security".to_string(),
+                    serde_json::Value::String("reality".to_string()),
+                );
+                changed = true;
+            }
+        }
+    } else if changed
+        && !matches!(
+            lookup_case_insensitive(obj, &["security"])
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "tls" | "xtls" | "reality"
+        )
+    {
+        obj.insert(
+            "security".to_string(),
+            serde_json::Value::String("tls".to_string()),
+        );
+        changed = true;
+    }
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T05: Hysteria inner fold state — raw UI strings
+/// exactly as the page controls hold them. Speeds fold as the engine
+/// `up`/`down` flats (v1 requires them, v2 `take_speed` coerces them to
+/// `up_mbps`/`down_mbps` — one input shape serves both wire grammars).
+/// `auth` is the v1 secret, `password` the v2 secret; the fold writes exactly
+/// one of them per `is_v2` (each credential folds only where its engine arm
+/// consumes it — a v2 `password` riding a v1 row would fail `check` as an
+/// unknown field). Every other key folds on both layouts (R5 hide-preserve —
+/// the layout toggle never wipes); v1-only tunables on a v2 row fail at the
+/// engine naming the field (AWG v2-negative precedent). Numerics fold as TEXT
+/// (aid precedent — the engine coerces); `auth_type` is keep-blank (no
+/// fabricated marker, contract C2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HysteriaFold {
+    pub server_ports: String,
+    pub hop_interval: String,
+    pub up: String,
+    pub down: String,
+    pub obfs: String,
+    pub auth_type: String,
+    pub auth: String,
+    pub recv_window_conn: String,
+    pub recv_window: String,
+    pub disable_mtu_discovery: bool,
+    pub password: String,
+}
+
+/// Config-completeness T05: fold the Hysteria inner fields into a params JSON
+/// text. `is_v2` selects the credential (`password` on v2, `auth` on v1);
+/// blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_hysteria_into_params(params_raw: &str, fold: &HysteriaFold, is_v2: bool) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "server_ports", &["server_ports"], &fold.server_ports);
+    changed |= fold_text_aliases(obj, "hop_interval", &["hop_interval"], &fold.hop_interval);
+    changed |= fold_text_aliases(obj, "up", &["up", "up_mbps", "upmbps"], &fold.up);
+    changed |= fold_text_aliases(obj, "down", &["down", "down_mbps", "downmbps"], &fold.down);
+    changed |= fold_text_aliases(obj, "obfs", &["obfs"], &fold.obfs);
+    changed |= fold_select_keep_blank(obj, "auth_type", &fold.auth_type);
+    if is_v2 {
+        changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    } else {
+        changed |= fold_text_aliases(obj, "auth", &["auth"], &fold.auth);
+    }
+    changed |= fold_number_text(obj, "recv_window_conn", &fold.recv_window_conn);
+    changed |= fold_number_text(obj, "recv_window", &fold.recv_window);
+    changed |= fold_bool_aliases(
+        obj,
+        "disable_mtu_discovery",
+        &["disable_mtu_discovery"],
+        fold.disable_mtu_discovery,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T05: TUIC inner fold state — raw UI strings exactly as
+/// the page controls hold them. `congestion_control` / `udp_relay_mode` are
+/// keep-blank selects (no fabricated mode, contract C2); `zero_rtt_handshake`
+/// is the sing-box spelling (the Throne `zero_rtt` reads as an alias but is
+/// never written — a verbatim key would ride to the endpoint as an unknown
+/// field). `heartbeat` stays text (a duration like `10s`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TuicFold {
+    pub uuid: String,
+    pub password: String,
+    pub congestion_control: String,
+    pub udp_relay_mode: String,
+    pub udp_over_stream: bool,
+    pub zero_rtt_handshake: bool,
+    pub heartbeat: String,
+}
+
+/// Config-completeness T05: fold the TUIC inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_tuic_into_params(params_raw: &str, fold: &TuicFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], &fold.uuid);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_select_keep_blank(obj, "congestion_control", &fold.congestion_control);
+    changed |= fold_select_keep_blank(obj, "udp_relay_mode", &fold.udp_relay_mode);
+    changed |= fold_bool_aliases(
+        obj,
+        "udp_over_stream",
+        &["udp_over_stream"],
+        fold.udp_over_stream,
+    );
+    changed |= fold_bool_aliases(
+        obj,
+        "zero_rtt_handshake",
+        &["zero_rtt_handshake", "zero_rtt"],
+        fold.zero_rtt_handshake,
+    );
+    changed |= fold_text_aliases(obj, "heartbeat", &["heartbeat"], &fold.heartbeat);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: SOCKS versions (the `version` Select on the
+/// SOCKS page) and Naïve congestion modes (the `congestion_control` Select
+/// on the Naïve page, sing-box `quic_congestion_control` values per the
+/// 1.14.2 naive schema). One source for picker, prefill and fold — a value
+/// the UI cannot pick is a value the fold cannot write.
+pub const SOCKS_VERSIONS: [&str; 2] = ["5", "4"];
+pub const NAIVE_CC_MODES: [&str; 4] = ["bbr", "bbr2", "cubic", "reno"];
+
+/// Config-completeness T06: prefill one comma-list value (ssh `host_key` /
+/// `host_key_algorithms`) — string arrays join with ", " so a stored list
+/// echoes into its text input; anything else reads like
+/// [`guided_prefill_value`] (import query strings echo verbatim). Blank for
+/// unparseable JSON or missing keys.
+pub fn guided_prefill_list(params_raw: &str, keys: &[&str]) -> String {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    let Some(obj) = obj else {
+        return String::new();
+    };
+    for wanted in keys {
+        let hit = obj
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted));
+        if let Some((_, value)) = hit {
+            if let Some(items) = value.as_array() {
+                let joined = items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !joined.is_empty() {
+                    return joined;
+                }
+            }
+        }
+    }
+    guided_prefill_value(params_raw, keys)
+}
+
+/// Config-completeness T06: write one comma-list text value as a JSON string
+/// array (sing-box `host_key` / `host_key_algorithms` are lists — a bare
+/// string would fail `check`). Blank never touches the object; a value whose
+/// comma-split already matches the stored spelling (array or comma string)
+/// no-ops, so untouched echoes stay byte-identical. Anything else writes the
+/// canonical array. Returns true when the object changed.
+fn fold_comma_list(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    read_keys: &[&str],
+    value: &str,
+) -> bool {
+    let next: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    if next.is_empty() {
+        return false;
+    }
+    let current: Option<Vec<String>> = read_keys.iter().find_map(|key| {
+        let hit = obj
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)?;
+        match hit {
+            serde_json::Value::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            serde_json::Value::String(text) => Some(
+                text.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            serde_json::Value::Number(number) => Some(vec![number.to_string()]),
+            _ => None,
+        }
+    });
+    if current.as_deref() == Some(next.as_slice()) {
+        return false;
+    }
+    obj.insert(
+        canonical.to_string(),
+        serde_json::Value::Array(next.into_iter().map(serde_json::Value::String).collect()),
+    );
+    true
+}
+
+/// Config-completeness T06: write one keep-blank select value across read
+/// aliases — blank never touches the object (no fabrication, no strip);
+/// non-blank no-ops when any alias already holds it (import spellings echo
+/// byte-identical, the engine folds them at generate); otherwise writes the
+/// canonical key. Returns true when the object changed. (The single-key
+/// [`fold_select_keep_blank`] cannot do the alias half without changing its
+/// T03/T05 call sites.)
+fn fold_select_keep_blank_aliases(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    canonical: &str,
+    read_keys: &[&str],
+    value: &str,
+) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if lookup_case_insensitive(obj, read_keys).as_deref() == Some(value) {
+        return false;
+    }
+    obj.insert(
+        canonical.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    true
+}
+
+/// Config-completeness T06: SOCKS inner fold state — raw UI strings exactly
+/// as the page controls hold them. `version` is keep-blank (blank leaves the
+/// stock default 5 — the engine omits it; "4" folds and fails generate naming
+/// the field, never a guessed emission). `network` follows the S1 rule
+/// ("tcp" restores the default by removing the key; the engine allows
+/// tcp|udp only). `udp_over_tcp` folds the sing-box bool reading the `uot`
+/// spelling too (ss-page precedent).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SocksFold {
+    pub version: String,
+    pub username: String,
+    pub password: String,
+    pub network: String,
+    pub udp_over_tcp: bool,
+}
+
+/// Config-completeness T06: fold the SOCKS inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_socks_into_params(params_raw: &str, fold: &SocksFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_keep_blank(obj, "version", &fold.version);
+    changed |= fold_text_aliases(obj, "username", &["username"], &fold.username);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_select_key(obj, "network", &fold.network, "tcp");
+    changed |= fold_bool_aliases(
+        obj,
+        "udp_over_tcp",
+        &["udp_over_tcp", "uot"],
+        fold.udp_over_tcp,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: HTTP/HTTPS inner fold state — raw UI strings.
+/// `path`/`headers` are parity+ (Throne `edit_http.ui` lacks them, both
+/// engines accept them): they fold as text and `check` judges the shape
+/// loudly. Blank inputs never touch the object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpFold {
+    pub username: String,
+    pub password: String,
+    pub path: String,
+    pub headers: String,
+}
+
+/// Config-completeness T06: fold the HTTP/HTTPS inner fields into a params
+/// JSON text. Byte-identical on no-ops.
+pub fn fold_http_into_params(params_raw: &str, fold: &HttpFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "username", &["username"], &fold.username);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_text_aliases(obj, "path", &["path"], &fold.path);
+    changed |= fold_text_aliases(obj, "headers", &["headers"], &fold.headers);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: AnyTLS inner fold state — raw UI strings exactly
+/// as the page controls hold them. `interval`/`timeout` fold the sing-box
+/// duration texts (`idle_session_check_interval` / `idle_session_timeout`,
+/// e.g. "30s") reading the Throne short names too; `min` folds the count
+/// (`min_idle_session`) as a number (garbage stays a string for `check` to
+/// name loudly).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnytlsFold {
+    pub password: String,
+    pub interval: String,
+    pub timeout: String,
+    pub min: String,
+}
+
+/// Config-completeness T06: fold the AnyTLS inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_anytls_into_params(params_raw: &str, fold: &AnytlsFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_text_aliases(
+        obj,
+        "idle_session_check_interval",
+        &["idle_session_check_interval", "interval"],
+        &fold.interval,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "idle_session_timeout",
+        &["idle_session_timeout", "timeout"],
+        &fold.timeout,
+    );
+    changed |= fold_number_text(obj, "min_idle_session", &fold.min);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: Naïve inner fold state — raw UI strings exactly
+/// as the page controls hold them. `udp_over_tcp` folds the sing-box bool
+/// (docs: replaceable with a boolean) reading the Throne `uot` spelling too;
+/// `quic` folds the bool; `congestion_control` is keep-blank over the
+/// sing-box `quic_congestion_control` (blank leaves the chromium default
+/// cubic — contract C2, never fabricated).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NaiveFold {
+    pub username: String,
+    pub password: String,
+    pub udp_over_tcp: bool,
+    pub quic: bool,
+    pub congestion_control: String,
+}
+
+/// Config-completeness T06: fold the Naïve inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_naive_into_params(params_raw: &str, fold: &NaiveFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "username", &["username"], &fold.username);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_bool_aliases(
+        obj,
+        "udp_over_tcp",
+        &["udp_over_tcp", "uot"],
+        fold.udp_over_tcp,
+    );
+    changed |= fold_bool_aliases(obj, "quic", &["quic"], fold.quic);
+    changed |= fold_select_keep_blank_aliases(
+        obj,
+        "quic_congestion_control",
+        &["quic_congestion_control", "congestion_control"],
+        &fold.congestion_control,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T06: SSH inner fold state — raw UI strings exactly as
+/// the page controls hold them. `user` is the sing-box spelling (the engine
+/// folds `username` at generate, canonical wins); `private_key_passphrase`
+/// is the sing-box spelling (reads the Throne `private_key_pass` too);
+/// `host_key` / `host_key_algorithms` fold comma-lists to arrays (a bare
+/// string would fail `check`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshFold {
+    pub user: String,
+    pub password: String,
+    pub private_key: String,
+    pub private_key_path: String,
+    pub private_key_passphrase: String,
+    pub host_key: String,
+    pub host_key_algorithms: String,
+    pub client_version: String,
+}
+
+/// Config-completeness T06: fold the SSH inner fields into a params JSON
+/// text. Blank inputs never touch the object. Byte-identical on no-ops.
+pub fn fold_ssh_into_params(params_raw: &str, fold: &SshFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "user", &["user", "username"], &fold.user);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    changed |= fold_text_aliases(
+        obj,
+        "private_key",
+        &["private_key", "privatekey"],
+        &fold.private_key,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "private_key_path",
+        &["private_key_path"],
+        &fold.private_key_path,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "private_key_passphrase",
+        &["private_key_passphrase", "private_key_pass"],
+        &fold.private_key_passphrase,
+    );
+    changed |= fold_comma_list(obj, "host_key", &["host_key"], &fold.host_key);
+    changed |= fold_comma_list(
+        obj,
+        "host_key_algorithms",
+        &["host_key_algorithms"],
+        &fold.host_key_algorithms,
+    );
+    changed |= fold_text_aliases(
+        obj,
+        "client_version",
+        &["client_version"],
+        &fold.client_version,
+    );
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: Snell versions the engine maps (4|6 — absent
+/// means 4, anything else fails generate naming `version`). One source for
+/// the picker, the prefill reader and the fold below.
+pub const SNELL_VERSIONS: [&str; 2] = ["4", "6"];
+
+/// Config-completeness T07: ShadowTLS versions the engine maps (1|2|3 —
+/// absent takes the schema default 1; v1 rows omit the password). One source
+/// for the picker, the prefill reader and the fold below.
+pub const SHADOWTLS_VERSIONS: [&str; 3] = ["1", "2", "3"];
+
+/// Config-completeness T07: Xray stream networks (verified
+/// `xrayStreamSetting.h:5` via the audit — no tcp/quic on the Xray page).
+/// One source for the picker, the prefill reader and the fold below.
+pub const XRAY_NETWORKS: [&str; 5] = ["raw", "xhttp", "ws", "httpupgrade", "grpc"];
+
+/// Config-completeness T07: Xray VLESS flows (audit §3: the sing-box flow
+/// plus `xtls-rprx-vision-udp443`). One source for the picker and the fold.
+pub const XRAY_FLOWS: [&str; 2] = ["xtls-rprx-vision", "xtls-rprx-vision-udp443"];
+
+/// Config-completeness T07: Xray mux modes (audit §3 `xray_mux` — Keep
+/// Default is the blank row, never a stored value). One source for the
+/// picker, the prefill reader and the fold below.
+pub const XRAY_MUX_MODES: [&str; 2] = ["enabled", "disabled"];
+
+/// Config-completeness T07: Snell inner fold state — raw UI strings exactly
+/// as the page controls hold them. Engine-driven field list (Throne source
+/// has zero `snell` hits — no Throne editor to copy): `psk` text (required),
+/// `version` keep-blank over 4|6 (blank leaves the engine default 4 —
+/// contract C2, never fabricated), `obfs_mode`/`obfs_host`/`userkey` /
+/// `network`/`mode` as text (the engine passes them through for stock
+/// `check` to judge), `reuse` as a bool Switch. Blank inputs never touch the
+/// object (keep-blank — a stored value survives a blank pick for the engine
+/// gate to name, R5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnellFold {
+    pub psk: String,
+    pub version: String,
+    pub obfs_mode: String,
+    pub obfs_host: String,
+    pub userkey: String,
+    pub reuse: bool,
+    pub network: String,
+    pub mode: String,
+}
+
+/// Config-completeness T07: fold the Snell inner fields into a params JSON
+/// text. Byte-identical on no-ops (including unparseable input, which
+/// returns unchanged so validation names that error).
+pub fn fold_snell_into_params(params_raw: &str, fold: &SnellFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "psk", &["psk"], &fold.psk);
+    changed |= fold_select_keep_blank(obj, "version", &fold.version);
+    changed |= fold_text_aliases(obj, "obfs_mode", &["obfs_mode", "obfs"], &fold.obfs_mode);
+    changed |= fold_text_aliases(
+        obj,
+        "obfs_host",
+        &["obfs_host", "obfs-host"],
+        &fold.obfs_host,
+    );
+    changed |= fold_text_aliases(obj, "userkey", &["userkey"], &fold.userkey);
+    changed |= fold_bool_aliases(obj, "reuse", &["reuse"], fold.reuse);
+    changed |= fold_text_aliases(obj, "network", &["network"], &fold.network);
+    changed |= fold_text_aliases(obj, "mode", &["mode"], &fold.mode);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: ShadowTLS inner fold state — `version`
+/// keep-blank over 1|2|3 (blank leaves the schema default 1; import omits it
+/// on passwordless v1 rows) plus the v2/v3 `password` text. The page adds
+/// the shared S2-forced + S4 panels around these two fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowTlsFold {
+    pub version: String,
+    pub password: String,
+}
+
+/// Config-completeness T07: fold the ShadowTLS inner fields into a params
+/// JSON text. Byte-identical on no-ops.
+pub fn fold_shadowtls_into_params(params_raw: &str, fold: &ShadowTlsFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_select_keep_blank(obj, "version", &fold.version);
+    changed |= fold_text_aliases(obj, "password", &["password"], &fold.password);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: Xray-VLESS Ph1 inner fold state — the common
+/// subset only (`uuid`/`encryption`/`flow` + `sni`/`fp`/`alpn` + REALITY
+/// `pbk`/`sid`/`spiderx` + `network`/`mode` + `xray_mux`). Selects are
+/// keep-blank over their closed sets (never fabricated, never stripped);
+/// every other key already in the object — Ph2-only `xray_*`, `path`/`host`,
+/// `security`, `packetEncoding` — is never touched (preserved byte-identical
+/// for the bridge to pass through or the sidecar to judge). No Ph2 matrix
+/// smuggling: XHTTP/xmux/session keys get no inputs here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XrayFold {
+    pub uuid: String,
+    pub encryption: String,
+    pub flow: String,
+    pub sni: String,
+    pub fp: String,
+    pub alpn: String,
+    pub pbk: String,
+    pub sid: String,
+    pub spiderx: String,
+    pub network: String,
+    pub mode: String,
+    pub mux: String,
+}
+
+/// Config-completeness T07: fold the Xray-VLESS Ph1 fields into a params
+/// JSON text. Byte-identical on no-ops; unknown keys (Ph2 matrix included)
+/// round-trip untouched.
+pub fn fold_xray_into_params(params_raw: &str, fold: &XrayFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "uuid", &["uuid", "id"], &fold.uuid);
+    changed |= fold_text_aliases(obj, "encryption", &["encryption"], &fold.encryption);
+    changed |= fold_select_keep_blank(obj, "flow", &fold.flow);
+    changed |= fold_text_aliases(obj, "sni", &["sni"], &fold.sni);
+    changed |= fold_select_keep_blank_aliases(obj, "fp", &["fp", "fingerprint"], &fold.fp);
+    changed |= fold_text_aliases(obj, "alpn", &["alpn"], &fold.alpn);
+    changed |= fold_text_aliases(obj, "pbk", &["pbk"], &fold.pbk);
+    changed |= fold_text_aliases(obj, "sid", &["sid"], &fold.sid);
+    changed |= fold_text_aliases(obj, "spiderx", &["spiderx"], &fold.spiderx);
+    changed |= fold_select_keep_blank(obj, "network", &fold.network);
+    changed |= fold_text_aliases(obj, "mode", &["mode"], &fold.mode);
+    changed |= fold_select_keep_blank(obj, "xray_mux", &fold.mux);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: extra-core inner fold state — `exe` path text
+/// (reads the `binary` spelling too, writes `exe`), `args` text (stored with
+/// the row — the v1 spawn convention is `<exe> -c <file>`, so the footer
+/// says so honestly), `config` text (a JSON string or object — the sidecar
+/// file body). Blank inputs never touch the object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtraFold {
+    pub exe: String,
+    pub args: String,
+    pub config: String,
+}
+
+/// Config-completeness T07: fold one extra-core `config` text — blank never
+/// touches the object; text that parses as JSON compares against the stored
+/// value (object or string) so untouched echoes stay byte-identical;
+/// anything else lands as a string for the engine to name loudly (never a
+/// silently kept old value). Returns true when the object changed.
+fn fold_extra_config(obj: &mut serde_json::Map<String, serde_json::Value>, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let next = serde_json::from_str::<serde_json::Value>(value)
+        .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+    match obj.get("config") {
+        Some(current) if current == &next => false,
+        _ => {
+            obj.insert("config".to_string(), next);
+            true
+        }
+    }
+}
+
+/// Config-completeness T07: fold the extra-core inner fields into a params
+/// JSON text. Byte-identical on no-ops. Never writes `no_logs` (Throne
+/// non-persist bug — no such control exists anywhere).
+pub fn fold_extra_into_params(params_raw: &str, fold: &ExtraFold) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let mut changed = false;
+    changed |= fold_text_aliases(obj, "exe", &["exe", "binary"], &fold.exe);
+    changed |= fold_text_aliases(obj, "args", &["args"], &fold.args);
+    changed |= fold_extra_config(obj, &fold.config);
+    if changed {
+        value.to_string()
+    } else {
+        params_raw.to_string()
+    }
+}
+
+/// Config-completeness T07: echo one extra-core `config` value into its
+/// textarea — strings read verbatim, objects/arrays read as compact JSON
+/// (the fold re-parses them, so untouched echoes refold byte-identical).
+/// Blank for unparseable JSON or a missing key.
+pub fn extra_config_prefill(params_raw: &str) -> String {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned());
+    let Some(obj) = obj else {
+        return String::new();
+    };
+    let hit = obj
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("config"))
+        .map(|(_, value)| value);
+    match hit {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => {
+            hit.expect("config value present").to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Config-completeness T07: dialog-Validate shape for extra-core rows —
+/// `exe` present plus a present, JSON-valid `config` (string or object).
+/// Field-naming errors for the Validate button (the commit path keeps the
+/// import contract untouched — import rows land disabled and fail at start
+/// naming the same fields through the engine gate, never newly rejected at
+/// intake). The executable NAME hygiene (`is_bad_extra_exe_name`) stays
+/// single-owned by the engine (no drifted duplicate here).
+pub fn validate_extra_params(params_raw: &str) -> Result<(), String> {
+    let obj = serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| "extra-core params must be JSON object".to_string())?;
+    let exe_ok = ["exe", "binary"].iter().any(|wanted| {
+        obj.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case(wanted)
+                && matches!(value, serde_json::Value::String(text) if !text.trim().is_empty())
+        })
+    });
+    if !exe_ok {
+        return Err("extra-core params need exe (pick the executable with Browse)".to_string());
+    }
+    let config = obj
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("config"))
+        .map(|(_, value)| value);
+    match config {
+        None => {
+            Err("extra-core params need config (passed to the executable as -c <file>)".to_string())
+        }
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => {
+            Err("extra-core params need config (passed to the executable as -c <file>)".to_string())
+        }
+        Some(serde_json::Value::String(text)) => serde_json::from_str::<serde_json::Value>(text)
+            .map(|_| ())
+            .map_err(|_| "extra-core config string must be valid JSON".to_string()),
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => Ok(()),
+        Some(_) => Err("extra-core config must be a JSON object or a JSON string".to_string()),
+    }
+}
+
+/// Config-completeness T07: chain hop kinds for the hop-list editor —
+/// `Other` covers standard rows, unknown ids and inline objects alike (the
+/// engine judges those at generate, loudly; the editor only gates what the
+/// ticket names: nested chains and misplaced extracore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainHopSlot {
+    Chain,
+    Autoselector,
+    Extra,
+    Other,
+}
+
+/// Config-completeness T07: Throne hop rule for one add/replace — `existing`
+/// holds the current hops' kinds in order, `candidate` the picked row's
+/// kind, `index` the insert (add) or target (replace) position. Returns the
+/// rule-naming refusal, or `None` when the hop may land. Rules (Throne
+/// `edit_chain.ui` parity): v1 chains are flat (no chain/autoselector hops
+/// ever), at most one extracore hop and only at index 0. Engine egress-only
+/// placement (Extra/Custom/Xray last) is NOT gated here — generate names it
+/// at start.
+pub fn chain_hop_rejection(
+    existing: &[ChainHopSlot],
+    candidate: ChainHopSlot,
+    index: usize,
+    replacing: bool,
+) -> Option<String> {
+    if candidate == ChainHopSlot::Chain {
+        return Some(
+            "chain hops cannot nest a chain (v1 chains are flat — pick a non-chain row)"
+                .to_string(),
+        );
+    }
+    if candidate == ChainHopSlot::Autoselector {
+        return Some(
+            "chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)"
+                .to_string(),
+        );
+    }
+    let len = existing.len();
+    if (!replacing && index > len) || (replacing && index >= len) {
+        return Some("hop index is out of range (pick the hop to replace)".to_string());
+    }
+    if candidate == ChainHopSlot::Extra {
+        if index != 0 {
+            return Some(
+                "extracore hops must sit at index 0 (first hop only — off-index-0 rejected)"
+                    .to_string(),
+            );
+        }
+        let surviving = existing
+            .iter()
+            .enumerate()
+            .any(|(slot, kind)| *kind == ChainHopSlot::Extra && (!replacing || slot != index));
+        if surviving {
+            return Some("at most one extracore hop per chain".to_string());
+        }
+    }
+    None
+}
+
+/// Config-completeness T07: read one chain row's `nodes` array — id
+/// references stay strings, inline outbound objects stay objects. Empty for
+/// unparseable JSON, a missing key, or a non-array value (the JSON stays the
+/// source of truth; the editor only echoes it).
+pub fn chain_nodes_of(params_raw: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(params_raw)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .and_then(|obj| obj.get("nodes").cloned())
+        .and_then(|nodes| nodes.as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// Config-completeness T07: fold the hop-list editor state into a params
+/// JSON text — writes the full `nodes` array when it differs (an explicit
+/// clear-all writes `[]`, which generate refuses naming `nodes`); untouched
+/// editors stay byte-identical (the empty editor over a nodeless template is
+/// a no-op, so fresh chain rows commit without a fabricated key).
+pub fn fold_chain_nodes_into_params(params_raw: &str, nodes: &[serde_json::Value]) -> String {
+    let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
+        Ok(value) => value,
+        Err(_) => return params_raw.to_string(),
+    };
+    let obj = match value.as_object_mut() {
+        Some(obj) => obj,
+        None => return params_raw.to_string(),
+    };
+    let current: Vec<serde_json::Value> = obj
+        .get("nodes")
+        .and_then(|nodes| nodes.as_array().cloned())
+        .unwrap_or_default();
+    if current == nodes {
+        return params_raw.to_string();
+    }
+    obj.insert(
+        "nodes".to_string(),
+        serde_json::Value::Array(nodes.to_vec()),
+    );
+    value.to_string()
 }
 
 /// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
@@ -1032,7 +2959,7 @@ pub fn guided_identity_fields(protocol: &str) -> Option<GuidedIdentity> {
             read_keys: &["psk"],
             needs: "psk",
         },
-        "socks" | "http" | "https" | "shadowtls" => GuidedIdentity {
+        "socks" | "http" | "https" | "shadowtls" | "direct" => GuidedIdentity {
             key: None,
             read_keys: &[],
             needs: "no secret",
@@ -1326,6 +3253,47 @@ fn validate_protocol_params(
             };
             errors.push(missing(what));
             return None;
+        }
+        // Config-completeness T05: hysteria v1 rows cannot start without
+        // upload/download speeds (the engine hard-requires the `up`/`down`
+        // flats) — refuse at commit naming the page fields instead of
+        // producing a parse-ok/start-fail row. v2 leaves them optional
+        // (BBR-by-omission), so no gate there.
+        if canonical == "hysteria"
+            && !(has(&["up", "up_mbps", "upmbps"]) && has(&["down", "down_mbps", "downmbps"]))
+        {
+            errors.push(missing("up_mbps and down_mbps"));
+            return None;
+        }
+        // Config-completeness review: brutal speeds are panel state the
+        // engine preserves but never emits (no 1.14.2 mapping — follow-up),
+        // so garbage here would ride silently forever. Blank stays a
+        // no-op (untouched panels); JSON numbers pass; anything else must
+        // parse as Mbps, else the commit names the field.
+        for key in [
+            "brutal_up_mbps",
+            "brutal_down_mbps",
+            "brutal_up",
+            "brutal_down",
+            "brutal_upmbps",
+            "brutal_downmbps",
+        ] {
+            let numeric_ok = match obj.get(key) {
+                None | Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::Number(_)) => true,
+                Some(serde_json::Value::String(text)) if text.trim().is_empty() => true,
+                Some(serde_json::Value::String(text)) => {
+                    text.trim().parse::<f64>().is_ok_and(f64::is_finite)
+                }
+                Some(_) => false,
+            };
+            if !numeric_ok {
+                errors.push(FieldError::new(
+                    "params",
+                    format!("{canonical} params need {key} as a number (Mbps)"),
+                ));
+                return None;
+            }
         }
         if lookup_case_insensitive(obj, &["security"])
             .is_some_and(|security| security.eq_ignore_ascii_case("reality"))
@@ -8829,6 +10797,1802 @@ mod tests {
             fallback.contains("server"),
             "fallback still guides, got {fallback}"
         );
+    }
+
+    /// Config-completeness review: virtual starters are bare (no server/port
+    /// slots — the guided inputs hide for these) and commit clean; brutal
+    /// garbage fails naming the field instead of riding silently.
+    #[test]
+    fn review_virtual_templates_commit_and_brutal_gate() {
+        for virtual_proto in [
+            "chain",
+            "custom-outbound",
+            "custom-config",
+            "extra-core",
+            "direct",
+        ] {
+            let template = protocol_params_template(virtual_proto);
+            let value: serde_json::Value =
+                serde_json::from_str(&template).expect("virtual template is JSON");
+            assert!(
+                value.get("server").is_none() && value.get("server_port").is_none(),
+                "{virtual_proto} starter is bare: {template}"
+            );
+            assert!(
+                !is_import_shaped_params(&template),
+                "{virtual_proto} starter skips the server gate"
+            );
+        }
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for virtual_proto in ["chain", "custom-config", "direct"] {
+            store
+                .add(NewConfig {
+                    name: format!("{virtual_proto} row"),
+                    protocol: virtual_proto.to_string(),
+                    params: protocol_params_template(virtual_proto),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .unwrap_or_else(|error| panic!("bare {virtual_proto} starter commits: {error}"));
+        }
+        // Brutal garbage fails at commit naming the field; numerics pass the
+        // gate (emission stays preserved-not-emitted per follow-up).
+        let bad = "{\"type\":\"vless\",\"server\":\"s.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\
+            \"brutal_down_mbps\":\"fast\"}";
+        let error = store
+            .add(NewConfig {
+                name: "Bad brutal".to_string(),
+                protocol: "vless".to_string(),
+                params: bad.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect_err("garbage brutal speed must fail");
+        assert!(
+            error.to_string().contains("brutal_down_mbps"),
+            "names the field, got {error}"
+        );
+        let numeric = bad.replace("\"fast\"", "100");
+        store
+            .add(NewConfig {
+                name: "Numeric brutal".to_string(),
+                protocol: "vless".to_string(),
+                params: numeric,
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("numeric brutal speed commits");
+    }
+
+    /// Config-completeness T01: the picker lists exactly the 24 canonical
+    /// stored types (contract: no free-text typos); the virtual set is the
+    /// four address-less types plus trivial `direct` (T08, Throne label-only
+    /// parity); pristine detection is byte-identical; the switch rewrite
+    /// fires on pristine JSON only.
+    #[test]
+    fn t01_picker_virtual_and_pristine_rules() {
+        assert_eq!(
+            VALID_PROTOCOLS.len(),
+            24,
+            "picker lists exactly the canonical types"
+        );
+        for virtual_proto in [
+            "chain",
+            "custom-outbound",
+            "custom-config",
+            "extra-core",
+            "direct",
+        ] {
+            assert!(
+                is_virtual_protocol(virtual_proto),
+                "{virtual_proto} hides Server/Port"
+            );
+        }
+        for endpoint_proto in [
+            "vless",
+            "vmess",
+            "trojan",
+            "shadowsocks",
+            "socks",
+            "wireguard",
+            "xray",
+        ] {
+            assert!(
+                !is_virtual_protocol(endpoint_proto),
+                "{endpoint_proto} keeps Server/Port"
+            );
+        }
+        assert!(!is_virtual_protocol("bogus"), "unknown is not virtual");
+        // Pristine: byte-identical starter only (any edit dirties it).
+        let vless_starter = protocol_params_template("vless");
+        assert!(is_pristine_template(&vless_starter, "vless"));
+        assert!(!is_pristine_template(&format!("{vless_starter} "), "vless"));
+        assert!(!is_pristine_template(&vless_starter, "chain"));
+        // Switch on pristine JSON rewrites to the new starter.
+        assert_eq!(
+            pristine_template_rewrite(&vless_starter, "vless", "chain"),
+            protocol_params_template("chain"),
+            "pristine switch rewrites"
+        );
+        // Switch on dirty JSON stands (server filled, hand-typed object,
+        // garbage text all survive the switch).
+        let dirty = vless_starter.replace("\"server\":\"\"", "\"server\":\"a.example.com\"");
+        assert_eq!(
+            pristine_template_rewrite(&dirty, "vless", "chain"),
+            dirty,
+            "dirty switch preserves"
+        );
+        let hand_typed = "{\"type\":\"vless\",\"server\":\"b.example.com\"}";
+        assert_eq!(
+            pristine_template_rewrite(hand_typed, "vless", "socks"),
+            hand_typed,
+            "hand-typed JSON stands"
+        );
+        assert_eq!(
+            pristine_template_rewrite("{{{", "vless", "socks"),
+            "{{{",
+            "garbage stands"
+        );
+    }
+
+    /// Config-completeness T08 (CAP-12): trivial `direct` rows — the starter
+    /// is the bare kind marker (no fields to fill), the guided identity is
+    /// secret-free, and the untouched starter saves (opaque passthrough, no
+    /// credential gate).
+    #[test]
+    fn t08_direct_template_saves_with_no_fields() {
+        assert_eq!(
+            protocol_params_template("direct"),
+            "{\"type\":\"direct\"}",
+            "direct starter is the bare marker"
+        );
+        let guided = guided_identity_fields("direct").expect("direct has a guided row");
+        assert!(guided.key.is_none(), "direct takes no secret");
+        assert_eq!(guided.needs, "no secret");
+        assert!(is_virtual_protocol("direct"), "direct hides Server/Port");
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let created = store
+            .add(NewConfig {
+                name: "Direct".to_string(),
+                protocol: "direct".to_string(),
+                params: protocol_params_template("direct"),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("bare direct row saves");
+        assert_eq!(created.protocol, "direct");
+    }
+
+    /// Config-completeness T02: shared-panel folds are byte-identical
+    /// no-ops on untouched values and write minimal diffs on changes —
+    /// never a spurious patch, never a wipe of hidden keys.
+    #[test]
+    fn t02_panel_folds_noop_untouched_and_write_minimal() {
+        // Transport: untouched import row (network=tcp echoed) folds back
+        // byte-identical; ws sets network+path+host; back to tcp removes
+        // the network key instead of writing a default.
+        let shaped = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"network\":\"tcp\"}";
+        let echoed = TransportFold {
+            network: "tcp".to_string(),
+            path: String::new(),
+            host: String::new(),
+            method: String::new(),
+            service_name: String::new(),
+        };
+        assert_eq!(fold_transport_into_params(shaped, &echoed), shaped);
+        let ws = fold_transport_into_params(
+            shaped,
+            &TransportFold {
+                network: "ws".to_string(),
+                path: "/w".to_string(),
+                host: "h.example.com".to_string(),
+                ..Default::default()
+            },
+        );
+        let ws_value: serde_json::Value = serde_json::from_str(&ws).expect("ws folds to JSON");
+        assert_eq!(ws_value["network"], "ws");
+        assert_eq!(ws_value["path"], "/w");
+        assert_eq!(ws_value["host"], "h.example.com");
+        let back = fold_transport_into_params(
+            &ws,
+            &TransportFold {
+                network: "tcp".to_string(),
+                ..Default::default()
+            },
+        );
+        let back_value: serde_json::Value = serde_json::from_str(&back).expect("back folds");
+        assert!(back_value.get("network").is_none(), "tcp restores default");
+        assert_eq!(back_value["path"], "/w", "conditional values preserved");
+        assert_eq!(back_value["server"], "a.example.com", "row untouched");
+        // TLS optional: enabling writes tls, pbk flips to reality,
+        // disabling removes security only (sni stays per R5).
+        let bare = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443}";
+        let on = fold_tls_optional_into_params(
+            bare,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "s.example.com".to_string(),
+                ..Default::default()
+            },
+        );
+        let on_value: serde_json::Value = serde_json::from_str(&on).expect("tls on folds");
+        assert_eq!(on_value["security"], "tls");
+        assert_eq!(on_value["sni"], "s.example.com");
+        let reality = fold_tls_optional_into_params(
+            &on,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "s.example.com".to_string(),
+                pbk: "pubkey".to_string(),
+                sid: "short".to_string(),
+                ..Default::default()
+            },
+        );
+        let reality_value: serde_json::Value =
+            serde_json::from_str(&reality).expect("reality folds");
+        assert_eq!(
+            reality_value["security"], "reality",
+            "non-empty pbk means REALITY"
+        );
+        let off = fold_tls_optional_into_params(
+            &reality,
+            &TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+        );
+        let off_value: serde_json::Value = serde_json::from_str(&off).expect("tls off folds");
+        assert!(
+            off_value.get("security").is_none(),
+            "disable drops security"
+        );
+        assert_eq!(off_value["sni"], "s.example.com", "sni preserved");
+        assert_eq!(off_value["pbk"], "pubkey", "pbk preserved");
+        // insecure across alias spellings: untouched alias no-ops, toggle
+        // writes canonical and clears the alias.
+        let aliased = "{\"security\":\"tls\",\"allowInsecure\":true}";
+        let kept = fold_tls_optional_into_params(
+            aliased,
+            &TlsOptionalFold {
+                enable: true,
+                insecure: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(kept, aliased, "aliased true no-ops");
+        let cleared = fold_tls_optional_into_params(
+            aliased,
+            &TlsOptionalFold {
+                enable: true,
+                insecure: false,
+                ..Default::default()
+            },
+        );
+        let cleared_value: serde_json::Value =
+            serde_json::from_str(&cleared).expect("insecure off folds");
+        assert!(cleared_value.get("allowInsecure").is_none());
+        assert!(cleared_value.get("insecure").is_none());
+        // Mux: modes round-trip, brutal speeds land as numbers, garbage
+        // speeds land as strings at fold time and fail at the commit gate
+        // naming the field (never silent at either level).
+        let mux_on = fold_mux_into_params(
+            bare,
+            &MuxFold {
+                mode: "on".to_string(),
+                brutal_enable: true,
+                brutal_up_mbps: "100".to_string(),
+                brutal_down_mbps: "fast".to_string(),
+            },
+        );
+        let mux_value: serde_json::Value = serde_json::from_str(&mux_on).expect("mux folds");
+        assert_eq!(mux_value["mux"], "on");
+        assert_eq!(mux_value["brutal_enable"], true);
+        assert_eq!(mux_value["brutal_up_mbps"], 100);
+        assert_eq!(mux_value["brutal_down_mbps"], "fast");
+        let mux_default = fold_mux_into_params(
+            &mux_on,
+            &MuxFold {
+                mode: String::new(),
+                brutal_enable: true,
+                brutal_up_mbps: "100".to_string(),
+                brutal_down_mbps: "fast".to_string(),
+            },
+        );
+        let default_value: serde_json::Value =
+            serde_json::from_str(&mux_default).expect("mux default folds");
+        assert!(
+            default_value.get("mux").is_none(),
+            "default removes the key"
+        );
+        assert_eq!(default_value["brutal_enable"], true, "brutal preserved");
+        // Dial: toggles clear to absent, texts are blank-safe, untouched
+        // echoes stay byte-identical.
+        let dialed = fold_dial_into_params(
+            bare,
+            &DialFold {
+                reuse_addr: true,
+                bind_interface: "eth0".to_string(),
+                ..Default::default()
+            },
+        );
+        let dial_value: serde_json::Value = serde_json::from_str(&dialed).expect("dial folds");
+        assert_eq!(dial_value["reuse_addr"], true);
+        assert_eq!(dial_value["bind_interface"], "eth0");
+        let dial_echo = DialFold {
+            reuse_addr: true,
+            bind_interface: "eth0".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(fold_dial_into_params(&dialed, &dial_echo), dialed);
+        let dial_off = fold_dial_into_params(
+            &dialed,
+            &DialFold {
+                bind_interface: "eth0".to_string(),
+                ..Default::default()
+            },
+        );
+        let dial_off_value: serde_json::Value =
+            serde_json::from_str(&dial_off).expect("dial off folds");
+        assert!(dial_off_value.get("reuse_addr").is_none(), "false clears");
+        // VLESS inner: uuid/flow/packet_encoding with default-restore.
+        let inner = fold_vless_inner_into_params(
+            bare,
+            "11111111-2222-4333-8444-555555555555",
+            "xtls-rprx-vision",
+            "xudp",
+        );
+        let inner_value: serde_json::Value = serde_json::from_str(&inner).expect("inner folds");
+        assert_eq!(inner_value["uuid"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(inner_value["flow"], "xtls-rprx-vision");
+        assert_eq!(inner_value["packet_encoding"], "xudp");
+        let inner_echo = fold_vless_inner_into_params(
+            &inner,
+            "11111111-2222-4333-8444-555555555555",
+            "xtls-rprx-vision",
+            "xudp",
+        );
+        assert_eq!(inner_echo, inner, "echoed inner folds byte-identical");
+        let inner_plain =
+            fold_vless_inner_into_params(&inner, "11111111-2222-4333-8444-555555555555", "", "");
+        let plain_value: serde_json::Value =
+            serde_json::from_str(&inner_plain).expect("inner plain folds");
+        assert!(
+            plain_value.get("flow").is_none(),
+            "blank flow restores default"
+        );
+        assert!(plain_value.get("packet_encoding").is_none());
+        // Garbage JSON stands untouched through every fold.
+        for fold_it in [
+            fold_transport_into_params("{{{", &TransportFold::default()),
+            fold_mux_into_params("{{{", &MuxFold::default()),
+            fold_dial_into_params("{{{", &DialFold::default()),
+        ] {
+            assert_eq!(fold_it, "{{{");
+        }
+    }
+
+    /// Config-completeness T03: vmess inner fold is grammar-aware — legacy
+    /// rows (boolean `tls`) keep the cipher in `security`, new-style rows
+    /// write `encryption`; untouched rows echo byte-identical; `aid` stays a
+    /// string (the engine coerces); `packet_encoding` restores on blank.
+    #[test]
+    fn t03_vmess_inner_fold_keeps_grammar() {
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        // Legacy import shape: boolean `tls` owns the row, cipher in
+        // `security` (exactly what `parse_vmess` writes).
+        let legacy = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"alter_id\":\"0\",\"security\":\"auto\",\"tls\":true}}"
+        );
+        assert!(vmess_has_legacy_tls(&legacy));
+        assert!(!vmess_has_legacy_tls("{\"security\":\"tls\"}"));
+        assert_eq!(vmess_cipher_value(&legacy), "auto", "legacy cipher reads");
+        assert!(vmess_tls_enabled(&legacy), "legacy boolean enables");
+        assert_eq!(
+            fold_vmess_inner_into_params(&legacy, uuid, "0", "auto", ""),
+            legacy,
+            "untouched legacy echoes byte-identical"
+        );
+        // Cipher switch on a legacy row rewrites `security`, never
+        // `encryption`; the boolean stands.
+        let switched = fold_vmess_inner_into_params(&legacy, uuid, "0", "chacha20-poly1305", "");
+        let switched_value: serde_json::Value =
+            serde_json::from_str(&switched).expect("switched folds");
+        assert_eq!(switched_value["security"], "chacha20-poly1305");
+        assert!(
+            switched_value.get("encryption").is_none(),
+            "no new-style key on legacy rows"
+        );
+        assert_eq!(switched_value["tls"], true, "boolean untouched");
+        assert_eq!(switched_value["alter_id"], "0", "aid stays a string");
+        // New-style reality row: cipher goes to `encryption`, tls-ness stays.
+        let modern = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"alter_id\":\"2\",\"security\":\"reality\",\
+            \"encryption\":\"aes-128-gcm\",\"pbk\":\"k\"}}"
+        );
+        assert!(!vmess_has_legacy_tls(&modern));
+        assert_eq!(vmess_cipher_value(&modern), "aes-128-gcm");
+        assert!(vmess_tls_enabled(&modern));
+        assert_eq!(
+            fold_vmess_inner_into_params(&modern, uuid, "2", "aes-128-gcm", ""),
+            modern,
+            "untouched new-style echoes byte-identical"
+        );
+        // A tls-ness `security` never reads as a cipher (the picker falls
+        // back to `auto`, never to a cipher the row does not have).
+        assert_eq!(vmess_cipher_value("{\"security\":\"tls\"}"), "");
+        assert_eq!(vmess_cipher_value("{\"security\":\"reality\"}"), "");
+        assert!(vmess_tls_enabled("{\"security\":\"tls\"}"));
+        assert!(!vmess_tls_enabled("{\"security\":\"auto\"}"));
+        assert!(!vmess_tls_enabled("{}"));
+        // Ambiguous hand-written row (cipher in `security`, no boolean):
+        // the reader shows the cipher; the inner fold stages `encryption`
+        // and the S2 fold drops the ambiguous `security` — healed together.
+        let ambiguous = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"security\":\"auto\"}}"
+        );
+        assert_eq!(vmess_cipher_value(&ambiguous), "auto");
+        let staged = fold_vmess_inner_into_params(&ambiguous, uuid, "", "auto", "xudp");
+        let staged_value: serde_json::Value = serde_json::from_str(&staged).expect("staged folds");
+        assert_eq!(staged_value["packet_encoding"], "xudp");
+        let healed = fold_tls_vmess_into_params(
+            &staged,
+            &TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+        );
+        let healed_value: serde_json::Value = serde_json::from_str(&healed).expect("healed folds");
+        assert!(
+            healed_value.get("security").is_none(),
+            "ambiguous tls-ness cleared"
+        );
+        assert!(
+            healed_value.get("encryption").is_none(),
+            "default cipher stays absent"
+        );
+        assert_eq!(healed_value["packet_encoding"], "xudp");
+        // Garbage JSON stands untouched through every new fold.
+        for fold_it in [
+            fold_vmess_inner_into_params("{{{", uuid, "0", "auto", ""),
+            fold_trojan_inner_into_params("{{{", "secret"),
+            fold_shadowsocks_inner_into_params("{{{", "aes-128-gcm", "pw", "", "", false),
+            fold_tls_vmess_into_params("{{{", &TlsOptionalFold::default()),
+        ] {
+            assert_eq!(fold_it, "{{{");
+        }
+    }
+
+    /// Config-completeness T03: the vmess TLS fold mirrors the toggle into
+    /// the legacy boolean (cipher never stripped), migrates to new-style on
+    /// reality intent, and matches the standard fold off legacy rows.
+    #[test]
+    fn t03_tls_vmess_fold_mirrors_bool_and_migrates_reality() {
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let legacy = format!(
+            "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"{uuid}\",\"alter_id\":\"0\",\"security\":\"auto\",\"tls\":true}}"
+        );
+        // Untouched legacy echoes byte-identical (cipher never stripped).
+        let echo = fold_tls_vmess_into_params(
+            &legacy,
+            &TlsOptionalFold {
+                enable: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(echo, legacy, "untouched legacy echoes byte-identical");
+        // Toggle off flips the boolean, keeps the cipher and every key.
+        let off = fold_tls_vmess_into_params(
+            &legacy,
+            &TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+        );
+        let off_value: serde_json::Value = serde_json::from_str(&off).expect("off folds");
+        assert_eq!(off_value["tls"], false, "boolean mirrors the toggle");
+        assert_eq!(off_value["security"], "auto", "cipher preserved");
+        // Reality intent migrates: boolean dropped, cipher moved to
+        // `encryption`, `security` becomes `reality`.
+        let migrated = fold_tls_vmess_into_params(
+            &legacy,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "a.example.com".to_string(),
+                pbk: "pubkey".to_string(),
+                sid: "short".to_string(),
+                ..Default::default()
+            },
+        );
+        let migrated_value: serde_json::Value =
+            serde_json::from_str(&migrated).expect("migrated folds");
+        assert!(
+            migrated_value.get("tls").is_none(),
+            "boolean dropped on migration"
+        );
+        assert_eq!(migrated_value["encryption"], "auto", "cipher moved");
+        assert_eq!(migrated_value["security"], "reality");
+        assert_eq!(migrated_value["sni"], "a.example.com");
+        assert_eq!(migrated_value["pbk"], "pubkey");
+        // Migrating twice is stable (second fold is a no-op echo).
+        let twice = fold_tls_vmess_into_params(
+            &migrated,
+            &TlsOptionalFold {
+                enable: true,
+                sni: "a.example.com".to_string(),
+                pbk: "pubkey".to_string(),
+                sid: "short".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(twice, migrated, "migration is idempotent");
+        // Off legacy rows: every standard detail still folds (sni lands,
+        // cipher stands, boolean flips only when the toggle differs).
+        let modern = "{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443}";
+        for fold in [
+            TlsOptionalFold {
+                enable: true,
+                sni: "s.example.com".to_string(),
+                ..Default::default()
+            },
+            TlsOptionalFold {
+                enable: false,
+                ..Default::default()
+            },
+            TlsOptionalFold {
+                enable: true,
+                pbk: "pubkey".to_string(),
+                insecure: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                fold_tls_vmess_into_params(modern, &fold),
+                fold_tls_optional_into_params(modern, &fold),
+                "non-legacy matches the standard fold"
+            );
+        }
+    }
+
+    /// Config-completeness T03: trojan/shadowsocks inner folds — secrets
+    /// echo, blank method/plugin never fabricate or strip, `uot` folds the
+    /// `udp_over_tcp` bool across both spellings.
+    #[test]
+    fn t03_ss_and_trojan_inner_folds() {
+        // Trojan: password echoes, writes, blanks never wipe.
+        let trojan = "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"password\":\"secret\"}";
+        assert_eq!(
+            fold_trojan_inner_into_params(trojan, "secret"),
+            trojan,
+            "untouched password echoes"
+        );
+        let rotated = fold_trojan_inner_into_params(trojan, "rotated");
+        let rotated_value: serde_json::Value =
+            serde_json::from_str(&rotated).expect("rotated folds");
+        assert_eq!(rotated_value["password"], "rotated");
+        assert_eq!(
+            fold_trojan_inner_into_params(trojan, ""),
+            trojan,
+            "blank never wipes"
+        );
+        assert_eq!(
+            fold_trojan_inner_into_params(trojan, "  "),
+            trojan,
+            "whitespace never wipes"
+        );
+        // Shadowsocks pristine template: blank method/plugin stand — no
+        // fabricated cipher, no stripped key (the commit gate names the
+        // missing method instead).
+        let template = protocol_params_template("shadowsocks");
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(&template, "", "", "", "", false),
+            template,
+            "pristine template stands"
+        );
+        // Populated row echoes byte-identical.
+        let ss = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+            \"method\":\"aes-128-gcm\",\"password\":\"pw\",\"udp_over_tcp\":true}";
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(ss, "aes-128-gcm", "pw", "", "", true),
+            ss,
+            "untouched ss echoes byte-identical"
+        );
+        // Method switch writes; plugin pick writes; plugin_opts lands;
+        // `uot:true` echoes (the engine folds that spelling — same rule as
+        // every aliased toggle), while a false→true flip retires the alias
+        // to the canonical bool.
+        let uot_legacy = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
+            \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\"uot\":true}";
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(uot_legacy, "aes-128-gcm", "pw", "", "", true),
+            uot_legacy,
+            "matching uot echoes (engine folds the spelling)"
+        );
+        let uot_off = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
+            \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\"uot\":false}";
+        let normalized = fold_shadowsocks_inner_into_params(
+            uot_off,
+            "chacha20-ietf-poly1305",
+            "pw",
+            "obfs-local",
+            "obfs=http",
+            true,
+        );
+        let normalized_value: serde_json::Value =
+            serde_json::from_str(&normalized).expect("normalized folds");
+        assert_eq!(normalized_value["method"], "chacha20-ietf-poly1305");
+        assert_eq!(normalized_value["plugin"], "obfs-local");
+        assert_eq!(normalized_value["plugin_opts"], "obfs=http");
+        assert_eq!(normalized_value["udp_over_tcp"], true);
+        assert!(
+            normalized_value.get("uot").is_none(),
+            "alias retired on write"
+        );
+        // Stored SIP002 `;`-tails survive a blank pick (never stripped).
+        let tailed = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
+            \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\
+            \"plugin\":\"obfs-local;obfs=http\"}";
+        assert_eq!(
+            fold_shadowsocks_inner_into_params(tailed, "aes-128-gcm", "pw", "", "", false),
+            tailed,
+            "unrepresentable plugin preserved"
+        );
+        // `uot` off clears the canonical bool.
+        let cleared = fold_shadowsocks_inner_into_params(ss, "aes-128-gcm", "pw", "", "", false);
+        let cleared_value: serde_json::Value =
+            serde_json::from_str(&cleared).expect("cleared folds");
+        assert!(cleared_value.get("udp_over_tcp").is_none(), "false clears");
+        assert_eq!(cleared_value["method"], "aes-128-gcm", "method kept");
+    }
+
+    /// Config-completeness T04: wireguard inner fold — canonical engine
+    /// spellings win (`pre_shared_key`, `address`), Throne spellings read
+    /// as aliases but are never written; numerics stay text (aid precedent —
+    /// the engine coerces); `udp_timeout` (import-only) is never stripped.
+    #[test]
+    fn t04_wireguard_inner_fold() {
+        let full = WireguardFold {
+            private_key: "LOCAL".to_string(),
+            public_key: "REMOTE".to_string(),
+            pre_shared_key: "PSK".to_string(),
+            reserved: "1,2,3".to_string(),
+            persistent_keepalive: "25".to_string(),
+            local_addr: "10.0.0.2/32".to_string(),
+            dns: "1.1.1.1".to_string(),
+            mtu: "1420".to_string(),
+            workers: "4".to_string(),
+            sys_ifc: true,
+        };
+        let bare = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+            \"private_key\":\"\",\"public_key\":\"\"}";
+        let folded = fold_wireguard_into_params(bare, &full);
+        let folded_value: serde_json::Value = serde_json::from_str(&folded).expect("wg folds");
+        assert_eq!(folded_value["private_key"], "LOCAL");
+        assert_eq!(folded_value["public_key"], "REMOTE");
+        assert_eq!(folded_value["pre_shared_key"], "PSK");
+        assert!(
+            folded_value.get("preshared_key").is_none(),
+            "Throne spelling never written"
+        );
+        assert_eq!(folded_value["reserved"], "1,2,3", "comma ints stay text");
+        assert_eq!(folded_value["persistent_keepalive"], "25");
+        assert_eq!(
+            folded_value["address"], "10.0.0.2/32",
+            "local_addr stores as address"
+        );
+        assert!(
+            folded_value.get("local_addr").is_none(),
+            "Throne spelling never written"
+        );
+        assert_eq!(folded_value["dns"], "1.1.1.1");
+        assert_eq!(
+            folded_value["mtu"], "1420",
+            "mtu stays text (engine coerces)"
+        );
+        assert_eq!(folded_value["workers"], "4");
+        assert_eq!(folded_value["system"], true, "sys_ifc stores as system");
+        assert!(
+            folded_value.get("sys_ifc").is_none(),
+            "Throne spelling never written"
+        );
+        // Echoed fold is byte-identical (no spurious patch).
+        let echo = WireguardFold {
+            private_key: "LOCAL".to_string(),
+            public_key: "REMOTE".to_string(),
+            pre_shared_key: "PSK".to_string(),
+            reserved: "1,2,3".to_string(),
+            persistent_keepalive: "25".to_string(),
+            local_addr: "10.0.0.2/32".to_string(),
+            dns: "1.1.1.1".to_string(),
+            mtu: "1420".to_string(),
+            workers: "4".to_string(),
+            sys_ifc: true,
+        };
+        assert_eq!(
+            fold_wireguard_into_params(&folded, &echo),
+            folded,
+            "untouched wg echoes byte-identical"
+        );
+        // Throne/legacy spellings echo without duplicating the canonical key.
+        let throne = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"preshared_key\":\"PSK\",\
+            \"local_addr\":\"10.0.0.2/32\",\"sys_ifc\":true}";
+        let throne_fold = WireguardFold {
+            private_key: "LOCAL".to_string(),
+            public_key: "REMOTE".to_string(),
+            pre_shared_key: "PSK".to_string(),
+            local_addr: "10.0.0.2/32".to_string(),
+            sys_ifc: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_wireguard_into_params(throne, &throne_fold),
+            throne,
+            "matching aliases echo (engine-adjacent spellings retire only on write)"
+        );
+        // Pristine template stands through a blank fold.
+        let template = protocol_params_template("wireguard");
+        assert_eq!(
+            fold_wireguard_into_params(&template, &WireguardFold::default()),
+            template,
+            "pristine template stands"
+        );
+        // Import-only extras ride through untouched (preserved, never
+        // stripped, no UI): `udp_timeout`, verbatim conf keys, AllowedIPs.
+        let imported = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"udp_timeout\":\"30\",\
+            \"allowed_ips\":\"10.0.0.0/8\",\"fwmark\":\"100\",\"keepalive\":\"25\"}";
+        let kept = fold_wireguard_into_params(
+            imported,
+            &WireguardFold {
+                private_key: "LOCAL".to_string(),
+                public_key: "REMOTE".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(kept, imported, "import-only keys preserved");
+        let kept_value: serde_json::Value = serde_json::from_str(&kept).expect("kept parses");
+        assert_eq!(kept_value["udp_timeout"], "30");
+        // `system` off clears the canonical bool (and the Throne alias).
+        let sys_off = fold_wireguard_into_params(
+            &folded,
+            &WireguardFold {
+                sys_ifc: false,
+                ..Default::default()
+            },
+        );
+        // Blank texts never wipe — only the toggle flips.
+        let sys_off_value: serde_json::Value =
+            serde_json::from_str(&sys_off).expect("sys off folds");
+        assert!(sys_off_value.get("system").is_none(), "false clears");
+        assert_eq!(
+            sys_off_value["private_key"], "LOCAL",
+            "blank texts never wipe"
+        );
+        assert_eq!(fold_wireguard_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T04: amneziawg matrix fold — version keep-blank
+    /// (never fabricated, never stripped), full J/S/H/I + v3 texts,
+    /// trailers/cookies bools, enable marker; hidden-version folds still
+    /// preserve (R5 — the fold never branches on version).
+    #[test]
+    fn t04_amneziawg_matrix_fold() {
+        assert_eq!(AWG_VERSIONS, ["2.0", "3.x"]);
+        let matrix = AmneziaFold {
+            enable_amnezia: true,
+            version: "3.x".to_string(),
+            jc: "5".to_string(),
+            jmin: "30".to_string(),
+            jmax: "1000".to_string(),
+            s1: "20".to_string(),
+            h1: "1-100".to_string(),
+            i1: "<b 0xd100><r 50>".to_string(),
+            header_protection_key: "HPK".to_string(),
+            content_padding_addition: "PAD".to_string(),
+            rekey_after_time: "120".to_string(),
+            rekey_timeout: "30".to_string(),
+            reject_after_time: "180".to_string(),
+            keepalive_timeout: "60".to_string(),
+            max_handshake_attempts: "3".to_string(),
+            random_trailers: true,
+            disable_cookies: true,
+            ..Default::default()
+        };
+        let bare = "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\"}";
+        let folded = fold_amneziawg_into_params(bare, &matrix);
+        let folded_value: serde_json::Value = serde_json::from_str(&folded).expect("awg folds");
+        assert_eq!(folded_value["enable_amnezia"], true);
+        assert_eq!(folded_value["awg_version"], "3.x");
+        assert_eq!(folded_value["jc"], "5", "junk stays text (engine coerces)");
+        assert_eq!(folded_value["jmin"], "30");
+        assert_eq!(folded_value["jmax"], "1000");
+        assert_eq!(folded_value["s1"], "20");
+        assert_eq!(folded_value["h1"], "1-100", "h-range verbatim");
+        assert_eq!(folded_value["i1"], "<b 0xd100><r 50>", "i-chain verbatim");
+        assert_eq!(folded_value["headerprotectionkey"], "HPK");
+        assert_eq!(folded_value["contentpaddingaddition"], "PAD");
+        assert_eq!(folded_value["rekeyaftertime"], "120");
+        assert_eq!(folded_value["maxhandshakeattempts"], "3");
+        assert_eq!(folded_value["randomtrailers"], true);
+        assert_eq!(folded_value["disablecookies"], true);
+        assert_eq!(
+            fold_amneziawg_into_params(&folded, &matrix),
+            folded,
+            "untouched matrix echoes byte-identical"
+        );
+        // Blank version never fabricates (contract C2) and a blank-text
+        // echo never strips stored values (R5 hide-preserve); toggles echo
+        // explicitly (off counts as blank and clears — same rule as S4).
+        let noversion = fold_amneziawg_into_params(bare, &AmneziaFold::default());
+        let noversion_value: serde_json::Value =
+            serde_json::from_str(&noversion).expect("no-version folds");
+        assert!(
+            noversion_value.get("awg_version").is_none(),
+            "blank never fabricates"
+        );
+        let keeper = AmneziaFold {
+            enable_amnezia: true,
+            version: "3.x".to_string(),
+            random_trailers: true,
+            disable_cookies: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_amneziawg_into_params(&folded, &keeper),
+            folded,
+            "echoed toggles+version keep, blank texts never strip"
+        );
+        // The fold never branches on version: v3 keys fold onto a 2.0 row
+        // untouched (R5 hide-preserve — the engine gate names them loudly).
+        let v2row = "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"awg_version\":\"2.0\",\
+            \"headerprotectionkey\":\"HPK\"}";
+        assert_eq!(
+            fold_amneziawg_into_params(v2row, &AmneziaFold::default()),
+            v2row,
+            "hidden-version values preserved, never wiped"
+        );
+        // Toggles off clear; unparseable JSON stands.
+        let off = fold_amneziawg_into_params(
+            &folded,
+            &AmneziaFold {
+                version: "3.x".to_string(),
+                ..Default::default()
+            },
+        );
+        let off_value: serde_json::Value = serde_json::from_str(&off).expect("off folds");
+        assert!(off_value.get("enable_amnezia").is_none(), "marker clears");
+        assert!(off_value.get("randomtrailers").is_none(), "trailers clear");
+        assert!(off_value.get("disablecookies").is_none(), "cookies clear");
+        assert_eq!(off_value["awg_version"], "3.x", "version kept");
+        assert_eq!(fold_amneziawg_into_params("{{{", &matrix), "{{{");
+    }
+
+    /// Config-completeness T05: hysteria fold — common fields on both
+    /// layouts, engine spellings only (`up`/`down`, never `up_mbps`; recv
+    /// windows as numbers), keep-blank `auth_type`, exclusive credentials
+    /// per `is_v2` (auth on v1, password on v2); pristine templates stand
+    /// through blank folds.
+    #[test]
+    fn t05_hysteria_fold_common_and_version_halves() {
+        assert_eq!(HY_AUTH_TYPES, ["STRING", "BASE64"]);
+        let v1 = HysteriaFold {
+            server_ports: "9000-9010".to_string(),
+            hop_interval: "30s".to_string(),
+            up: "100".to_string(),
+            down: "50 Mbps".to_string(),
+            obfs: "obfspw".to_string(),
+            auth_type: "STRING".to_string(),
+            auth: "secret".to_string(),
+            recv_window_conn: "1024".to_string(),
+            recv_window: "2048".to_string(),
+            disable_mtu_discovery: true,
+            password: "NEVER-FOLDS-ON-V1".to_string(),
+        };
+        let bare_v1 = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"\"}";
+        let folded = fold_hysteria_into_params(bare_v1, &v1, false);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("hy folds");
+        assert_eq!(value["server_ports"], "9000-9010");
+        assert_eq!(value["hop_interval"], "30s");
+        assert_eq!(value["up"], "100", "speeds fold as up/down flats");
+        assert_eq!(value["down"], "50 Mbps");
+        assert!(
+            value.get("up_mbps").is_none() && value.get("down_mbps").is_none(),
+            "Throne spellings never written"
+        );
+        assert_eq!(value["obfs"], "obfspw");
+        assert_eq!(value["auth_type"], "STRING");
+        assert_eq!(value["auth"], "secret");
+        assert_eq!(
+            value["recv_window_conn"], 1024,
+            "recv windows land as numbers"
+        );
+        assert_eq!(value["recv_window"], 2048);
+        assert_eq!(value["disable_mtu_discovery"], true);
+        assert!(
+            value.get("password").is_none(),
+            "v1 never folds the v2 credential"
+        );
+        // Echoed fold is byte-identical (numbers echo as their text).
+        let echo = HysteriaFold {
+            server_ports: "9000-9010".to_string(),
+            hop_interval: "30s".to_string(),
+            up: "100".to_string(),
+            down: "50 Mbps".to_string(),
+            obfs: "obfspw".to_string(),
+            auth_type: "STRING".to_string(),
+            auth: "secret".to_string(),
+            recv_window_conn: "1024".to_string(),
+            recv_window: "2048".to_string(),
+            disable_mtu_discovery: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_hysteria_into_params(&folded, &echo, false),
+            folded,
+            "untouched v1 echoes byte-identical"
+        );
+        // v2 folds the password and never the v1 auth.
+        let v2 = HysteriaFold {
+            up: "100".to_string(),
+            down: "100".to_string(),
+            auth: "NEVER-FOLDS-ON-V2".to_string(),
+            password: "v2secret".to_string(),
+            ..Default::default()
+        };
+        let bare_v2 = "{\"type\":\"hysteria2\",\"server\":\"192.0.2.13\",\"server_port\":443,\
+            \"password\":\"\"}";
+        let folded2 = fold_hysteria_into_params(bare_v2, &v2, true);
+        let value2: serde_json::Value = serde_json::from_str(&folded2).expect("hy2 folds");
+        assert_eq!(value2["password"], "v2secret");
+        assert_eq!(value2["up"], "100");
+        assert!(value2.get("auth").is_none(), "v2 never folds the v1 auth");
+        // Throne `up_mbps` spellings echo through the up/down readers.
+        let throne = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"s\",\"up_mbps\":100,\"down_mbps\":50}";
+        let throne_echo = HysteriaFold {
+            auth: "s".to_string(),
+            up: "100".to_string(),
+            down: "50".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_hysteria_into_params(throne, &throne_echo, false),
+            throne,
+            "matching aliases echo"
+        );
+        // Pristine templates stand through blank folds on both layouts.
+        for proto in ["hysteria", "hysteria2"] {
+            let template = protocol_params_template(proto);
+            assert_eq!(
+                fold_hysteria_into_params(
+                    &template,
+                    &HysteriaFold::default(),
+                    proto == "hysteria2"
+                ),
+                template,
+                "{proto} pristine template stands"
+            );
+        }
+        assert_eq!(fold_hysteria_into_params("{{{", &v1, false), "{{{");
+    }
+
+    /// Config-completeness T05: v1 commits refuse blank up/down naming the
+    /// page fields; v1 with speeds lands; v2 without speeds lands
+    /// (BBR-by-omission).
+    #[test]
+    fn t05_hysteria_v1_up_down_gate_names_fields() {
+        fn add(
+            store: &mut Store,
+            name: &str,
+            protocol: &str,
+            params: &str,
+        ) -> Result<String, String> {
+            store
+                .add(NewConfig {
+                    name: name.to_string(),
+                    protocol: protocol.to_string(),
+                    params: params.to_string(),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .map(|created| created.id)
+                .map_err(|error| error.to_string())
+        }
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let no_speeds = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"secret\"}";
+        let error = add(&mut store, "HyNoSpeed", "hysteria", no_speeds)
+            .expect_err("v1 without speeds must fail");
+        assert!(
+            error.contains("up_mbps") && error.contains("down_mbps"),
+            "names the page fields, got {error}"
+        );
+        let speeds = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"secret\",\"up\":\"100\",\"down\":\"100\"}";
+        add(&mut store, "HySpeed", "hysteria", speeds).expect("v1 with speeds lands");
+        let bbr = "{\"type\":\"hysteria2\",\"server\":\"192.0.2.13\",\"server_port\":443,\
+            \"password\":\"secret\"}";
+        add(&mut store, "Hy2Bbr", "hysteria2", bbr).expect("v2 omits speeds for BBR");
+        assert_eq!(
+            store.list().expect("list works").len(),
+            2,
+            "the refused row wrote nothing"
+        );
+    }
+
+    /// Config-completeness T05: tuic fold — all seven tuning fields land in
+    /// engine spellings (`zero_rtt_handshake`, never `zero_rtt`; keep-blank
+    /// selects never fabricate); pristine template stands through a blank.
+    #[test]
+    fn t05_tuic_fold_seven_fields_engine_spellings() {
+        assert_eq!(TUIC_CC_MODES, ["bbr", "cubic", "new_reno"]);
+        assert_eq!(TUIC_RELAY_MODES, ["native", "quic"]);
+        let full = TuicFold {
+            uuid: "11111111-2222-4333-8444-555555555555".to_string(),
+            password: "secret".to_string(),
+            congestion_control: "bbr".to_string(),
+            udp_relay_mode: "quic".to_string(),
+            udp_over_stream: true,
+            zero_rtt_handshake: true,
+            heartbeat: "10s".to_string(),
+        };
+        let bare = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"\",\"password\":\"\"}";
+        let folded = fold_tuic_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("tuic folds");
+        assert_eq!(value["uuid"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["congestion_control"], "bbr");
+        assert_eq!(value["udp_relay_mode"], "quic");
+        assert_eq!(value["udp_over_stream"], true);
+        assert_eq!(
+            value["zero_rtt_handshake"], true,
+            "sing-box spelling written"
+        );
+        assert!(
+            value.get("zero_rtt").is_none(),
+            "Throne spelling never written"
+        );
+        assert_eq!(value["heartbeat"], "10s");
+        assert_eq!(
+            fold_tuic_into_params(&folded, &full),
+            folded,
+            "untouched tuic echoes byte-identical"
+        );
+        // The Throne `zero_rtt` spelling echoes into the handshake switch.
+        let throne = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"u\",\"password\":\"p\",\"zero_rtt\":true}";
+        let throne_echo = TuicFold {
+            uuid: "u".to_string(),
+            password: "p".to_string(),
+            zero_rtt_handshake: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_tuic_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes"
+        );
+        // Blank selects never fabricate; pristine template stands.
+        let template = protocol_params_template("tuic");
+        assert_eq!(
+            fold_tuic_into_params(&template, &TuicFold::default()),
+            template,
+            "tuic pristine template stands"
+        );
+        assert_eq!(fold_tuic_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T05: forced-TLS fold — untouched rows stay
+    /// byte-identical (no fabricated `security`); details fold blank-safe;
+    /// a public key locks `reality`; any other touched detail locks `tls`;
+    /// a stored `security=none` survives untouched (the engine names it).
+    #[test]
+    fn t05_tls_forced_fold_locks_only_when_touched() {
+        let bare = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"u\",\"password\":\"p\"}";
+        assert_eq!(
+            fold_tls_forced_into_params(bare, &TlsForcedFold::default()),
+            bare,
+            "untouched forced page stays byte-identical"
+        );
+        let sni = TlsForcedFold {
+            sni: "example.com".to_string(),
+            ..Default::default()
+        };
+        let sni_value: serde_json::Value =
+            serde_json::from_str(&fold_tls_forced_into_params(bare, &sni)).expect("sni folds");
+        assert_eq!(sni_value["sni"], "example.com");
+        assert_eq!(sni_value["security"], "tls", "touched detail locks tls");
+        let pbk = TlsForcedFold {
+            pbk: "PUBKEY".to_string(),
+            sid: "SID".to_string(),
+            ..Default::default()
+        };
+        let pbk_value: serde_json::Value =
+            serde_json::from_str(&fold_tls_forced_into_params(bare, &pbk)).expect("pbk folds");
+        assert_eq!(pbk_value["security"], "reality", "public key locks reality");
+        assert_eq!(pbk_value["pbk"], "PUBKEY");
+        // An existing tls marker is kept, never rewritten.
+        let tls_row =
+            "{\"type\":\"tuic\",\"server\":\"s\",\"server_port\":443,\"security\":\"tls\"}";
+        let kept = fold_tls_forced_into_params(
+            tls_row,
+            &TlsForcedFold {
+                sni: "example.com".to_string(),
+                ..Default::default()
+            },
+        );
+        let kept_value: serde_json::Value = serde_json::from_str(&kept).expect("kept parses");
+        assert_eq!(kept_value["security"], "tls");
+        // A stored `security=none` survives an untouched fold (engine names it).
+        let none_row =
+            "{\"type\":\"tuic\",\"server\":\"s\",\"server_port\":443,\"security\":\"none\"}";
+        assert_eq!(
+            fold_tls_forced_into_params(none_row, &TlsForcedFold::default()),
+            none_row,
+            "broken security never silently repaired"
+        );
+        assert_eq!(fold_tls_forced_into_params("{{{", &sni), "{{{");
+    }
+
+    /// Config-completeness T06: SOCKS fold — version keep-blank (blank
+    /// leaves the stock 5; "4" folds for the engine to reject naming the
+    /// field), S1-rule network ("tcp" removes), uot bool; pristine template
+    /// stands through a blank.
+    #[test]
+    fn t06_socks_fold_version_network_uot() {
+        assert_eq!(SOCKS_VERSIONS, ["5", "4"]);
+        let full = SocksFold {
+            version: "5".to_string(),
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            network: "udp".to_string(),
+            udp_over_tcp: true,
+        };
+        let bare = "{\"type\":\"socks\",\"server\":\"192.0.2.20\",\"server_port\":1080}";
+        let folded = fold_socks_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("socks folds");
+        assert_eq!(value["version"], "5");
+        assert_eq!(value["username"], "user");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["network"], "udp");
+        assert_eq!(value["udp_over_tcp"], true);
+        assert_eq!(
+            fold_socks_into_params(&folded, &full),
+            folded,
+            "untouched socks echoes byte-identical"
+        );
+        // A stored v4 survives the fold (the engine rejects it naming
+        // `version` — never a guessed emission).
+        let v4 = "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080,\"version\":\"4\"}";
+        let v4_echo = SocksFold {
+            version: "4".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_socks_into_params(v4, &v4_echo),
+            v4,
+            "v4 echoes for the engine gate"
+        );
+        // The Throne `uot` spelling echoes into the sing-box bool.
+        let throne = "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080,\"uot\":true}";
+        let throne_echo = SocksFold {
+            udp_over_tcp: true,
+            network: "tcp".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_socks_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes (tcp removes nothing absent)"
+        );
+        // Pristine template stands through a blank fold.
+        let template = protocol_params_template("socks");
+        assert_eq!(
+            fold_socks_into_params(&template, &SocksFold::default()),
+            template,
+            "socks pristine template stands"
+        );
+        assert_eq!(fold_socks_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: HTTP/HTTPS fold — username/password/path/
+    /// headers parity+ as blank-safe text; pristine templates stand.
+    #[test]
+    fn t06_http_fold_parity_plus() {
+        let full = HttpFold {
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            path: "/p".to_string(),
+            headers: "Host: h.example.com".to_string(),
+        };
+        let bare = "{\"type\":\"http\",\"server\":\"192.0.2.21\",\"server_port\":8080}";
+        let folded = fold_http_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("http folds");
+        assert_eq!(value["username"], "user");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["path"], "/p");
+        assert_eq!(value["headers"], "Host: h.example.com");
+        assert_eq!(
+            fold_http_into_params(&folded, &full),
+            folded,
+            "untouched http echoes byte-identical"
+        );
+        for proto in ["http", "https"] {
+            let template = protocol_params_template(proto);
+            assert_eq!(
+                fold_http_into_params(&template, &HttpFold::default()),
+                template,
+                "{proto} pristine template stands"
+            );
+        }
+        assert_eq!(fold_http_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: AnyTLS fold — password plus the session
+    /// tunables in sing-box spellings (interval/timeout texts, min as a
+    /// number); Throne short names echo without duplication; pristine
+    /// template stands.
+    #[test]
+    fn t06_anytls_fold_interval_timeout_min() {
+        let full = AnytlsFold {
+            password: "secret".to_string(),
+            interval: "30s".to_string(),
+            timeout: "60s".to_string(),
+            min: "5".to_string(),
+        };
+        let bare = "{\"type\":\"anytls\",\"server\":\"192.0.2.15\",\"server_port\":8443,\
+            \"password\":\"\"}";
+        let folded = fold_anytls_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("anytls folds");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["idle_session_check_interval"], "30s");
+        assert_eq!(value["idle_session_timeout"], "60s");
+        assert_eq!(value["min_idle_session"], 5, "min lands as a number");
+        assert!(
+            value.get("interval").is_none() && value.get("timeout").is_none(),
+            "Throne spellings never written"
+        );
+        assert_eq!(
+            fold_anytls_into_params(&folded, &full),
+            folded,
+            "untouched anytls echoes byte-identical"
+        );
+        // Throne short names echo into the long inputs without duplicating.
+        let throne = "{\"type\":\"anytls\",\"server\":\"s\",\"server_port\":8443,\
+            \"password\":\"p\",\"interval\":\"30s\",\"timeout\":\"60s\"}";
+        let throne_echo = AnytlsFold {
+            password: "p".to_string(),
+            interval: "30s".to_string(),
+            timeout: "60s".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_anytls_into_params(throne, &throne_echo),
+            throne,
+            "matching aliases echo"
+        );
+        let template = protocol_params_template("anytls");
+        assert_eq!(
+            fold_anytls_into_params(&template, &AnytlsFold::default()),
+            template,
+            "anytls pristine template stands"
+        );
+        assert_eq!(fold_anytls_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: Naïve fold — username/password plus uot/quic
+    /// bools and the keep-blank cc (never fabricated); the Throne
+    /// `congestion_control` spelling echoes without duplicating; pristine
+    /// template stands.
+    #[test]
+    fn t06_naive_fold_uot_quic_cc() {
+        assert_eq!(NAIVE_CC_MODES, ["bbr", "bbr2", "cubic", "reno"]);
+        let full = NaiveFold {
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            udp_over_tcp: true,
+            quic: true,
+            congestion_control: "bbr2".to_string(),
+        };
+        let bare = "{\"type\":\"naive\",\"server\":\"192.0.2.22\",\"server_port\":443,\
+            \"username\":\"\",\"password\":\"\"}";
+        let folded = fold_naive_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("naive folds");
+        assert_eq!(value["username"], "user");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["udp_over_tcp"], true);
+        assert_eq!(value["quic"], true);
+        assert_eq!(
+            value["quic_congestion_control"], "bbr2",
+            "sing-box spelling written"
+        );
+        assert!(
+            value.get("uot").is_none() && value.get("congestion_control").is_none(),
+            "Throne spellings never written"
+        );
+        assert_eq!(
+            fold_naive_into_params(&folded, &full),
+            folded,
+            "untouched naive echoes byte-identical"
+        );
+        // The Throne spellings echo without duplicating (the engine folds
+        // them at generate, canonical wins).
+        let throne = "{\"type\":\"naive\",\"server\":\"s\",\"server_port\":443,\
+            \"username\":\"u\",\"password\":\"p\",\"uot\":true,\"congestion_control\":\"cubic\"}";
+        let throne_echo = NaiveFold {
+            username: "u".to_string(),
+            password: "p".to_string(),
+            udp_over_tcp: true,
+            congestion_control: "cubic".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_naive_into_params(throne, &throne_echo),
+            throne,
+            "matching aliases echo"
+        );
+        // Blank cc never fabricates; pristine template stands.
+        let template = protocol_params_template("naive");
+        assert_eq!(
+            fold_naive_into_params(&template, &NaiveFold::default()),
+            template,
+            "naive pristine template stands"
+        );
+        assert_eq!(fold_naive_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T06: SSH fold — user/password/key blob/path/pass
+    /// plus host-key lists (comma text in, string arrays out) and
+    /// client_version; engine spellings written, Throne spellings read;
+    /// pristine template stands.
+    #[test]
+    fn t06_ssh_fold_user_key_hostlists() {
+        let full = SshFold {
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            private_key: "KEY-BLOB".to_string(),
+            private_key_path: "/home/u/.ssh/id_rsa".to_string(),
+            private_key_passphrase: "pp".to_string(),
+            host_key: "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB".to_string(),
+            host_key_algorithms: "ssh-ed25519".to_string(),
+            client_version: "SSH-2.0-OpenSSH_7.4p1".to_string(),
+        };
+        let bare = "{\"type\":\"ssh\",\"server\":\"192.0.2.23\",\"server_port\":22,\
+            \"username\":\"\",\"password\":\"\"}";
+        let folded = fold_ssh_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("ssh folds");
+        assert_eq!(value["user"], "root", "sing-box spelling written");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(value["private_key"], "KEY-BLOB");
+        assert_eq!(value["private_key_path"], "/home/u/.ssh/id_rsa");
+        assert_eq!(value["private_key_passphrase"], "pp");
+        assert_eq!(
+            value["host_key"],
+            serde_json::json!(["ecdsa-sha2-nistp256 AAAA", "ssh-ed25519 BBBB"]),
+            "host_key lands as an array"
+        );
+        assert_eq!(
+            value["host_key_algorithms"],
+            serde_json::json!(["ssh-ed25519"]),
+            "algs land as an array"
+        );
+        assert_eq!(value["client_version"], "SSH-2.0-OpenSSH_7.4p1");
+        assert!(
+            value.get("username").is_some_and(|name| name == ""),
+            "template username slot untouched (engine drops it when user wins)"
+        );
+        // Untouched echoes stay byte-identical — arrays echo through the
+        // list reader, the Throne `username`/`privatekey` spellings echo
+        // through the text readers.
+        let echo = SshFold {
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            private_key: "KEY-BLOB".to_string(),
+            private_key_path: "/home/u/.ssh/id_rsa".to_string(),
+            private_key_passphrase: "pp".to_string(),
+            host_key: "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB".to_string(),
+            host_key_algorithms: "ssh-ed25519".to_string(),
+            client_version: "SSH-2.0-OpenSSH_7.4p1".to_string(),
+        };
+        assert_eq!(
+            fold_ssh_into_params(&folded, &echo),
+            folded,
+            "untouched ssh echoes byte-identical"
+        );
+        assert_eq!(
+            guided_prefill_list(&folded, &["host_key"]),
+            "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB",
+            "stored arrays echo as comma text"
+        );
+        // Throne spellings echo without duplicating.
+        let throne = "{\"type\":\"ssh\",\"server\":\"s\",\"server_port\":22,\
+            \"username\":\"root\",\"privatekey\":\"K\",\"private_key_pass\":\"pp\"}";
+        let throne_echo = SshFold {
+            user: "root".to_string(),
+            private_key: "K".to_string(),
+            private_key_passphrase: "pp".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_ssh_into_params(throne, &throne_echo),
+            throne,
+            "matching aliases echo"
+        );
+        let template = protocol_params_template("ssh");
+        assert_eq!(
+            fold_ssh_into_params(&template, &SshFold::default()),
+            template,
+            "ssh pristine template stands"
+        );
+        assert_eq!(fold_ssh_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: Snell fold — engine-driven fields (the engine
+    /// maps exactly psk/version/userkey/reuse/network/obfs_mode/obfs_host/
+    /// mode; version keep-blank leaves the engine default 4). Blank folds
+    /// never touch the object; the Throne `obfs` spelling echoes.
+    #[test]
+    fn t07_snell_fold_engine_driven_fields() {
+        assert_eq!(SNELL_VERSIONS, ["4", "6"]);
+        let full = SnellFold {
+            psk: "secret".to_string(),
+            version: "6".to_string(),
+            obfs_mode: "http".to_string(),
+            obfs_host: "example.com".to_string(),
+            userkey: "key".to_string(),
+            reuse: true,
+            network: "tcp".to_string(),
+            mode: "multi".to_string(),
+        };
+        let bare = "{\"type\":\"snell\",\"server\":\"192.0.2.30\",\"server_port\":8080}";
+        let folded = fold_snell_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("snell folds");
+        assert_eq!(value["psk"], "secret");
+        assert_eq!(value["version"], "6");
+        assert_eq!(value["obfs_mode"], "http");
+        assert_eq!(value["obfs_host"], "example.com");
+        assert_eq!(value["userkey"], "key");
+        assert_eq!(value["reuse"], true);
+        assert_eq!(value["network"], "tcp");
+        assert_eq!(value["mode"], "multi");
+        assert_eq!(
+            fold_snell_into_params(&folded, &full),
+            folded,
+            "untouched snell echoes byte-identical"
+        );
+        // A stored version survives a blank pick (the engine default applies
+        // only when the key is absent — the fold never strips).
+        let v6 = "{\"type\":\"snell\",\"server\":\"s\",\"server_port\":8080,\
+            \"psk\":\"secret\",\"version\":\"6\"}";
+        assert_eq!(
+            fold_snell_into_params(v6, &SnellFold::default()),
+            v6,
+            "stored version survives blank picks"
+        );
+        // The Throne `obfs` spelling echoes without duplicating.
+        let throne = "{\"type\":\"snell\",\"server\":\"s\",\"server_port\":8080,\"obfs\":\"http\"}";
+        let throne_echo = SnellFold {
+            obfs_mode: "http".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_snell_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes"
+        );
+        let template = protocol_params_template("snell");
+        assert_eq!(
+            fold_snell_into_params(&template, &SnellFold::default()),
+            template,
+            "snell pristine template stands"
+        );
+        assert_eq!(fold_snell_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: ShadowTLS fold — version keep-blank over
+    /// 1|2|3 (blank leaves the schema default 1; v1 rows omit the password)
+    /// plus the v2/v3 password text. Blank folds never touch the object.
+    #[test]
+    fn t07_shadowtls_fold_version_password() {
+        assert_eq!(SHADOWTLS_VERSIONS, ["1", "2", "3"]);
+        let full = ShadowTlsFold {
+            version: "2".to_string(),
+            password: "secret".to_string(),
+        };
+        let bare = "{\"type\":\"shadowtls\",\"server\":\"192.0.2.31\",\"server_port\":443}";
+        let folded = fold_shadowtls_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("shadowtls folds");
+        assert_eq!(value["version"], "2");
+        assert_eq!(value["password"], "secret");
+        assert_eq!(
+            fold_shadowtls_into_params(&folded, &full),
+            folded,
+            "untouched shadowtls echoes byte-identical"
+        );
+        // A passwordless v1 row stands through a blank fold.
+        let v1 = "{\"type\":\"shadowtls\",\"server\":\"s\",\"server_port\":443}";
+        assert_eq!(
+            fold_shadowtls_into_params(v1, &ShadowTlsFold::default()),
+            v1,
+            "v1 rows omit the password"
+        );
+        let template = protocol_params_template("shadowtls");
+        assert_eq!(
+            fold_shadowtls_into_params(&template, &ShadowTlsFold::default()),
+            template,
+            "shadowtls pristine template stands"
+        );
+        assert_eq!(fold_shadowtls_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: Xray-VLESS Ph1 fold — the common subset lands
+    /// in bridge spellings while Ph2-only keys (`xPaddingBytes`,
+    /// `maxConcurrency`, `downloadSettings`, …) and unknown `xray_*` keys are
+    /// preserved byte-identical, never stripped. No Ph2 matrix smuggling: the
+    /// fold writes no XHTTP/xmux/session keys.
+    #[test]
+    fn t07_xray_fold_ph1_preserves_ph2() {
+        assert_eq!(XRAY_NETWORKS, ["raw", "xhttp", "ws", "httpupgrade", "grpc"]);
+        assert_eq!(XRAY_FLOWS, ["xtls-rprx-vision", "xtls-rprx-vision-udp443"]);
+        assert_eq!(XRAY_MUX_MODES, ["enabled", "disabled"]);
+        let full = XrayFold {
+            uuid: "11111111-2222-4333-8444-555555555555".to_string(),
+            encryption: "none".to_string(),
+            flow: "xtls-rprx-vision".to_string(),
+            sni: "example.com".to_string(),
+            fp: "chrome".to_string(),
+            alpn: "h2".to_string(),
+            pbk: "pubkey".to_string(),
+            sid: "shortid".to_string(),
+            spiderx: "/".to_string(),
+            network: "xhttp".to_string(),
+            mode: "auto".to_string(),
+            mux: "enabled".to_string(),
+        };
+        let bare = "{\"type\":\"xray\",\"server\":\"192.0.2.32\",\"server_port\":443}";
+        let folded = fold_xray_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("xray folds");
+        assert_eq!(value["uuid"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(value["encryption"], "none");
+        assert_eq!(value["flow"], "xtls-rprx-vision");
+        assert_eq!(value["sni"], "example.com");
+        assert_eq!(value["fp"], "chrome");
+        assert_eq!(value["alpn"], "h2");
+        assert_eq!(value["pbk"], "pubkey");
+        assert_eq!(value["sid"], "shortid");
+        assert_eq!(value["spiderx"], "/");
+        assert_eq!(value["network"], "xhttp");
+        assert_eq!(value["mode"], "auto");
+        assert_eq!(value["xray_mux"], "enabled");
+        assert_eq!(
+            fold_xray_into_params(&folded, &full),
+            folded,
+            "untouched xray echoes byte-identical"
+        );
+        // Hand-added Ph2-only keys survive a matching Ph1 fold untouched.
+        let ph2 = "{\"type\":\"xray\",\"server\":\"s\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+            \"flow\":\"xtls-rprx-vision\",\"sni\":\"example.com\",\"fp\":\"chrome\",\
+            \"alpn\":\"h2\",\"pbk\":\"pubkey\",\"sid\":\"shortid\",\"spiderx\":\"/\",\
+            \"network\":\"xhttp\",\"mode\":\"auto\",\"xray_mux\":\"enabled\",\
+            \"xPaddingBytes\":\"100-200\",\"maxConcurrency\":16,\
+            \"downloadSettings\":{\"address\":\"d.example.com\"},\
+            \"xray_custom_future\":\"kept\"}";
+        assert_eq!(
+            fold_xray_into_params(ph2, &full),
+            ph2,
+            "Ph2-only and unknown xray_* keys round-trip untouched (preserve-not-strip)"
+        );
+        // The `fingerprint` spelling echoes without duplicating.
+        let throne = "{\"type\":\"xray\",\"server\":\"s\",\"server_port\":443,\
+            \"fingerprint\":\"chrome\"}";
+        let throne_echo = XrayFold {
+            fp: "chrome".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_xray_into_params(throne, &throne_echo),
+            throne,
+            "matching alias echoes"
+        );
+        assert!(
+            !folded.contains("xPaddingBytes") && !folded.contains("maxConcurrency"),
+            "the fold writes no Ph2 matrix keys"
+        );
+        assert_eq!(fold_xray_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T07: chain hop rules — Throne rejections verbatim
+    /// (flat v1 chains: no chain/autoselector hops ever; at most one
+    /// extracore hop, only at index 0). Every refusal names the rule; legal
+    /// hops land with `None`. The nodes reader/fold round-trips the editor
+    /// state byte-identically.
+    #[test]
+    fn t07_chain_hop_rules_name_throne_rejections() {
+        use ChainHopSlot::{Autoselector, Chain, Extra, Other};
+        let none: &[ChainHopSlot] = &[];
+        let one_other: &[ChainHopSlot] = &[Other];
+        let extra_first: &[ChainHopSlot] = &[Extra, Other];
+        // Nested chains and autoselectors never land, at any index.
+        for candidate in [Chain, Autoselector] {
+            let rule = chain_hop_rejection(none, candidate, 0, false).expect("rejected");
+            assert!(
+                rule.contains("chain") || rule.contains("autoselector"),
+                "refusal names the flat-chain rule: {rule}"
+            );
+            assert!(chain_hop_rejection(one_other, candidate, 1, false).is_some());
+        }
+        // Extracore hops sit at index 0 only.
+        let off_index = chain_hop_rejection(one_other, Extra, 1, false).expect("rejected");
+        assert!(
+            off_index.contains("index 0"),
+            "off-index-0 extracore refusal names the rule: {off_index}"
+        );
+        assert!(chain_hop_rejection(none, Extra, 0, false).is_none());
+        assert!(chain_hop_rejection(one_other, Extra, 0, false).is_none());
+        // At most one extracore hop per chain (replacing the index-0
+        // extracore with another extracore is the one legal overlap).
+        let second = chain_hop_rejection(extra_first, Extra, 0, false).expect("rejected");
+        assert!(
+            second.contains("at most one"),
+            "second extracore refusal names the rule: {second}"
+        );
+        assert!(chain_hop_rejection(extra_first, Extra, 0, true).is_none());
+        assert!(chain_hop_rejection(extra_first, Other, 1, true).is_none());
+        // Out-of-range replaces name the index rule.
+        let oob = chain_hop_rejection(one_other, Other, 1, true).expect("rejected");
+        assert!(
+            oob.contains("out of range"),
+            "out-of-range replace names the rule: {oob}"
+        );
+        // Ordinary hops land anywhere, including beside an extracore first hop.
+        assert!(chain_hop_rejection(none, Other, 0, false).is_none());
+        assert!(chain_hop_rejection(extra_first, Other, 2, false).is_none());
+        // The nodes reader echoes the editor state; the fold is a no-op when
+        // nothing differs and writes explicit clear-alls.
+        let params = "{\"type\":\"chain\",\"nodes\":[\"a\",\"b\"]}";
+        assert_eq!(
+            chain_nodes_of(params),
+            vec![
+                serde_json::Value::String("a".to_string()),
+                serde_json::Value::String("b".to_string())
+            ]
+        );
+        assert!(chain_nodes_of("{\"type\":\"chain\"}").is_empty());
+        assert!(chain_nodes_of("{{{").is_empty());
+        assert_eq!(
+            fold_chain_nodes_into_params(
+                params,
+                &[
+                    serde_json::Value::String("a".to_string()),
+                    serde_json::Value::String("b".to_string())
+                ]
+            ),
+            params,
+            "untouched hops refold byte-identical"
+        );
+        let cleared = fold_chain_nodes_into_params(params, &[]);
+        let cleared_value: serde_json::Value =
+            serde_json::from_str(&cleared).expect("clear-all folds");
+        assert_eq!(cleared_value["nodes"], serde_json::json!([]));
+        let template = protocol_params_template("chain");
+        assert_eq!(
+            fold_chain_nodes_into_params(&template, &[]),
+            template,
+            "empty editor over a nodeless template is a no-op"
+        );
+        assert_eq!(fold_chain_nodes_into_params("{{{", &[]), "{{{");
+    }
+
+    /// Config-completeness T07: extra-core fold + Validate — exe/args/config
+    /// land in engine spellings, untouched echoes stay byte-identical, and
+    /// the shape gate names exe/config fields. `no_logs` is never written
+    /// (Throne non-persist bug — no such control exists anywhere).
+    #[test]
+    fn t07_extra_fold_validate_never_no_logs() {
+        let full = ExtraFold {
+            exe: "core.exe".to_string(),
+            args: "--fast".to_string(),
+            config: "{\"inbounds\":[]}".to_string(),
+        };
+        let bare = "{\"type\":\"extra-core\"}";
+        let folded = fold_extra_into_params(bare, &full);
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("extra folds");
+        assert_eq!(value["exe"], "core.exe");
+        assert_eq!(value["args"], "--fast");
+        assert_eq!(value["config"], serde_json::json!({"inbounds":[]}));
+        assert!(
+            value.get("no_logs").is_none() && !folded.contains("no_logs"),
+            "the fold never writes no_logs"
+        );
+        assert_eq!(
+            fold_extra_into_params(&folded, &full),
+            folded,
+            "untouched extra echoes byte-identical"
+        );
+        // Stored objects echo as JSON text through the reader and refold
+        // byte-identically; strings read verbatim.
+        assert_eq!(
+            extra_config_prefill(&folded),
+            "{\"inbounds\":[]}",
+            "stored objects echo as JSON text"
+        );
+        let with_string = "{\"type\":\"extra-core\",\"config\":\"{\\\"a\\\":1}\"}";
+        assert_eq!(extra_config_prefill(with_string), "{\"a\":1}");
+        assert_eq!(extra_config_prefill("{\"type\":\"extra-core\"}"), "");
+        assert_eq!(extra_config_prefill("{{{"), "");
+        // The `binary` spelling echoes into `exe` without duplicating.
+        let alias = "{\"type\":\"extra-core\",\"binary\":\"core.exe\"}";
+        let alias_echo = ExtraFold {
+            exe: "core.exe".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_extra_into_params(alias, &alias_echo),
+            alias,
+            "matching alias echoes"
+        );
+        // Validate names the missing shape before commit.
+        assert!(validate_extra_params(&folded).is_ok());
+        let no_exe = validate_extra_params("{\"config\":\"{}\"}").expect_err("exe required");
+        assert!(no_exe.contains("exe"), "missing exe names exe: {no_exe}");
+        let no_config =
+            validate_extra_params("{\"exe\":\"core.exe\"}").expect_err("config required");
+        assert!(
+            no_config.contains("config"),
+            "missing config names config: {no_config}"
+        );
+        let bad_config = validate_extra_params("{\"exe\":\"core.exe\",\"config\":\"{oops\"}")
+            .expect_err("config must be JSON");
+        assert!(
+            bad_config.contains("config"),
+            "bad config names config: {bad_config}"
+        );
+        let scalar_config =
+            validate_extra_params("{\"exe\":\"core.exe\",\"config\":7}").expect_err("shape gated");
+        assert!(
+            scalar_config.contains("config"),
+            "scalar config names config: {scalar_config}"
+        );
+        assert!(validate_extra_params("not json").is_err());
+        assert_eq!(fold_extra_into_params("{{{", &full), "{{{");
+    }
+
+    /// Config-completeness T02: toggle prefill reads truthy spellings
+    /// (bools, numbers, liberal strings) and stays false on garbage.
+    #[test]
+    fn t02_prefill_bool_reads_truthy_spellings() {
+        assert!(guided_prefill_bool(
+            "{\"reuse_addr\":true}",
+            &["reuse_addr"]
+        ));
+        assert!(guided_prefill_bool("{\"reuse_addr\":1}", &["reuse_addr"]));
+        assert!(guided_prefill_bool("{\"a\":\"ON\"}", &["a"]));
+        assert!(!guided_prefill_bool(
+            "{\"reuse_addr\":false}",
+            &["reuse_addr"]
+        ));
+        assert!(!guided_prefill_bool("{\"reuse_addr\":0}", &["reuse_addr"]));
+        assert!(!guided_prefill_bool("{\"other\":true}", &["reuse_addr"]));
+        assert!(!guided_prefill_bool("{{{", &["reuse_addr"]));
+        assert!(!guided_prefill_bool("", &["reuse_addr"]));
     }
 
     /// Ticket 05: guided identity mapping mirrors the commit gate (same

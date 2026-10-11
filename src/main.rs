@@ -22,7 +22,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::description_list::DescriptionList;
-use gpui_kit::component::dialog::{Dialog, DialogButtonProps, DialogFooter};
+use gpui_kit::component::dialog::{Confirm, Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::form::{field, v_form, Field};
 use gpui_kit::component::group_box::GroupBox;
@@ -71,11 +71,24 @@ use import::{
     parse_addsub_link, AddSubRequest, ImportError,
 };
 use store::{
-    count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
-    export_confirm_description, fold_guided_into_params, guided_identity_fields,
-    guided_prefill_value, now_unix, protocol_params_template, proxy_urls, ConfigPatch,
-    HealthSnapshot, NewConfig, ProxyConfig, RestoreOutcome, Store, StoreError,
-    Subscription as ProxySubscription, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    chain_hop_rejection, chain_nodes_of, count_importable, delete_confirm_text,
+    delete_running_confirm_text, due_for_refresh_for, export_confirm_description,
+    extra_config_prefill, fold_amneziawg_into_params, fold_anytls_into_params,
+    fold_chain_nodes_into_params, fold_dial_into_params, fold_extra_into_params,
+    fold_guided_into_params, fold_http_into_params, fold_hysteria_into_params,
+    fold_mux_into_params, fold_naive_into_params, fold_shadowsocks_inner_into_params,
+    fold_shadowtls_into_params, fold_snell_into_params, fold_socks_into_params,
+    fold_ssh_into_params, fold_tls_forced_into_params, fold_tls_optional_into_params,
+    fold_tls_vmess_into_params, fold_transport_into_params, fold_trojan_inner_into_params,
+    fold_tuic_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
+    fold_wireguard_into_params, fold_xray_into_params, guided_identity_fields, guided_prefill_bool,
+    guided_prefill_list, guided_prefill_value, is_virtual_protocol, now_unix,
+    pristine_template_rewrite, protocol_params_template, proxy_urls, validate_extra_params,
+    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, ChainHopSlot, ConfigPatch,
+    DialFold, ExtraFold, HealthSnapshot, HttpFold, HysteriaFold, MuxFold, NaiveFold, NewConfig,
+    ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SshFold, Store, StoreError,
+    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
+    WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -89,6 +102,7 @@ actions!(
     [
         AddConfig,
         ImportConfigs,
+        PasteImport,
         StartSelected,
         StopSelected,
         TestSelected,
@@ -117,10 +131,15 @@ pub const APP_KEY_CONTEXT: &str = "manyproxy-library";
 /// Delete/Ctrl-E/Ctrl-F are inert while typing in a field (the focused
 /// input consumes the keystroke before the shell sees it) and while any
 /// dialog is open.
+/// Config-completeness T08 (CAP-11): Ctrl-V pastes clipboard text into the
+/// Import dialog (same handler as the palette `ImportClipboard` op and the
+/// Library-menu item). Like every other shortcut it is inert while typing
+/// (the focused input keeps native paste) and while any dialog is open.
 pub fn bind_app_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-n", AddConfig, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-o", ImportConfigs, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteImport, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("f5", StartSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("shift-f5", StopSelected, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-t", TestSelected, Some(APP_KEY_CONTEXT)),
@@ -198,6 +217,7 @@ pub const GIT_HASH: &str = match option_env!("MANYPROXY_GIT_HASH") {
 pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Add configuration", "Ctrl-N"),
     ("Import configurations", "Ctrl-O"),
+    ("Paste clipboard into Import", "Ctrl-V"),
     ("Start selected", "F5"),
     ("Stop selected", "Shift-F5"),
     ("Test selected", "Ctrl-T"),
@@ -1594,12 +1614,371 @@ fn advanced_toggle_button(
         })
 }
 
+/// Config-completeness T02: one shared-panel disclosure toggle — the same
+/// behavior as [`advanced_toggle_button`] (the cell flips, the owning view
+/// notifies, the next frame rebuilds) with a per-panel stable id so
+/// headless tests can expand each section. Labels name the open action.
+fn panel_toggle_button(
+    id: &'static str,
+    label: &'static str,
+    view: &Entity<AppView>,
+    open: &Rc<RefCell<bool>>,
+) -> impl IntoElement {
+    let toggle_view = view.clone();
+    let toggle_cell = open.clone();
+    Button::new(id)
+        .small()
+        .label(label)
+        .on_click(move |_, _, cx| {
+            toggle_view.update(cx, |_, cx| {
+                let expanded = !*toggle_cell.borrow();
+                *toggle_cell.borrow_mut() = expanded;
+                cx.notify();
+            });
+        })
+}
+
 /// Handles to the add/edit dialog inputs. Entities are created once in the
 /// button handler (never in render) and cloned into the dialog builder.
 #[derive(Clone)]
 struct ConfigForm {
     name: Entity<InputState>,
-    protocol: Entity<InputState>,
+    /// Config-completeness T01: protocol picker state (Add only — Edit
+    /// renders [`ConfigForm::protocol_locked`] text instead, Throne §7.7
+    /// parity). Created once in [`ConfigForm::blank`]/[`ConfigForm::prefilled`]
+    /// (never in render); the selection drives the guided hint, the
+    /// virtual-type gate, and the pristine-only template sync below.
+    protocol_select: Entity<SelectState<ProtocolChoiceList>>,
+    /// Config-completeness T01: last protocol the template sync applied.
+    /// Compared against the live selection in the dialog builder (the only
+    /// window-holding frame scope) so a switch rewrites pristine JSON once
+    /// and dirty JSON never.
+    last_protocol: Rc<RefCell<String>>,
+    /// Config-completeness T01: true on Edit — the type control renders as
+    /// read-only text (`protocol-lock`) and commits keep the baseline type.
+    protocol_locked: bool,
+    /// Config-completeness T01: baseline protocol text shown (and committed)
+    /// while locked.
+    locked_protocol: String,
+    /// Config-completeness T02: VLESS inner fields — masked uuid secret,
+    /// flow + packet_encoding pickers. Prefilled from params on Edit;
+    /// rendered (and folded) only while the live protocol is `vless`.
+    vless_uuid: Entity<InputState>,
+    vless_flow: Entity<SelectState<PanelChoiceList>>,
+    vless_packet_encoding: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T02: shared Transport panel (S1) — network
+    /// picker plus conditional text inputs. Entities persist while hidden
+    /// (R5: hiding never wipes), so ws→tcp keeps path/host for reopen.
+    s1_network: Entity<SelectState<PanelChoiceList>>,
+    s1_path: Entity<InputState>,
+    s1_host: Entity<InputState>,
+    s1_method: Entity<InputState>,
+    s1_service_name: Entity<InputState>,
+    s1_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: shared TLS panel, optional variant (S2) —
+    /// enable toggle plus credential inputs. Disabling folds `security`
+    /// away while every other key stays preserved (R5).
+    s2_enable: Rc<RefCell<bool>>,
+    s2_sni: Entity<InputState>,
+    s2_alpn: Entity<InputState>,
+    s2_fp: Entity<SelectState<PanelChoiceList>>,
+    s2_insecure: Rc<RefCell<bool>>,
+    s2_pbk: Entity<InputState>,
+    s2_sid: Entity<InputState>,
+    s2_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: shared Mux+Brutal panel (S3) — mode cell
+    /// (`""`|`on`|`off`, RadioGroup-driven) plus brutal state. `flow=vision`
+    /// unmounts the section with reason text (values preserved, fold
+    /// skipped); brutal forces the effective mode On.
+    s3_mode: Rc<RefCell<String>>,
+    s3_brutal: Rc<RefCell<bool>>,
+    s3_up: Entity<InputState>,
+    s3_down: Entity<InputState>,
+    s3_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: shared Advanced dial panel (S4, dial half) —
+    /// four toggles plus timeout/bind text inputs (TLS extras are a later
+    /// ticket with their own engine `tls{}` mapping).
+    s4_reuse: Rc<RefCell<bool>>,
+    s4_fastopen: Rc<RefCell<bool>>,
+    s4_fragment: Rc<RefCell<bool>>,
+    s4_multipath: Rc<RefCell<bool>>,
+    s4_timeout: Entity<InputState>,
+    s4_bind: Entity<InputState>,
+    s4_inet4: Entity<InputState>,
+    s4_inet6: Entity<InputState>,
+    s4_open: Rc<RefCell<bool>>,
+    /// Config-completeness T02: outer VLESS disclosure (see
+    /// [`ConfigForm::vless_block`]) — collapsed by default per the t11
+    /// minimum-frame contract.
+    vless_open: Rc<RefCell<bool>>,
+    /// Config-completeness T03: VMess inner fields — masked uuid secret +
+    /// generate, aid text, cipher + packet_encoding pickers. Prefilled from
+    /// params on Edit (cipher via the grammar-aware reader); rendered (and
+    /// folded) only while the live protocol is `vmess`.
+    vmess_uuid: Entity<InputState>,
+    vmess_aid: Entity<InputState>,
+    vmess_security: Entity<SelectState<PanelChoiceList>>,
+    vmess_packet_encoding: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T03: outer VMess disclosure (see
+    /// [`ConfigForm::vmess_block`]) — collapsed by default like VLESS.
+    vmess_open: Rc<RefCell<bool>>,
+    /// Config-completeness T03: Trojan inner field — masked password secret
+    /// (no generator: passwords are not uuids). Rendered (and folded) only
+    /// while the live protocol is `trojan`.
+    trojan_password: Entity<InputState>,
+    /// Config-completeness T03: outer Trojan disclosure (see
+    /// [`ConfigForm::trojan_block`]) — collapsed by default like VLESS.
+    trojan_open: Rc<RefCell<bool>>,
+    /// Config-completeness T03: Shadowsocks inner fields — method + plugin
+    /// pickers, masked password secret, plugin_opts text, uot cell.
+    /// Rendered (and folded) only while the live protocol is `shadowsocks`;
+    /// the page carries S3+S4 only (no S1/S2 — Throne HasMux parity).
+    ss_method: Entity<SelectState<PanelChoiceList>>,
+    ss_password: Entity<InputState>,
+    ss_plugin: Entity<SelectState<PanelChoiceList>>,
+    ss_plugin_opts: Entity<InputState>,
+    ss_uot: Rc<RefCell<bool>>,
+    /// Config-completeness T03: outer Shadowsocks disclosure (see
+    /// [`ConfigForm::shadowsocks_block`]) — collapsed by default like VLESS.
+    ss_open: Rc<RefCell<bool>>,
+    /// Config-completeness T04: WireGuard inner fields — masked private-key
+    /// secret + keygen, peer public/preshared keys, reserved/keepalive/
+    /// local-addr/dns/mtu/workers texts, sys_ifc cell. Rendered (and folded)
+    /// only while the live protocol is `wireguard`; the page carries S4
+    /// only (no Transport/TLS/Mux — endpoint parity).
+    wg_private: Entity<InputState>,
+    wg_public: Entity<InputState>,
+    wg_preshared: Entity<InputState>,
+    wg_reserved: Entity<InputState>,
+    wg_keepalive: Entity<InputState>,
+    wg_local_addr: Entity<InputState>,
+    wg_dns: Entity<InputState>,
+    wg_mtu: Entity<InputState>,
+    wg_workers: Entity<InputState>,
+    wg_sys_ifc: Rc<RefCell<bool>>,
+    /// Config-completeness T04: outer WireGuard disclosure (see
+    /// [`ConfigForm::wireguard_block`]) — collapsed by default like VLESS.
+    wg_open: Rc<RefCell<bool>>,
+    /// Config-completeness T04: AmneziaWG inner fields — the full WG set
+    /// above (separate entities so unmerged typing never crosses pages —
+    /// T03 protocol-scoping) plus the AWG matrix: enable marker, version
+    /// picker, junk-train Jc/Jmin/Jmax, S-lengths, H-ranges, I-chains, v3
+    /// fields, trailers/cookies cells. Rendered (and folded) only while the
+    /// live protocol is `amneziawg`; the page carries S4 only.
+    awg_private: Entity<InputState>,
+    awg_public: Entity<InputState>,
+    awg_preshared: Entity<InputState>,
+    awg_reserved: Entity<InputState>,
+    awg_keepalive: Entity<InputState>,
+    awg_local_addr: Entity<InputState>,
+    awg_dns: Entity<InputState>,
+    awg_mtu: Entity<InputState>,
+    awg_workers: Entity<InputState>,
+    awg_sys_ifc: Rc<RefCell<bool>>,
+    awg_version: Entity<SelectState<PanelChoiceList>>,
+    awg_enable: Rc<RefCell<bool>>,
+    awg_jc: Entity<InputState>,
+    awg_jmin: Entity<InputState>,
+    awg_jmax: Entity<InputState>,
+    awg_s1: Entity<InputState>,
+    awg_s2: Entity<InputState>,
+    awg_s3: Entity<InputState>,
+    awg_s4: Entity<InputState>,
+    awg_h1: Entity<InputState>,
+    awg_h2: Entity<InputState>,
+    awg_h3: Entity<InputState>,
+    awg_h4: Entity<InputState>,
+    awg_i1: Entity<InputState>,
+    awg_i2: Entity<InputState>,
+    awg_i3: Entity<InputState>,
+    awg_i4: Entity<InputState>,
+    awg_i5: Entity<InputState>,
+    awg_hpk: Entity<InputState>,
+    awg_pad: Entity<InputState>,
+    awg_rekey_after: Entity<InputState>,
+    awg_rekey_timeout: Entity<InputState>,
+    awg_reject_after: Entity<InputState>,
+    awg_keepalive_timeout: Entity<InputState>,
+    awg_max_handshake: Entity<InputState>,
+    awg_trailers: Rc<RefCell<bool>>,
+    awg_cookies: Rc<RefCell<bool>>,
+    /// Config-completeness T04: outer AmneziaWG disclosure (see
+    /// [`ConfigForm::amneziawg_block`]) — collapsed by default like VLESS.
+    awg_open: Rc<RefCell<bool>>,
+    /// Config-completeness T05: Hysteria inner fields — common texts
+    /// (server_ports/hop_interval/up/down/obfs), v1-only auth_type picker +
+    /// auth secret + recv_window(_conn) + mtu-disvery cell, v2-only password
+    /// secret. One page serves both `hysteria` and `hysteria2` (the version
+    /// RadioGroup switches the protocol on Add, locked on Edit); hidden
+    /// halves persist in their entities (R5 hide-preserve).
+    hy_server_ports: Entity<InputState>,
+    hy_hop_interval: Entity<InputState>,
+    hy_up: Entity<InputState>,
+    hy_down: Entity<InputState>,
+    hy_obfs: Entity<InputState>,
+    hy_auth_type: Entity<SelectState<PanelChoiceList>>,
+    hy_auth: Entity<InputState>,
+    hy_recv_conn: Entity<InputState>,
+    hy_recv: Entity<InputState>,
+    hy_mtu: Rc<RefCell<bool>>,
+    hy_password: Entity<InputState>,
+    /// Config-completeness T05: outer Hysteria disclosure (see
+    /// [`ConfigForm::hysteria_block`]) — collapsed by default like VLESS.
+    hy_open: Rc<RefCell<bool>>,
+    /// Config-completeness T05: TUIC inner fields — uuid secret (+uuidgen
+    /// button, uuid-row precedent) + password secret, congestion_control +
+    /// udp_relay_mode keep-blank pickers, udp_over_stream + zero_rtt cells,
+    /// heartbeat text. Rendered (and folded) only while the live protocol is
+    /// `tuic`; the page carries S2-forced + S4.
+    tuic_uuid: Entity<InputState>,
+    tuic_password: Entity<InputState>,
+    tuic_cc: Entity<SelectState<PanelChoiceList>>,
+    tuic_relay: Entity<SelectState<PanelChoiceList>>,
+    tuic_uot: Rc<RefCell<bool>>,
+    tuic_zero_rtt: Rc<RefCell<bool>>,
+    tuic_heartbeat: Entity<InputState>,
+    /// Config-completeness T05: outer TUIC disclosure (see
+    /// [`ConfigForm::tuic_block`]) — collapsed by default like VLESS.
+    tuic_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: SOCKS inner fields — version + network
+    /// pickers, username/password texts, udp_over_tcp cell. Rendered (and
+    /// folded) only while the live protocol is `socks`; the page carries S4
+    /// only (no Transport/TLS/Mux — inner parity).
+    socks_version: Entity<SelectState<PanelChoiceList>>,
+    socks_username: Entity<InputState>,
+    socks_password: Entity<InputState>,
+    socks_network: Entity<SelectState<PanelChoiceList>>,
+    socks_uot: Rc<RefCell<bool>>,
+    /// Config-completeness T06: outer SOCKS disclosure (see
+    /// [`ConfigForm::socks_block`]) — collapsed by default like VLESS.
+    socks_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: HTTP/HTTPS inner fields — username/password/
+    /// path/headers texts (path/headers are parity+). One entity set serves
+    /// both `http` and `https` (hysteria v1/v2 precedent); rendered (and
+    /// folded) only while the live protocol is either; the page carries
+    /// S2-optional + S4.
+    http_username: Entity<InputState>,
+    http_password: Entity<InputState>,
+    http_path: Entity<InputState>,
+    http_headers: Entity<InputState>,
+    /// Config-completeness T06: outer HTTP disclosure (see
+    /// [`ConfigForm::http_block`]) — collapsed by default like VLESS.
+    http_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: AnyTLS inner fields — masked password secret
+    /// plus the idle-session tunables (interval/timeout durations, min
+    /// count). Rendered (and folded) only while the live protocol is
+    /// `anytls`; the page carries S2-forced + S4.
+    anytls_password: Entity<InputState>,
+    anytls_interval: Entity<InputState>,
+    anytls_timeout: Entity<InputState>,
+    anytls_min: Entity<InputState>,
+    /// Config-completeness T06: outer AnyTLS disclosure (see
+    /// [`ConfigForm::anytls_block`]) — collapsed by default like VLESS.
+    anytls_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: Naïve inner fields — username + masked
+    /// password secrets, uot/quic cells, congestion_control picker.
+    /// Rendered (and folded) only while the live protocol is `naive`; the
+    /// page carries S2-forced + S4.
+    naive_username: Entity<InputState>,
+    naive_password: Entity<InputState>,
+    naive_uot: Rc<RefCell<bool>>,
+    naive_quic: Rc<RefCell<bool>>,
+    naive_cc: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T06: outer Naïve disclosure (see
+    /// [`ConfigForm::naive_block`]) — collapsed by default like VLESS.
+    naive_open: Rc<RefCell<bool>>,
+    /// Config-completeness T06: SSH inner fields — user text, masked password
+    /// secret, private-key blob area + path input + Browse picker + masked
+    /// passphrase, host-key + algs comma lists, client version. Rendered (and
+    /// folded) only while the live protocol is `ssh`; the page carries S4
+    /// only (no TLS — inner parity).
+    ssh_user: Entity<InputState>,
+    ssh_password: Entity<InputState>,
+    ssh_private_key: Entity<TextareaState>,
+    ssh_key_path: Entity<InputState>,
+    ssh_key_pass: Entity<InputState>,
+    ssh_host_key: Entity<InputState>,
+    ssh_host_key_algs: Entity<InputState>,
+    ssh_client_version: Entity<InputState>,
+    /// Config-completeness T06: outer SSH disclosure (see
+    /// [`ConfigForm::ssh_block`]) — collapsed by default like VLESS.
+    ssh_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: Snell inner fields — masked psk secret,
+    /// version picker (4|6), obfs_mode/host + userkey + network + mode texts,
+    /// reuse cell. Engine-driven list (no Throne editor exists); rendered
+    /// (and folded) only while the live protocol is `snell`; the page carries
+    /// S4 only (no Transport/TLS/Mux — inner parity).
+    snell_psk: Entity<InputState>,
+    snell_version: Entity<SelectState<PanelChoiceList>>,
+    snell_obfs_mode: Entity<InputState>,
+    snell_obfs_host: Entity<InputState>,
+    snell_userkey: Entity<InputState>,
+    snell_reuse: Rc<RefCell<bool>>,
+    snell_network: Entity<InputState>,
+    snell_mode: Entity<InputState>,
+    /// Config-completeness T07: outer Snell disclosure (see
+    /// [`ConfigForm::snell_block`]) — collapsed by default like VLESS.
+    snell_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: ShadowTLS inner fields — version picker
+    /// (1|2|3) + password text (v2/v3-only; v1 rows omit it). Rendered (and
+    /// folded) only while the live protocol is `shadowtls`; the page carries
+    /// S2-forced + S4.
+    shadowtls_version: Entity<SelectState<PanelChoiceList>>,
+    shadowtls_password: Entity<InputState>,
+    /// Config-completeness T07: outer ShadowTLS disclosure (see
+    /// [`ConfigForm::shadowtls_block`]) — collapsed by default like VLESS.
+    shadowtls_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: Xray-VLESS Ph1 inner fields (uuid with
+    /// uuidgen, encryption, flow picker, sni/fp/alpn, REALITY pbk/sid/spiderx,
+    /// Xray-network picker, mode text, xray-mux picker). Ph2-only keys stay
+    /// JSON-only (preserved, never stripped); rendered (and folded) only
+    /// while the live protocol is `xray`; no shared panels (the bridge serves
+    /// the Ph1 subset, so S4 dial keys would be dead there).
+    xray_uuid: Entity<InputState>,
+    xray_enc: Entity<InputState>,
+    xray_flow: Entity<SelectState<PanelChoiceList>>,
+    xray_sni: Entity<InputState>,
+    xray_fp: Entity<SelectState<PanelChoiceList>>,
+    xray_alpn: Entity<InputState>,
+    xray_pbk: Entity<InputState>,
+    xray_sid: Entity<InputState>,
+    xray_spiderx: Entity<InputState>,
+    xray_network: Entity<SelectState<PanelChoiceList>>,
+    xray_mode: Entity<InputState>,
+    xray_mux: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T07: outer Xray disclosure (see
+    /// [`ConfigForm::xray_block`]) — collapsed by default like VLESS.
+    xray_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: chain hop-list editor state — ordered `nodes`
+    /// (id-reference strings or inline outbound objects, exactly the stored
+    /// shape). The cell is NEVER reset by `clear_panels` (kept, so the
+    /// expand→commit path refolds idempotently) and `echo_panels` always
+    /// re-syncs it from the box on collapse (hand-edited box JSON wins over
+    /// stale picks — expanding always merges first, so no unmerged typing
+    /// can be clobbered). Rendered (and folded) only while the live protocol
+    /// is `chain`.
+    chain_hops: Rc<RefCell<Vec<serde_json::Value>>>,
+    /// Config-completeness T07: the library picker behind the hop editor —
+    /// choices rebuilt with the row list at dialog open (tests keep the
+    /// blank placeholder; the selection is transient UI, never folded).
+    chain_pick: Entity<SelectState<PanelChoiceList>>,
+    /// Config-completeness T07: library snapshot (id, name, protocol) behind
+    /// the hop picker + hop labels + add/replace rejection. Set at dialog
+    /// open alongside `chain_pick`; empty for direct test forms.
+    chain_library: Rc<RefCell<Vec<ChainLibraryEntry>>>,
+    /// Config-completeness T07: outer chain disclosure (see
+    /// [`ConfigForm::chain_block`]) — collapsed by default like VLESS.
+    chain_open: Rc<RefCell<bool>>,
+    /// Config-completeness T07: extra-core inner fields — exe path text +
+    /// Browse picker, args text, config textarea. Rendered (and folded) only
+    /// while the live protocol is `extra-core`. Deliberately no `no_logs`
+    /// control anywhere (Throne non-persist bug — never copied).
+    extra_exe: Entity<InputState>,
+    extra_args: Entity<InputState>,
+    extra_config: Entity<TextareaState>,
+    /// Config-completeness T07: outer extra-core disclosure (see
+    /// [`ConfigForm::extra_block`]) — collapsed by default like VLESS.
+    extra_open: Rc<RefCell<bool>>,
     /// Ticket 43: multiline params editor (was single-line `Input` — JSON
     /// needs room). Reads/writes go through the same `value()` seam.
     params: Entity<TextareaState>,
@@ -1665,6 +2044,23 @@ impl ConfigForm {
         })
     }
 
+    /// Config-completeness T02: one picker builder behind the panel
+    /// dropdowns — `choices` from the option tables above, `current`
+    /// preselected (fallback: first row). States are created once in
+    /// [`ConfigForm::blank`]/[`ConfigForm::prefilled`], never in render.
+    fn panel_select(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        choices: Vec<PanelChoice>,
+        current: &str,
+    ) -> Entity<SelectState<PanelChoiceList>> {
+        let selected = choices
+            .iter()
+            .position(|choice| choice.value == current)
+            .map(IndexPath::new);
+        cx.new(|cx| SelectState::new(PanelChoiceList(choices), selected, window, cx))
+    }
+
     /// Ticket 43: one multiline builder for the params box (same
     /// placeholder + default wiring as [`ConfigForm::field`]).
     fn area(
@@ -1682,6 +2078,55 @@ impl ConfigForm {
         })
     }
 
+    /// Config-completeness T01: live protocol text — the picker selection on
+    /// Add, the baseline on Edit (locked). Falls back to the last-seen
+    /// protocol when the Select holds no selection (unknown legacy type on a
+    /// locked row), so reads never invent a type.
+    fn protocol_text(&self, cx: &App) -> String {
+        if self.protocol_locked {
+            return self.locked_protocol.clone();
+        }
+        self.protocol_select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .unwrap_or_else(|| self.last_protocol.borrow().clone())
+    }
+
+    /// Config-completeness T01: pristine-only template sync (contract C1).
+    /// Runs at the top of the Add/Edit dialog builders — the only frame scope
+    /// holding a `Window` outside kit internals (kit `SelectState::set_value`
+    /// needs one, and the Confirm subscription has none). When the picker
+    /// selection moved since the last sync, the params box rewrites to the
+    /// new starter only via [`pristine_template_rewrite`] (dirty JSON stands);
+    /// the tracker advances either way so the rewrite fires exactly once per
+    /// switch. No-op on locked (Edit) rows.
+    fn sync_protocol_template(&self, window: &mut Window, cx: &mut App) {
+        if self.protocol_locked {
+            return;
+        }
+        let current = self
+            .protocol_select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .unwrap_or_else(|| self.last_protocol.borrow().clone());
+        let mut last = self.last_protocol.borrow_mut();
+        if current == *last {
+            return;
+        }
+        let old = last.clone();
+        *last = current.clone();
+        drop(last);
+        let box_text = self.params.read(cx).value().to_string();
+        let next = pristine_template_rewrite(&box_text, &old, &current);
+        if next != box_text {
+            self.params.update(cx, |state, cx| {
+                state.set_value(next, window, cx);
+            });
+        }
+    }
+
     fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
         // Ticket 31: the params box opens with the per-protocol field
         // template (guided add, not raw JSON first). Submitting it untouched
@@ -1689,9 +2134,18 @@ impl ConfigForm {
         // Ticket 05: the guided mini-form opens blank (fold no-ops, so the
         // template stands) under a collapsed Advanced disclosure.
         let template = protocol_params_template(DEFAULT_PROTOCOL);
+        let selected = protocol_choices()
+            .iter()
+            .position(|choice| choice.value == DEFAULT_PROTOCOL)
+            .map(IndexPath::new);
         Self {
             name: Self::field(window, cx, "Name", None),
-            protocol: Self::field(window, cx, "Protocol", Some(DEFAULT_PROTOCOL)),
+            protocol_select: cx.new(|cx| {
+                SelectState::new(ProtocolChoiceList(protocol_choices()), selected, window, cx)
+            }),
+            last_protocol: Rc::new(RefCell::new(DEFAULT_PROTOCOL.to_string())),
+            protocol_locked: false,
+            locked_protocol: DEFAULT_PROTOCOL.to_string(),
             params: Self::area(
                 window,
                 cx,
@@ -1705,6 +2159,197 @@ impl ConfigForm {
             guided_server: Self::field(window, cx, "Upstream server", None),
             guided_port: Self::field(window, cx, "Upstream port", None),
             guided_identity: Self::secret_field(window, cx, "Identity secret", None),
+            // Config-completeness T02: panels open blank (every fold
+            // no-ops, so the template stands) under collapsed disclosures
+            // (the 880x620 minimum fits the guided core; t11 pins it).
+            vless_uuid: Self::secret_field(window, cx, "UUID", None),
+            vless_flow: Self::panel_select(window, cx, flow_choices(), ""),
+            vless_packet_encoding: Self::panel_select(window, cx, packet_encoding_choices(), ""),
+            s1_network: Self::panel_select(window, cx, network_choices(), "tcp"),
+            s1_path: Self::field(window, cx, "Path", None),
+            s1_host: Self::field(window, cx, "Host", None),
+            s1_method: Self::field(window, cx, "Method", None),
+            s1_service_name: Self::field(window, cx, "Service name", None),
+            s1_open: Rc::new(RefCell::new(false)),
+            s2_enable: Rc::new(RefCell::new(false)),
+            s2_sni: Self::field(window, cx, "SNI", None),
+            s2_alpn: Self::field(window, cx, "ALPN (comma list)", None),
+            s2_fp: Self::panel_select(window, cx, fp_choices(), ""),
+            s2_insecure: Rc::new(RefCell::new(false)),
+            s2_pbk: Self::field(window, cx, "Reality public key", None),
+            s2_sid: Self::field(window, cx, "Reality short id", None),
+            s2_open: Rc::new(RefCell::new(false)),
+            s3_mode: Rc::new(RefCell::new(String::new())),
+            s3_brutal: Rc::new(RefCell::new(false)),
+            s3_up: Self::field(window, cx, "Brutal up Mbps", None),
+            s3_down: Self::field(window, cx, "Brutal down Mbps", None),
+            s3_open: Rc::new(RefCell::new(false)),
+            s4_reuse: Rc::new(RefCell::new(false)),
+            s4_fastopen: Rc::new(RefCell::new(false)),
+            s4_fragment: Rc::new(RefCell::new(false)),
+            s4_multipath: Rc::new(RefCell::new(false)),
+            s4_timeout: Self::field(window, cx, "Connect timeout (e.g. 5s)", None),
+            s4_bind: Self::field(window, cx, "Bind interface", None),
+            s4_inet4: Self::field(window, cx, "IPv4 bind address", None),
+            s4_inet6: Self::field(window, cx, "IPv6 bind address", None),
+            s4_open: Rc::new(RefCell::new(false)),
+            vless_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T03: panels open blank (every fold
+            // no-ops, so the template stands) under collapsed disclosures.
+            vmess_uuid: Self::secret_field(window, cx, "UUID", None),
+            vmess_aid: Self::field(window, cx, "Alter ID (aid)", None),
+            vmess_security: Self::panel_select(window, cx, vmess_security_choices(), "auto"),
+            vmess_packet_encoding: Self::panel_select(window, cx, packet_encoding_choices(), ""),
+            vmess_open: Rc::new(RefCell::new(false)),
+            trojan_password: Self::secret_field(window, cx, "Password", None),
+            trojan_open: Rc::new(RefCell::new(false)),
+            ss_method: Self::panel_select(window, cx, ss_method_choices(), ""),
+            ss_password: Self::secret_field(window, cx, "Password", None),
+            ss_plugin: Self::panel_select(window, cx, ss_plugin_choices(), ""),
+            ss_plugin_opts: Self::field(window, cx, "Plugin options", None),
+            ss_uot: Rc::new(RefCell::new(false)),
+            ss_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T04: WG/AWG pages open blank (every fold
+            // no-ops, so the template stands) under collapsed disclosures.
+            wg_private: Self::secret_field(window, cx, "Private key", None),
+            wg_public: Self::field(window, cx, "Peer public key", None),
+            wg_preshared: Self::secret_field(window, cx, "Preshared key", None),
+            wg_reserved: Self::field(window, cx, "Reserved (comma ints)", None),
+            wg_keepalive: Self::field(window, cx, "Keepalive (seconds)", None),
+            wg_local_addr: Self::field(window, cx, "Local address (comma CIDRs)", None),
+            wg_dns: Self::field(window, cx, "DNS", None),
+            wg_mtu: Self::field(window, cx, "MTU", None),
+            wg_workers: Self::field(window, cx, "Workers", None),
+            wg_sys_ifc: Rc::new(RefCell::new(false)),
+            wg_open: Rc::new(RefCell::new(false)),
+            awg_private: Self::secret_field(window, cx, "Private key", None),
+            awg_public: Self::field(window, cx, "Peer public key", None),
+            awg_preshared: Self::secret_field(window, cx, "Preshared key", None),
+            awg_reserved: Self::field(window, cx, "Reserved (comma ints)", None),
+            awg_keepalive: Self::field(window, cx, "Keepalive (seconds)", None),
+            awg_local_addr: Self::field(window, cx, "Local address (comma CIDRs)", None),
+            awg_dns: Self::field(window, cx, "DNS", None),
+            awg_mtu: Self::field(window, cx, "MTU", None),
+            awg_workers: Self::field(window, cx, "Workers", None),
+            awg_sys_ifc: Rc::new(RefCell::new(false)),
+            awg_version: Self::panel_select(window, cx, awg_version_choices(), ""),
+            awg_enable: Rc::new(RefCell::new(false)),
+            awg_jc: Self::field(window, cx, "Jc", None),
+            awg_jmin: Self::field(window, cx, "Jmin", None),
+            awg_jmax: Self::field(window, cx, "Jmax", None),
+            awg_s1: Self::field(window, cx, "S1", None),
+            awg_s2: Self::field(window, cx, "S2", None),
+            awg_s3: Self::field(window, cx, "S3", None),
+            awg_s4: Self::field(window, cx, "S4", None),
+            awg_h1: Self::field(window, cx, "H1", None),
+            awg_h2: Self::field(window, cx, "H2", None),
+            awg_h3: Self::field(window, cx, "H3", None),
+            awg_h4: Self::field(window, cx, "H4", None),
+            awg_i1: Self::field(window, cx, "I1", None),
+            awg_i2: Self::field(window, cx, "I2", None),
+            awg_i3: Self::field(window, cx, "I3", None),
+            awg_i4: Self::field(window, cx, "I4", None),
+            awg_i5: Self::field(window, cx, "I5", None),
+            awg_hpk: Self::field(window, cx, "Header protection key", None),
+            awg_pad: Self::field(window, cx, "Content padding addition", None),
+            awg_rekey_after: Self::field(window, cx, "Rekey after time", None),
+            awg_rekey_timeout: Self::field(window, cx, "Rekey timeout", None),
+            awg_reject_after: Self::field(window, cx, "Reject after time", None),
+            awg_keepalive_timeout: Self::field(window, cx, "Keepalive timeout", None),
+            awg_max_handshake: Self::field(window, cx, "Max handshake attempts", None),
+            awg_trailers: Rc::new(RefCell::new(false)),
+            awg_cookies: Rc::new(RefCell::new(false)),
+            awg_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T05: Hysteria/TUIC pages open blank (every
+            // fold no-ops, so the template stands) under collapsed
+            // disclosures.
+            hy_server_ports: Self::field(window, cx, "Server ports (e.g. 9000-9010)", None),
+            hy_hop_interval: Self::field(window, cx, "Hop interval (e.g. 30s)", None),
+            hy_up: Self::field(window, cx, "Up Mbps", None),
+            hy_down: Self::field(window, cx, "Down Mbps", None),
+            hy_obfs: Self::field(window, cx, "Obfs", None),
+            hy_auth_type: Self::panel_select(window, cx, hy_auth_type_choices(), ""),
+            hy_auth: Self::secret_field(window, cx, "Auth secret", None),
+            hy_recv_conn: Self::field(window, cx, "Recv window conn", None),
+            hy_recv: Self::field(window, cx, "Recv window", None),
+            hy_mtu: Rc::new(RefCell::new(false)),
+            hy_password: Self::secret_field(window, cx, "Password", None),
+            hy_open: Rc::new(RefCell::new(false)),
+            tuic_uuid: Self::secret_field(window, cx, "UUID", None),
+            tuic_password: Self::secret_field(window, cx, "Password", None),
+            tuic_cc: Self::panel_select(window, cx, tuic_cc_choices(), ""),
+            tuic_relay: Self::panel_select(window, cx, tuic_relay_choices(), ""),
+            tuic_uot: Rc::new(RefCell::new(false)),
+            tuic_zero_rtt: Rc::new(RefCell::new(false)),
+            tuic_heartbeat: Self::field(window, cx, "Heartbeat (e.g. 10s)", None),
+            tuic_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T06: SOCKS/HTTP(S)/AnyTLS/Naïve/SSH pages
+            // open blank (every fold no-ops, so the template stands) under
+            // collapsed disclosures.
+            socks_version: Self::panel_select(window, cx, socks_version_choices(), ""),
+            socks_username: Self::field(window, cx, "Username", None),
+            socks_password: Self::secret_field(window, cx, "Password", None),
+            socks_network: Self::panel_select(window, cx, socks_network_choices(), "tcp"),
+            socks_uot: Rc::new(RefCell::new(false)),
+            socks_open: Rc::new(RefCell::new(false)),
+            http_username: Self::field(window, cx, "Username", None),
+            http_password: Self::secret_field(window, cx, "Password", None),
+            http_path: Self::field(window, cx, "Path", None),
+            http_headers: Self::field(window, cx, "Headers", None),
+            http_open: Rc::new(RefCell::new(false)),
+            anytls_password: Self::secret_field(window, cx, "Password", None),
+            anytls_interval: Self::field(window, cx, "Idle check interval (e.g. 30s)", None),
+            anytls_timeout: Self::field(window, cx, "Idle timeout (e.g. 30s)", None),
+            anytls_min: Self::field(window, cx, "Min idle sessions", None),
+            anytls_open: Rc::new(RefCell::new(false)),
+            naive_username: Self::field(window, cx, "Username", None),
+            naive_password: Self::secret_field(window, cx, "Password", None),
+            naive_uot: Rc::new(RefCell::new(false)),
+            naive_quic: Rc::new(RefCell::new(false)),
+            naive_cc: Self::panel_select(window, cx, naive_cc_choices(), ""),
+            naive_open: Rc::new(RefCell::new(false)),
+            ssh_user: Self::field(window, cx, "User", None),
+            ssh_password: Self::secret_field(window, cx, "Password", None),
+            ssh_private_key: Self::area(window, cx, "Private key (paste or Browse…)", None),
+            ssh_key_path: Self::field(window, cx, "Private key path", None),
+            ssh_key_pass: Self::secret_field(window, cx, "Private key passphrase", None),
+            ssh_host_key: Self::field(window, cx, "Host key (comma list)", None),
+            ssh_host_key_algs: Self::field(window, cx, "Host key algorithms (comma list)", None),
+            ssh_client_version: Self::field(window, cx, "Client version", None),
+            ssh_open: Rc::new(RefCell::new(false)),
+            snell_psk: Self::secret_field(window, cx, "PSK", None),
+            snell_version: Self::panel_select(window, cx, snell_version_choices(), ""),
+            snell_obfs_mode: Self::field(window, cx, "Obfs mode", None),
+            snell_obfs_host: Self::field(window, cx, "Obfs host", None),
+            snell_userkey: Self::field(window, cx, "User key", None),
+            snell_reuse: Rc::new(RefCell::new(false)),
+            snell_network: Self::field(window, cx, "Network", None),
+            snell_mode: Self::field(window, cx, "Mode", None),
+            snell_open: Rc::new(RefCell::new(false)),
+            shadowtls_version: Self::panel_select(window, cx, shadowtls_version_choices(), ""),
+            shadowtls_password: Self::secret_field(window, cx, "Password", None),
+            shadowtls_open: Rc::new(RefCell::new(false)),
+            xray_uuid: Self::secret_field(window, cx, "UUID", None),
+            xray_enc: Self::field(window, cx, "Encryption (default none)", None),
+            xray_flow: Self::panel_select(window, cx, xray_flow_choices(), ""),
+            xray_sni: Self::field(window, cx, "SNI", None),
+            xray_fp: Self::panel_select(window, cx, fp_choices(), ""),
+            xray_alpn: Self::field(window, cx, "ALPN (comma list)", None),
+            xray_pbk: Self::field(window, cx, "REALITY public key (pbk)", None),
+            xray_sid: Self::field(window, cx, "REALITY short id (sid)", None),
+            xray_spiderx: Self::field(window, cx, "REALITY spiderX path", None),
+            xray_network: Self::panel_select(window, cx, xray_network_choices(), ""),
+            xray_mode: Self::field(window, cx, "Mode", None),
+            xray_mux: Self::panel_select(window, cx, xray_mux_choices(), ""),
+            xray_open: Rc::new(RefCell::new(false)),
+            chain_hops: Rc::new(RefCell::new(Vec::new())),
+            chain_pick: Self::panel_select(window, cx, chain_pick_choices(&[]), ""),
+            chain_library: Rc::new(RefCell::new(Vec::new())),
+            chain_open: Rc::new(RefCell::new(false)),
+            extra_exe: Self::field(window, cx, "Executable (app dir file name)", None),
+            extra_args: Self::field(window, cx, "Args", None),
+            extra_config: Self::area(window, cx, "Config JSON (passed as -c <file>)", None),
+            extra_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(false)),
         }
     }
@@ -1721,9 +2366,39 @@ impl ConfigForm {
         let read_keys: &[&str] = guided_identity_fields(&config.protocol)
             .map(|guided| guided.read_keys)
             .unwrap_or(&[]);
+        let selected = protocol_choices()
+            .iter()
+            .position(|choice| choice.value == config.protocol)
+            .map(IndexPath::new);
+        // Config-completeness T02: panels echo the row's params JSON
+        // (untouched values fold back byte-identical — no spurious patch).
+        let params = config.params.as_str();
+        let network_value = guided_prefill_value(params, &["network"]);
+        let network = if network_value.is_empty() {
+            "tcp".to_string()
+        } else {
+            network_value
+        };
+        let security = guided_prefill_value(params, &["security"]);
+        // Config-completeness T03: vmess rows may carry the legacy boolean
+        // `tls` import writes for `vmess://` links (the cipher sits in
+        // `security` there) — the grammar-aware reader owns that protocol.
+        let tls_on = if config.protocol == "vmess" {
+            vmess_tls_enabled(params)
+        } else {
+            matches!(
+                security.to_ascii_lowercase().as_str(),
+                "tls" | "xtls" | "reality"
+            )
+        };
         Self {
             name: Self::field(window, cx, "Name", Some(config.name.as_str())),
-            protocol: Self::field(window, cx, "Protocol", Some(config.protocol.as_str())),
+            protocol_select: cx.new(|cx| {
+                SelectState::new(ProtocolChoiceList(protocol_choices()), selected, window, cx)
+            }),
+            last_protocol: Rc::new(RefCell::new(config.protocol.clone())),
+            protocol_locked: true,
+            locked_protocol: config.protocol.clone(),
             params: Self::area(
                 window,
                 cx,
@@ -1763,6 +2438,962 @@ impl ConfigForm {
                 "Identity secret",
                 Some(&guided_prefill_value(&config.params, read_keys)),
             ),
+            vless_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            vless_flow: Self::panel_select(
+                window,
+                cx,
+                flow_choices(),
+                &guided_prefill_value(params, &["flow"]),
+            ),
+            vless_packet_encoding: Self::panel_select(
+                window,
+                cx,
+                packet_encoding_choices(),
+                &guided_prefill_value(params, &["packet_encoding", "packetEncoding"]),
+            ),
+            s1_network: Self::panel_select(window, cx, network_choices(), &network),
+            s1_path: Self::field(
+                window,
+                cx,
+                "Path",
+                Some(&guided_prefill_value(params, &["path"])),
+            ),
+            s1_host: Self::field(
+                window,
+                cx,
+                "Host",
+                Some(&guided_prefill_value(params, &["host"])),
+            ),
+            s1_method: Self::field(
+                window,
+                cx,
+                "Method",
+                Some(&guided_prefill_value(params, &["method"])),
+            ),
+            s1_service_name: Self::field(
+                window,
+                cx,
+                "Service name",
+                Some(&guided_prefill_value(
+                    params,
+                    &["service_name", "serviceName"],
+                )),
+            ),
+            s1_open: Rc::new(RefCell::new(false)),
+            s2_enable: Rc::new(RefCell::new(tls_on)),
+            s2_sni: Self::field(
+                window,
+                cx,
+                "SNI",
+                Some(&guided_prefill_value(params, &["sni", "peer"])),
+            ),
+            s2_alpn: Self::field(
+                window,
+                cx,
+                "ALPN (comma list)",
+                Some(&guided_prefill_value(params, &["alpn"])),
+            ),
+            s2_fp: Self::panel_select(
+                window,
+                cx,
+                fp_choices(),
+                &guided_prefill_value(params, &["fp", "fingerprint"]),
+            ),
+            s2_insecure: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &[
+                    "insecure",
+                    "allowInsecure",
+                    "allow_insecure",
+                    "allowinsecure",
+                ],
+            ))),
+            s2_pbk: Self::field(
+                window,
+                cx,
+                "Reality public key",
+                Some(&guided_prefill_value(params, &["pbk"])),
+            ),
+            s2_sid: Self::field(
+                window,
+                cx,
+                "Reality short id",
+                Some(&guided_prefill_value(params, &["sid"])),
+            ),
+            s2_open: Rc::new(RefCell::new(false)),
+            s3_mode: Rc::new(RefCell::new(guided_prefill_value(params, &["mux"]))),
+            s3_brutal: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["brutal_enable"],
+            ))),
+            s3_up: Self::field(
+                window,
+                cx,
+                "Brutal up Mbps",
+                Some(&guided_prefill_value(
+                    params,
+                    &["brutal_up_mbps", "brutal_up"],
+                )),
+            ),
+            s3_down: Self::field(
+                window,
+                cx,
+                "Brutal down Mbps",
+                Some(&guided_prefill_value(
+                    params,
+                    &["brutal_down_mbps", "brutal_down"],
+                )),
+            ),
+            s3_open: Rc::new(RefCell::new(false)),
+            s4_reuse: Rc::new(RefCell::new(guided_prefill_bool(params, &["reuse_addr"]))),
+            s4_fastopen: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["tcp_fast_open"],
+            ))),
+            s4_fragment: Rc::new(RefCell::new(guided_prefill_bool(params, &["udp_fragment"]))),
+            s4_multipath: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["tcp_multi_path"],
+            ))),
+            s4_timeout: Self::field(
+                window,
+                cx,
+                "Connect timeout (e.g. 5s)",
+                Some(&guided_prefill_value(params, &["connect_timeout"])),
+            ),
+            s4_bind: Self::field(
+                window,
+                cx,
+                "Bind interface",
+                Some(&guided_prefill_value(params, &["bind_interface"])),
+            ),
+            s4_inet4: Self::field(
+                window,
+                cx,
+                "IPv4 bind address",
+                Some(&guided_prefill_value(params, &["inet4_bind_address"])),
+            ),
+            s4_inet6: Self::field(
+                window,
+                cx,
+                "IPv6 bind address",
+                Some(&guided_prefill_value(params, &["inet6_bind_address"])),
+            ),
+            s4_open: Rc::new(RefCell::new(false)),
+            vless_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T03: inner pages echo the row's params
+            // JSON (untouched values fold back byte-identical — no spurious
+            // patch). The vmess cipher reads grammar-aware (legacy `security`
+            // vs new-style `encryption`); the ss method/plugin blanks stand
+            // for "no selection" (never fabricated, never stripped).
+            vmess_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            vmess_aid: Self::field(
+                window,
+                cx,
+                "Alter ID (aid)",
+                Some(&guided_prefill_value(params, &["alter_id", "aid"])),
+            ),
+            vmess_security: Self::panel_select(
+                window,
+                cx,
+                vmess_security_choices(),
+                &vmess_cipher_value(params),
+            ),
+            vmess_packet_encoding: Self::panel_select(
+                window,
+                cx,
+                packet_encoding_choices(),
+                &guided_prefill_value(params, &["packet_encoding", "packetEncoding"]),
+            ),
+            vmess_open: Rc::new(RefCell::new(false)),
+            trojan_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            trojan_open: Rc::new(RefCell::new(false)),
+            ss_method: Self::panel_select(
+                window,
+                cx,
+                ss_method_choices(),
+                &guided_prefill_value(params, &["method"]),
+            ),
+            ss_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            ss_plugin: Self::panel_select(
+                window,
+                cx,
+                ss_plugin_choices(),
+                &guided_prefill_value(params, &["plugin"]),
+            ),
+            ss_plugin_opts: Self::field(
+                window,
+                cx,
+                "Plugin options",
+                Some(&guided_prefill_value(
+                    params,
+                    &["plugin_opts", "plugin-opts", "pluginOpts"],
+                )),
+            ),
+            ss_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_tcp", "uot"],
+            ))),
+            ss_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T04: WG/AWG inner pages echo the row's
+            // params JSON (untouched values fold back byte-identical — no
+            // spurious patch). The version picker reads `awg_version` else
+            // the legacy `version`; anything outside 2.0|3.x echoes as no
+            // selection and round-trips byte-identical (the engine accepts
+            // `2`/`3`/`3.0`/`3.1` too).
+            wg_private: Self::secret_field(
+                window,
+                cx,
+                "Private key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key", "privatekey"],
+                )),
+            ),
+            wg_public: Self::field(
+                window,
+                cx,
+                "Peer public key",
+                Some(&guided_prefill_value(params, &["public_key", "publickey"])),
+            ),
+            wg_preshared: Self::secret_field(
+                window,
+                cx,
+                "Preshared key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["pre_shared_key", "presharedkey", "preshared_key"],
+                )),
+            ),
+            wg_reserved: Self::field(
+                window,
+                cx,
+                "Reserved (comma ints)",
+                Some(&guided_prefill_value(params, &["reserved"])),
+            ),
+            wg_keepalive: Self::field(
+                window,
+                cx,
+                "Keepalive (seconds)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["persistent_keepalive", "persistent_keepalive_interval"],
+                )),
+            ),
+            wg_local_addr: Self::field(
+                window,
+                cx,
+                "Local address (comma CIDRs)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["address", "local_address", "local_addr"],
+                )),
+            ),
+            wg_dns: Self::field(
+                window,
+                cx,
+                "DNS",
+                Some(&guided_prefill_value(params, &["dns"])),
+            ),
+            wg_mtu: Self::field(
+                window,
+                cx,
+                "MTU",
+                Some(&guided_prefill_value(params, &["mtu"])),
+            ),
+            wg_workers: Self::field(
+                window,
+                cx,
+                "Workers",
+                Some(&guided_prefill_value(params, &["workers"])),
+            ),
+            wg_sys_ifc: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["system", "sys_ifc"],
+            ))),
+            wg_open: Rc::new(RefCell::new(false)),
+            awg_private: Self::secret_field(
+                window,
+                cx,
+                "Private key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key", "privatekey"],
+                )),
+            ),
+            awg_public: Self::field(
+                window,
+                cx,
+                "Peer public key",
+                Some(&guided_prefill_value(params, &["public_key", "publickey"])),
+            ),
+            awg_preshared: Self::secret_field(
+                window,
+                cx,
+                "Preshared key",
+                Some(&guided_prefill_value(
+                    params,
+                    &["pre_shared_key", "presharedkey", "preshared_key"],
+                )),
+            ),
+            awg_reserved: Self::field(
+                window,
+                cx,
+                "Reserved (comma ints)",
+                Some(&guided_prefill_value(params, &["reserved"])),
+            ),
+            awg_keepalive: Self::field(
+                window,
+                cx,
+                "Keepalive (seconds)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["persistent_keepalive", "persistent_keepalive_interval"],
+                )),
+            ),
+            awg_local_addr: Self::field(
+                window,
+                cx,
+                "Local address (comma CIDRs)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["address", "local_address", "local_addr"],
+                )),
+            ),
+            awg_dns: Self::field(
+                window,
+                cx,
+                "DNS",
+                Some(&guided_prefill_value(params, &["dns"])),
+            ),
+            awg_mtu: Self::field(
+                window,
+                cx,
+                "MTU",
+                Some(&guided_prefill_value(params, &["mtu"])),
+            ),
+            awg_workers: Self::field(
+                window,
+                cx,
+                "Workers",
+                Some(&guided_prefill_value(params, &["workers"])),
+            ),
+            awg_sys_ifc: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["system", "sys_ifc"],
+            ))),
+            awg_version: Self::panel_select(
+                window,
+                cx,
+                awg_version_choices(),
+                &guided_prefill_value(params, &["awg_version", "version"]),
+            ),
+            awg_enable: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["enable_amnezia"],
+            ))),
+            awg_jc: Self::field(
+                window,
+                cx,
+                "Jc",
+                Some(&guided_prefill_value(params, &["jc"])),
+            ),
+            awg_jmin: Self::field(
+                window,
+                cx,
+                "Jmin",
+                Some(&guided_prefill_value(params, &["jmin"])),
+            ),
+            awg_jmax: Self::field(
+                window,
+                cx,
+                "Jmax",
+                Some(&guided_prefill_value(params, &["jmax"])),
+            ),
+            awg_s1: Self::field(
+                window,
+                cx,
+                "S1",
+                Some(&guided_prefill_value(params, &["s1"])),
+            ),
+            awg_s2: Self::field(
+                window,
+                cx,
+                "S2",
+                Some(&guided_prefill_value(params, &["s2"])),
+            ),
+            awg_s3: Self::field(
+                window,
+                cx,
+                "S3",
+                Some(&guided_prefill_value(params, &["s3"])),
+            ),
+            awg_s4: Self::field(
+                window,
+                cx,
+                "S4",
+                Some(&guided_prefill_value(params, &["s4"])),
+            ),
+            awg_h1: Self::field(
+                window,
+                cx,
+                "H1",
+                Some(&guided_prefill_value(params, &["h1"])),
+            ),
+            awg_h2: Self::field(
+                window,
+                cx,
+                "H2",
+                Some(&guided_prefill_value(params, &["h2"])),
+            ),
+            awg_h3: Self::field(
+                window,
+                cx,
+                "H3",
+                Some(&guided_prefill_value(params, &["h3"])),
+            ),
+            awg_h4: Self::field(
+                window,
+                cx,
+                "H4",
+                Some(&guided_prefill_value(params, &["h4"])),
+            ),
+            awg_i1: Self::field(
+                window,
+                cx,
+                "I1",
+                Some(&guided_prefill_value(params, &["i1"])),
+            ),
+            awg_i2: Self::field(
+                window,
+                cx,
+                "I2",
+                Some(&guided_prefill_value(params, &["i2"])),
+            ),
+            awg_i3: Self::field(
+                window,
+                cx,
+                "I3",
+                Some(&guided_prefill_value(params, &["i3"])),
+            ),
+            awg_i4: Self::field(
+                window,
+                cx,
+                "I4",
+                Some(&guided_prefill_value(params, &["i4"])),
+            ),
+            awg_i5: Self::field(
+                window,
+                cx,
+                "I5",
+                Some(&guided_prefill_value(params, &["i5"])),
+            ),
+            awg_hpk: Self::field(
+                window,
+                cx,
+                "Header protection key",
+                Some(&guided_prefill_value(params, &["headerprotectionkey"])),
+            ),
+            awg_pad: Self::field(
+                window,
+                cx,
+                "Content padding addition",
+                Some(&guided_prefill_value(params, &["contentpaddingaddition"])),
+            ),
+            awg_rekey_after: Self::field(
+                window,
+                cx,
+                "Rekey after time",
+                Some(&guided_prefill_value(params, &["rekeyaftertime"])),
+            ),
+            awg_rekey_timeout: Self::field(
+                window,
+                cx,
+                "Rekey timeout",
+                Some(&guided_prefill_value(params, &["rekeytimeout"])),
+            ),
+            awg_reject_after: Self::field(
+                window,
+                cx,
+                "Reject after time",
+                Some(&guided_prefill_value(params, &["rejectaftertime"])),
+            ),
+            awg_keepalive_timeout: Self::field(
+                window,
+                cx,
+                "Keepalive timeout",
+                Some(&guided_prefill_value(params, &["keepalivetimeout"])),
+            ),
+            awg_max_handshake: Self::field(
+                window,
+                cx,
+                "Max handshake attempts",
+                Some(&guided_prefill_value(params, &["maxhandshakeattempts"])),
+            ),
+            awg_trailers: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["randomtrailers", "random_trailers"],
+            ))),
+            awg_cookies: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["disablecookies", "disable_cookies"],
+            ))),
+            awg_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T05: Hysteria/TUIC pages echo the row's
+            // params JSON (untouched values fold back byte-identical — no
+            // spurious patch). Speeds read the engine `up`/`down` flats else
+            // the Throne `up_mbps` spellings; the v1 auth reads `auth` only
+            // (a `password` on a v1 row stays preserved for the v2 layout,
+            // never duplicated into `auth`).
+            hy_server_ports: Self::field(
+                window,
+                cx,
+                "Server ports (e.g. 9000-9010)",
+                Some(&guided_prefill_value(params, &["server_ports"])),
+            ),
+            hy_hop_interval: Self::field(
+                window,
+                cx,
+                "Hop interval (e.g. 30s)",
+                Some(&guided_prefill_value(params, &["hop_interval"])),
+            ),
+            hy_up: Self::field(
+                window,
+                cx,
+                "Up Mbps",
+                Some(&guided_prefill_value(params, &["up", "up_mbps", "upmbps"])),
+            ),
+            hy_down: Self::field(
+                window,
+                cx,
+                "Down Mbps",
+                Some(&guided_prefill_value(
+                    params,
+                    &["down", "down_mbps", "downmbps"],
+                )),
+            ),
+            hy_obfs: Self::field(
+                window,
+                cx,
+                "Obfs",
+                Some(&guided_prefill_value(params, &["obfs"])),
+            ),
+            hy_auth_type: Self::panel_select(
+                window,
+                cx,
+                hy_auth_type_choices(),
+                &guided_prefill_value(params, &["auth_type"]),
+            ),
+            hy_auth: Self::secret_field(
+                window,
+                cx,
+                "Auth secret",
+                Some(&guided_prefill_value(params, &["auth"])),
+            ),
+            hy_recv_conn: Self::field(
+                window,
+                cx,
+                "Recv window conn",
+                Some(&guided_prefill_value(params, &["recv_window_conn"])),
+            ),
+            hy_recv: Self::field(
+                window,
+                cx,
+                "Recv window",
+                Some(&guided_prefill_value(params, &["recv_window"])),
+            ),
+            hy_mtu: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["disable_mtu_discovery"],
+            ))),
+            hy_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            hy_open: Rc::new(RefCell::new(false)),
+            tuic_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            tuic_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            tuic_cc: Self::panel_select(
+                window,
+                cx,
+                tuic_cc_choices(),
+                &guided_prefill_value(params, &["congestion_control"]),
+            ),
+            tuic_relay: Self::panel_select(
+                window,
+                cx,
+                tuic_relay_choices(),
+                &guided_prefill_value(params, &["udp_relay_mode"]),
+            ),
+            tuic_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_stream"],
+            ))),
+            tuic_zero_rtt: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["zero_rtt_handshake", "zero_rtt"],
+            ))),
+            tuic_heartbeat: Self::field(
+                window,
+                cx,
+                "Heartbeat (e.g. 10s)",
+                Some(&guided_prefill_value(params, &["heartbeat"])),
+            ),
+            tuic_open: Rc::new(RefCell::new(false)),
+            // Config-completeness T06: small-matrix pages echo the row's
+            // params JSON (untouched values fold back byte-identical — no
+            // spurious patch). The socks version/network, naive cc and ssh
+            // host-key lists read alias-aware like the T03–T05 pickers; the
+            // http block serves both `http` and `https` on one entity set.
+            socks_version: Self::panel_select(
+                window,
+                cx,
+                socks_version_choices(),
+                &guided_prefill_value(params, &["version"]),
+            ),
+            socks_username: Self::field(
+                window,
+                cx,
+                "Username",
+                Some(&guided_prefill_value(params, &["username"])),
+            ),
+            socks_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            socks_network: Self::panel_select(
+                window,
+                cx,
+                socks_network_choices(),
+                &guided_prefill_value(params, &["network"]),
+            ),
+            socks_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_tcp", "uot"],
+            ))),
+            socks_open: Rc::new(RefCell::new(false)),
+            http_username: Self::field(
+                window,
+                cx,
+                "Username",
+                Some(&guided_prefill_value(params, &["username"])),
+            ),
+            http_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            http_path: Self::field(
+                window,
+                cx,
+                "Path",
+                Some(&guided_prefill_value(params, &["path"])),
+            ),
+            http_headers: Self::field(
+                window,
+                cx,
+                "Headers",
+                Some(&guided_prefill_value(params, &["headers"])),
+            ),
+            http_open: Rc::new(RefCell::new(false)),
+            anytls_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            anytls_interval: Self::field(
+                window,
+                cx,
+                "Idle check interval (e.g. 30s)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["idle_session_check_interval", "interval"],
+                )),
+            ),
+            anytls_timeout: Self::field(
+                window,
+                cx,
+                "Idle timeout (e.g. 30s)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["idle_session_timeout", "timeout"],
+                )),
+            ),
+            anytls_min: Self::field(
+                window,
+                cx,
+                "Min idle sessions",
+                Some(&guided_prefill_value(params, &["min_idle_session", "min"])),
+            ),
+            anytls_open: Rc::new(RefCell::new(false)),
+            naive_username: Self::field(
+                window,
+                cx,
+                "Username",
+                Some(&guided_prefill_value(params, &["username"])),
+            ),
+            naive_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            naive_uot: Rc::new(RefCell::new(guided_prefill_bool(
+                params,
+                &["udp_over_tcp", "uot"],
+            ))),
+            naive_quic: Rc::new(RefCell::new(guided_prefill_bool(params, &["quic"]))),
+            naive_cc: Self::panel_select(
+                window,
+                cx,
+                naive_cc_choices(),
+                &guided_prefill_value(params, &["quic_congestion_control", "congestion_control"]),
+            ),
+            naive_open: Rc::new(RefCell::new(false)),
+            ssh_user: Self::field(
+                window,
+                cx,
+                "User",
+                Some(&guided_prefill_value(params, &["user", "username"])),
+            ),
+            ssh_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            ssh_private_key: Self::area(
+                window,
+                cx,
+                "Private key (paste or Browse…)",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key", "privatekey"],
+                )),
+            ),
+            ssh_key_path: Self::field(
+                window,
+                cx,
+                "Private key path",
+                Some(&guided_prefill_value(params, &["private_key_path"])),
+            ),
+            ssh_key_pass: Self::secret_field(
+                window,
+                cx,
+                "Private key passphrase",
+                Some(&guided_prefill_value(
+                    params,
+                    &["private_key_passphrase", "private_key_pass"],
+                )),
+            ),
+            ssh_host_key: Self::field(
+                window,
+                cx,
+                "Host key (comma list)",
+                Some(&guided_prefill_list(params, &["host_key"])),
+            ),
+            ssh_host_key_algs: Self::field(
+                window,
+                cx,
+                "Host key algorithms (comma list)",
+                Some(&guided_prefill_list(params, &["host_key_algorithms"])),
+            ),
+            ssh_client_version: Self::field(
+                window,
+                cx,
+                "Client version",
+                Some(&guided_prefill_value(params, &["client_version"])),
+            ),
+            ssh_open: Rc::new(RefCell::new(false)),
+            snell_psk: Self::secret_field(
+                window,
+                cx,
+                "PSK",
+                Some(&guided_prefill_value(params, &["psk"])),
+            ),
+            snell_version: Self::panel_select(
+                window,
+                cx,
+                snell_version_choices(),
+                &guided_prefill_value(params, &["version"]),
+            ),
+            snell_obfs_mode: Self::field(
+                window,
+                cx,
+                "Obfs mode",
+                Some(&guided_prefill_value(params, &["obfs_mode", "obfs"])),
+            ),
+            snell_obfs_host: Self::field(
+                window,
+                cx,
+                "Obfs host",
+                Some(&guided_prefill_value(params, &["obfs_host", "obfs-host"])),
+            ),
+            snell_userkey: Self::field(
+                window,
+                cx,
+                "User key",
+                Some(&guided_prefill_value(params, &["userkey"])),
+            ),
+            snell_reuse: Rc::new(RefCell::new(guided_prefill_bool(params, &["reuse"]))),
+            snell_network: Self::field(
+                window,
+                cx,
+                "Network",
+                Some(&guided_prefill_value(params, &["network"])),
+            ),
+            snell_mode: Self::field(
+                window,
+                cx,
+                "Mode",
+                Some(&guided_prefill_value(params, &["mode"])),
+            ),
+            snell_open: Rc::new(RefCell::new(false)),
+            shadowtls_version: Self::panel_select(
+                window,
+                cx,
+                shadowtls_version_choices(),
+                &guided_prefill_value(params, &["version"]),
+            ),
+            shadowtls_password: Self::secret_field(
+                window,
+                cx,
+                "Password",
+                Some(&guided_prefill_value(params, &["password"])),
+            ),
+            shadowtls_open: Rc::new(RefCell::new(false)),
+            xray_uuid: Self::secret_field(
+                window,
+                cx,
+                "UUID",
+                Some(&guided_prefill_value(params, &["uuid", "id"])),
+            ),
+            xray_enc: Self::field(
+                window,
+                cx,
+                "Encryption (default none)",
+                Some(&guided_prefill_value(params, &["encryption"])),
+            ),
+            xray_flow: Self::panel_select(
+                window,
+                cx,
+                xray_flow_choices(),
+                &guided_prefill_value(params, &["flow"]),
+            ),
+            xray_sni: Self::field(
+                window,
+                cx,
+                "SNI",
+                Some(&guided_prefill_value(params, &["sni"])),
+            ),
+            xray_fp: Self::panel_select(
+                window,
+                cx,
+                fp_choices(),
+                &guided_prefill_value(params, &["fp", "fingerprint"]),
+            ),
+            xray_alpn: Self::field(
+                window,
+                cx,
+                "ALPN (comma list)",
+                Some(&guided_prefill_value(params, &["alpn"])),
+            ),
+            xray_pbk: Self::field(
+                window,
+                cx,
+                "REALITY public key (pbk)",
+                Some(&guided_prefill_value(params, &["pbk"])),
+            ),
+            xray_sid: Self::field(
+                window,
+                cx,
+                "REALITY short id (sid)",
+                Some(&guided_prefill_value(params, &["sid"])),
+            ),
+            xray_spiderx: Self::field(
+                window,
+                cx,
+                "REALITY spiderX path",
+                Some(&guided_prefill_value(params, &["spiderx"])),
+            ),
+            xray_network: Self::panel_select(
+                window,
+                cx,
+                xray_network_choices(),
+                &guided_prefill_value(params, &["network"]),
+            ),
+            xray_mode: Self::field(
+                window,
+                cx,
+                "Mode",
+                Some(&guided_prefill_value(params, &["mode"])),
+            ),
+            xray_mux: Self::panel_select(
+                window,
+                cx,
+                xray_mux_choices(),
+                &guided_prefill_value(params, &["xray_mux"]),
+            ),
+            xray_open: Rc::new(RefCell::new(false)),
+            chain_hops: Rc::new(RefCell::new(chain_nodes_of(params))),
+            chain_pick: Self::panel_select(window, cx, chain_pick_choices(&[]), ""),
+            chain_library: Rc::new(RefCell::new(Vec::new())),
+            chain_open: Rc::new(RefCell::new(false)),
+            extra_exe: Self::field(
+                window,
+                cx,
+                "Executable (app dir file name)",
+                Some(&guided_prefill_value(params, &["exe", "binary"])),
+            ),
+            extra_args: Self::field(
+                window,
+                cx,
+                "Args",
+                Some(&guided_prefill_value(params, &["args"])),
+            ),
+            extra_config: Self::area(
+                window,
+                cx,
+                "Config JSON (passed as -c <file>)",
+                Some(&extra_config_prefill(params)),
+            ),
+            extra_open: Rc::new(RefCell::new(false)),
             advanced: Rc::new(RefCell::new(true)),
         }
     }
@@ -1806,6 +3437,2502 @@ impl ConfigForm {
         format!("Auto ports: {used} of {total} in use (10801–10999, spill 18081–18380)")
     }
 
+    /// Config-completeness T03: one masked-secret-plus-generate row (the
+    /// VLESS and VMess uuid fields) — `id_prefix` pins `<prefix>-uuid` /
+    /// `<prefix>-uuid-generate`. Same kit pieces as the T02 inline row
+    /// (`Input` + `mask_toggle`, `.small()` `Button` + tooltip, honest
+    /// toast naming the protocol-neutral outcome).
+    fn uuid_row(
+        &self,
+        view: &Entity<AppView>,
+        secret: &Entity<InputState>,
+        id_prefix: &str,
+    ) -> impl IntoElement {
+        let secret_entity = secret.clone();
+        let uuid_view = view.clone();
+        field().label("UUID".to_string()).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .id(format!("{id_prefix}-uuid"))
+                        .test_support()
+                        .child(Input::new(secret).mask_toggle()),
+                )
+                .child(
+                    Button::new(format!("{id_prefix}-uuid-generate"))
+                        .small()
+                        .label("Generate")
+                        .tooltip("Generate a random UUIDv4")
+                        .accessibility_label("Generate a random UUIDv4")
+                        .on_click(move |_, window, cx| {
+                            let generated = generate_uuid_v4();
+                            uuid_view.update(cx, |_, cx| {
+                                secret_entity.update(cx, |state, cx| {
+                                    state.set_value(generated, &mut *window, cx);
+                                });
+                            });
+                            window
+                                .push_notification(Notification::info("Generated a new UUID"), cx);
+                        }),
+                ),
+        )
+    }
+
+    /// Config-completeness T03: one kit-maximal dropdown row — label-over
+    /// field with the hover copy on an outer wrapper (kit `Select` has no
+    /// tooltip slot — facet-bar precedent) and the T01 ENTER-guard on the
+    /// wrapper (kit `BaseSelect` propagates Confirm even with its popup
+    /// open; without the stop the picker's Enter pick would also commit a
+    /// half-filled row). Kit: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`.
+    fn panel_select_row(
+        label: &str,
+        tip_id: &'static str,
+        tip: &str,
+        select_id: &'static str,
+        a11y: &str,
+        state: &Entity<SelectState<PanelChoiceList>>,
+    ) -> Field {
+        let tip = tip.to_string();
+        field().label(label.to_string()).child(
+            div()
+                .id(tip_id)
+                .test_support()
+                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    Select::new(state)
+                        .id(select_id)
+                        .small()
+                        .accessibility_label(a11y),
+                ),
+        )
+    }
+
+    /// Config-completeness T03: one outer collapsed disclosure per guided
+    /// page (a single header row at the 880x620 minimum — t11 pins the core
+    /// form in-frame; the full page is one click away). Closed content
+    /// unmounts, entities persist (R5). Kit: `Collapsible` (controlled
+    /// `open`) + `Button` toggle + `Label` caption.
+    fn page_disclosure(
+        caption: &str,
+        caption_id: &'static str,
+        toggle_id: &'static str,
+        section_id: &'static str,
+        open: &Rc<RefCell<bool>>,
+        view: &Entity<AppView>,
+        block: impl IntoElement,
+    ) -> impl IntoElement {
+        Collapsible::new()
+            .open(*open.borrow())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .id(caption_id)
+                            .test_support()
+                            .child(Label::new(caption.to_string())),
+                    )
+                    .child(panel_toggle_button(
+                        toggle_id,
+                        if *open.borrow() { "Hide" } else { "Show" },
+                        view,
+                        open,
+                    )),
+            )
+            .content(div().id(section_id).test_support().child(block))
+    }
+
+    /// Config-completeness T03: shared Transport panel (S1) — the exact T02
+    /// section (network picker plus per-network conditionals; `headers` /
+    /// early-data have no inputs by decision — hand JSON carrying them fails
+    /// typed at generate, never silently), shared by the
+    /// vless/vmess/trojan pages (one rule, three pages).
+    fn s1_section(&self, view: &Entity<AppView>, cx: &App) -> impl IntoElement {
+        // S1: Transport — network picker plus per-network conditionals
+        // (only keys `apply_transport` maps; `headers`/early-data have no
+        // inputs, and hand JSON carrying them fails typed at generate).
+        let network = Self::panel_value(&self.s1_network, cx, "tcp");
+        let network_select = self.s1_network.clone();
+        let mut s1_body = div().flex().flex_col().gap_1().child(
+            field().label("Network".to_string()).child(
+                div()
+                    .id("s1-network-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("Stream transport network".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&network_select)
+                            .id("s1-network")
+                            .small()
+                            .accessibility_label("Stream transport network"),
+                    ),
+            ),
+        );
+        let conditional = |id: &'static str, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        match network.as_str() {
+            "ws" => {
+                s1_body = s1_body
+                    .child(conditional("s1-path", "Path", &self.s1_path))
+                    .child(conditional("s1-host", "Host", &self.s1_host));
+            }
+            "httpupgrade" | "http" => {
+                s1_body = s1_body
+                    .child(conditional("s1-host", "Host", &self.s1_host))
+                    .child(conditional("s1-path", "Path", &self.s1_path));
+                if network == "http" {
+                    s1_body = s1_body.child(conditional("s1-method", "Method", &self.s1_method));
+                }
+            }
+            "grpc" => {
+                s1_body = s1_body.child(conditional(
+                    "s1-service-name",
+                    "Service name",
+                    &self.s1_service_name,
+                ));
+            }
+            _ => {}
+        }
+        field().label_indent(false).child(
+            Collapsible::new()
+                .open(*self.s1_open.borrow())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("s1-caption")
+                                .test_support()
+                                .child(Label::new("Transport")),
+                        )
+                        .child(panel_toggle_button(
+                            "s1-toggle",
+                            if *self.s1_open.borrow() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                            view,
+                            &self.s1_open,
+                        )),
+                )
+                .content(div().id("s1-section").test_support().child(s1_body)),
+        )
+    }
+
+    /// Config-completeness T03: shared TLS panel, optional variant (S2) —
+    /// the exact T02 section (enable toggle plus credential inputs;
+    /// disabling folds `security` away while every other key stays
+    /// preserved), shared by the vless/vmess/trojan pages.
+    /// Config-completeness T05: `forced` renders the MustTLS variant (same
+    /// credential inputs over the shared entities, no enable toggle — the
+    /// forced fold locks `security` to tls/reality instead); the caption
+    /// names the lock honestly.
+    fn s2_section(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+        forced: bool,
+    ) -> impl IntoElement {
+        // S2: TLS, optional variant — enable toggle plus credential inputs.
+        // Disabling folds `security` away; every other key stays preserved.
+        // Forced variant: no toggle (the fold locks security instead).
+        let _ = cx;
+        let s2_insecure = self.s2_insecure.clone();
+        let s2_repaint_insecure = repaint.clone();
+        let fp_select = self.s2_fp.clone();
+        let mut s2_body = div().flex().flex_col().gap_1();
+        if forced {
+            s2_body = s2_body.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("s2-forced-note")
+                        .test_support()
+                        .child("TLS is always on for this protocol (security locked tls)."),
+                ),
+            );
+        } else {
+            let s2_enable = self.s2_enable.clone();
+            let s2_repaint = repaint.clone();
+            s2_body = s2_body.child(
+            field().label_indent(false).child(
+                div().id("s2-enable").test_support().child(
+                    Switch::new("s2-enable-switch")
+                        .small()
+                        .checked(*self.s2_enable.borrow())
+                        .label("Enable TLS")
+                        .tooltip(
+                            "Wrap the stream in TLS (security=tls, or reality with a public key)",
+                        )
+                        .accessibility_label("Enable TLS for this row")
+                        .on_change(move |next: &bool, window, cx| {
+                            *s2_enable.borrow_mut() = *next;
+                            s2_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        }
+        s2_body = s2_body
+            .child(
+                field().label("SNI".to_string()).child(
+                    div()
+                        .id("s2-sni")
+                        .test_support()
+                        .child(Input::new(&self.s2_sni)),
+                ),
+            )
+            .child(
+                field().label("ALPN (comma list)".to_string()).child(
+                    div()
+                        .id("s2-alpn")
+                        .test_support()
+                        .child(Input::new(&self.s2_alpn)),
+                ),
+            )
+            .child(
+                field().label("Fingerprint".to_string()).child(
+                    div()
+                        .id("s2-fp-tip")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| Tooltip::new("uTLS fingerprint".to_string()))
+                                .into()
+                        })
+                        .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            Select::new(&fp_select)
+                                .id("s2-fp")
+                                .small()
+                                .accessibility_label("uTLS fingerprint"),
+                        ),
+                ),
+            )
+            .child(
+                field().label_indent(false).child(
+                    div().id("s2-insecure").test_support().child(
+                        Switch::new("s2-insecure-switch")
+                            .small()
+                            .checked(*self.s2_insecure.borrow())
+                            .label("Allow insecure")
+                            .tooltip("Skip certificate verification (testing only)")
+                            .accessibility_label("Skip TLS certificate verification")
+                            .on_change(move |next: &bool, window, cx| {
+                                *s2_insecure.borrow_mut() = *next;
+                                s2_repaint_insecure(window, cx);
+                            }),
+                    ),
+                ),
+            )
+            .child(
+                field().label("Reality public key".to_string()).child(
+                    div()
+                        .id("s2-pbk")
+                        .test_support()
+                        .child(Input::new(&self.s2_pbk)),
+                ),
+            )
+            .child(
+                field().label("Reality short id".to_string()).child(
+                    div()
+                        .id("s2-sid")
+                        .test_support()
+                        .child(Input::new(&self.s2_sid)),
+                ),
+            );
+        field().label_indent(false).child(
+            Collapsible::new()
+                .open(*self.s2_open.borrow())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("s2-caption")
+                                .test_support()
+                                .child(Label::new(
+                                    if forced { "TLS (always on)" } else { "TLS" }.to_string(),
+                                )),
+                        )
+                        .child(panel_toggle_button(
+                            "s2-toggle",
+                            if *self.s2_open.borrow() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                            view,
+                            &self.s2_open,
+                        )),
+                )
+                .content(div().id("s2-section").test_support().child(s2_body)),
+        )
+    }
+
+    /// Config-completeness T03: shared Mux+Brutal panel (S3) — the exact
+    /// T02 section (`flow=vision` unmounts the section with reason text,
+    /// stored keys preserved, fold skipped; brutal forces On). `vision`
+    /// comes from the page's flow picker (true only on VLESS with
+    /// `xtls-rprx-vision`); every other page passes false. Kit:
+    /// `RadioGroup` (`selected_index` + `on_change`) + `Switch` + `Input`.
+    fn s3_section(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+        vision: bool,
+    ) -> AnyElement {
+        // S3: Mux+Brutal — `flow=vision` unmounts the section with reason
+        // text (stored keys preserved, fold skipped); brutal forces On.
+        let _ = cx;
+        if vision {
+            return field().label_indent(false).child(
+                div()
+                    .id("s3-vision-note")
+                    .test_support()
+                    .child("Mux is unavailable with the xtls-rprx-vision flow — stored mux keys are preserved."),
+            ).into_any_element();
+        }
+        let effective = self.s3_effective_mode();
+        let selected = ["", "on", "off"].iter().position(|mode| *mode == effective);
+        let mode_labels = ["Keep Default", "On", "Off"];
+        let mode_cell = self.s3_mode.clone();
+        let mode_repaint = repaint.clone();
+        let mut group = RadioGroup::horizontal("s3-mux-options")
+            .selected_index(selected)
+            .on_change(move |ix, window, cx| {
+                if let Some(mode) = ["", "on", "off"].get(*ix) {
+                    *mode_cell.borrow_mut() = mode.to_string();
+                }
+                mode_repaint(window, cx);
+            });
+        for label in mode_labels {
+            group = group.child(
+                Radio::new(label)
+                    .small()
+                    .label(label)
+                    .tooltip(format!("Mux mode {label}")),
+            );
+        }
+        let mut s3_body = div().flex().flex_col().gap_1().child(
+            field().label("Multiplex mode".to_string()).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("s3-mux-caption")
+                            .test_support()
+                            .child(Label::new("Multiplex mode")),
+                    )
+                    .child(div().id("s3-mux-group").test_support().child(group)),
+            ),
+        );
+        if *self.s3_brutal.borrow() && effective == "on" && self.s3_mode.borrow().as_str() != "on" {
+            s3_body = s3_body.child(
+                div()
+                    .id("s3-brutal-note")
+                    .test_support()
+                    .child("Brutal requires mux (forced On)."),
+            );
+        }
+        let brutal_cell = self.s3_brutal.clone();
+        let brutal_repaint = repaint.clone();
+        s3_body = s3_body
+            .child(
+                field().label_indent(false).child(
+                    div().id("s3-brutal").test_support().child(
+                        Switch::new("s3-brutal-switch")
+                            .small()
+                            .checked(*self.s3_brutal.borrow())
+                            .label("Brutal (forces mux On)")
+                            .tooltip("Brutal congestion speeds (Mbps); enabling forces mux On")
+                            .accessibility_label("Enable Brutal speeds (forces mux On)")
+                            .on_change(move |next: &bool, window, cx| {
+                                *brutal_cell.borrow_mut() = *next;
+                                brutal_repaint(window, cx);
+                            }),
+                    ),
+                ),
+            )
+            .child(
+                field().label("Brutal up Mbps".to_string()).child(
+                    div()
+                        .id("s3-up")
+                        .test_support()
+                        .child(Input::new(&self.s3_up)),
+                ),
+            )
+            .child(
+                field().label("Brutal down Mbps".to_string()).child(
+                    div()
+                        .id("s3-down")
+                        .test_support()
+                        .child(Input::new(&self.s3_down)),
+                ),
+            );
+        field()
+            .label_indent(false)
+            .child(
+                Collapsible::new()
+                    .open(*self.s3_open.borrow())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("s3-caption")
+                                    .test_support()
+                                    .child(Label::new("Mux")),
+                            )
+                            .child(panel_toggle_button(
+                                "s3-toggle",
+                                if *self.s3_open.borrow() {
+                                    "Hide"
+                                } else {
+                                    "Show"
+                                },
+                                view,
+                                &self.s3_open,
+                            )),
+                    )
+                    .content(div().id("s3-section").test_support().child(s3_body)),
+            )
+            .into_any_element()
+    }
+
+    /// Config-completeness T03: shared Advanced dial panel (S4, dial half)
+    /// — the exact T02 section (four toggles plus timeout/bind inputs; TLS
+    /// extras are a later ticket with their own engine `tls{}` mapping),
+    /// shared by all four pages. Kit: `Switch` (`checked` + `on_change`
+    /// over shared cells) + `Input`.
+    fn s4_section(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        // S4: Advanced dial — toggles plus timeout/bind inputs (TLS extras
+        // are a later ticket with their own engine `tls{}` mapping).
+        let _ = cx;
+        let dial_switch = |id: &'static str,
+                           switch_id: &'static str,
+                           label: &str,
+                           tip: &str,
+                           cell: &Rc<RefCell<bool>>| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let tip = tip.to_string();
+            let label = label.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let mut s4_body = div().flex().flex_col().gap_1();
+        s4_body = s4_body
+            .child(dial_switch(
+                "s4-reuse",
+                "s4-reuse-switch",
+                "Reuse address",
+                "SO_REUSEADDR on the upstream socket",
+                &self.s4_reuse,
+            ))
+            .child(dial_switch(
+                "s4-fastopen",
+                "s4-fastopen-switch",
+                "TCP fast open",
+                "TCP Fast Open on the upstream socket",
+                &self.s4_fastopen,
+            ))
+            .child(dial_switch(
+                "s4-fragment",
+                "s4-fragment-switch",
+                "UDP fragment",
+                "Fragment upstream UDP packets",
+                &self.s4_fragment,
+            ))
+            .child(dial_switch(
+                "s4-multipath",
+                "s4-multipath-switch",
+                "TCP multipath",
+                "Multipath TCP on the upstream socket",
+                &self.s4_multipath,
+            ))
+            .child(
+                field().label("Connect timeout".to_string()).child(
+                    div()
+                        .id("s4-timeout")
+                        .test_support()
+                        .child(Input::new(&self.s4_timeout)),
+                ),
+            )
+            .child(
+                field().label("Bind interface".to_string()).child(
+                    div()
+                        .id("s4-bind")
+                        .test_support()
+                        .child(Input::new(&self.s4_bind)),
+                ),
+            )
+            .child(
+                field().label("IPv4 bind address".to_string()).child(
+                    div()
+                        .id("s4-inet4")
+                        .test_support()
+                        .child(Input::new(&self.s4_inet4)),
+                ),
+            )
+            .child(
+                field().label("IPv6 bind address".to_string()).child(
+                    div()
+                        .id("s4-inet6")
+                        .test_support()
+                        .child(Input::new(&self.s4_inet6)),
+                ),
+            );
+        field().label_indent(false).child(
+            Collapsible::new()
+                .open(*self.s4_open.borrow())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("s4-caption")
+                                .test_support()
+                                .child(Label::new("Advanced dial")),
+                        )
+                        .child(panel_toggle_button(
+                            "s4-toggle",
+                            if *self.s4_open.borrow() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                            view,
+                            &self.s4_open,
+                        )),
+                )
+                .content(div().id("s4-section").test_support().child(s4_body)),
+        )
+    }
+
+    /// Config-completeness T03: VMess guided page — uuid (+uuidgen button),
+    /// aid, cipher and packet_encoding inner plus the shared S1–S4 panels
+    /// (same section fns as VLESS — one rule, four pages). Rendered only
+    /// while the live protocol is `vmess`; every other protocol keeps its
+    /// form. The whole page rides ONE outer collapsed disclosure (a single
+    /// header row at the 880x620 minimum — t11 pins the core form in-frame).
+    /// Kit constructors/builders: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, masked `Input` +
+    /// `mask_toggle`, `.small()` `Button` generator, `Field` + `v_form`
+    /// layout, outer-wrapper `Tooltip`s, `Label` captions.
+    fn vmess_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.uuid_row(view, &self.vmess_uuid, "vmess"));
+        block = block.child(
+            field().label("Alter ID".to_string()).child(
+                div()
+                    .id("vmess-aid")
+                    .test_support()
+                    .child(Input::new(&self.vmess_aid)),
+            ),
+        );
+        block = block.child(Self::panel_select_row(
+            "Security",
+            "vmess-security-tip",
+            "VMess packet cipher (legacy links keep it in security)",
+            "vmess-security",
+            "VMess security (packet cipher)",
+            &self.vmess_security,
+        ));
+        block = block.child(Self::panel_select_row(
+            "Packet encoding",
+            "vmess-packet-encoding-tip",
+            "VMess packet encoding",
+            "vmess-packet-encoding",
+            "VMess packet encoding",
+            &self.vmess_packet_encoding,
+        ));
+        block = block.child(self.s1_section(view, cx));
+        block = block.child(self.s2_section(view, repaint, cx, false));
+        block = block.child(self.s3_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        Self::page_disclosure(
+            "VMess settings",
+            "vmess-section-caption",
+            "vmess-section-toggle",
+            "vmess-section",
+            &self.vmess_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T03: Trojan guided page — masked password inner
+    /// plus the full shared S1+S2+S3+S4 panels (same section fns as VLESS).
+    /// Rendered only while the live protocol is `trojan`. Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::vmess_block`].
+    fn trojan_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("trojan-password")
+                    .test_support()
+                    .child(Input::new(&self.trojan_password).mask_toggle()),
+            ),
+        );
+        block = block.child(self.s1_section(view, cx));
+        block = block.child(self.s2_section(view, repaint, cx, false));
+        block = block.child(self.s3_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        Self::page_disclosure(
+            "Trojan settings",
+            "trojan-section-caption",
+            "trojan-section-toggle",
+            "trojan-section",
+            &self.trojan_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T03: Shadowsocks guided page — method, password,
+    /// plugin, plugin_opts and uot inner with Mux-only Settings (no
+    /// Transport/Security panels — Throne HasMux parity) plus the shared
+    /// S4 dial panel (dial fields only — no TLS section, HasTLS gating).
+    /// Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::vmess_block`]. The plugin footer is honest: any
+    /// non-empty plugin fails generate naming the field until its
+    /// executable sits beside the engine.
+    fn shadowsocks_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(Self::panel_select_row(
+            "Method",
+            "ss-method-tip",
+            "Shadowsocks cipher (all 18)",
+            "ss-method",
+            "Shadowsocks method",
+            &self.ss_method,
+        ));
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("ss-password")
+                    .test_support()
+                    .child(Input::new(&self.ss_password).mask_toggle()),
+            ),
+        );
+        block = block.child(Self::panel_select_row(
+            "Plugin",
+            "ss-plugin-tip",
+            "Plugin executable (none runs stock)",
+            "ss-plugin",
+            "Shadowsocks plugin",
+            &self.ss_plugin,
+        ));
+        block = block.child(
+            field().label("Plugin options".to_string()).child(
+                div()
+                    .id("ss-plugin-opts")
+                    .test_support()
+                    .child(Input::new(&self.ss_plugin_opts)),
+            ),
+        );
+        let uot_cell = self.ss_uot.clone();
+        let uot_repaint = repaint.clone();
+        block = block.child(
+            field().label_indent(false).child(
+                div().id("ss-uot").test_support().child(
+                    Switch::new("ss-uot-switch")
+                        .small()
+                        .checked(*self.ss_uot.borrow())
+                        .label("UDP over TCP (uot)")
+                        .tooltip("UDP over TCP for shadowsocks (folds the uot flat)")
+                        .accessibility_label("UDP over TCP for shadowsocks")
+                        .on_change(move |next: &bool, window, cx| {
+                            *uot_cell.borrow_mut() = *next;
+                            uot_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        if !Self::panel_value(&self.ss_plugin, cx, "").trim().is_empty() {
+            block = block.child(field().label_indent(false).child(
+                div().id("ss-plugin-note").test_support().child(
+                    "Plugin rows need the plugin executable beside the engine — stock check fails without it.",
+                ),
+            ));
+        }
+        block = block.child(self.s3_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        Self::page_disclosure(
+            "Shadowsocks settings",
+            "ss-section-caption",
+            "ss-section-toggle",
+            "ss-section",
+            &self.ss_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T04: the nine shared WireGuard peer/net rows
+    /// (private key + keygen, peer public/preshared keys, reserved,
+    /// keepalive, local address, DNS, MTU, workers, sys_ifc) — one helper
+    /// behind the WG and AWG pages (separate entities per page, one render
+    /// rule). Kit constructors/builders: masked `Input` + `mask_toggle`,
+    /// `.small()` `Button` generator (uuid-row precedent), `Switch`
+    /// (`checked` + `on_change` over the shared cell), `Field` layout.
+    fn wg_peer_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        peer: WgPeerRefs<'_>,
+    ) -> impl IntoElement {
+        let prefix = peer.prefix;
+        let secret_entity = peer.private_key.clone();
+        let keygen_view = view.clone();
+        let sys_cell = peer.sys_ifc.clone();
+        let sys_repaint = repaint.clone();
+        let row = |id: String, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        let masked_row = |id: String, label: &str, state: &Entity<InputState>| {
+            field().label(label.to_string()).child(
+                div()
+                    .id(id)
+                    .test_support()
+                    .child(Input::new(state).mask_toggle()),
+            )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                field().label("Private key".to_string()).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id(format!("{prefix}-private-key"))
+                                .test_support()
+                                .child(Input::new(peer.private_key).mask_toggle()),
+                        )
+                        .child(
+                            Button::new(format!("{prefix}-private-key-generate"))
+                                .small()
+                                .label("Generate")
+                                .tooltip(
+                                    "Generate a fresh WireGuard private key (local only — no WARP registration)",
+                                )
+                                .accessibility_label("Generate a fresh WireGuard private key")
+                                .on_click(move |_, window, cx| {
+                                    let generated = generate_wireguard_key();
+                                    keygen_view.update(cx, |_, cx| {
+                                        secret_entity.update(cx, |state, cx| {
+                                            state.set_value(generated, &mut *window, cx);
+                                        });
+                                    });
+                                    window.push_notification(
+                                        Notification::info("Generated a new WireGuard private key"),
+                                        cx,
+                                    );
+                                }),
+                        ),
+                ),
+            )
+            .child(row(
+                format!("{prefix}-public-key"),
+                "Public key (peer)",
+                peer.public_key,
+            ))
+            .child(masked_row(
+                format!("{prefix}-preshared-key"),
+                "Preshared key",
+                peer.pre_shared_key,
+            ))
+            .child(row(
+                format!("{prefix}-reserved"),
+                "Reserved (comma ints)",
+                peer.reserved,
+            ))
+            .child(row(
+                format!("{prefix}-keepalive"),
+                "Keepalive (seconds)",
+                peer.keepalive,
+            ))
+            .child(row(
+                format!("{prefix}-local-addr"),
+                "Local address (comma CIDRs)",
+                peer.local_addr,
+            ))
+            .child(row(format!("{prefix}-dns"), "DNS", peer.dns))
+            .child(row(format!("{prefix}-mtu"), "MTU", peer.mtu))
+            .child(row(
+                format!("{prefix}-workers"),
+                "Workers",
+                peer.workers,
+            ))
+            .child(
+                field().label_indent(false).child(
+                    div()
+                        .id(format!("{prefix}-sys-ifc"))
+                        .test_support()
+                        .child(
+                            Switch::new(format!("{prefix}-sys-ifc-switch"))
+                                .small()
+                                .checked(*peer.sys_ifc.borrow())
+                                .label("System interface (sys_ifc)")
+                                .tooltip("Use the system WireGuard interface (stores as system)")
+                                .accessibility_label("Use the system WireGuard interface")
+                                .on_change(move |next: &bool, window, cx| {
+                                    *sys_cell.borrow_mut() = *next;
+                                    sys_repaint(window, cx);
+                                }),
+                        ),
+                ),
+            )
+    }
+
+    /// Config-completeness T04: WireGuard guided page — the shared peer/net
+    /// rows plus the shared S4 dial panel (no Transport/TLS/Mux — endpoint
+    /// parity). Rendered only while the live protocol is `wireguard`. Same
+    /// outer-disclosure contract as [`ConfigForm::vmess_block`].
+    fn wireguard_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.wg_peer_block(
+            view,
+            repaint,
+            WgPeerRefs {
+                prefix: "wg",
+                private_key: &self.wg_private,
+                public_key: &self.wg_public,
+                pre_shared_key: &self.wg_preshared,
+                reserved: &self.wg_reserved,
+                keepalive: &self.wg_keepalive,
+                local_addr: &self.wg_local_addr,
+                dns: &self.wg_dns,
+                mtu: &self.wg_mtu,
+                workers: &self.wg_workers,
+                sys_ifc: &self.wg_sys_ifc,
+            },
+        ));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("wg-notes").test_support().child(
+                "WireGuard rows become endpoints[] at generate. Blank AllowedIPs defaults to \
+                 0.0.0.0/0; DNS is stored but never emitted; udp_timeout stays JSON-only.",
+            ),
+        ));
+        Self::page_disclosure(
+            "WireGuard settings",
+            "wg-section-caption",
+            "wg-section-toggle",
+            "wg-section",
+            &self.wg_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T04: AmneziaWG guided page (headline) — all WG
+    /// peer/net rows + enable marker + `awg_version` 2.0|3.x picker + the
+    /// full J/S/H/I matrix + v3 fields + trailers/cookies switches, plus
+    /// the shared S4 dial panel. The v3 section hides unless 3.x is picked
+    /// (entities persist, the fold always folds — R5 hide-preserve, never a
+    /// wipe). Rendered only while the live protocol is `amneziawg`. Same
+    /// kit set and outer-disclosure contract as
+    /// [`ConfigForm::wireguard_block`].
+    fn amneziawg_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let caption = |id: &'static str, text: &str| {
+            div()
+                .id(id)
+                .test_support()
+                .child(Label::new(text.to_string()))
+        };
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.wg_peer_block(
+            view,
+            repaint,
+            WgPeerRefs {
+                prefix: "awg",
+                private_key: &self.awg_private,
+                public_key: &self.awg_public,
+                pre_shared_key: &self.awg_preshared,
+                reserved: &self.awg_reserved,
+                keepalive: &self.awg_keepalive,
+                local_addr: &self.awg_local_addr,
+                dns: &self.awg_dns,
+                mtu: &self.awg_mtu,
+                workers: &self.awg_workers,
+                sys_ifc: &self.awg_sys_ifc,
+            },
+        ));
+        block = block.child(switch_row(
+            "awg-enable",
+            "awg-enable-switch".to_string(),
+            "Enable Amnezia",
+            "AmneziaWG obfuscation marker (UI state — stripped at generate, like brutal speeds)",
+            &self.awg_enable,
+            repaint,
+        ));
+        block = block.child(Self::panel_select_row(
+            "AWG version",
+            "awg-version-tip",
+            "AmneziaWG version (2.0 or 3.x — gates the v3 fields below)",
+            "awg-version",
+            "AmneziaWG version",
+            &self.awg_version,
+        ));
+        block = block.child(caption("awg-junk-caption", "Junk train"));
+        block = block
+            .child(row("awg-jc", "Jc", &self.awg_jc))
+            .child(row("awg-jmin", "Jmin", &self.awg_jmin))
+            .child(row("awg-jmax", "Jmax", &self.awg_jmax));
+        block = block.child(caption("awg-length-caption", "Length prefixes (S1–S4)"));
+        block = block
+            .child(row("awg-s1", "S1", &self.awg_s1))
+            .child(row("awg-s2", "S2", &self.awg_s2))
+            .child(row("awg-s3", "S3", &self.awg_s3))
+            .child(row("awg-s4", "S4", &self.awg_s4));
+        block = block.child(caption("awg-header-caption", "Header ranges (H1–H4)"));
+        block = block
+            .child(row("awg-h1", "H1", &self.awg_h1))
+            .child(row("awg-h2", "H2", &self.awg_h2))
+            .child(row("awg-h3", "H3", &self.awg_h3))
+            .child(row("awg-h4", "H4", &self.awg_h4));
+        block = block.child(caption("awg-chain-caption", "CPS chains (I1–I5)"));
+        block = block
+            .child(row("awg-i1", "I1", &self.awg_i1))
+            .child(row("awg-i2", "I2", &self.awg_i2))
+            .child(row("awg-i3", "I3", &self.awg_i3))
+            .child(row("awg-i4", "I4", &self.awg_i4))
+            .child(row("awg-i5", "I5", &self.awg_i5));
+        // Version-gated v3 section: hidden inputs persist (entities stand,
+        // the fold always folds) — hiding never wipes per R5.
+        if Self::panel_value(&self.awg_version, cx, "") == "3.x" {
+            block = block.child(caption("awg-v3-caption", "v3-only fields"));
+            block = block
+                .child(row("awg-hpk", "Header protection key", &self.awg_hpk))
+                .child(row("awg-pad", "Content padding addition", &self.awg_pad))
+                .child(row(
+                    "awg-rekey-after",
+                    "Rekey after time",
+                    &self.awg_rekey_after,
+                ))
+                .child(row(
+                    "awg-rekey-timeout",
+                    "Rekey timeout",
+                    &self.awg_rekey_timeout,
+                ))
+                .child(row(
+                    "awg-reject-after",
+                    "Reject after time",
+                    &self.awg_reject_after,
+                ))
+                .child(row(
+                    "awg-keepalive-timeout",
+                    "Keepalive timeout",
+                    &self.awg_keepalive_timeout,
+                ))
+                .child(row(
+                    "awg-max-handshake",
+                    "Max handshake attempts",
+                    &self.awg_max_handshake,
+                ));
+            block = block.child(switch_row(
+                "awg-trailers",
+                "awg-trailers-switch".to_string(),
+                "Random trailers",
+                "Append random trailers (v3-only — passes through for the fork check)",
+                &self.awg_trailers,
+                repaint,
+            ));
+            block = block.child(switch_row(
+                "awg-cookies",
+                "awg-cookies-switch".to_string(),
+                "Disable cookies",
+                "Disable handshake cookies (v3-only — passes through for the fork check)",
+                &self.awg_cookies,
+                repaint,
+            ));
+        } else {
+            block = block.child(
+                field().label_indent(false).child(
+                    div()
+                        .id("awg-v3-note")
+                        .test_support()
+                        .child("v3-only fields hidden — stored values preserved (never wiped)."),
+                ),
+            );
+        }
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("awg-notes").test_support().child(
+                "AmneziaWG rows run in the fork sidecar (sing-box-awg). v3-only keys on a 2.0 row \
+                 fail generate naming the field; udp_timeout stays JSON-only.",
+            ),
+        ));
+        Self::page_disclosure(
+            "AmneziaWG settings",
+            "awg-section-caption",
+            "awg-section-toggle",
+            "awg-section",
+            &self.awg_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T05: Hysteria guided page — one page for both
+    /// `hysteria` (v1) and `hysteria2` (v2). The version RadioGroup switches
+    /// the protocol on Add (pristine-template machinery does the rewrite);
+    /// on Edit the type is locked so the version renders as read-only text
+    /// (Throne §7.7 parity). Common rows (server_ports/hop_interval/
+    /// up/down/obfs) persist across the toggle; v1-only (auth_type/auth/
+    /// recv_window(_conn)/disable_mtu_discovery) vs v2-only (password)
+    /// layouts swap as kit primitives with hidden halves preserved in their
+    /// entities (R5 — the fold always folds both halves, credentials excepted:
+    /// each folds only where its engine arm consumes it). Plus the shared
+    /// S2-forced + S4 panels. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::wireguard_block`]: `RadioGroup` (`selected_index` +
+    /// `on_change`), `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, masked `Input` +
+    /// `mask_toggle`, `Switch` (`checked` + `on_change`), `Field` layout,
+    /// outer-wrapper `Tooltip`s, `Label` captions, honest footer.
+    fn hysteria_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let row = |id: &'static str, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let protocol = self.protocol_text(cx);
+        let is_v2 = protocol == "hysteria2";
+        let mut block = div().flex().flex_col().gap_2();
+        if self.protocol_locked {
+            block = block.child(
+                field().label("Protocol version".to_string()).child(
+                    div()
+                        .id("hy-version-locked")
+                        .test_support()
+                        .child(if is_v2 { "2 (locked)" } else { "1 (locked)" }),
+                ),
+            );
+        } else {
+            let picker = self.protocol_select.clone();
+            let version_repaint = repaint.clone();
+            let selected = Some(if is_v2 { 1 } else { 0 });
+            let mut group = RadioGroup::horizontal("hy-version-options")
+                .selected_index(selected)
+                .on_change(move |ix, window, cx| {
+                    let want = if *ix == 1 { "hysteria2" } else { "hysteria" };
+                    let next = want.to_string();
+                    picker.update(cx, |state, cx| {
+                        state.set_selected_value(&next, window, cx);
+                    });
+                    version_repaint(window, cx);
+                });
+            for label in ["1", "2"] {
+                group = group.child(
+                    Radio::new(label)
+                        .small()
+                        .label(label)
+                        .tooltip(format!("Hysteria version {label}")),
+                );
+            }
+            block = block.child(
+                field().label("Protocol version".to_string()).child(
+                    div()
+                        .id("hy-version-tip")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| {
+                                Tooltip::new(
+                                    "Hysteria protocol version (switches layout)".to_string(),
+                                )
+                            })
+                            .into()
+                        })
+                        .child(div().id("hy-version-group").test_support().child(group)),
+                ),
+            );
+        }
+        block = block
+            .child(row(
+                "hy-server-ports",
+                "Server ports (e.g. 9000-9010)",
+                &self.hy_server_ports,
+            ))
+            .child(row(
+                "hy-hop-interval",
+                "Hop interval (e.g. 30s)",
+                &self.hy_hop_interval,
+            ))
+            .child(row("hy-up", "Up Mbps", &self.hy_up))
+            .child(row("hy-down", "Down Mbps", &self.hy_down))
+            .child(row("hy-obfs", "Obfs", &self.hy_obfs));
+        if is_v2 {
+            block = block.child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("hy-password")
+                        .test_support()
+                        .child(Input::new(&self.hy_password).mask_toggle()),
+                ),
+            );
+        } else {
+            block = block.child(Self::panel_select_row(
+                "Auth type",
+                "hy-auth-type-tip",
+                "v1 auth marker (blank leaves it unset)",
+                "hy-auth-type",
+                "Hysteria auth type",
+                &self.hy_auth_type,
+            ));
+            block = block.child(
+                field().label("Auth".to_string()).child(
+                    div()
+                        .id("hy-auth")
+                        .test_support()
+                        .child(Input::new(&self.hy_auth).mask_toggle()),
+                ),
+            );
+            block = block
+                .child(row(
+                    "hy-recv-window-conn",
+                    "Recv window conn",
+                    &self.hy_recv_conn,
+                ))
+                .child(row("hy-recv-window", "Recv window", &self.hy_recv));
+            block = block.child(switch_row(
+                "hy-mtu",
+                "hy-mtu-switch".to_string(),
+                "Disable MTU discovery",
+                "Disable MTU discovery on v1 (folds disable_mtu_discovery)",
+                &self.hy_mtu,
+                repaint,
+            ));
+        }
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("hy-notes").test_support().child(
+                "Hysteria v1 rows require up/down (blank refuses naming up_mbps/down_mbps); \
+                 v2 omits them for BBR. v1-only keys on a v2 row fail generate naming the field.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Hysteria settings",
+            "hy-section-caption",
+            "hy-section-toggle",
+            "hy-section",
+            &self.hy_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T05: TUIC guided page — uuid (+uuidgen button) +
+    /// password secrets, congestion_control + udp_relay_mode keep-blank
+    /// pickers, udp_over_stream + zero_rtt switches, heartbeat text, plus the
+    /// shared S2-forced + S4 panels. Rendered only while the live protocol is
+    /// `tuic`. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::hysteria_block`].
+    fn tuic_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.uuid_row(view, &self.tuic_uuid, "tuic"));
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("tuic-password")
+                    .test_support()
+                    .child(Input::new(&self.tuic_password).mask_toggle()),
+            ),
+        );
+        block = block.child(Self::panel_select_row(
+            "Congestion control",
+            "tuic-cc-tip",
+            "TUIC congestion control (blank leaves it unset)",
+            "tuic-cc",
+            "TUIC congestion control",
+            &self.tuic_cc,
+        ));
+        block = block.child(Self::panel_select_row(
+            "UDP relay mode",
+            "tuic-relay-tip",
+            "TUIC relay mode (blank leaves it unset)",
+            "tuic-relay",
+            "TUIC UDP relay mode",
+            &self.tuic_relay,
+        ));
+        block = block.child(switch_row(
+            "tuic-uot",
+            "tuic-uot-switch".to_string(),
+            "UDP over stream",
+            "UDP over stream (folds udp_over_stream)",
+            &self.tuic_uot,
+            repaint,
+        ));
+        block = block.child(switch_row(
+            "tuic-zero-rtt",
+            "tuic-zero-rtt-switch".to_string(),
+            "Zero RTT",
+            "Zero-RTT handshake (folds zero_rtt_handshake)",
+            &self.tuic_zero_rtt,
+            repaint,
+        ));
+        block = block.child(
+            field().label("Heartbeat".to_string()).child(
+                div()
+                    .id("tuic-heartbeat")
+                    .test_support()
+                    .child(Input::new(&self.tuic_heartbeat)),
+            ),
+        );
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("tuic-notes").test_support().child(
+                "TUIC runs TLS always-on (security locked tls). Blank congestion/relay stay unset.",
+            ),
+        ));
+        Self::page_disclosure(
+            "TUIC settings",
+            "tuic-section-caption",
+            "tuic-section-toggle",
+            "tuic-section",
+            &self.tuic_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: SOCKS guided page — version + network
+    /// keep-blank/S1-rule pickers, username/password texts, udp_over_tcp
+    /// switch, plus the shared S4 dial panel (no Transport/TLS/Mux — inner
+    /// parity). Rendered only while the live protocol is `socks`. The footer
+    /// is honest: blank version leaves the stock 5, and 4 fails generate
+    /// naming the field. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::tuic_block`]: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, masked `Input` +
+    /// `mask_toggle`, `Switch` (`checked` + `on_change`), `Field` layout,
+    /// outer-wrapper `Tooltip`s, `Label` captions.
+    fn socks_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let uot_cell = self.socks_uot.clone();
+        let uot_repaint = repaint.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(Self::panel_select_row(
+            "Version",
+            "socks-version-tip",
+            "SOCKS version (blank leaves the stock default 5)",
+            "socks-version",
+            "SOCKS version",
+            &self.socks_version,
+        ));
+        block = block.child(
+            field().label("Username".to_string()).child(
+                div()
+                    .id("socks-username")
+                    .test_support()
+                    .child(Input::new(&self.socks_username)),
+            ),
+        );
+        block = block.child(
+            field().label("Password".to_string()).child(
+                div()
+                    .id("socks-password")
+                    .test_support()
+                    .child(Input::new(&self.socks_password).mask_toggle()),
+            ),
+        );
+        block = block.child(Self::panel_select_row(
+            "Network",
+            "socks-network-tip",
+            "SOCKS network (tcp is the default)",
+            "socks-network",
+            "SOCKS network",
+            &self.socks_network,
+        ));
+        block = block.child(
+            field().label_indent(false).child(
+                div().id("socks-uot").test_support().child(
+                    Switch::new("socks-uot-switch")
+                        .small()
+                        .checked(*self.socks_uot.borrow())
+                        .label("UDP over TCP (uot)")
+                        .tooltip("UDP over TCP for socks (folds the uot flat)")
+                        .accessibility_label("UDP over TCP for socks")
+                        .on_change(move |next: &bool, window, cx| {
+                            *uot_cell.borrow_mut() = *next;
+                            uot_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("socks-notes").test_support().child(
+                "SOCKS serves version 5 stock (blank leaves the default); 4 fails generate \
+                 naming version. Blank network leaves tcp.",
+            ),
+        ));
+        Self::page_disclosure(
+            "SOCKS settings",
+            "socks-section-caption",
+            "socks-section-toggle",
+            "socks-section",
+            &self.socks_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: HTTP/HTTPS guided page — username/password/
+    /// path/headers texts (path/headers are parity+: Throne `edit_http.ui`
+    /// lacks them, both engines accept them) plus the shared S2-optional +
+    /// S4 panels. One block serves both `http` and `https` (hysteria v1/v2
+    /// precedent — one entity set, two protocols). The footer is honest:
+    /// `https` rows serve TLS-on even with the panel off, and `check` judges
+    /// the headers shape. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::socks_block`].
+    fn http_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("Username".to_string()).child(
+                    div()
+                        .id("http-username")
+                        .test_support()
+                        .child(Input::new(&self.http_username)),
+                ),
+            )
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("http-password")
+                        .test_support()
+                        .child(Input::new(&self.http_password).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Path".to_string()).child(
+                    div()
+                        .id("http-path")
+                        .test_support()
+                        .child(Input::new(&self.http_path)),
+                ),
+            )
+            .child(
+                field().label("Headers".to_string()).child(
+                    div()
+                        .id("http-headers")
+                        .test_support()
+                        .child(Input::new(&self.http_headers)),
+                ),
+            );
+        block = block.child(self.s2_section(view, repaint, cx, false));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("http-notes").test_support().child(
+                "HTTPS rows serve TLS-on (security=tls) even with the panel off. \
+                 Path/headers ride the http outbound — check judges the headers shape.",
+            ),
+        ));
+        Self::page_disclosure(
+            "HTTP settings",
+            "http-section-caption",
+            "http-section-toggle",
+            "http-section",
+            &self.http_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: AnyTLS guided page — masked password secret
+    /// plus the idle-session tunables (interval/timeout durations, min
+    /// count), plus the shared S2-forced + S4 panels. Rendered only while the
+    /// live protocol is `anytls`. The footer is honest about the duration
+    /// shapes. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::socks_block`].
+    fn anytls_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("anytls-password")
+                        .test_support()
+                        .child(Input::new(&self.anytls_password).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Idle check interval".to_string()).child(
+                    div()
+                        .id("anytls-interval")
+                        .test_support()
+                        .child(Input::new(&self.anytls_interval)),
+                ),
+            )
+            .child(
+                field().label("Idle timeout".to_string()).child(
+                    div()
+                        .id("anytls-timeout")
+                        .test_support()
+                        .child(Input::new(&self.anytls_timeout)),
+                ),
+            )
+            .child(
+                field().label("Min idle sessions".to_string()).child(
+                    div()
+                        .id("anytls-min")
+                        .test_support()
+                        .child(Input::new(&self.anytls_min)),
+                ),
+            );
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("anytls-notes").test_support().child(
+                "AnyTLS runs TLS always-on (security locked tls). Interval/timeout are \
+                 durations (e.g. 30s); min is a session count.",
+            ),
+        ));
+        Self::page_disclosure(
+            "AnyTLS settings",
+            "anytls-section-caption",
+            "anytls-section-toggle",
+            "anytls-section",
+            &self.anytls_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: Naïve guided page — username + masked
+    /// password secrets, uot/quic switches, congestion_control keep-blank
+    /// picker, plus the shared S2-forced + S4 panels. Rendered only while the
+    /// live protocol is `naive`. The footer is honest about the 1.14.2
+    /// shapes. Same kit set and outer-disclosure contract as
+    /// [`ConfigForm::socks_block`].
+    fn naive_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let switch_row = |id: &'static str,
+                          switch_id: String,
+                          label: &str,
+                          tip: &str,
+                          cell: &Rc<RefCell<bool>>,
+                          repaint: &DialogRepaint| {
+            let switch_cell = cell.clone();
+            let switch_repaint = repaint.clone();
+            let label = label.to_string();
+            let tip = tip.to_string();
+            field().label_indent(false).child(
+                div().id(id).test_support().child(
+                    Switch::new(switch_id)
+                        .small()
+                        .checked(*cell.borrow())
+                        .label(label.clone())
+                        .tooltip(tip.clone())
+                        .accessibility_label(label)
+                        .on_change(move |next: &bool, window, cx| {
+                            *switch_cell.borrow_mut() = *next;
+                            switch_repaint(window, cx);
+                        }),
+                ),
+            )
+        };
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("Username".to_string()).child(
+                    div()
+                        .id("naive-username")
+                        .test_support()
+                        .child(Input::new(&self.naive_username)),
+                ),
+            )
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("naive-password")
+                        .test_support()
+                        .child(Input::new(&self.naive_password).mask_toggle()),
+                ),
+            );
+        block = block.child(switch_row(
+            "naive-uot",
+            "naive-uot-switch".to_string(),
+            "UDP over TCP (uot)",
+            "UDP over TCP for naive (folds the uot flat)",
+            &self.naive_uot,
+            repaint,
+        ));
+        block = block.child(switch_row(
+            "naive-quic",
+            "naive-quic-switch".to_string(),
+            "QUIC",
+            "Run naive over QUIC instead of HTTP/2",
+            &self.naive_quic,
+            repaint,
+        ));
+        block = block.child(Self::panel_select_row(
+            "Congestion control",
+            "naive-cc-tip",
+            "QUIC congestion control (blank leaves the chromium default cubic)",
+            "naive-cc",
+            "Naive congestion control",
+            &self.naive_cc,
+        ));
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("naive-notes").test_support().child(
+                "Naïve runs TLS always-on (security locked tls). Blank congestion control \
+                 leaves the default (cubic).",
+            ),
+        ));
+        Self::page_disclosure(
+            "Naïve settings",
+            "naive-section-caption",
+            "naive-section-toggle",
+            "naive-section",
+            &self.naive_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T06: SSH guided page — user text, masked password
+    /// secret, private-key blob area + path input + Browse picker + masked
+    /// passphrase, host-key + algs comma lists, client version, plus the
+    /// shared S4 dial panel (no TLS — inner parity). Rendered only while the
+    /// live protocol is `ssh`. The key area is a kit `Textarea` (Throne
+    /// text-area parity; `Input::mask_toggle` exists only on `Input` in kit
+    /// 0.6.6, so the blob stays visible while both secrets stay masked). The
+    /// footer is honest about the JSON-only remainder. Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn ssh_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let browse_view = view.clone();
+        let browse_path = self.ssh_key_path.clone();
+        let browse_key = self.ssh_private_key.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("User".to_string()).child(
+                    div()
+                        .id("ssh-user")
+                        .test_support()
+                        .child(Input::new(&self.ssh_user)),
+                ),
+            )
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("ssh-password")
+                        .test_support()
+                        .child(Input::new(&self.ssh_password).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Private key".to_string()).child(
+                    div()
+                        .id("ssh-private-key")
+                        .test_support()
+                        .child(Textarea::new(&self.ssh_private_key).h(px(96.))),
+                ),
+            )
+            .child(
+                field().label("Private key path".to_string()).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("ssh-key-path")
+                                .test_support()
+                                .child(Input::new(&self.ssh_key_path)),
+                        )
+                        .child(
+                            Button::new("ssh-key-browse")
+                                .small()
+                                .label("Browse…")
+                                .tooltip(
+                                    "Pick a private-key file — fills the path and loads the key",
+                                )
+                                .accessibility_label("Browse for an SSH private-key file")
+                                .on_click(move |_, window, cx| {
+                                    browse_view.update(cx, |view, cx| {
+                                        view.browse_for_ssh_key(
+                                            browse_path.clone(),
+                                            browse_key.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        ),
+                ),
+            )
+            .child(
+                field().label("Private key passphrase".to_string()).child(
+                    div()
+                        .id("ssh-key-pass")
+                        .test_support()
+                        .child(Input::new(&self.ssh_key_pass).mask_toggle()),
+                ),
+            )
+            .child(
+                field().label("Host key (comma list)".to_string()).child(
+                    div()
+                        .id("ssh-host-key")
+                        .test_support()
+                        .child(Input::new(&self.ssh_host_key)),
+                ),
+            )
+            .child(
+                field()
+                    .label("Host key algorithms (comma list)".to_string())
+                    .child(
+                        div()
+                            .id("ssh-host-key-algs")
+                            .test_support()
+                            .child(Input::new(&self.ssh_host_key_algs)),
+                    ),
+            )
+            .child(
+                field().label("Client version".to_string()).child(
+                    div()
+                        .id("ssh-client-version")
+                        .test_support()
+                        .child(Input::new(&self.ssh_client_version)),
+                ),
+            );
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("ssh-notes").test_support().child(
+                "Browse fills the path and loads the key file (no hand-paste). Host key \
+                 lists are comma-separated; cipher/mac/kex stay JSON-only.",
+            ),
+        ));
+        Self::page_disclosure(
+            "SSH settings",
+            "ssh-section-caption",
+            "ssh-section-toggle",
+            "ssh-section",
+            &self.ssh_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: Snell guided page — masked psk secret +
+    /// version picker + obfs_mode/host + userkey + reuse Switch + network +
+    /// mode texts, plus the shared S4 panel. Engine-driven list (the Throne
+    /// source snapshot has zero `snell` hits, so there is no Throne editor to
+    /// copy — fields come from `engine.rs` + `import.rs`). Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn snell_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let reuse_cell = self.snell_reuse.clone();
+        let reuse_repaint = repaint.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field().label("PSK".to_string()).child(
+                    div()
+                        .id("snell-psk")
+                        .test_support()
+                        .child(Input::new(&self.snell_psk).mask_toggle()),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Version",
+                "snell-version-tip",
+                "Snell version (blank leaves the engine default 4)",
+                "snell-version",
+                "Snell version",
+                &self.snell_version,
+            ))
+            .child(
+                field().label("Obfs mode".to_string()).child(
+                    div()
+                        .id("snell-obfs-mode")
+                        .test_support()
+                        .child(Input::new(&self.snell_obfs_mode)),
+                ),
+            )
+            .child(
+                field().label("Obfs host".to_string()).child(
+                    div()
+                        .id("snell-obfs-host")
+                        .test_support()
+                        .child(Input::new(&self.snell_obfs_host)),
+                ),
+            )
+            .child(
+                field().label("User key".to_string()).child(
+                    div()
+                        .id("snell-userkey")
+                        .test_support()
+                        .child(Input::new(&self.snell_userkey)),
+                ),
+            )
+            .child(
+                field().label("Network".to_string()).child(
+                    div()
+                        .id("snell-network")
+                        .test_support()
+                        .child(Input::new(&self.snell_network)),
+                ),
+            )
+            .child(
+                field().label("Mode".to_string()).child(
+                    div()
+                        .id("snell-mode")
+                        .test_support()
+                        .child(Input::new(&self.snell_mode)),
+                ),
+            );
+        block = block.child(
+            field().label_indent(false).child(
+                div().id("snell-reuse").test_support().child(
+                    Switch::new("snell-reuse-switch")
+                        .small()
+                        .checked(*self.snell_reuse.borrow())
+                        .label("Reuse")
+                        .tooltip("Reuse sessions for snell (folds the reuse flat)")
+                        .accessibility_label("Reuse sessions for snell")
+                        .on_change(move |next: &bool, window, cx| {
+                            *reuse_cell.borrow_mut() = *next;
+                            reuse_repaint(window, cx);
+                        }),
+                ),
+            ),
+        );
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("snell-notes").test_support().child(
+                "Snell serves version 4 when blank; 6 needs a v6 peer. \
+                 Obfs/userkey/reuse/network/mode ride the snell outbound — check judges their shapes.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Snell settings",
+            "snell-section-caption",
+            "snell-section-toggle",
+            "snell-section",
+            &self.snell_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: ShadowTLS guided page (version picker 1|2|3
+    /// with password text, plus the shared S2-forced and S4 panels). Rendered
+    /// only while the live protocol is `shadowtls`. Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn shadowtls_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(Self::panel_select_row(
+                "Version",
+                "shadowtls-version-tip",
+                "ShadowTLS version (blank takes the schema default 1; v1 rows omit the password)",
+                "shadowtls-version",
+                "ShadowTLS version",
+                &self.shadowtls_version,
+            ))
+            .child(
+                field().label("Password".to_string()).child(
+                    div()
+                        .id("shadowtls-password")
+                        .test_support()
+                        .child(Input::new(&self.shadowtls_password).mask_toggle()),
+                ),
+            );
+        block = block.child(self.s2_section(view, repaint, cx, true));
+        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(field().label_indent(false).child(
+            div().id("shadowtls-notes").test_support().child(
+                "ShadowTLS runs TLS always-on (security locked tls). Version blank takes \
+                 the schema default 1; v1 rows omit the password.",
+            ),
+        ));
+        Self::page_disclosure(
+            "ShadowTLS settings",
+            "shadowtls-section-caption",
+            "shadowtls-section-toggle",
+            "shadowtls-section",
+            &self.shadowtls_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: Xray-VLESS Ph1 guided page (uuid with uuidgen,
+    /// encryption, flow picker, sni/fp/alpn, REALITY pbk/sid/spiderx,
+    /// Xray-network picker, mode text, xray-mux picker). No shared panels
+    /// (the bridge serves the Ph1 subset, so S4 dial keys would be dead there;
+    /// the footer says what stays JSON-only). Ph2-only keys already in the
+    /// box are preserved untouched (never stripped). Same kit set and
+    /// outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn xray_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        _cx: &App,
+    ) -> impl IntoElement {
+        let _ = repaint;
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(self.uuid_row(view, &self.xray_uuid, "xray"));
+        block = block
+            .child(
+                field().label("Encryption".to_string()).child(
+                    div()
+                        .id("xray-enc")
+                        .test_support()
+                        .child(Input::new(&self.xray_enc)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Flow",
+                "xray-flow-tip",
+                "Xray flow (blank leaves the default)",
+                "xray-flow",
+                "Xray flow",
+                &self.xray_flow,
+            ))
+            .child(
+                field().label("SNI".to_string()).child(
+                    div()
+                        .id("xray-sni")
+                        .test_support()
+                        .child(Input::new(&self.xray_sni)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Fingerprint",
+                "xray-fp-tip",
+                "Xray fingerprint (blank leaves the default)",
+                "xray-fp",
+                "Xray fingerprint",
+                &self.xray_fp,
+            ))
+            .child(
+                field().label("ALPN (comma list)".to_string()).child(
+                    div()
+                        .id("xray-alpn")
+                        .test_support()
+                        .child(Input::new(&self.xray_alpn)),
+                ),
+            )
+            .child(
+                field().label("REALITY public key (pbk)".to_string()).child(
+                    div()
+                        .id("xray-pbk")
+                        .test_support()
+                        .child(Input::new(&self.xray_pbk)),
+                ),
+            )
+            .child(
+                field().label("REALITY short id (sid)".to_string()).child(
+                    div()
+                        .id("xray-sid")
+                        .test_support()
+                        .child(Input::new(&self.xray_sid)),
+                ),
+            )
+            .child(
+                field().label("REALITY spiderX path".to_string()).child(
+                    div()
+                        .id("xray-spiderx")
+                        .test_support()
+                        .child(Input::new(&self.xray_spiderx)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Network",
+                "xray-network-tip",
+                "Xray stream network (raw|xhttp|ws|httpupgrade|grpc)",
+                "xray-network",
+                "Xray network",
+                &self.xray_network,
+            ))
+            .child(
+                field().label("Mode".to_string()).child(
+                    div()
+                        .id("xray-mode")
+                        .test_support()
+                        .child(Input::new(&self.xray_mode)),
+                ),
+            )
+            .child(Self::panel_select_row(
+                "Mux",
+                "xray-mux-tip",
+                "Xray mux (Keep default leaves the sidecar default)",
+                "xray-mux",
+                "Xray mux",
+                &self.xray_mux,
+            ));
+        block = block.child(field().label_indent(false).child(
+            div().id("xray-notes").test_support().child(
+                "Ph1 subset only — XHTTP/xmux/session keys (xPaddingBytes, maxConcurrency, \
+                 downloadSettings…) stay JSON-only and are preserved, never stripped.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Xray settings",
+            "xray-section-caption",
+            "xray-section-toggle",
+            "xray-section",
+            &self.xray_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: chain hop-list editor — ordered hop rows
+    /// (name + protocol labels, per-hop Replace/Remove) plus the library
+    /// picker + Add, with Throne rejection rules (no chain hops, at most one
+    /// extracore hop at index 0 — refusals toast naming the rule). Empty hops
+    /// render a kit `Empty`, never a hand-rolled placeholder. Same kit set
+    /// and outer-disclosure contract as [`ConfigForm::socks_block`].
+    fn chain_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        _cx: &App,
+    ) -> impl IntoElement {
+        let hops = self.chain_hops.borrow().clone();
+        let library = self.chain_library.borrow().clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block.child(Self::panel_select_row(
+            "Hop from library",
+            "chain-pick-tip",
+            "Add or replace hops from your row list (chain and off-index-0 extracore hops are rejected)",
+            "chain-pick",
+            "Chain hop from library",
+            &self.chain_pick,
+        ));
+        {
+            let add_view = view.clone();
+            let add_hops = self.chain_hops.clone();
+            let add_library = self.chain_library.clone();
+            let add_pick = self.chain_pick.clone();
+            let add_repaint = repaint.clone();
+            block = block.child(
+                field().label_indent(false).child(
+                    div().id("chain-hop-add-row").test_support().child(
+                        Button::new("chain-hop-add")
+                            .small()
+                            .label("Add hop")
+                            .tooltip("Append the picked row to the chain")
+                            .accessibility_label("Add the picked row to the chain")
+                            .on_click(move |_, window, cx| {
+                                let picked = add_pick.read(cx).selected_value().cloned();
+                                let picked = picked.as_deref().unwrap_or("").to_string();
+                                add_view.update(cx, |view, cx| {
+                                    view.chain_add_hop(
+                                        &add_hops,
+                                        &add_library,
+                                        &add_pick,
+                                        &picked,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                                add_repaint(window, cx);
+                            }),
+                    ),
+                ),
+            );
+        }
+        if hops.is_empty() {
+            block = block.child(
+                div().id("chain-hops-empty").test_support().child(
+                    Empty::new().header(
+                        EmptyHeader::new()
+                            .title(EmptyTitle::new().child("No hops yet"))
+                            .description(EmptyDescription::new().child(
+                                "Add hops from the library — the first hop may be an extra-core row.",
+                            )),
+                    ),
+                ),
+            );
+        } else {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .id("chain-hops-list")
+                .test_support();
+            for (index, node) in hops.iter().enumerate() {
+                let label = chain_hop_label(node, index, &library);
+                let replace_view = view.clone();
+                let replace_hops = self.chain_hops.clone();
+                let replace_library = self.chain_library.clone();
+                let replace_pick = self.chain_pick.clone();
+                let replace_repaint = repaint.clone();
+                let remove_hops = self.chain_hops.clone();
+                let remove_repaint = repaint.clone();
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id(format!("chain-hop-{index}"))
+                                .test_support()
+                                .child(Label::new(label)),
+                        )
+                        .child(
+                            Button::new(format!("chain-hop-replace-{index}"))
+                                .small()
+                                .label("Replace")
+                                .tooltip("Replace this hop with the picked row")
+                                .accessibility_label(format!("Replace hop {}", index + 1))
+                                .on_click(move |_, window, cx| {
+                                    let picked = replace_pick.read(cx).selected_value().cloned();
+                                    let picked = picked.as_deref().unwrap_or("").to_string();
+                                    replace_view.update(cx, |view, cx| {
+                                        view.chain_replace_hop(
+                                            &replace_hops,
+                                            &replace_library,
+                                            &replace_pick,
+                                            index,
+                                            &picked,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    replace_repaint(window, cx);
+                                }),
+                        )
+                        .child(
+                            Button::new(format!("chain-hop-remove-{index}"))
+                                .small()
+                                .label("Remove")
+                                .tooltip("Remove this hop from the chain")
+                                .accessibility_label(format!("Remove hop {}", index + 1))
+                                .on_click(move |_, window, cx| {
+                                    let mut hops = remove_hops.borrow_mut();
+                                    if index < hops.len() {
+                                        hops.remove(index);
+                                    }
+                                    drop(hops);
+                                    remove_repaint(window, cx);
+                                }),
+                        ),
+                );
+            }
+            block = block.child(list);
+        }
+        block = block.child(field().label_indent(false).child(
+            div().id("chain-notes").test_support().child(
+                "V1 chains are flat: no chain hops; at most one extra-core hop, first only. \
+                 Extra/Custom/Xray hops must be last — the engine names violations at start.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Chain settings",
+            "chain-section-caption",
+            "chain-section-toggle",
+            "chain-section",
+            &self.chain_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T07: extra-core picker page — exe path text +
+    /// Browse (fills the path, never reads the binary) + args text + config
+    /// textarea. Deliberately no `no_logs` control anywhere (Throne
+    /// non-persist bug — never copied). Same kit set and outer-disclosure
+    /// contract as [`ConfigForm::socks_block`].
+    fn extra_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let _ = (repaint, cx);
+        let browse_view = view.clone();
+        let browse_path = self.extra_exe.clone();
+        let mut block = div().flex().flex_col().gap_2();
+        block = block
+            .child(
+                field()
+                    .label("Executable (app dir file name)".to_string())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("extra-exe")
+                                    .test_support()
+                                    .child(Input::new(&self.extra_exe)),
+                            )
+                            .child(
+                                Button::new("extra-exe-browse")
+                                    .small()
+                                    .label("Browse…")
+                                    .tooltip("Pick the sidecar executable — fills the path")
+                                    .accessibility_label("Browse for the extra-core executable")
+                                    .on_click(move |_, window, cx| {
+                                        browse_view.update(cx, |view, cx| {
+                                            view.browse_for_extra_exe(
+                                                browse_path.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                field().label("Args".to_string()).child(
+                    div()
+                        .id("extra-args")
+                        .test_support()
+                        .child(Input::new(&self.extra_args)),
+                ),
+            )
+            .child(
+                field()
+                    .label("Config (passed as -c <file>)".to_string())
+                    .child(
+                        div()
+                            .id("extra-config")
+                            .test_support()
+                            .child(Textarea::new(&self.extra_config).h(px(96.))),
+                    ),
+            );
+        block = block.child(field().label_indent(false).child(
+            div().id("extra-notes").test_support().child(
+                "Spawned unprivileged as <exe> -c <config-file> (v1 convention — extra flags \
+                 ride args with the row). Validate checks exe + config shape before commit; \
+                 there is no logs toggle by design.",
+            ),
+        ));
+        Self::page_disclosure(
+            "Extra-core settings",
+            "extra-section-caption",
+            "extra-section-toggle",
+            "extra-section",
+            &self.extra_open,
+            view,
+            block,
+        )
+    }
+
+    /// Config-completeness T02: VLESS guided page — inner fields plus the
+    /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
+    /// `open`, no motion id — closed content unmounts, entities persist, so
+    /// hiding never wipes per R5). Rendered only while the live protocol is
+    /// `vless`; every other protocol keeps the T01 form byte-for-byte.
+    /// The whole page rides ONE outer collapsed disclosure (a single header
+    /// row at the 880x620 minimum — t11 pins the core form in-frame; seven
+    /// open rows would push it out).
+    /// Kit constructors/builders: `Select::new(&state)` +
+    /// `.id().small().accessibility_label()`, `Input` (+ masked `uuid` with
+    /// `mask_toggle`), `Button` (+ `.small()` generators), `RadioGroup`
+    /// (`selected_index` + `on_change`, interval-picker precedent),
+    /// `Switch` (`checked` + `on_change` over shared cells), `Field` +
+    /// `v_form` layout, outer-wrapper `Tooltip`s, `Label` captions.
+    fn vless_block(
+        &self,
+        view: &Entity<AppView>,
+        repaint: &DialogRepaint,
+        cx: &App,
+    ) -> impl IntoElement {
+        let mut block = div().flex().flex_col().gap_2();
+        // Inner: uuid (masked + generate) + flow + packet_encoding.
+        block = block.child(self.uuid_row(view, &self.vless_uuid, "vless"));
+        let flow_select = self.vless_flow.clone();
+        let packet_select = self.vless_packet_encoding.clone();
+        block = block.child(
+            field().label("Flow".to_string()).child(
+                div()
+                    .id("vless-flow-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("VLESS flow (vision disables mux)".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&flow_select)
+                            .id("vless-flow")
+                            .small()
+                            .accessibility_label("VLESS flow"),
+                    ),
+            ),
+        );
+        block = block.child(
+            field().label("Packet encoding".to_string()).child(
+                div()
+                    .id("vless-packet-encoding-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Tooltip::new("VLESS packet encoding".to_string()))
+                            .into()
+                    })
+                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        Select::new(&packet_select)
+                            .id("vless-packet-encoding")
+                            .small()
+                            .accessibility_label("VLESS packet encoding"),
+                    ),
+            ),
+        );
+        // S1: Transport (shared section — see `s1_section`).
+        block = block.child(self.s1_section(view, cx));
+        // S2: TLS, optional variant (shared section — see `s2_section`).
+        block = block.child(self.s2_section(view, repaint, cx, false));
+        // S3: Mux+Brutal (shared section — see `s3_section`).
+        let flow = Self::panel_value(&self.vless_flow, cx, "");
+        block = block.child(self.s3_section(view, repaint, cx, flow == "xtls-rprx-vision"));
+        // S4: Advanced dial (shared section — see `s4_section`).
+        block = block.child(self.s4_section(view, repaint, cx));
+        // One outer collapsed disclosure: a single header row at the minimum
+        // frame (t11), the full page one click away.
+        Self::page_disclosure(
+            "VLESS settings",
+            "vless-section-caption",
+            "vless-section-toggle",
+            "vless-section",
+            &self.vless_open,
+            view,
+            block,
+        )
+    }
+
     fn element(
         self,
         view: Entity<AppView>,
@@ -1816,19 +5943,67 @@ impl ConfigForm {
         port_budget: Option<String>,
     ) -> impl IntoElement {
         let bind = self.bind.read(cx).value().to_string();
-        let protocol_text = self.protocol.read(cx).value().to_string();
+        let protocol_text = self.protocol_text(cx);
         let guided = guided_identity_fields(&protocol_text);
+        // Config-completeness T01: virtual rows (chain/custom-*/extra-core)
+        // carry no endpoint address — the guided Server/Server port inputs
+        // hide for these (Throne gating parity).
+        let virtual_row = is_virtual_protocol(&protocol_text);
         let format_view = view.clone();
         let format_params = self.params.clone();
         let template_view = view.clone();
         let template_params = self.params.clone();
-        let template_protocol = self.protocol.clone();
+        let template_form = self.clone();
         let validate_view = view.clone();
         let validate_params = self.params.clone();
+        let validate_form = self.clone();
         let expanded = *self.advanced.borrow();
         // Pre-clone for the toggle buttons (both placements borrow this,
         // never `self` — the assembly below moves `self`'s fields).
         let toggle_form = self.clone();
+        // Config-completeness T02/T03: the guided page builds here, before
+        // the assembly below moves `self`'s fields (each `*_block` borrows
+        // `&self`; the built element owns entity/Rc clones, so the borrow
+        // ends before the first move). One page per protocol — every other
+        // protocol keeps the T01 form byte-for-byte.
+        let guided_panels = if expanded {
+            None
+        } else {
+            let repaint_view = view.clone();
+            let repaint: DialogRepaint = Rc::new(move |_window, cx| {
+                repaint_view.update(cx, |_, cx| cx.notify());
+            });
+            match protocol_text.as_str() {
+                "vless" => Some(self.vless_block(&view, &repaint, cx).into_any_element()),
+                "vmess" => Some(self.vmess_block(&view, &repaint, cx).into_any_element()),
+                "trojan" => Some(self.trojan_block(&view, &repaint, cx).into_any_element()),
+                "shadowsocks" => Some(
+                    self.shadowsocks_block(&view, &repaint, cx)
+                        .into_any_element(),
+                ),
+                "wireguard" => Some(self.wireguard_block(&view, &repaint, cx).into_any_element()),
+                "amneziawg" => Some(self.amneziawg_block(&view, &repaint, cx).into_any_element()),
+                "hysteria" | "hysteria2" => {
+                    Some(self.hysteria_block(&view, &repaint, cx).into_any_element())
+                }
+                "tuic" => Some(self.tuic_block(&view, &repaint, cx).into_any_element()),
+                // Config-completeness T06: small matrices — one page per
+                // protocol (http/https share one block, hysteria precedent).
+                "socks" => Some(self.socks_block(&view, &repaint, cx).into_any_element()),
+                "http" | "https" => Some(self.http_block(&view, &repaint, cx).into_any_element()),
+                "anytls" => Some(self.anytls_block(&view, &repaint, cx).into_any_element()),
+                "naive" => Some(self.naive_block(&view, &repaint, cx).into_any_element()),
+                "ssh" => Some(self.ssh_block(&view, &repaint, cx).into_any_element()),
+                // Config-completeness T07: edge pages (Snell/ShadowTLS engine
+                // shapes, Xray Ph1 subset, chain hops, extra-core picker).
+                "snell" => Some(self.snell_block(&view, &repaint, cx).into_any_element()),
+                "shadowtls" => Some(self.shadowtls_block(&view, &repaint, cx).into_any_element()),
+                "xray" => Some(self.xray_block(&view, &repaint, cx).into_any_element()),
+                "chain" => Some(self.chain_block(&view, &repaint, cx).into_any_element()),
+                "extra-core" => Some(self.extra_block(&view, &repaint, cx).into_any_element()),
+                _ => None,
+            }
+        };
         // Ticket 05: guided and JSON swap (never stack) — each mode stays
         // near the old form's height, so no mode pushes content below the
         // fold. Server + Server port share one row; the toggle rides the
@@ -1879,7 +6054,7 @@ impl ConfigForm {
                                 template_view.update(cx, |view, cx| {
                                     view.template_dialog_params(
                                         &template_params,
-                                        &template_protocol,
+                                        &template_form,
                                         window,
                                         cx,
                                     );
@@ -1889,7 +6064,13 @@ impl ConfigForm {
                     .child(Button::new("params-validate").label("Validate").on_click(
                         move |_, window, cx| {
                             validate_view.update(cx, |view, cx| {
-                                view.validate_dialog_params(&validate_params, window, cx);
+                                let protocol = validate_form.protocol_text(cx);
+                                view.validate_dialog_params(
+                                    &validate_params,
+                                    &protocol,
+                                    window,
+                                    cx,
+                                );
                             });
                         },
                     )),
@@ -1909,8 +6090,65 @@ impl ConfigForm {
         // hint row when collapsed and the params buttons row when expanded.
         let mut form = v_form()
             .small()
-            .child(dialog_field("field-name", "Name", self.name))
-            .child(dialog_field("field-protocol", "Protocol", self.protocol));
+            .child(dialog_field("field-name", "Name", self.name));
+        // Config-completeness T01: protocol is a kit `Select` over the 23
+        // canonical types on Add (no free-text typos possible) and read-only
+        // `protocol-lock` text on Edit (type locked once created, Throne §7.7
+        // parity). Kit constructors/builders: `Select::new(&state)` +
+        // `.id().small().accessibility_label()`; the hover copy rides an outer
+        // wrapper (kit `Select` has no tooltip slot — facet-bar precedent).
+        if self.protocol_locked {
+            let locked = self.locked_protocol.clone();
+            form = form.child(
+                field().label("Protocol".to_string()).child(
+                    div()
+                        .id("protocol-lock")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| Tooltip::new("Type is locked after creation".to_string()))
+                                .into()
+                        })
+                        .child(Label::new(format!("{locked} (locked)"))),
+                ),
+            );
+        } else {
+            let select = self.protocol_select.clone();
+            form = form.child(
+                field().label("Protocol".to_string()).child(
+                    div()
+                        .id("protocol-select-tip")
+                        .test_support()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| Tooltip::new("Protocol (locked after creation)".to_string()))
+                                .into()
+                        })
+                        // T01 ENTER-guard: kit `BaseSelect` propagates Confirm even
+                        // with its popup open (verified gpui-base 0.6.6
+                        // `select.rs`: the Confirm handler calls `cx.propagate()`
+                        // before the open check, while Cancel stops) and the dialog
+                        // host commits on any bubbled Confirm — without this stop
+                        // the picker's Enter pick would also commit a half-filled
+                        // row (audit §10.9 incident). The inner kit handlers (list
+                        // pick, popup close, trigger refocus) already ran, so only
+                        // the dialog commit is suppressed here.
+                        .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            Select::new(&select)
+                                .id("protocol-select")
+                                .small()
+                                .accessibility_label("Protocol"),
+                        ),
+                ),
+            );
+        }
+        // Config-completeness T02/T03: guided page (inner + shared panels,
+        // prebuilt above) between the protocol row and the guided/JSON
+        // swap — other protocols keep the T01 form byte-for-byte.
+        if let Some(panels) = guided_panels {
+            form = form.child(field().label_indent(false).child(panels));
+        }
         if expanded {
             form = form.child(
                 field()
@@ -1923,32 +6161,39 @@ impl ConfigForm {
             // + Advanced toggle row — so the guided block costs a single grid
             // row set instead of three.
             let mut guided_block = div().flex().flex_col().gap_1();
-            guided_block = guided_block.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        div().flex_1().child(
-                            field().label("Server").child(
-                                div()
-                                    .id("field-guided-server")
-                                    .test_support()
-                                    .child(Input::new(&self.guided_server)),
+            // Config-completeness T01: virtual rows hide the endpoint inputs
+            // (see `virtual_row` above); Identity already hides for these via
+            // the `guided.key` gate below, and the params JSON keeps its slots
+            // for explicit edits. Hidden values are never wiped (fold no-ops
+            // on blank inputs).
+            if !virtual_row {
+                guided_block = guided_block.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            div().flex_1().child(
+                                field().label("Server").child(
+                                    div()
+                                        .id("field-guided-server")
+                                        .test_support()
+                                        .child(Input::new(&self.guided_server)),
+                                ),
+                            ),
+                        )
+                        .child(
+                            div().flex_1().child(
+                                field().label("Server port").child(
+                                    div()
+                                        .id("field-guided-port")
+                                        .test_support()
+                                        .child(Input::new(&self.guided_port)),
+                                ),
                             ),
                         ),
-                    )
-                    .child(
-                        div().flex_1().child(
-                            field().label("Server port").child(
-                                div()
-                                    .id("field-guided-port")
-                                    .test_support()
-                                    .child(Input::new(&self.guided_port)),
-                            ),
-                        ),
-                    ),
-            );
+                );
+            }
             if guided.is_some_and(|guided| guided.key.is_some()) {
                 guided_block = guided_block.child(
                     field()
@@ -2050,12 +6295,21 @@ impl ConfigForm {
     /// Ticket 31: move keyboard focus to the named field's input
     /// (`name`/`protocol`/`params`/`group`/`bind_ip`/`port`). Unknown names
     /// focus nothing (never a wrong field).
+    /// Config-completeness T01: `protocol` is a kit `Select`, not a text
+    /// input — focus its trigger on Add; a locked Edit row focuses nothing.
     fn focus_field(&self, field: &str, window: &mut Window, cx: &mut App) {
+        if field == "protocol" {
+            if !self.protocol_locked {
+                self.protocol_select.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            }
+            return;
+        }
         // Ticket 43: `params` is a textarea state — every arm converts to
         // the shared [`AnyInputState`] (the match cannot mix entity types).
         let target: Option<AnyInputState> = match field {
             "name" => Some(AnyInputState::from(self.name.clone())),
-            "protocol" => Some(AnyInputState::from(self.protocol.clone())),
             "params" => Some(AnyInputState::from(self.params.clone())),
             "group" => Some(AnyInputState::from(self.group.clone())),
             "bind_ip" => Some(AnyInputState::from(self.bind.clone())),
@@ -2071,7 +6325,7 @@ impl ConfigForm {
     fn as_new(&self, cx: &App) -> NewConfig {
         NewConfig {
             name: self.name.read(cx).value().to_string(),
-            protocol: self.protocol.read(cx).value().to_string(),
+            protocol: self.protocol_text(cx),
             params: self.effective_params(cx),
             group: self.group.read(cx).value().to_string(),
             bind_ip: self.bind.read(cx).value().to_string(),
@@ -2084,36 +6338,673 @@ impl ConfigForm {
     /// protocol's identity key). Blank guided inputs change nothing, so an
     /// untouched template and an untouched edit row commit byte-identical
     /// params (validation still names every missing field inline).
+    /// Config-completeness T02/T03: on guided pages the inner fields plus
+    /// the attached shared panels fold in the same byte-identical way —
+    /// vless/vmess/trojan take S1/S2/S4 (S3 unless vision-disabled on
+    /// vless), shadowsocks takes S3+S4 only (Mux-only Settings, Throne
+    /// HasMux parity); any other protocol skips the panels outright so a
+    /// type switch can never smear guided keys onto foreign rows.
+    /// Config-completeness T06: socks/ssh take S4 alone, http/https take
+    /// S2-optional + S4, anytls/naive take S2-forced + S4 (see
+    /// [`ConfigForm::effective_params`]).
+    /// Config-completeness T07: snell takes S4 alone, shadowtls takes
+    /// S2-forced + S4, xray/chain/extra-core take no shared panels (the xray
+    /// bridge serves the Ph1 subset — S4 dial keys would be dead there; the
+    /// chain/extra rows carry no endpoint tuning).
     fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
-        let protocol = self.protocol.read(cx).value().to_string();
+        let protocol = self.protocol_text(cx);
         let identity = guided_identity_fields(&protocol)
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
-        fold_guided_into_params(
+        let params = fold_guided_into_params(
             &params,
             self.guided_server.read(cx).value().as_ref(),
             self.guided_port.read(cx).value().as_ref(),
             identity,
             self.guided_identity.read(cx).value().as_ref(),
+        );
+        match protocol.as_str() {
+            "vless" => {
+                let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
+                let params = fold_vless_inner_into_params(&params, &uuid, &flow, &packet_encoding);
+                let params = fold_transport_into_params(&params, &self.transport_fold(cx));
+                let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
+                let params = if flow == "xtls-rprx-vision" {
+                    params
+                } else {
+                    fold_mux_into_params(&params, &self.mux_fold(cx))
+                };
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "vmess" => {
+                let (uuid, aid, cipher, packet_encoding) = self.vmess_inner_values(cx);
+                let params =
+                    fold_vmess_inner_into_params(&params, &uuid, &aid, &cipher, &packet_encoding);
+                let params = fold_transport_into_params(&params, &self.transport_fold(cx));
+                let params = fold_tls_vmess_into_params(&params, &self.tls_optional_fold(cx));
+                let params = fold_mux_into_params(&params, &self.mux_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "trojan" => {
+                let password = self.trojan_password.read(cx).value().to_string();
+                let params = fold_trojan_inner_into_params(&params, &password);
+                let params = fold_transport_into_params(&params, &self.transport_fold(cx));
+                let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
+                let params = fold_mux_into_params(&params, &self.mux_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "shadowsocks" => {
+                let (method, password, plugin, plugin_opts, uot) = self.ss_inner_values(cx);
+                let params = fold_shadowsocks_inner_into_params(
+                    &params,
+                    &method,
+                    &password,
+                    &plugin,
+                    &plugin_opts,
+                    uot,
+                );
+                let params = fold_mux_into_params(&params, &self.mux_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "wireguard" => {
+                let params =
+                    fold_wireguard_into_params(&params, &self.wireguard_fold(cx, "wireguard"));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "amneziawg" => {
+                let params =
+                    fold_wireguard_into_params(&params, &self.wireguard_fold(cx, "amneziawg"));
+                let params = fold_amneziawg_into_params(&params, &self.amnezia_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "hysteria" | "hysteria2" => {
+                let params = fold_hysteria_into_params(
+                    &params,
+                    &self.hysteria_fold(cx),
+                    protocol == "hysteria2",
+                );
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "tuic" => {
+                let params = fold_tuic_into_params(&params, &self.tuic_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            // Config-completeness T06: small matrices — each page folds
+            // exactly what it renders (never smears keys onto foreign rows).
+            // SOCKS/SSH take S4 alone; HTTP(S) takes S2-optional; AnyTLS and
+            // Naïve take S2-forced.
+            "socks" => {
+                let params = fold_socks_into_params(&params, &self.socks_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "http" | "https" => {
+                let params = fold_http_into_params(&params, &self.http_fold(cx));
+                let params = fold_tls_optional_into_params(&params, &self.tls_optional_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "anytls" => {
+                let params = fold_anytls_into_params(&params, &self.anytls_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "naive" => {
+                let params = fold_naive_into_params(&params, &self.naive_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "ssh" => {
+                let params = fold_ssh_into_params(&params, &self.ssh_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            // Config-completeness T07: edge pages fold exactly what they
+            // render (same scoping rule as T06 — never smear keys onto
+            // foreign rows).
+            "snell" => {
+                let params = fold_snell_into_params(&params, &self.snell_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "shadowtls" => {
+                let params = fold_shadowtls_into_params(&params, &self.shadowtls_fold(cx));
+                let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
+                fold_dial_into_params(&params, &self.dial_fold(cx))
+            }
+            "xray" => fold_xray_into_params(&params, &self.xray_fold(cx)),
+            "chain" => fold_chain_nodes_into_params(&params, &self.chain_hops.borrow()),
+            "extra-core" => fold_extra_into_params(&params, &self.extra_fold(cx)),
+            _ => params,
+        }
+    }
+
+    /// Config-completeness T02: read one panel dropdown (default when the
+    /// Select holds no selection, so reads never invent a type).
+    fn panel_value(
+        select: &Entity<SelectState<PanelChoiceList>>,
+        cx: &App,
+        default: &str,
+    ) -> String {
+        select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// Config-completeness T02: VLESS inner texts in fold order
+    /// (uuid, flow, packet_encoding).
+    fn vless_inner_values(&self, cx: &App) -> (String, String, String) {
+        (
+            self.vless_uuid.read(cx).value().to_string(),
+            Self::panel_value(&self.vless_flow, cx, ""),
+            Self::panel_value(&self.vless_packet_encoding, cx, ""),
         )
+    }
+
+    /// Config-completeness T03: VMess inner texts in fold order (uuid, aid,
+    /// cipher, packet_encoding). The cipher picker falls back to `auto`
+    /// (the sing-box default) when the row carries none.
+    fn vmess_inner_values(&self, cx: &App) -> (String, String, String, String) {
+        (
+            self.vmess_uuid.read(cx).value().to_string(),
+            self.vmess_aid.read(cx).value().to_string(),
+            Self::panel_value(&self.vmess_security, cx, "auto"),
+            Self::panel_value(&self.vmess_packet_encoding, cx, ""),
+        )
+    }
+
+    /// Config-completeness T03: Shadowsocks inner texts in fold order
+    /// (method, password, plugin, plugin_opts, uot). The method/plugin
+    /// pickers fall back to blank ("no selection" — the fold never
+    /// fabricates nor strips).
+    fn ss_inner_values(&self, cx: &App) -> (String, String, String, String, bool) {
+        (
+            Self::panel_value(&self.ss_method, cx, ""),
+            self.ss_password.read(cx).value().to_string(),
+            Self::panel_value(&self.ss_plugin, cx, ""),
+            self.ss_plugin_opts.read(cx).value().to_string(),
+            *self.ss_uot.borrow(),
+        )
+    }
+
+    /// Config-completeness T04: WireGuard inner texts in fold order — read
+    /// from the WG page (`page == "wireguard"`) or the AWG page (same slots,
+    /// separate entities). The version/matrix half reads through
+    /// [`ConfigForm::amnezia_fold`].
+    fn wireguard_fold(&self, cx: &App, page: &str) -> WireguardFold {
+        let awg = page == "amneziawg";
+        WireguardFold {
+            private_key: if awg {
+                self.awg_private.read(cx).value().to_string()
+            } else {
+                self.wg_private.read(cx).value().to_string()
+            },
+            public_key: if awg {
+                self.awg_public.read(cx).value().to_string()
+            } else {
+                self.wg_public.read(cx).value().to_string()
+            },
+            pre_shared_key: if awg {
+                self.awg_preshared.read(cx).value().to_string()
+            } else {
+                self.wg_preshared.read(cx).value().to_string()
+            },
+            reserved: if awg {
+                self.awg_reserved.read(cx).value().to_string()
+            } else {
+                self.wg_reserved.read(cx).value().to_string()
+            },
+            persistent_keepalive: if awg {
+                self.awg_keepalive.read(cx).value().to_string()
+            } else {
+                self.wg_keepalive.read(cx).value().to_string()
+            },
+            local_addr: if awg {
+                self.awg_local_addr.read(cx).value().to_string()
+            } else {
+                self.wg_local_addr.read(cx).value().to_string()
+            },
+            dns: if awg {
+                self.awg_dns.read(cx).value().to_string()
+            } else {
+                self.wg_dns.read(cx).value().to_string()
+            },
+            mtu: if awg {
+                self.awg_mtu.read(cx).value().to_string()
+            } else {
+                self.wg_mtu.read(cx).value().to_string()
+            },
+            workers: if awg {
+                self.awg_workers.read(cx).value().to_string()
+            } else {
+                self.wg_workers.read(cx).value().to_string()
+            },
+            sys_ifc: if awg {
+                *self.awg_sys_ifc.borrow()
+            } else {
+                *self.wg_sys_ifc.borrow()
+            },
+        }
+    }
+
+    /// Config-completeness T04: AmneziaWG matrix UI state as a store fold.
+    /// Always reads every field regardless of the live version selection —
+    /// the fold never branches on version (R5 hide-preserve).
+    fn amnezia_fold(&self, cx: &App) -> AmneziaFold {
+        AmneziaFold {
+            enable_amnezia: *self.awg_enable.borrow(),
+            version: Self::panel_value(&self.awg_version, cx, ""),
+            jc: self.awg_jc.read(cx).value().to_string(),
+            jmin: self.awg_jmin.read(cx).value().to_string(),
+            jmax: self.awg_jmax.read(cx).value().to_string(),
+            s1: self.awg_s1.read(cx).value().to_string(),
+            s2: self.awg_s2.read(cx).value().to_string(),
+            s3: self.awg_s3.read(cx).value().to_string(),
+            s4: self.awg_s4.read(cx).value().to_string(),
+            h1: self.awg_h1.read(cx).value().to_string(),
+            h2: self.awg_h2.read(cx).value().to_string(),
+            h3: self.awg_h3.read(cx).value().to_string(),
+            h4: self.awg_h4.read(cx).value().to_string(),
+            i1: self.awg_i1.read(cx).value().to_string(),
+            i2: self.awg_i2.read(cx).value().to_string(),
+            i3: self.awg_i3.read(cx).value().to_string(),
+            i4: self.awg_i4.read(cx).value().to_string(),
+            i5: self.awg_i5.read(cx).value().to_string(),
+            header_protection_key: self.awg_hpk.read(cx).value().to_string(),
+            content_padding_addition: self.awg_pad.read(cx).value().to_string(),
+            rekey_after_time: self.awg_rekey_after.read(cx).value().to_string(),
+            rekey_timeout: self.awg_rekey_timeout.read(cx).value().to_string(),
+            reject_after_time: self.awg_reject_after.read(cx).value().to_string(),
+            keepalive_timeout: self.awg_keepalive_timeout.read(cx).value().to_string(),
+            max_handshake_attempts: self.awg_max_handshake.read(cx).value().to_string(),
+            random_trailers: *self.awg_trailers.borrow(),
+            disable_cookies: *self.awg_cookies.borrow(),
+        }
+    }
+
+    /// Config-completeness T05: Hysteria inner UI state as a store fold.
+    /// Reads every field regardless of the live layout — the store fold
+    /// branches only on the credential (R5 hide-preserve).
+    fn hysteria_fold(&self, cx: &App) -> HysteriaFold {
+        HysteriaFold {
+            server_ports: self.hy_server_ports.read(cx).value().to_string(),
+            hop_interval: self.hy_hop_interval.read(cx).value().to_string(),
+            up: self.hy_up.read(cx).value().to_string(),
+            down: self.hy_down.read(cx).value().to_string(),
+            obfs: self.hy_obfs.read(cx).value().to_string(),
+            auth_type: Self::panel_value(&self.hy_auth_type, cx, ""),
+            auth: self.hy_auth.read(cx).value().to_string(),
+            recv_window_conn: self.hy_recv_conn.read(cx).value().to_string(),
+            recv_window: self.hy_recv.read(cx).value().to_string(),
+            disable_mtu_discovery: *self.hy_mtu.borrow(),
+            password: self.hy_password.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T05: TUIC inner UI state as a store fold.
+    fn tuic_fold(&self, cx: &App) -> TuicFold {
+        TuicFold {
+            uuid: self.tuic_uuid.read(cx).value().to_string(),
+            password: self.tuic_password.read(cx).value().to_string(),
+            congestion_control: Self::panel_value(&self.tuic_cc, cx, ""),
+            udp_relay_mode: Self::panel_value(&self.tuic_relay, cx, ""),
+            udp_over_stream: *self.tuic_uot.borrow(),
+            zero_rtt_handshake: *self.tuic_zero_rtt.borrow(),
+            heartbeat: self.tuic_heartbeat.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T06: SOCKS inner UI state as a store fold. The
+    /// version/network pickers fall back to blank/"tcp" (the fold never
+    /// fabricates a version; "tcp" restores the S1-rule default).
+    fn socks_fold(&self, cx: &App) -> SocksFold {
+        SocksFold {
+            version: Self::panel_value(&self.socks_version, cx, ""),
+            username: self.socks_username.read(cx).value().to_string(),
+            password: self.socks_password.read(cx).value().to_string(),
+            network: Self::panel_value(&self.socks_network, cx, "tcp"),
+            udp_over_tcp: *self.socks_uot.borrow(),
+        }
+    }
+
+    /// Config-completeness T06: HTTP/HTTPS inner UI state as a store fold
+    /// (one entity set, both protocols — hysteria v1/v2 precedent).
+    fn http_fold(&self, cx: &App) -> HttpFold {
+        HttpFold {
+            username: self.http_username.read(cx).value().to_string(),
+            password: self.http_password.read(cx).value().to_string(),
+            path: self.http_path.read(cx).value().to_string(),
+            headers: self.http_headers.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T06: AnyTLS inner UI state as a store fold.
+    fn anytls_fold(&self, cx: &App) -> AnytlsFold {
+        AnytlsFold {
+            password: self.anytls_password.read(cx).value().to_string(),
+            interval: self.anytls_interval.read(cx).value().to_string(),
+            timeout: self.anytls_timeout.read(cx).value().to_string(),
+            min: self.anytls_min.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T06: Naïve inner UI state as a store fold. The cc
+    /// picker falls back to blank (never fabricated — contract C2).
+    fn naive_fold(&self, cx: &App) -> NaiveFold {
+        NaiveFold {
+            username: self.naive_username.read(cx).value().to_string(),
+            password: self.naive_password.read(cx).value().to_string(),
+            udp_over_tcp: *self.naive_uot.borrow(),
+            quic: *self.naive_quic.borrow(),
+            congestion_control: Self::panel_value(&self.naive_cc, cx, ""),
+        }
+    }
+
+    /// Config-completeness T06: SSH inner UI state as a store fold.
+    fn ssh_fold(&self, cx: &App) -> SshFold {
+        SshFold {
+            user: self.ssh_user.read(cx).value().to_string(),
+            password: self.ssh_password.read(cx).value().to_string(),
+            private_key: self.ssh_private_key.read(cx).value().to_string(),
+            private_key_path: self.ssh_key_path.read(cx).value().to_string(),
+            private_key_passphrase: self.ssh_key_pass.read(cx).value().to_string(),
+            host_key: self.ssh_host_key.read(cx).value().to_string(),
+            host_key_algorithms: self.ssh_host_key_algs.read(cx).value().to_string(),
+            client_version: self.ssh_client_version.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T07: Snell inner UI state as a store fold. The
+    /// version picker falls back to blank (engine default 4 — never
+    /// fabricated, contract C2).
+    fn snell_fold(&self, cx: &App) -> SnellFold {
+        SnellFold {
+            psk: self.snell_psk.read(cx).value().to_string(),
+            version: Self::panel_value(&self.snell_version, cx, ""),
+            obfs_mode: self.snell_obfs_mode.read(cx).value().to_string(),
+            obfs_host: self.snell_obfs_host.read(cx).value().to_string(),
+            userkey: self.snell_userkey.read(cx).value().to_string(),
+            reuse: *self.snell_reuse.borrow(),
+            network: self.snell_network.read(cx).value().to_string(),
+            mode: self.snell_mode.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T07: ShadowTLS inner UI state as a store fold
+    /// (version keep-blank, password text — the page adds S2-forced + S4).
+    fn shadowtls_fold(&self, cx: &App) -> ShadowTlsFold {
+        ShadowTlsFold {
+            version: Self::panel_value(&self.shadowtls_version, cx, ""),
+            password: self.shadowtls_password.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T07: Xray-VLESS Ph1 UI state as a store fold. All
+    /// three pickers fall back to blank (never fabricated — contract C2).
+    fn xray_fold(&self, cx: &App) -> XrayFold {
+        XrayFold {
+            uuid: self.xray_uuid.read(cx).value().to_string(),
+            encryption: self.xray_enc.read(cx).value().to_string(),
+            flow: Self::panel_value(&self.xray_flow, cx, ""),
+            sni: self.xray_sni.read(cx).value().to_string(),
+            fp: Self::panel_value(&self.xray_fp, cx, ""),
+            alpn: self.xray_alpn.read(cx).value().to_string(),
+            pbk: self.xray_pbk.read(cx).value().to_string(),
+            sid: self.xray_sid.read(cx).value().to_string(),
+            spiderx: self.xray_spiderx.read(cx).value().to_string(),
+            network: Self::panel_value(&self.xray_network, cx, ""),
+            mode: self.xray_mode.read(cx).value().to_string(),
+            mux: Self::panel_value(&self.xray_mux, cx, ""),
+        }
+    }
+
+    /// Config-completeness T07: extra-core inner UI state as a store fold.
+    fn extra_fold(&self, cx: &App) -> ExtraFold {
+        ExtraFold {
+            exe: self.extra_exe.read(cx).value().to_string(),
+            args: self.extra_args.read(cx).value().to_string(),
+            config: self.extra_config.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T05: S2-forced UI state as a store fold — the
+    /// shared S2 entities (the enable cell never renders on forced pages, so
+    /// it never folds there either).
+    fn tls_forced_fold(&self, cx: &App) -> TlsForcedFold {
+        TlsForcedFold {
+            sni: self.s2_sni.read(cx).value().to_string(),
+            alpn: self.s2_alpn.read(cx).value().to_string(),
+            fp: Self::panel_value(&self.s2_fp, cx, ""),
+            insecure: *self.s2_insecure.borrow(),
+            pbk: self.s2_pbk.read(cx).value().to_string(),
+            sid: self.s2_sid.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T02: S1 UI state as a store fold.
+    fn transport_fold(&self, cx: &App) -> TransportFold {
+        TransportFold {
+            network: Self::panel_value(&self.s1_network, cx, "tcp"),
+            path: self.s1_path.read(cx).value().to_string(),
+            host: self.s1_host.read(cx).value().to_string(),
+            method: self.s1_method.read(cx).value().to_string(),
+            service_name: self.s1_service_name.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T02: S2 UI state as a store fold.
+    fn tls_optional_fold(&self, cx: &App) -> TlsOptionalFold {
+        TlsOptionalFold {
+            enable: *self.s2_enable.borrow(),
+            sni: self.s2_sni.read(cx).value().to_string(),
+            alpn: self.s2_alpn.read(cx).value().to_string(),
+            fp: Self::panel_value(&self.s2_fp, cx, ""),
+            insecure: *self.s2_insecure.borrow(),
+            pbk: self.s2_pbk.read(cx).value().to_string(),
+            sid: self.s2_sid.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T02: effective S3 mode — brutal forces On
+    /// (Throne parity); the stored cell is untouched so unsetting brutal
+    /// restores the picked mode.
+    fn s3_effective_mode(&self) -> String {
+        if *self.s3_brutal.borrow() {
+            "on".to_string()
+        } else {
+            self.s3_mode.borrow().clone()
+        }
+    }
+
+    /// Config-completeness T02: S3 UI state as a store fold (effective
+    /// mode — brutal-forced On folds as `on`).
+    fn mux_fold(&self, cx: &App) -> MuxFold {
+        MuxFold {
+            mode: self.s3_effective_mode(),
+            brutal_enable: *self.s3_brutal.borrow(),
+            brutal_up_mbps: self.s3_up.read(cx).value().to_string(),
+            brutal_down_mbps: self.s3_down.read(cx).value().to_string(),
+        }
+    }
+
+    /// Config-completeness T02: S4 UI state as a store fold.
+    fn dial_fold(&self, cx: &App) -> DialFold {
+        DialFold {
+            reuse_addr: *self.s4_reuse.borrow(),
+            tcp_fast_open: *self.s4_fastopen.borrow(),
+            udp_fragment: *self.s4_fragment.borrow(),
+            tcp_multi_path: *self.s4_multipath.borrow(),
+            connect_timeout: self.s4_timeout.read(cx).value().to_string(),
+            bind_interface: self.s4_bind.read(cx).value().to_string(),
+            inet4_bind_address: self.s4_inet4.read(cx).value().to_string(),
+            inet6_bind_address: self.s4_inet6.read(cx).value().to_string(),
+        }
     }
 
     /// Ticket 05: expand direction of the Advanced swap — merge non-blank
     /// guided values into the JSON box, then clear the guided inputs when
     /// the box parses as an object. A garbage box keeps the inputs, so
     /// nothing is ever lost (the commit fold reports that error instead).
+    /// Config-completeness T02/T03: on guided pages the panels merge and
+    /// clear the same way (one truth after expand); other protocols keep
+    /// the guided-only behavior byte-for-byte.
     fn expand_merge(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
-        let protocol = self.protocol.read(cx).value().to_string();
+        let protocol = self.protocol_text(cx);
         let identity = guided_identity_fields(&protocol)
             .and_then(|guided| guided.key.map(|key| (key, guided.read_keys)));
-        let merged = fold_guided_into_params(
+        let mut merged = fold_guided_into_params(
             &box_text,
             self.guided_server.read(cx).value().as_ref(),
             self.guided_port.read(cx).value().as_ref(),
             identity,
             self.guided_identity.read(cx).value().as_ref(),
         );
+        // Each page folds exactly what it renders (never smears keys onto
+        // foreign rows); the clear below resets exactly what was merged.
+        let page = matches!(
+            protocol.as_str(),
+            "vless"
+                | "vmess"
+                | "trojan"
+                | "shadowsocks"
+                | "wireguard"
+                | "amneziawg"
+                | "hysteria"
+                | "hysteria2"
+                | "tuic"
+                | "socks"
+                | "http"
+                | "https"
+                | "anytls"
+                | "naive"
+                | "ssh"
+                | "snell"
+                | "shadowtls"
+                | "xray"
+                | "chain"
+                | "extra-core"
+        );
+        if page {
+            match protocol.as_str() {
+                "vless" => {
+                    let (uuid, flow, packet_encoding) = self.vless_inner_values(cx);
+                    merged = fold_vless_inner_into_params(&merged, &uuid, &flow, &packet_encoding);
+                    merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
+                    merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
+                    if flow != "xtls-rprx-vision" {
+                        merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    }
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "vmess" => {
+                    let (uuid, aid, cipher, packet_encoding) = self.vmess_inner_values(cx);
+                    merged = fold_vmess_inner_into_params(
+                        &merged,
+                        &uuid,
+                        &aid,
+                        &cipher,
+                        &packet_encoding,
+                    );
+                    merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
+                    merged = fold_tls_vmess_into_params(&merged, &self.tls_optional_fold(cx));
+                    merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "trojan" => {
+                    let password = self.trojan_password.read(cx).value().to_string();
+                    merged = fold_trojan_inner_into_params(&merged, &password);
+                    merged = fold_transport_into_params(&merged, &self.transport_fold(cx));
+                    merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
+                    merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "shadowsocks" => {
+                    let (method, password, plugin, plugin_opts, uot) = self.ss_inner_values(cx);
+                    merged = fold_shadowsocks_inner_into_params(
+                        &merged,
+                        &method,
+                        &password,
+                        &plugin,
+                        &plugin_opts,
+                        uot,
+                    );
+                    merged = fold_mux_into_params(&merged, &self.mux_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "wireguard" => {
+                    merged =
+                        fold_wireguard_into_params(&merged, &self.wireguard_fold(cx, "wireguard"));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "amneziawg" => {
+                    merged =
+                        fold_wireguard_into_params(&merged, &self.wireguard_fold(cx, "amneziawg"));
+                    merged = fold_amneziawg_into_params(&merged, &self.amnezia_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "hysteria" | "hysteria2" => {
+                    merged = fold_hysteria_into_params(
+                        &merged,
+                        &self.hysteria_fold(cx),
+                        protocol == "hysteria2",
+                    );
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "tuic" => {
+                    merged = fold_tuic_into_params(&merged, &self.tuic_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                // Config-completeness T06: small matrices merge exactly what
+                // their pages render (same scoping as `effective_params`).
+                "socks" => {
+                    merged = fold_socks_into_params(&merged, &self.socks_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "http" | "https" => {
+                    merged = fold_http_into_params(&merged, &self.http_fold(cx));
+                    merged = fold_tls_optional_into_params(&merged, &self.tls_optional_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "anytls" => {
+                    merged = fold_anytls_into_params(&merged, &self.anytls_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "naive" => {
+                    merged = fold_naive_into_params(&merged, &self.naive_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "ssh" => {
+                    merged = fold_ssh_into_params(&merged, &self.ssh_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                // Config-completeness T07: edge pages merge exactly what
+                // their pages render (same scoping as `effective_params`).
+                "snell" => {
+                    merged = fold_snell_into_params(&merged, &self.snell_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "shadowtls" => {
+                    merged = fold_shadowtls_into_params(&merged, &self.shadowtls_fold(cx));
+                    merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
+                    merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
+                }
+                "xray" => {
+                    merged = fold_xray_into_params(&merged, &self.xray_fold(cx));
+                }
+                "chain" => {
+                    merged = fold_chain_nodes_into_params(&merged, &self.chain_hops.borrow());
+                }
+                "extra-core" => {
+                    merged = fold_extra_into_params(&merged, &self.extra_fold(cx));
+                }
+                _ => {}
+            }
+        }
         let parseable = merged.trim().is_empty()
             || serde_json::from_str::<serde_json::Value>(&merged)
                 .ok()
@@ -2134,15 +7025,300 @@ impl ConfigForm {
                     state.set_value(String::new(), window, cx);
                 });
             }
+            if page {
+                self.clear_panels(window, cx, &protocol);
+            }
+        }
+    }
+
+    /// Config-completeness T02/T03: collapse counterpart of
+    /// [`ConfigForm::expand_merge`] for the panels — reset text inputs,
+    /// dropdowns (to their defaults), toggles and the mux mode cell.
+    /// Resets exactly what the page merged: the current page's inner plus
+    /// the shared panels it folds (shadowsocks folds S3+S4 only, so S1/S2
+    /// inputs — possibly holding another page's unmerged typing — stand).
+    fn clear_panels(&self, window: &mut Window, cx: &mut Context<AppView>, protocol: &str) {
+        // S4 (dial) merges on every guided page; S3 (mux) only on the
+        // vless/vmess/trojan/shadowsocks pages (T03 scoping: a page resets
+        // exactly what it merged, so another page's unmerged typing stands —
+        // wireguard/amneziawg never touch S3).
+        let mut texts: Vec<&Entity<InputState>> = vec![
+            &self.s4_timeout,
+            &self.s4_bind,
+            &self.s4_inet4,
+            &self.s4_inet6,
+        ];
+        let mut selects: Vec<(&Entity<SelectState<PanelChoiceList>>, &'static str)> = vec![];
+        let mut cells: Vec<&Rc<RefCell<bool>>> = vec![
+            &self.s4_reuse,
+            &self.s4_fastopen,
+            &self.s4_fragment,
+            &self.s4_multipath,
+        ];
+        let mux_page = matches!(protocol, "vless" | "vmess" | "trojan" | "shadowsocks");
+        if mux_page {
+            texts.extend([&self.s3_up, &self.s3_down]);
+            cells.push(&self.s3_brutal);
+        }
+        if protocol != "shadowsocks" {
+            // Config-completeness T05: forced-TLS pages (hysteria/tuic)
+            // merge the S2 credential inputs only — S1/S3 and the enable
+            // toggle ride other pages, so their unmerged typing stands.
+            // Config-completeness T06: anytls/naive join the forced set;
+            // http/https merge the optional-S2 panel but never S1; socks/ssh
+            // merge no shared panel (S4 alone).
+            // Config-completeness T07: shadowtls joins the forced set; snell /
+            // xray / chain / extra-core merge no shared panel (S4 alone for
+            // snell, none for the rest).
+            let forced_tls = matches!(
+                protocol,
+                "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls"
+            );
+            let inner_only = matches!(
+                protocol,
+                "socks" | "ssh" | "snell" | "xray" | "chain" | "extra-core"
+            );
+            let no_transport = matches!(protocol, "http" | "https");
+            if !forced_tls && !inner_only && !no_transport {
+                texts.extend([
+                    &self.s1_path,
+                    &self.s1_host,
+                    &self.s1_method,
+                    &self.s1_service_name,
+                ]);
+                selects.extend([(&self.s1_network, "tcp")]);
+                cells.extend([&self.s2_enable]);
+            }
+            if !inner_only {
+                if no_transport {
+                    cells.extend([&self.s2_enable]);
+                }
+                texts.extend([&self.s2_sni, &self.s2_alpn, &self.s2_pbk, &self.s2_sid]);
+                selects.extend([(&self.s2_fp, "")]);
+                cells.extend([&self.s2_insecure]);
+            }
+        }
+        match protocol {
+            "vless" => {
+                texts.push(&self.vless_uuid);
+                selects.extend([(&self.vless_flow, ""), (&self.vless_packet_encoding, "")]);
+            }
+            "vmess" => {
+                texts.extend([&self.vmess_uuid, &self.vmess_aid]);
+                selects.extend([
+                    (&self.vmess_security, "auto"),
+                    (&self.vmess_packet_encoding, ""),
+                ]);
+            }
+            "trojan" => {
+                texts.push(&self.trojan_password);
+            }
+            "shadowsocks" => {
+                texts.extend([&self.ss_password, &self.ss_plugin_opts]);
+                selects.extend([(&self.ss_method, ""), (&self.ss_plugin, "")]);
+                cells.push(&self.ss_uot);
+            }
+            "hysteria" | "hysteria2" => {
+                texts.extend([
+                    &self.hy_server_ports,
+                    &self.hy_hop_interval,
+                    &self.hy_up,
+                    &self.hy_down,
+                    &self.hy_obfs,
+                    &self.hy_auth,
+                    &self.hy_recv_conn,
+                    &self.hy_recv,
+                    &self.hy_password,
+                ]);
+                selects.extend([(&self.hy_auth_type, "")]);
+                cells.push(&self.hy_mtu);
+            }
+            "tuic" => {
+                texts.extend([&self.tuic_uuid, &self.tuic_password, &self.tuic_heartbeat]);
+                selects.extend([(&self.tuic_cc, ""), (&self.tuic_relay, "")]);
+                cells.extend([&self.tuic_uot, &self.tuic_zero_rtt]);
+            }
+            // Config-completeness T06: small matrices reset exactly what
+            // their pages merged (shared-panel scope above mirrors the same
+            // rule). The ssh key area clears like any text input.
+            "socks" => {
+                texts.extend([&self.socks_username, &self.socks_password]);
+                selects.extend([(&self.socks_version, ""), (&self.socks_network, "tcp")]);
+                cells.push(&self.socks_uot);
+            }
+            "http" | "https" => {
+                texts.extend([
+                    &self.http_username,
+                    &self.http_password,
+                    &self.http_path,
+                    &self.http_headers,
+                ]);
+            }
+            "anytls" => {
+                texts.extend([
+                    &self.anytls_password,
+                    &self.anytls_interval,
+                    &self.anytls_timeout,
+                    &self.anytls_min,
+                ]);
+            }
+            "naive" => {
+                texts.extend([&self.naive_username, &self.naive_password]);
+                selects.extend([(&self.naive_cc, "")]);
+                cells.extend([&self.naive_uot, &self.naive_quic]);
+            }
+            "ssh" => {
+                texts.extend([
+                    &self.ssh_user,
+                    &self.ssh_password,
+                    &self.ssh_key_path,
+                    &self.ssh_key_pass,
+                    &self.ssh_host_key,
+                    &self.ssh_host_key_algs,
+                    &self.ssh_client_version,
+                ]);
+                // The key blob area is a `TextareaState`, not an `InputState`
+                // (it cannot ride the `texts` vec) — cleared the same way.
+                self.ssh_private_key.update(cx, |state, cx| {
+                    state.set_value(String::new(), window, cx);
+                });
+            }
+            // Config-completeness T07: edge pages reset exactly what their
+            // pages merged (shared-panel scope above mirrors the same rule).
+            // The chain hop cell is deliberately NOT reset here: the fold is
+            // idempotent, so keeping it makes the expand→commit path refold
+            // byte-identical instead of wiping merged hops (the collapse echo
+            // below re-syncs it from the box instead).
+            "snell" => {
+                texts.extend([
+                    &self.snell_psk,
+                    &self.snell_obfs_mode,
+                    &self.snell_obfs_host,
+                    &self.snell_userkey,
+                    &self.snell_network,
+                    &self.snell_mode,
+                ]);
+                selects.extend([(&self.snell_version, "")]);
+                cells.push(&self.snell_reuse);
+            }
+            "shadowtls" => {
+                texts.push(&self.shadowtls_password);
+                selects.extend([(&self.shadowtls_version, "")]);
+            }
+            "xray" => {
+                texts.extend([
+                    &self.xray_uuid,
+                    &self.xray_enc,
+                    &self.xray_sni,
+                    &self.xray_alpn,
+                    &self.xray_pbk,
+                    &self.xray_sid,
+                    &self.xray_spiderx,
+                    &self.xray_mode,
+                ]);
+                selects.extend([
+                    (&self.xray_flow, ""),
+                    (&self.xray_fp, ""),
+                    (&self.xray_network, ""),
+                    (&self.xray_mux, ""),
+                ]);
+            }
+            "chain" => {}
+            "extra-core" => {
+                texts.extend([&self.extra_exe, &self.extra_args]);
+                // The config area is a `TextareaState` — cleared like the ssh
+                // key blob above.
+                self.extra_config.update(cx, |state, cx| {
+                    state.set_value(String::new(), window, cx);
+                });
+            }
+            "wireguard" => {
+                texts.extend([
+                    &self.wg_private,
+                    &self.wg_public,
+                    &self.wg_preshared,
+                    &self.wg_reserved,
+                    &self.wg_keepalive,
+                    &self.wg_local_addr,
+                    &self.wg_dns,
+                    &self.wg_mtu,
+                    &self.wg_workers,
+                ]);
+                cells.push(&self.wg_sys_ifc);
+            }
+            "amneziawg" => {
+                texts.extend([
+                    &self.awg_private,
+                    &self.awg_public,
+                    &self.awg_preshared,
+                    &self.awg_reserved,
+                    &self.awg_keepalive,
+                    &self.awg_local_addr,
+                    &self.awg_dns,
+                    &self.awg_mtu,
+                    &self.awg_workers,
+                    &self.awg_jc,
+                    &self.awg_jmin,
+                    &self.awg_jmax,
+                    &self.awg_s1,
+                    &self.awg_s2,
+                    &self.awg_s3,
+                    &self.awg_s4,
+                    &self.awg_h1,
+                    &self.awg_h2,
+                    &self.awg_h3,
+                    &self.awg_h4,
+                    &self.awg_i1,
+                    &self.awg_i2,
+                    &self.awg_i3,
+                    &self.awg_i4,
+                    &self.awg_i5,
+                    &self.awg_hpk,
+                    &self.awg_pad,
+                    &self.awg_rekey_after,
+                    &self.awg_rekey_timeout,
+                    &self.awg_reject_after,
+                    &self.awg_keepalive_timeout,
+                    &self.awg_max_handshake,
+                ]);
+                selects.extend([(&self.awg_version, "")]);
+                cells.extend([
+                    &self.awg_sys_ifc,
+                    &self.awg_enable,
+                    &self.awg_trailers,
+                    &self.awg_cookies,
+                ]);
+            }
+            _ => {}
+        }
+        for entity in texts {
+            entity.update(cx, |state, cx| {
+                state.set_value(String::new(), window, cx);
+            });
+        }
+        for (entity, default) in selects {
+            let next = default.to_string();
+            entity.update(cx, |state, cx| {
+                state.set_selected_value(&next, window, cx);
+            });
+        }
+        for cell in cells {
+            *cell.borrow_mut() = false;
+        }
+        if mux_page {
+            *self.s3_mode.borrow_mut() = String::new();
         }
     }
 
     /// Ticket 05: collapse direction of the Advanced swap — echo the JSON
     /// box into blank guided inputs only (never clobbers values kept
     /// across a garbage box).
+    /// Config-completeness T02/T03: on guided pages the panels echo the
+    /// same way (defaults count as blank for dropdowns, off counts as
+    /// blank for toggles).
     fn collapse_echo(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
-        let protocol = self.protocol.read(cx).value().to_string();
+        let protocol = self.protocol_text(cx);
         let read_keys: &[&str] = guided_identity_fields(&protocol)
             .map(|guided| guided.read_keys)
             .unwrap_or(&[]);
@@ -2166,6 +7342,571 @@ impl ConfigForm {
                 entity.update(cx, |state, cx| {
                     state.set_value(next, window, cx);
                 });
+            }
+        }
+        if matches!(
+            protocol.as_str(),
+            "vless"
+                | "vmess"
+                | "trojan"
+                | "shadowsocks"
+                | "wireguard"
+                | "amneziawg"
+                | "hysteria"
+                | "hysteria2"
+                | "tuic"
+                | "socks"
+                | "http"
+                | "https"
+                | "anytls"
+                | "naive"
+                | "ssh"
+                | "snell"
+                | "shadowtls"
+                | "xray"
+                | "chain"
+                | "extra-core"
+        ) {
+            self.echo_panels(window, cx, &box_text, &protocol);
+        }
+    }
+
+    /// Config-completeness T02/T03: collapse counterpart of
+    /// [`ConfigForm::clear_panels`] — echo the JSON box into blank/default
+    /// panel inputs only (never clobbers values kept across a garbage box).
+    /// Shared panels echo on every guided page; inner fields echo per page
+    /// (the vmess cipher reads grammar-aware, like prefill).
+    fn echo_panels(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        box_text: &str,
+        protocol: &str,
+    ) {
+        // Shared panels echo only what the page merged (clear-scoping
+        // mirror): S4 dial on every guided page; S1/S2/S3 only on the pages
+        // that fold them (wireguard/amneziawg take S4 alone).
+        let full_panels = matches!(protocol, "vless" | "vmess" | "trojan");
+        let mux_page = matches!(protocol, "vless" | "vmess" | "trojan" | "shadowsocks");
+        let mut shared_texts: Vec<(&Entity<InputState>, &[&str])> = vec![
+            (&self.s4_timeout, &["connect_timeout"][..]),
+            (&self.s4_bind, &["bind_interface"][..]),
+            (&self.s4_inet4, &["inet4_bind_address"][..]),
+            (&self.s4_inet6, &["inet6_bind_address"][..]),
+        ];
+        // Config-completeness T05: forced-TLS pages echo the S2 credential
+        // inputs (never the enable toggle or S1 — those ride other pages).
+        // Config-completeness T06: anytls/naive join the forced set;
+        // http/https echo the full optional-S2 panel (enable included).
+        // Config-completeness T07: shadowtls joins the forced set (S2
+        // credentials echo; the enable toggle rides other pages).
+        let forced_tls = matches!(
+            protocol,
+            "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls"
+        );
+        let optional_tls = matches!(protocol, "http" | "https");
+        if full_panels {
+            shared_texts.extend([
+                (&self.s1_path, &["path"][..]),
+                (&self.s1_host, &["host"][..]),
+                (&self.s1_method, &["method"][..]),
+                (&self.s1_service_name, &["service_name", "serviceName"][..]),
+            ]);
+        }
+        if full_panels || forced_tls || optional_tls {
+            shared_texts.extend([
+                (&self.s2_sni, &["sni", "peer"][..]),
+                (&self.s2_alpn, &["alpn"][..]),
+                (&self.s2_pbk, &["pbk"][..]),
+                (&self.s2_sid, &["sid"][..]),
+            ]);
+        }
+        if mux_page {
+            shared_texts.extend([
+                (&self.s3_up, &["brutal_up_mbps", "brutal_up"][..]),
+                (&self.s3_down, &["brutal_down_mbps", "brutal_down"][..]),
+            ]);
+        }
+        for (entity, keys) in shared_texts {
+            let value = guided_prefill_value(box_text, keys);
+            let blank = entity.read(cx).value().to_string().trim().is_empty();
+            if blank && !value.is_empty() {
+                entity.update(cx, |state, cx| {
+                    state.set_value(value.clone(), window, cx);
+                });
+            }
+        }
+        // Inner texts per page (blank inputs only, same rule).
+        let inner_texts: &[(&Entity<InputState>, &[&str])] = match protocol {
+            "vless" => &[(&self.vless_uuid, &["uuid", "id"][..])],
+            "vmess" => &[
+                (&self.vmess_uuid, &["uuid", "id"][..]),
+                (&self.vmess_aid, &["alter_id", "aid"][..]),
+            ],
+            "trojan" => &[(&self.trojan_password, &["password"][..])],
+            "shadowsocks" => &[
+                (&self.ss_password, &["password"][..]),
+                (
+                    &self.ss_plugin_opts,
+                    &["plugin_opts", "plugin-opts", "pluginOpts"][..],
+                ),
+            ],
+            // Config-completeness T05: Hysteria inner texts echo on both
+            // layouts (one page, two protocols — the v1 auth reads `auth`
+            // only so a v2 `password` never duplicates into it); TUIC inner
+            // texts echo the seven tuning fields.
+            "hysteria" | "hysteria2" => &[
+                (&self.hy_server_ports, &["server_ports"][..]),
+                (&self.hy_hop_interval, &["hop_interval"][..]),
+                (&self.hy_up, &["up", "up_mbps", "upmbps"][..]),
+                (&self.hy_down, &["down", "down_mbps", "downmbps"][..]),
+                (&self.hy_obfs, &["obfs"][..]),
+                (&self.hy_auth, &["auth"][..]),
+                (&self.hy_recv_conn, &["recv_window_conn"][..]),
+                (&self.hy_recv, &["recv_window"][..]),
+                (&self.hy_password, &["password"][..]),
+            ],
+            "tuic" => &[
+                (&self.tuic_uuid, &["uuid", "id"][..]),
+                (&self.tuic_password, &["password"][..]),
+                (&self.tuic_heartbeat, &["heartbeat"][..]),
+            ],
+            // Config-completeness T06: small-matrix inner texts echo on
+            // blank inputs only (same rule). The ssh host-key lists read
+            // through the list reader (stored arrays echo as comma text);
+            // the key blob area echoes like any text input.
+            "socks" => &[
+                (&self.socks_username, &["username"][..]),
+                (&self.socks_password, &["password"][..]),
+            ],
+            "http" | "https" => &[
+                (&self.http_username, &["username"][..]),
+                (&self.http_password, &["password"][..]),
+                (&self.http_path, &["path"][..]),
+                (&self.http_headers, &["headers"][..]),
+            ],
+            "anytls" => &[
+                (&self.anytls_password, &["password"][..]),
+                (
+                    &self.anytls_interval,
+                    &["idle_session_check_interval", "interval"][..],
+                ),
+                (
+                    &self.anytls_timeout,
+                    &["idle_session_timeout", "timeout"][..],
+                ),
+                (&self.anytls_min, &["min_idle_session", "min"][..]),
+            ],
+            "naive" => &[
+                (&self.naive_username, &["username"][..]),
+                (&self.naive_password, &["password"][..]),
+            ],
+            "ssh" => &[
+                (&self.ssh_user, &["user", "username"][..]),
+                (&self.ssh_password, &["password"][..]),
+                (&self.ssh_key_path, &["private_key_path"][..]),
+                (
+                    &self.ssh_key_pass,
+                    &["private_key_passphrase", "private_key_pass"][..],
+                ),
+                (&self.ssh_client_version, &["client_version"][..]),
+            ],
+            // Config-completeness T07: edge inner texts echo on blank inputs
+            // only (same rule). The extra config area echoes through its own
+            // reader below (stored objects read as JSON text); chain hops
+            // re-sync from the box unconditionally (see below).
+            "snell" => &[
+                (&self.snell_psk, &["psk"][..]),
+                (&self.snell_obfs_mode, &["obfs_mode", "obfs"][..]),
+                (&self.snell_obfs_host, &["obfs_host", "obfs-host"][..]),
+                (&self.snell_userkey, &["userkey"][..]),
+                (&self.snell_network, &["network"][..]),
+                (&self.snell_mode, &["mode"][..]),
+            ],
+            "shadowtls" => &[(&self.shadowtls_password, &["password"][..])],
+            "xray" => &[
+                (&self.xray_uuid, &["uuid", "id"][..]),
+                (&self.xray_enc, &["encryption"][..]),
+                (&self.xray_sni, &["sni"][..]),
+                (&self.xray_alpn, &["alpn"][..]),
+                (&self.xray_pbk, &["pbk"][..]),
+                (&self.xray_sid, &["sid"][..]),
+                (&self.xray_spiderx, &["spiderx"][..]),
+                (&self.xray_mode, &["mode"][..]),
+            ],
+            "extra-core" => &[
+                (&self.extra_exe, &["exe", "binary"][..]),
+                (&self.extra_args, &["args"][..]),
+            ],
+            // Config-completeness T04: WG peer/net rows echo on both pages
+            // (separate entities per page — T03 scoping).
+            "wireguard" => &[
+                (&self.wg_private, &["private_key", "privatekey"][..]),
+                (&self.wg_public, &["public_key", "publickey"][..]),
+                (
+                    &self.wg_preshared,
+                    &["pre_shared_key", "presharedkey", "preshared_key"][..],
+                ),
+                (&self.wg_reserved, &["reserved"][..]),
+                (
+                    &self.wg_keepalive,
+                    &["persistent_keepalive", "persistent_keepalive_interval"][..],
+                ),
+                (
+                    &self.wg_local_addr,
+                    &["address", "local_address", "local_addr"][..],
+                ),
+                (&self.wg_dns, &["dns"][..]),
+                (&self.wg_mtu, &["mtu"][..]),
+                (&self.wg_workers, &["workers"][..]),
+            ],
+            "amneziawg" => &[
+                (&self.awg_private, &["private_key", "privatekey"][..]),
+                (&self.awg_public, &["public_key", "publickey"][..]),
+                (
+                    &self.awg_preshared,
+                    &["pre_shared_key", "presharedkey", "preshared_key"][..],
+                ),
+                (&self.awg_reserved, &["reserved"][..]),
+                (
+                    &self.awg_keepalive,
+                    &["persistent_keepalive", "persistent_keepalive_interval"][..],
+                ),
+                (
+                    &self.awg_local_addr,
+                    &["address", "local_address", "local_addr"][..],
+                ),
+                (&self.awg_dns, &["dns"][..]),
+                (&self.awg_mtu, &["mtu"][..]),
+                (&self.awg_workers, &["workers"][..]),
+                (&self.awg_jc, &["jc"][..]),
+                (&self.awg_jmin, &["jmin"][..]),
+                (&self.awg_jmax, &["jmax"][..]),
+                (&self.awg_s1, &["s1"][..]),
+                (&self.awg_s2, &["s2"][..]),
+                (&self.awg_s3, &["s3"][..]),
+                (&self.awg_s4, &["s4"][..]),
+                (&self.awg_h1, &["h1"][..]),
+                (&self.awg_h2, &["h2"][..]),
+                (&self.awg_h3, &["h3"][..]),
+                (&self.awg_h4, &["h4"][..]),
+                (&self.awg_i1, &["i1"][..]),
+                (&self.awg_i2, &["i2"][..]),
+                (&self.awg_i3, &["i3"][..]),
+                (&self.awg_i4, &["i4"][..]),
+                (&self.awg_i5, &["i5"][..]),
+                (&self.awg_hpk, &["headerprotectionkey"][..]),
+                (&self.awg_pad, &["contentpaddingaddition"][..]),
+                (&self.awg_rekey_after, &["rekeyaftertime"][..]),
+                (&self.awg_rekey_timeout, &["rekeytimeout"][..]),
+                (&self.awg_reject_after, &["rejectaftertime"][..]),
+                (&self.awg_keepalive_timeout, &["keepalivetimeout"][..]),
+                (&self.awg_max_handshake, &["maxhandshakeattempts"][..]),
+            ],
+            _ => &[],
+        };
+        for (entity, keys) in inner_texts {
+            let value = guided_prefill_value(box_text, keys);
+            let blank = entity.read(cx).value().to_string().trim().is_empty();
+            if blank && !value.is_empty() {
+                entity.update(cx, |state, cx| {
+                    state.set_value(value.clone(), window, cx);
+                });
+            }
+        }
+        // Config-completeness T06: the ssh host-key lists echo through the
+        // list reader (stored arrays read as comma text) and the key blob
+        // echoes into its area — blank inputs only, same rule.
+        if protocol == "ssh" {
+            for (entity, keys) in [
+                (&self.ssh_host_key, &["host_key"][..]),
+                (&self.ssh_host_key_algs, &["host_key_algorithms"][..]),
+            ] {
+                let value = guided_prefill_list(box_text, keys);
+                let blank = entity.read(cx).value().to_string().trim().is_empty();
+                if blank && !value.is_empty() {
+                    entity.update(cx, |state, cx| {
+                        state.set_value(value.clone(), window, cx);
+                    });
+                }
+            }
+            let key_value = guided_prefill_value(box_text, &["private_key", "privatekey"]);
+            let key_blank = self
+                .ssh_private_key
+                .read(cx)
+                .value()
+                .to_string()
+                .trim()
+                .is_empty();
+            if key_blank && !key_value.is_empty() {
+                self.ssh_private_key.update(cx, |state, cx| {
+                    state.set_value(key_value.clone(), window, cx);
+                });
+            }
+        }
+        // Config-completeness T07: the extra config area echoes through its
+        // reader (stored objects read as JSON text) — blank inputs only.
+        if protocol == "extra-core" {
+            let config_value = extra_config_prefill(box_text);
+            let config_blank = self
+                .extra_config
+                .read(cx)
+                .value()
+                .to_string()
+                .trim()
+                .is_empty();
+            if config_blank && !config_value.is_empty() {
+                self.extra_config.update(cx, |state, cx| {
+                    state.set_value(config_value.clone(), window, cx);
+                });
+            }
+        }
+        // Config-completeness T07: the hop cell always re-syncs from the box
+        // on collapse (hand-edited box JSON wins — expanding always merges
+        // first, so no unmerged editor typing can be clobbered; and the cell
+        // is never cleared, so the expand→commit path refolds idempotently).
+        if protocol == "chain" {
+            *self.chain_hops.borrow_mut() = chain_nodes_of(box_text);
+        }
+        // Config-completeness T06: the socks network echoes S1-rule (the
+        // default counts as blank, like the transport pages).
+        if protocol == "socks" {
+            let value = guided_prefill_value(box_text, &["network"]);
+            let current = self
+                .socks_network
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == "tcp" && !value.is_empty() && value != "tcp" {
+                self.socks_network.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
+        // S1 echoes on the transport pages; the S2 fingerprint echoes on the
+        // optional and forced TLS pages alike (shared entities, one rule).
+        let panel_selects: &[EchoSelect] = if full_panels {
+            &[
+                (&self.s1_network, &["network"][..], "tcp"),
+                (&self.s2_fp, &["fp", "fingerprint"][..], ""),
+            ]
+        } else if forced_tls || optional_tls {
+            &[(&self.s2_fp, &["fp", "fingerprint"][..], "")]
+        } else {
+            &[]
+        };
+        for (entity, keys, default) in panel_selects {
+            let value = guided_prefill_value(box_text, keys);
+            let current = entity
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == *default && !value.is_empty() && value != *default {
+                entity.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
+        // Inner dropdowns per page (a default counts as blank, same rule).
+        let inner_selects: &[EchoSelect] = match protocol {
+            "vless" => &[
+                (&self.vless_flow, &["flow"][..], ""),
+                (
+                    &self.vless_packet_encoding,
+                    &["packet_encoding", "packetEncoding"][..],
+                    "",
+                ),
+            ],
+            "vmess" => &[(
+                &self.vmess_packet_encoding,
+                &["packet_encoding", "packetEncoding"][..],
+                "",
+            )],
+            "shadowsocks" => &[
+                (&self.ss_method, &["method"][..], ""),
+                (&self.ss_plugin, &["plugin"][..], ""),
+            ],
+            // Config-completeness T04: the AWG version reads `awg_version`
+            // else the legacy `version` (a non-2.0|3.x spelling echoes as no
+            // selection and round-trips byte-identical).
+            "amneziawg" => &[(&self.awg_version, &["awg_version", "version"][..], "")],
+            // Config-completeness T05: the v1 auth marker and the TUIC
+            // modes echo the same way (a non-pickable spelling echoes as no
+            // selection and round-trips byte-identical).
+            // Config-completeness T06: the socks version and naive cc echo
+            // the same way (the socks network echoes S1-rule below).
+            "hysteria" | "hysteria2" => &[(&self.hy_auth_type, &["auth_type"][..], "")],
+            "tuic" => &[
+                (&self.tuic_cc, &["congestion_control"][..], ""),
+                (&self.tuic_relay, &["udp_relay_mode"][..], ""),
+            ],
+            "socks" => &[(&self.socks_version, &["version"][..], "")],
+            "naive" => &[(
+                &self.naive_cc,
+                &["quic_congestion_control", "congestion_control"][..],
+                "",
+            )],
+            // Config-completeness T07: edge dropdowns echo the same way (a
+            // non-pickable spelling echoes as no selection and round-trips
+            // byte-identical — the folds never strip).
+            "snell" => &[(&self.snell_version, &["version"][..], "")],
+            "shadowtls" => &[(&self.shadowtls_version, &["version"][..], "")],
+            "xray" => &[
+                (&self.xray_flow, &["flow"][..], ""),
+                (&self.xray_fp, &["fp", "fingerprint"][..], ""),
+                (&self.xray_network, &["network"][..], ""),
+                (&self.xray_mux, &["xray_mux"][..], ""),
+            ],
+            _ => &[],
+        };
+        for (entity, keys, default) in inner_selects {
+            let value = guided_prefill_value(box_text, keys);
+            let current = entity
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == *default && !value.is_empty() && value != *default {
+                entity.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
+        // The vmess cipher reads grammar-aware (legacy `security` vs
+        // new-style `encryption`) — the same reader prefill uses.
+        if protocol == "vmess" {
+            let value = vmess_cipher_value(box_text);
+            let current = self
+                .vmess_security
+                .read(cx)
+                .selected_value()
+                .cloned()
+                .unwrap_or_default();
+            if current == "auto" && !value.is_empty() && value != "auto" {
+                self.vmess_security.update(cx, |state, cx| {
+                    state.set_selected_value(&value, window, cx);
+                });
+            }
+        }
+        let mut shared_cells: Vec<(&Rc<RefCell<bool>>, &[&str])> = vec![
+            (&self.s4_reuse, &["reuse_addr"][..]),
+            (&self.s4_fastopen, &["tcp_fast_open"][..]),
+            (&self.s4_fragment, &["udp_fragment"][..]),
+            (&self.s4_multipath, &["tcp_multi_path"][..]),
+        ];
+        // The S2 insecure toggle echoes on the optional and forced TLS
+        // pages alike (the forced page has no enable toggle to echo).
+        if full_panels || forced_tls || optional_tls {
+            shared_cells.push((
+                &self.s2_insecure,
+                &[
+                    "insecure",
+                    "allowInsecure",
+                    "allow_insecure",
+                    "allowinsecure",
+                ][..],
+            ));
+        }
+        if mux_page {
+            shared_cells.push((&self.s3_brutal, &["brutal_enable"][..]));
+        }
+        for (cell, keys) in shared_cells {
+            if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                *cell.borrow_mut() = true;
+            }
+        }
+        // `security: "tls"` is not a truthy spelling — the enable toggle
+        // echoes the on-values the engine maps (same rule as prefill;
+        // vmess rows read grammar-aware for the legacy boolean). HTTP(S)
+        // rows echo it too (optional-TLS pages, same rule).
+        if (full_panels || optional_tls) && !*self.s2_enable.borrow() {
+            let on = if protocol == "vmess" {
+                vmess_tls_enabled(box_text)
+            } else {
+                let security = guided_prefill_value(box_text, &["security"]);
+                matches!(
+                    security.to_ascii_lowercase().as_str(),
+                    "tls" | "xtls" | "reality"
+                )
+            };
+            if on {
+                *self.s2_enable.borrow_mut() = true;
+            }
+        }
+        if protocol == "shadowsocks"
+            && !*self.ss_uot.borrow()
+            && guided_prefill_bool(box_text, &["udp_over_tcp", "uot"])
+        {
+            *self.ss_uot.borrow_mut() = true;
+        }
+        // Config-completeness T06: SOCKS/Naïve toggles echo the same way
+        // (off counts as blank).
+        if protocol == "socks"
+            && !*self.socks_uot.borrow()
+            && guided_prefill_bool(box_text, &["udp_over_tcp", "uot"])
+        {
+            *self.socks_uot.borrow_mut() = true;
+        }
+        if protocol == "naive" {
+            for (cell, keys) in [
+                (&self.naive_uot, &["udp_over_tcp", "uot"][..]),
+                (&self.naive_quic, &["quic"][..]),
+            ] {
+                if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                    *cell.borrow_mut() = true;
+                }
+            }
+        }
+        // Config-completeness T05: Hysteria/TUIC toggles echo the same way
+        // (off counts as blank).
+        if matches!(protocol, "hysteria" | "hysteria2")
+            && !*self.hy_mtu.borrow()
+            && guided_prefill_bool(box_text, &["disable_mtu_discovery"])
+        {
+            *self.hy_mtu.borrow_mut() = true;
+        }
+        if protocol == "tuic" {
+            for (cell, keys) in [
+                (&self.tuic_uot, &["udp_over_stream"][..]),
+                (&self.tuic_zero_rtt, &["zero_rtt_handshake", "zero_rtt"][..]),
+            ] {
+                if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                    *cell.borrow_mut() = true;
+                }
+            }
+        }
+        // Config-completeness T04: WG/AWG toggles echo the same way (off
+        // counts as blank).
+        if protocol == "wireguard"
+            && !*self.wg_sys_ifc.borrow()
+            && guided_prefill_bool(box_text, &["system", "sys_ifc"])
+        {
+            *self.wg_sys_ifc.borrow_mut() = true;
+        }
+        if protocol == "amneziawg" {
+            for (cell, keys) in [
+                (&self.awg_sys_ifc, &["system", "sys_ifc"][..]),
+                (&self.awg_enable, &["enable_amnezia"][..]),
+                (
+                    &self.awg_trailers,
+                    &["randomtrailers", "random_trailers"][..],
+                ),
+                (
+                    &self.awg_cookies,
+                    &["disablecookies", "disable_cookies"][..],
+                ),
+            ] {
+                if !*cell.borrow() && guided_prefill_bool(box_text, keys) {
+                    *cell.borrow_mut() = true;
+                }
+            }
+        }
+        if mux_page && self.s3_mode.borrow().is_empty() {
+            let mode = guided_prefill_value(box_text, &["mux"]);
+            if !mode.is_empty() {
+                *self.s3_mode.borrow_mut() = mode;
             }
         }
     }
@@ -4675,6 +10416,655 @@ impl FacetPicker {
     }
 }
 
+/// Config-completeness T01: one row of the Add-dialog protocol picker. `title`
+/// is the dropdown row, `display` is the trigger text (`Protocol: vless`),
+/// `value` is the canonical stored type, `id` is the stable headless anchor
+/// (`protocol-option-vless`, …). Mirrors the facet `Select` composition (same
+/// delegate shape, same stable-id rows) so the picker needs no new kit API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtocolChoice {
+    id: String,
+    title: String,
+    display: String,
+    value: String,
+}
+
+impl SearchableListItem for ProtocolChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.title.clone().into()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(self.display.clone().into_any_element())
+    }
+
+    fn value(&self) -> &String {
+        &self.value
+    }
+}
+
+/// Config-completeness T01: the item data behind the protocol `Select` — a
+/// dedicated delegate (not `SearchableVec`) so option rows render with stable
+/// observed ids (`protocol-option-<type>`) that headless tests can find.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProtocolChoiceList(Vec<ProtocolChoice>);
+
+impl SearchableListDelegate for ProtocolChoiceList {
+    type Item = ProtocolChoice;
+
+    fn items_count(&self, _section: usize) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&ProtocolChoice> {
+        self.0.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        ProtocolChoice: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0
+            .iter()
+            .position(|choice| choice.value() == value)
+            .map(IndexPath::new)
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &ProtocolChoice,
+        _checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .id(item.id.clone())
+                .test_support()
+                .child(item.title.clone())
+                .into_any_element(),
+        )
+    }
+}
+
+/// Config-completeness T01: the 24 canonical stored types as picker rows, in
+/// [`VALID_PROTOCOLS`] order (the store owns the list — the dialog never
+/// forks it, so a typo'd protocol is unrepresentable).
+/// Config-completeness T08: `direct` rides last (trivial final, CAP-12).
+fn protocol_choices() -> Vec<ProtocolChoice> {
+    VALID_PROTOCOLS
+        .iter()
+        .map(|protocol| ProtocolChoice {
+            id: format!("protocol-option-{protocol}"),
+            title: protocol.to_string(),
+            display: format!("Protocol: {protocol}"),
+            value: protocol.to_string(),
+        })
+        .collect()
+}
+
+/// Config-completeness T02: the item data behind one panel `Select`
+/// (flow, packet_encoding, network, fp). Same delegate shape as the
+/// protocol picker (stable `SelectedListItem` rows); one shared type for
+/// all panel dropdowns so each new select needs no new delegate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelChoice {
+    id: String,
+    title: String,
+    display: String,
+    value: String,
+}
+
+impl SearchableListItem for PanelChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.title.clone().into()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(self.display.clone().into_any_element())
+    }
+
+    fn value(&self) -> &String {
+        &self.value
+    }
+}
+
+/// Config-completeness T02: the item data behind panel `Select`s — a
+/// dedicated delegate (not `SearchableVec`) so option rows render with
+/// stable observed ids (`<prefix>-<value>`) that headless tests can find.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PanelChoiceList(Vec<PanelChoice>);
+
+impl SearchableListDelegate for PanelChoiceList {
+    type Item = PanelChoice;
+
+    fn items_count(&self, _section: usize) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&PanelChoice> {
+        self.0.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        PanelChoice: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0
+            .iter()
+            .position(|choice| choice.value() == value)
+            .map(IndexPath::new)
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &PanelChoice,
+        _checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .id(item.id.clone())
+                .test_support()
+                .child(item.title.clone())
+                .into_any_element(),
+        )
+    }
+}
+
+/// Config-completeness T02: picker rows for one panel dropdown — `items`
+/// are `(value, title)` pairs; ids read `<prefix>-<slug>` where blank
+/// values slug to `default`.
+fn panel_choices(prefix: &str, items: &[(&str, &str)]) -> Vec<PanelChoice> {
+    items
+        .iter()
+        .map(|(value, title)| {
+            let slug = if value.trim().is_empty() {
+                "default".to_string()
+            } else {
+                value.to_string()
+            };
+            PanelChoice {
+                id: format!("{prefix}-{slug}"),
+                title: title.to_string(),
+                display: title.to_string(),
+                value: value.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Config-completeness T02: option tables for the panel dropdowns (one
+/// source — render, prefill and fold all read these, so a value the UI
+/// cannot pick is a value the fold cannot write).
+fn flow_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "vless-flow-option",
+        &[
+            ("", "Default (no flow)"),
+            ("xtls-rprx-vision", "xtls-rprx-vision"),
+        ],
+    )
+}
+
+/// Config-completeness T02: sing-box 1.14.2 vless `packet_encoding`
+/// spellings (the engine passes them through; `check` judges).
+fn packet_encoding_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "vless-packet-encoding-option",
+        &[
+            ("", "Default"),
+            ("packetaddr", "packetaddr"),
+            ("xudp", "xudp"),
+        ],
+    )
+}
+
+/// Config-completeness T02: sing-box stream networks the engine maps
+/// (`apply_transport`); `raw`/`none`/`gun` intake spellings keep working
+/// through JSON, they just get no picker row.
+fn network_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "s1-network-option",
+        &[
+            ("tcp", "tcp"),
+            ("ws", "ws"),
+            ("httpupgrade", "httpupgrade"),
+            ("http", "http"),
+            ("grpc", "grpc"),
+            ("quic", "quic"),
+        ],
+    )
+}
+
+/// Config-completeness T02: uTLS fingerprints the engine forwards
+/// (`tls.utls.fingerprint`; `check` judges).
+fn fp_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "s2-fp-option",
+        &[
+            ("", "Default (no fingerprint)"),
+            ("chrome", "chrome"),
+            ("firefox", "firefox"),
+            ("edge", "edge"),
+            ("safari", "safari"),
+            ("360", "360"),
+            ("qq", "qq"),
+            ("ios", "ios"),
+            ("android", "android"),
+            ("random", "random"),
+            ("randomized", "randomized"),
+        ],
+    )
+}
+
+/// Config-completeness T03: vmess packet ciphers (exactly the 5
+/// [`crate::store::VMESS_CIPHERS`] values — one source for picker, prefill
+/// and fold, so a value the UI cannot pick is a value the fold cannot
+/// write). `auto` leads as the sing-box default.
+fn vmess_security_choices() -> Vec<PanelChoice> {
+    use crate::store::VMESS_CIPHERS;
+    let mut items: Vec<(&str, &str)> = Vec::with_capacity(VMESS_CIPHERS.len());
+    for cipher in VMESS_CIPHERS {
+        let title = if cipher == "auto" {
+            "auto (default)"
+        } else {
+            cipher
+        };
+        items.push((cipher, title));
+    }
+    panel_choices("vmess-security-option", &items)
+}
+
+/// Config-completeness T03: all 18 sing-box shadowsocks ciphers (exactly
+/// [`crate::store::SS_METHODS`]) behind one blank "Select method…" row.
+/// Method has no valid default — the blank row stands for "no selection"
+/// (the fold never fabricates nor strips; the commit gate names a missing
+/// method instead).
+fn ss_method_choices() -> Vec<PanelChoice> {
+    use crate::store::SS_METHODS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select method…")];
+    for method in SS_METHODS {
+        items.push((method, method));
+    }
+    panel_choices("ss-method-option", &items)
+}
+
+/// Config-completeness T03: shadowsocks plugin names (`""` = none; any
+/// non-empty pick fails generate naming `plugin` until its executable sits
+/// beside the engine — the page footer says so, Throne parity).
+fn ss_plugin_choices() -> Vec<PanelChoice> {
+    panel_choices(
+        "ss-plugin-option",
+        &[
+            ("", "No plugin"),
+            ("obfs-local", "obfs-local"),
+            ("v2ray-plugin", "v2ray-plugin"),
+        ],
+    )
+}
+
+/// Config-completeness T04: AmneziaWG versions (exactly
+/// [`crate::store::AWG_VERSIONS`]) behind one blank "Select version…" row.
+/// Version has no valid default — the blank row stands for "no selection"
+/// (the fold never fabricates nor strips — contract C2; the engine names a
+/// missing version at start instead).
+fn awg_version_choices() -> Vec<PanelChoice> {
+    use crate::store::AWG_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version…")];
+    for version in AWG_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("awg-version-option", &items)
+}
+
+/// Config-completeness T05: hysteria v1 `auth_type` marker (exactly
+/// [`crate::store::HY_AUTH_TYPES`]) behind one blank "Default" row. The
+/// marker has no valid default — blank stands for "no selection" (the fold
+/// never fabricates nor strips — contract C2).
+fn hy_auth_type_choices() -> Vec<PanelChoice> {
+    use crate::store::HY_AUTH_TYPES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Default")];
+    for marker in HY_AUTH_TYPES {
+        items.push((marker, marker));
+    }
+    panel_choices("hy-auth-type-option", &items)
+}
+
+/// Config-completeness T05: TUIC `congestion_control` modes (exactly
+/// [`crate::store::TUIC_CC_MODES`]) behind one blank "Select…" row
+/// (keep-blank — contract C2).
+fn tuic_cc_choices() -> Vec<PanelChoice> {
+    use crate::store::TUIC_CC_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
+    for mode in TUIC_CC_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("tuic-cc-option", &items)
+}
+
+/// Config-completeness T05: TUIC `udp_relay_mode` modes (exactly
+/// [`crate::store::TUIC_RELAY_MODES`]) behind one blank "Select…" row
+/// (keep-blank — contract C2).
+fn tuic_relay_choices() -> Vec<PanelChoice> {
+    use crate::store::TUIC_RELAY_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
+    for mode in TUIC_RELAY_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("tuic-relay-option", &items)
+}
+
+/// Config-completeness T06: SOCKS versions (exactly
+/// [`crate::store::SOCKS_VERSIONS`]) behind one blank "Select version…" row.
+/// Version has no valid default — blank leaves the stock default 5 (the
+/// engine omits it); "4" folds for generate to reject naming the field.
+fn socks_version_choices() -> Vec<PanelChoice> {
+    use crate::store::SOCKS_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 5)")];
+    for version in SOCKS_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("socks-version-option", &items)
+}
+
+/// Config-completeness T06: SOCKS networks the engine maps (tcp|udp only —
+/// anything else fails generate naming `network`). `tcp` leads as the
+/// sing-box default (the fold removes it, S1-rule).
+fn socks_network_choices() -> Vec<PanelChoice> {
+    panel_choices("socks-network-option", &[("tcp", "tcp"), ("udp", "udp")])
+}
+
+/// Config-completeness T06: Naïve `quic_congestion_control` modes (exactly
+/// [`crate::store::NAIVE_CC_MODES`]) behind one blank "Select…" row
+/// (keep-blank — blank leaves the chromium default cubic, contract C2).
+fn naive_cc_choices() -> Vec<PanelChoice> {
+    use crate::store::NAIVE_CC_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
+    for mode in NAIVE_CC_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("naive-cc-option", &items)
+}
+
+/// Config-completeness T06: SSH Browse failure text — names the full picked
+/// path (a wrong path must say which path: never a basename, never silent).
+/// Pure so headless tests pin it without a file picker.
+fn ssh_key_pick_error(path: &str) -> String {
+    format!("SSH key file unreadable: {path} (check the path and pick again)")
+}
+
+/// Config-completeness T07: Snell versions the engine maps (exactly
+/// [`crate::store::SNELL_VERSIONS`]) behind one blank row (keep-blank —
+/// blank leaves the engine default 4, contract C2).
+fn snell_version_choices() -> Vec<PanelChoice> {
+    use crate::store::SNELL_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 4)")];
+    for version in SNELL_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("snell-version-option", &items)
+}
+
+/// Config-completeness T07: ShadowTLS versions the engine maps (exactly
+/// [`crate::store::SHADOWTLS_VERSIONS`]) behind one blank row (keep-blank —
+/// blank leaves the schema default 1; import omits it on v1 rows).
+fn shadowtls_version_choices() -> Vec<PanelChoice> {
+    use crate::store::SHADOWTLS_VERSIONS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 1)")];
+    for version in SHADOWTLS_VERSIONS {
+        items.push((version, version));
+    }
+    panel_choices("shadowtls-version-option", &items)
+}
+
+/// Config-completeness T07: Xray stream networks (exactly
+/// [`crate::store::XRAY_NETWORKS`]) behind one blank row (keep-blank — no
+/// fabricated default; the sidecar judges).
+fn xray_network_choices() -> Vec<PanelChoice> {
+    use crate::store::XRAY_NETWORKS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Select network…")];
+    for network in XRAY_NETWORKS {
+        items.push((network, network));
+    }
+    panel_choices("xray-network-option", &items)
+}
+
+/// Config-completeness T07: Xray VLESS flows (exactly
+/// [`crate::store::XRAY_FLOWS`]) behind one blank row (keep-blank — blank
+/// leaves the default, like the sing-box flow picker).
+fn xray_flow_choices() -> Vec<PanelChoice> {
+    use crate::store::XRAY_FLOWS;
+    let mut items: Vec<(&str, &str)> = vec![("", "Default (no flow)")];
+    for flow in XRAY_FLOWS {
+        items.push((flow, flow));
+    }
+    panel_choices("xray-flow-option", &items)
+}
+
+/// Config-completeness T07: Xray mux modes (exactly
+/// [`crate::store::XRAY_MUX_MODES`]) behind one blank Keep-Default row (the
+/// blank stands for default — the fold never fabricates nor strips).
+fn xray_mux_choices() -> Vec<PanelChoice> {
+    use crate::store::XRAY_MUX_MODES;
+    let mut items: Vec<(&str, &str)> = vec![("", "Keep default")];
+    for mode in XRAY_MUX_MODES {
+        items.push((mode, mode));
+    }
+    panel_choices("xray-mux-option", &items)
+}
+
+/// Config-completeness T07: one chain-library row for the hop picker —
+/// values are row ids (stable, never reused); titles read `name (protocol)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainLibraryEntry {
+    id: String,
+    name: String,
+    protocol: String,
+}
+
+/// Config-completeness T07: hop-picker rows for the chain library — one blank
+/// "Select a row…" head plus one row per library entry (id values, human
+/// titles). Rebuilt with the row list at dialog open; the blank form keeps
+/// the head only.
+fn chain_pick_choices(library: &[ChainLibraryEntry]) -> Vec<PanelChoice> {
+    let mut owned: Vec<(String, String)> = Vec::with_capacity(library.len() + 1);
+    owned.push((String::new(), "Select a row…".to_string()));
+    for entry in library {
+        owned.push((
+            entry.id.clone(),
+            format!("{} ({})", entry.name, entry.protocol),
+        ));
+    }
+    let items: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(value, title)| (value.as_str(), title.as_str()))
+        .collect();
+    panel_choices("chain-pick-option", &items)
+}
+
+/// Config-completeness T07: chain→rule mapping for one hop candidate —
+/// canonical protocol to the [`ChainHopSlot`] the rejection rule matches on
+/// (`autoselector` has no row type here — matched literally so the Throne
+/// rule holds verbatim even for hand JSON).
+fn chain_slot_kind(protocol: &str) -> ChainHopSlot {
+    use crate::engine::{is_chain_protocol, is_extra_core_protocol};
+    if protocol.trim().eq_ignore_ascii_case("autoselector") {
+        return ChainHopSlot::Autoselector;
+    }
+    if is_chain_protocol(protocol) {
+        ChainHopSlot::Chain
+    } else if is_extra_core_protocol(protocol) {
+        ChainHopSlot::Extra
+    } else {
+        ChainHopSlot::Other
+    }
+}
+
+/// Config-completeness T07: kinds of the current editor hops in order —
+/// id references resolve through the library (unknown ids read `Other` —
+/// the engine names them at generate), inline objects classify by their
+/// `type`/`protocol` marker. Pure so headless tests pin it without a dialog.
+fn chain_existing_kinds(
+    hops: &[serde_json::Value],
+    library: &[ChainLibraryEntry],
+) -> Vec<ChainHopSlot> {
+    hops.iter()
+        .map(|node| match node {
+            serde_json::Value::String(id) => library
+                .iter()
+                .find(|entry| entry.id == id.trim())
+                .map(|entry| chain_slot_kind(&entry.protocol))
+                .unwrap_or(ChainHopSlot::Other),
+            serde_json::Value::Object(map) => {
+                let marker = map
+                    .get("type")
+                    .or_else(|| map.get("protocol"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                chain_slot_kind(marker)
+            }
+            _ => ChainHopSlot::Other,
+        })
+        .collect()
+}
+
+/// Config-completeness T07: one hop row label — id references show the
+/// library `name (protocol)` (bare id when unknown — never params contents);
+/// inline objects show their marker + `(inline)`. Pure so headless tests pin
+/// it without a dialog.
+fn chain_hop_label(
+    node: &serde_json::Value,
+    index: usize,
+    library: &[ChainLibraryEntry],
+) -> String {
+    match node {
+        serde_json::Value::String(id) => {
+            let id = id.trim();
+            match library.iter().find(|entry| entry.id == id) {
+                Some(entry) => format!("{}. {} ({})", index + 1, entry.name, entry.protocol),
+                None => format!("{}. {id}", index + 1),
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let marker = map
+                .get("type")
+                .or_else(|| map.get("protocol"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|marker| !marker.is_empty())
+                .unwrap_or("outbound");
+            format!("{}. {marker} (inline)", index + 1)
+        }
+        _ => format!("{}. hop", index + 1),
+    }
+}
+
+/// Config-completeness T04: borrowed entity set for the nine shared
+/// WireGuard peer/net rows — the WG and AWG pages hold separate entities
+/// (T03 protocol-scoping: unmerged typing never crosses pages) but render
+/// the same rows through [`ConfigForm::wg_peer_block`].
+struct WgPeerRefs<'a> {
+    prefix: &'static str,
+    private_key: &'a Entity<InputState>,
+    public_key: &'a Entity<InputState>,
+    pre_shared_key: &'a Entity<InputState>,
+    reserved: &'a Entity<InputState>,
+    keepalive: &'a Entity<InputState>,
+    local_addr: &'a Entity<InputState>,
+    dns: &'a Entity<InputState>,
+    mtu: &'a Entity<InputState>,
+    workers: &'a Entity<InputState>,
+    sys_ifc: &'a Rc<RefCell<bool>>,
+}
+
+/// Config-completeness T03: one echoed dropdown for the collapse path —
+/// panel state, read keys, and the default that counts as blank.
+type EchoSelect<'a> = (
+    &'a Entity<SelectState<PanelChoiceList>>,
+    &'a [&'a str],
+    &'a str,
+);
+
+/// Config-completeness T02: UUIDv4 for the VLESS generate button — OS
+/// CSPRNG via the existing `getrandom` dep (no new crates); the clash-secret
+/// hash fallback (pid + wall clock + atomic nonce) so generation never
+/// panics, never logs. Version/variant bits set per RFC 4122.
+fn generate_uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now();
+        let mut first = DefaultHasher::new();
+        ("manyproxy-uuid-v1", std::process::id(), now, n).hash(&mut first);
+        let mut second = DefaultHasher::new();
+        ("manyproxy-uuid-v2", n, now, std::process::id()).hash(&mut second);
+        let (a, b) = (first.finish().to_be_bytes(), second.finish().to_be_bytes());
+        bytes[..8].copy_from_slice(&a);
+        bytes[8..].copy_from_slice(&b);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex = |byte: u8| {
+        [
+            HEX[(byte >> 4) as usize] as char,
+            HEX[(byte & 0x0f) as usize] as char,
+        ]
+    };
+    let mut out = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.extend(hex(*byte));
+    }
+    out
+}
+
+/// Config-completeness T04: WireGuard private key for the WG/AWG keygen
+/// button — 32 OS-random bytes, base64 (exactly what `wg genkey` emits; no
+/// new crates: `getrandom` + `base64` are already deps). The hash fallback
+/// mirrors [`generate_uuid_v4`] (pid + wall clock + atomic nonce across two
+/// hashers for 32 bytes) so generation never panics, never logs. Local-only
+/// by construction: this fills local key material only — there is no WARP
+/// account registration (that needs network; Throne's `warp_autogen`
+/// endpoint-filling stays out per local-only).
+fn generate_wireguard_key() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now();
+        for (slot, tag) in bytes.chunks_mut(8).zip([
+            "manyproxy-wg-1",
+            "manyproxy-wg-2",
+            "manyproxy-wg-3",
+            "manyproxy-wg-4",
+        ]) {
+            let mut hasher = DefaultHasher::new();
+            (tag, std::process::id(), now, n).hash(&mut hasher);
+            slot.copy_from_slice(&hasher.finish().to_be_bytes());
+        }
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// Command palette (Ctrl-K): one searchable surface over the whole
 /// action set — every key-bound action plus every menu-only destination.
 /// Sections below are the dispatch table: keep the group/item order and
@@ -5288,6 +11678,20 @@ impl AppView {
             cx.notify();
             return false;
         }
+        // Config-completeness T07: extra-core rows gate on exe + config shape
+        // at dialog commit (the Validate button surfaces the same errors
+        // pre-commit; the store/import path stays untouched so imported rows
+        // keep landing disabled and failing at start through the engine gate).
+        if input.protocol == "extra-core" {
+            if let Err(reason) = validate_extra_params(&input.params) {
+                *form_error.borrow_mut() = Some(("params".to_string(), reason.clone()));
+                *form.advanced.borrow_mut() = true;
+                form.focus_field("params", window, cx);
+                window.push_notification(Notification::error(reason), cx);
+                cx.notify();
+                return false;
+            }
+        }
         match self.store.add(input) {
             Ok(created) => {
                 *form_error.borrow_mut() = None;
@@ -5348,14 +11752,20 @@ impl AppView {
     /// per-protocol starter for the current protocol field (overwrites the
     /// box; Format/undo restores typing). The toast names the protocol so a
     /// stale-field fill is never mysterious.
+    /// Config-completeness T01: the protocol comes from the picker's live
+    /// selection (Add) or the locked baseline (Edit). This button stays an
+    /// EXPLICIT overwrite (the click is consent); the pristine-only rule
+    /// covers the AUTOMATIC type-switch rewrite instead (see
+    /// [`ConfigForm::sync_protocol_template`]) — refusing an explicit reset
+    /// would defeat the button's purpose.
     fn template_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
-        protocol: &Entity<InputState>,
+        form: &ConfigForm,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let name = protocol.read(cx).value().to_string();
+        let name = form.protocol_text(cx);
         let template = protocol_params_template(&name);
         params.update(cx, |state, cx| {
             state.set_value(template, window, cx);
@@ -5376,25 +11786,36 @@ impl AppView {
     fn validate_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
+        protocol: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let current = params.read(cx).value().to_string();
         match validate_params_json(&current) {
-            Ok(()) => {
-                window.push_notification(
-                    Notification::success(if current.trim().is_empty() {
-                        "Params blank — the protocol default applies"
-                    } else {
-                        "Params are valid JSON"
-                    }),
-                    cx,
-                );
-            }
+            Ok(()) => {}
             Err(reason) => {
                 window.push_notification(Notification::error(reason), cx);
+                return false;
             }
         }
+        // Config-completeness T07: extra-core rows gate on exe + config shape
+        // (the engine names the same fields at start; the button surfaces
+        // them pre-commit instead). Other protocols keep the JSON-only check.
+        if protocol == "extra-core" {
+            if let Err(reason) = validate_extra_params(&current) {
+                window.push_notification(Notification::error(reason), cx);
+                return false;
+            }
+        }
+        window.push_notification(
+            Notification::success(if current.trim().is_empty() {
+                "Params blank — the protocol default applies"
+            } else {
+                "Params are valid JSON"
+            }),
+            cx,
+        );
+        true
     }
 
     /// Ticket 26: re-read the row at commit. A row deleted while the dialog
@@ -5503,6 +11924,21 @@ impl AppView {
                     window.push_notification(Notification::error(reason), cx);
                     cx.notify();
                     return false;
+                }
+                // Config-completeness T07: extra-core rows gate on exe +
+                // config shape when the dialog actually rewrote params
+                // (untouched legacy rows pass through; the store/import path
+                // stays untouched — see `commit_add_with_focus`).
+                if patch.params.is_some() && existing.protocol == "extra-core" {
+                    let params = patch.params.as_deref().unwrap_or(&existing.params);
+                    if let Err(reason) = validate_extra_params(params) {
+                        *form_error.borrow_mut() = Some(("params".to_string(), reason.clone()));
+                        *form.advanced.borrow_mut() = true;
+                        form.focus_field("params", window, cx);
+                        window.push_notification(Notification::error(reason), cx);
+                        cx.notify();
+                        return false;
+                    }
                 }
                 match self.store.update(id, patch) {
                     Ok(updated) => {
@@ -5627,6 +12063,13 @@ impl AppView {
                 self.report_save_error(error, window, cx);
             }
         }
+    }
+
+    /// Config-completeness T08 (CAP-11): `Clone` is an alias over
+    /// [`AppView::commit_duplicate`] — same disabled copy, fresh auto port,
+    /// identical params. No new dupe logic lives here by construction.
+    fn commit_clone(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_duplicate(id, window, cx);
     }
     /// Ticket 43: reset one row's traffic totals (post-confirm). Store and
     /// session mirror zero together, then the rows repaint; the toast names
@@ -8572,9 +15015,8 @@ impl AppView {
     }
 
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let form = ConfigForm::blank(window, cx);
+        let mut form = ConfigForm::blank(window, cx);
         let view = cx.entity();
-        let reader = form.clone();
         // Ticket 31: the shared first-error slot — the commit records it and
         // the builder renders it inline under the fields on the next frame.
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
@@ -8582,6 +15024,19 @@ impl AppView {
         // Ticket 31: rows snapshot for the live bind/port collision warning
         // (a broken database warns nothing — the commit still reports it).
         let rows = self.store.list().unwrap_or_default();
+        // Config-completeness T07: the chain hop picker + labels read this
+        // dialog-open snapshot (id, name, protocol per row).
+        let library: Vec<ChainLibraryEntry> = rows
+            .iter()
+            .map(|row| ChainLibraryEntry {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                protocol: row.protocol.clone(),
+            })
+            .collect();
+        form.chain_library = Rc::new(RefCell::new(library.clone()));
+        form.chain_pick = ConfigForm::panel_select(window, cx, chain_pick_choices(&library), "");
+        let reader = form.clone();
         // Port budget readout rides the dialog (auto-assign draws from it).
         let budget = ConfigForm::port_budget_text(&rows);
         // Ticket 18: Rc-shared with the footer OK button (mouse commits
@@ -8595,7 +15050,13 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        window.open_dialog(cx, move |dialog: Dialog, window, cx| {
+            // Config-completeness T01: pristine-only template sync — a picker
+            // switch rewrites an untouched starter once via
+            // `pristine_template_rewrite`, dirty JSON never. The builder is the
+            // only window-holding frame scope (the kit Confirm subscription
+            // has no Window, and render has no &mut).
+            form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             // Ticket 31: live warning inputs — the builder re-runs every
@@ -8636,14 +15097,13 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = ConfigForm::prefilled(
+        let mut form = ConfigForm::prefilled(
             window,
             cx,
             &config,
             self.store.row_test_url(&config.id).as_deref(),
         );
         let view = cx.entity();
-        let reader = form.clone();
         let id = config.id.clone();
         let title = format!("Edit {}", config.name);
         // Ticket 31: the shared first-error slot (see `open_add_dialog`).
@@ -8652,6 +15112,20 @@ impl AppView {
         // Ticket 31: rows snapshot for the live collision warning; the edited
         // row itself is excluded.
         let rows = self.store.list().unwrap_or_default();
+        // Config-completeness T07: the chain hop picker + labels read this
+        // dialog-open snapshot (the edited row stays listed — adding it back
+        // is refused naming the flat-chain rule).
+        let library: Vec<ChainLibraryEntry> = rows
+            .iter()
+            .map(|row| ChainLibraryEntry {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                protocol: row.protocol.clone(),
+            })
+            .collect();
+        form.chain_library = Rc::new(RefCell::new(library.clone()));
+        form.chain_pick = ConfigForm::panel_select(window, cx, chain_pick_choices(&library), "");
+        let reader = form.clone();
         // Port budget readout rides the dialog (auto-assign draws from it).
         let budget = ConfigForm::port_budget_text(&rows);
         let exclude = id.clone();
@@ -8679,7 +15153,10 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
-        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+        window.open_dialog(cx, move |dialog: Dialog, window, cx| {
+            // Config-completeness T01: template sync (no-op on locked Edit
+            // rows — kept at both builders so the rule lives in one place).
+            form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let live = form.clone();
@@ -9020,6 +15497,225 @@ impl AppView {
             });
         })
         .detach();
+    }
+
+    /// Config-completeness T06: Browse button behind the SSH page — the
+    /// platform file picker (single-select, Import-Browse pattern); the
+    /// picked key bytes fill the path input and load into the key textarea
+    /// (no hand-paste). Cancelling picks nothing and changes nothing; a
+    /// wrong path toasts naming the full path via
+    /// [`ssh_key_pick_error`].
+    fn browse_for_ssh_key(
+        &mut self,
+        path_entity: Entity<InputState>,
+        key_entity: Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        let view = cx.entity();
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                _ => return,
+            };
+            let path = paths.into_iter().next().expect("non-empty checked");
+            let display = path.to_string_lossy().into_owned();
+            let content = std::fs::read_to_string(&path).ok();
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.finish_ssh_key_pick(path_entity, key_entity, display, content, window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Config-completeness T06: SSH Browse completion (windowed) — success
+    /// fills the path input and loads the key bytes into the textarea
+    /// (overwrite, so path and content never disagree); failure toasts
+    /// naming the full path and changes nothing.
+    fn finish_ssh_key_pick(
+        &mut self,
+        path_entity: Entity<InputState>,
+        key_entity: Entity<TextareaState>,
+        path: String,
+        content: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(content) = content else {
+            window.push_notification(Notification::warning(ssh_key_pick_error(&path)), cx);
+            return;
+        };
+        path_entity.update(cx, |state, cx| {
+            state.set_value(path.clone(), window, cx);
+        });
+        key_entity.update(cx, |state, cx| {
+            state.set_value(content, window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Loaded SSH key from {path}")),
+            cx,
+        );
+    }
+
+    /// Config-completeness T07: chain hop-list Add behind the editor button —
+    /// resolves the picked id through the library, applies the Throne
+    /// rejection rules (refusals toast naming the rule and change nothing),
+    /// appends the id reference on success and resets the picker. Returns
+    /// whether the hop landed (headless tests pin the state directly).
+    fn chain_add_hop(
+        &mut self,
+        hops: &Rc<RefCell<Vec<serde_json::Value>>>,
+        library: &Rc<RefCell<Vec<ChainLibraryEntry>>>,
+        pick: &Entity<SelectState<PanelChoiceList>>,
+        picked_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let picked_id = picked_id.trim();
+        let entry = library
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == picked_id)
+            .cloned();
+        let Some(entry) = entry else {
+            window.push_notification(
+                Notification::warning("Pick a library row first — hops reference rows by id"),
+                cx,
+            );
+            return false;
+        };
+        let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
+        if let Some(rule) =
+            chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), kinds.len(), false)
+        {
+            window.push_notification(Notification::warning(rule), cx);
+            return false;
+        }
+        hops.borrow_mut()
+            .push(serde_json::Value::String(entry.id.clone()));
+        pick.update(cx, |state, cx| {
+            state.set_selected_value(&String::new(), window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Added {} to the chain", entry.name)),
+            cx,
+        );
+        true
+    }
+
+    /// Config-completeness T07: chain hop-list Replace behind the per-hop
+    /// button — same resolution + rules as
+    /// [`AppView::chain_add_hop`] against the target index (replacing the
+    /// index-0 extracore with another extracore is allowed; anything else
+    /// follows the add rules). Returns whether the hop landed.
+    #[allow(clippy::too_many_arguments)]
+    fn chain_replace_hop(
+        &mut self,
+        hops: &Rc<RefCell<Vec<serde_json::Value>>>,
+        library: &Rc<RefCell<Vec<ChainLibraryEntry>>>,
+        pick: &Entity<SelectState<PanelChoiceList>>,
+        index: usize,
+        picked_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let picked_id = picked_id.trim();
+        let entry = library
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == picked_id)
+            .cloned();
+        let Some(entry) = entry else {
+            window.push_notification(
+                Notification::warning("Pick a library row first — hops reference rows by id"),
+                cx,
+            );
+            return false;
+        };
+        let kinds = chain_existing_kinds(&hops.borrow(), &library.borrow());
+        if let Some(rule) =
+            chain_hop_rejection(&kinds, chain_slot_kind(&entry.protocol), index, true)
+        {
+            window.push_notification(Notification::warning(rule), cx);
+            return false;
+        }
+        hops.borrow_mut()[index] = serde_json::Value::String(entry.id.clone());
+        pick.update(cx, |state, cx| {
+            state.set_selected_value(&String::new(), window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Replaced hop {} with {}", index + 1, entry.name)),
+            cx,
+        );
+        true
+    }
+
+    /// Config-completeness T07: extra-core Browse (windowed) — fills the exe
+    /// input with the picked FILE NAME (the engine resolves it in the app
+    /// directory and refuses paths, so the full pick never lands verbatim).
+    /// The binary is never read (unlike the SSH key text). Nothing picked
+    /// changes nothing.
+    fn browse_for_extra_exe(
+        &mut self,
+        path_entity: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: None,
+        });
+        let view = cx.entity();
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                _ => return,
+            };
+            let path = paths.into_iter().next().expect("non-empty checked");
+            let display = path.to_string_lossy().into_owned();
+            let _ = handle.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.finish_extra_exe_pick(path_entity, display, window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Config-completeness T07: extra-core Browse completion (windowed) —
+    /// stores the file name (see [`AppView::browse_for_extra_exe`]) and
+    /// toasts it. Pure enough for headless tests to pin without a picker.
+    fn finish_extra_exe_pick(
+        &mut self,
+        path_entity: Entity<InputState>,
+        display: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stored = std::path::Path::new(&display)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| display.clone());
+        path_entity.update(cx, |state, cx| {
+            state.set_value(stored.clone(), window, cx);
+        });
+        window.push_notification(
+            Notification::success(format!("Picked extra-core executable {stored}")),
+            cx,
+        );
     }
 
     /// Ticket 43: Browse completion (windowed) — unreadable files toast by
@@ -12800,6 +19496,41 @@ impl AppView {
                         }
                     }),
                 )
+                // Config-completeness T08 (CAP-11): `Clone` alias over the
+                // same `commit_duplicate` handler (no new dupe logic; the
+                // row menu names both spellings). No shortcut bound, so no
+                // `Kbd` chip and no `Name (Key)` suffix (kit-maximal rule).
+                .item(
+                    PopupMenuItem::element(|_, _| {
+                        div()
+                            .id("clone-config")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tooltip::new("Clone the selected row (disabled copy)"))
+                                    .into()
+                            })
+                            .child("Clone")
+                    })
+                    .on_click({
+                        let view = row_view.clone();
+                        move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                if let Some(config) = view.selected_config(cx) {
+                                    view.commit_clone(&config.id, window, cx);
+                                } else {
+                                    window.push_notification(
+                                        Notification::info(no_selection_message()),
+                                        cx,
+                                    );
+                                }
+                            });
+                        }
+                    }),
+                )
                 .item(
                     PopupMenuItem::element(|_, _| {
                         div()
@@ -14184,6 +20915,15 @@ impl AppView {
                 }
                 view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
             }))
+            // Config-completeness T08 (CAP-11): paste-intake binding — the
+            // same handler as the palette `ImportClipboard` op and the
+            // Library-menu "From clipboard" item (same guard, no new path).
+            .on_action(cx.listener(|view, _: &PasteImport, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.open_import_from_clipboard(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &StartSelected, window, cx| {
                 if overlay_open(window, cx) {
                     return;
@@ -14475,10 +21215,15 @@ impl AppView {
                                 div()
                                     .id("import-clipboard")
                                     .test_support()
-                                    // Ticket 02: expose role + name (no
-                                    // shortcut bound, so no keyshortcuts).
+                                    // Ticket 02: expose role + name.
+                                    // Config-completeness T08 (CAP-11): Ctrl-V
+                                    // is bound (see `bind_app_keys`), so the
+                                    // binding rides the shortcut property as
+                                    // well as the visible chip (Import-item
+                                    // precedent — `Kbd` only on bound actions).
                                     .role(Role::MenuItem)
-                                    .aria_label("From clipboard")
+                                    .aria_label("From clipboard (Ctrl-V)")
+                                    .aria_keyshortcuts("Ctrl-V")
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -14488,6 +21233,7 @@ impl AppView {
                                             .into()
                                     })
                                     .child("From clipboard")
+                                    .child(shortcut_kbd("ctrl-v", "(Ctrl-V)"))
                             })
                             .on_click({
                                 let view = library_view.clone();
@@ -15345,12 +22091,3901 @@ mod tests {
         });
 
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        for field in ["field-name", "field-protocol", "field-bind", "field-port"] {
+        // Config-completeness T01: the protocol free-text input is a kit
+        // `Select` now (`protocol-select`); `field-protocol` is retired.
+        for field in ["field-name", "protocol-select", "field-bind", "field-port"] {
             assert!(
                 cx.update(|window, _| window.try_find(field).is_some()),
                 "add dialog renders {field}"
             );
         }
+    }
+
+    /// Config-completeness T01: Add renders the kit protocol `Select` listing
+    /// exactly the 24 canonical types as stable option rows — no free-text
+    /// protocol input remains, so a typo'd protocol is unrepresentable.
+    /// Kit: `Select::new(&state)` + `.id().small().accessibility_label()`.
+    /// The popup list virtualizes (only visible rows paint), so paint asserts
+    /// cover the opened popup's top rows while full 24-membership is pinned
+    /// through the delegate (`set_selected_value` resolves every canonical
+    /// type — a missing row would come back `None`).
+    /// Config-completeness T08: `direct` (CAP-12 trivial final) is the 24th
+    /// row, appended last so the existing order never shifts.
+    #[gpui_kit::test]
+    fn t01_protocol_picker_lists_24_canonical_types(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "protocol-select");
+        // Open the popup — the top rows paint with stable option ids.
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        for protocol in ["vless", "vmess", "trojan"] {
+            assert_painted(cx, &format!("protocol-option-{protocol}"));
+        }
+        // Enter confirms the highlight and closes the popup (guard-covered).
+        let keystroke = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert_absent(cx, "protocol-option-vless".to_string());
+        // Full membership: every canonical type resolves through the picker
+        // delegate (24 rows, `VALID_PROTOCOLS` order — the store owns it).
+        assert_eq!(
+            VALID_PROTOCOLS.len(),
+            24,
+            "picker covers the canonical list"
+        );
+        assert_eq!(
+            crate::protocol_choices().len(),
+            24,
+            "one picker row per canonical type"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                for protocol in VALID_PROTOCOLS {
+                    form.protocol_select.update(cx, |state, cx| {
+                        state.set_selected_value(&protocol.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.protocol_select.read(cx).selected_value(),
+                        Some(&protocol.to_string()),
+                        "{protocol} resolves in the picker"
+                    );
+                }
+            })
+        });
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T01: Edit locks the type — read-only
+    /// `protocol-lock` paints, the picker is absent, and committing an
+    /// edited row keeps the baseline type (Throne §7.7 parity).
+    #[gpui_kit::test]
+    fn t01_edit_locks_protocol_type(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "protocol-lock");
+        assert_absent(cx, "protocol-select".to_string());
+        // An untouched edit carries no protocol change.
+        let untouched = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &seeded, None);
+                form.as_patch_vs(cx, &seeded).protocol.is_none()
+            })
+        });
+        assert!(untouched, "locked edit changes no type");
+        // A real commit (name edited) keeps the baseline type.
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::prefilled(window, cx, &seeded, None);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("Work2", window, cx);
+                });
+                let patch = form.as_patch_vs(cx, &seeded);
+                assert!(patch.protocol.is_none(), "rename carries no type change");
+                view.commit_edit_with_focus(&seeded.id, patch, &form, &form_error, window, cx)
+            })
+        });
+        assert!(committed, "rename commits");
+        let row = view.read_with(cx, |view, _| {
+            view.store
+                .get(&seeded.id)
+                .expect("get works")
+                .expect("row kept")
+        });
+        assert_eq!(row.name, "Work2", "rename lands");
+        assert_eq!(row.protocol, "vless", "baseline type kept");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T01: virtual types (`chain`, `custom-outbound`,
+    /// `custom-config`, `extra-core`) hide the guided Server/Server port
+    /// inputs (Throne gating parity); endpoint types keep them. Driven
+    /// through the real picker with keyboard navigation (the popup list
+    /// virtualizes — off-screen rows never paint, so clicks can't reach
+    /// them; arrows + Enter is the honest path) so the builder sync runs
+    /// each switch. Cursor starts at `vless` (row 0); deltas track it.
+    #[gpui_kit::test]
+    fn t01_virtual_types_hide_server_port(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        use gpui_kit::VisualTestContext;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        // Default (vless) keeps the endpoint inputs.
+        assert_painted(cx, "field-guided-server");
+        assert_painted(cx, "field-guided-port");
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let mut cursor = row_of("vless");
+        let pick = |cx: &mut VisualTestContext, target: usize, cursor: &mut usize| {
+            cx.update(|window, cx| {
+                window.click("protocol-select", cx);
+            });
+            cx.run_until_parked();
+            paint_dialog_open(cx);
+            let (key, steps) = if target >= *cursor {
+                ("down", target - *cursor)
+            } else {
+                ("up", *cursor - target)
+            };
+            let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+            for _ in 0..steps {
+                cx.update(|window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                });
+                cx.run_until_parked();
+            }
+            let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(enter, cx);
+            });
+            cx.run_until_parked();
+            paint_dialog_open(cx);
+            *cursor = target;
+        };
+        for virtual_proto in [
+            "chain",
+            "custom-outbound",
+            "custom-config",
+            "extra-core",
+            // Config-completeness T08: `direct` is label-only (CAP-12), so
+            // it hides the endpoint inputs like the other virtual types.
+            "direct",
+        ] {
+            pick(cx, row_of(virtual_proto), &mut cursor);
+            assert_absent(cx, "field-guided-server".to_string());
+            assert_absent(cx, "field-guided-port".to_string());
+            assert_painted(cx, "protocol-select");
+            assert_painted(cx, "guided-hint");
+        }
+        // Switching back to an endpoint type restores the inputs.
+        pick(cx, row_of("vless"), &mut cursor);
+        assert_painted(cx, "field-guided-server");
+        assert_painted(cx, "field-guided-port");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T01: the picker switch rewrites pristine JSON to
+    /// the new starter and preserves dirty JSON (contract C1), wired through
+    /// [`ConfigForm::sync_protocol_template`] — the builder-called seam.
+    #[gpui_kit::test]
+    fn t01_template_sync_rewrites_pristine_only(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let (pristine_after, dirty_after) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                // Pristine starter + switch rewrites to the new starter.
+                let form = ConfigForm::blank(window, cx);
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"chain".to_string(), window, cx);
+                });
+                form.sync_protocol_template(window, cx);
+                let pristine_after = form.params.read(cx).value().to_string();
+                // User-typed JSON + switch stands untouched.
+                form.params.update(cx, |state, cx| {
+                    state.set_value(
+                        "{\"type\":\"vless\",\"server\":\"a.example.com\"}",
+                        window,
+                        cx,
+                    );
+                });
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"socks".to_string(), window, cx);
+                });
+                form.sync_protocol_template(window, cx);
+                let dirty_after = form.params.read(cx).value().to_string();
+                (pristine_after, dirty_after)
+            })
+        });
+        assert_eq!(
+            pristine_after,
+            protocol_params_template("chain"),
+            "pristine switch rewrites"
+        );
+        assert_eq!(
+            dirty_after, "{\"type\":\"vless\",\"server\":\"a.example.com\"}",
+            "dirty switch preserves"
+        );
+    }
+
+    /// Config-completeness T01 ENTER-guard: Confirm from inside the protocol
+    /// picker popup stops at the picker wrapper — the dialog never commits a
+    /// half-filled row (audit §10.9 incident regression). The test is
+    /// validation-sensitive by construction: a broken guard would run the
+    /// commit on the untouched (invalid) template and fire exactly one error
+    /// toast, so zero toasts plus an open dialog plus zero rows pins the
+    /// guard rather than the validator.
+    #[gpui_kit::test]
+    fn t01_enter_in_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("protocol-option-socks".to_string())
+                .is_some()),
+            "picker popup opened"
+        );
+        let keystroke = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "picker Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "picker Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "picker Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "protocol-option-socks".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Tall frame fitting the full VLESS page (the 880x620 minimum shows
+    /// the top; t11 pins that contract separately).
+    fn paint_tall_dialog(cx: &mut VisualTestContext) {
+        cx.simulate_resize(size(px(1000.), px(1800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+    }
+
+    /// Config-completeness T02: VLESS Add renders inner + S1–S4 as kit
+    /// primitives with pinned ids; default tcp shows no conditionals.
+    /// The page rides one outer collapsed disclosure (t11 minimum-frame
+    /// contract) with per-panel sections inside — the test pins the
+    /// collapsed default, then expands outer + panels and paints bodies.
+    #[gpui_kit::test]
+    fn t02_vless_panels_paint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Collapsed default: outer caption paints, everything inside stays
+        // unmounted (one header row at the minimum frame).
+        assert_painted(cx, "vless-section-caption");
+        assert_absent(cx, "s1-caption".to_string());
+        assert_absent(cx, "vless-uuid".to_string());
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Inner fields paint; panel sections stay collapsed inside.
+        for id in [
+            "vless-uuid",
+            "vless-uuid-generate",
+            "vless-flow",
+            "vless-packet-encoding",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "vless-uuid",
+            "vless-uuid-generate",
+            "vless-flow",
+            "vless-packet-encoding",
+            "s1-caption",
+            "s1-network",
+            "s2-caption",
+            "s2-enable",
+            "s2-sni",
+            "s2-fp",
+            "s2-insecure",
+            "s2-pbk",
+            "s3-caption",
+            "s3-mux-group",
+            "s3-brutal",
+            "s3-up",
+            "s3-down",
+            "s4-caption",
+            "s4-reuse",
+            "s4-timeout",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "s1-path".to_string());
+        assert_absent(cx, "s3-vision-note".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: the uuid Generate button fills + toasts
+    /// (the masked value itself is unreadable headless by design).
+    #[gpui_kit::test]
+    fn t02_uuid_generate_button_toasts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_eq!(notification_count(cx), 0, "no toast before Generate");
+        // The Generate button lives inside the outer VLESS disclosure.
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("vless-uuid-generate", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(notification_count(cx), 1, "Generate toasts once");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog stays open after Generate"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: uuid v4 shape (RFC 4122 bits, hyphenated,
+    /// unique) — pure unit test for the Generate backend.
+    #[test]
+    fn t02_generate_uuid_v4_shape() {
+        use crate::generate_uuid_v4;
+        for _ in 0..8 {
+            let uuid = generate_uuid_v4();
+            assert_eq!(uuid.len(), 36, "hyphenated length: {uuid}");
+            assert_eq!(
+                uuid.chars().filter(|c| *c == '-').count(),
+                4,
+                "four hyphens: {uuid}"
+            );
+            assert_eq!(uuid.chars().nth(14), Some('4'), "version nibble: {uuid}");
+            assert!(
+                matches!(uuid.chars().nth(19), Some('8' | '9' | 'a' | 'b')),
+                "variant nibble: {uuid}"
+            );
+            assert!(
+                uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+                "hex only: {uuid}"
+            );
+        }
+        assert_ne!(generate_uuid_v4(), generate_uuid_v4(), "unique");
+    }
+
+    /// Config-completeness T02: ws shows path/host; back to tcp hides them
+    /// (entities persist, JSON preserved per the store fold tests); the
+    /// round trip restores the inputs. Driven through the real picker.
+    #[gpui_kit::test]
+    fn t02_ws_to_tcp_hides_and_restores(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "WsRow".to_string(),
+                protocol: "vless".to_string(),
+                params: "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
+                    \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"network\":\"ws\",\
+                    \"path\":\"/w\",\"host\":\"h.example.com\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Edit opens on the raw JSON (Advanced expanded) — collapse into
+        // the guided page before asserting panel gating.
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Expand the outer VLESS disclosure, then the Transport section
+        // (both collapsed by default per t11).
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Expand the Transport section (collapsed by default per t11).
+        cx.update(|window, cx| {
+            window.click("s1-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s1-path");
+        assert_painted(cx, "s1-host");
+        // ws (row 1) → tcp (row 0): option click commits.
+        cx.update(|window, cx| {
+            window.click("s1-network", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s1-network-option-tcp", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "s1-path".to_string());
+        assert_absent(cx, "s1-host".to_string());
+        // Back to ws: inputs repaint (entities + JSON values preserved).
+        cx.update(|window, cx| {
+            window.click("s1-network", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s1-network-option-ws", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s1-path");
+        assert_painted(cx, "s1-host");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: an imported Reality+Vision link prefills
+    /// every panel (uuid/flow/TLS/transport) and refolds byte-identical —
+    /// untouched Edit commits zero spurious patch.
+    #[gpui_kit::test]
+    fn t02_reality_vision_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::import::import_text;
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let link = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443\
+            ?encryption=none&security=reality&pbk=9p5voorXr3Y8kZ7Q6W5E4R3T2Y1U0I9O8P7O6&fp=chrome\
+            &sni=a.example.com&sid=9f8e7d&spx=%2F&flow=xtls-rprx-vision&type=tcp#RealityVision";
+        let mut batch = import_text(&link.replace(' ', ""));
+        assert!(
+            batch.failures.is_empty(),
+            "link imports: {:?}",
+            batch.failures
+        );
+        assert_eq!(batch.configs.len(), 1, "one row");
+        let parsed = batch.configs.remove(0);
+        assert_eq!(parsed.protocol, "vless");
+        let row = ProxyConfig {
+            id: "t02".to_string(),
+            name: parsed.name.clone(),
+            protocol: parsed.protocol.clone(),
+            params: parsed.params.clone(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let (uuid, flow, enable, pbk, sni, fp, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                let uuid = form.vless_uuid.read(cx).value().to_string();
+                let flow = form
+                    .vless_flow
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .unwrap_or_default();
+                let enable = *form.s2_enable.borrow();
+                let pbk = form.s2_pbk.read(cx).value().to_string();
+                let sni = form.s2_sni.read(cx).value().to_string();
+                let fp = form
+                    .s2_fp
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .unwrap_or_default();
+                let folded = form.effective_params(cx);
+                (uuid, flow, enable, pbk, sni, fp, folded)
+            })
+        });
+        assert_eq!(
+            uuid, "11111111-2222-4333-8444-555555555555",
+            "uuid prefills"
+        );
+        assert_eq!(flow, "xtls-rprx-vision", "flow prefills");
+        assert!(enable, "reality enables TLS");
+        assert!(!pbk.is_empty(), "pbk prefills");
+        assert_eq!(sni, "a.example.com", "sni prefills");
+        assert_eq!(fp, "chrome", "fp prefills");
+        assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
+    }
+
+    /// Config-completeness T02: `flow=vision` unmounts S3 with reason text
+    /// (Throne parity); back to default restores the section.
+    #[gpui_kit::test]
+    fn t02_vision_disables_mux_with_reason(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Expand the outer VLESS disclosure, then Mux (both collapsed by
+        // default per t11).
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s3-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-mux-group");
+        cx.update(|window, cx| {
+            window.click("vless-flow", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("vless-flow-option-xtls-rprx-vision", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-vision-note");
+        assert_absent(cx, "s3-mux-group".to_string());
+        cx.update(|window, cx| {
+            window.click("vless-flow", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("vless-flow-option-default", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-mux-group");
+        assert_absent(cx, "s3-vision-note".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T02: brutal on forces mux On — the reason note
+    /// paints and the fold writes `mux:"on"` even with a default cell.
+    #[gpui_kit::test]
+    fn t02_brutal_forces_mux_on(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "s3-brutal-note".to_string());
+        // Expand the outer VLESS disclosure, then the Mux section (both
+        // collapsed by default per t11), then flip the brutal switch.
+        cx.update(|window, cx| {
+            window.click("vless-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s3-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("s3-brutal-switch", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "s3-brutal-note");
+        let folded = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                *form.s3_brutal.borrow_mut() = true;
+                form.effective_params(cx)
+            })
+        });
+        let value: serde_json::Value = serde_json::from_str(&folded).expect("brutal fold is JSON");
+        assert_eq!(value["mux"], "on", "brutal forces mux on in the fold");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T03: new dropdown sizes — vmess security 5,
+    /// packet_encoding 3, ss method 18 (plus the blank "no selection" row),
+    /// ss plugin 3. Pure constructors, no window needed.
+    #[test]
+    fn t03_dropdown_counts() {
+        assert_eq!(
+            crate::vmess_security_choices().len(),
+            5,
+            "vmess security lists 5 ciphers"
+        );
+        assert_eq!(
+            crate::packet_encoding_choices().len(),
+            3,
+            "packet_encoding lists 3"
+        );
+        let methods = crate::ss_method_choices();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|choice| !choice.value.is_empty())
+                .count(),
+            18,
+            "ss method lists 18 ciphers"
+        );
+        assert_eq!(crate::ss_plugin_choices().len(), 3, "ss plugin lists 3");
+    }
+
+    /// Config-completeness T03: VMess Edit renders uuid (+uuidgen) + aid +
+    /// cipher + packet_encoding + S1–S4 as kit primitives with pinned ids;
+    /// every cipher and packet spelling resolves through the delegate.
+    #[gpui_kit::test]
+    fn t03_vmess_page_paints(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let params = "{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"alter_id\":\"0\",\
+            \"security\":\"auto\",\"tls\":true,\"sni\":\"a.example.com\",\"network\":\"ws\",\
+            \"path\":\"/w\",\"mux\":\"on\"}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "VmessRow".to_string(),
+                protocol: "vmess".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Edit opens on the raw JSON (Advanced expanded) — collapse into
+        // the guided page, then expand the VMess disclosure.
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "vmess-section-caption");
+        assert_absent(cx, "vmess-uuid".to_string());
+        cx.update(|window, cx| {
+            window.click("vmess-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "vmess-uuid",
+            "vmess-uuid-generate",
+            "vmess-aid",
+            "vmess-security",
+            "vmess-packet-encoding",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // Foreign pages never paint here.
+        for id in [
+            "ss-method",
+            "trojan-password",
+            "vless-flow",
+            "s3-vision-note",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "s1-network",
+            "s1-path",
+            "s2-enable",
+            "s2-sni",
+            "s3-mux-group",
+            "s4-reuse",
+            "s4-timeout",
+        ] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: every cipher (5) and packet spelling (3)
+        // resolves through `set_selected_value` (virtualized popups only
+        // paint visible rows, so counts pin here, not in the tree).
+        let row = ProxyConfig {
+            id: "t03-v".to_string(),
+            name: "V".to_string(),
+            protocol: "vmess".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                for cipher in crate::store::VMESS_CIPHERS {
+                    form.vmess_security.update(cx, |state, cx| {
+                        state.set_selected_value(&cipher.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.vmess_security
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        cipher,
+                        "cipher {cipher} resolves"
+                    );
+                }
+                for choice in crate::packet_encoding_choices() {
+                    form.vmess_packet_encoding.update(cx, |state, cx| {
+                        state.set_selected_value(&choice.value.clone(), window, cx);
+                    });
+                    assert_eq!(
+                        form.vmess_packet_encoding
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        choice.value,
+                        "packet spelling resolves"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T03: Trojan Edit renders the masked password +
+    /// full S1+S2+S3+S4 as kit primitives; nothing from the other pages.
+    #[gpui_kit::test]
+    fn t03_trojan_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "TrojanRow".to_string(),
+                protocol: "trojan".to_string(),
+                params: "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
+                    \"password\":\"secret\",\"security\":\"tls\",\"sni\":\"a.example.com\",\
+                    \"network\":\"ws\",\"path\":\"/w\",\"mux\":\"on\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "trojan-section-caption");
+        cx.update(|window, cx| {
+            window.click("trojan-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "trojan-password",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in ["vmess-aid", "ss-method", "vless-uuid", "s3-vision-note"] {
+            assert_absent(cx, id.to_string());
+        }
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "s1-network",
+            "s2-enable",
+            "s2-pbk",
+            "s3-mux-group",
+            "s3-brutal",
+            "s4-reuse",
+        ] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T03: Shadowsocks Edit renders method, password,
+    /// plugin, plugin_opts and uot with Mux-only Settings (no
+    /// Network/Security panels — Throne HasMux parity); Advanced shows the
+    /// dial fields with no TLS section (HasTLS gating). All 18 methods and
+    /// all 3 plugin spellings resolve through the delegate.
+    #[gpui_kit::test]
+    fn t03_ss_page_paints_mux_only(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let params = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+            \"method\":\"aes-128-gcm\",\"password\":\"pw\",\"mux\":\"on\"}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "SsRow".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "ss-section-caption");
+        cx.update(|window, cx| {
+            window.click("ss-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "ss-method",
+            "ss-password",
+            "ss-plugin",
+            "ss-plugin-opts",
+            "ss-uot",
+            "s3-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // Mux-only Settings: no Transport/TLS panels; nothing from the
+        // other pages; no plugin footer on a plugin-less row.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s2-enable",
+            "trojan-password",
+            "vmess-aid",
+            "ss-plugin-note",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        for toggle in ["s3-toggle", "s4-toggle"] {
+            cx.update(|window, cx| {
+                window.click(toggle, cx);
+            });
+            cx.run_until_parked();
+        }
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Advanced dial paints with no TLS section (HasTLS gating holds —
+        // the dial half carries no TLS extras by construction).
+        for id in ["s3-mux-group", "s4-reuse", "s4-timeout", "s4-bind"] {
+            assert_painted(cx, id);
+        }
+        for id in ["s1-caption", "s2-caption", "s2-enable", "s2-pbk"] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: all 18 methods + all 3 plugin spellings.
+        let row = ProxyConfig {
+            id: "t03-s".to_string(),
+            name: "S".to_string(),
+            protocol: "shadowsocks".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                for method in crate::store::SS_METHODS {
+                    form.ss_method.update(cx, |state, cx| {
+                        state.set_selected_value(&method.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.ss_method
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        method,
+                        "method {method} resolves"
+                    );
+                }
+                for plugin in ["", "obfs-local", "v2ray-plugin"] {
+                    form.ss_plugin.update(cx, |state, cx| {
+                        state.set_selected_value(&plugin.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.ss_plugin
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        plugin,
+                        "plugin spellings resolve"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T03: picking a plugin paints the honest footer
+    /// (the executable must sit beside the engine); back to none hides it.
+    /// Driven through the real picker (3 rows fit — clicks reach them).
+    #[gpui_kit::test]
+    fn t03_ss_plugin_note_paints_on_pick(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "SsPluginRow".to_string(),
+                protocol: "shadowsocks".to_string(),
+                params:
+                    "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+                    \"method\":\"aes-128-gcm\",\"password\":\"pw\"}"
+                        .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("ss-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "ss-plugin-note".to_string());
+        cx.update(|window, cx| {
+            window.click("ss-plugin", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("ss-plugin-option-obfs-local", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "ss-plugin-note");
+        cx.update(|window, cx| {
+            window.click("ss-plugin", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("ss-plugin-option-default", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_absent(cx, "ss-plugin-note".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T03: an imported legacy `vmess://` link (boolean
+    /// `tls`, cipher in `security` — exactly what the grammar writes)
+    /// prefills every inner field and refolds byte-identical — untouched
+    /// Edit commits zero spurious patch.
+    #[gpui_kit::test]
+    fn t03_legacy_vmess_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::import::import_text;
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let link = "vmess://eyJ2IjoiMiIsInBzIjoibGVnYWN5LXZtZXNzIiwiYWRkIjoiYS5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidHlwZSI6Im5vbmUiLCJ0bHMiOiJ0bHMiLCJzbmkiOiJhLmV4YW1wbGUuY29tIn0=";
+        let mut batch = import_text(link);
+        assert!(
+            batch.failures.is_empty(),
+            "link imports: {:?}",
+            batch.failures
+        );
+        assert_eq!(batch.configs.len(), 1, "one row");
+        let parsed = batch.configs.remove(0);
+        assert_eq!(parsed.protocol, "vmess");
+        let row = ProxyConfig {
+            id: "t03".to_string(),
+            name: parsed.name.clone(),
+            protocol: parsed.protocol.clone(),
+            params: parsed.params.clone(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let (uuid, aid, cipher, enable, sni, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                let uuid = form.vmess_uuid.read(cx).value().to_string();
+                let aid = form.vmess_aid.read(cx).value().to_string();
+                let cipher = form
+                    .vmess_security
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .unwrap_or_default();
+                let enable = *form.s2_enable.borrow();
+                let sni = form.s2_sni.read(cx).value().to_string();
+                let folded = form.effective_params(cx);
+                (uuid, aid, cipher, enable, sni, folded)
+            })
+        });
+        assert_eq!(
+            uuid, "11111111-2222-4333-8444-555555555555",
+            "uuid prefills"
+        );
+        assert_eq!(aid, "0", "aid prefills");
+        assert_eq!(cipher, "auto", "legacy cipher prefills");
+        assert!(enable, "legacy boolean enables TLS");
+        assert_eq!(sni, "a.example.com", "sni prefills");
+        assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
+    }
+
+    /// Config-completeness T03: seeded trojan/shadowsocks rows prefill and
+    /// refold byte-identical (passwords, method, plugin opts, uot, mux).
+    #[gpui_kit::test]
+    fn t03_trojan_ss_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let trojan_params =
+            "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
+            \"password\":\"secret\",\"security\":\"tls\",\"sni\":\"a.example.com\",\
+            \"network\":\"ws\",\"path\":\"/w\",\"mux\":\"on\"}";
+        let ss_params =
+            "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
+            \"method\":\"chacha20-ietf-poly1305\",\"password\":\"pw\",\
+            \"plugin_opts\":\"obfs=http\",\"udp_over_tcp\":true,\"mux\":\"on\"}";
+        let rows = [
+            ("t03-t", "T", "trojan", trojan_params),
+            ("t03-s", "S", "shadowsocks", ss_params),
+        ];
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        for (id, name, protocol, params) in rows {
+            let row = ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let (password, extra, folded) = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    let password = if protocol == "trojan" {
+                        form.trojan_password.read(cx).value().to_string()
+                    } else {
+                        form.ss_password.read(cx).value().to_string()
+                    };
+                    let extra = if protocol == "trojan" {
+                        form.s2_sni.read(cx).value().to_string()
+                    } else {
+                        form.ss_method
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    (password, extra, form.effective_params(cx))
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "{protocol} untouched refold is byte-identical"
+            );
+            if protocol == "trojan" {
+                assert_eq!(password, "secret", "trojan password prefills");
+                assert_eq!(extra, "a.example.com", "trojan sni prefills");
+            } else {
+                assert_eq!(password, "pw", "ss password prefills");
+                assert_eq!(extra, "chacha20-ietf-poly1305", "ss method prefills");
+            }
+        }
+    }
+
+    /// Config-completeness T03 ENTER-guard (audit §10.9 incident regression
+    /// per dropdown ticket): Confirm from inside a new picker popup stops
+    /// at the picker wrapper — the dialog never commits a half-filled row.
+    /// Driven through the real protocol picker with keyboard navigation
+    /// (virtualized list — arrows + Enter is the honest path, T01
+    /// precedent), then into the ss method popup. Validation-sensitive by
+    /// construction like the T01 guard test: a broken guard would run the
+    /// commit on the untouched (invalid) ss template and fire exactly one
+    /// error toast.
+    #[gpui_kit::test]
+    fn t03_enter_in_ss_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to shadowsocks through the real picker (cursor starts
+        // at `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("shadowsocks");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The Shadowsocks page renders (Add wiring holds for the new page).
+        assert_painted(cx, "ss-section-caption");
+        cx.update(|window, cx| {
+            window.click("ss-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "ss-method");
+        // Open the method popup, then Enter: the pick lands, the commit
+        // must not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("ss-method", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("ss-method-option-default".to_string())
+                .is_some()),
+            "method popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "method Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "method Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "method Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "ss-method-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T04: WireGuard Edit renders the nine peer/net
+    /// rows + keygen + S4 as kit primitives with pinned ids; no
+    /// Transport/TLS/Mux panels (endpoint parity) and nothing from the
+    /// other pages.
+    #[gpui_kit::test]
+    fn t04_wireguard_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "WgRow".to_string(),
+                protocol: "wireguard".to_string(),
+                params: "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
+                    \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"address\":\"10.0.0.2/32\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "wg-section-caption");
+        assert_absent(cx, "wg-private-key".to_string());
+        cx.update(|window, cx| {
+            window.click("wg-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "wg-private-key",
+            "wg-private-key-generate",
+            "wg-public-key",
+            "wg-preshared-key",
+            "wg-reserved",
+            "wg-keepalive",
+            "wg-local-addr",
+            "wg-dns",
+            "wg-mtu",
+            "wg-workers",
+            "wg-sys-ifc",
+            "wg-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No Transport/TLS/Mux panels; nothing from the other pages.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "awg-version",
+            "vmess-aid",
+            "ss-method",
+            "trojan-password",
+            "vless-uuid",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| {
+            window.click("s4-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in ["s4-reuse", "s4-timeout"] {
+            assert_painted(cx, id);
+        }
+        // Keygen toasts once and keeps the dialog open (the key backend is
+        // pinned by `t04_generate_wireguard_key_shape`).
+        assert_eq!(notification_count(cx), 0, "no toast before Generate");
+        cx.update(|window, cx| {
+            window.click("wg-private-key-generate", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(notification_count(cx), 1, "Generate toasts once");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog stays open after Generate"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T04: AmneziaWG Edit renders WG rows + enable +
+    /// version + the J/S/H/I matrix + S4; the v3 section hides until 3.x is
+    /// picked (entities persist — hide-preserve is pinned at fold level by
+    /// `t04_awg_version_toggle_hide_preserves`). The page is the longest
+    /// guided page, so it paints jumbo-tall (the t11 minimum-frame contract
+    /// pins the collapsed core, not open pages).
+    #[gpui_kit::test]
+    fn t04_amneziawg_page_paints_and_version_gates(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // Jumbo paint: the full AWG page (peer rows + matrix + v3) needs
+        // more than the shared 1800px tall paint to be visible in-frame.
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "AwgRow".to_string(),
+                protocol: "amneziawg".to_string(),
+                params: "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+                    \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\
+                    \"awg_version\":\"2.0\",\"jc\":\"5\",\"s1\":\"20\",\"h1\":\"1-100\",\"i1\":\"x\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "awg-section-caption");
+        cx.update(|window, cx| {
+            window.click("awg-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "awg-private-key",
+            "awg-private-key-generate",
+            "awg-public-key",
+            "awg-preshared-key",
+            "awg-reserved",
+            "awg-keepalive",
+            "awg-local-addr",
+            "awg-dns",
+            "awg-mtu",
+            "awg-workers",
+            "awg-sys-ifc",
+            "awg-enable",
+            "awg-version",
+            "awg-jc",
+            "awg-jmin",
+            "awg-jmax",
+            "awg-s1",
+            "awg-h1",
+            "awg-i1",
+            "awg-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // 2.0 rows hide the v3 section (with the honest note); nothing from
+        // the other pages and no Transport/TLS/Mux panels.
+        assert_painted(cx, "awg-v3-note");
+        for id in [
+            "awg-hpk",
+            "awg-pad",
+            "awg-rekey-after",
+            "awg-trailers",
+            "awg-cookies",
+            "wg-private-key",
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "ss-method",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        // Picking 3.x mounts the v3 section live (option-click precedent:
+        // small lists paint every row, like the ss plugin note test).
+        cx.update(|window, cx| {
+            window.click("awg-version", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("awg-version-option-3.x", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "awg-v3-caption",
+            "awg-hpk",
+            "awg-pad",
+            "awg-rekey-after",
+            "awg-rekey-timeout",
+            "awg-reject-after",
+            "awg-keepalive-timeout",
+            "awg-max-handshake",
+            "awg-trailers",
+            "awg-cookies",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "awg-v3-note".to_string());
+        // Picking back to no-selection unmounts it again (values persist —
+        // fold-level proof below).
+        cx.update(|window, cx| {
+            window.click("awg-version", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("awg-version-option-default", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "awg-v3-note");
+        assert_absent(cx, "awg-hpk".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: blank + both versions resolve (virtualized
+        // popups only paint visible rows, so membership pins here).
+        let row = crate::store::ProxyConfig {
+            id: "t04-a".to_string(),
+            name: "A".to_string(),
+            protocol: "amneziawg".to_string(),
+            params: "{\"type\":\"amneziawg\"}".to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                for version in ["", "2.0", "3.x"] {
+                    form.awg_version.update(cx, |state, cx| {
+                        state.set_selected_value(&version.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.awg_version
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        version,
+                        "version {version:?} resolves"
+                    );
+                }
+            })
+        });
+        assert_eq!(
+            crate::awg_version_choices().len(),
+            3,
+            "version lists blank + 2.0 + 3.x"
+        );
+    }
+
+    /// Config-completeness T04: version-toggle hide-preserves at the fold
+    /// level — a v3 matrix survives a 2.0 refold byte-identical (R5); the
+    /// engine version gate (not the fold) is what rejects v3 keys on 2.0
+    /// rows at generate (pinned by `t04_awg_markers_strip_…` in engine).
+    #[gpui_kit::test]
+    fn t04_awg_version_toggle_hide_preserves(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let params = "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
+            \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"awg_version\":\"3.x\",\
+            \"jc\":\"5\",\"headerprotectionkey\":\"HPK\",\"randomtrailers\":true}";
+        let row = ProxyConfig {
+            id: "t04-h".to_string(),
+            name: "H".to_string(),
+            protocol: "amneziawg".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let folded = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                assert_eq!(
+                    form.effective_params(cx),
+                    params,
+                    "untouched v3 row refolds byte-identical"
+                );
+                // Hide the v3 section (toggle to 2.0) with v3 values still
+                // typed: the refold keeps every v3 key (never wiped).
+                form.awg_version.update(cx, |state, cx| {
+                    state.set_selected_value(&"2.0".to_string(), window, cx);
+                });
+                form.effective_params(cx)
+            })
+        });
+        let folded_value: serde_json::Value = serde_json::from_str(&folded).expect("refold parses");
+        assert_eq!(folded_value["awg_version"], "2.0", "version switched");
+        assert_eq!(
+            folded_value["headerprotectionkey"], "HPK",
+            "hidden v3 value preserved"
+        );
+        assert_eq!(
+            folded_value["randomtrailers"], true,
+            "hidden switch preserved"
+        );
+        assert_eq!(folded_value["jc"], "5", "visible matrix kept");
+    }
+
+    /// Config-completeness T04: `.conf` imports land in kit fields (nothing
+    /// JSON-only) — reserved/keepalive/MTU/DNS round-trip on WG, the full
+    /// J/S/H/I matrix + version on AWG; untouched refolds stay
+    /// byte-identical (zero spurious patch).
+    #[gpui_kit::test]
+    fn t04_conf_prefill_round_trips(cx: &mut TestAppContext) {
+        use crate::import::import_text;
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let conf = "[Interface]\nPrivateKey = LOCAL-KEY\nAddress = 10.0.0.2/32\n\
+            DNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = REMOTE-KEY\n\
+            PresharedKey = PSK\nAllowedIPs = 0.0.0.0/0\n\
+            Endpoint = 192.0.2.44:51820\nPersistentKeepalive = 25\nReserved = 1,2,3\n";
+        let awg_conf = "[Interface]\nPrivateKey = LOCAL-KEY\nAddress = 10.0.0.2/32\n\
+            Jc = 5\nJmin = 30\nJmax = 1000\nS1 = 20\nH1 = 1-100\nI1 = x\n\n[Peer]\n\
+            PublicKey = REMOTE-KEY\nEndpoint = 192.0.2.90:51820\n";
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let mut batch = import_text(conf);
+        assert!(batch.failures.is_empty(), "wg conf imports");
+        assert_eq!(batch.configs.len(), 1, "one wg row");
+        let wg = batch.configs.remove(0);
+        assert_eq!(wg.protocol, "wireguard");
+        let mut awg_batch = import_text(awg_conf);
+        assert!(awg_batch.failures.is_empty(), "awg conf imports");
+        assert_eq!(awg_batch.configs.len(), 1, "one awg row");
+        let awg = awg_batch.configs.remove(0);
+        assert_eq!(awg.protocol, "amneziawg");
+        for parsed in [wg, awg] {
+            let protocol = parsed.protocol.clone();
+            let params = parsed.params.clone();
+            let row = ProxyConfig {
+                id: "t04-c".to_string(),
+                name: parsed.name.clone(),
+                protocol: protocol.clone(),
+                params: params.clone(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let (fields, folded) = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    let fields: Vec<String> = if protocol == "wireguard" {
+                        vec![
+                            form.wg_private.read(cx).value().to_string(),
+                            form.wg_public.read(cx).value().to_string(),
+                            form.wg_preshared.read(cx).value().to_string(),
+                            form.wg_reserved.read(cx).value().to_string(),
+                            form.wg_keepalive.read(cx).value().to_string(),
+                            form.wg_local_addr.read(cx).value().to_string(),
+                            form.wg_dns.read(cx).value().to_string(),
+                            form.wg_mtu.read(cx).value().to_string(),
+                        ]
+                    } else {
+                        vec![
+                            form.awg_private.read(cx).value().to_string(),
+                            form.awg_public.read(cx).value().to_string(),
+                            form.awg_local_addr.read(cx).value().to_string(),
+                            form.awg_jc.read(cx).value().to_string(),
+                            form.awg_jmin.read(cx).value().to_string(),
+                            form.awg_jmax.read(cx).value().to_string(),
+                            form.awg_s1.read(cx).value().to_string(),
+                            form.awg_h1.read(cx).value().to_string(),
+                            form.awg_i1.read(cx).value().to_string(),
+                            form.awg_version
+                                .read(cx)
+                                .selected_value()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ]
+                    };
+                    (fields, form.effective_params(cx))
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "{protocol} untouched refold is byte-identical"
+            );
+            if protocol == "wireguard" {
+                assert_eq!(
+                    fields,
+                    vec![
+                        "LOCAL-KEY",
+                        "REMOTE-KEY",
+                        "PSK",
+                        "1,2,3",
+                        "25",
+                        "10.0.0.2/32",
+                        "1.1.1.1",
+                        "1420",
+                    ],
+                    "wg conf values sit in kit fields"
+                );
+            } else {
+                assert_eq!(
+                    fields,
+                    vec![
+                        "LOCAL-KEY",
+                        "REMOTE-KEY",
+                        "10.0.0.2/32",
+                        "5",
+                        "30",
+                        "1000",
+                        "20",
+                        "1-100",
+                        "x",
+                        "2.0",
+                    ],
+                    "awg conf values sit in kit fields"
+                );
+            }
+        }
+    }
+
+    /// Config-completeness T04 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside the AWG version popup stops at the picker wrapper — the
+    /// dialog never commits a half-filled row. Validation-sensitive by
+    /// construction like the T01/T03 guard tests: a broken guard would run
+    /// the commit on the untouched (invalid) awg template and fire exactly
+    /// one error toast.
+    #[gpui_kit::test]
+    fn t04_enter_in_awg_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to amneziawg through the real picker (cursor starts at
+        // `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("amneziawg");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The AmneziaWG page renders (Add wiring holds for the new page).
+        assert_painted(cx, "awg-section-caption");
+        cx.update(|window, cx| {
+            window.click("awg-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "awg-version");
+        // Open the version popup, then Enter: the pick lands, the commit
+        // must not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("awg-version", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("awg-version-option-default".to_string())
+                .is_some()),
+            "version popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "version Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "version Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "version Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "awg-version-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T04: wireguard key shape (base64 32 bytes —
+    /// exactly what `wg genkey` emits — unique) — pure unit test for the
+    /// keygen backend.
+    #[test]
+    fn t04_generate_wireguard_key_shape() {
+        use crate::generate_wireguard_key;
+        use base64::Engine as _;
+        for _ in 0..8 {
+            let key = generate_wireguard_key();
+            assert_eq!(key.len(), 44, "base64 32 bytes: {key}");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&key)
+                .expect("key decodes");
+            assert_eq!(bytes.len(), 32, "32 key bytes: {key}");
+        }
+        assert_ne!(generate_wireguard_key(), generate_wireguard_key(), "unique");
+    }
+
+    /// Config-completeness T05: picker option counts — hysteria `auth_type`
+    /// (blank + STRING + BASE64), tuic cc (blank + 3) and relay (blank + 2).
+    /// One source behind picker, prefill and fold (store consts).
+    #[test]
+    fn t05_dropdown_counts() {
+        use crate::store::{HY_AUTH_TYPES, TUIC_CC_MODES, TUIC_RELAY_MODES};
+        assert_eq!(HY_AUTH_TYPES, ["STRING", "BASE64"]);
+        assert_eq!(TUIC_CC_MODES, ["bbr", "cubic", "new_reno"]);
+        assert_eq!(TUIC_RELAY_MODES, ["native", "quic"]);
+        assert_eq!(
+            crate::hy_auth_type_choices().len(),
+            3,
+            "auth_type lists blank + 2"
+        );
+        assert_eq!(crate::tuic_cc_choices().len(), 4, "cc lists blank + 3");
+        assert_eq!(
+            crate::tuic_relay_choices().len(),
+            3,
+            "relay lists blank + 2"
+        );
+    }
+
+    /// Config-completeness T05: Hysteria Add toggles the v1/v2 layouts —
+    /// common rows persist while v1-only (auth family) vs v2-only (password)
+    /// swap as kit primitives; the forced-TLS section carries no enable
+    /// toggle. The page is long, so it paints jumbo-tall (the t11
+    /// minimum-frame contract pins the collapsed core, not open pages).
+    #[gpui_kit::test]
+    fn t05_hysteria_add_toggles_layouts(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        // Drive the picker through real keystrokes (T01 precedent: cursor
+        // starts at `vless`; deltas track it; Enter picks, never commits).
+        let pick = |cx: &mut VisualTestContext, target: &str, current: &str| {
+            let start = row_of(current);
+            let end = row_of(target);
+            cx.update(|window, cx| {
+                window.click("protocol-select", cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            let (key, steps) = if end >= start {
+                ("down", end - start)
+            } else {
+                ("up", start - end)
+            };
+            let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+            for _ in 0..steps {
+                cx.update(|window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                });
+                cx.run_until_parked();
+            }
+            let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(enter.clone(), cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+        };
+        pick(cx, "hysteria", "vless");
+        assert_painted(cx, "hy-section-caption");
+        cx.update(|window, cx| {
+            window.click("hy-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        // v1 layout: version switch + common + auth family; no password, no
+        // edit lock, no Transport/Mux panels.
+        for id in [
+            "hy-version-group",
+            "hy-server-ports",
+            "hy-hop-interval",
+            "hy-up",
+            "hy-down",
+            "hy-obfs",
+            "hy-auth-type",
+            "hy-auth",
+            "hy-recv-window-conn",
+            "hy-recv-window",
+            "hy-mtu",
+            "hy-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "hy-password",
+            "hy-version-locked",
+            "s2-enable",
+            "s1-caption",
+            "s3-caption",
+            "tuic-cc",
+            "ss-method",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        // The forced-TLS section opens with the lock note (never a toggle).
+        cx.update(|window, cx| {
+            window.click("s2-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "s2-forced-note",
+            "s2-sni",
+            "s2-alpn",
+            "s2-fp",
+            "s2-insecure",
+            "s2-pbk",
+            "s2-sid",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "s2-enable".to_string());
+        // Toggle to v2: the auth family unmounts, the password mounts,
+        // common rows persist.
+        pick(cx, "hysteria2", "hysteria");
+        for id in [
+            "hy-version-group",
+            "hy-server-ports",
+            "hy-hop-interval",
+            "hy-up",
+            "hy-down",
+            "hy-obfs",
+            "hy-password",
+            "s2-forced-note",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "hy-auth-type",
+            "hy-auth",
+            "hy-recv-window-conn",
+            "hy-recv-window",
+            "hy-mtu",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        // Toggle back: the v1 layout returns (entities persist — the
+        // fold-level proof below pins hide-preserve byte-identical).
+        pick(cx, "hysteria", "hysteria2");
+        for id in ["hy-auth-type", "hy-auth", "hy-mtu", "hy-version-group"] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "hy-password".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T05: layout-toggle hide-preserves at the fold
+    /// level — v1-only values survive a v2 refold (R5; the exclusive
+    /// credential is the only branch) and an untouched row refolds
+    /// byte-identical on both layouts.
+    #[gpui_kit::test]
+    fn t05_hysteria_toggle_hide_preserves(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let params = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
+            \"auth\":\"secret\",\"auth_type\":\"STRING\",\"up\":\"100\",\"down\":\"100\",\
+            \"recv_window\":2048,\"disable_mtu_discovery\":true}";
+        let row = ProxyConfig {
+            id: "t05-h".to_string(),
+            name: "H".to_string(),
+            protocol: "hysteria".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let folded = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                assert_eq!(
+                    form.effective_params(cx),
+                    params,
+                    "untouched v1 row refolds byte-identical"
+                );
+                // Hide the v1 half (refold as v2): every v1-only value stays
+                // in the JSON (never wiped); only the credential swaps.
+                let as_v2 = crate::store::fold_hysteria_into_params(
+                    params,
+                    &crate::store::HysteriaFold {
+                        password: "v2secret".to_string(),
+                        ..Default::default()
+                    },
+                    true,
+                );
+                let as_v2_value: serde_json::Value =
+                    serde_json::from_str(&as_v2).expect("v2 refold parses");
+                assert_eq!(as_v2_value["password"], "v2secret", "v2 credential folds");
+                assert_eq!(as_v2_value["auth"], "secret", "hidden v1 auth preserved");
+                assert_eq!(
+                    as_v2_value["auth_type"], "STRING",
+                    "hidden v1 marker preserved"
+                );
+                assert_eq!(
+                    as_v2_value["recv_window"], 2048,
+                    "hidden tunables preserved"
+                );
+                assert_eq!(as_v2_value["up"], "100", "common speeds kept");
+                form.effective_params(cx)
+            })
+        });
+        assert_eq!(folded, params, "v1 refold still byte-identical");
+    }
+
+    /// Config-completeness T05 scenario (v1 commit blank up/down): save
+    /// refuses naming up_mbps/down_mbps with zero rows stored; filling the
+    /// speeds on the same form then commits.
+    #[gpui_kit::test]
+    fn t05_hysteria_v1_blank_up_down_refuses_commit(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let (closed, message, closed2) = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("Hy", window, cx);
+                });
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"hysteria".to_string(), window, cx);
+                });
+                // The dialog builder rewrites the pristine starter on switch
+                // — mirror it (dirty JSON would stand instead).
+                form.params.update(cx, |state, cx| {
+                    state.set_value(protocol_params_template("hysteria"), window, cx);
+                });
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value("192.0.2.14", window, cx);
+                });
+                form.hy_auth.update(cx, |state, cx| {
+                    state.set_value("secret", window, cx);
+                });
+                let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
+                let message = form_error
+                    .borrow()
+                    .clone()
+                    .map(|(_, message)| message)
+                    .unwrap_or_default();
+                form.hy_up.update(cx, |state, cx| {
+                    state.set_value("100", window, cx);
+                });
+                form.hy_down.update(cx, |state, cx| {
+                    state.set_value("100", window, cx);
+                });
+                let closed2 = view.commit_add_with_focus(&form, &form_error, window, cx);
+                (closed, message, closed2)
+            })
+        });
+        assert!(!closed, "blank speeds keep the dialog open");
+        assert!(
+            message.contains("up_mbps") && message.contains("down_mbps"),
+            "refusal names the page fields: {message}"
+        );
+        assert!(closed2, "speeds filled commits");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "exactly one row lands"
+        );
+    }
+
+    /// Config-completeness T05: TUIC Edit renders uuid (+uuidgen) + password
+    /// + cc/relay + uot/zero-rtt/heartbeat + S2-forced + S4, all kit; an
+    /// untouched row refolds byte-identical.
+    #[gpui_kit::test]
+    fn t05_tuic_edit_round_trips(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let params = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
+            \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"password\":\"secret\",\
+            \"congestion_control\":\"bbr\",\"udp_relay_mode\":\"quic\",\
+            \"udp_over_stream\":true,\"zero_rtt_handshake\":true,\"heartbeat\":\"10s\",\
+            \"sni\":\"example.com\",\"fp\":\"chrome\",\"insecure\":true}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "TuicRow".to_string(),
+                protocol: "tuic".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "tuic-section-caption");
+        cx.update(|window, cx| {
+            window.click("tuic-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "tuic-uuid",
+            "tuic-uuid-generate",
+            "tuic-password",
+            "tuic-cc",
+            "tuic-relay",
+            "tuic-uot",
+            "tuic-zero-rtt",
+            "tuic-heartbeat",
+            "tuic-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No enable toggle, no Transport/Mux panels, nothing from the other
+        // pages.
+        for id in [
+            "s2-enable",
+            "s1-caption",
+            "s3-caption",
+            "hy-auth",
+            "hy-password",
+            "ss-method",
+            "trojan-password",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| {
+            window.click("s2-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in ["s2-forced-note", "s2-sni", "s2-fp", "s2-insecure"] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Prefill + refold at the form level (no typing simulation).
+        let row = ProxyConfig {
+            id: "t05-t".to_string(),
+            name: "T".to_string(),
+            protocol: "tuic".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let (fields, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                let fields = vec![
+                    form.tuic_uuid.read(cx).value().to_string(),
+                    form.tuic_password.read(cx).value().to_string(),
+                    form.tuic_cc
+                        .read(cx)
+                        .selected_value()
+                        .cloned()
+                        .unwrap_or_default(),
+                    form.tuic_relay
+                        .read(cx)
+                        .selected_value()
+                        .cloned()
+                        .unwrap_or_default(),
+                    form.tuic_heartbeat.read(cx).value().to_string(),
+                ];
+                (fields, form.effective_params(cx))
+            })
+        });
+        assert_eq!(
+            fields,
+            vec![
+                "11111111-2222-4333-8444-555555555555",
+                "secret",
+                "bbr",
+                "quic",
+                "10s",
+            ],
+            "tuic values sit in kit fields"
+        );
+        assert_eq!(folded, params, "untouched tuic refolds byte-identical");
+        // Delegate membership: blank + every mode resolves (virtualized
+        // popups only paint visible rows, so membership pins here).
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::prefilled(window, cx, &row, None);
+                for mode in ["", "bbr", "cubic", "new_reno"] {
+                    form.tuic_cc.update(cx, |state, cx| {
+                        state.set_selected_value(&mode.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.tuic_cc
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        mode,
+                        "cc {mode:?} resolves"
+                    );
+                }
+                for mode in ["", "native", "quic"] {
+                    form.tuic_relay.update(cx, |state, cx| {
+                        state.set_selected_value(&mode.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.tuic_relay
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        mode,
+                        "relay {mode:?} resolves"
+                    );
+                }
+            })
+        });
+        assert_eq!(crate::tuic_cc_choices().len(), 4, "cc lists blank + 3");
+        assert_eq!(
+            crate::tuic_relay_choices().len(),
+            3,
+            "relay lists blank + 2"
+        );
+    }
+
+    /// Config-completeness T05 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside a TUIC picker popup stops at the wrapper — the dialog
+    /// never commits a half-filled row. Validation-sensitive by construction
+    /// like the T01/T03/T04 guard tests.
+    #[gpui_kit::test]
+    fn t05_enter_in_tuic_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to tuic through the real picker (cursor starts at
+        // `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("tuic");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The TUIC page renders (Add wiring holds for the new page).
+        assert_painted(cx, "tuic-section-caption");
+        cx.update(|window, cx| {
+            window.click("tuic-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "tuic-cc");
+        // Open the cc popup, then Enter: the pick lands, the commit must
+        // not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("tuic-cc", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("tuic-cc-option-default".to_string())
+                .is_some()),
+            "cc popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "cc Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "cc Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "cc Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "tuic-cc-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T06: panel dropdown counts — socks version lists
+    /// blank + 2, socks network lists tcp + udp, naive cc lists blank + 4.
+    #[test]
+    fn t06_dropdown_counts() {
+        use crate::store::{NAIVE_CC_MODES, SOCKS_VERSIONS};
+        assert_eq!(SOCKS_VERSIONS, ["5", "4"]);
+        assert_eq!(NAIVE_CC_MODES, ["bbr", "bbr2", "cubic", "reno"]);
+        assert_eq!(
+            crate::socks_version_choices().len(),
+            3,
+            "version lists blank + 2"
+        );
+        assert_eq!(
+            crate::socks_network_choices().len(),
+            2,
+            "network lists tcp + udp"
+        );
+        assert_eq!(crate::naive_cc_choices().len(), 5, "cc lists blank + 4");
+    }
+
+    /// Config-completeness T06: SOCKS Add renders version + credentials +
+    /// network + uot + S4-only as kit primitives; a stored "5" echoes into
+    /// the picker and delegate membership covers blank + both versions
+    /// (virtualized popups paint visible rows only, so membership pins here).
+    #[gpui_kit::test]
+    fn t06_socks_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("socks");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "socks-section-caption");
+        cx.update(|window, cx| {
+            window.click("socks-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "socks-version",
+            "socks-username",
+            "socks-password",
+            "socks-network",
+            "socks-uot",
+            "socks-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // S4-only page: no Transport/TLS/Mux panels, nothing from the other
+        // small pages.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "http-username",
+            "anytls-password",
+            "naive-cc",
+            "ssh-user",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: blank + both versions resolve.
+        let row = crate::store::ProxyConfig {
+            id: "t06-s".to_string(),
+            name: "S".to_string(),
+            protocol: "socks".to_string(),
+            params: "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080}".to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                for version in ["", "5", "4"] {
+                    form.socks_version.update(cx, |state, cx| {
+                        state.set_selected_value(&version.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.socks_version
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        version,
+                        "version {version:?} resolves"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T06: HTTP Add renders username/password/path/
+    /// headers + S2-optional + S4; HTTPS renders the same block (one entity
+    /// set, two protocols) with the enable toggle present.
+    #[gpui_kit::test]
+    fn t06_http_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let mut current = "vless".to_string();
+        let mut pick = |cx: &mut VisualTestContext, target: &str| {
+            let start = row_of(current.as_str());
+            let end = row_of(target);
+            current = target.to_string();
+            cx.update(|window, cx| {
+                window.click("protocol-select", cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            let (key, steps) = if end >= start {
+                ("down", end - start)
+            } else {
+                ("up", start - end)
+            };
+            let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+            for _ in 0..steps {
+                cx.update(|window, cx| {
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                });
+                cx.run_until_parked();
+            }
+            let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(enter.clone(), cx);
+            });
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+            cx.run_until_parked();
+            paint_jumbo_dialog(cx);
+        };
+        let mut first = true;
+        for target in ["http", "https"] {
+            pick(cx, target);
+            assert_painted(cx, "http-section-caption");
+            // Section-open states persist across the protocol switch (T05
+            // precedent), so toggles open once — re-clicking would close them.
+            if first {
+                cx.update(|window, cx| {
+                    window.click("http-section-toggle", cx);
+                });
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+            }
+            for id in [
+                "http-username",
+                "http-password",
+                "http-path",
+                "http-headers",
+                "http-notes",
+                "s2-caption",
+                "s4-caption",
+            ] {
+                assert_painted(cx, id);
+            }
+            // The optional-TLS section opens with the enable toggle (never
+            // the forced lock note).
+            if first {
+                cx.update(|window, cx| {
+                    window.click("s2-toggle", cx);
+                });
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+                cx.run_until_parked();
+                paint_jumbo_dialog(cx);
+            }
+            for id in ["s2-enable", "s2-sni", "s2-fp"] {
+                assert_painted(cx, id);
+            }
+            assert_absent(cx, "s2-forced-note".to_string());
+            for id in ["s1-caption", "s3-caption", "socks-version", "naive-cc"] {
+                assert_absent(cx, id.to_string());
+            }
+            first = false;
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T06: AnyTLS Add renders password + the three
+    /// session tunables + S2-forced + S4, all kit; no enable toggle anywhere.
+    #[gpui_kit::test]
+    fn t06_anytls_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("anytls");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "anytls-section-caption");
+        cx.update(|window, cx| {
+            window.click("anytls-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "anytls-password",
+            "anytls-interval",
+            "anytls-timeout",
+            "anytls-min",
+            "anytls-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        cx.update(|window, cx| {
+            window.click("s2-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "s2-forced-note");
+        for id in ["s2-enable", "s1-caption", "s3-caption", "ssh-user"] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T06: Naïve Add renders username/password/uot/
+    /// quic/cc + S2-forced + S4, all kit; delegate membership covers blank +
+    /// all four modes.
+    #[gpui_kit::test]
+    fn t06_naive_page_paints(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("naive");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "naive-section-caption");
+        cx.update(|window, cx| {
+            window.click("naive-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "naive-username",
+            "naive-password",
+            "naive-uot",
+            "naive-quic",
+            "naive-cc",
+            "naive-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in ["s2-enable", "s1-caption", "s3-caption", "tuic-cc"] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Delegate membership: blank + every mode resolves.
+        let row = crate::store::ProxyConfig {
+            id: "t06-n".to_string(),
+            name: "N".to_string(),
+            protocol: "naive".to_string(),
+            params: "{\"type\":\"naive\",\"server\":\"s\",\"server_port\":443}".to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                for mode in ["", "bbr", "bbr2", "cubic", "reno"] {
+                    form.naive_cc.update(cx, |state, cx| {
+                        state.set_selected_value(&mode.to_string(), window, cx);
+                    });
+                    assert_eq!(
+                        form.naive_cc
+                            .read(cx)
+                            .selected_value()
+                            .cloned()
+                            .unwrap_or_default(),
+                        mode,
+                        "cc {mode:?} resolves"
+                    );
+                }
+            })
+        });
+    }
+
+    /// Config-completeness T06: SSH Edit renders user/password/key blob +
+    /// path picker + passphrase + host-key lists + client version + S4-only;
+    /// an untouched row refolds byte-identical (stored host-key arrays echo
+    /// as comma text); simulating the Browse completion fills the path and
+    /// loads the key without hand-paste.
+    #[gpui_kit::test]
+    fn t06_ssh_edit_round_trips_and_key_pick(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let params = "{\"type\":\"ssh\",\"server\":\"192.0.2.23\",\"server_port\":22,\
+            \"user\":\"root\",\"password\":\"secret\",\"private_key\":\"KEY-BLOB\",\
+            \"host_key\":[\"ecdsa-sha2-nistp256 AAAA\",\"ssh-ed25519 BBBB\"],\
+            \"host_key_algorithms\":[\"ssh-ed25519\"],\"client_version\":\"SSH-2.0-X\"}";
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "SshRow".to_string(),
+                protocol: "ssh".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert_painted(cx, "ssh-section-caption");
+        cx.update(|window, cx| {
+            window.click("ssh-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        for id in [
+            "ssh-user",
+            "ssh-password",
+            "ssh-private-key",
+            "ssh-key-path",
+            "ssh-key-browse",
+            "ssh-key-pass",
+            "ssh-host-key",
+            "ssh-host-key-algs",
+            "ssh-client-version",
+            "ssh-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No TLS/Transport/Mux panels, nothing from the other small pages.
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "socks-version",
+            "http-username",
+            "anytls-password",
+            "naive-cc",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Prefill + refold at the form level (no typing simulation).
+        let row = ProxyConfig {
+            id: "t06-k".to_string(),
+            name: "K".to_string(),
+            protocol: "ssh".to_string(),
+            params: params.to_string(),
+            group: "default".to_string(),
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let (fields, folded) = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                let fields = vec![
+                    form.ssh_user.read(cx).value().to_string(),
+                    form.ssh_password.read(cx).value().to_string(),
+                    form.ssh_private_key.read(cx).value().to_string(),
+                    form.ssh_host_key.read(cx).value().to_string(),
+                    form.ssh_host_key_algs.read(cx).value().to_string(),
+                    form.ssh_client_version.read(cx).value().to_string(),
+                ];
+                (fields, form.effective_params(cx))
+            })
+        });
+        assert_eq!(
+            fields,
+            vec![
+                "root",
+                "secret",
+                "KEY-BLOB",
+                "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB",
+                "ssh-ed25519",
+                "SSH-2.0-X",
+            ],
+            "ssh values sit in kit fields (arrays echo as comma text)"
+        );
+        assert_eq!(folded, params, "untouched ssh refolds byte-identical");
+        // The Browse completion fills the path and loads the key (the same
+        // two entity writes `finish_ssh_key_pick` performs).
+        cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &row, None);
+                form.ssh_key_path.update(cx, |state, cx| {
+                    state.set_value("/home/u/.ssh/id_rsa".to_string(), window, cx);
+                });
+                form.ssh_private_key.update(cx, |state, cx| {
+                    state.set_value("PICKED-KEY-BLOB".to_string(), window, cx);
+                });
+                let folded = form.effective_params(cx);
+                let value: serde_json::Value =
+                    serde_json::from_str(&folded).expect("picked key folds");
+                assert_eq!(value["private_key_path"], "/home/u/.ssh/id_rsa");
+                assert_eq!(value["private_key"], "PICKED-KEY-BLOB");
+            })
+        });
+    }
+
+    /// Config-completeness T06: small-matrix round-trips at the form level —
+    /// socks/http/anytls/naive rows echo their fields and refold
+    /// byte-identical (no paint needed).
+    #[gpui_kit::test]
+    fn t06_small_pages_round_trip(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let cases = [
+            (
+                "socks",
+                "{\"type\":\"socks\",\"server\":\"192.0.2.20\",\"server_port\":1080,\
+                \"version\":\"5\",\"username\":\"u\",\"password\":\"p\",\
+                \"network\":\"udp\",\"udp_over_tcp\":true}",
+            ),
+            (
+                "http",
+                "{\"type\":\"http\",\"server\":\"192.0.2.21\",\"server_port\":8080,\
+                \"username\":\"u\",\"password\":\"p\",\"path\":\"/p\",\
+                \"headers\":\"Host: h.example.com\",\"security\":\"tls\",\
+                \"sni\":\"example.com\"}",
+            ),
+            (
+                "anytls",
+                "{\"type\":\"anytls\",\"server\":\"192.0.2.15\",\"server_port\":8443,\
+                \"password\":\"p\",\"idle_session_check_interval\":\"30s\",\
+                \"idle_session_timeout\":\"60s\",\"min_idle_session\":5,\
+                \"sni\":\"example.com\"}",
+            ),
+            (
+                "naive",
+                "{\"type\":\"naive\",\"server\":\"192.0.2.22\",\"server_port\":443,\
+                \"username\":\"u\",\"password\":\"p\",\"udp_over_tcp\":true,\
+                \"quic\":true,\"quic_congestion_control\":\"bbr2\",\
+                \"sni\":\"example.com\"}",
+            ),
+        ];
+        for (protocol, params) in cases {
+            let row = ProxyConfig {
+                id: format!("t06-{protocol}"),
+                name: protocol.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let folded = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    form.effective_params(cx)
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "untouched {protocol} refolds byte-identical"
+            );
+        }
+    }
+
+    /// Config-completeness T06: the SSH key-file Browse failure names the
+    /// full picked path (never a basename, never silent).
+    #[test]
+    fn t06_ssh_key_pick_error_names_path() {
+        let error = crate::ssh_key_pick_error("C:\\keys\\missing_rsa");
+        assert!(
+            error.contains("C:\\keys\\missing_rsa"),
+            "wrong path names the path, got {error}"
+        );
+    }
+
+    /// Config-completeness T06 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside a Naïve picker popup stops at the wrapper — the dialog
+    /// never commits a half-filled row. Validation-sensitive by construction
+    /// like the T01/T03/T04/T05 guard tests.
+    #[gpui_kit::test]
+    fn t06_enter_in_naive_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // Switch Add to naive through the real picker (cursor starts at
+        // `vless`, row 0; deltas track it).
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of("naive");
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        // The Naïve page renders (Add wiring holds for the new page).
+        assert_painted(cx, "naive-section-caption");
+        cx.update(|window, cx| {
+            window.click("naive-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "naive-cc");
+        // Open the cc popup, then Enter: the pick lands, the commit must
+        // not run.
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("naive-cc", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("naive-cc-option-default".to_string())
+                .is_some()),
+            "cc popup opened"
+        );
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "cc Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "cc Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "cc Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "naive-cc-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: open Add switched to `protocol` through the
+    /// real picker (cursor starts at `vless`, row 0), painted tall.
+    fn t07_open_add_on(view: &Entity<AppView>, cx: &mut VisualTestContext, protocol: &str) {
+        use crate::store::VALID_PROTOCOLS;
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let row_of = |protocol: &str| {
+            VALID_PROTOCOLS
+                .iter()
+                .position(|candidate| *candidate == protocol)
+                .expect("canonical protocol")
+        };
+        let start = row_of("vless");
+        let target = row_of(protocol);
+        cx.update(|window, cx| {
+            window.click("protocol-select", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        let (key, steps) = if target >= start {
+            ("down", target - start)
+        } else {
+            ("up", start - target)
+        };
+        let keystroke = gpui_kit::Keystroke::parse(key).expect("test keystroke parses");
+        for _ in 0..steps {
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke.clone(), cx);
+            });
+            cx.run_until_parked();
+        }
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+    }
+
+    /// Config-completeness T07: picker tables behind the new dropdowns —
+    /// blank head + every engine-mapped value, nothing else.
+    #[test]
+    fn t07_dropdown_counts() {
+        use crate::store::{
+            SHADOWTLS_VERSIONS, SNELL_VERSIONS, XRAY_FLOWS, XRAY_MUX_MODES, XRAY_NETWORKS,
+        };
+        assert_eq!(SNELL_VERSIONS, ["4", "6"]);
+        assert_eq!(SHADOWTLS_VERSIONS, ["1", "2", "3"]);
+        assert_eq!(XRAY_NETWORKS, ["raw", "xhttp", "ws", "httpupgrade", "grpc"]);
+        assert_eq!(XRAY_FLOWS, ["xtls-rprx-vision", "xtls-rprx-vision-udp443"]);
+        assert_eq!(XRAY_MUX_MODES, ["enabled", "disabled"]);
+        assert_eq!(
+            crate::snell_version_choices().len(),
+            3,
+            "version lists blank + 2"
+        );
+        assert_eq!(
+            crate::shadowtls_version_choices().len(),
+            4,
+            "version lists blank + 3"
+        );
+        assert_eq!(
+            crate::xray_network_choices().len(),
+            6,
+            "network lists blank + 5"
+        );
+        assert_eq!(crate::xray_flow_choices().len(), 3, "flow lists blank + 2");
+        assert_eq!(crate::xray_mux_choices().len(), 3, "mux lists blank + 2");
+    }
+
+    /// Config-completeness T07: Snell Add renders psk + version + obfs/host +
+    /// userkey + reuse + network + mode + S4-only as kit primitives, all with
+    /// pinned ids; no Transport/TLS/Mux panels, nothing from sibling pages.
+    #[gpui_kit::test]
+    fn t07_snell_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "snell");
+        assert_painted(cx, "snell-section-caption");
+        cx.update(|window, cx| {
+            window.click("snell-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "snell-psk",
+            "snell-version",
+            "snell-obfs-mode",
+            "snell-obfs-host",
+            "snell-userkey",
+            "snell-reuse",
+            "snell-network",
+            "snell-mode",
+            "snell-notes",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "shadowtls-version",
+            "xray-uuid",
+            "chain-pick",
+            "extra-exe",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: ShadowTLS Add renders version + password +
+    /// S2-forced + S4 as kit primitives; the TLS panel reads forced (no
+    /// enable toggle page), S1/S3 stay off.
+    #[gpui_kit::test]
+    fn t07_shadowtls_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "shadowtls");
+        assert_painted(cx, "shadowtls-section-caption");
+        cx.update(|window, cx| {
+            window.click("shadowtls-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "shadowtls-version",
+            "shadowtls-password",
+            "shadowtls-notes",
+            "s2-caption",
+            "s4-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "s1-caption",
+            "s3-caption",
+            "snell-psk",
+            "xray-uuid",
+            "chain-pick",
+            "extra-exe",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: Xray-VLESS Add renders the Ph1 subset (uuid
+    /// +generate, enc, flow, sni/fp/alpn, pbk/sid/spiderx, network, mode, mux)
+    /// with pinned ids and the honest Ph1 footer; no shared panels ride the
+    /// bridge page.
+    #[gpui_kit::test]
+    fn t07_xray_page_paints(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "xray");
+        assert_painted(cx, "xray-section-caption");
+        cx.update(|window, cx| {
+            window.click("xray-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "xray-uuid",
+            "xray-uuid-generate",
+            "xray-enc",
+            "xray-flow",
+            "xray-sni",
+            "xray-fp",
+            "xray-alpn",
+            "xray-pbk",
+            "xray-sid",
+            "xray-spiderx",
+            "xray-network",
+            "xray-mode",
+            "xray-mux",
+            "xray-notes",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in [
+            "s1-caption",
+            "s2-caption",
+            "s3-caption",
+            "s4-caption",
+            "snell-psk",
+            "shadowtls-version",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T07: edge round-trips at the form level —
+    /// snell/shadowtls/xray/chain/extra rows echo their fields and refold
+    /// byte-identical (no paint needed). The xray case carries Ph2-only keys
+    /// to pin preserve-not-strip through the real echo path.
+    #[gpui_kit::test]
+    fn t07_small_pages_round_trip(cx: &mut TestAppContext) {
+        use crate::store::ProxyConfig;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let cases = [
+            (
+                "snell",
+                "{\"type\":\"snell\",\"server\":\"192.0.2.30\",\"server_port\":8080,\
+                \"psk\":\"secret\",\"version\":\"6\",\"obfs_mode\":\"http\",\
+                \"obfs_host\":\"example.com\",\"userkey\":\"key\",\"reuse\":true,\
+                \"network\":\"tcp\",\"mode\":\"multi\"}",
+            ),
+            (
+                "shadowtls",
+                "{\"type\":\"shadowtls\",\"server\":\"192.0.2.31\",\"server_port\":443,\
+                \"version\":\"2\",\"password\":\"secret\",\
+                \"sni\":\"example.com\",\"fp\":\"chrome\",\"insecure\":true}",
+            ),
+            (
+                "xray",
+                "{\"type\":\"xray\",\"server\":\"192.0.2.32\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"flow\":\"xtls-rprx-vision\",\"sni\":\"example.com\",\"fp\":\"chrome\",\
+                \"alpn\":\"h2\",\"pbk\":\"pubkey\",\"sid\":\"shortid\",\"spiderx\":\"/\",\
+                \"network\":\"xhttp\",\"mode\":\"auto\",\"xray_mux\":\"enabled\",\
+                \"xPaddingBytes\":\"100-200\",\"maxConcurrency\":16,\
+                \"downloadSettings\":{\"address\":\"d.example.com\"}}",
+            ),
+            (
+                "chain",
+                "{\"type\":\"chain\",\"server\":\"\",\"server_port\":443,\
+                \"nodes\":[\"row-a\",\"row-b\"]}",
+            ),
+            (
+                "extra-core",
+                "{\"type\":\"extra-core\",\"server\":\"\",\"server_port\":443,\
+                \"exe\":\"core.exe\",\"args\":\"--fast\",\"config\":{\"inbounds\":[]}}",
+            ),
+        ];
+        for (protocol, params) in cases {
+            let row = ProxyConfig {
+                id: format!("t07-{protocol}"),
+                name: protocol.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: "default".to_string(),
+                enabled: false,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 11801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            };
+            let folded = cx.update(|window, cx| {
+                view.update(cx, |_, cx| {
+                    let form = ConfigForm::prefilled(window, cx, &row, None);
+                    form.effective_params(cx)
+                })
+            });
+            assert_eq!(
+                folded, params,
+                "untouched {protocol} refolds byte-identical"
+            );
+        }
+    }
+
+    /// Config-completeness T07: chain Add renders the hop picker + Add over a
+    /// kit `Empty` (never a hand-rolled placeholder); the Throne add/replace
+    /// rules hold behind the buttons with rule-naming refusals that change
+    /// nothing; labels read `name (protocol)`, never params contents.
+    #[gpui_kit::test]
+    fn t07_chain_page_paints_empty_and_rules(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "chain");
+        assert_painted(cx, "chain-section-caption");
+        cx.update(|window, cx| {
+            window.click("chain-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "chain-pick",
+            "chain-hop-add",
+            "chain-hops-empty",
+            "chain-notes",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "chain-hops-list".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Hop rules behind the buttons, no dialog needed.
+        let (landed, refused_chain, refused_off_index, refused_second, replaced) =
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    let library = vec![
+                        crate::ChainLibraryEntry {
+                            id: "a".to_string(),
+                            name: "VlessOne".to_string(),
+                            protocol: "vless".to_string(),
+                        },
+                        crate::ChainLibraryEntry {
+                            id: "b".to_string(),
+                            name: "ChainOne".to_string(),
+                            protocol: "chain".to_string(),
+                        },
+                        crate::ChainLibraryEntry {
+                            id: "c".to_string(),
+                            name: "CoreOne".to_string(),
+                            protocol: "extra-core".to_string(),
+                        },
+                    ];
+                    let library = Rc::new(RefCell::new(library));
+                    let hops: Rc<RefCell<Vec<serde_json::Value>>> =
+                        Rc::new(RefCell::new(Vec::new()));
+                    let pick = ConfigForm::panel_select(
+                        window,
+                        cx,
+                        crate::chain_pick_choices(&library.borrow()),
+                        "",
+                    );
+                    // The picker id rides along for the UI path; the rules
+                    // below drive the same fns the Add/Replace buttons call
+                    // with the picked row id directly.
+                    let refused_chain = view.chain_add_hop(&hops, &library, &pick, "b", window, cx);
+                    let landed_extra = view.chain_add_hop(&hops, &library, &pick, "c", window, cx);
+                    let refused_second =
+                        view.chain_add_hop(&hops, &library, &pick, "c", window, cx);
+                    let landed = view.chain_add_hop(&hops, &library, &pick, "a", window, cx);
+                    let refused_off_index =
+                        view.chain_replace_hop(&hops, &library, &pick, 1, "c", window, cx);
+                    let refused_replace_chain =
+                        view.chain_replace_hop(&hops, &library, &pick, 1, "b", window, cx);
+                    let replaced = hops.borrow().clone();
+                    assert_eq!(
+                        crate::chain_hop_label(&replaced[0], 0, &library.borrow()),
+                        "1. CoreOne (extra-core)"
+                    );
+                    assert_eq!(
+                        crate::chain_existing_kinds(&replaced, &library.borrow()),
+                        vec![
+                            crate::store::ChainHopSlot::Extra,
+                            crate::store::ChainHopSlot::Other
+                        ]
+                    );
+                    (
+                        landed_extra && landed,
+                        !refused_chain,
+                        !refused_off_index,
+                        !refused_second,
+                        !refused_replace_chain && replaced.len() == 2,
+                    )
+                })
+            });
+        assert!(landed, "legal hops land (extra at 0, vless after)");
+        assert!(refused_chain, "chain→chain add refused");
+        assert!(refused_off_index, "off-index-0 extracore replace refused");
+        assert!(refused_second, "second extracore add refused");
+        assert!(replaced, "chain replace refused, hops unchanged");
+    }
+
+    /// Config-completeness T07: extra-core Add renders exe + Browse + args +
+    /// config with pinned ids and deliberately no `no_logs` control; Browse
+    /// completion stores the file name; dialog commit refuses an exeless row
+    /// naming the field and lands once exe + config shape hold.
+    #[gpui_kit::test]
+    fn t07_extra_page_paints_validates_and_gates_commit(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "extra-core");
+        assert_painted(cx, "extra-section-caption");
+        cx.update(|window, cx| {
+            window.click("extra-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "extra-exe",
+            "extra-exe-browse",
+            "extra-args",
+            "extra-config",
+            "extra-notes",
+        ] {
+            assert_painted(cx, id);
+        }
+        // No `no_logs` control anywhere on the page (Throne non-persist bug —
+        // never copied).
+        assert_absent(cx, "extra-no-logs".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // Browse completion stores the file name (the engine resolves it in
+        // the app directory and refuses paths).
+        let stored = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                view.finish_extra_exe_pick(
+                    form.extra_exe.clone(),
+                    "C:\\cores\\my-core.exe".to_string(),
+                    window,
+                    cx,
+                );
+                form.extra_exe.read(cx).value().to_string()
+            })
+        });
+        assert_eq!(stored, "my-core.exe", "Browse stores the file name");
+        // Validate gates commit: the pristine template (no exe/config)
+        // refuses naming exe; filling both lands exactly one row.
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let (closed, message, closed2) = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("EC", window, cx);
+                });
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"extra-core".to_string(), window, cx);
+                });
+                form.params.update(cx, |state, cx| {
+                    state.set_value(protocol_params_template("extra-core"), window, cx);
+                });
+                let closed = view.commit_add_with_focus(&form, &form_error, window, cx);
+                let message = form_error
+                    .borrow()
+                    .clone()
+                    .map(|(_, message)| message)
+                    .unwrap_or_default();
+                form.extra_exe.update(cx, |state, cx| {
+                    state.set_value("core.exe", window, cx);
+                });
+                form.extra_config.update(cx, |state, cx| {
+                    state.set_value("{}", window, cx);
+                });
+                // Review: the bare extra-core starter needs no dummy server —
+                // the folded exe/config over it commits clean (virtual rows
+                // carry no endpoint address; the store gate only constrains
+                // import-shaped rows).
+                let closed2 = view.commit_add_with_focus(&form, &form_error, window, cx);
+                (closed, message, closed2)
+            })
+        });
+        assert!(!closed, "exeless row keeps the dialog open");
+        assert!(
+            message.contains("exe"),
+            "refusal names the exe field: {message}"
+        );
+        assert!(closed2, "exe + config shape commits");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "exactly one row lands"
+        );
+    }
+
+    /// Config-completeness T07 ENTER-guard (R12 per-dropdown-ticket): Confirm
+    /// from inside an Xray picker popup stops at the wrapper — the dialog
+    /// never commits a half-filled row.
+    #[gpui_kit::test]
+    fn t07_enter_in_xray_picker_popup_does_not_commit(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        t07_open_add_on(&view, cx, "xray");
+        cx.update(|window, cx| {
+            window.click("xray-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "xray-network");
+        assert_eq!(notification_count(cx), 0, "no toast before Enter");
+        cx.update(|window, cx| {
+            window.click("xray-network", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find("xray-network-option-default".to_string())
+                .is_some()),
+            "network popup opened"
+        );
+        let enter = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(enter.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "network Enter keeps the dialog open (no half-filled commit)"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "network Enter stores no row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "network Enter runs no commit (a broken guard would toast the template error)"
+        );
+        assert_absent(cx, "xray-network-option-default".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     /// Ticket 02: edit dialog and delete confirm open for a stored config.
@@ -18636,6 +29271,100 @@ mod tests {
         assert_eq!(copy.params, alpha.params);
     }
 
+    /// Config-completeness T08 (CAP-11): the `Clone` alias duplicates
+    /// through the existing `commit_duplicate` logic — new disabled row,
+    /// fresh auto port, identical params (no rebuilt dupe path).
+    #[gpui_kit::test]
+    fn t08_clone_alias_duplicates_row(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10854"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_clone(&alpha.id, window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 1, "clone toasts");
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert_eq!(rows.len(), 2, "copy lands");
+        let copy = rows
+            .iter()
+            .find(|row| row.id != alpha.id)
+            .expect("copy there");
+        assert_eq!(copy.name, "Alpha copy");
+        assert!(!copy.enabled, "copy lands disabled");
+        assert_ne!(copy.port, alpha.port, "fresh auto port");
+        assert!(crate::store::is_auto_port(copy.port), "port is auto-range");
+        assert_eq!(copy.protocol, alpha.protocol);
+        assert_eq!(copy.params, alpha.params);
+    }
+
+    /// Config-completeness T08 (CAP-11): a share link on the clipboard +
+    /// the paste-intake binding opens the Import dialog prefilled with the
+    /// live valid/invalid preview — the same handler as the palette
+    /// `ImportClipboard` op (no regression, no new path). The
+    /// first-failure line paints only for a non-empty prefill, so it pins
+    /// the clipboard text landed in the box (an empty box stays neutral).
+    #[gpui_kit::test]
+    fn t08_paste_binding_opens_import_prefilled(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x"
+                    .to_string(),
+            ));
+        });
+        // Focus the shell so the library key context matches (keyboard-test
+        // precedent); the binding stays inert while typing or under a dialog.
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let paste = Keystroke::parse("ctrl-v").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(paste, cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "paste opens the import dialog"
+        );
+        assert_painted(cx, "field-import-text");
+        assert_painted(cx, "import-preview");
+        assert_painted(cx, "import-first-failure");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Config-completeness T08 (CAP-12): the `direct` page is label-only —
+    /// switching to it rewrites the box to the bare marker and the dialog
+    /// commit carries no endpoint fields (form-level; the T01 virtual test
+    /// pins the Server/Port hiding through the real picker).
+    #[gpui_kit::test]
+    fn t08_direct_form_commits_bare_marker(cx: &mut TestAppContext) {
+        use crate::store::protocol_params_template;
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let params = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.protocol_select.update(cx, |state, cx| {
+                    state.set_selected_value(&"direct".to_string(), window, cx);
+                });
+                form.sync_protocol_template(window, cx);
+                form.effective_params(cx)
+            })
+        });
+        assert_eq!(params, protocol_params_template("direct"));
+        assert_eq!(params, "{\"type\":\"direct\"}");
+    }
+
     /// Scenario: edited concrete port → "auto" returns to auto-assign (US-3).
     #[gpui_kit::test]
     fn ticket43_reauto_port_via_auto_word(cx: &mut TestAppContext) {
@@ -19416,7 +30145,9 @@ mod tests {
                 "library-menu",
                 &[
                     ("menu-import-config", "Import (Ctrl-O)"),
-                    ("import-clipboard", "From clipboard"),
+                    // Config-completeness T08: Ctrl-V is now bound, so the
+                    // pinned `Name (Key)` string moves onto this item.
+                    ("import-clipboard", "From clipboard (Ctrl-V)"),
                     ("export-library", "Export"),
                 ][..],
             ),
@@ -24342,6 +35073,7 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
+            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -24590,6 +35322,8 @@ mod tests {
     /// Ticket 05 (CAP-6): management hides behind exactly one disclosed
     /// `Row actions…` trigger — the five items stay unmounted while closed
     /// (t04 pins the closed half) and all five paint once opened.
+    /// Config-completeness T08: the `Clone` alias paints beside `Duplicate`
+    /// (same handler, no new dupe logic).
     #[gpui_kit::test]
     fn t05_row_menu_opens_management_items(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -24616,6 +35350,7 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
+            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -24632,6 +35367,7 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
+            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -30197,7 +40933,9 @@ mod tests {
         );
         for id in [
             "field-name",
-            "field-protocol",
+            // Config-completeness T01: protocol picker replaces the free-text
+            // `field-protocol` input (same row, kit `Select` trigger).
+            "protocol-select",
             "field-guided-server",
             "field-guided-port",
             "field-guided-identity",
@@ -30251,6 +40989,9 @@ mod tests {
         let expected = [
             ("Add configuration", "Ctrl-N"),
             ("Import configurations", "Ctrl-O"),
+            // Config-completeness T08: paste-intake binding (same handler as
+            // the palette `ImportClipboard` op).
+            ("Paste clipboard into Import", "Ctrl-V"),
             ("Start selected", "F5"),
             ("Stop selected", "Shift-F5"),
             ("Test selected", "Ctrl-T"),

@@ -356,6 +356,13 @@ pub fn is_egress_only_protocol(protocol: &str) -> bool {
         || is_xray_protocol(protocol)
 }
 
+/// Config-completeness T08 (CAP-12): trivial `direct` rows (no fields —
+/// Throne `edit_direct.ui` label-only) serve as a bare direct final under
+/// the row's own tag. Case folds like every other kind predicate.
+pub fn is_direct_protocol(protocol: &str) -> bool {
+    matches_protocol_aliases(protocol, &["direct"])
+}
+
 /// Ticket 08: which generated config owns a custom row. Stock is the
 /// default; unknown values name the `core` field instead of guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -810,6 +817,11 @@ const AWG_BASE_KEYS: &[&str] = &[
     "peers",
     "awg_version",
     "version",
+    // Config-completeness T04: `enable_amnezia` is a UI-state marker
+    // (Throne parity) — allowed on the row so the version matrix keeps it,
+    // stripped at reshape (brutal-speeds precedent: preserved in stored
+    // JSON, never emitted).
+    "enable_amnezia",
 ];
 
 /// Xray-side noise semantics (research 02: "Amnezia Noise" ≠ "Xray Noise").
@@ -1840,12 +1852,17 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
             let mut stream = serde_json::Map::new();
             // Ticket 29: `packetEncoding` stays camelCase per the xray schema
             // (`streamSettings.packetEncoding`, accepted by `xray run -test`).
+            // Config-completeness T07: `spiderx` rides the same flat
+            // passthrough (the Xray page folds it; the sidecar judges the
+            // shape — without this the page would write a key the bridge
+            // drops, T02 dead-key precedent).
             for key in [
                 "network",
                 "security",
                 "sni",
                 "pbk",
                 "sid",
+                "spiderx",
                 "path",
                 "host",
                 "mode",
@@ -1857,6 +1874,69 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                     stream.insert(key.to_string(), value.clone());
                 }
             }
+            // Config-completeness review: Throne spellings the page reads as
+            // aliases also emit — `fingerprint` falls back to `fp`, either
+            // `serviceName`/`service_name` lands as Xray's `serviceName`
+            // (grpc links import these spellings; without this the reject
+            // below would break rows the dialog itself maintains).
+            if stream.get("fp").is_none() {
+                if let Some(fp) = egress.params.get("fingerprint") {
+                    stream.insert("fp".to_string(), fp.clone());
+                }
+            }
+            if stream.get("serviceName").is_none() {
+                if let Some(svc) = egress
+                    .params
+                    .get("serviceName")
+                    .or_else(|| egress.params.get("service_name"))
+                {
+                    stream.insert("serviceName".to_string(), svc.clone());
+                }
+            }
+            // Config-completeness review: keys the bridge never sees fail
+            // typed naming the field instead of riding silently past it
+            // (stored JSON still preserves them — fold-level preserve — but a
+            // Ph2 XHTTP/xmux key the sidecar ignores must never look
+            // configured). The `xray_shaped` full-config branch above is
+            // untouched: the sidecar judges that JSON itself.
+            const XRAY_FLAT_KEYS: &[&str] = &[
+                "type",
+                "address",
+                "server",
+                "server_port",
+                "port",
+                "uuid",
+                "id",
+                "encryption",
+                "flow",
+                "network",
+                "security",
+                "sni",
+                "pbk",
+                "sid",
+                "spiderx",
+                "path",
+                "host",
+                "mode",
+                "fp",
+                "fingerprint",
+                "alpn",
+                "packetEncoding",
+                "serviceName",
+                "service_name",
+                "xray_mux",
+            ];
+            if let Some(unknown) = egress
+                .params
+                .keys()
+                .find(|key| !XRAY_FLAT_KEYS.contains(&key.as_str()))
+            {
+                return Err(bad_option(
+                    &egress.owner,
+                    unknown,
+                    "has no Xray bridge mapping (the Ph2 XHTTP/xmux matrix is not served; use custom-config for full Xray control)",
+                ));
+            }
             let mut node = serde_json::Map::new();
             node.insert(
                 "protocol".to_string(),
@@ -1867,6 +1947,33 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                 serde_json::Value::String(egress.egress_tag.clone()),
             );
             node.insert("settings".to_string(), serde_json::Value::Object(settings));
+            // Config-completeness T07: the Xray page's `xray_mux` keep-blank
+            // select (`""` | `enabled` | `disabled`) maps to the outbound
+            // `mux` object (absent on default — never fabricated). Anything
+            // else fails typed naming the field (the page constrains its
+            // picks; hand JSON garbage must not silently become mux-off).
+            match egress
+                .params
+                .get("xray_mux")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+            {
+                None | Some("") => {}
+                Some("enabled") => {
+                    node.insert("mux".to_string(), serde_json::json!({"enabled": true}));
+                }
+                Some("disabled") => {
+                    node.insert("mux".to_string(), serde_json::json!({"enabled": false}));
+                }
+                Some(_) => {
+                    return Err(EngineError::BadCustom {
+                        name: egress.owner.clone(),
+                        field: "xray_mux".to_string(),
+                        detail: "xray_mux must be \"\" (default), \"enabled\" or \"disabled\""
+                            .to_string(),
+                    });
+                }
+            }
             if !stream.is_empty() {
                 node.insert(
                     "streamSettings".to_string(),
@@ -2126,6 +2233,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             if canonical_type(&config.protocol).is_none()
                 && !is_awg_protocol(&config.protocol)
                 && !is_noise_protocol(&config.protocol)
+                && !is_direct_protocol(&config.protocol)
             {
                 return Err(EngineError::UnsupportedProtocol {
                     name: config.name.clone(),
@@ -2649,6 +2757,14 @@ fn build_standard_node(
     params: &mut serde_json::Map<String, serde_json::Value>,
     out_tag: &str,
 ) -> Result<(serde_json::Value, bool, bool), EngineError> {
+    // Config-completeness T08 (CAP-12): trivial `direct` rows carry no
+    // endpoint — serve a bare direct outbound under the row's tag (the
+    // row's own isolation rule routes its inbound there). Stored extras
+    // are ignored, never emitted (a final takes no fields).
+    if is_direct_protocol(&config.protocol) {
+        let node = serde_json::json!({"type": "direct", "tag": out_tag});
+        return Ok((node, false, false));
+    }
     str_field(params, "server").ok_or(EngineError::BadParams {
         name: config.name.clone(),
         field: "server",
@@ -3200,6 +3316,27 @@ fn apply_transport(
     let network = take_flat(params, &["network"]).unwrap_or_default();
     let path = take_flat(params, &["path"]);
     let host = take_flat(params, &["host"]);
+    // Config-completeness review: a custom `headers` map has no transport
+    // mapping on this path (only `host` survives below as the Host header)
+    // — fail typed naming the field instead of consuming it silently
+    // (ticket-42 kcp/header_type precedent: meaningful but unmappable
+    // errors at its own site). Blank and empty shapes stay no-ops so
+    // untouched rows keep working; the `http`-protocol arm never reaches
+    // here (it keeps path/headers via its own allowlist).
+    let headers_trivial = match params.get("headers") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(text)) => text.trim().is_empty(),
+        Some(serde_json::Value::Object(map)) => map.is_empty(),
+        Some(serde_json::Value::Array(items)) => items.is_empty(),
+        Some(_) => false,
+    };
+    if !headers_trivial {
+        return Err(bad_option(
+            name,
+            "headers",
+            "custom transport headers have no sing-box 1.14.2 mapping on this protocol (only `host` maps to the Host header)",
+        ));
+    }
     take_flat(params, &["headers"]);
     let service_name = take_flat(params, &["serviceName", "service_name"]).or(path.clone());
     let method = take_flat(params, &["method"]);
@@ -3292,6 +3429,68 @@ fn apply_transport(
     Ok(())
 }
 
+/// Config-completeness T02 (S3): v2ray-flat mux keys → stock sing-box
+/// 1.14.2 `multiplex` outbound object, for ss/trojan/vless/vmess only.
+/// Per-key contract (live-probed shape, recorded here):
+/// - `mux` ""/absent → omit `multiplex` (sing-box default: disabled).
+/// - `mux` "on" (case-insensitive) → `{"enabled": true}`.
+/// - `mux` "off" → `{"enabled": false}` (explicitly disables).
+/// - any other `mux` spelling → typed `bad_option` (the UI constrains to
+///   the three; hand JSON garbage fails naming the field, never emits a
+///   shape `check` would reject opaquely).
+/// - `brutal_enable` + `brutal_up_mbps`/`brutal_down_mbps` (plus
+///   `brutal_up`/`brutal_down` intake spellings): consumed here, preserved
+///   in stored JSON (generation works on a clone), NEVER emitted — stock
+///   sing-box 1.14.2 has no brutal mapping. The mux-force behavior still
+///   holds: the panel writes `mux: "on"` alongside brutal (UI-forced), so
+///   emission sees it. `flow=vision` does not veto here (the VLESS page
+///   disables S3 with reason instead — dumb engine, smart UI).
+///
+/// sing-box 1.14.2 `multiplex` also knows `protocol`, `max_connections`,
+///   `min_streams`, `max_streams`, `padding` — none have panel controls in
+///   this ticket, so none emit (never invent keys the UI cannot explain).
+fn apply_mux(
+    name: &str,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    let mode = take_flat(params, &["mux"]);
+    // Brutal speeds are panel state, not emission: consume every spelling
+    // so provider/import junk in these keys can never fail `check`.
+    take_truthy(params, &["brutal_enable"]);
+    take_flat(
+        params,
+        &[
+            "brutal_up_mbps",
+            "brutal_down_mbps",
+            "brutal_up",
+            "brutal_down",
+            "brutal_upmbps",
+            "brutal_downmbps",
+        ],
+    );
+    let mode = mode.unwrap_or_default();
+    if mode.trim().is_empty() {
+        return Ok(());
+    }
+    let mut multiplex = serde_json::Map::new();
+    if mode.eq_ignore_ascii_case("on") {
+        multiplex.insert("enabled".to_string(), serde_json::Value::Bool(true));
+    } else if mode.eq_ignore_ascii_case("off") {
+        multiplex.insert("enabled".to_string(), serde_json::Value::Bool(false));
+    } else {
+        return Err(bad_option(
+            name,
+            "mux",
+            "\"mux\" must be \"\" (default), \"on\" or \"off\"",
+        ));
+    }
+    params.insert(
+        "multiplex".to_string(),
+        serde_json::Value::Object(multiplex),
+    );
+    Ok(())
+}
+
 /// Ticket 32: keys that carry no meaning for protocols without TLS or
 /// stream transports (intake spellings from other protocols' links).
 /// Dropped so provider junk never fails `check`; anything meaningful but
@@ -3326,10 +3525,21 @@ fn drop_foreign_flats(params: &mut serde_json::Map<String, serde_json::Value>, k
         // protocols without TLS or those shapes — drop them here so they
         // never reach `check` as unknown fields (the TLS-capable and
         // strict arms consume or judge their own copies first).
+        // Config-completeness T02 (S3): mux flats are meaningless outside
+        // ss/trojan/vless/vmess (those arms consume them in `apply_mux`
+        // first) — drop them here for the same reason.
         "allowInsecure",
         "allow_insecure",
         "allowinsecure",
         "insecure",
+        "mux",
+        "brutal_enable",
+        "brutal_up_mbps",
+        "brutal_down_mbps",
+        "brutal_up",
+        "brutal_down",
+        "brutal_upmbps",
+        "brutal_downmbps",
         "ech",
         "ech_config",
         "echconfig",
@@ -3374,6 +3584,9 @@ fn translate_outbound(
         "vless" | "trojan" => {
             apply_tls(name, params, &server, canonical == "trojan", false)?;
             apply_transport(name, params)?;
+            // Config-completeness T02 (S3): mux emission ships with the UI
+            // (never UI-first with dead keys).
+            apply_mux(name, params)?;
         }
         "vmess" => {
             // Legacy links carry a `tls` bool plus a cipher `security`;
@@ -3388,9 +3601,30 @@ fn translate_outbound(
                     let server_name = take_flat(params, &["sni"]);
                     let fingerprint = take_flat(params, &["fp", "fingerprint"]);
                     let alpn = split_alpn(take_flat(params, &["alpn"]));
+                    // Config-completeness T03: the S2 panel folds `insecure`
+                    // on every TLS-capable page incl. legacy vmess rows —
+                    // honor it here instead of dropping it (rows without the
+                    // flat keep the old shape).
+                    let insecure = take_truthy(
+                        params,
+                        &[
+                            "allowInsecure",
+                            "allow_insecure",
+                            "allowinsecure",
+                            "insecure",
+                        ],
+                    );
                     params.insert(
                         "tls".to_string(),
-                        tls_object(&server, server_name, fingerprint, alpn, None, false, None),
+                        tls_object(
+                            &server,
+                            server_name,
+                            fingerprint,
+                            alpn,
+                            None,
+                            insecure,
+                            None,
+                        ),
                     );
                 }
                 // `security` stays: it is the sing-box packet cipher here.
@@ -3402,6 +3636,17 @@ fn translate_outbound(
                 params.insert("security".to_string(), serde_json::Value::String(cipher));
             }
             // `alter_id` is numeric in sing-box; intake keeps strings.
+            // Config-completeness T03: `aid` is the link/Throne spelling of
+            // the same field (the VMess page reads both, writes `alter_id`)
+            // — fold it so hand JSON keeps working; the canonical key wins
+            // when both disagree, and the alias never leaks (t32 precedent:
+            // folded, not duplicated).
+            let aid = take_flat(params, &["aid"]);
+            if params.get("alter_id").is_none() {
+                if let Some(aid) = aid {
+                    params.insert("alter_id".to_string(), serde_json::Value::String(aid));
+                }
+            }
             match params.remove("alter_id") {
                 None => {}
                 Some(serde_json::Value::Number(number)) => {
@@ -3433,6 +3678,8 @@ fn translate_outbound(
                 ));
             }
             apply_transport(name, params)?;
+            // Config-completeness T02 (S3): same mux arm as vless/trojan.
+            apply_mux(name, params)?;
         }
         "tuic" | "hysteria" | "anytls" => {
             apply_tls(name, params, &server, true, true)?;
@@ -3465,13 +3712,61 @@ fn translate_outbound(
                     ],
                 );
             }
+            // Config-completeness T06: AnyTLS session tunables — the Throne
+            // short names (`interval`/`timeout`/`min`) fold to the sing-box
+            // session fields (docs-verified 1.14.2 shapes: durations stay
+            // text, the count coerces to a number; t32 precedent: folded,
+            // not duplicated, canonical wins). Other protocols never see
+            // these keys (wrong layer would hide a mistyped row).
+            if canonical == "anytls" {
+                if params.get("idle_session_check_interval").is_none() {
+                    if let Some(interval) = take_flat(params, &["interval"]) {
+                        params.insert(
+                            "idle_session_check_interval".to_string(),
+                            serde_json::Value::String(interval),
+                        );
+                    }
+                } else {
+                    params.remove("interval");
+                }
+                if params.get("idle_session_timeout").is_none() {
+                    if let Some(timeout) = take_flat(params, &["timeout"]) {
+                        params.insert(
+                            "idle_session_timeout".to_string(),
+                            serde_json::Value::String(timeout),
+                        );
+                    }
+                } else {
+                    params.remove("timeout");
+                }
+                if params.get("min_idle_session").is_none() {
+                    if let Some(min) = take_flat(params, &["min"]) {
+                        let coerced = match min.trim().parse::<u64>() {
+                            Ok(number) => serde_json::Value::Number(number.into()),
+                            Err(_) => serde_json::Value::String(min),
+                        };
+                        params.insert("min_idle_session".to_string(), coerced);
+                    }
+                } else {
+                    params.remove("min");
+                }
+            }
             if canonical == "hysteria" {
                 // sing-box holds the plaintext credential in `auth_str`;
                 // `auth` is base64 bytes there, never the link secret.
+                // Config-completeness T05: a v2-layout `password` also folds
+                // here when no v1 `auth` is present (hy2-arm precedent) — the
+                // guided page folds exactly one credential per layout, and a
+                // toggled row must still start with the typed secret instead
+                // of running auth-less. Canonical `auth` wins on conflict;
+                // the alias never leaks to `check` either way.
                 let auth = take_flat(params, &["auth"]);
+                let password = take_flat(params, &["password"]);
                 if params.get("auth_str").is_none() {
                     if let Some(auth) = auth {
                         params.insert("auth_str".to_string(), serde_json::Value::String(auth));
+                    } else if let Some(password) = password {
+                        params.insert("auth_str".to_string(), serde_json::Value::String(password));
                     }
                 }
                 // Live-probed: 1.14.2 fails initialize without upload and
@@ -3498,6 +3793,17 @@ fn translate_outbound(
                 // Ticket 42 (US-26): tuic extras validate against the 1.14.2
                 // shape — wild keys fail typed naming the field instead of
                 // dying inside `check`.
+                // Config-completeness T05: the Throne `zero_rtt` spelling
+                // folds to the sing-box `zero_rtt_handshake` bool (a stored
+                // false drops — the schema default — so the alias never
+                // leaks; WG t32 precedent: folded, not duplicated, canonical
+                // wins).
+                if take_truthy(params, &["zero_rtt_handshake", "zero_rtt"]) {
+                    params.insert(
+                        "zero_rtt_handshake".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
                 reject_unknown_params(
                     name,
                     "tuic",
@@ -3757,12 +4063,52 @@ fn translate_outbound(
                 }
             }
             apply_tls(name, params, &server, true, true)?;
-            drop_foreign_flats(params, &["username", "password", "network", "tls"]);
+            // Config-completeness T06: the Naïve page writes the docs-verified
+            // 1.14.2 tunables (`udp_over_tcp` bool-or-object, `quic` bool,
+            // `quic_congestion_control` bbr|bbr2|cubic|reno) — the strict gate
+            // below allows them so the page never writes a key generate
+            // rejects (T02 mux-arm precedent: UI ships with its engine arm).
+            // The Throne `uot`/`congestion_control` spellings fold to the
+            // sing-box names (t32 precedent: folded, not duplicated,
+            // canonical wins).
+            if take_truthy(params, &["uot"]) && params.get("udp_over_tcp").is_none() {
+                params.insert("udp_over_tcp".to_string(), serde_json::Value::Bool(true));
+            }
+            if params.get("quic_congestion_control").is_none() {
+                if let Some(congestion) = take_flat(params, &["congestion_control"]) {
+                    params.insert(
+                        "quic_congestion_control".to_string(),
+                        serde_json::Value::String(congestion),
+                    );
+                }
+            } else {
+                params.remove("congestion_control");
+            }
+            drop_foreign_flats(
+                params,
+                &[
+                    "username",
+                    "password",
+                    "network",
+                    "tls",
+                    "udp_over_tcp",
+                    "quic",
+                    "quic_congestion_control",
+                ],
+            );
             reject_unknown_params(
                 name,
                 "naive",
                 params,
-                &["username", "password", "network", "tls"],
+                &[
+                    "username",
+                    "password",
+                    "network",
+                    "tls",
+                    "udp_over_tcp",
+                    "quic",
+                    "quic_congestion_control",
+                ],
             )?;
         }
         "snell" => {
@@ -3884,6 +4230,20 @@ fn translate_outbound(
             } else {
                 params.remove("username");
             }
+            // Config-completeness T06: the Throne `private_key_pass` spelling
+            // folds to sing-box `private_key_passphrase` (t32 precedent:
+            // folded, not duplicated, canonical wins — the alias never leaks
+            // to `check` either way).
+            if params.get("private_key_passphrase").is_none() {
+                if let Some(pass) = take_flat(params, &["private_key_pass"]) {
+                    params.insert(
+                        "private_key_passphrase".to_string(),
+                        serde_json::Value::String(pass),
+                    );
+                }
+            } else {
+                params.remove("private_key_pass");
+            }
             drop_foreign_flats(params, &["user"]);
         }
         "wireguard" => {
@@ -3902,6 +4262,19 @@ fn translate_outbound(
                     "plugin",
                     "shadowsocks plugins need their executable beside the engine (stock check fails without it)",
                 ));
+            }
+            // Config-completeness T02 (S3): mux-only Settings panel — the
+            // mux arm runs FIRST (it consumes the flats `drop_foreign_flats`
+            // would otherwise eat).
+            apply_mux(name, params)?;
+            // Config-completeness T03: `uot` is the v2ray/Throne flat
+            // spelling of sing-box `udp_over_tcp` (the socks arm already
+            // consumes that flat; the Shadowsocks page reads both, writes
+            // the canonical bool) — fold it so hand JSON keeps working; the
+            // canonical key wins when both disagree, and the alias never
+            // leaks (t32 precedent: folded, not duplicated).
+            if take_truthy(params, &["uot"]) && params.get("udp_over_tcp").is_none() {
+                params.insert("udp_over_tcp".to_string(), serde_json::Value::Bool(true));
             }
             drop_foreign_flats(params, &["method"]);
         }
@@ -4022,6 +4395,9 @@ fn reshape_wireguard_endpoint(
     params.remove("server_port");
     // Internal classification markers never reach the engine.
     params.remove("awg_version");
+    // Config-completeness T04: `enable_amnezia` is dialog state, not an
+    // endpoint field (brutal-speeds precedent — stored JSON keeps it).
+    params.remove("enable_amnezia");
     // Client-side resolver setting from conf files: not an endpoint field.
     params.remove("dns");
     // Ticket 42 (US-25): conf/URI intake keeps `reserved` bytes as a
@@ -4062,8 +4438,24 @@ fn reshape_wireguard_endpoint(
     // coerce the plain-numeric fields. H-ranges ("1-100") and i-chains
     // ("<b …><r …>") are truly opaque and pass through verbatim for the
     // fork to judge (a failed parse keeps the original string).
+    // Config-completeness T04: `workers` and `maxhandshakeattempts` join
+    // the loop — the T04 pages fold every numeric as text (aid precedent:
+    // import spellings echo byte-identical), so string spellings must be
+    // check-safe here rather than canonicalized at fold time.
     for key in [
-        "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4",
+        "jc",
+        "jmin",
+        "jmax",
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "workers",
+        "maxhandshakeattempts",
     ] {
         let number = params
             .get(key)
@@ -9430,6 +9822,87 @@ mod tests {
         assert_eq!(endpoint["i2"], json!("5"), "i-chain never coerced");
     }
 
+    /// Config-completeness T04 (R7): `enable_amnezia` is UI state (stripped
+    /// like brutal speeds — never emitted); trailers/cookies + the v3 matrix
+    /// pass through verbatim for the fork `check`; WG peer/net keys land
+    /// endpoint-shaped; import-only `udp_timeout` is preserved, never
+    /// stripped. Hermetic `generate()`-shape proof (no fork binary in dev —
+    /// T02 precedent); the fork's own `check` stays authoritative for value
+    /// shapes (live-gate).
+    #[test]
+    fn t04_awg_markers_strip_and_matrix_passes_through() {
+        let params = awg_params(
+            "3.x",
+            json!({"private_key": "LOCAL", "public_key": "REMOTE",
+            "pre_shared_key": "PSK", "allowed_ips": "10.0.0.0/8",
+            "persistent_keepalive": "25", "reserved": "1,2,3",
+            "address": "10.0.0.2/32", "dns": "198.18.0.1", "mtu": "1280",
+            "workers": "4", "system": true, "udp_timeout": "30",
+            "enable_amnezia": true,
+            "jc": "5", "jmin": "30", "jmax": "1000",
+            "s1": "20", "h1": "1-100", "i1": "<b 0xd100><r 50>",
+            "headerprotectionkey": "HPK", "contentpaddingaddition": "PAD",
+            "rekeyaftertime": "120", "rekeytimeout": "30",
+            "rejectaftertime": "180", "keepalivetimeout": "60",
+            "maxhandshakeattempts": "3",
+            "randomtrailers": true, "disablecookies": true}),
+        );
+        let configs = vec![awg_fixture("7", "AwgFull", params, 10807)];
+        let generated = generate(&configs).expect("AWG v3 generates");
+        let endpoint = generated.value()["endpoints"][0].clone();
+        assert!(
+            endpoint.get("enable_amnezia").is_none(),
+            "UI marker stripped"
+        );
+        assert!(endpoint.get("awg_version").is_none(), "no internal marker");
+        assert!(endpoint.get("dns").is_none(), "no client setting");
+        assert_eq!(endpoint["private_key"], json!("LOCAL"));
+        assert_eq!(endpoint["address"], json!(["10.0.0.2/32"]));
+        assert_eq!(endpoint["mtu"], json!(1280), "mtu coerced");
+        assert_eq!(endpoint["workers"], json!(4), "workers coerced");
+        assert_eq!(endpoint["system"], json!(true), "system passes through");
+        assert_eq!(
+            endpoint["udp_timeout"],
+            json!("30"),
+            "import-only preserved, never stripped"
+        );
+        assert_eq!(endpoint["reserved"], json!([1, 2, 3]), "reserved coerced");
+        assert_eq!(endpoint["jc"], json!(5));
+        assert_eq!(endpoint["h1"], json!("1-100"), "h-range verbatim");
+        assert_eq!(endpoint["headerprotectionkey"], json!("HPK"), "v3 verbatim");
+        assert_eq!(
+            endpoint["maxhandshakeattempts"],
+            json!(3),
+            "v3 numeric coerced"
+        );
+        assert_eq!(
+            endpoint["randomtrailers"],
+            json!(true),
+            "trailers pass through for fork check"
+        );
+        assert_eq!(
+            endpoint["disablecookies"],
+            json!(true),
+            "cookies pass through for fork check"
+        );
+        let peer = endpoint["peers"]
+            .as_array()
+            .expect("peers array")
+            .first()
+            .expect("one peer");
+        assert_eq!(peer["public_key"], json!("REMOTE"));
+        assert_eq!(peer["pre_shared_key"], json!("PSK"));
+        assert_eq!(peer["allowed_ips"], json!(["10.0.0.0/8"]));
+        assert_eq!(peer["persistent_keepalive_interval"], json!(25));
+        // The version gate still holds: a v3-only key on a 2.0 row fails
+        // naming the field (hide-preserve never smuggles it past).
+        let bad = awg_params("2.0", json!({"randomtrailers": true}));
+        let error =
+            generate(&[awg_fixture("8", "AwgOld", bad, 10808)]).expect_err("v3 key on 2.0 fails");
+        let text = error.to_string();
+        assert!(text.contains("randomtrailers"), "names the field: {text}");
+    }
+
     /// Ticket 32 (live): every standard row shape the app emits passes the
     /// real stock sing-box 1.14.2 `check` (EXIT 0) — route arrays, `tls` /
     /// `transport` translation, endpoint reshape. Hermetic by default —
@@ -11127,6 +11600,47 @@ mod tests {
         );
     }
 
+    /// Config-completeness T08 (CAP-12): trivial `direct` rows serve as a
+    /// bare direct final under their own tag (no endpoint, no fork, no
+    /// bridge) and pass activation validation with field-less params.
+    #[test]
+    fn t08_direct_serves_bare_final() {
+        assert!(is_direct_protocol("Direct"));
+        let row = fixture(
+            "7",
+            "DirectOne",
+            "direct",
+            json!({"type": "direct"}),
+            "127.0.0.1",
+            10807,
+        );
+        assert!(!needs_fork(&row), "stock, not fork");
+        let generated = generate(std::slice::from_ref(&row)).expect("direct generates");
+        assert!(!generated.requires_fork, "no fork");
+        assert!(!generated.requires_xray, "no bridge");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(outbound_tag("7")))
+            .expect("direct outbound present");
+        assert_eq!(node["type"], json!("direct"));
+        assert_eq!(
+            node.as_object().expect("object").len(),
+            2,
+            "bare final carries no fields: {node}"
+        );
+        let rule = value["route"]["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["inbound"] == json!([inbound_tag("7")]))
+            .expect("direct rule present");
+        assert_eq!(rule["outbound"], json!(outbound_tag("7")));
+        validate_activation(std::slice::from_ref(&row)).expect("direct activates");
+    }
+
     /// Standalone Noise rows ride the fork sidecar with explicit AWG-vs-Noise
     /// mismatch guards in both directions (plus Xray-noise on stock).
     #[test]
@@ -12420,6 +12934,673 @@ Active Connections\r
         let row = fixture("1", "Typo", "vless", params, "127.0.0.1", 10801);
         let plan = validate_activation(std::slice::from_ref(&row)).expect("warns, not fails");
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    }
+
+    /// Config-completeness T02 (S3): panel-produced mux flats emit the
+    /// stock sing-box 1.14.2 `multiplex` object on ss/trojan/vless/vmess.
+    /// Per-key shape: `mux:"on"` → `{"enabled": true}`; brutal keys are
+    /// consumed (never leak into the emission) while staying preserved in
+    /// stored JSON (generation works on a clone).
+    #[test]
+    fn t02_mux_emission_shape_on_four_protocols() {
+        fn muxed(protocol: &str, params: serde_json::Value) -> ProxyConfig {
+            let mut params = params;
+            let obj = params.as_object_mut().expect("object");
+            obj.insert("mux".to_string(), json!("on"));
+            obj.insert("brutal_enable".to_string(), json!(true));
+            obj.insert("brutal_up_mbps".to_string(), json!(100));
+            obj.insert("brutal_down_mbps".to_string(), json!(50));
+            fixture("9", "Muxed", protocol, params, "127.0.0.1", 10809)
+        }
+        for (protocol, params) in [
+            ("vless", vless_params()),
+            (
+                "trojan",
+                json!({"type": "trojan", "server": "198.51.100.9", "server_port": 443,
+                       "password": "secret"}),
+            ),
+            (
+                "vmess",
+                json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                       "uuid": "11111111-2222-4333-8444-555555555555"}),
+            ),
+            ("shadowsocks", ss_params("pass1")),
+        ] {
+            let row = muxed(protocol, params);
+            let stored = row.params.clone();
+            let generated = generate(std::slice::from_ref(&row)).expect("mux row generates");
+            let value = generated.value();
+            let node = value["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(protocol))
+                .unwrap_or_else(|| panic!("{protocol} egress present"));
+            assert_eq!(
+                node["multiplex"],
+                json!({"enabled": true}),
+                "{protocol} emits the 1.14.2 shape"
+            );
+            for leaked in ["mux", "brutal_enable", "brutal_up_mbps", "brutal_down_mbps"] {
+                assert!(
+                    node.get(leaked).is_none(),
+                    "{protocol} emission leaks no {leaked}: {node}"
+                );
+            }
+            assert!(
+                stored.contains("brutal_up_mbps"),
+                "stored JSON preserves brutal speeds"
+            );
+        }
+    }
+
+    /// Config-completeness T02 (S3): default omits `multiplex`, explicit
+    /// off disables it, garbage fails typed naming the field.
+    #[test]
+    fn t02_mux_default_omits_off_disables_garbage_fails() {
+        let plain = fixture("9", "Plain", "vless", vless_params(), "127.0.0.1", 10809);
+        let generated = generate(std::slice::from_ref(&plain)).expect("plain generates");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == json!("vless"))
+            .expect("vless egress present");
+        assert!(
+            node.get("multiplex").is_none(),
+            "default emits no multiplex key"
+        );
+        let mut off_params = vless_params();
+        off_params
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("off"));
+        let off = fixture("9", "Off", "vless", off_params, "127.0.0.1", 10809);
+        let generated = generate(std::slice::from_ref(&off)).expect("off generates");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == json!("vless"))
+            .expect("vless egress present");
+        assert_eq!(node["multiplex"], json!({"enabled": false}));
+        let mut junk_params = vless_params();
+        junk_params
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("sometimes"));
+        let junk = fixture("9", "Junk", "vless", junk_params, "127.0.0.1", 10809);
+        let error = generate(std::slice::from_ref(&junk)).expect_err("garbage mux fails");
+        let text = error.to_string();
+        assert!(text.contains("mux"), "names the field, got {text}");
+    }
+
+    /// Config-completeness T02 (S3): mux flats on non-mux protocols drop
+    /// so provider junk can never fail `check` (established
+    /// `drop_foreign_flats` semantics, extended to the new keys).
+    #[test]
+    fn t02_mux_flats_dropped_on_non_mux_protocol() {
+        let mut params = json!({"type": "socks", "server": "198.51.100.9", "server_port": 1080});
+        let obj = params.as_object_mut().expect("object");
+        obj.insert("mux".to_string(), json!("on"));
+        obj.insert("brutal_enable".to_string(), json!(true));
+        let row = fixture("9", "SocksJunk", "socks", params, "127.0.0.1", 10809);
+        let generated = generate(std::slice::from_ref(&row)).expect("socks junk generates");
+        let value = generated.value();
+        let node = value["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == json!("socks"))
+            .expect("socks egress present");
+        assert!(node.get("multiplex").is_none(), "no mux arm on socks");
+        assert!(node.get("mux").is_none(), "mux flat dropped: {node}");
+        assert!(
+            node.get("brutal_enable").is_none(),
+            "brutal flat dropped: {node}"
+        );
+    }
+
+    /// Config-completeness review: flat-built Xray rows fail typed on keys
+    /// the bridge never copies (Ph2 XHTTP/xmux matrix) instead of looking
+    /// configured while the sidecar ignores them. Stored JSON still
+    /// preserves them (fold-level preserve); real link spellings
+    /// (`fingerprint`, `serviceName`) keep emitting; full-config
+    /// (`xray_shaped`) rows stay sidecar-judged.
+    #[test]
+    fn review_xray_flat_unknown_keys_reject_loud() {
+        let mut ph2 = xray_params();
+        ph2.as_object_mut()
+            .expect("object")
+            .insert("xPaddingBytes".to_string(), json!("100-200"));
+        let rows = vec![fixture("2", "XrayPh2", "xray", ph2, "127.0.0.1", 10802)];
+        let plan = validate_activation(&rows).expect("ph2 set plans");
+        let error = generate_xray_config(&plan.egresses).expect_err("Ph2 key fails typed");
+        let text = error.to_string();
+        assert!(
+            text.contains("xPaddingBytes"),
+            "names the field, got {text}"
+        );
+        // Real link spellings emit through the flat branch.
+        let mut aliases = xray_params();
+        let obj = aliases.as_object_mut().expect("object");
+        obj.remove("fp");
+        obj.insert("fingerprint".to_string(), json!("firefox"));
+        obj.insert("service_name".to_string(), json!("svc"));
+        let rows = vec![fixture(
+            "2",
+            "XrayAlias",
+            "xray",
+            aliases,
+            "127.0.0.1",
+            10802,
+        )];
+        let plan = validate_activation(&rows).expect("alias set plans");
+        let sidecar = generate_xray_config(&plan.egresses).expect("alias row generates");
+        let value = sidecar.value();
+        let stream = &value["outbounds"]
+            .as_array()
+            .expect("xray outbounds")
+            .iter()
+            .find(|node| node["tag"] == json!(xray_egress_tag("2")))
+            .expect("xray egress present")["streamSettings"];
+        assert_eq!(
+            stream["fp"],
+            json!("firefox"),
+            "fingerprint falls back to fp"
+        );
+        assert_eq!(
+            stream["serviceName"],
+            json!("svc"),
+            "service_name lands as serviceName"
+        );
+    }
+
+    /// Config-completeness review: a custom `headers` map has no transport
+    /// mapping on vless/trojan/vmess (only `host` survives as the Host
+    /// header) — generate fails typed naming the field instead of dropping
+    /// it silently. Blank and empty shapes stay no-ops so untouched rows
+    /// keep working; the `http`-protocol arm never reaches this path (own
+    /// allowlist keeps path/headers).
+    #[test]
+    fn review_transport_headers_reject_loud() {
+        let mut params = vless_params();
+        params
+            .as_object_mut()
+            .expect("object")
+            .insert("headers".to_string(), json!({"X-Custom": "1"}));
+        let row = fixture("9", "HeadersMap", "vless", params, "127.0.0.1", 10809);
+        let error = generate(std::slice::from_ref(&row)).expect_err("custom headers fail");
+        assert!(
+            error.to_string().contains("headers"),
+            "names the field, got {error}"
+        );
+        let mut blank = vless_params();
+        blank
+            .as_object_mut()
+            .expect("object")
+            .insert("headers".to_string(), json!(""));
+        let blank_row = fixture("9", "HeadersBlank", "vless", blank, "127.0.0.1", 10809);
+        generate(std::slice::from_ref(&blank_row)).expect("blank headers stay a no-op");
+        let mut empty = vless_params();
+        empty
+            .as_object_mut()
+            .expect("object")
+            .insert("headers".to_string(), json!({}));
+        let empty_row = fixture("9", "HeadersEmpty", "vless", empty, "127.0.0.1", 10809);
+        generate(std::slice::from_ref(&empty_row)).expect("empty headers stay a no-op");
+    }
+
+    /// Config-completeness T03: panel-produced vmess/trojan/shadowsocks rows
+    /// generate — per-key emission shapes the new pages rely on (cipher
+    /// grammars, `aid`/`uot` intake folds, legacy insecure, ss extras ride).
+    #[test]
+    fn t03_panel_rows_generate_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        // VMess new-style (the page writes `encryption` + string `alter_id`
+        // + `packet_encoding` + mux): cipher lands in `security`, aid
+        // coerces, packet_encoding rides, mux emits.
+        let modern = fixture(
+            "31",
+            "VmessModern",
+            "vmess",
+            json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "alter_id": "3",
+                   "encryption": "chacha20-poly1305", "packet_encoding": "xudp",
+                   "mux": "on"}),
+            "127.0.0.1",
+            10831,
+        );
+        let node = node_of(&modern, "vmess");
+        assert_eq!(node["security"], json!("chacha20-poly1305"));
+        assert_eq!(node["alter_id"], json!(3), "string aid coerces");
+        assert_eq!(node["packet_encoding"], json!("xudp"), "rides to check");
+        assert_eq!(node["multiplex"], json!({"enabled": true}));
+        // VMess legacy link shape (boolean `tls`, cipher in `security`):
+        // the tls object builds, the cipher stays, insecure honored (T03).
+        let legacy = fixture(
+            "32",
+            "VmessLegacy",
+            "vmess",
+            json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "alter_id": "0",
+                   "security": "auto", "tls": true, "sni": "198.51.100.9",
+                   "insecure": true}),
+            "127.0.0.1",
+            10832,
+        );
+        let node = node_of(&legacy, "vmess");
+        assert_eq!(node["security"], json!("auto"), "legacy cipher stays");
+        assert_eq!(node["tls"]["server_name"], json!("198.51.100.9"));
+        assert_eq!(node["tls"]["insecure"], json!(true), "legacy insecure maps");
+        assert!(node.get("encryption").is_none(), "no new-style key");
+        // Hand-written `aid` spelling folds to `alter_id` (t32 precedent).
+        let aided = fixture(
+            "33",
+            "VmessAid",
+            "vmess",
+            json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "aid": "2"}),
+            "127.0.0.1",
+            10833,
+        );
+        let node = node_of(&aided, "vmess");
+        assert_eq!(node["alter_id"], json!(2), "`aid` folds");
+        assert!(node.get("aid").is_none(), "alias never leaks");
+        // Trojan page shape (password + S1/S2/S3 keys) generates with tls,
+        // transport and mux emitted.
+        let trojan = fixture(
+            "34",
+            "TrojanPage",
+            "trojan",
+            json!({"type": "trojan", "server": "198.51.100.9", "server_port": 443,
+                   "password": "secret", "security": "tls", "sni": "198.51.100.9",
+                   "network": "ws", "path": "/w", "mux": "on"}),
+            "127.0.0.1",
+            10834,
+        );
+        let node = node_of(&trojan, "trojan");
+        assert_eq!(node["password"], json!("secret"));
+        assert_eq!(node["tls"]["server_name"], json!("198.51.100.9"));
+        assert_eq!(node["transport"]["type"], json!("ws"));
+        assert_eq!(node["multiplex"], json!({"enabled": true}));
+        // Shadowsocks page shape (method + password + uot spelling +
+        // plugin_opts + mux): cipher/secret land, `uot` folds to the
+        // sing-box bool, extras ride, mux emits.
+        let mut ss = ss_params("pass1");
+        ss.as_object_mut()
+            .expect("object")
+            .insert("uot".to_string(), serde_json::Value::Bool(true));
+        ss.as_object_mut().expect("object").insert(
+            "plugin_opts".to_string(),
+            json!("obfs=http;obfs-host=h.example.com"),
+        );
+        ss.as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("on"));
+        let row = fixture("35", "SsPage", "shadowsocks", ss, "127.0.0.1", 10835);
+        let node = node_of(&row, "shadowsocks");
+        assert_eq!(node["method"], json!("aes-128-gcm"));
+        assert_eq!(node["password"], json!("pass1"));
+        assert_eq!(node["udp_over_tcp"], json!(true), "`uot` folds");
+        assert!(node.get("uot").is_none(), "alias never leaks");
+        assert_eq!(
+            node["plugin_opts"],
+            json!("obfs=http;obfs-host=h.example.com"),
+            "plugin_opts rides"
+        );
+        assert_eq!(node["multiplex"], json!({"enabled": true}));
+    }
+
+    /// Config-completeness T05: hysteria v1 + tuic page rows generate clean —
+    /// v1 maps `auth` to `auth_str` (a v2-layout `password` falls back when no
+    /// v1 auth is present; the alias never leaks), speeds ride as the native
+    /// `up`/`down` flats, v1 without speeds fails naming the field, and the
+    /// tuic seven tune the 1.14.2 shape (the `zero_rtt` alias folds to
+    /// `zero_rtt_handshake`).
+    #[test]
+    fn t05_hysteria_v1_and_tuic_page_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        // Hysteria v1 page shape (auth + string speeds + v1 tunables).
+        let v1 = fixture(
+            "51",
+            "HyOne",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "auth": "secret", "up": "100", "down": "50 Mbps",
+                   "server_ports": "9000-9010", "hop_interval": "30s",
+                   "obfs": "obfspw", "auth_type": "STRING",
+                   "recv_window_conn": 1024, "recv_window": 2048,
+                   "disable_mtu_discovery": true}),
+            "127.0.0.1",
+            10851,
+        );
+        let node = node_of(&v1, "hysteria");
+        assert_eq!(node["auth_str"], json!("secret"), "`auth` maps");
+        assert!(node.get("auth").is_none(), "link spelling never leaks");
+        assert_eq!(node["up"], json!("100"), "v1 speeds ride");
+        assert_eq!(node["down"], json!("50 Mbps"));
+        assert_eq!(node["server_ports"], json!("9000-9010"), "v1 tunables ride");
+        assert_eq!(node["disable_mtu_discovery"], json!(true));
+        // A v2-layout `password` on a v1 row still starts (falls back to
+        // `auth_str` when no v1 `auth` is present) and never leaks.
+        let toggled = fixture(
+            "52",
+            "HyToggled",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "password": "v2secret", "up": "100", "down": "100"}),
+            "127.0.0.1",
+            10852,
+        );
+        let node = node_of(&toggled, "hysteria");
+        assert_eq!(node["auth_str"], json!("v2secret"), "password falls back");
+        assert!(node.get("password").is_none(), "alias never leaks");
+        // Canonical `auth` wins when both spellings disagree.
+        let both = fixture(
+            "53",
+            "HyBoth",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "auth": "v1secret", "password": "v2secret",
+                   "up": "100", "down": "100"}),
+            "127.0.0.1",
+            10853,
+        );
+        let node = node_of(&both, "hysteria");
+        assert_eq!(node["auth_str"], json!("v1secret"), "canonical wins");
+        assert!(node.get("password").is_none(), "alias never leaks");
+        // v1 without speeds fails at generate naming the field (the store
+        // gate refuses earlier at commit; this is the backstop).
+        let nospeed = fixture(
+            "54",
+            "HyNoSpeed",
+            "hysteria",
+            json!({"type": "hysteria", "server": "192.0.2.14", "server_port": 443,
+                   "auth": "secret"}),
+            "127.0.0.1",
+            10854,
+        );
+        let error = generate(std::slice::from_ref(&nospeed)).expect_err("v1 needs speeds");
+        assert!(
+            error.to_string().contains("up") || error.to_string().contains("down"),
+            "names the missing speed, got {error}"
+        );
+        // TUIC page shape (all seven tuning fields + forced TLS).
+        let tuic = fixture(
+            "55",
+            "TuicPage",
+            "tuic",
+            json!({"type": "tuic", "server": "192.0.2.12", "server_port": 443,
+                   "uuid": "11111111-2222-4333-8444-555555555555", "password": "secret",
+                   "congestion_control": "bbr", "udp_relay_mode": "quic",
+                   "udp_over_stream": true, "zero_rtt": true, "heartbeat": "10s",
+                   "security": "tls", "sni": "192.0.2.12"}),
+            "127.0.0.1",
+            10855,
+        );
+        let node = node_of(&tuic, "tuic");
+        assert_eq!(node["congestion_control"], json!("bbr"));
+        assert_eq!(node["udp_relay_mode"], json!("quic"));
+        assert_eq!(node["udp_over_stream"], json!(true));
+        assert_eq!(
+            node["zero_rtt_handshake"],
+            json!(true),
+            "`zero_rtt` alias folds"
+        );
+        assert!(node.get("zero_rtt").is_none(), "alias never leaks");
+        assert_eq!(node["heartbeat"], json!("10s"));
+        assert_eq!(node["tls"]["server_name"], json!("192.0.2.12"));
+    }
+
+    /// Config-completeness T06: naive/anytls/ssh page rows generate clean —
+    /// the naive tunables ride the strict gate (Throne spellings fold,
+    /// canonical wins, aliases never leak), anytls short names fold to the
+    /// session fields, and the ssh passphrase alias folds.
+    #[test]
+    fn t06_naive_anytls_ssh_page_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        // Naïve page shape (sing-box spellings): uot/quic bools + cc ride.
+        let naive = fixture(
+            "61",
+            "NaivePage",
+            "naive",
+            json!({"type": "naive", "server": "192.0.2.22", "server_port": 443,
+                   "username": "u", "password": "p", "udp_over_tcp": true,
+                   "quic": true, "quic_congestion_control": "bbr2",
+                   "security": "tls", "sni": "192.0.2.22"}),
+            "127.0.0.1",
+            10861,
+        );
+        let node = node_of(&naive, "naive");
+        assert_eq!(node["udp_over_tcp"], json!(true));
+        assert_eq!(node["quic"], json!(true));
+        assert_eq!(node["quic_congestion_control"], json!("bbr2"));
+        assert_eq!(node["tls"]["server_name"], json!("192.0.2.22"));
+        // Throne spellings fold (canonical wins, aliases never leak).
+        let throne = fixture(
+            "62",
+            "NaiveThrone",
+            "naive",
+            json!({"type": "naive", "server": "192.0.2.22", "server_port": 443,
+                   "username": "u", "password": "p", "uot": true,
+                   "quic_congestion_control": "cubic", "congestion_control": "bbr",
+                   "security": "tls", "sni": "192.0.2.22"}),
+            "127.0.0.1",
+            10862,
+        );
+        let node = node_of(&throne, "naive");
+        assert_eq!(node["udp_over_tcp"], json!(true), "`uot` folds");
+        assert!(node.get("uot").is_none(), "alias never leaks");
+        assert_eq!(
+            node["quic_congestion_control"],
+            json!("cubic"),
+            "canonical wins"
+        );
+        assert!(
+            node.get("congestion_control").is_none(),
+            "alias never leaks"
+        );
+        // A bare `congestion_control` (no canonical) folds too.
+        let bare_cc = fixture(
+            "63",
+            "NaiveBareCc",
+            "naive",
+            json!({"type": "naive", "server": "192.0.2.22", "server_port": 443,
+                   "username": "u", "password": "p", "congestion_control": "reno",
+                   "security": "tls", "sni": "192.0.2.22"}),
+            "127.0.0.1",
+            10863,
+        );
+        let node = node_of(&bare_cc, "naive");
+        assert_eq!(node["quic_congestion_control"], json!("reno"));
+        assert!(
+            node.get("congestion_control").is_none(),
+            "alias never leaks"
+        );
+        // AnyTLS page shape (session tunables in sing-box spellings).
+        let anytls = fixture(
+            "64",
+            "AnytlsPage",
+            "anytls",
+            json!({"type": "anytls", "server": "192.0.2.15", "server_port": 8443,
+                   "password": "secret", "idle_session_check_interval": "30s",
+                   "idle_session_timeout": "60s", "min_idle_session": 5,
+                   "security": "tls", "sni": "192.0.2.15"}),
+            "127.0.0.1",
+            10864,
+        );
+        let node = node_of(&anytls, "anytls");
+        assert_eq!(node["idle_session_check_interval"], json!("30s"));
+        assert_eq!(node["idle_session_timeout"], json!("60s"));
+        assert_eq!(node["min_idle_session"], json!(5));
+        // Throne short names fold (canonical wins, aliases never leak).
+        let short = fixture(
+            "65",
+            "AnytlsShort",
+            "anytls",
+            json!({"type": "anytls", "server": "192.0.2.15", "server_port": 8443,
+                   "password": "secret", "interval": "30s", "timeout": "60s",
+                   "min": "5", "security": "tls", "sni": "192.0.2.15"}),
+            "127.0.0.1",
+            10865,
+        );
+        let node = node_of(&short, "anytls");
+        assert_eq!(node["idle_session_check_interval"], json!("30s"));
+        assert_eq!(node["idle_session_timeout"], json!("60s"));
+        assert_eq!(node["min_idle_session"], json!(5), "count coerces");
+        for leaked in ["interval", "timeout", "min"] {
+            assert!(node.get(leaked).is_none(), "alias never leaks: {leaked}");
+        }
+        // SSH passphrase alias folds (canonical wins, alias never leaks).
+        let ssh = fixture(
+            "66",
+            "SshPass",
+            "ssh",
+            json!({"type": "ssh", "server": "192.0.2.23", "server_port": 22,
+                   "user": "root", "password": "p", "private_key_pass": "pp"}),
+            "127.0.0.1",
+            10866,
+        );
+        let node = node_of(&ssh, "ssh");
+        assert_eq!(node["private_key_passphrase"], json!("pp"));
+        assert!(node.get("private_key_pass").is_none(), "alias never leaks");
+        let both = fixture(
+            "67",
+            "SshBoth",
+            "ssh",
+            json!({"type": "ssh", "server": "192.0.2.23", "server_port": 22,
+                   "user": "root", "password": "p",
+                   "private_key_passphrase": "canon", "private_key_pass": "alias"}),
+            "127.0.0.1",
+            10867,
+        );
+        let node = node_of(&both, "ssh");
+        assert_eq!(node["private_key_passphrase"], json!("canon"));
+        assert!(node.get("private_key_pass").is_none(), "alias never leaks");
+    }
+
+    /// Config-completeness T06: socks/http page rows generate — version 5
+    /// (string or number) and blank networks ride, udp_over_tcp rides, http
+    /// path/headers ride, https rows serve TLS-on.
+    #[test]
+    fn t06_socks_http_page_shapes() {
+        fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
+            generate(std::slice::from_ref(row))
+                .expect("panel row generates")
+                .value()["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(ty))
+                .unwrap_or_else(|| panic!("{ty} egress present"))
+                .clone()
+        }
+        let socks = fixture(
+            "68",
+            "SocksPage",
+            "socks",
+            json!({"type": "socks", "server": "192.0.2.20", "server_port": 1080,
+                   "version": "5", "username": "u", "password": "p",
+                   "network": "udp", "udp_over_tcp": true}),
+            "127.0.0.1",
+            10868,
+        );
+        let node = node_of(&socks, "socks");
+        assert_eq!(node["username"], json!("u"));
+        assert_eq!(node["network"], json!("udp"));
+        assert_eq!(node["udp_over_tcp"], json!(true));
+        assert!(node.get("version").is_none(), "stock default omits");
+        let http = fixture(
+            "69",
+            "HttpPage",
+            "http",
+            json!({"type": "http", "server": "192.0.2.21", "server_port": 8080,
+                   "username": "u", "password": "p", "path": "/p",
+                   "headers": "Host: h.example.com",
+                   "security": "tls", "sni": "192.0.2.21"}),
+            "127.0.0.1",
+            10869,
+        );
+        let node = node_of(&http, "http");
+        assert_eq!(node["path"], json!("/p"));
+        assert_eq!(node["headers"], json!("Host: h.example.com"));
+        assert_eq!(node["tls"]["server_name"], json!("192.0.2.21"));
+        // An `https` row without TLS markers still serves TLS-on.
+        let https = fixture(
+            "70",
+            "HttpsPlain",
+            "https",
+            json!({"type": "https", "server": "192.0.2.21", "server_port": 443,
+                   "username": "u", "password": "p"}),
+            "127.0.0.1",
+            10870,
+        );
+        let node = node_of(&https, "http");
+        assert!(node.get("tls").is_some(), "https serves TLS-on: {node}");
+    }
+
+    /// Config-completeness T06: version gates stay typed engine errors —
+    /// socks≠5 and any http `version` presence fail naming the field (never
+    /// a guessed emission, never an opaque `check` failure).
+    #[test]
+    fn t06_version_gates_keep_typed_errors() {
+        let v4 = fixture(
+            "71",
+            "SocksFour",
+            "socks",
+            json!({"type": "socks", "server": "192.0.2.20", "server_port": 1080,
+                   "version": "4"}),
+            "127.0.0.1",
+            10871,
+        );
+        let error = generate(std::slice::from_ref(&v4)).expect_err("socks v4 fails");
+        let text = error.to_string();
+        assert!(text.contains("version"), "names the field, got {text}");
+        let http_v = fixture(
+            "72",
+            "HttpVersion",
+            "http",
+            json!({"type": "http", "server": "192.0.2.21", "server_port": 8080,
+                   "version": "h2"}),
+            "127.0.0.1",
+            10872,
+        );
+        let error = generate(std::slice::from_ref(&http_v)).expect_err("http version fails");
+        let text = error.to_string();
+        assert!(text.contains("version"), "names the field, got {text}");
     }
 
     /// Two custom replacements binding one port conflict naming both.
