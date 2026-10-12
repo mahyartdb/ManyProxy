@@ -1630,6 +1630,11 @@ type DialogRepaint = Rc<dyn Fn(&mut Window, &mut App)>;
 /// no side effects, and destructive work stays on alert confirms carrying
 /// `ButtonVariant::Danger` (never on this plain path). Both buttons ride
 /// `.small()` so footers stay inside the minimum-frame paint budget.
+/// Ticket 03 (US-3): pure-close dialogs render Close-only — when the commit
+/// label reads `Close` there is no commit to offer, so the footer is the
+/// single close button (kept on `ok_id`, which the pins click) and no
+/// `Cancel` sibling. `Esc` still closes through the dialog's Cancel key
+/// path, which never depended on the sibling button existing.
 fn dialog_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
@@ -1640,6 +1645,15 @@ fn dialog_footer(
         !ok_label.eq_ignore_ascii_case("ok") && !ok_label.eq_ignore_ascii_case("okay"),
         "Ticket 05: honest footers never use a bare OK label"
     );
+    if ok_label.eq_ignore_ascii_case("close") {
+        return DialogFooter::new().child(Button::new(ok_id).small().label(ok_label).on_click(
+            move |_, window, cx| {
+                if commit(window, cx) {
+                    window.close_all_dialogs(cx);
+                }
+            },
+        ));
+    }
     let commit_click = commit.clone();
     DialogFooter::new()
         .child(
@@ -2376,8 +2390,8 @@ impl ConfigForm {
             bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
             port: Self::field(window, cx, "Port (blank or auto = auto-assign)", None),
             test_url: Self::field(window, cx, "Test URL (blank = global)", None),
-            guided_server: Self::field(window, cx, "Server address (e.g. example.com)", None),
-            guided_port: Self::field(window, cx, "Server port (e.g. 443)", None),
+            guided_server: Self::field(window, cx, "Server (e.g. example.com)", None),
+            guided_port: Self::field(window, cx, "Port (e.g. 443)", None),
             guided_identity: Self::secret_field(window, cx, "Identity secret", None),
             // Config-completeness T02: panels open blank (every fold
             // no-ops, so the template stands) under collapsed disclosures
@@ -2636,7 +2650,7 @@ impl ConfigForm {
             guided_server: Self::field(
                 window,
                 cx,
-                "Server address (e.g. example.com)",
+                "Server (e.g. example.com)",
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server", "address"],
@@ -2645,7 +2659,7 @@ impl ConfigForm {
             guided_port: Self::field(
                 window,
                 cx,
-                "Server port (e.g. 443)",
+                "Port (e.g. 443)",
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server_port", "port"],
@@ -15071,6 +15085,12 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_2()
+                        // Ticket 02 (US-2/CAP-2): tail clearance — bottom
+                        // padding on the shared body stack (never a per-line
+                        // nudge) so the last content row clears the sticky
+                        // footer when the body is scrolled to its end; any
+                        // future section tail inherits the clearance.
+                        .pb_4()
                         // Ticket 01: Basic section — the pre-existing Startup /
                         // Probe / Paths / Maintenance blocks verbatim (their
                         // ids and fold positions stay pinned); Appearance
@@ -15466,7 +15486,10 @@ impl AppView {
                             ),
                         ),
                 )
-                .button_props(DialogButtonProps::default().show_cancel(true))
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "settings-dialog-ok",
                     "settings-dialog-cancel",
@@ -15686,7 +15709,10 @@ impl AppView {
             dialog
                 .title("Runtime stats")
                 .child(body)
-                .button_props(DialogButtonProps::default().show_cancel(true))
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "runtime-stats-ok",
                     "runtime-stats-cancel",
@@ -15773,7 +15799,10 @@ impl AppView {
             dialog
                 .title("Traffic stats")
                 .child(body)
-                .button_props(DialogButtonProps::default().show_cancel(true))
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "traffic-stats-ok",
                     "traffic-stats-cancel",
@@ -18561,16 +18590,57 @@ impl AppView {
 
     /// Ticket 03: clipboard entry point. Clipboard text prefills the same
     /// dialog (same group choice, same commit path).
+    /// Ticket 08 (cua-fixes): prose on the clipboard toasts honestly
+    /// instead of opening a junk-prefilled dialog — never silent, and never
+    /// an echo (clipboard text may carry secrets, so both toasts are static
+    /// copy).
     fn open_import_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
             .unwrap_or_default();
-        if text.trim().is_empty() {
-            window.push_notification(Notification::warning("Clipboard has no text to import"), cx);
-            return;
+        match Self::paste_intake_refusal(&text) {
+            None => self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx),
+            Some(reason) => {
+                window.push_notification(Notification::warning(reason), cx);
+            }
         }
-        self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx);
+    }
+
+    /// Ticket 08 (cua-fixes): paste-intake gate for the Ctrl+V handler
+    /// above (the same handler as the palette `ImportClipboard` op and the
+    /// Library-menu "From clipboard" item). `None` opens the prefilled
+    /// dialog exactly as before; `Some(reason)` is the honest toast. The
+    /// shaped arms mirror the commit diversions in
+    /// [`commit_import_with_context`] (library export, addsub,
+    /// route/remoteroute, preset JSON), and the fallback asks
+    /// [`import_text`] — the same parse the dialog preview and commit use —
+    /// so the gate can never block a valid import.
+    fn paste_intake_refusal(text: &str) -> Option<&'static str> {
+        use crate::preset::{is_remote_route_attempt, is_route_attempt, looks_like_preset_json};
+        if text.trim().is_empty() {
+            return Some("Clipboard has no text to import");
+        }
+        if is_library_export(text) {
+            return None;
+        }
+        let trimmed = text.trim();
+        let single_line = !trimmed.contains('\n');
+        if single_line && is_addsub_attempt(trimmed) {
+            return None;
+        }
+        if single_line && (is_route_attempt(trimmed) || is_remote_route_attempt(trimmed)) {
+            return None;
+        }
+        if looks_like_preset_json(trimmed) {
+            return None;
+        }
+        if import_text(text).configs.is_empty() {
+            return Some(
+                "Clipboard text is not importable — nothing imported (paste a share link, JSON, conf, or preset link)",
+            );
+        }
+        None
     }
 
     /// Ticket 07 (throne-adoption): OS open-with handoff. Bare `http(s)` URLs
@@ -18658,7 +18728,10 @@ impl AppView {
                             },
                         ),
                 )
-                .button_props(DialogButtonProps::default().show_cancel(true))
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "bare-url-close",
                     "bare-url-cancel",
@@ -21313,8 +21386,10 @@ impl AppView {
                 .title(format!("Routing preset for \"{config_name}\""))
                 .child(body)
                 .button_props(
+                    // Ticket 03 (US-3): pure-close footer — no kit Cancel
+                    // affordance; the shared footer renders the single
+                    // `Close`. The Confirm-key commit stays a no-op close.
                     DialogButtonProps::default()
-                        .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
                 .footer(dialog_footer(
@@ -23891,6 +23966,12 @@ impl AppView {
     /// detail `row-menu` ids — both menus can paint at once); the click
     /// resolves the row fresh so the menu acts on the right-clicked row,
     /// never the selection. Ghost rows warn; the selection is untouched.
+    /// Ticket 07 (CUA US-5/CAP-5): role + name through the accessibility
+    /// bridge — `Role::MenuItem` with the visible label as the accessible
+    /// name, the same contract `topbar_menu_row` already carries, so the
+    /// UIA walk names every card-menu item. No synthetic nodes: the div is
+    /// the real clickable row, and keyboard (arrows/`Enter`/`Esc`) rides
+    /// the kit `PopupMenu` bindings.
     fn row_menu_item(
         verb: &str,
         row_id: &str,
@@ -23909,6 +23990,8 @@ impl AppView {
             div()
                 .id(id.clone())
                 .test_support()
+                .role(Role::MenuItem)
+                .aria_label(label.clone())
                 .flex()
                 .flex_row()
                 .items_center()
@@ -35296,6 +35379,61 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
+    /// Ticket 08 (cua-fixes): the paste-intake gate — importable shapes
+    /// pass (`None`, dialog opens as before), empty/non-importable
+    /// clipboards refuse with static copy (`Some`). The refusal never
+    /// echoes clipboard text (it may carry secrets). Pure gate, no window
+    /// needed.
+    #[test]
+    fn cua08_paste_intake_refusal_gates_prose_not_links() {
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(""),
+            Some("Clipboard has no text to import")
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal("  \n "),
+            Some("Clipboard has no text to import")
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x"
+            ),
+            None,
+            "partially-valid paste still opens the dialog"
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(
+                "throne://addsub/demo?url=https://example.com/feed"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal("throne://route/demo"),
+            None
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(r#"{"rules": [{"action": "direct"}]}"#),
+            None
+        );
+        let prose = crate::AppView::paste_intake_refusal("just some meeting notes for Thursday")
+            .expect("prose refuses");
+        assert!(
+            !prose.contains("Thursday"),
+            "refusal echoes nothing, got {prose}"
+        );
+        let bogus = crate::AppView::paste_intake_refusal("bogus://x").expect("bogus refuses");
+        assert!(
+            !bogus.contains("bogus"),
+            "refusal echoes nothing, got {bogus}"
+        );
+    }
+
     /// Config-completeness T08 (CAP-12): the `direct` page is label-only —
     /// switching to it rewrites the box to the bare marker and the dialog
     /// commit carries no endpoint fields (form-level; the T01 virtual test
@@ -36240,6 +36378,314 @@ mod tests {
             cx.run_until_parked();
             paint_frame(cx);
         }
+    }
+
+    /// Ticket 07 (CUA US-5/CAP-5): PROGRAM menu UIA-walk snapshot — every
+    /// item exposes role MenuItem + its pinned accessible name through the
+    /// native accessibility facts (`role()`/`label()` read the same
+    /// AccessKit properties the OS UIA bridge serves). The committed
+    /// fixture `tests/fixtures/uia-program-menu.json` is the contract; the
+    /// live walk must match it entry for entry. The ticket names five
+    /// entries (`Add configuration`, `Import`, `From clipboard`,
+    /// `From file(s)`, `Export`); `About` rides the same menu and pins too.
+    #[gpui_kit::test]
+    fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("program-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/uia-program-menu.json"))
+                .expect("program menu fixture parses");
+        let items = fixture["items"].as_array().expect("fixture lists items");
+        let names: Vec<&str> = items
+            .iter()
+            .map(|item| item["name"].as_str().expect("fixture name"))
+            .collect();
+        for expected in [
+            "Add configuration",
+            "Import",
+            "From clipboard",
+            "From file(s)",
+            "Export",
+        ] {
+            assert!(
+                names.iter().any(|name| name.contains(expected)),
+                "PROGRAM walk names {expected}: {names:?}"
+            );
+        }
+        for item in items {
+            let id = item["id"].as_str().expect("fixture id");
+            let (role, label) = cx.update(|window, _| {
+                let snapshot = window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders in the PROGRAM menu"));
+                (
+                    snapshot.role().map(|role| format!("{role:?}")),
+                    snapshot.label().map(str::to_string),
+                )
+            });
+            assert_eq!(
+                role.as_deref(),
+                Some(item["role"].as_str().expect("fixture role")),
+                "{id} exposes its fixture role"
+            );
+            assert_eq!(
+                label.as_deref(),
+                item["name"].as_str(),
+                "{id} announces its fixture name"
+            );
+        }
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    }
+
+    /// Ticket 07 (CUA US-5/CAP-5): card context-menu UIA-walk snapshot —
+    /// all 15 items expose role MenuItem + name, and no sixteenth node
+    /// rides the `rowctx-` prefix. The committed fixture
+    /// `tests/fixtures/uia-card-context-menu.json` is the contract; the
+    /// observed native-fact walk (the same properties UIA serves) must
+    /// match it exactly as a set.
+    #[gpui_kit::test]
+    fn cua07_card_context_menu_exposes_fifteen_items(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let card = format!("row-card-{}", row.id);
+        assert!(
+            cx.update(|window, _| window.try_find(card.clone()).is_some()),
+            "seeded card paints"
+        );
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/uia-card-context-menu.json"))
+                .expect("card menu fixture parses");
+        let items = fixture["items"].as_array().expect("fixture lists items");
+        assert_eq!(items.len(), 15, "card menu pins exactly 15 items");
+        for item in items {
+            let verb = item["verb"].as_str().expect("fixture verb");
+            let id = format!("rowctx-{verb}-{}", row.id);
+            let (role, label) = cx.update(|window, _| {
+                let snapshot = window
+                    .try_find(id.clone())
+                    .unwrap_or_else(|| panic!("{id} renders in the card menu"));
+                (
+                    snapshot.role().map(|role| format!("{role:?}")),
+                    snapshot.label().map(str::to_string),
+                )
+            });
+            assert_eq!(
+                role.as_deref(),
+                Some(item["role"].as_str().expect("fixture role")),
+                "{id} exposes its fixture role"
+            );
+            assert_eq!(
+                label.as_deref(),
+                item["name"].as_str(),
+                "{id} announces its fixture name"
+            );
+        }
+        // No sixteenth: every observed `rowctx-` node is one of the 15.
+        let wanted: std::collections::HashSet<String> = items
+            .iter()
+            .map(|item| {
+                format!(
+                    "rowctx-{}-{}",
+                    item["verb"].as_str().expect("fixture verb"),
+                    row.id
+                )
+            })
+            .collect();
+        let observed: Vec<String> = cx.update(|window, _| {
+            gpui_kit::base::test_support::snapshots(window)
+                .iter()
+                .filter_map(|snapshot| {
+                    snapshot.path().last().and_then(|last| {
+                        let id = format!("{last:?}");
+                        if id.contains("rowctx-") {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        });
+        assert_eq!(
+            observed.len(),
+            15,
+            "card menu walks exactly 15 items, no sixteenth: {observed:?}"
+        );
+        for id in &observed {
+            assert!(
+                wanted.iter().any(|want| id.contains(want)),
+                "walked node {id} is one of the 15 pinned items"
+            );
+        }
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    }
+
+    /// Ticket 07 (CUA US-5/CAP-5): keyboard fallback contract — the kit
+    /// `PopupMenu` bindings (arrows move, `Enter` confirms, `Esc`
+    /// dismisses) operate both menus with no mouse. PROGRAM: open, `Down`
+    /// selects the first item, `Enter` opens Add, `Esc` closes it with
+    /// nothing committed. Card menu: right-click opens, `Esc` dismisses.
+    #[gpui_kit::test]
+    fn cua07_menus_keyboard_operable(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("program-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            let down = Keystroke::parse("down").expect("test keystroke parses");
+            window.dispatch_keystroke(down, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            let enter = Keystroke::parse("enter").expect("test keystroke parses");
+            window.dispatch_keystroke(enter, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Enter on the first PROGRAM item opens Add"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Esc closes Add"
+        );
+        assert_eq!(notification_count(cx), before, "Esc commits nothing");
+        let card = format!("row-card-{}", row.id);
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let edit = format!("rowctx-edit-{}", row.id);
+        assert!(
+            cx.update(|window, _| window.try_find(edit.clone()).is_some()),
+            "card menu opens from the keyboard path too"
+        );
+        cx.update(|window, cx| {
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, _| window.try_find(edit.clone()).is_none()),
+            "Esc dismisses the card menu"
+        );
+    }
+
+    /// Ticket 07 (CUA US-5/CAP-5): invoke parity spot-check — the Edit and
+    /// Test card-menu items reach the same postconditions as their
+    /// handlers: Edit opens the Edit dialog for THAT row, Test on a
+    /// stopped row toasts the honest not-running warning (no fakes needed:
+    /// a stopped row never touches the network).
+    #[gpui_kit::test]
+    fn cua07_card_menu_invoke_matches_click(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let card = format!("row-card-{}", row.id);
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click(format!("rowctx-edit-{}", row.id), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "card-menu Edit opens the Edit dialog"
+        );
+        cx.update(|window, cx| {
+            window.close_all_dialogs(cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click(format!("rowctx-test-{}", row.id), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "card-menu Test toasts on a stopped row"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "stopped-row Test opens no dialog and probes nothing"
+        );
     }
 
     /// Ticket 02 (throne-adoption layout): at the 880x620 minimum all five
@@ -38985,6 +39431,8 @@ mod tests {
     /// commit label, so a future lie fails here instead of hiding inline.
     /// Pure-close dialogs read `Close`; commits name their verb; the Logs
     /// filter commit is distinct from discarding; never a bare `OK`.
+    /// Ticket 03 (US-3): the pure-close set pins `Close` (the shared footer
+    /// renders Close-only exactly for these labels).
     #[test]
     fn honest_footer_labels_name_their_effect() {
         use crate::footer_commit_label;
@@ -38992,6 +39440,9 @@ mod tests {
             "settings",
             "groups",
             "preset-attach",
+            "runtime-stats",
+            "traffic-stats",
+            "bare-url",
             "logs",
             "presets",
             "subscriptions",
@@ -39013,6 +39464,9 @@ mod tests {
         assert_eq!(footer_commit_label("settings"), "Close");
         assert_eq!(footer_commit_label("groups"), "Close");
         assert_eq!(footer_commit_label("preset-attach"), "Close");
+        assert_eq!(footer_commit_label("runtime-stats"), "Close");
+        assert_eq!(footer_commit_label("traffic-stats"), "Close");
+        assert_eq!(footer_commit_label("bare-url"), "Close");
         assert_eq!(
             footer_commit_label("logs"),
             "Apply filter",
@@ -39028,6 +39482,73 @@ mod tests {
         assert_eq!(footer_commit_label("export"), "Export");
         assert_eq!(footer_commit_label("bulk-move"), "Move");
         assert_eq!(footer_commit_label("group-rename"), "Rename");
+    }
+
+    /// Ticket 03 (US-3): single-close footers — Settings and Runtime stats
+    /// each render exactly one footer button (`Close`, no `Cancel` sibling),
+    /// every stats line still paints, and `Esc` closes with nothing
+    /// committed.
+    #[gpui_kit::test]
+    fn single_close_footers_render_one_close_and_esc_closes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let esc = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+        // Settings: exactly one Close, no Cancel; Esc closes silently.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(
+            cx.update(|window, _| window.try_find("settings-dialog-ok").is_some()),
+            "Settings renders its Close"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("settings-dialog-cancel").is_none()),
+            "Settings renders no Cancel sibling"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(esc.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Esc closes Settings"
+        );
+        assert_eq!(notification_count(cx), before, "Esc commits nothing");
+        // Runtime stats: same single Close, every stats line paints, Esc closes.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        for ix in 0..10 {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("runtime-stat-{ix}")).is_some()),
+                "runtime-stat-{ix} paints"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("runtime-stats-ok").is_some()),
+            "Runtime stats renders its Close"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("runtime-stats-cancel").is_none()),
+            "Runtime stats renders no Cancel sibling"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(esc.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Esc closes Runtime stats"
+        );
+        assert_eq!(notification_count(cx), before, "Esc commits nothing");
     }
 
     /// Ticket 05 scenario 1: pure-close footers commit nothing — Settings,
@@ -49638,5 +50159,98 @@ mod tests {
         assert!(body.contains("library"), "payload has library section");
         let _ = std::fs::remove_file(&target);
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Ticket 02 (CUA US-2/CAP-2): settings body tail-clearance rule — at
+    /// the 1000x700 desktop frame and the 880x620 minimum, first paint
+    /// keeps the pinned Startup/Probe sections above the fold in order
+    /// (their fold slots never move), and with the body scrolled to its
+    /// end the last content row paints fully clear of the sticky footer
+    /// (the shared body bottom pad, never a per-line nudge — future tails
+    /// inherit it). The mid-body Timers line itself stays a presence pin
+    /// at first paint: it rides below the fold until scrolled to.
+    #[gpui_kit::test]
+    fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
+        use gpui_kit::point;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        for paint in [
+            paint_frame as fn(&mut VisualTestContext),
+            paint_frame_min as fn(&mut VisualTestContext),
+        ] {
+            cx.run_until_parked();
+            paint(cx);
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+            });
+            paint_dialog_open(cx);
+            // Fold slots preserved: Startup and Probe paint, in order.
+            assert_painted(cx, "settings-section-startup");
+            assert_painted(cx, "settings-section-probe");
+            let (startup_top, probe_top) = cx.update(|window, _| {
+                (
+                    window
+                        .try_find("settings-section-startup".to_string())
+                        .expect("startup renders")
+                        .bounds()
+                        .origin
+                        .y,
+                    window
+                        .try_find("settings-section-probe".to_string())
+                        .expect("probe renders")
+                        .bounds()
+                        .origin
+                        .y,
+                )
+            });
+            assert!(
+                startup_top < probe_top,
+                "Startup keeps its fold slot above Probe"
+            );
+            // Timers renders (below the fold at first paint — presence,
+            // not paint, is the pin).
+            assert!(
+                cx.update(|window, _| window.try_find("settings-ticks".to_string()).is_some()),
+                "Timers renders"
+            );
+            // Scroll the body to its end through a painted anchor, then
+            // the tail must paint fully clear of the sticky footer.
+            cx.update(|window, cx| {
+                window.scroll(
+                    "settings-section-probe",
+                    gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+            assert_painted(cx, "settings-tray-note");
+            let (tail_bottom, footer_top) = cx.update(|window, _| {
+                (
+                    window
+                        .try_find("settings-tray-note".to_string())
+                        .expect("tail renders")
+                        .bounds()
+                        .bottom(),
+                    window
+                        .try_find("settings-dialog-ok".to_string())
+                        .expect("footer renders")
+                        .bounds()
+                        .origin
+                        .y,
+                )
+            });
+            assert!(
+                tail_bottom + px(24.) <= footer_top,
+                "tail clears the footer by the body pad: tail {tail_bottom:?} vs footer {footer_top:?}"
+            );
+            cx.update(|window, cx| window.close_all_dialogs(cx));
+            cx.run_until_parked();
+        }
     }
 }
