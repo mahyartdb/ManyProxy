@@ -25,11 +25,15 @@ pub fn tray_tooltip(running: usize) -> String {
     format!("ManyProxy · {running} running")
 }
 
-/// Menu item ids for the tray menu (Show / Start all / Stop all / Quit).
+/// Menu item ids for the tray menu (Show / Select exit / Select preset /
+/// Start all / Stop all / Open config folder / Quit).
 pub mod menu_id {
     pub const SHOW: &str = "tray-show";
+    pub const SELECT_EXIT: &str = "tray-select-exit";
+    pub const SELECT_PRESET: &str = "tray-select-preset";
     pub const START_ALL: &str = "tray-start-all";
     pub const STOP_ALL: &str = "tray-stop-all";
+    pub const OPEN_CONFIG: &str = "tray-open-config";
     pub const QUIT: &str = "tray-quit";
 }
 
@@ -37,8 +41,16 @@ pub mod menu_id {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     Show,
+    /// Ticket 10 (US-30): show the window and open the preset picker for
+    /// the selected row (the ROUTING chooser twin — tray mirrors the shell).
+    SelectExit,
+    /// Ticket 10 (US-30): show the window and open the presets manager.
+    SelectPreset,
     StartAll,
     StopAll,
+    /// Ticket 10 (US-30): show the window and copy the config folder path
+    /// (copy, never a shell-out — the shell never launches an explorer).
+    OpenConfig,
     Quit,
 }
 
@@ -46,8 +58,11 @@ pub enum TrayAction {
 pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
     match id {
         menu_id::SHOW => Some(TrayAction::Show),
+        menu_id::SELECT_EXIT => Some(TrayAction::SelectExit),
+        menu_id::SELECT_PRESET => Some(TrayAction::SelectPreset),
         menu_id::START_ALL => Some(TrayAction::StartAll),
         menu_id::STOP_ALL => Some(TrayAction::StopAll),
+        menu_id::OPEN_CONFIG => Some(TrayAction::OpenConfig),
         menu_id::QUIT => Some(TrayAction::Quit),
         _ => None,
     }
@@ -57,10 +72,25 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
 pub fn menu_id_for_action(action: TrayAction) -> &'static str {
     match action {
         TrayAction::Show => menu_id::SHOW,
+        TrayAction::SelectExit => menu_id::SELECT_EXIT,
+        TrayAction::SelectPreset => menu_id::SELECT_PRESET,
         TrayAction::StartAll => menu_id::START_ALL,
         TrayAction::StopAll => menu_id::STOP_ALL,
+        TrayAction::OpenConfig => menu_id::OPEN_CONFIG,
         TrayAction::Quit => menu_id::QUIT,
     }
+}
+
+/// Ticket 10 (US-30): the config folder behind the tray OpenConfig action
+/// and the manager share rows — the data folder's parent (the database
+/// path minus its file name; `MANYPROXY_DB` overrides honored through
+/// [`crate::store::Store::default_path`]).
+pub fn config_folder() -> String {
+    let path = crate::store::Store::default_path();
+    path.parent()
+        .map(|parent| parent.display().to_string())
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Value name of the autostart entry.
@@ -383,8 +413,11 @@ impl TrayHandle {
         let menu = Menu::new();
         for (action, title) in [
             (TrayAction::Show, "Show"),
+            (TrayAction::SelectExit, "Select exit"),
+            (TrayAction::SelectPreset, "Select preset"),
             (TrayAction::StartAll, "Start all"),
             (TrayAction::StopAll, "Stop all"),
+            (TrayAction::OpenConfig, "Open config folder"),
             (TrayAction::Quit, "Quit"),
         ] {
             menu.append(&MenuItem::with_id(
@@ -451,18 +484,36 @@ mod tests {
     }
 
     /// Ticket 38: every menu id maps to exactly one action and back.
+    /// Ticket 10 (US-30): Select exit / Select preset / Open config folder
+    /// ride the same round-trip (tray mirrors the shell).
     #[test]
     fn menu_ids_round_trip() {
         for (id, action) in [
             (menu_id::SHOW, TrayAction::Show),
+            (menu_id::SELECT_EXIT, TrayAction::SelectExit),
+            (menu_id::SELECT_PRESET, TrayAction::SelectPreset),
             (menu_id::START_ALL, TrayAction::StartAll),
             (menu_id::STOP_ALL, TrayAction::StopAll),
+            (menu_id::OPEN_CONFIG, TrayAction::OpenConfig),
             (menu_id::QUIT, TrayAction::Quit),
         ] {
             assert_eq!(action_for_menu_id(id), Some(action));
             assert_eq!(menu_id_for_action(action), id);
         }
         assert_eq!(action_for_menu_id("foreign"), None);
+    }
+
+    /// Ticket 10 (US-30): the config folder is the data folder's parent
+    /// (never empty — falls back to the full path).
+    #[test]
+    fn config_folder_is_parent_of_db_path() {
+        let folder = config_folder();
+        assert!(!folder.trim().is_empty(), "folder never empty");
+        let db = crate::store::Store::default_path().display().to_string();
+        assert!(
+            db.starts_with(&folder),
+            "folder contains the db path ({db} vs {folder})"
+        );
     }
 
     /// Ticket 38: autostart round-trips on a temp key (never the real Run

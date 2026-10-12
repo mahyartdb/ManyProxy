@@ -51,6 +51,12 @@ pub const VALID_PROTOCOLS: &[&str] = &[
     // verified `edit_direct.ui` label-only) save and serve as a bare direct
     // final. Appended last so the existing picker order never shifts.
     "direct",
+    // Ticket 07 (throne-adoption): parse-only intake protocols (disabled
+    // rows; serving them is a later ticket — the engine still names the gap
+    // at start time). Appended last, same order rule as `direct`.
+    "mieru",
+    "juicity",
+    "trusttunnel",
 ];
 /// Inclusive auto-port range for configs created without an explicit port.
 pub const AUTO_PORT_START: u16 = 10801;
@@ -510,6 +516,9 @@ pub fn export_payload_full(
                 "last_error": sub.last_error,
                 "failures": failures,
                 "interval_secs": sub.interval_secs,
+                "quota_used": sub.quota_used,
+                "quota_total": sub.quota_total,
+                "quota_expire": sub.quota_expire,
             })
         })
         .collect();
@@ -612,6 +621,182 @@ pub fn delete_running_confirm_text(name: &str) -> String {
         "Remove \"{name}\"? Its endpoint is running and will be stopped first, \
          then the stored configuration is deleted."
     )
+}
+
+/// Ticket 10 (throne-adoption US-22): Traffic Stats periods. Only
+/// cumulative totals persist (per-period history is phase-2), so every
+/// period summarizes the same stored totals — the dialog labels them
+/// all-time honest (see [`Store::traffic_period_summary`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficPeriod {
+    Day,
+    Week,
+    Month,
+    Quarter,
+}
+
+impl TrafficPeriod {
+    /// Every period, in selector order.
+    pub const ALL: [TrafficPeriod; 4] = [
+        TrafficPeriod::Day,
+        TrafficPeriod::Week,
+        TrafficPeriod::Month,
+        TrafficPeriod::Quarter,
+    ];
+
+    /// Selector label for the period.
+    pub fn label(self) -> &'static str {
+        match self {
+            TrafficPeriod::Day => "24h",
+            TrafficPeriod::Week => "7d",
+            TrafficPeriod::Month => "30d",
+            TrafficPeriod::Quarter => "90d",
+        }
+    }
+}
+
+/// Ticket 09 (throne-adoption): preview cap for the Remove-duplicates
+/// confirm (names at most this many rows; the count still names all).
+pub const PRUNE_PREVIEW_LIMIT: usize = 20;
+
+/// Ticket 09 (throne-adoption): the four group prune kinds. There is
+/// deliberately no `Insecure` kind (spec Out of Scope: no `Remove
+/// insecure`); [`GroupPruneKind::ALL`] pins the surface so a fifth kind
+/// cannot slip in silently (see the `group_prune_kinds_pinned` test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupPruneKind {
+    Duplicates,
+    Unavailable,
+    Invalid,
+    ClearTests,
+}
+
+impl GroupPruneKind {
+    /// Every prune kind, in menu order.
+    pub const ALL: [GroupPruneKind; 4] = [
+        GroupPruneKind::Duplicates,
+        GroupPruneKind::Unavailable,
+        GroupPruneKind::Invalid,
+        GroupPruneKind::ClearTests,
+    ];
+
+    /// Menu/confirm verb for the kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            GroupPruneKind::Duplicates => "Remove duplicates",
+            GroupPruneKind::Unavailable => "Remove unavailable",
+            GroupPruneKind::Invalid => "Remove invalid",
+            GroupPruneKind::ClearTests => "Clear tests",
+        }
+    }
+}
+
+/// Ticket 09 (throne-adoption): re-run commit validation over a stored
+/// protocol + params pair (the `IsValid` sweep predicate). A throwaway
+/// error vec keeps the signature boolean — callers needing field detail
+/// use the commit path, never this.
+pub fn is_valid_config(protocol: &str, params: &str) -> bool {
+    let mut errors = Vec::new();
+    validate_protocol_params(protocol, params, &mut errors).is_some() && errors.is_empty()
+}
+
+/// Ticket 09 (throne-adoption): confirm copy for Remove-duplicates. Names
+/// the group scope, the duplicate count, and previews at most
+/// [`PRUNE_PREVIEW_LIMIT`] names (`+N more` covers the rest).
+pub fn prune_duplicates_confirm_text(group: &str, total: usize, preview: &[String]) -> String {
+    let mut text = format!(
+        "Remove {total} duplicate(s) in group \"{group}\"? The first copy of each \
+         configuration is kept. This cannot be undone."
+    );
+    if !preview.is_empty() {
+        text.push_str(&format!(" Duplicates: {}.", preview.join(", ")));
+        if total > preview.len() {
+            text.push_str(&format!(" (+{} more)", total - preview.len()));
+        }
+    }
+    text
+}
+
+/// Ticket 09 (throne-adoption): confirm copy for Remove-unavailable.
+/// Names the group scope and the dead-sample count.
+pub fn prune_unavailable_confirm_text(group: &str, count: usize) -> String {
+    format!(
+        "Remove {count} unavailable row(s) in group \"{group}\"? Rows whose last test failed \
+         are deleted. This cannot be undone."
+    )
+}
+
+/// Ticket 09 (throne-adoption): confirm copy for Remove-invalid. Names the
+/// group scope and the validation-failure count.
+pub fn prune_invalid_confirm_text(group: &str, count: usize) -> String {
+    format!(
+        "Remove {count} invalid row(s) in group \"{group}\"? Rows failing validation are \
+         deleted. This cannot be undone."
+    )
+}
+
+/// Ticket 09 (throne-adoption): confirm copy for Clear-tests. Names the
+/// group scope and the cleared-sample count; rows are kept.
+pub fn clear_group_tests_confirm_text(group: &str, count: usize) -> String {
+    format!(
+        "Clear {count} test result(s) in group \"{group}\"? Rows are kept and read untested \
+         until the next probe. This cannot be undone."
+    )
+}
+
+/// Ticket 09 (throne-adoption): one row's transport-security posture for
+/// the Show-Security column (`reality` > `tls` > `none`). Reads the
+/// explicit `security` key; protocols whose forms lock TLS always-on
+/// (AnyTLS/Naïve/TUIC/Hysteria/ShadowTLS captions) read `tls` without the
+/// key; everything else (shadowsocks, wireguard, plain, unreadable)
+/// reads `none` (fail-closed: never claim TLS that is not evidenced).
+pub fn row_security_label(protocol: &str, params_raw: &str) -> &'static str {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(params_raw.trim()) {
+        if let Some(obj) = value.as_object() {
+            if let Some(security) = lookup_case_insensitive(obj, &["security"]) {
+                if security.eq_ignore_ascii_case("reality") {
+                    return "reality";
+                }
+                if security.eq_ignore_ascii_case("tls") {
+                    return "tls";
+                }
+            }
+        }
+    }
+    match protocol.trim().to_ascii_lowercase().as_str() {
+        "anytls" | "naive" | "tuic" | "hysteria" | "hysteria2" | "hy2" | "shadowtls" => "tls",
+        _ => "none",
+    }
+}
+
+/// Ticket 09 (throne-adoption): rank behind the `Type|Security` sort
+/// (`reality` first — strongest posture — then `tls`, then `none`).
+pub fn security_rank(label: &str) -> u8 {
+    match label {
+        "reality" => 3,
+        "tls" => 2,
+        "none" => 1,
+        _ => 0,
+    }
+}
+
+/// Ticket 09 (throne-adoption): `Type|Security` row order — protocol
+/// name ascending, then security posture strongest-first, then row name
+/// (stable, total: names are unique per add). Pure seam; the list view
+/// applies it when the sort is armed.
+pub fn compare_type_security(a: &ProxyConfig, b: &ProxyConfig) -> std::cmp::Ordering {
+    a.protocol
+        .to_ascii_lowercase()
+        .cmp(&b.protocol.to_ascii_lowercase())
+        .then_with(|| {
+            security_rank(row_security_label(&b.protocol, &b.params))
+                .cmp(&security_rank(row_security_label(&a.protocol, &a.params)))
+        })
+        .then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
 }
 
 /// Ticket 09: explicit warning copy for any user-owned plaintext export.
@@ -877,6 +1062,11 @@ fn canonical_protocol(raw: &str) -> Option<String> {
         // (fork sidecar; AWG-vs-Noise mismatch rejected in the engine).
         "ssh" => Some("ssh".to_string()),
         "noise" => Some("noise".to_string()),
+        // Ticket 07 (throne-adoption): parse-only intake protocols (commit
+        // + library accept them; the engine still names the serving gap).
+        "mieru" => Some("mieru".to_string()),
+        "juicity" => Some("juicity".to_string()),
+        "trusttunnel" => Some("trusttunnel".to_string()),
         "http" => Some("http".to_string()),
         "https" => Some("https".to_string()),
         "naive" => Some("naive".to_string()),
@@ -967,6 +1157,16 @@ pub fn protocol_params_template(protocol: &str) -> String {
         }
         "naive" | "ssh" => {
             blank(&mut params, "username");
+            blank(&mut params, "password");
+        }
+        // Ticket 07 (throne-adoption): parse-only templates carry their
+        // credential slots (same key sets as the commit gate below).
+        "mieru" | "trusttunnel" => {
+            blank(&mut params, "username");
+            blank(&mut params, "password");
+        }
+        "juicity" => {
+            blank(&mut params, "uuid");
             blank(&mut params, "password");
         }
         "noise" => blank(&mut params, "key"),
@@ -2944,6 +3144,23 @@ pub fn guided_identity_fields(protocol: &str) -> Option<GuidedIdentity> {
             read_keys: &["password"],
             needs: "username and password",
         },
+        // Ticket 07 (throne-adoption): parse-only protocols (key sets mirror
+        // [`validate_protocol_params`] exactly, same contract as above).
+        "mieru" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password"],
+            needs: "username and password",
+        },
+        "juicity" => GuidedIdentity {
+            key: Some("uuid"),
+            read_keys: &["uuid", "id"],
+            needs: "uuid and password",
+        },
+        "trusttunnel" => GuidedIdentity {
+            key: Some("password"),
+            read_keys: &["password"],
+            needs: "username and password",
+        },
         "ssh" => GuidedIdentity {
             key: Some("password"),
             read_keys: &["password", "private_key", "privatekey"],
@@ -3233,6 +3450,12 @@ fn validate_protocol_params(
             // Ticket 42: snell needs its psk; shadowtls/socks/http serve
             // without link credentials (v1 shadowtls omits the password).
             "snell" => has(&["psk"]),
+            // Ticket 07 (throne-adoption): parse-only credential gates
+            // mirroring the import side (never commit-ok/serve-fail on
+            // missing secrets).
+            "mieru" => has(&["username", "user"]) && has(&["password"]),
+            "juicity" => has(&["uuid", "id"]) && has(&["password"]),
+            "trusttunnel" => has(&["username", "user"]) && has(&["password"]),
             _ => true,
         };
         if !credential_ok {
@@ -3249,6 +3472,10 @@ fn validate_protocol_params(
                 "ssh" => "username and a password or private_key",
                 "noise" => "password or key",
                 "snell" => "psk",
+                // Ticket 07 (throne-adoption): parse-only credential names.
+                "mieru" => "username and password",
+                "juicity" => "uuid and password",
+                "trusttunnel" => "username and password",
                 _ => "credentials",
             };
             errors.push(missing(what));
@@ -3305,6 +3532,47 @@ fn validate_protocol_params(
     }
     Some((canonical, params_text))
 }
+
+/// Ticket 09 (throne-adoption): the stored server hostname of a params
+/// blob, if it names a domain (not an IP literal). `None` means nothing
+/// to resolve — unparseable, no server key, blank, or already an IP.
+/// Pure seam: the UI resolves the returned hostname and saves
+/// [`rewrite_server_to_ip`]'s output.
+pub fn row_server_hostname(params_raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(params_raw.trim()).ok()?;
+    let obj = value.as_object()?;
+    for (key, item) in obj {
+        if key.eq_ignore_ascii_case("server") || key.eq_ignore_ascii_case("address") {
+            if let serde_json::Value::String(text) = item {
+                let trimmed = text.trim().to_string();
+                if trimmed.is_empty() || trimmed.parse::<std::net::IpAddr>().is_ok() {
+                    return None;
+                }
+                return Some(trimmed);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Ticket 09 (throne-adoption): rewrite a params blob's `server` (or
+/// `address`) hostname to a looked-up IP. Returns `None` when there is
+/// nothing to rewrite (see [`row_server_hostname`]); otherwise the
+/// re-serialized object with every other key byte-preserved through
+/// serde. Group-with-confirm and row-save both commit this string.
+pub fn rewrite_server_to_ip(params_raw: &str, ip: &str) -> Option<String> {
+    row_server_hostname(params_raw)?;
+    let mut value: serde_json::Value = serde_json::from_str(params_raw.trim()).ok()?;
+    let obj = value.as_object_mut()?;
+    for (key, item) in obj.iter_mut() {
+        if key.eq_ignore_ascii_case("server") || key.eq_ignore_ascii_case("address") {
+            *item = serde_json::Value::String(ip.trim().to_string());
+            return serde_json::to_string(&value).ok();
+        }
+    }
+    None
+}
 /// Ticket 04: a subscription refresh source. Refresh upserts ProxyConfigs in
 /// `group` keyed by normalized identity (never the remark); it never deletes
 /// hand-created configs and never enables or starts anything.
@@ -3328,6 +3596,15 @@ pub struct Subscription {
     /// Missing/legacy rows read as [`DEFAULT_AUTO_REFRESH_SECS`]; `<= 0`
     /// means always due (matches [`due_for_refresh`] semantics).
     pub interval_secs: i64,
+    /// Ticket 08 (throne-adoption): quota snapshot from the
+    /// `Subscription-Userinfo` response header (`upload` + `download` land
+    /// in `quota_used`, `total` in `quota_total`, `expire` in
+    /// `quota_expire`). All `None` when the provider sends no header (or
+    /// the last success carried none) — the Manage Groups rows read these
+    /// for `Used / Remain / Expire`. Never secrets, plain integers.
+    pub quota_used: Option<i64>,
+    pub quota_total: Option<i64>,
+    pub quota_expire: Option<i64>,
 }
 
 /// Ticket 04: outcome of one refresh merge. `error` is `Some` when the body
@@ -3345,6 +3622,11 @@ pub struct RefreshOutcome {
     /// The user's version is kept in place — never silently reverted — and
     /// each such row counts here exactly once so the UI can surface it.
     pub conflicts: usize,
+    /// Ticket 08 (throne-adoption): owned rows that vanished upstream but
+    /// are currently serving — kept verbatim (never deleted, never
+    /// rewritten under a live endpoint) and reported as `[=] Still in
+    /// use`. They stay owned, so the next refresh revisits them.
+    pub in_use: usize,
     pub failures: Vec<crate::import::ImportFailure>,
     pub error: Option<String>,
 }
@@ -3382,6 +3664,82 @@ pub fn due_for_refresh_for(subscription: &Subscription, now: i64) -> bool {
     due_for_refresh(subscription, now, subscription.interval_secs)
 }
 
+/// Ticket 08 (throne-adoption): quota snapshot parsed from one
+/// `Subscription-Userinfo` response header
+/// (`upload=…; download=…; total=…; expire=…`). Keys match
+/// case-insensitively; surrounding whitespace is ignored; unparseable
+/// values are skipped (never a whole-header failure). `used` is
+/// `upload + download` saturating (a present-but-garbled pair still yields
+/// `None`, never a guessed zero). `None` when the header carries no usable
+/// quota pair — the caller then clears the stored snapshot so a provider
+/// that stops reporting never shows stale numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SubscriptionQuota {
+    pub used: Option<i64>,
+    pub total: Option<i64>,
+    pub expire: Option<i64>,
+}
+
+/// Parse one `Subscription-Userinfo` header value into a
+/// [`SubscriptionQuota`]. Returns `None` when nothing usable parses
+/// (empty header, no keys, or all values garbled).
+pub fn parse_subscription_userinfo(header: &str) -> Option<SubscriptionQuota> {
+    fn parse_int(raw: &str) -> Option<i64> {
+        let text = raw.trim();
+        if text.is_empty() {
+            return None;
+        }
+        // Plain integers only — floats, units, and signs never appear in
+        // this header; anything else is garbled, not zero.
+        if !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let digits = text.trim_start_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        // Saturate absurd magnitudes instead of wrapping.
+        if digits.len() > 19 {
+            return Some(i64::MAX);
+        }
+        digits.parse::<i64>().ok()
+    }
+    let mut upload: Option<i64> = None;
+    let mut download: Option<i64> = None;
+    let mut total: Option<i64> = None;
+    let mut expire: Option<i64> = None;
+    let mut seen_any = false;
+    for part in header.split(';') {
+        let (key, value) = match part.split_once('=') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        seen_any = true;
+        match key.trim().to_ascii_lowercase().as_str() {
+            "upload" => upload = parse_int(value).or(upload),
+            "download" => download = parse_int(value).or(download),
+            "total" => total = parse_int(value).or(total),
+            "expire" => expire = parse_int(value).or(expire),
+            _ => {}
+        }
+    }
+    if !seen_any {
+        return None;
+    }
+    let used = match (upload, download) {
+        (Some(up), Some(down)) => Some(up.saturating_add(down)),
+        (Some(up), None) => Some(up),
+        (None, Some(down)) => Some(down),
+        (None, None) => None,
+    };
+    if used.is_none() && total.is_none() && expire.is_none() {
+        return None;
+    }
+    Some(SubscriptionQuota {
+        used,
+        total,
+        expire,
+    })
+}
+
 /// Map one subscription row to a Subscription.
 fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
     let id: i64 = row.get(0)?;
@@ -3390,6 +3748,11 @@ fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscriptio
     // Ticket 40: v5 `interval_secs` is column 8 when present; legacy rows
     // (v0–v4 fixtures, hand-built SELECTs) fall back to the default.
     let interval_secs: Option<i64> = row.get(8).ok();
+    // Ticket 08 (throne-adoption): quota columns are 9–11 when present;
+    // legacy rows and hand-built SELECTs read as no-quota (never an error).
+    let quota_used: Option<i64> = row.get(9).ok().flatten();
+    let quota_total: Option<i64> = row.get(10).ok().flatten();
+    let quota_expire: Option<i64> = row.get(11).ok().flatten();
     Ok(Subscription {
         id: id.to_string(),
         label: row.get(1)?,
@@ -3420,6 +3783,9 @@ fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscriptio
         last_error: row.get(6)?,
         failures: decode_failures(failures_raw),
         interval_secs: interval_secs.unwrap_or(DEFAULT_AUTO_REFRESH_SECS),
+        quota_used,
+        quota_total,
+        quota_expire,
     })
 }
 
@@ -4237,7 +4603,8 @@ impl Store {
                subscription_id TEXT,
                identity_key TEXT,
                adoptable INTEGER NOT NULL DEFAULT 0,
-               synced_params TEXT
+               synced_params TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0
              ) STRICT;
              CREATE TABLE IF NOT EXISTS subscriptions (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4248,7 +4615,10 @@ impl Store {
                last_refresh_at INTEGER,
                last_error TEXT,
                failures TEXT NOT NULL DEFAULT '[]',
-               interval_secs INTEGER NOT NULL DEFAULT 86400
+               interval_secs INTEGER NOT NULL DEFAULT 86400,
+                quota_used INTEGER,
+                quota_total INTEGER,
+                quota_expire INTEGER
              ) STRICT;
              CREATE TABLE IF NOT EXISTS subscription_tombstones (
                subscription_id TEXT NOT NULL,
@@ -4309,6 +4679,17 @@ impl Store {
         // no version bump (same precedent as the ticket-25 columns).
         self.ensure_column("proxy_configs", "traffic_rx", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("proxy_configs", "traffic_tx", "INTEGER NOT NULL DEFAULT 0")?;
+        // Ticket 08 (throne-adoption): library display order. Fresh rows
+        // and refresh inserts keep `sort_order` assigned (creation order by
+        // default, remote order for refreshed members); pre-ticket-08
+        // databases backfill to creation order exactly once (a later
+        // refresh legitimately assigns 0 to the first row, so the backfill
+        // must not re-run on reopen — hence the gate on column absence).
+        if !self.column_exists("proxy_configs", "sort_order")? {
+            self.ensure_column("proxy_configs", "sort_order", "INTEGER NOT NULL DEFAULT 0")?;
+            self.conn
+                .execute("UPDATE proxy_configs SET sort_order = id", [])?;
+        }
         // Ticket 40 (v5): per-sub interval, preset extensions, tombstone URL
         // + rotation core. All constraint-free ADD COLUMN (online, time
         // independent of row count); idempotent via `ensure_column`.
@@ -4322,6 +4703,17 @@ impl Store {
         self.ensure_column("route_presets", "last_used_at", "INTEGER")?;
         self.ensure_column("subscription_tombstones", "subscription_url", "TEXT")?;
         self.ensure_column("subscription_tombstones", "rotation_core", "TEXT")?;
+        // Ticket 08 (throne-adoption): quota snapshot from the
+        // `Subscription-Userinfo` header. Nullable plain columns (no
+        // backfill: missing reads as no-quota, same as a provider that
+        // sends no header).
+        for (column, ddl) in [
+            ("quota_used", "INTEGER"),
+            ("quota_total", "INTEGER"),
+            ("quota_expire", "INTEGER"),
+        ] {
+            self.ensure_column("subscriptions", column, ddl)?;
+        }
         // Indexes (after all columns exist, so legacy DBs missing columns
         // never fail index creation; IF NOT EXISTS keeps re-runs idempotent).
         self.conn.execute_batch(
@@ -4603,7 +4995,14 @@ impl Store {
                     item.port as i64,
                 ],
             )?;
-            ids.push(tx.last_insert_rowid());
+            let rowid = tx.last_insert_rowid();
+            ids.push(rowid);
+            // Ticket 08: new rows append in creation order (`sort_order`
+            // tracks the row id until a refresh reseats it).
+            tx.execute(
+                "UPDATE proxy_configs SET sort_order = ?1 WHERE id = ?1",
+                params![rowid],
+            )?;
         }
         tx.commit()?;
         let mut out = Vec::with_capacity(ids.len());
@@ -4616,12 +5015,14 @@ impl Store {
         Ok(out)
     }
 
-    /// All configs in stable id order.
+    /// All configs in library display order (`sort_order`, ties by id).
+    /// Fresh rows append in creation order; subscription refresh reseats
+    /// its members to remote order (see [`Store::refresh_with_body_running`]).
     pub fn list(&self) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
               subscription_id, identity_key, preset_id
-             FROM proxy_configs ORDER BY id",
+             FROM proxy_configs ORDER BY sort_order, id",
         )?;
         let rows = stmt
             .query_map([], map_row)?
@@ -4660,7 +5061,7 @@ impl Store {
         let ids: Vec<i64> = {
             let mut id_stmt = self
                 .conn
-                .prepare("SELECT id FROM proxy_configs ORDER BY id")?;
+                .prepare("SELECT id FROM proxy_configs ORDER BY sort_order, id")?;
             let mapped = id_stmt.query_map([], |row| row.get::<_, i64>(0))?;
             let mut out = Vec::new();
             for row in mapped {
@@ -4855,6 +5256,25 @@ impl Store {
             "UPDATE proxy_configs SET grp = ?1 WHERE grp = ?2",
             params![new, old],
         )?;
+        // Ticket 08: subscriptions feeding the old label follow it — their
+        // members GroupFollow `subscription.group` on every refresh, so a
+        // rename that left them behind would yank members back on the next
+        // refresh. (Row counts and validation above are untouched.)
+        self.conn.execute(
+            "UPDATE subscriptions SET grp = ?1 WHERE grp = ?2",
+            params![new, old],
+        )?;
+        // Ticket 08: the skip-automatic-refresh flag follows the label, so
+        // a renamed group keeps its refresh policy (additive move — row
+        // counts and validation above are untouched).
+        if old != new {
+            let old_key = Self::group_skip_key(&old);
+            if let Some(value) = self.get_meta(&old_key)? {
+                self.set_meta(&Self::group_skip_key(&new), &value)?;
+                self.conn
+                    .execute("DELETE FROM meta WHERE key = ?1", params![old_key])?;
+            }
+        }
         Ok(changed)
     }
 
@@ -4907,6 +5327,144 @@ impl Store {
             )]));
         }
         Ok(())
+    }
+
+    // -- Ticket 09 (throne-adoption): group prunes ------------------------
+
+    /// Rows of one group in library display order (same order as
+    /// [`Store::list`], filtered to the normalized label).
+    fn rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
+        let group = normalized_group(group);
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|row| row.group == group)
+            .collect())
+    }
+
+    /// Later duplicates of one group: positional Uniq by
+    /// [`widened_identity`] (protocol + server + port + credentials +
+    /// extras) — the first row per key is kept, every later row is a
+    /// removal candidate, in display order.
+    pub fn duplicate_rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
+        let mut seen = HashSet::new();
+        let mut dupes = Vec::new();
+        for row in self.rows_in_group(group)? {
+            let key = widened_identity(&row.protocol, &row.params);
+            if !seen.insert(key) {
+                dupes.push(row);
+            }
+        }
+        Ok(dupes)
+    }
+
+    /// Duplicate preview for the confirm: total count plus at most
+    /// [`PRUNE_PREVIEW_LIMIT`] names (first dupes in display order).
+    pub fn duplicate_preview_in_group(
+        &self,
+        group: &str,
+    ) -> Result<(usize, Vec<String>), StoreError> {
+        let dupes = self.duplicate_rows_in_group(group)?;
+        let total = dupes.len();
+        let names = dupes
+            .into_iter()
+            .take(PRUNE_PREVIEW_LIMIT)
+            .map(|row| row.name)
+            .collect();
+        Ok((total, names))
+    }
+
+    /// Remove later duplicates of one group (keeps the first copy of each
+    /// identity). Removal rides [`Store::remove`] per row, so tombstones
+    /// and health snapshots follow each deleted row. Returns the removed
+    /// rows (display order) so the toast can name them.
+    pub fn remove_duplicates_in_group(
+        &mut self,
+        group: &str,
+    ) -> Result<Vec<ProxyConfig>, StoreError> {
+        let dupes = self.duplicate_rows_in_group(group)?;
+        let mut removed = Vec::with_capacity(dupes.len());
+        for row in dupes {
+            if self.remove(&row.id)? {
+                removed.push(row);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Rows of one group whose latest persisted sample is dead (an `error`
+    /// present — the Throne `latency<0` unavailable state; untested rows
+    /// carry no error and are never unavailable).
+    pub fn unavailable_rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
+        let dead: HashSet<String> = self
+            .load_health_snapshots()?
+            .into_iter()
+            .filter(|snap| snap.error.is_some())
+            .map(|snap| snap.config_id)
+            .collect();
+        Ok(self
+            .rows_in_group(group)?
+            .into_iter()
+            .filter(|row| dead.contains(&row.id))
+            .collect())
+    }
+
+    /// Remove dead-sample rows of one group (same per-row [`Store::remove`]
+    /// hygiene as duplicates). Returns the removed rows for toast naming.
+    pub fn remove_unavailable_in_group(
+        &mut self,
+        group: &str,
+    ) -> Result<Vec<ProxyConfig>, StoreError> {
+        let dead = self.unavailable_rows_in_group(group)?;
+        let mut removed = Vec::with_capacity(dead.len());
+        for row in dead {
+            if self.remove(&row.id)? {
+                removed.push(row);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Rows of one group failing commit validation ([`is_valid_config`]) —
+    /// the `IsValid` sweep. Stored rows normally pass (writes validate),
+    /// but legacy/foreign-touched rows can drift; the sweep re-checks.
+    pub fn invalid_rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
+        Ok(self
+            .rows_in_group(group)?
+            .into_iter()
+            .filter(|row| !is_valid_config(&row.protocol, &row.params))
+            .collect())
+    }
+
+    /// Remove validation-failing rows of one group (same per-row
+    /// [`Store::remove`] hygiene). Returns the removed rows for naming.
+    pub fn remove_invalid_in_group(&mut self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
+        let bad = self.invalid_rows_in_group(group)?;
+        let mut removed = Vec::with_capacity(bad.len());
+        for row in bad {
+            if self.remove(&row.id)? {
+                removed.push(row);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Drop persisted test samples (latest + history) for one group's rows
+    /// — the `Clear tests` prune. Rows are untouched; they read untested
+    /// until the next probe. Returns the cleared latest-sample count.
+    pub fn clear_tests_in_group(&mut self, group: &str) -> Result<usize, StoreError> {
+        let group = normalized_group(group);
+        let cleared = self.conn.execute(
+            "DELETE FROM health_snapshots WHERE config_id IN
+              (SELECT id FROM proxy_configs WHERE grp = ?1)",
+            params![group],
+        )?;
+        let _ = self.conn.execute(
+            "DELETE FROM health_history WHERE config_id IN
+              (SELECT id FROM proxy_configs WHERE grp = ?1)",
+            params![group],
+        );
+        Ok(cleared)
     }
 
     /// Flip the enabled flag.
@@ -5529,7 +6087,8 @@ impl Store {
     /// All subscriptions in stable id order.
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs,
+                     quota_used, quota_total, quota_expire
              FROM subscriptions ORDER BY id",
         )?;
         let rows = stmt
@@ -5545,7 +6104,8 @@ impl Store {
             Err(_) => return Ok(None),
         };
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs
+            "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs,
+                     quota_used, quota_total, quota_expire
              FROM subscriptions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_subscription_row)?;
@@ -5592,6 +6152,37 @@ impl Store {
         let changed = self.conn.execute(
             "UPDATE subscriptions SET auto_refresh = ?1 WHERE id = ?2",
             params![auto_refresh as i64, rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_subscription(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Ticket 08 (throne-adoption): persist the quota snapshot parsed from
+    /// the `Subscription-Userinfo` header (see
+    /// [`parse_subscription_userinfo`]). `None` clears the snapshot — a
+    /// success that carries no header must not show stale numbers. Unknown
+    /// ids are `NotFound`; the merge itself never calls this (refresh keeps
+    /// last-good quota on failure by simply not calling it).
+    pub fn set_subscription_quota(
+        &mut self,
+        id: &str,
+        quota: Option<SubscriptionQuota>,
+    ) -> Result<Subscription, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let (used, total, expire) = match quota {
+            Some(quota) => (quota.used, quota.total, quota.expire),
+            None => (None, None, None),
+        };
+        let changed = self.conn.execute(
+            "UPDATE subscriptions SET quota_used = ?1, quota_total = ?2, quota_expire = ?3
+             WHERE id = ?4",
+            params![used, total, expire, rowid],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(id.to_string()));
@@ -5750,11 +6341,28 @@ impl Store {
         };
         self.refresh_with_body(sub_id, text, now)
     }
+    /// Ticket 08 (throne-adoption): refresh with no endpoint serving —
+    /// nothing is ever sticky (see [`Store::refresh_with_body_running`]).
+    /// Every existing caller and test keeps this shape.
     pub fn refresh_with_body(
         &mut self,
         sub_id: &str,
         body: &str,
         now: i64,
+    ) -> Result<RefreshOutcome, StoreError> {
+        self.refresh_with_body_running(sub_id, body, now, &HashSet::new())
+    }
+    /// Ticket 08 (throne-adoption): refresh while `running` (row ids with a
+    /// live endpoint) is sticky — owned rows that vanished upstream but are
+    /// in `running` are kept verbatim and counted as `in_use` (`[=] Still
+    /// in use`) instead of deleted. The UI passes its live-endpoint set;
+    /// tests inject ids directly, never real sidecars.
+    pub fn refresh_with_body_running(
+        &mut self,
+        sub_id: &str,
+        body: &str,
+        now: i64,
+        running: &HashSet<String>,
     ) -> Result<RefreshOutcome, StoreError> {
         use crate::import::{import_subscription_body, ImportedConfig};
         let subscription = self
@@ -5782,6 +6390,10 @@ impl Store {
         // Values carry the batch position so port-exhaustion failures report
         // real per-item indices (ticket 25 L3).
         let mut desired: BTreeMap<String, (usize, ImportedConfig)> = BTreeMap::new();
+        // Ticket 08: first-occurrence order of the unique remote keys (the
+        // BTreeMap above is key-ordered, not remote-ordered) — the
+        // resequence below seats owned members in this order.
+        let mut remote_keys: Vec<String> = Vec::new();
         let mut duplicates = 0usize;
         for (index, config) in batch.configs.into_iter().enumerate() {
             let key = widened_identity(&config.protocol, &config.params);
@@ -5790,6 +6402,7 @@ impl Store {
                     duplicates += 1;
                 }
                 std::collections::btree_map::Entry::Vacant(slot) => {
+                    remote_keys.push(slot.key().clone());
                     slot.insert((index, config));
                 }
             }
@@ -6073,6 +6686,15 @@ impl Store {
                     continue;
                 }
             }
+            if running.contains(view.row.id.as_str()) {
+                // Ticket 08 sticky: vanished upstream but currently
+                // serving — keep the row verbatim (never delete or rewrite
+                // a live endpoint's config under it) and count it `[=]`.
+                // It stays owned with its old key, so the next refresh
+                // revisits it once the endpoint stops.
+                outcome.in_use += 1;
+                continue;
+            }
             let mut paired = false;
             if let Some(core) = core.as_deref() {
                 for (candidate_key, _, candidate) in &candidates {
@@ -6088,6 +6710,42 @@ impl Store {
                         } else {
                             // Ticket 25 rotation in place: same id, same
                             // port, same enabled — never delete + re-add.
+                            ops.push(Op::UpstreamUpdate {
+                                id: view.row.id.clone(),
+                                protocol: candidate.protocol.clone(),
+                                params: candidate.params.clone(),
+                                key: candidate_key.clone(),
+                            });
+                            outcome.updated += 1;
+                        }
+                        paired = true;
+                        break;
+                    }
+                }
+            }
+            if !paired {
+                // Ticket 08 (throne-adoption): remark-stable fallback. The
+                // rotation pass above only pairs same-server cores; when
+                // upstream moves a node to a NEW host but keeps its remark,
+                // the vanished owned row and the unmatched candidate share
+                // the display name. Pair by exact name (first-wins in the
+                // deterministic vanished order above) so a host rotation
+                // updates in place — same id, same port, same enabled,
+                // same traffic — instead of delete + re-add. Hand-renamed
+                // rows never match (their name differs from every upstream
+                // remark), so rename preservation is unaffected. The
+                // user-edit rule mirrors rotation: a user-changed row keeps
+                // its version and swallows the twin (counted once as a
+                // conflict, never silently reverted).
+                for (candidate_key, _, candidate) in &candidates {
+                    if consumed.contains(candidate_key) {
+                        continue;
+                    }
+                    if candidate.name == view.row.name {
+                        consumed.insert(candidate_key.clone());
+                        if user_changed {
+                            outcome.conflicts += 1;
+                        } else {
                             ops.push(Op::UpstreamUpdate {
                                 id: view.row.id.clone(),
                                 protocol: candidate.protocol.clone(),
@@ -6245,6 +6903,66 @@ impl Store {
                         params![id],
                     );
                 }
+            }
+        }
+        // Ticket 08 (throne-adoption): reorder owned members to remote
+        // order. `remote_keys` is the unique remote sequence; the post-merge
+        // read below resolves each key to its row (matched, adopted,
+        // rotated, name-paired, and freshly inserted alike — tombstoned and
+        // deleted keys resolve to nothing and are skipped). Every other row
+        // (hand-made, other subscriptions', sticky still-in-use rows) keeps
+        // its relative order; the member block anchors at the first owned
+        // slot, or the end when nothing owned is on screen yet.
+        let remote_ids: Vec<String> = {
+            let mut key_to_id: HashMap<String, String> = HashMap::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT id, identity_key FROM proxy_configs WHERE subscription_id = ?1",
+                )?;
+                let entries = stmt.query_map(params![subscription.id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+                for entry in entries {
+                    let (id, key) = entry?;
+                    if let Some(key) = key {
+                        key_to_id.insert(key, id.to_string());
+                    }
+                }
+            }
+            remote_keys
+                .iter()
+                .filter_map(|key| key_to_id.get(key).cloned())
+                .collect()
+        };
+        {
+            let mut current: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("SELECT id FROM proxy_configs ORDER BY sort_order, id")?;
+                let ids = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+                let mut out = Vec::new();
+                for id in ids {
+                    out.push(id?.to_string());
+                }
+                out
+            };
+            let remote_set: HashSet<&str> = remote_ids.iter().map(String::as_str).collect();
+            let anchor = current
+                .iter()
+                .position(|id| remote_set.contains(id.as_str()))
+                .unwrap_or(current.len());
+            current.retain(|id| !remote_set.contains(id.as_str()));
+            let at = anchor.min(current.len());
+            for (offset, id) in remote_ids.iter().enumerate() {
+                current.insert(at + offset, id.clone());
+            }
+            for (position, id) in current.iter().enumerate() {
+                let rowid: i64 = id.parse().map_err(|_| {
+                    StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
+                })?;
+                tx.execute(
+                    "UPDATE proxy_configs SET sort_order = ?1 WHERE id = ?2",
+                    params![position as i64, rowid],
+                )?;
             }
         }
         {
@@ -6532,6 +7250,14 @@ impl Store {
                     meta.insert(key.to_string(), serde_json::Value::String(v));
                 }
             }
+            // Ticket 08: per-group skip flags ride the same section
+            // (prefix-scoped; only `"1"` ever writes, so only it reads).
+            for group in self.group_skip_flags()? {
+                meta.insert(
+                    Self::group_skip_key(&group),
+                    serde_json::Value::String("1".to_string()),
+                );
+            }
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("meta".to_string(), serde_json::Value::Object(meta));
             }
@@ -6804,6 +7530,9 @@ impl Store {
             last_error: Option<String>,
             failures: String,
             interval_secs: i64,
+            quota_used: Option<i64>,
+            quota_total: Option<i64>,
+            quota_expire: Option<i64>,
         }
         let mut sub_rows: Vec<SubRow> = Vec::with_capacity(subs.len());
         for (index, entry) in subs.iter().enumerate() {
@@ -6841,6 +7570,15 @@ impl Store {
                     .get("interval_secs")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or(DEFAULT_AUTO_REFRESH_SECS),
+                // Ticket 08: quota is tolerant (a missing key reads as
+                // no-quota, like a provider that sends no header); corrupt
+                // non-integer values fall back the same way, never failing
+                // the whole restore.
+                quota_used: entry.get("quota_used").and_then(serde_json::Value::as_i64),
+                quota_total: entry.get("quota_total").and_then(serde_json::Value::as_i64),
+                quota_expire: entry
+                    .get("quota_expire")
+                    .and_then(serde_json::Value::as_i64),
             });
         }
         struct TombRow {
@@ -6955,6 +7693,18 @@ impl Store {
                 meta_rows.push((key.to_string(), v.to_string()));
             }
         }
+        // Ticket 08: per-group skip flags restore from the same section
+        // (prefix-scoped; only `"1"` restores — anything else is unset,
+        // never a guess).
+        for (key, value) in &meta_json {
+            if let (Some(group), Some(flag)) =
+                (key.strip_prefix("group.skip_refresh."), value.as_str())
+            {
+                if flag == "1" && !group.trim().is_empty() {
+                    meta_rows.push((key.clone(), "1".to_string()));
+                }
+            }
+        }
         // Seal plaintext params BEFORE opening the tx (DPAPI failures abort
         // before any wipe, so the tx never starts half-sealed).
         let mut sealed_rows: Vec<(LibraryRow, String, Option<String>)> =
@@ -7039,8 +7789,9 @@ impl Store {
         for (sub, sealed_url) in sub_rows.iter().zip(sealed_sub_urls.iter()) {
             tx.execute(
                 "INSERT INTO subscriptions
-                   (id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                   (id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs,
+                    quota_used, quota_total, quota_expire)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     sub.id,
                     sub.label,
@@ -7051,10 +7802,16 @@ impl Store {
                     sub.last_error,
                     sub.failures,
                     sub.interval_secs,
+                    sub.quota_used,
+                    sub.quota_total,
+                    sub.quota_expire,
                 ],
             )?;
         }
-        for (row, sealed_params, sealed_synced) in &sealed_rows {
+        // Ticket 08: display order rides the array position (export
+        // writes the library array in display order, so enumerate seats
+        // `sort_order` to reproduce it; payload ids never order rows).
+        for (position, (row, sealed_params, sealed_synced)) in sealed_rows.iter().enumerate() {
             // Ticket 40: linkage BY NAME (never dangling ids). Unknown names
             // rebuild unattached (visible in the manager, never a serve-time
             // failure).
@@ -7066,8 +7823,8 @@ impl Store {
                 "INSERT INTO proxy_configs
                    (id, name, protocol, params, grp, enabled, bind_ip, port,
                     subscription_id, identity_key, synced_params, adoptable,
-                    preset_id, traffic_rx, traffic_tx)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    preset_id, traffic_rx, traffic_tx, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     row.id,
                     row.name,
@@ -7084,6 +7841,7 @@ impl Store {
                     preset_id,
                     row.traffic_rx,
                     row.traffic_tx,
+                    position as i64,
                 ],
             )?;
         }
@@ -7484,6 +8242,59 @@ impl Store {
         self.set_meta(Self::META_SUBS_AUTO_REFRESH, if on { "1" } else { "0" })
     }
 
+    /// Ticket 08 (throne-adoption): meta-key behind one group's
+    /// skip-automatic-refresh flag. The suffix is the trimmed group label
+    /// (labels are case-sensitive display strings; the flag follows the
+    /// label — renames migrate it, see [`Store::rename_group`]).
+    fn group_skip_key(group: &str) -> String {
+        format!("group.skip_refresh.{}", group.trim())
+    }
+
+    /// True when the group is flagged to skip automatic refresh
+    /// (background ticks and Update-all). Unset means refresh normally.
+    /// Explicit per-row Update and Update-current always run — explicit
+    /// consent overrides the auto-skip.
+    pub fn group_skip_refresh(&self, group: &str) -> bool {
+        self.get_meta(&Self::group_skip_key(group))
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    /// Every group currently flagged to skip automatic refresh, ordered.
+    /// (Export writes these into the `meta` section; restore reads them
+    /// back — same table, same prefix, values strictly `"1"`.)
+    pub fn group_skip_flags(&self) -> Result<Vec<String>, StoreError> {
+        let prefix = "group.skip_refresh.";
+        let mut stmt = self.conn.prepare(
+            "SELECT key FROM meta WHERE key LIKE 'group.skip_refresh.%' AND value = '1'
+             ORDER BY key",
+        )?;
+        let keys = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for key in keys {
+            let key = key?;
+            if let Some(group) = key.strip_prefix(prefix) {
+                out.push(group.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Set or clear the skip-automatic-refresh flag (Manage Groups Edit
+    /// only — ticks never flip it). Clearing deletes the key (unset means
+    /// refresh); unknown groups flag fine (the flag is inert until a
+    /// subscription feeds that label).
+    pub fn set_group_skip_refresh(&mut self, group: &str, skip: bool) -> Result<(), StoreError> {
+        let key = Self::group_skip_key(group);
+        if skip {
+            self.set_meta(&key, "1")
+        } else {
+            self.conn
+                .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+            Ok(())
+        }
+    }
+
     /// Persist the currently running set for a later restore. Best-effort
     /// bookkeeping (like health snapshots): callers ignore errors.
     /// Ticket 40: filters to known config ids (ghost ids never persist) and
@@ -7568,6 +8379,165 @@ impl Store {
             params![Self::row_test_url_key(id)],
         )?;
         Ok(())
+    }
+
+    /// Ticket 01: meta key behind the Appearance choice (`"dark"` default,
+    /// `"light"`, or `"system"` → Windows AppsUseLightTheme). A UI-only
+    /// preference: persisted here, never exported (like the probe-URL
+    /// override — machine-local, not cross-DB state).
+    pub const META_APPEARANCE: &str = "appearance";
+
+    /// Ticket 01: persisted appearance (`"dark"` when unset or corrupt —
+    /// dark is the documented default, never a guessed OS read).
+    pub fn appearance(&self) -> String {
+        match self.get_meta(Self::META_APPEARANCE) {
+            Ok(Some(value)) if value == "dark" || value == "light" || value == "system" => value,
+            _ => "dark".to_string(),
+        }
+    }
+
+    /// Ticket 01: persist the Appearance choice. Anything outside the three
+    /// documented values fails loudly (never a guessed write).
+    pub fn set_appearance(&mut self, value: &str) -> Result<(), StoreError> {
+        if value != "dark" && value != "light" && value != "system" {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "appearance",
+                "appearance must be dark, light, or system",
+            )]));
+        }
+        self.set_meta(Self::META_APPEARANCE, value)
+    }
+
+    /// Ticket 10 (throne-adoption US-30): meta key behind the
+    /// skip-delete-confirm toggle. `"1"` skips the single-row and bulk
+    /// remove confirms (the preset detach-delete confirm never skips —
+    /// detaching rows is not a plain delete). Unset/corrupt means ask
+    /// (fail-closed to the confirm, never to silent deletes).
+    pub const META_SKIP_DELETE_CONFIRM: &str = "skip_delete_confirm";
+
+    /// True only after the explicit Settings opt-in. Broken reads fail
+    /// closed (confirm shown), never open.
+    pub fn skip_delete_confirm(&self) -> bool {
+        self.get_meta(Self::META_SKIP_DELETE_CONFIRM)
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    /// Persist the skip-delete-confirm toggle (explicit Settings switch
+    /// only — delete paths never flip it).
+    pub fn set_skip_delete_confirm(&mut self, skip: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_SKIP_DELETE_CONFIRM, if skip { "1" } else { "0" })
+    }
+
+    /// Ticket 10 (US-26): Connections table columns in render order, with
+    /// their default widths in px. The UI applies these as cell widths,
+    /// persists resizes through [`Store::set_conn_column_width`], and
+    /// restores all five through [`Store::reset_conn_column_widths`]
+    /// (the Refresh Column Widths button).
+    pub const CONN_COLUMNS: [(&str, u32); 5] = [
+        ("destination", 220),
+        ("exit", 180),
+        ("protocol", 90),
+        ("traffic", 140),
+        ("session", 90),
+    ];
+
+    /// Meta key behind the Connections column widths (JSON array of five
+    /// px widths, same order as [`Store::CONN_COLUMNS`]).
+    pub const META_CONN_COL_WIDTHS: &str = "conn_col_widths";
+
+    /// Persisted Connections column widths in px. Corrupt/absent reads as
+    /// the defaults (never a zero-width table); each entry clamps to
+    /// 40..=600 so one bad value cannot collapse the rest.
+    pub fn conn_column_widths(&self) -> [u32; 5] {
+        let defaults = Self::default_conn_column_widths();
+        let raw = match self.get_meta(Self::META_CONN_COL_WIDTHS) {
+            Ok(Some(raw)) => raw,
+            _ => return defaults,
+        };
+        let parsed: Vec<u32> = match serde_json::from_str(&raw) {
+            Ok(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_u64().map(|v| v as u32))
+                .collect(),
+            _ => return defaults,
+        };
+        if parsed.len() != defaults.len() {
+            return defaults;
+        }
+        let mut out = defaults;
+        for (slot, value) in out.iter_mut().zip(parsed) {
+            *slot = value.clamp(40, 600);
+        }
+        out
+    }
+
+    /// Default Connections column widths in px.
+    pub fn default_conn_column_widths() -> [u32; 5] {
+        [
+            Self::CONN_COLUMNS[0].1,
+            Self::CONN_COLUMNS[1].1,
+            Self::CONN_COLUMNS[2].1,
+            Self::CONN_COLUMNS[3].1,
+            Self::CONN_COLUMNS[4].1,
+        ]
+    }
+
+    /// Persist one Connections column width (clamped 40..=600;
+    /// out-of-range columns fail loudly, never write a shifted table).
+    pub fn set_conn_column_width(&mut self, index: usize, width_px: u32) -> Result<(), StoreError> {
+        if index >= Self::CONN_COLUMNS.len() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "column",
+                format!(
+                    "column {index} does not exist (table has {} columns)",
+                    Self::CONN_COLUMNS.len()
+                ),
+            )]));
+        }
+        let mut widths = self.conn_column_widths();
+        widths[index] = width_px.clamp(40, 600);
+        let value = serde_json::Value::Array(
+            widths
+                .iter()
+                .map(|width| serde_json::Value::from(*width))
+                .collect(),
+        )
+        .to_string();
+        self.set_meta(Self::META_CONN_COL_WIDTHS, &value)
+    }
+
+    /// Restore the default Connections column widths (the Refresh Column
+    /// Widths button). Deletes the key so `conn_column_widths` reads
+    /// defaults (explicit reset, never a guessed write).
+    pub fn reset_conn_column_widths(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::META_CONN_COL_WIDTHS],
+        )?;
+        Ok(())
+    }
+
+    /// Ticket 10 (US-22): summarize stored totals for one Traffic Stats
+    /// period — `(exits_with_traffic, rx_bytes, tx_bytes)`. Periods share
+    /// the cumulative totals (no per-period history persists yet), so the
+    /// caller labels the summary all-time; the per-exit bars come from the
+    /// same map and always match this summary.
+    pub fn traffic_period_summary(
+        totals: &std::collections::HashMap<String, (u64, u64)>,
+        _period: TrafficPeriod,
+    ) -> (usize, u64, u64) {
+        let mut exits = 0usize;
+        let mut rx = 0u64;
+        let mut tx = 0u64;
+        for (row_rx, row_tx) in totals.values() {
+            if *row_rx > 0 || *row_tx > 0 {
+                exits += 1;
+            }
+            rx = rx.saturating_add(*row_rx);
+            tx = tx.saturating_add(*row_tx);
+        }
+        (exits, rx, tx)
     }
 
     /// Load the running-set snapshot. Missing or corrupt reads as empty
@@ -7772,6 +8742,52 @@ mod tests {
                 .count(),
             2,
             "failed rename writes nothing"
+        );
+    }
+
+    /// Ticket 08 (throne-adoption): the skip-automatic-refresh flag
+    /// round-trips per group; rename migrates the flag AND retargets
+    /// subscriptions feeding the old label (their members would otherwise
+    /// GroupFollow back on the next refresh); export/restore carries the
+    /// flags.
+    #[test]
+    fn t08_group_skip_flag_round_trips_and_follows_rename() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        assert!(!store.group_skip_refresh("travel"), "unset means refresh");
+        assert!(store.group_skip_flags().expect("flags read").is_empty());
+        store
+            .set_group_skip_refresh("travel", true)
+            .expect("flag sets");
+        assert!(store.group_skip_refresh("travel"), "flag reads back");
+        assert_eq!(
+            store.group_skip_flags().expect("flags read"),
+            vec!["travel".to_string()]
+        );
+        store
+            .set_group_skip_refresh("travel", false)
+            .expect("flag clears");
+        assert!(!store.group_skip_refresh("travel"), "clear deletes the key");
+        assert!(store.group_skip_flags().expect("flags read").is_empty());
+        // Rename migrates the flag and retargets the subscription.
+        store
+            .set_group_skip_refresh("travel", true)
+            .expect("flag sets");
+        store.rename_group("travel", "team").expect("rename works");
+        assert!(!store.group_skip_refresh("travel"), "old label unflagged");
+        assert!(store.group_skip_refresh("team"), "flag follows rename");
+        let moved = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub kept");
+        assert_eq!(moved.group, "team", "subscription follows rename");
+        // Export/restore carries the flag.
+        let payload = store.export_library_json().expect("export works");
+        let mut other = Store::open_in_memory().expect("in-memory store opens");
+        other.restore_library_json(&payload).expect("restore works");
+        assert!(
+            other.group_skip_refresh("team"),
+            "skip flag survives export/restore"
         );
     }
 
@@ -8356,6 +9372,154 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 1);
     }
 
+    /// Ticket 08 (throne-adoption) scenario 1: upstream moves one member to
+    /// a new host but keeps its remark → the same row id is updated in
+    /// place (`[~]Updated 1`, no add, no delete); port, enabled state, and
+    /// accumulated traffic survive the move.
+    #[test]
+    fn subscription_refresh_host_change_updates_in_place_keeps_port_traffic() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let before: Vec<ProxyConfig> = store.list().expect("list works");
+        assert_eq!(before.len(), 2);
+        let moved = before
+            .iter()
+            .find(|row| row.name == "one")
+            .expect("seeded member one");
+        let moved_id = moved.id.clone();
+        let moved_port = moved.port;
+        store
+            .add_traffic(&moved_id, 1_000_000, 500_000)
+            .expect("traffic seeds");
+        // Same remark `#one`, new host `c.example.com`.
+        let outcome = store
+            .refresh_with_body(
+                &sub.id,
+                &format!(
+                    "vless://{SUB_UUID}@c.example.com:443#one\ntrojan://pw@b.example.com:443#two"
+                ),
+                200,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.updated, 1, "host move counts updated");
+        assert_eq!(outcome.added, 0, "no re-add");
+        assert_eq!(outcome.removed, 0, "no delete");
+        let after = store.get(&moved_id).expect("get works").expect("kept");
+        assert_eq!(after.id, moved_id, "same row id kept");
+        assert_eq!(after.port, moved_port, "port preserved");
+        assert!(!after.enabled, "refresh never enables");
+        assert!(after.params.contains("c.example.com"), "params moved");
+        let totals = store.traffic_totals().expect("totals read");
+        let kept = totals.get(&moved_id).expect("traffic row kept");
+        assert_eq!(kept.0, 1_000_000, "rx preserved");
+        assert_eq!(kept.1, 500_000, "tx preserved");
+    }
+
+    /// Ticket 08 (throne-adoption): a serving row that vanishes upstream is
+    /// sticky — kept verbatim and counted `[=] Still in use`, never
+    /// deleted; once it stops serving, the delete lands on the next
+    /// refresh.
+    #[test]
+    fn subscription_refresh_running_row_stays_in_use_until_stopped() {
+        use std::collections::HashSet;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let live_id = store
+            .list()
+            .expect("list works")
+            .iter()
+            .find(|row| row.name == "one")
+            .expect("seeded member one")
+            .id
+            .clone();
+        let running: HashSet<String> = [live_id.clone()].into_iter().collect();
+        // Upstream drops `one`, keeps `two`.
+        let one_body = "trojan://pw@b.example.com:443#two".to_string();
+        let outcome = store
+            .refresh_with_body_running(&sub.id, &one_body, 200, &running)
+            .expect("refresh works");
+        assert_eq!(outcome.in_use, 1, "serving row counted still-in-use");
+        assert_eq!(outcome.removed, 0, "serving row never deleted");
+        let kept = store.get(&live_id).expect("get works").expect("kept");
+        assert_eq!(kept.name, "one", "kept verbatim");
+        assert_eq!(store.list().expect("list works").len(), 2);
+        // Stopped: the same body now deletes it.
+        let outcome = store
+            .refresh_with_body(&sub.id, &one_body, 300)
+            .expect("refresh works");
+        assert_eq!(outcome.in_use, 0);
+        assert_eq!(outcome.removed, 1, "stopped row deletes");
+        assert_eq!(store.list().expect("list works").len(), 1);
+    }
+
+    /// Ticket 08 (throne-adoption): refresh reseats owned members to remote
+    /// order; hand-made rows keep their relative slots around the member
+    /// block (anchored at the first owned slot).
+    #[test]
+    fn subscription_refresh_reorders_members_to_remote_order() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        // A hand-made row sorts first (creation order = id order).
+        let hand = store
+            .add(NewConfig {
+                name: "Hand made".to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "travel".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("hand add works");
+        // Remote order flips to [two, one]; the hand row stays put.
+        let outcome = store
+            .refresh_with_body(
+                &sub.id,
+                &format!(
+                    "trojan://pw@b.example.com:443#two\nvless://{SUB_UUID}@a.example.com:443#one"
+                ),
+                200,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.updated, 0, "same nodes, only order moves");
+        let names: Vec<String> = store
+            .list()
+            .expect("list works")
+            .iter()
+            .map(|row| row.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["two".to_string(), "one".to_string(), hand.name.clone()],
+            "members follow remote order, hand row keeps its slot: {names:?}"
+        );
+        // Flipping back restores [one, two] with the hand row still last.
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 300)
+            .expect("refresh works");
+        let names: Vec<String> = store
+            .list()
+            .expect("list works")
+            .iter()
+            .map(|row| row.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["one".to_string(), "two".to_string(), hand.name.clone()],
+            "order tracks remote both ways: {names:?}"
+        );
+    }
+
     /// Issue 04, scenario 3: upstream removes a member → only the
     /// subscription-owned row is removed; hand-created configs are untouched.
     #[test]
@@ -8444,6 +9608,106 @@ mod tests {
             .expect("sub present");
         assert_eq!(cleared.last_error, None);
         assert_eq!(cleared.last_refresh_at, Some(300));
+    }
+
+    /// Ticket 08 (throne-adoption): `Subscription-Userinfo` header parsing —
+    /// the standard `upload / download / total / expire` shape, tolerant of
+    /// case, whitespace, unknown keys, and garbled values.
+    #[test]
+    fn subscription_userinfo_parses_standard_shape() {
+        let quota = parse_subscription_userinfo(
+            "upload=1024; download=2048; total=1073741824; expire=1735689600",
+        )
+        .expect("standard header parses");
+        assert_eq!(quota.used, Some(3_072));
+        assert_eq!(quota.total, Some(1_073_741_824));
+        assert_eq!(quota.expire, Some(1_735_689_600));
+        // Case + whitespace tolerant; unknown keys ignored.
+        let mixed = parse_subscription_userinfo(" Upload = 7 ;DOWNLOAD=8;foo=bar ")
+            .expect("tolerant parse works");
+        assert_eq!(mixed.used, Some(15));
+        assert_eq!(mixed.total, None);
+        assert_eq!(mixed.expire, None);
+        // Garbage never becomes a quota (and never a zero).
+        assert_eq!(parse_subscription_userinfo(""), None);
+        assert_eq!(parse_subscription_userinfo("upload=abc; total=xyz"), None);
+        assert_eq!(parse_subscription_userinfo("nothing-here"), None);
+        assert_eq!(parse_subscription_userinfo("upload=12.5; total=1GB"), None);
+        // One usable key suffices; saturating on absurd magnitudes.
+        let partial = parse_subscription_userinfo("total=99999999999999999999999")
+            .expect("huge total saturates");
+        assert_eq!(partial.total, Some(i64::MAX));
+        let expire_only =
+            parse_subscription_userinfo("expire=1735689600").expect("expire alone counts");
+        assert_eq!(expire_only.used, None);
+        assert_eq!(expire_only.expire, Some(1_735_689_600));
+    }
+
+    /// Ticket 08 (throne-adoption): quota setter round-trips; `None` clears
+    /// so a success without a header never shows stale numbers; the refresh
+    /// merge itself never touches quota (last-good preserved on failure by
+    /// simply not calling the setter).
+    #[test]
+    fn subscription_quota_round_trips_and_refresh_keeps_it() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+        let seeded = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(seeded.quota_used, None, "no quota until a header lands");
+        store
+            .set_subscription_quota(
+                &sub.id,
+                Some(SubscriptionQuota {
+                    used: Some(3_072),
+                    total: Some(1_073_741_824),
+                    expire: Some(1_735_689_600),
+                }),
+            )
+            .expect("quota sets");
+        let kept = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(kept.quota_used, Some(3_072));
+        assert_eq!(kept.quota_total, Some(1_073_741_824));
+        assert_eq!(kept.quota_expire, Some(1_735_689_600));
+        // A refresh (success or failure) never rewrites quota itself.
+        store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        let after_success = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(after_success.quota_used, Some(3_072), "merge keeps quota");
+        store
+            .refresh_with_body(&sub.id, "bogus://x", 200)
+            .expect("failure is an outcome");
+        let after_failure = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(after_failure.quota_used, Some(3_072), "failure keeps quota");
+        // Explicit clear (success without a header at the call site).
+        store
+            .set_subscription_quota(&sub.id, None)
+            .expect("quota clears");
+        let cleared = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub present");
+        assert_eq!(cleared.quota_used, None);
+        assert_eq!(cleared.quota_total, None);
+        assert_eq!(cleared.quota_expire, None);
+        // Unknown ids fail loudly.
+        assert!(
+            store
+                .set_subscription_quota("9999", Some(SubscriptionQuota::default()))
+                .is_err(),
+            "unknown id fails"
+        );
     }
 
     /// Prohibited side effect: refresh never enables/starts configs and never
@@ -8796,6 +10060,9 @@ mod tests {
             last_error: None,
             failures: Vec::new(),
             interval_secs: DEFAULT_AUTO_REFRESH_SECS,
+            quota_used: None,
+            quota_total: None,
+            quota_expire: None,
         };
         assert!(
             due_for_refresh(&scheduled, 1_000, 86_400),
@@ -8987,6 +10254,301 @@ mod tests {
         assert_eq!(written, None);
         assert!(!path.exists(), "dismissing the warning creates no file");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- Ticket 09 (throne-adoption): group prunes ---------------------------
+
+    /// The prune surface stays four kinds (no `Remove insecure`).
+    #[test]
+    fn t09_group_prune_kinds_pinned() {
+        assert_eq!(GroupPruneKind::ALL.len(), 4, "four prune kinds");
+        let labels: Vec<&str> = GroupPruneKind::ALL
+            .iter()
+            .map(|kind| kind.label())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Remove duplicates",
+                "Remove unavailable",
+                "Remove invalid",
+                "Clear tests"
+            ]
+        );
+        for label in &labels {
+            assert!(
+                !label.to_ascii_lowercase().contains("insecure"),
+                "no insecure prune: {label}"
+            );
+        }
+        assert_eq!(PRUNE_PREVIEW_LIMIT, 20, "preview cap pinned");
+    }
+
+    fn t09_input(name: &str, group: &str, params: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: params.to_string(),
+            group: group.to_string(),
+            bind_ip: String::new(),
+            port: String::new(),
+        }
+    }
+
+    /// Scenario: group with 2 dupes + 1 dead → Remove duplicates confirms
+    /// with count + preview and keeps one copy of each.
+    #[test]
+    fn t09_remove_duplicates_keeps_first_with_preview() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let a1 = store.add(t09_input("A1", "g", "")).expect("add works");
+        let a2 = store.add(t09_input("A2", "g", "")).expect("add works");
+        let b = store
+            .add(t09_input(
+                "B",
+                "g",
+                r#"{"server":"example.com","server_port":443,"uuid":"11111111-2222-4333-8444-555555555555"}"#,
+            ))
+            .expect("add works");
+        // The dead row is untouched by the duplicates sweep (availability
+        // is a different prune).
+        store
+            .save_health_snapshot(&dead_snapshot(&b.id))
+            .expect("save works");
+        let dupes = store.duplicate_rows_in_group("g").expect("scan works");
+        assert_eq!(dupes.len(), 1, "one later copy");
+        assert_eq!(dupes[0].id, a2.id, "first copy kept");
+        let (total, preview) = store
+            .duplicate_preview_in_group("g")
+            .expect("preview works");
+        assert_eq!(total, 1);
+        assert_eq!(preview, vec!["A2".to_string()]);
+        let confirm = prune_duplicates_confirm_text("g", total, &preview);
+        assert!(confirm.contains("\"g\""), "names scope: {confirm}");
+        assert!(confirm.contains('1'), "names count: {confirm}");
+        assert!(confirm.contains("A2"), "previews names: {confirm}");
+        let removed = store.remove_duplicates_in_group("g").expect("prune works");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, a2.id);
+        let kept: Vec<String> = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert!(kept.contains(&a1.id), "first copy kept");
+        assert!(kept.contains(&b.id), "distinct row kept");
+        assert!(!kept.contains(&a2.id), "dupe removed");
+        assert!(
+            store
+                .duplicate_rows_in_group("g")
+                .expect("rescan works")
+                .is_empty(),
+            "idempotent"
+        );
+    }
+
+    /// Previews name at most 20 rows while the count names all.
+    #[test]
+    fn t09_duplicate_preview_caps_at_twenty() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut inputs = Vec::new();
+        for i in 0..25 {
+            inputs.push(t09_input(&format!("D{i:02}"), "g", ""));
+        }
+        store.add_batch(inputs).expect("adds work");
+        let (total, preview) = store
+            .duplicate_preview_in_group("g")
+            .expect("preview works");
+        assert_eq!(total, 24, "first copy kept, rest dupes");
+        assert_eq!(preview.len(), PRUNE_PREVIEW_LIMIT);
+        let confirm = prune_duplicates_confirm_text("g", total, &preview);
+        assert!(confirm.contains("24"), "count names all: {confirm}");
+        assert!(confirm.contains("+4 more"), "overflow named: {confirm}");
+    }
+
+    /// Remove-unavailable drops dead-sample rows only (live + untested stay).
+    #[test]
+    fn t09_remove_unavailable_drops_dead_only() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let live = store.add(valid_input("Live")).expect("add works");
+        let dead = store.add(valid_input("Dead")).expect("add works");
+        store.add(valid_input("Fresh")).expect("add works");
+        store
+            .save_health_snapshot(&live_snapshot(&live.id, 33))
+            .expect("save works");
+        store
+            .save_health_snapshot(&dead_snapshot(&dead.id))
+            .expect("save works");
+        let found = store
+            .unavailable_rows_in_group("default")
+            .expect("scan works");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, dead.id);
+        let confirm = prune_unavailable_confirm_text("default", found.len());
+        assert!(confirm.contains("\"default\""), "names scope: {confirm}");
+        let removed = store
+            .remove_unavailable_in_group("default")
+            .expect("prune works");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, dead.id);
+        let kept: Vec<String> = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert!(kept.contains(&"Live".to_string()));
+        assert!(kept.contains(&"Fresh".to_string()), "untested stays");
+        assert!(!kept.contains(&"Dead".to_string()));
+    }
+
+    /// Insert one validation-failing row past the commit gate (raw SQL —
+    /// the commit path would refuse it), for the sweep test.
+    fn t09_insert_invalid_row(store: &mut Store, name: &str, group: &str) -> String {
+        let sealed =
+            Store::seal_or_fail(r#"{"type":"vless","server":"example.com","server_port":443}"#)
+                .expect("seal works");
+        store
+            .conn
+            .execute(
+                "INSERT INTO proxy_configs
+                   (name, protocol, params, grp, enabled, bind_ip, port, sort_order)
+                 VALUES (?1, 'vless', ?2, ?3, 0, '127.0.0.1', 19999, 999999)",
+                rusqlite::params![name, sealed, group],
+            )
+            .expect("raw insert works");
+        store.conn.last_insert_rowid().to_string()
+    }
+
+    /// Remove-invalid sweeps validation failures, keeps the rest.
+    #[test]
+    fn t09_remove_invalid_sweeps_failures_only() {
+        assert!(is_valid_config("vless", ""), "opaque legacy passes");
+        assert!(
+            is_valid_config(
+                "vless",
+                r#"{"server":"example.com","server_port":443,"uuid":"11111111-2222-4333-8444-555555555555"}"#
+            ),
+            "complete row passes"
+        );
+        assert!(
+            !is_valid_config(
+                "vless",
+                r#"{"type":"vless","server":"example.com","server_port":443}"#
+            ),
+            "import-shaped without uuid fails"
+        );
+        assert!(!is_valid_config("nope", ""), "unknown protocol fails");
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let good = store.add(valid_input("Good")).expect("add works");
+        let bad_id = t09_insert_invalid_row(&mut store, "Bad", "default");
+        let found = store.invalid_rows_in_group("default").expect("scan works");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, bad_id);
+        let confirm = prune_invalid_confirm_text("default", found.len());
+        assert!(confirm.contains("\"default\""), "names scope: {confirm}");
+        let removed = store
+            .remove_invalid_in_group("default")
+            .expect("prune works");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, bad_id);
+        assert!(
+            store.get(&good.id).expect("get works").is_some(),
+            "valid row kept"
+        );
+    }
+
+    /// Clear-tests drops one group's samples + history, keeps rows and the
+    /// other group's samples.
+    #[test]
+    fn t09_clear_tests_in_group_scoped() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut a = valid_input("A");
+        a.group = "g1".to_string();
+        let mut b = valid_input("B");
+        b.group = "g2".to_string();
+        let a = store.add(a).expect("add works");
+        let b = store.add(b).expect("add works");
+        store
+            .save_health_snapshot(&live_snapshot(&a.id, 10))
+            .expect("save works");
+        store
+            .save_health_snapshot(&dead_snapshot(&b.id))
+            .expect("save works");
+        let confirm = clear_group_tests_confirm_text("g1", 1);
+        assert!(confirm.contains("\"g1\""), "names scope: {confirm}");
+        assert_eq!(store.clear_tests_in_group("g1").expect("clear works"), 1);
+        let snaps = store.load_health_snapshots().expect("load works");
+        assert_eq!(snaps.len(), 1, "other group kept");
+        assert_eq!(snaps[0].config_id, b.id);
+        assert!(store.get(&a.id).expect("get works").is_some(), "row kept");
+        assert_eq!(
+            store.clear_tests_in_group("missing").expect("clear works"),
+            0,
+            "missing group clears nothing"
+        );
+    }
+
+    /// Resolve-Domain rewrite: hostnames rewrite, IPs and keyless blobs do not.
+    #[test]
+    fn t09_resolve_domain_rewrite_helpers() {
+        assert_eq!(
+            row_server_hostname(r#"{"server":"example.com","server_port":443}"#),
+            Some("example.com".to_string())
+        );
+        assert_eq!(row_server_hostname(r#"{"server":"93.184.216.34"}"#), None);
+        assert_eq!(row_server_hostname(r#"{"server":"::1"}"#), None);
+        assert_eq!(row_server_hostname("{}"), None);
+        assert_eq!(row_server_hostname("not json"), None);
+        assert_eq!(
+            rewrite_server_to_ip(
+                r#"{"server":"example.com","server_port":443}"#,
+                "93.184.216.34"
+            ),
+            Some(r#"{"server":"93.184.216.34","server_port":443}"#.to_string())
+        );
+        assert_eq!(
+            rewrite_server_to_ip(r#"{"server":"93.184.216.34"}"#, "1.2.3.4"),
+            None,
+            "already an IP"
+        );
+        assert_eq!(rewrite_server_to_ip("{}", "1.2.3.4"), None);
+    }
+
+    /// Show-Security labels + Type|Security order.
+    #[test]
+    fn t09_security_label_and_sort() {
+        assert_eq!(row_security_label("vless", r#"{"security":"tls"}"#), "tls");
+        assert_eq!(
+            row_security_label("vless", r#"{"security":"reality"}"#),
+            "reality"
+        );
+        assert_eq!(row_security_label("shadowsocks", "{}"), "none");
+        assert_eq!(row_security_label("anytls", "{}"), "tls");
+        assert_eq!(security_rank("reality"), 3);
+        assert_eq!(security_rank("tls"), 2);
+        assert_eq!(security_rank("none"), 1);
+        let row = |name: &str, protocol: &str, params: &str| ProxyConfig {
+            id: "0".to_string(),
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            params: params.to_string(),
+            group: "g".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10801,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        let mut rows = [
+            row("c", "vless", r#"{"security":"tls"}"#),
+            row("a", "trojan", "{}"),
+            row("b", "vless", r#"{"security":"reality"}"#),
+        ];
+        rows.sort_by(compare_type_security);
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"], "type asc, reality before tls");
     }
 
     // -- Ticket 12: health snapshot persistence ------------------------------
@@ -9632,7 +11194,14 @@ mod tests {
         store
             .refresh_with_body(&sub.id, &sub_body_two(), 100)
             .expect("refresh works");
-        let row = store.list().expect("list works").remove(0);
+        // Ticket 08: members seat in remote order (no longer BTreeMap key
+        // order), so pick the doomed member by name, not position.
+        let row = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "two")
+            .expect("member two doomed by the next refresh");
         store
             .save_health_snapshot(&HealthSnapshot {
                 config_id: row.id.clone(),
@@ -10518,6 +12087,69 @@ mod tests {
         }
     }
 
+    /// Ticket 07 (throne-adoption): parse-only rows commit like the import
+    /// path (credentials required, named without values; opaque rows still
+    /// pass through untouched).
+    #[test]
+    fn t07_parse_only_rows_validate() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for (protocol, params) in [
+            (
+                "mieru",
+                "{\"type\":\"mieru\",\"server\":\"a.example.com\",\"server_port\":1080,\"username\":\"u\",\"password\":\"p\"}",
+            ),
+            (
+                "juicity",
+                "{\"type\":\"juicity\",\"server\":\"a.example.com\",\"server_port\":23142,\"uuid\":\"11111111-2222-4333-8444-555555555555\",\"password\":\"p\"}",
+            ),
+            (
+                "trusttunnel",
+                "{\"type\":\"trusttunnel\",\"server\":\"a.example.com\",\"server_port\":443,\"username\":\"u\",\"password\":\"p\"}",
+            ),
+        ] {
+            store
+                .add(NewConfig {
+                    name: format!("{protocol} row"),
+                    protocol: protocol.to_string(),
+                    params: params.to_string(),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .unwrap_or_else(|error| panic!("{protocol} with creds works: {error}"));
+        }
+        for (protocol, params, wants) in [
+            (
+                "mieru",
+                "{\"type\":\"mieru\",\"server\":\"a.example.com\",\"server_port\":1080,\"username\":\"u\"}",
+                "username and password",
+            ),
+            (
+                "juicity",
+                "{\"type\":\"juicity\",\"server\":\"a.example.com\",\"server_port\":23142,\"password\":\"p\"}",
+                "uuid and password",
+            ),
+            (
+                "trusttunnel",
+                "{\"type\":\"trusttunnel\",\"server\":\"a.example.com\",\"server_port\":443,\"password\":\"p\"}",
+                "username and password",
+            ),
+        ] {
+            let error = store
+                .add(NewConfig {
+                    name: "Bad".to_string(),
+                    protocol: protocol.to_string(),
+                    params: params.to_string(),
+                    group: String::new(),
+                    bind_ip: String::new(),
+                    port: String::new(),
+                })
+                .expect_err(&format!("{protocol} without creds fails"));
+            let text = error.to_string();
+            assert!(text.contains(wants), "names {wants}, got {text}");
+        }
+    }
+
     // -- Ticket 35: DPAPI secrets at rest ------------------------------
 
     /// Ticket 35: DPAPI round trip — sealed bytes carry no plaintext and
@@ -10868,16 +12500,17 @@ mod tests {
             .expect("numeric brutal speed commits");
     }
 
-    /// Config-completeness T01: the picker lists exactly the 24 canonical
+    /// Config-completeness T01: the picker lists exactly the 27 canonical
     /// stored types (contract: no free-text typos); the virtual set is the
     /// four address-less types plus trivial `direct` (T08, Throne label-only
     /// parity); pristine detection is byte-identical; the switch rewrite
     /// fires on pristine JSON only.
+    /// Ticket 07 (throne-adoption): 24 + mieru/juicity/trusttunnel.
     #[test]
     fn t01_picker_virtual_and_pristine_rules() {
         assert_eq!(
             VALID_PROTOCOLS.len(),
-            24,
+            27,
             "picker lists exactly the canonical types"
         );
         for virtual_proto in [
@@ -13338,6 +14971,26 @@ mod tests {
         generate_with_presets(&rows, &map).expect("swept set generates");
     }
 
+    /// Ticket 01: appearance defaults dark, round-trips all three values,
+    /// and rejects junk (unset/corrupt reads dark, bad writes fail loudly).
+    #[test]
+    fn appearance_defaults_dark_and_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(store.appearance(), "dark", "default dark");
+        for value in ["dark", "light", "system"] {
+            store.set_appearance(value).expect("valid choice writes");
+            assert_eq!(store.appearance(), value, "{value} reads back");
+        }
+        assert!(
+            store.set_appearance("midnight").is_err(),
+            "junk fails loudly"
+        );
+        store
+            .set_meta(Store::META_APPEARANCE, "midnight")
+            .expect("raw write");
+        assert_eq!(store.appearance(), "dark", "corrupt reads dark");
+    }
+
     /// Ticket 38: restore opt-in defaults off and round-trips (explicit
     /// checkbox only — nothing enables it silently).
     #[test]
@@ -13348,6 +15001,90 @@ mod tests {
         assert!(store.restore_running(), "opt-in reads back");
         store.set_restore_running(false).expect("opt-out writes");
         assert!(!store.restore_running(), "opt-out reads back");
+    }
+
+    /// Ticket 10 (US-30): skip-delete-confirm defaults to asking and
+    /// round-trips (explicit Settings switch only — delete paths never
+    /// flip it; corrupt reads ask).
+    #[test]
+    fn t10_skip_delete_confirm_defaults_off_and_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(!store.skip_delete_confirm(), "default asks");
+        store.set_skip_delete_confirm(true).expect("opt-out writes");
+        assert!(store.skip_delete_confirm(), "skip reads back");
+        store.set_skip_delete_confirm(false).expect("opt-in writes");
+        assert!(!store.skip_delete_confirm(), "ask reads back");
+        store
+            .set_meta(Store::META_SKIP_DELETE_CONFIRM, "maybe")
+            .expect("raw write");
+        assert!(!store.skip_delete_confirm(), "corrupt reads ask");
+    }
+
+    /// Ticket 10 (US-26): column widths default, persist per column,
+    /// clamp strays, reject bad indexes, and reset to defaults.
+    #[test]
+    fn t10_conn_column_widths_persist_clamp_and_reset() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.conn_column_widths(),
+            Store::default_conn_column_widths(),
+            "unset reads defaults"
+        );
+        store.set_conn_column_width(0, 300).expect("width writes");
+        let widths = store.conn_column_widths();
+        assert_eq!(widths[0], 300, "resize persists");
+        assert_eq!(widths[1], Store::default_conn_column_widths()[1]);
+        store.set_conn_column_width(1, 5).expect("tiny clamps");
+        assert_eq!(store.conn_column_widths()[1], 40, "clamped, not zero");
+        store.set_conn_column_width(2, 9999).expect("huge clamps");
+        assert_eq!(store.conn_column_widths()[2], 600, "clamped, not huge");
+        assert!(
+            store.set_conn_column_width(5, 100).is_err(),
+            "bad column fails loudly"
+        );
+        store
+            .set_meta(Store::META_CONN_COL_WIDTHS, "[1,2]")
+            .expect("raw write");
+        assert_eq!(
+            store.conn_column_widths(),
+            Store::default_conn_column_widths(),
+            "short reads defaults"
+        );
+        store
+            .set_meta(Store::META_CONN_COL_WIDTHS, "junk")
+            .expect("raw write");
+        assert_eq!(
+            store.conn_column_widths(),
+            Store::default_conn_column_widths(),
+            "corrupt reads defaults"
+        );
+        store.set_conn_column_width(0, 300).expect("width writes");
+        store.reset_conn_column_widths().expect("reset works");
+        assert_eq!(
+            store.conn_column_widths(),
+            Store::default_conn_column_widths(),
+            "refresh restores defaults"
+        );
+    }
+
+    /// Ticket 10 (US-22): every period summarizes the same stored totals
+    /// (cumulative — per-period history is phase-2); per-exit bars from
+    /// the same map always match the summary.
+    #[test]
+    fn t10_traffic_period_summary_matches_stored_totals() {
+        let mut totals = std::collections::HashMap::new();
+        totals.insert("1".to_string(), (1000u64, 50u64));
+        totals.insert("2".to_string(), (3000u64, 90u64));
+        totals.insert("3".to_string(), (0u64, 0u64));
+        for period in TrafficPeriod::ALL {
+            let (exits, rx, tx) = Store::traffic_period_summary(&totals, period);
+            assert_eq!((exits, rx, tx), (2, 4000, 140), "period {}", period.label());
+        }
+        assert_eq!(
+            Store::traffic_period_summary(&std::collections::HashMap::new(), TrafficPeriod::Day),
+            (0, 0, 0),
+            "empty stays empty"
+        );
     }
 
     /// Ticket 38: running-set snapshot round-trips; missing reads empty;

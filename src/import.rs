@@ -1160,16 +1160,181 @@ fn parse_shadowtls(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     })
 }
 
+/// Ticket 07 (throne-adoption): Mieru link (`mieru://user:pass@host:port?…`
+/// or the community query form `mieru://host:port?username=&password=`).
+/// Mieru authenticates with username + password (both required); every other
+/// query key (`transport`, `tls`, `multiplexing`, …) rides verbatim into
+/// params. Parse-only: no sing-box 1.14.2 outbound schema exists (only the
+/// third-party mbox fork serves mieru), so the row lands disabled and the
+/// engine names the gap at start time — never silently.
+fn parse_mieru(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("mieru", parts)?;
+    let (mut username, mut password) = match parts.userinfo.as_deref() {
+        Some(raw) if !raw.is_empty() => match raw.find(':') {
+            Some(i) => (
+                percent_decode(&raw[..i], false),
+                percent_decode(&raw[i + 1..], false),
+            ),
+            None => (percent_decode(raw, false), String::new()),
+        },
+        _ => (String::new(), String::new()),
+    };
+    if username.trim().is_empty() {
+        username = parts.query.get("username").cloned().unwrap_or_default();
+    }
+    if password.trim().is_empty() {
+        password = parts.query.get("password").cloned().unwrap_or_default();
+    }
+    if username.trim().is_empty() {
+        return Err(missing_credential("mieru link is missing username"));
+    }
+    if password.trim().is_empty() {
+        return Err(missing_credential("mieru link is missing password"));
+    }
+    let port = require_port(parts.port_text.as_deref())?;
+    let mut params = base_params("mieru", &parts.host, port);
+    insert_str(&mut params, "username", username);
+    insert_str(&mut params, "password", password);
+    insert_extras(
+        &mut params,
+        &parts.query,
+        &["username", "password", "server", "server_port", "port"],
+    );
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "mieru", &parts.host, port),
+        protocol: "mieru".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
+/// Ticket 07 (throne-adoption): Juicity link
+/// (`juicity://uuid:password@host:port?…` — the official `generate-sharelink`
+/// shape; first-colon split so passwords may contain `:`). uuid + password
+/// required; `congestion_control`/`sni`/`allow_insecure`/`pinned_certchain…`
+/// ride verbatim. Parse-only (upstream sing-box never merged juicity support):
+/// the row lands disabled, the engine names the gap at start time.
+fn parse_juicity(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("juicity", parts)?;
+    let raw = parts.userinfo.as_deref().unwrap_or("");
+    let i = raw
+        .find(':')
+        .ok_or_else(|| missing_credential("juicity link is missing password"))?;
+    let (uuid, password) = (
+        percent_decode(&raw[..i], false),
+        percent_decode(&raw[i + 1..], false),
+    );
+    if uuid.trim().is_empty() {
+        return Err(missing_credential("juicity link is missing uuid"));
+    }
+    if password.trim().is_empty() {
+        return Err(missing_credential("juicity link is missing password"));
+    }
+    let port = require_port(parts.port_text.as_deref())?;
+    let mut params = base_params("juicity", &parts.host, port);
+    insert_str(&mut params, "uuid", uuid);
+    insert_str(&mut params, "password", password);
+    insert_extras(
+        &mut params,
+        &parts.query,
+        &["uuid", "password", "server", "server_port", "port"],
+    );
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "juicity", &parts.host, port),
+        protocol: "juicity".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
+/// Ticket 07 (throne-adoption): TrustTunnel link
+/// (`trusttunnel://username:password@host:port?…` — HTTP Basic credentials
+/// per the protocol spec, same triple as the sing transport shim's
+/// Server/Username/Password). Both halves required; TLS extras (`sni`, …)
+/// ride verbatim. Parse-only ("trusttunnel beyond parse" is out of scope):
+/// the row lands disabled.
+fn parse_trusttunnel(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
+    reject_unexpected_path("trusttunnel", parts)?;
+    let raw = parts.userinfo.as_deref().unwrap_or("");
+    let (username, password) = match raw.find(':') {
+        Some(i) => (
+            percent_decode(&raw[..i], false),
+            percent_decode(&raw[i + 1..], false),
+        ),
+        None => (percent_decode(raw, false), String::new()),
+    };
+    if username.trim().is_empty() {
+        return Err(missing_credential("trusttunnel link is missing username"));
+    }
+    if password.trim().is_empty() {
+        return Err(missing_credential("trusttunnel link is missing password"));
+    }
+    let port = require_port(parts.port_text.as_deref())?;
+    let mut params = base_params("trusttunnel", &parts.host, port);
+    insert_str(&mut params, "username", username);
+    insert_str(&mut params, "password", password);
+    insert_extras(
+        &mut params,
+        &parts.query,
+        &["username", "password", "server", "server_port", "port"],
+    );
+    Ok(ImportedConfig {
+        name: display_name(&parts.fragment, "trusttunnel", &parts.host, port),
+        protocol: "trusttunnel".to_string(),
+        params: finish(params),
+        host: parts.host.clone(),
+        port,
+    })
+}
+
+/// Ticket 07 (throne-adoption): JSON link
+/// (`json://<base64 of one outbound object>[#remark]`). The payload goes
+/// through the standard outbound path (per-type credential gates included);
+/// a `#fragment` overrides the embedded tag exactly like legacy vmess.
+/// Xray routing terminals ride the same drop rule as JSON batches (loud here:
+/// a single link has nowhere to drop silently to — nothing is stored).
+fn parse_json_link(rest: &str) -> Result<ImportedConfig, ImportError> {
+    let (payload, fragment) = match rest.find('#') {
+        Some(i) => (&rest[..i], rest[i + 1..].to_string()),
+        None => (rest, String::new()),
+    };
+    if payload.trim().is_empty() {
+        return Err(ImportError::new(
+            ImportErrorKind::Empty,
+            "json link is missing its payload",
+        ));
+    }
+    let text = decode_b64_utf8(payload)?;
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim()).map_err(|_| invalid_json("invalid json link payload"))?;
+    if !value.is_object() {
+        return Err(invalid_json(
+            "invalid json link payload: expected an object",
+        ));
+    }
+    if let Some(terminal) = xray_terminal_kind(&value) {
+        return Err(unknown_scheme(format!(
+            "Xray terminal '{terminal}' carries no importable endpoint — dropped"
+        )));
+    }
+    let mut config = json_outbound(0, &value)?;
+    if !fragment.trim().is_empty() {
+        config.name = display_name(&fragment, &config.protocol, &config.host, config.port);
+    }
+    Ok(config)
+}
+
 /// Ticket 42: protocols with no sing-box 1.14.2 outbound schema reject at
 /// import with per-protocol guidance (never parse-ok/start-fail). Messages
 /// name the scheme and the gap only — never userinfo or hosts.
+/// Ticket 07 (throne-adoption): mieru/juicity/trusttunnel left this set —
+/// they parse (disabled rows) now; the engine still names the serving gap.
 fn unsupported_protocol_guidance(scheme: &str) -> ImportError {
     let detail = match scheme {
-        "mieru" => "mieru has no sing-box 1.14.2 outbound schema (only the third-party mbox fork serves mieru) — import rejected; serve it via a \"custom-config\" row on a fork core instead",
-        "juicity" => "juicity has no sing-box outbound schema (upstream feature request, never merged) — import rejected; serve it via a \"custom-config\" row instead",
         "openvpn" => "openvpn is a sing-box endpoint (openvpn-client), not a 1.14.2 outbound — import rejected; serve it via a \"custom-config\" row instead",
         "masque" => "masque-client is a sing-box 1.15.0+ endpoint, not a 1.14.2 outbound — import rejected; serve it via a \"custom-config\" row on a newer core instead",
-        "trusttunnel" => "trusttunnel has no sing-box 1.14.2 outbound schema — import rejected; serve it via a \"custom-config\" row instead",
         // Config-completeness T08 (CAP-12): the remaining exotic fates stay
         // guidance-only (never fabricated editors, never 1.15.0 emission).
         "tailscale" => "tailscale is a sing-box endpoint, not a 1.14.2 outbound — import rejected; serve it via a \"custom-config\" row instead",
@@ -1557,7 +1722,9 @@ fn parse_noise(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
 /// Ticket 37: `throne://route/...` (routing presets) gets a named error, not
 /// the generic unknown-command text — the pure batch path cannot store
 /// presets; the single-line import path stores them (see `preset.rs`).
-fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
+/// Ticket 07 (throne-adoption): `manyproxy://` takes the same commands;
+/// `scheme` names the intake in errors.
+fn parse_throne_rest(scheme: &str, rest: &str) -> Result<ImportedConfig, ImportError> {
     if rest.trim().is_empty() {
         return Err(ImportError::new(
             ImportErrorKind::Empty,
@@ -1573,9 +1740,14 @@ fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
             "routing preset link: paste it as a single line to import the preset (throne://route links carry no importable endpoint)",
         ));
     }
+    if command.eq_ignore_ascii_case("addsub") {
+        return Err(unknown_scheme(format!(
+            "unknown {scheme} command 'addsub' (subscription links add through the single-line intake, never the batch path)"
+        )));
+    }
     if !command.eq_ignore_ascii_case("add") {
         return Err(unknown_scheme(format!(
-            "unknown throne command '{}'",
+            "unknown {scheme} command '{}'",
             cap_echo(command)
         )));
     }
@@ -1588,6 +1760,11 @@ fn parse_throne_rest(rest: &str) -> Result<ImportedConfig, ImportError> {
     let text = decode_b64_utf8(payload)?;
     let value: serde_json::Value =
         serde_json::from_str(&text).map_err(|_| invalid_json("invalid throne JSON"))?;
+    if let Some(terminal) = xray_terminal_kind(&value) {
+        return Err(unknown_scheme(format!(
+            "Xray terminal '{terminal}' carries no importable endpoint — dropped"
+        )));
+    }
     json_outbound(0, &value)
 }
 
@@ -1627,6 +1804,11 @@ pub const VALID_OUTBOUND_TYPES: &[&str] = &[
     "chain",
     // Config-completeness T08 (CAP-12): trivial `direct` final.
     "direct",
+    // Ticket 07 (throne-adoption): parse-only protocols (disabled rows;
+    // serving them is a later ticket).
+    "mieru",
+    "juicity",
+    "trusttunnel",
 ];
 
 /// Ticket 31: accepted link schemes (lowercase, as matched in
@@ -1667,13 +1849,20 @@ pub const VALID_LINK_SCHEMES: &[&str] = &[
     "naive+https",
     // Config-completeness T08 (CAP-12): trivial `direct` final.
     "direct",
+    // Ticket 07 (throne-adoption): parse-only protocols + single-JSON link.
+    "mieru",
+    "juicity",
+    "trusttunnel",
+    "json",
 ];
 fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
         "vless" | "vmess" | "trojan" | "shadowsocks" | "hysteria2" | "hysteria" | "tuic"
-        | "wireguard" | "amneziawg" | "socks" | "snell" | "anytls" | "ssh" | "noise" | "http"
-        | "https" | "naive" => Ok(lower),
+        | "wireguard" | "amneziawg" | "socks" | "snell" | "shadowtls" | "anytls" | "ssh"
+        | "noise" | "http" | "https" | "naive" => Ok(lower),
+        // Ticket 07 (throne-adoption): parse-only protocols land as disabled
+        // rows (same shape as their links); serving them is a later ticket.
         "ss" => Ok("shadowsocks".to_string()),
         "socks5" => Ok("socks".to_string()),
         // Ticket 42: link-scheme aliases shared with the link grammar.
@@ -1684,6 +1873,11 @@ fn normalize_outbound_type(raw: &str) -> Result<String, ImportError> {
         "hy2" | "hysteria2+realm" => Ok("hysteria2".to_string()),
         "wg" => Ok("wireguard".to_string()),
         "naive+https" | "naive_https" => Ok("naive".to_string()),
+        // Ticket 07 (throne-adoption): parse-only protocols land as disabled
+        // rows (same shape as their links); serving them is a later ticket.
+        "mieru" => Ok("mieru".to_string()),
+        "juicity" => Ok("juicity".to_string()),
+        "trusttunnel" => Ok("trusttunnel".to_string()),
         // Ticket 08: Xray/custom/extra/chain rows keep their kind so the
         // engine can route them to the sidecar bridge, the owning core,
         // the user slot, or the chain builder.
@@ -1737,6 +1931,25 @@ fn json_port(obj: &Params) -> Result<u16, ImportError> {
         Some(serde_json::Value::String(text)) => parse_port(text)
             .map_err(|_| bad_port(format!("item has a bad \"server_port\" ({text})"))),
         _ => Err(bad_port("item is missing \"server_port\"")),
+    }
+}
+
+/// Ticket 07 (throne-adoption): Xray routing terminals (`freedom` = direct,
+/// `blackhole` = block) carry no proxy endpoint. Batch intake drops them
+/// (neither a row nor a failure — they are infrastructure, not user configs);
+/// single-link intake (`json://`, `throne://add`) rejects loudly instead (a
+/// single link has nowhere to drop silently to — nothing is stored either
+/// way). Matches `type` and `protocol` spellings, case-insensitively.
+fn xray_terminal_kind(value: &serde_json::Value) -> Option<&'static str> {
+    let raw = value
+        .as_object()?
+        .get("type")
+        .or_else(|| value.as_object()?.get("protocol"))?
+        .as_str()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "freedom" => Some("freedom"),
+        "blackhole" => Some("blackhole"),
+        _ => None,
     }
 }
 
@@ -1864,6 +2077,13 @@ fn require_json_credentials(protocol: &str, obj: &Params) -> Result<(), ImportEr
         // credential-less (shadowtls v1 omits the password, socks/http
         // allow anonymous).
         "snell" => present(obj, &["psk"], false),
+        // Ticket 07 (throne-adoption): parse-only credential gates mirroring
+        // the link parsers (never parse-ok/commit-fail on missing secrets).
+        "mieru" => present(obj, &["username", "user"], true) && present(obj, &["password"], false),
+        "juicity" => present(obj, &["uuid", "id"], true) && present(obj, &["password"], false),
+        "trusttunnel" => {
+            present(obj, &["username", "user"], true) && present(obj, &["password"], false)
+        }
         _ => true,
     };
     if !ok {
@@ -1965,6 +2185,11 @@ fn import_json_value(value: &serde_json::Value) -> BatchResult {
                 match servers {
                     serde_json::Value::Array(items) => {
                         for (index, item) in items.iter().enumerate() {
+                            // Ticket 07 (throne-adoption): Xray terminals
+                            // drop here too (never rows, never failures).
+                            if xray_terminal_kind(item).is_some() {
+                                continue;
+                            }
                             let label = item
                                 .get("tag")
                                 .or_else(|| item.get("remark"))
@@ -2025,6 +2250,11 @@ fn import_json_value(value: &serde_json::Value) -> BatchResult {
         }
     };
     for (index, item) in items {
+        // Ticket 07 (throne-adoption): Xray routing terminals drop here
+        // (neither rows nor failures).
+        if xray_terminal_kind(item).is_some() {
+            continue;
+        }
         let label = item
             .get("tag")
             .or_else(|| item.get("remark"))
@@ -2393,7 +2623,9 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
             }
         }
         "ss" | "shadowsocks" => parse_ss_rest(rest),
-        "throne" => parse_throne_rest(rest),
+        // Ticket 07 (throne-adoption): `manyproxy://` mirrors `throne://`
+        // command-for-command (add/addsub/route) for open-with handling.
+        "throne" | "manyproxy" => parse_throne_rest(&scheme, rest),
         "vless" => parse_vless_like("vless", &split_uri(&scheme, rest)?, "uuid"),
         "trojan" => parse_vless_like("trojan", &split_uri(&scheme, rest)?, "password"),
         // Ticket 08: Xray-only VLESS links share the vless userinfo shape;
@@ -2429,12 +2661,21 @@ pub fn parse_link(line: &str) -> Result<ImportedConfig, ImportError> {
         // endpoint, so no authority parsing (a bad port must not fail a
         // row that has no address); the fragment names the row.
         "direct" => parse_direct_link(rest),
+        // Ticket 07 (throne-adoption): parse-only protocols — rows land
+        // disabled with host/port/protocol shown; serving them is a later
+        // ticket (the engine still names the gap at start time).
+        "mieru" => parse_mieru(&split_uri(&scheme, rest)?),
+        "juicity" => parse_juicity(&split_uri(&scheme, rest)?),
+        "trusttunnel" => parse_trusttunnel(&split_uri(&scheme, rest)?),
+        // Ticket 07 (throne-adoption): single JSON-outbound link.
+        "json" => parse_json_link(rest),
         // Ticket 42 (US-24): no upstream 1.14.2 schema (or endpoint-only /
         // 1.15+-only) — loud import reject with per-protocol guidance.
         // Config-completeness T08 (CAP-12): tailscale/openconnect/
         // autoselector join the guidance-only set (never fabricated editors).
-        "mieru" | "juicity" | "openvpn" | "masque" | "trusttunnel" | "tailscale" | "openconnect"
-        | "autoselector" => Err(unsupported_protocol_guidance(&scheme)),
+        "openvpn" | "masque" | "tailscale" | "openconnect" | "autoselector" => {
+            Err(unsupported_protocol_guidance(&scheme))
+        }
         // Ticket 31: a typo scheme names the valid schemes.
         _ => Err(unknown_scheme(format!(
             "unknown scheme '{}' (valid: {})",
@@ -2466,12 +2707,190 @@ pub fn is_library_export(text: &str) -> bool {
     }
 }
 
+/// Ticket 07 (throne-adoption): one piece of a pasted body — either a
+/// brace-balanced `{…}` JSON block (possibly spanning lines) or one link
+/// line. Only a line whose first non-space byte is `{` opens a block; braces
+/// inside JSON strings never count (escape-aware), so remarks carrying
+/// braces cannot fuse two links into one block.
+enum TextChunk {
+    Json(String),
+    Line(String),
+}
+
+/// Ticket 07: brace delta of one line with JSON-string awareness (`\"`
+/// never toggles string state; only unbalanced braces move the depth).
+fn brace_depth_delta(line: &str, in_string: &mut bool, escaped: &mut bool) -> i32 {
+    let mut delta = 0i32;
+    for c in line.chars() {
+        if *escaped {
+            *escaped = false;
+            continue;
+        }
+        if *in_string {
+            match c {
+                '\\' => *escaped = true,
+                '"' => *in_string = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '"' => *in_string = true,
+                '{' => delta += 1,
+                '}' => delta -= 1,
+                _ => {}
+            }
+        }
+    }
+    delta
+}
+
+/// Ticket 07: split a body into JSON blocks + link lines. An unbalanced tail
+/// falls back to plain lines (honest per-line errors downstream) — nothing
+/// is ever swallowed by a block that never closes.
+fn split_brace_aware(body: &str) -> Vec<TextChunk> {
+    let mut chunks = Vec::new();
+    let mut block = String::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for raw_line in body.lines() {
+        if depth == 0 {
+            if raw_line.trim_start().starts_with('{') {
+                block.clear();
+                block.push_str(raw_line);
+                depth = brace_depth_delta(raw_line, &mut in_string, &mut escaped).max(0);
+                if depth == 0 {
+                    chunks.push(TextChunk::Json(std::mem::take(&mut block)));
+                    in_string = false;
+                    escaped = false;
+                }
+            } else {
+                chunks.push(TextChunk::Line(raw_line.to_string()));
+            }
+        } else {
+            block.push('\n');
+            block.push_str(raw_line);
+            depth = (depth + brace_depth_delta(raw_line, &mut in_string, &mut escaped)).max(0);
+            if depth == 0 {
+                chunks.push(TextChunk::Json(std::mem::take(&mut block)));
+                in_string = false;
+                escaped = false;
+            }
+        }
+    }
+    if depth != 0 {
+        // Unbalanced tail: re-emit the buffered lines as plain link lines.
+        for line in block.lines() {
+            chunks.push(TextChunk::Line(line.to_string()));
+        }
+    }
+    chunks
+}
+
+/// Ticket 07: deepest useful form of a schemeless line after following
+/// base64 layers (cap 4 — double-encoded subscriptions circulate in the
+/// wild; the cap bounds pathological ping-pong pairs).
+enum Recursed {
+    /// Decoded to link text (possibly several lines).
+    Links(String),
+    /// Decoded to schemeless vmess JSON — `blob` is the layer that decoded
+    /// to it (re-enters as a legacy `vmess://` blob, like single-level).
+    VmessBlob(String),
+    /// Decoded to JSON text (object or array).
+    JsonText(String),
+    /// Not a decodable blob (or nothing useful inside) — the caller reports
+    /// the original line honestly.
+    Opaque,
+}
+
+fn recurse_b64(line: &str) -> Recursed {
+    let mut current = line.trim().to_string();
+    for _ in 0..4 {
+        let next = match decode_b64_utf8(&current) {
+            Ok(text) => text,
+            Err(_) => return Recursed::Opaque,
+        };
+        let trimmed = next.trim().to_string();
+        if trimmed.contains("://") {
+            return Recursed::Links(trimmed);
+        }
+        if looks_like_vmess_json(&trimmed) {
+            return Recursed::VmessBlob(current);
+        }
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            return Recursed::JsonText(trimmed);
+        }
+        if trimmed == current {
+            return Recursed::Opaque;
+        }
+        current = trimmed;
+    }
+    Recursed::Opaque
+}
+
+/// Ticket 07: parse one brace-balanced chunk as a single JSON value (full
+/// configs with `outbounds` work — the block is the whole pretty-printed
+/// object). Xray terminals drop; anything else is one per-item result.
+fn import_json_chunk(chunk: &str, index: usize, out: &mut BatchResult) {
+    match serde_json::from_str::<serde_json::Value>(chunk.trim()) {
+        Ok(value) => {
+            if value.is_object() && xray_terminal_kind(&value).is_some() {
+                return;
+            }
+            if value.is_object() {
+                let label = value
+                    .get("tag")
+                    .or_else(|| value.get("remark"))
+                    .or_else(|| value.get("remarks"))
+                    .or_else(|| value.get("ps"))
+                    .or_else(|| value.get("name"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("json");
+                match json_outbound(index, &value) {
+                    Ok(config) => out.configs.push(config),
+                    Err(error) => {
+                        // A full-config object (`{"outbounds": [...]}`) parses
+                        // as its member list instead of failing the chunk.
+                        if value
+                            .as_object()
+                            .is_some_and(|obj| obj.contains_key("outbounds"))
+                        {
+                            let sub = import_json_value(&value);
+                            out.configs.extend(sub.configs);
+                            for mut failure in sub.failures {
+                                failure.index = index;
+                                out.failures.push(failure);
+                            }
+                        } else {
+                            out.failures.push(ImportFailure::new(index, label, error));
+                        }
+                    }
+                }
+            } else {
+                let sub = import_json_value(&value);
+                out.configs.extend(sub.configs);
+                for mut failure in sub.failures {
+                    failure.index = index;
+                    out.failures.push(failure);
+                }
+            }
+        }
+        Err(_) => out.failures.push(ImportFailure::new(
+            index,
+            "json",
+            invalid_json("invalid JSON"),
+        )),
+    }
+}
+
 /// Parse pasted/clipboard text: JSON (outbounds array or full config,
 /// BOM-prefixed or not), a WireGuard conf (any marker case), limited Clash
-/// YAML (`proxies:` — same support as subscription bodies), or one share
-/// link per line. Ticket 24 (M18): the sniff order matches
-/// [`import_subscription_body`] (JSON → conf → Clash). Blank lines are
-/// skipped silently; every other failure is reported with its item index.
+/// YAML (`proxies:` — same support as subscription bodies), brace-balanced
+/// JSON blocks across lines, base64 blobs (recursive — double-encoded bodies
+/// decode all the way down), or one share link per line. Ticket 24 (M18):
+/// the sniff order matches [`import_subscription_body`] (JSON → conf →
+/// Clash). Blank lines are skipped silently; every other failure is reported
+/// with its item index.
 pub fn import_text(body: &str) -> BatchResult {
     let trimmed = strip_bom(body.trim()).trim();
     if trimmed.is_empty() {
@@ -2490,6 +2909,44 @@ pub fn import_text(body: &str) -> BatchResult {
                 if has_clash_proxies(trimmed) {
                     return import_clash_proxies(trimmed);
                 }
+                // Ticket 07 (throne-adoption): brace-aware recovery — pasted
+                // JSON blocks that only fail as a whole (several objects, a
+                // trailing comma, pretty-printed concatenation) still import
+                // per block; with no balanced block this stays the single
+                // invalid-JSON failure it always was.
+                let chunks = split_brace_aware(trimmed);
+                if chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, TextChunk::Json(_)))
+                {
+                    let mut out = BatchResult::default();
+                    let mut index = 0;
+                    for chunk in &chunks {
+                        match chunk {
+                            TextChunk::Json(text) => {
+                                import_json_chunk(text, index, &mut out);
+                                index += 1;
+                            }
+                            TextChunk::Line(line) => {
+                                let line = strip_bom(line.trim());
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                match parse_link(line) {
+                                    Ok(config) => out.configs.push(config),
+                                    Err(error) => out.failures.push(ImportFailure::new(
+                                        index,
+                                        redact_link(line),
+                                        error,
+                                    )),
+                                }
+                                index += 1;
+                            }
+                        }
+                    }
+                    dedupe_names(&mut out.configs);
+                    return out;
+                }
                 return BatchResult::fail(0, ImportErrorKind::InvalidJson, "invalid JSON");
             }
         }
@@ -2502,32 +2959,87 @@ pub fn import_text(body: &str) -> BatchResult {
     }
     let mut out = BatchResult::default();
     let mut index = 0;
-    for raw_line in body.lines() {
-        let line = strip_bom(raw_line.trim());
-        if line.is_empty() {
-            continue;
-        }
-        // Ticket 42 (US-27): a pasted bare v2rayn line (base64 of vmess
-        // JSON, no scheme) parses as a legacy vmess blob.
-        let owned;
-        let effective = if !line.contains("://") {
-            match decode_b64_utf8(line) {
-                Ok(text) if looks_like_vmess_json(&text) => {
-                    owned = format!("vmess://{line}");
-                    owned.as_str()
-                }
-                _ => line,
+    for chunk in split_brace_aware(body) {
+        match chunk {
+            TextChunk::Json(text) => {
+                import_json_chunk(&text, index, &mut out);
+                index += 1;
             }
-        } else {
-            line
-        };
-        match parse_link(effective) {
-            Ok(config) => out.configs.push(config),
-            Err(error) => out
-                .failures
-                .push(ImportFailure::new(index, redact_link(line), error)),
+            TextChunk::Line(raw_line) => {
+                let line = strip_bom(raw_line.trim());
+                if line.is_empty() {
+                    continue;
+                }
+                // Ticket 42 (US-27): a pasted bare v2rayn line (base64 of vmess
+                // JSON, no scheme) parses as a legacy vmess blob.
+                // Ticket 07 (throne-adoption): base64-recurse — the line may
+                // carry several encoding layers (double-encoded subscriptions
+                // circulate); every layer is followed (cap 4) before the
+                // honest per-line verdict.
+                if !line.contains("://") {
+                    match recurse_b64(line) {
+                        Recursed::Links(text) => {
+                            for sub in text.lines() {
+                                let sub = strip_bom(sub.trim());
+                                if sub.is_empty() {
+                                    continue;
+                                }
+                                match parse_link(sub) {
+                                    Ok(config) => out.configs.push(config),
+                                    Err(error) => out.failures.push(ImportFailure::new(
+                                        index,
+                                        redact_link(sub),
+                                        error,
+                                    )),
+                                }
+                                index += 1;
+                            }
+                            continue;
+                        }
+                        Recursed::VmessBlob(blob) => {
+                            match parse_link(&format!("vmess://{blob}")) {
+                                Ok(config) => out.configs.push(config),
+                                Err(error) => out.failures.push(ImportFailure::new(
+                                    index,
+                                    redact_link(line),
+                                    error,
+                                )),
+                            }
+                            index += 1;
+                            continue;
+                        }
+                        Recursed::JsonText(json) => {
+                            match serde_json::from_str::<serde_json::Value>(&json) {
+                                Ok(value) => {
+                                    let sub = import_json_value(&value);
+                                    out.configs.extend(sub.configs);
+                                    for mut failure in sub.failures {
+                                        failure.index = index;
+                                        out.failures.push(failure);
+                                    }
+                                }
+                                Err(_) => out.failures.push(ImportFailure::new(
+                                    index,
+                                    "json",
+                                    invalid_json("invalid JSON"),
+                                )),
+                            }
+                            index += 1;
+                            continue;
+                        }
+                        Recursed::Opaque => {}
+                    }
+                }
+                match parse_link(line) {
+                    Ok(config) => out.configs.push(config),
+                    Err(error) => {
+                        out.failures
+                            .push(ImportFailure::new(index, redact_link(line), error))
+                    }
+                }
+                index += 1;
+            }
         }
-        index += 1;
     }
     // Ticket 24 (M9): link batches dedupe exactly like JSON/Clash batches.
     dedupe_names(&mut out.configs);
@@ -2748,17 +3260,30 @@ pub struct AddSubRequest {
     pub group: String,
 }
 
+/// Ticket 07 (throne-adoption): `manyproxy://` mirrors `throne://` for
+/// open-with handling — both schemes route the same commands.
+fn intake_scheme(text: &str) -> Option<&str> {
+    let sep = text.find("://")?;
+    let scheme = &text[..sep];
+    if scheme.eq_ignore_ascii_case("throne") || scheme.eq_ignore_ascii_case("manyproxy") {
+        Some(scheme)
+    } else {
+        None
+    }
+}
+
 /// Ticket 14: single-line `throne://addsub/...` routing check (scheme and
 /// command both case-insensitive). Only these lines divert to the
 /// subscription intake; a malformed one reports its own
 /// [`parse_addsub_link`] reason instead of falling through to the generic
 /// unknown-command failure.
+/// Ticket 07 (throne-adoption): `manyproxy://addsub/...` routes identically.
 pub fn is_addsub_attempt(line: &str) -> bool {
     let trimmed = strip_bom(line.trim()).trim();
     let Some(sep) = trimmed.find("://") else {
         return false;
     };
-    if !trimmed[..sep].eq_ignore_ascii_case("throne") {
+    if intake_scheme(trimmed).is_none() {
         return false;
     }
     trimmed[sep + 3..]
@@ -2768,17 +3293,139 @@ pub fn is_addsub_attempt(line: &str) -> bool {
         .eq_ignore_ascii_case("addsub")
 }
 
+/// Ticket 07 (throne-adoption): single-line `throne://add/...` or
+/// `manyproxy://add/...` (case-insensitive both halves). Unlike addsub these
+/// need no divert — the normal batch path parses them — but open-with and
+/// diagnostics use this to name the shape.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_add_attempt(line: &str) -> bool {
+    let trimmed = strip_bom(line.trim()).trim();
+    let Some(sep) = trimmed.find("://") else {
+        return false;
+    };
+    if intake_scheme(trimmed).is_none() {
+        return false;
+    }
+    trimmed[sep + 3..]
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("add")
+}
+
+/// Ticket 07 (throne-adoption): true for one bare `http(s)://` line with a
+/// host (no whitespace/control bytes). A bare URL is ambiguous — subscription
+/// feed vs HTTP proxy — so open-with routes it to the chooser instead of the
+/// batch path (which would read it as a proxy row).
+pub fn is_bare_http_url(text: &str) -> bool {
+    let trimmed = strip_bom(text.trim()).trim();
+    if trimmed.is_empty() || trimmed.contains(['\n', '\r']) {
+        return false;
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let after_scheme = if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        &trimmed[7..]
+    } else if trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        &trimmed[8..]
+    } else {
+        return false;
+    };
+    let host = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    !host.trim().is_empty()
+}
+
+/// Ticket 07 (throne-adoption): how an OS open-with argument enters the app.
+/// `BareHttp` is ambiguous (feed vs proxy) and gets the chooser; `Batch`
+/// is already disambiguated (a deeplink command or a share link) and becomes
+/// one batch result through the normal commit path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenWithKind {
+    BareHttp(String),
+    Batch(String),
+}
+
+/// Ticket 07 (throne-adoption): classify one launch argument. `None` means
+/// "not an intake payload" (flags like `--tray`, file paths, junk) — the
+/// caller ignores it. Never panics, never touches the store.
+pub fn classify_open_with(arg: &str) -> Option<OpenWithKind> {
+    let trimmed = strip_bom(arg.trim()).trim();
+    if trimmed.is_empty() || trimmed.contains(['\n', '\r']) {
+        return None;
+    }
+    if is_bare_http_url(trimmed) {
+        return Some(OpenWithKind::BareHttp(trimmed.to_string()));
+    }
+    let sep = trimmed.find("://")?;
+    if !valid_scheme_chars(&trimmed[..sep]) {
+        return None;
+    }
+    if intake_scheme(trimmed).is_some() {
+        return Some(OpenWithKind::Batch(trimmed.to_string()));
+    }
+    // A bare share link handed by the OS (extension-associated text files
+    // stay on the file path — only link-shaped args route here).
+    Some(OpenWithKind::Batch(trimmed.to_string()))
+}
+
+/// Ticket 07 (throne-adoption): per-file intake cap (50MB). Files over the
+/// cap are rejected before reading (never loaded into the dialog).
+pub const MAX_IMPORT_FILE_BYTES: u64 = 50_000_000;
+
+/// Ticket 07 (throne-adoption): true when `len` bytes may enter the intake.
+pub fn import_file_size_ok(len: u64) -> bool {
+    len <= MAX_IMPORT_FILE_BYTES
+}
+
+/// Ticket 07 (throne-adoption): reject non-config file bytes before they
+/// reach the parsers. Returns a static reason (safe for toasts — never
+/// echoes content): image files (QR/photo scan needs link text — there is no
+/// image decoder in this build), NUL-carrying binaries, or non-UTF8 bytes.
+/// `None` means "text, parse it".
+pub fn reject_file_bytes(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G'];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
+    const GIF87: &[u8] = b"GIF87a";
+    const GIF89: &[u8] = b"GIF89a";
+    const BMP: &[u8] = b"BM";
+    let is_webp = bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP";
+    if bytes.starts_with(PNG)
+        || bytes.starts_with(JPEG)
+        || bytes.starts_with(GIF87)
+        || bytes.starts_with(GIF89)
+        || bytes.starts_with(BMP)
+        || is_webp
+    {
+        return Some("image file (paste the link text instead — this build has no image/QR scan)");
+    }
+    if bytes.contains(&0) {
+        return Some("binary file (NUL byte — not config text)");
+    }
+    if std::str::from_utf8(bytes).is_err() {
+        return Some("file is not UTF-8 text");
+    }
+    None
+}
+
 /// Parse `throne://addsub/<standard-base64 of "<url>[#group]">`
 /// (case-insensitive command). Unlike `throne://add`, the payload alphabet is
 /// standard base64 ONLY: urlsafe bytes (`-`, `_`) are rejected as bad base64.
 /// The URL must be `http(s)`; a missing group falls back to the default.
+/// Ticket 07 (throne-adoption): `manyproxy://addsub/...` parses identically.
 pub fn parse_addsub_link(line: &str) -> Result<AddSubRequest, ImportError> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
     let text = strip_bom(line.trim()).trim();
     let sep = text
         .find("://")
         .ok_or_else(|| unknown_scheme("not a share link (missing '://')"))?;
-    if !text[..sep].eq_ignore_ascii_case("throne") {
+    if intake_scheme(text).is_none() {
         return Err(unknown_scheme(format!("unknown scheme '{}'", &text[..sep])));
     }
     let rest = &text[sep + 3..];
@@ -3040,6 +3687,14 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             "shadow-tls" | "shadow_tls" => Ok("shadowtls".to_string()),
             // Ticket 08: same kind-preserving fold as the JSON path.
             "xray" | "xray-vless" | "xray_vless" | "vless-xray" => Ok("xray".to_string()),
+            // Ticket 07 (throne-adoption): an `xhttp` Clash entry is an
+            // Xray-only transport — it folds to the `xray` kind so the Xray
+            // sidecar serves it instead of dying in stock `check`.
+            // Parse-only protocols land as disabled rows (see the JSON path).
+            "xhttp" => Ok("xray".to_string()),
+            "mieru" => Ok("mieru".to_string()),
+            "juicity" => Ok("juicity".to_string()),
+            "trusttunnel" => Ok("trusttunnel".to_string()),
             "custom"
             | "custom-out"
             | "custom-outbound"
@@ -3053,11 +3708,14 @@ fn import_clash_proxies(content: &str) -> BatchResult {
             "direct" => Ok("direct".to_string()),
             // Config-completeness T08 (CAP-12): exotic Clash types reject
             // with the same guidance as links (never fabricated editors).
-            "mieru" | "juicity" | "openvpn" | "masque" | "trusttunnel" | "tailscale"
-            | "openconnect" | "autoselector" => Err(unknown_scheme(format!(
-                "unsupported clash type '{lower}' ({})",
-                unsupported_protocol_guidance(&lower).message,
-            ))),
+            // Ticket 07 (throne-adoption): mieru/juicity/trusttunnel left
+            // this set — they parse (disabled rows) now.
+            "openvpn" | "masque" | "tailscale" | "openconnect" | "autoselector" => {
+                Err(unknown_scheme(format!(
+                    "unsupported clash type '{lower}' ({})",
+                    unsupported_protocol_guidance(&lower).message,
+                )))
+            }
             "" => Err(invalid_json("clash entry is missing \"type\"")),
             // Ticket 24 (LOW scheme casing): echo the input's case, capped.
             _ => Err(unknown_scheme(format!(
@@ -3343,6 +4001,45 @@ fn import_clash_proxies(content: &str) -> BatchResult {
     out
 }
 
+/// Ticket 10 (throne-adoption US-28): native share-link form for one
+/// stored row (`ExportToLink`). The original share text is not retained
+/// at intake (only parsed params store), and rebuilding per-protocol
+/// native links from params is phase-2 work — so this is `None` today.
+/// `None` is the honest signal the [`share_link_for_config`] fallback
+/// keys on (never an empty string, never a guessed link).
+pub fn export_config_link(_protocol: &str, _name: &str, _params_json: &str) -> Option<String> {
+    None
+}
+
+/// Ticket 10 (US-28): deep-link form for one stored row (`ExportJsonLink`
+/// fallback). Encodes the stored params object (which already carries
+/// `type`/`server`/`server_port`, the shape [`parse_link`] reads back
+/// through the `manyproxy://add/...` batch path) as standard base64.
+/// Always non-empty for any input — even unparseable params encode (the
+/// re-import then fails loudly with its own reason, never silently).
+pub fn export_config_json_link(protocol: &str, name: &str, params_json: &str) -> String {
+    use base64::Engine as _;
+    let mut body = serde_json::from_str::<serde_json::Value>(params_json)
+        .unwrap_or_else(|_| serde_json::json!({"type": protocol, "name": name, "unparsed": true}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.entry("type".to_string())
+            .or_insert_with(|| serde_json::Value::String(protocol.to_string()));
+        obj.entry("name".to_string())
+            .or_insert_with(|| serde_json::Value::String(name.to_string()));
+    }
+    let payload = base64::engine::general_purpose::STANDARD.encode(body.to_string().as_bytes());
+    format!("manyproxy://add/{payload}")
+}
+
+/// Ticket 10 (US-28): the share-out copy for one stored row —
+/// `ExportToLink || ExportJsonLink`. Never empty by construction (the
+/// fallback always encodes); protocols without a native link form fall
+/// back to the deep-link form.
+pub fn share_link_for_config(protocol: &str, name: &str, params_json: &str) -> String {
+    export_config_link(protocol, name, params_json)
+        .unwrap_or_else(|| export_config_json_link(protocol, name, params_json))
+}
+
 /// Redact credentials and query values, then truncate, for notifications and
 /// logs (boundary: secrets never reach logs/clipboard). Query keys stay
 /// (they diagnose failures); values go (some schemes carry key material like
@@ -3371,7 +4068,9 @@ pub fn redact_link(line: &str) -> String {
             // host for diagnostics.
             None => {
                 let scheme = text[..scheme_end].to_ascii_lowercase();
-                if ["vmess", "v2rayn", "ss", "shadowsocks", "throne"].contains(&scheme.as_str()) {
+                if ["vmess", "v2rayn", "ss", "shadowsocks", "throne", "json"]
+                    .contains(&scheme.as_str())
+                {
                     text.replace_range(after..auth_end, "…");
                 }
             }
@@ -3909,6 +4608,34 @@ mod tests {
     fn failure_throne_missing_payload() {
         let error = parse_link("throne://add/").expect_err("missing payload fails");
         assert_eq!(error.kind, ImportErrorKind::Empty);
+    }
+
+    /// Ticket 10 (US-28): share-out never encodes an empty string — every
+    /// protocol falls back to the deep-link form, and the fallback
+    /// re-imports through the batch path with protocol/host/port intact.
+    #[test]
+    fn t10_share_link_fallback_never_empty_and_round_trips() {
+        let params = serde_json::json!({
+            "type": "vless", "server": "example.com", "server_port": 443,
+            "uuid": "11111111-1111-1111-1111-111111111111",
+        })
+        .to_string();
+        let link = share_link_for_config("vless", "row", &params);
+        assert!(!link.is_empty(), "fallback never empty");
+        assert!(link.starts_with("manyproxy://add/"), "{link}");
+        let back = parse_link(&link).expect("share link re-imports");
+        assert_eq!(back.protocol, "vless");
+        assert_eq!(back.host, "example.com");
+        assert_eq!(back.port, 443);
+        // Protocols without a native link form still share non-empty.
+        for protocol in ["mieru", "juicity", "direct", "chain"] {
+            let link = share_link_for_config(protocol, "row", &params);
+            assert!(!link.is_empty(), "{protocol} shares non-empty");
+        }
+        // Corrupt stored params still encode (re-import fails loudly, never
+        // an empty copy).
+        let link = share_link_for_config("vless", "row", "{not json");
+        assert!(!link.is_empty(), "corrupt params still share");
     }
 
     #[test]
@@ -5256,32 +5983,410 @@ mod tests {
         assert_eq!(error.kind, ImportErrorKind::InvalidJson);
     }
 
-    /// Ticket 42 (US-24): mieru/juicity have no upstream sing-box schema —
-    /// import fails loudly naming the gap, never at start.
+    /// Ticket 07 (throne-adoption): mieru/juicity parse (disabled rows) —
+    /// the serving gap stays an engine concern, never an import reject.
+    /// (Replaces the ticket-42 reject expectation: parse-only intake now.)
     #[test]
-    fn t42_mieru_juicity_reject_with_guidance() {
+    fn t07_mieru_juicity_parse_to_disabled_rows() {
         for link in [
             "mieru://user:pass@example.com:1080#m",
             "juicity://uuid:pass@example.com:23142#j",
             "MIERU://user:pass@example.com:1080#m",
         ] {
-            let error = parse_link(link).expect_err(&format!("{link} rejects"));
-            assert_eq!(error.kind, ImportErrorKind::UnknownScheme, "link {link}");
+            let config = parse_link(link).unwrap_or_else(|_| panic!("{link} parses"));
             assert!(
-                error.message.contains("no sing-box"),
-                "names the schema gap: {error}"
+                ["mieru", "juicity"].contains(&config.protocol.as_str()),
+                "kind kept: {link}"
+            );
+            assert_eq!(config.host, "example.com");
+        }
+    }
+
+    /// Ticket 07 (throne-adoption): trusttunnel links + the community mieru
+    /// query form parse with credentials and extras preserved verbatim.
+    #[test]
+    fn t07_trusttunnel_and_mieru_query_forms() {
+        let trust =
+            parse_link("trusttunnel://alice:wonderland@example.com:443?sni=example.com#t-one")
+                .expect("trusttunnel parses");
+        assert_eq!(trust.protocol, "trusttunnel");
+        assert_eq!(trust.host, "example.com");
+        assert_eq!(trust.port, 443);
+        assert_eq!(trust.name, "t-one");
+        let params = params_of(&trust);
+        assert_eq!(params["username"], "alice");
+        assert_eq!(params["password"], "wonderland");
+        assert_eq!(params["sni"], "example.com");
+
+        let community = parse_link(
+            "mieru://example.com:1080?username=john&password=secret&transport=tcp#m-comm",
+        )
+        .expect("community mieru parses");
+        assert_eq!(community.protocol, "mieru");
+        assert_eq!(community.host, "example.com");
+        assert_eq!(community.port, 1080);
+        let params = params_of(&community);
+        assert_eq!(params["username"], "john");
+        assert_eq!(params["password"], "secret");
+        assert_eq!(params["transport"], "tcp");
+    }
+
+    /// Ticket 07 (throne-adoption): new-scheme credential gates fail without
+    /// echoing secrets (mirrors the tuic-style gates).
+    #[test]
+    fn t07_new_scheme_credential_gates() {
+        for (link, wants) in [
+            ("mieru://:pass@example.com:1080#m", "username"),
+            ("mieru://user:@example.com:1080#m", "password"),
+            ("mieru://example.com:1080#m", "username"),
+            ("juicity://:pass@example.com:23142#j", "uuid"),
+            ("juicity://uuid@example.com:23142#j", "password"),
+            ("trusttunnel://:pw@example.com:443#t", "username"),
+            ("trusttunnel://user@example.com:443#t", "password"),
+        ] {
+            let error = parse_link(link).expect_err(&format!("{link} fails"));
+            assert_eq!(
+                error.kind,
+                ImportErrorKind::MissingCredential,
+                "link {link}"
+            );
+            assert!(error.message.contains(wants), "names {wants}: {error}");
+        }
+        // No secret echoes anywhere in the messages above.
+        let error = parse_link("trusttunnel://alice:wonderland@example.com:99999#t")
+            .expect_err("bad port fails");
+        assert_eq!(error.kind, ImportErrorKind::BadPort);
+        assert!(
+            !error.message.contains("wonderland"),
+            "no secret echo: {error}"
+        );
+    }
+
+    /// Ticket 07 (throne-adoption): `json://` links ride the standard
+    /// outbound path (credential gates included); the fragment overrides the
+    /// embedded tag; terminals reject loudly with nothing stored.
+    #[test]
+    fn t07_json_link_parses_and_names() {
+        let body = serde_json::json!({
+            "type": "vless", "tag": "j-tag",
+            "server": "a.example.com", "server_port": 443, "uuid": UUID,
+        });
+        let link = format!("json://{}#frag", b64(&body.to_string()));
+        let config = parse_link(&link).expect("json link parses");
+        assert_eq!(config.protocol, "vless");
+        assert_eq!(config.host, "a.example.com");
+        assert_eq!(config.name, "frag", "fragment wins over the tag");
+
+        let bare = format!("json://{}", b64(&body.to_string()));
+        let config = parse_link(&bare).expect("tag survives without fragment");
+        assert_eq!(config.name, "j-tag");
+
+        let error = parse_link("json://!!!").expect_err("bad base64 fails");
+        assert_eq!(error.kind, ImportErrorKind::BadBase64);
+        let error = parse_link(&format!("json://{}", b64("[1,2]"))).expect_err("non-object fails");
+        assert_eq!(error.kind, ImportErrorKind::InvalidJson);
+        // Missing credentials fail through the same gate as JSON batches.
+        let thin =
+            serde_json::json!({"type": "vless", "server": "a.example.com", "server_port": 443});
+        let error = parse_link(&format!("json://{}", b64(&thin.to_string())))
+            .expect_err("missing uuid fails");
+        assert_eq!(error.kind, ImportErrorKind::MissingCredential);
+        // Xray terminal via json:// rejects loudly (single links drop loud).
+        let freedom = serde_json::json!({"protocol": "freedom", "tag": "direct"});
+        let error = parse_link(&format!("json://{}", b64(&freedom.to_string())))
+            .expect_err("freedom json link drops");
+        assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+        assert!(error.message.contains("freedom"), "names it: {error}");
+    }
+
+    /// Ticket 07 (throne-adoption): `{"type":"shadowtls"}` JSON rows parse
+    /// now (the link/Clash/store paths already accepted shadowtls — only the
+    /// JSON normalizer missed the bare spelling).
+    #[test]
+    fn t07_shadowtls_json_type_parses() {
+        let body = serde_json::json!([{
+            "type": "shadowtls", "tag": "st",
+            "server": "a.example.com", "server_port": 443,
+            "password": "pw", "version": "3", "sni": "a.example.com",
+        }]);
+        let out = import_text(&body.to_string());
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].protocol, "shadowtls");
+    }
+
+    /// Ticket 07 (throne-adoption): mieru/juicity/trusttunnel ride JSON
+    /// batches and Clash `proxies:` (credential gates included); Clash
+    /// `xhttp` folds to the `xray` kind.
+    #[test]
+    fn t07_new_types_json_and_clash() {
+        let body = serde_json::json!([
+            {"type": "mieru", "tag": "m", "server": "a.example.com",
+             "server_port": 1080, "username": "u", "password": "p"},
+            {"type": "juicity", "tag": "j", "server": "b.example.com",
+             "server_port": 23142, "uuid": UUID, "password": "q"},
+            {"type": "trusttunnel", "tag": "t", "server": "c.example.com",
+             "server_port": 443, "username": "u", "password": "q"},
+            {"type": "mieru", "tag": "thin", "server": "d.example.com",
+             "server_port": 1080, "username": "u"},
+        ]);
+        let out = import_text(&body.to_string());
+        assert_eq!(out.configs.len(), 3, "three rows land: {out:?}");
+        assert_eq!(out.failures.len(), 1, "thin mieru fails: {out:?}");
+        assert_eq!(out.failures[0].code, ImportErrorKind::MissingCredential);
+        assert_eq!(out.configs[0].protocol, "mieru");
+        assert_eq!(out.configs[1].protocol, "juicity");
+        assert_eq!(out.configs[2].protocol, "trusttunnel");
+
+        let clash = "proxies:\n\
+             \x20 - name: m1\n    type: mieru\n    server: a.example.com\n    port: 1080\n    username: u\n    password: p\n\
+             \x20 - name: j1\n    type: juicity\n    server: b.example.com\n    port: 23142\n    uuid: 11111111-2222-4333-8444-555555555555\n    password: q\n\
+             \x20 - name: x1\n    type: xhttp\n    server: c.example.com\n    port: 443\n    uuid: 11111111-2222-4333-8444-555555555555\n";
+        let out = import_text(clash);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 3);
+        assert_eq!(out.configs[0].protocol, "mieru");
+        assert_eq!(out.configs[1].protocol, "juicity");
+        assert_eq!(out.configs[2].protocol, "xray", "xhttp folds to xray");
+    }
+
+    /// Ticket 07 (throne-adoption): Xray `freedom`/`blackhole` terminals drop
+    /// from batches (neither rows nor failures); `throne://add` of one
+    /// rejects loudly with nothing stored.
+    #[test]
+    fn t07_xray_terminals_drop_from_batches() {
+        let body = serde_json::json!({"outbounds": [
+            {"type": "vless", "tag": "keep", "server": "a.example.com",
+             "server_port": 443, "uuid": UUID},
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "block"},
+        ]});
+        let out = import_text(&body.to_string());
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "keep");
+
+        let freedom = serde_json::json!({"protocol": "freedom", "tag": "direct"});
+        let link = format!("throne://add/{}", b64(&freedom.to_string()));
+        let error = parse_link(&link).expect_err("freedom add drops loud");
+        assert_eq!(error.kind, ImportErrorKind::UnknownScheme);
+        assert!(error.message.contains("freedom"), "names it: {error}");
+    }
+
+    /// Ticket 07 (throne-adoption): brace-aware multiline split — several
+    /// JSON objects on their own lines import per block; one pretty-printed
+    /// object spanning lines imports as one row; an unbalanced tail stores
+    /// nothing and counts its failure.
+    #[test]
+    fn t07_brace_aware_multiline_split() {
+        let two = "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\"password\":\"p\",\"tag\":\"one\"}\n\
+                   {\"type\":\"trojan\",\"server\":\"b.example.com\",\"server_port\":443,\"password\":\"p\",\"tag\":\"two\"}";
+        let out = import_text(two);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+        assert_eq!(out.configs[0].name, "one");
+        assert_eq!(out.configs[1].name, "two");
+
+        let pretty = "{\n  \"type\": \"trojan\",\n  \"server\": \"c.example.com\",\n  \"server_port\": 443,\n  \"password\": \"p\",\n  \"tag\": \"pretty\"\n}";
+        let out = import_text(pretty);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "pretty");
+
+        // Links around a JSON block stay links.
+        let mixed = "trojan://p@d.example.com:443#d\n\
+                     {\"type\":\"trojan\",\"server\":\"e.example.com\",\"server_port\":443,\"password\":\"p\",\"tag\":\"mid\"}\n\
+                     trojan://p@f.example.com:443#f";
+        let out = import_text(mixed);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 3);
+
+        // Unbalanced: nothing stored, one counted failure.
+        let broken = "{\"type\": \"trojan\",\n\"server\": \"g.example.com\"";
+        let out = import_text(broken);
+        assert!(out.configs.is_empty(), "nothing stored: {out:?}");
+        assert_eq!(out.failures.len(), 1);
+    }
+
+    /// Ticket 07 (throne-adoption): base64-recurse — multi-layer blobs
+    /// decode all the way down (cap 4); unsettled bytes keep the honest
+    /// per-line verdict instead of a decode panic.
+    #[test]
+    fn t07_base64_recurse() {
+        let link = format!("vless://{UUID}@a.example.com:443#deep");
+        let double = b64(&b64(&link));
+        let out = import_text(&double);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "deep");
+
+        let triple = b64(&double);
+        let out = import_text(&triple);
+        assert_eq!(out.configs.len(), 1, "three layers decode: {out:?}");
+
+        // A blob of blobs: outer blob holds two link lines.
+        let two_links = concat!(
+            "trojan://p@h.example.com:443#h\n",
+            "ss://YWVzLTEyOC1nY206dGVzdA@192.168.100.1:8888#i"
+        );
+        let nested = b64(&b64(two_links));
+        let out = import_text(&nested);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+
+        // Garbage stays an honest per-line failure, never a panic.
+        let out = import_text("not-a-link-at-all");
+        assert!(out.configs.is_empty());
+        assert_eq!(out.failures.len(), 1);
+    }
+
+    /// Ticket 07 (throne-adoption): open-with classification — bare `http(s)`
+    /// goes to the chooser, deeplinks and share links become one batch, and
+    /// flags/paths/junk are ignored.
+    #[test]
+    fn t07_open_with_classification() {
+        assert_eq!(
+            classify_open_with("https://example.com/sub?token=x"),
+            Some(OpenWithKind::BareHttp(
+                "https://example.com/sub?token=x".to_string()
+            ))
+        );
+        assert_eq!(
+            classify_open_with("manyproxy://add/eA=="),
+            Some(OpenWithKind::Batch("manyproxy://add/eA==".to_string()))
+        );
+        assert_eq!(
+            classify_open_with("manyproxy://addsub/eA=="),
+            Some(OpenWithKind::Batch("manyproxy://addsub/eA==".to_string()))
+        );
+        assert_eq!(
+            classify_open_with("throne://addsub/eA=="),
+            Some(OpenWithKind::Batch("throne://addsub/eA==".to_string()))
+        );
+        assert_eq!(
+            classify_open_with("vless://u@a.example.com:443#x"),
+            Some(OpenWithKind::Batch(
+                "vless://u@a.example.com:443#x".to_string()
+            ))
+        );
+        assert_eq!(classify_open_with("--tray"), None);
+        assert_eq!(classify_open_with(""), None);
+        assert_eq!(classify_open_with("C:\\configs\\nodes.txt"), None);
+        assert!(is_add_attempt("manyproxy://add/eA=="));
+        assert!(is_add_attempt("THRONE://ADD/eA=="));
+        assert!(!is_add_attempt("throne://addsub/eA=="));
+        assert!(!is_add_attempt("vless://u@a.example.com:443#x"));
+        assert!(is_bare_http_url("http://example.com/feed"));
+        assert!(!is_bare_http_url("http://"));
+        assert!(!is_bare_http_url("https://example.com/a b"));
+        assert!(!is_bare_http_url("vless://u@a.example.com:443#x"));
+        assert!(!is_bare_http_url(
+            "https://one.example.com\nhttps://two.example.com"
+        ));
+    }
+
+    /// Ticket 07 (throne-adoption): `manyproxy://addsub` parses exactly like
+    /// `throne://addsub` (same alphabet contract, same http(s) rule).
+    #[test]
+    fn t07_manyproxy_addsub_parses_like_throne() {
+        let payload = b64("https://example.com/feed#mygroup");
+        let request = parse_addsub_link(&format!("manyproxy://addsub/{payload}")).expect("parses");
+        assert_eq!(request.url, "https://example.com/feed");
+        assert_eq!(request.group, "mygroup");
+        assert!(is_addsub_attempt("manyproxy://addsub/eA=="));
+        assert!(is_addsub_attempt("MANYPROXY://ADDSUB/eA=="));
+        let error = parse_addsub_link("manyproxy://addsub/!!!").expect_err("bad b64 fails");
+        assert_eq!(error.kind, ImportErrorKind::BadBase64);
+        // `manyproxy://add` rides the normal batch path (no divert needed).
+        let add = serde_json::json!({
+            "type": "trojan", "tag": "via-manyproxy",
+            "server": "a.example.com", "server_port": 443, "password": "p",
+        });
+        let config = parse_link(&format!("manyproxy://add/{}", b64(&add.to_string())))
+            .expect("manyproxy add parses");
+        assert_eq!(config.protocol, "trojan");
+        assert_eq!(config.name, "via-manyproxy");
+    }
+
+    /// Ticket 07 (throne-adoption): file guards — the 50MB cap, image magic,
+    /// NUL bytes, and non-UTF8 are rejected with static reasons; plain text
+    /// passes.
+    #[test]
+    fn t07_file_guards() {
+        assert!(import_file_size_ok(MAX_IMPORT_FILE_BYTES));
+        assert!(!import_file_size_ok(MAX_IMPORT_FILE_BYTES + 1));
+        assert_eq!(reject_file_bytes(b"vless://u@a.example.com:443#x"), None);
+        assert_eq!(reject_file_bytes(b""), None);
+        for magic in [
+            b"\x89PNG\r\n\x1a\n....".as_slice(),
+            b"\xFF\xD8\xFF\xE0....".as_slice(),
+            b"GIF89a....".as_slice(),
+            b"BM....".as_slice(),
+        ] {
+            assert!(
+                reject_file_bytes(magic).is_some_and(|reason| reason.contains("image")),
+                "image magic rejects: {magic:?}"
             );
         }
+        assert!(
+            reject_file_bytes(b"ab\x00cd").is_some_and(|reason| reason.contains("NUL")),
+            "NUL rejects"
+        );
+        assert!(
+            reject_file_bytes(b"\xFF\xFE\xFD").is_some(),
+            "non-UTF8 rejects"
+        );
+    }
+
+    /// Ticket 07 (throne-adoption): new-scheme rows commit as disabled library
+    /// rows (store seam) — the ticket scenario, end to end through the batch
+    /// path with per-fixture host/port/protocol shown.
+    #[test]
+    fn t07_new_rows_commit_disabled() {
+        let body = format!(
+            "mieru://john:secret@a.example.com:1080#m-one\n\
+             juicity://{UUID}:s3cret@b.example.com:23142#j-one\n\
+             trusttunnel://alice:wonderland@c.example.com:443#t-one"
+        );
+        let batch = import_text(&body);
+        assert!(batch.failures.is_empty(), "failures: {:?}", batch.failures);
+        assert_eq!(batch.configs.len(), 3);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let outcome = commit_batch(&mut store, batch, "").expect("batch commits");
+        assert_eq!(outcome.imported, 3);
+        assert!(outcome.failures.is_empty());
+        let rows = store.list().expect("list works");
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert!(!row.enabled, "import lands disabled: {}", row.name);
+        }
+        let by_name = |name: &str| rows.iter().find(|row| row.name == name).expect(name);
+        let row_params = |name: &str| {
+            let row = by_name(name);
+            serde_json::from_str::<serde_json::Value>(&row.params).expect("row params are JSON")
+        };
+        let mieru = by_name("m-one");
+        assert_eq!(mieru.protocol, "mieru");
+        assert_eq!(row_params("m-one")["server"], "a.example.com");
+        assert_eq!(row_params("m-one")["server_port"], 1080);
+        let juicity = by_name("j-one");
+        assert_eq!(juicity.protocol, "juicity");
+        assert_eq!(row_params("j-one")["server"], "b.example.com");
+        assert_eq!(row_params("j-one")["server_port"], 23142);
+        let trust = by_name("t-one");
+        assert_eq!(trust.protocol, "trusttunnel");
+        assert_eq!(row_params("t-one")["server"], "c.example.com");
+        assert_eq!(row_params("t-one")["server_port"], 443);
     }
 
     /// Ticket 42 (US-24): endpoint-only / 1.15+-only protocols reject at
     /// import with guidance (they are not 1.14.2 outbounds).
+    /// Ticket 07 (throne-adoption): trusttunnel left this set — it parses now.
     #[test]
     fn t42_endpoint_protocols_reject_with_guidance() {
         for link in [
             "openvpn://user:pass@example.com:1194#o",
             "masque://user@example.com:443#m",
-            "trusttunnel://x@example.com:443#t",
         ] {
             let error = parse_link(link).expect_err(&format!("{link} rejects"));
             assert_eq!(error.kind, ImportErrorKind::UnknownScheme, "link {link}");
@@ -5295,12 +6400,11 @@ mod tests {
     /// Config-completeness T08 (CAP-12): every exotic fate rejects with
     /// guidance naming the `custom-config` row (never a fabricated editor),
     /// and trivial `direct` rows land from links, JSON, and Clash alike.
+    /// Ticket 07 (throne-adoption): mieru/juicity/trusttunnel left the
+    /// reject set — they parse (disabled rows) now.
     #[test]
     fn t08_exotic_fates_reject_direct_lands() {
         for link in [
-            "mieru://user:pass@example.com:1080#m",
-            "juicity://uuid:pass@example.com:23142#j",
-            "trusttunnel://x@example.com:443#t",
             "tailscale://x@example.com:443#t",
             "openvpn://user:pass@example.com:1194#o",
             "openconnect://user:pass@example.com:443#o",
