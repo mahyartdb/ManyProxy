@@ -70,15 +70,15 @@ components:
 
 **Creative North Star: "The Signal Box"**
 
-ManyProxy looks like the instrument it is: a railway signal-box panel for a personal proxy pool. Library rows are track circuits — an occupancy lamp, a nameplate, and the row's numbers on a paper-white ground. The toolbar is a lever frame of guarded throws on a single plate. The detail pane is a block shelf of ruled instruments (endpoints, health, usage, history), never stacked toolbars. Dialogs are ruled train orders: guided first, JSON only as Advanced.
+ManyProxy looks like the instrument it is: a railway signal-box panel for a personal proxy pool. Library rows are track circuits — an occupancy lamp, a nameplate, and the row's numbers on a paper-white ground. The toolbar is a menu bar with one labeled master throw (Start-all / Stop-all) at the trailing end. The detail pane is a block shelf of ruled instruments (endpoints, health, usage, history), never stacked toolbars. Dialogs are ruled train orders: guided first, JSON only as Advanced.
 
 Color is signal-only and rides gpui-kit theme tokens everywhere — app code carries zero hardcoded colors. Selection is a wash plus rim on one row only; the checked bulk set is a 2px accent rim plus a numeral count chip. Green means serving, red means dead or destructive, blue means selected-or-checked, black means primary action. Everything else is ink, paper, gray, or hairline.
 
 **Key Characteristics:**
 - Lamp-first rows: every row opens with an occupancy lamp in a fixed leading cell (green serving, red dead-while-serving, dark muted when stopped; flat fill, never glow).
 - One selection grammar: wash marks the selected row and nothing else; checked rows carry rim plus count chip; the bulk bar always reads `N checked (of M visible)`; the detail header echoes `Acting on: <name>`.
-- Lever-frame toolbar: five persistent throws (Add, Start, Stop, Test, Import) on one plate; everything else lives in named Library / Manage / Engine / Help menus.
-- Block-shelf detail: endpoints on every pane, one operate row (Enabled switch + six inline ops + Row menu), manage actions behind the menu.
+- Menu-bar toolbar: five menus (Program, Settings, Groups, Routing, Tools) plus a labeled master throw (Start-all / Stop-all) at the trailing end; selection ops keep their key bindings and palette twins.
+- Block-shelf detail: endpoints on every pane, one operate row (Auto-start switch + six inline ops + Row menu), manage actions behind the menu.
 - Guided-first dialogs: Add opens on a Server / Server-port / Identity mini-form; JSON is an Advanced disclosure; validation keeps the dialog open with inline errors.
 - Honest states: every action stays enabled with an honest toast (no disabled controls); loading shows label plus spinner; empty states teach the next step.
 
@@ -138,7 +138,7 @@ Signal meanings are identical in both palettes: the wash and rim stay blue, serv
 
 A fixed top band (title bar, lever-frame toolbar), a vertical split with the card list on top (`flex_1`) and the inspector below (filling its resizable panel: 240px start, 240–480px range, internal scroll only past the panel height), and a fixed status strip with three regions — counts left (`status-left`), engine + health center (`status-center`), usage totals right (`status-right`) — split by separators. Filters stack as thin bands above the list: search-with-count plus a visible search-focus button, facet pickers, then the bulk bar only while rows are checked. Spacing runs on two steps throughout: tight 4px groups ({spacing.sm}: card text padding, header gaps, dialog field stacks) separated by generous 8px rhythms ({spacing.md}: toolbar padding, section gaps, dialog bodies).
 
-The detail pane opens with the tab bar pinned above a scrolling body, then packs modules above one operate row: every pane carries the header plus Endpoints, then Details adds Usage, Health adds health + History, Presets adds the preset line + attach row — then a single `detail-operate` row (Enabled switch + Start/Stop/Test/Ping/Logs/Copy URLs + `row-menu` trigger) under its own hairline. Eight small controls fit the 1000px frame in that one row, so endpoints stay above the fold with no horizontal scroll; at narrower widths the row wraps to a second line (never sideways scroll). The detail header names the row once via `Acting on: <name>` plus protocol/group Tags, bind endpoint, and serving Badge.
+The detail pane opens with the tab bar pinned above a scrolling body, then packs modules above one operate row: every pane carries the header plus Endpoints, then Details adds Usage, Health adds health + History, Presets adds the preset line + attach row — then a single `detail-operate` row (Auto-start switch + Start/Stop/Test/Ping/Logs/Copy URLs + `row-menu` trigger) under its own hairline. The switch writes the stored flag only (Start-all picks it up; Start/Stop control serving now). Eight small controls fit the 1000px frame in that one row, so endpoints stay above the fold with no horizontal scroll; at narrower widths the row wraps to a second line (never sideways scroll). The detail header names the row once via `Acting on: <name>` plus protocol/group Tags, bind endpoint, and serving Badge.
 
 The window opens at 1000x700 with an 880x620 minimum; toolbar, detail, dialogs, and every status segment paint inside the minimum frame (pinned by containment tests).
 
@@ -174,17 +174,17 @@ Restrained and consistent: one button voice, one field voice, one chip voice per
 - **Primary:** switchboard-ink fill ({colors.primary-ink}) with contrasting text ({colors.primary-ink-foreground}); hover deepens ({colors.primary-ink-hover}). Used for Add and Start — the two constructive commitments.
 - **Hover / Focus:** kit hover tints plus visible keyboard focus; shortcuts ride as Kbd chips beside labels (Add, Start, Stop, Test, Import, Search) with the full `Name (Key)` string on the accessible name. Destructive commits (remove, bulk delete, clear-checked) return focus to the shell, since the control they acted from unmounts. The inspector header carries the status role so selection changes announce.
 - **Danger:** alarm-red fill ({colors.signal-stop}) with paper text (destructive confirms; the row-menu Delete gates through a naming confirm instead of carrying danger styling).
-- **Small density:** `.small()` variant across toolbar, facet, bulk, detail operate row, and endpoint rows so the full control set fits without scrolling (the nine toolbar buttons ride small so the strip fits the 880px minimum on one row).
+- **Small density:** `.small()` variant across toolbar, facet, bulk, detail operate row, and endpoint rows so the full control set fits without scrolling (the five menus plus the labeled master throw ride small so the strip fits the 880px minimum on one row).
 - **Loading:** `Starting…` label plus inline spinner (`engine-start-spinner`) while a start is in flight; probe buttons spinner while testing or pinging. Tooltips name every action.
 - **Enabled-with-honest-toast:** no control renders kit `.disabled()` — every action stays enabled and explains itself on press (`Nothing to start — the library is empty`, `"<name>" is already stopped`). Loading covers in-flight inertness.
 
-### Lever frame (toolbar)
+### Menu bar (toolbar)
 
-Five persistent throws — Add (`add-config`), Start (`start-selected`), Stop (`stop-selected`), Test (`test-selected`), Import (`import-config`) — ride one plate: `group_box` ground, hairline rim, theme radius, separators guarding the throws inside and the frame edge outside. Short visible labels with full `Name (Key)` names on tooltips, accessible labels, and Kbd chips. Library, Manage, Engine, and Help menus carry the rest (Import keeps a distinct `menu-import-config` twin inside Library carrying the Ctrl-O hint; Manage/Engine items carry no Kbd chips because no bindings exist for them; Help adds the `open-palette` entry for the command palette). Every key-bound action plus every menu-only destination also lives in the `Ctrl-K` palette: Library group (15 ops) and Manage group (9 ops) dispatched through the same handlers as buttons, menus, and keys.
+Five menus in fixed order — Program (`program-menu`: intake + lifecycle), Settings (`settings-menu`), Groups (`groups-menu`: subscriptions + group ops), Routing (`routing-menu`: presets + settings link), Tools (`tools-menu`: selection ops, diagnostics, palette) — plus a trailing labeled master throw (`global-start-stop`: `▶ Start all` / `■ Stop all`, `… Connecting…` while a start is in flight). Short visible labels with full `Name (Key)` names on tooltips, accessible labels, and Kbd chips on bound rows. Every key-bound action plus every menu-only destination also lives in the `Ctrl-K` palette: Library group (15 ops) and Manage group (9 ops) dispatched through the same handlers as buttons, menus, and keys.
 
 ### Chips
 
-- **Style:** Tag chips for protocol and group in the detail header; Kbd chips for shortcut hints; Badge with dot for the serving line (green serving, red failed, gray stopped); numeral check chips (`row-check-chip-<id>`) for checked-set position.
+- **Style:** Tag chips for protocol and group in the detail header; Kbd chips for shortcut hints; Badge with dot for the serving line (green serving, red failed, gray stopped); numeral check chips (`row-check-chip-<id>`) for checked-set position; port pills (`row-port-<id>`) pinning each row's `:port` at the trailing end.
 - **State:** chips are read-only labels except Kbd hints, which are part of their buttons. Exclusive choices ride kit `Radio` with real checked state — the subscription interval picker, the log-level row, and the Settings Appearance picker — never bracketed (`[3600]`) or prefixed (`● Error`) text conventions.
 
 ### Cards / Containers
@@ -206,11 +206,11 @@ Five persistent throws — Add (`add-config`), Start (`start-selected`), Stop (`
 
 - **Inspector tabs:** small segmented Details / Health / Presets bar, pinned above the scrolling pane body, with stable test anchors and aria labels; only one pane renders per frame, so shared ids never collide. Endpoints render on all three panes; the operate row closes every pane under its own hairline.
 - **Status bar:** three regions — library counts (`N configurations · M enabled`, singular at 1; honest zero-totals on empty, never a lying zero, absent on a broken read), engine + health (`health: never tested` short form; `N live · M dead` once probed), usage totals (absent when unreadable).
-- **Search and bulk:** `N of M` search count with a Clear-search reset; a visible `search-focus` button in the facet bar lands focus in the query input (no new binding); the bulk bar always reads `N checked (of M visible)`.
+- **Search and bulk:** `N of M` search count with a Clear-search reset; a visible `search-focus` button in the facet bar lands focus in the query input (no new binding); the bulk bar always reads `N checked (of M visible)` with a wash-vs-rim legend on its tooltip, and its verbs name their scope (`Check all visible`, `Uncheck all`, `Start checked`, `Stop checked`).
 
 ### Library Row (signature component)
 
-Occupancy lamp (`row-dot-<id>`, fixed leading cell, flat fill) plus checkbox plus name on line one, with the numeral check chip beside the name while checked; the name (`row-name-<id>`) and meta line (`row-meta-<id>`) truncate with full-text hover tooltips, like the endpoint rows. Small muted meta line (`protocol · upstream · group · bind:port · state`); small badge line in serving color with optional traffic totals. Hover tints quiet; selection takes wash plus rim; checked takes the 2px accent rim. Stopped rows honestly show pinned `○ Stopped` with no fabricated latency; a row both checked and selected shows both marks. A successful import selects the first new row and checks all of them, so `F5` and the bulk bar act at once.
+Occupancy lamp (`row-dot-<id>`, fixed leading cell, flat fill) plus checkbox plus name on line one, with the numeral check chip beside the name while checked and the local port pinned in a fixed trailing pill (`row-port-<id>`, `:port`, never truncated); the name (`row-name-<id>`) and meta line (`row-meta-<id>`) truncate with full-text hover tooltips, like the endpoint rows. Small muted meta line (`protocol · upstream · group · bind:port · state`); small badge line in serving color with optional traffic totals. Hover tints quiet; selection takes wash plus rim; checked takes the 2px accent rim. Stopped rows honestly show pinned `○ Stopped` with no fabricated latency; a row both checked and selected shows both marks. A successful import selects the first new row and checks all of them, so `F5` and the bulk bar act at once.
 
 ### Endpoints module
 
