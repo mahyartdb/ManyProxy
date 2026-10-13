@@ -580,6 +580,108 @@ pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, Prese
     })
 }
 
+/// Ticket 10 (throne-adoption US-29): share a stored preset as a
+/// `throne://route/...` link (standard-base64 of the preset object —
+/// the first encoding [`decode_route_link`] accepts, so the link always
+/// round-trips). Never empty: even a zero-rule preset encodes its name.
+/// Rule content rides the link by design (routing policy, not secrets —
+/// presets carry no credentials); error text never echoes payloads.
+pub fn preset_share_link(name: &str, rules: &[Value]) -> String {
+    use base64::Engine as _;
+    let body = serde_json::json!({"name": name, "rules": rules}).to_string();
+    let payload = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
+    format!("throne://route/{payload}")
+}
+
+/// Ticket 10 (US-29): actions the Basic builder and the Advanced action
+/// combo may offer. `route`/`proxy` both point at the attached row's
+/// outbound at merge ([`served_action`]); `warp`/`warp-bypass` are never
+/// offered (no endpoint design — see [`validate_preset_rules`]).
+pub const BASIC_PRESET_ACTIONS: &[&str] = &["direct", "proxy", "block"];
+
+/// Ticket 10 (US-29): build the rules for a New-Structured preset — one
+/// catch-all rule carrying `action` (the Basic 2×2 collapses to one row:
+/// every category Direct|Proxy|Block). Rejects anything outside
+/// [`BASIC_PRESET_ACTIONS`] (warp fails with the same guidance error as
+/// [`validate_preset_rules`], never a silent drop).
+pub fn structured_preset_rules(action: &str) -> Result<Vec<Value>, PresetError> {
+    if !BASIC_PRESET_ACTIONS.contains(&action) {
+        if action == "warp" || action == "warp-bypass" {
+            return validate_preset_rules(&[serde_json::json!({"action": action})])
+                .map(|()| Vec::new());
+        }
+        return Err(PresetError::new(
+            PresetErrorKind::BadRule,
+            format!(
+                "rule 0: field \"action\" must be one of {}",
+                BASIC_PRESET_ACTIONS.join(", ")
+            ),
+        ));
+    }
+    let rules = vec![serde_json::json!({"action": action})];
+    validate_preset_rules(&rules)?;
+    Ok(rules)
+}
+
+/// Ticket 10 (US-29): rewrite one rule's action in place (the Advanced
+/// action combo). The rewrite validates like intake: unknown actions and
+/// warp fail with the indexed error, and a `direct`/`block` rule keeps no
+/// stale `outbound` (the merge would refuse it — intake refuses first).
+pub fn set_rule_action(rule: &mut Value, action: &str) -> Result<(), PresetError> {
+    if !VALID_PRESET_ACTIONS.contains(&action) && action != "proxy" {
+        return validate_preset_rules(&[serde_json::json!({"action": action})]);
+    }
+    let obj = rule
+        .as_object_mut()
+        .ok_or_else(|| bad_rule(0, "must be a JSON object"))?;
+    obj.insert("action".to_string(), Value::String(action.to_string()));
+    if action != "route" && action != "proxy" {
+        obj.remove("outbound");
+    }
+    validate_preset_rules(std::slice::from_ref(rule))
+}
+
+/// Ticket 10 (US-29): per-attribute tabs present on one rule — the matcher
+/// groups the Advanced editor shows as tabs. `Action` always leads (every
+/// rule carries one); matcher keys map to their tab; unknown keys fold
+/// into `Other` (never dropped, never a new tab per key).
+pub fn rule_attribute_tabs(rule: &Value) -> Vec<&'static str> {
+    let mut tabs = vec!["Action"];
+    let Some(obj) = rule.as_object() else {
+        return tabs;
+    };
+    // (matcher key, tab) in stable tab order.
+    const GROUPS: &[(&str, &str)] = &[
+        ("domain", "Domain"),
+        ("domain_suffix", "Domain"),
+        ("domain_keyword", "Domain"),
+        ("domain_regex", "Domain"),
+        ("ip_cidr", "IP"),
+        ("ip_is_private", "IP"),
+        ("port", "Port"),
+        ("port_range", "Port"),
+        ("process_name", "Process"),
+        ("process_path", "Process"),
+        ("network", "Network"),
+        ("protocol", "Network"),
+    ];
+    for (_, tab) in GROUPS {
+        if GROUPS
+            .iter()
+            .any(|(key, group)| group == tab && obj.contains_key(*key))
+            && !tabs.contains(tab)
+        {
+            tabs.push(tab);
+        }
+    }
+    if obj.keys().any(|key| {
+        key != "action" && key != "outbound" && !GROUPS.iter().any(|(known, _)| known == key)
+    }) {
+        tabs.push("Other");
+    }
+    tabs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,5 +1057,81 @@ mod tests {
         assert!(is_internal_host("localhost."));
         assert!(!is_internal_host("example.com"));
         assert!(!is_internal_host("93.184.216.34"));
+    }
+
+    // -- Ticket 10: manager seams ----------------------------------------
+    // Share-out links round-trip; the structured builder and the action
+    // combo stay inside proxy|direct|block (warp never serves).
+
+    /// Ticket 10 (US-29): the manager Export-copy-link round-trips through
+    /// the intake (name + rules survive; even zero-rule shells encode).
+    #[test]
+    fn t10_preset_share_link_round_trips() {
+        let rules = sample_rules();
+        let link = preset_share_link("office", &rules);
+        assert!(link.starts_with("throne://route/"), "{link}");
+        let parsed = decode_route_link(&link).expect("share link decodes");
+        assert_eq!(parsed.name, "office");
+        assert_eq!(parsed.rules, rules);
+        let empty = preset_share_link("shell", &[]);
+        assert!(!empty.is_empty(), "shells still encode");
+        let parsed = decode_route_link(&empty).expect("shell link decodes");
+        assert_eq!(parsed.name, "shell");
+        assert!(parsed.rules.is_empty());
+    }
+
+    /// Ticket 10 (US-29): the structured builder serves one catch-all rule
+    /// per Basic action; anything else (incl. warp) fails loudly.
+    #[test]
+    fn t10_structured_preset_rules_cover_basic_actions() {
+        for action in ["direct", "proxy", "block"] {
+            let rules = structured_preset_rules(action).expect("basic action builds");
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].get("action").and_then(Value::as_str), Some(action));
+        }
+        for action in ["warp", "warp-bypass", "sniff"] {
+            let error = structured_preset_rules(action).expect_err("non-basic fails");
+            assert_eq!(error.kind, PresetErrorKind::BadRule);
+            assert!(error.message.contains("rule 0"), "{error}");
+        }
+    }
+
+    /// Ticket 10 (US-29): the Advanced action combo rewrites in place,
+    /// drops stale `outbound` off route-like actions, and refuses warp.
+    #[test]
+    fn t10_set_rule_action_rewrites_and_cleans_outbound() {
+        let mut rule = serde_json::json!({"action": "route", "outbound": "tag"});
+        set_rule_action(&mut rule, "direct").expect("combo rewrites");
+        assert_eq!(rule.get("action").and_then(Value::as_str), Some("direct"));
+        assert!(!rule.as_object().unwrap().contains_key("outbound"));
+        let mut rule = serde_json::json!({"action": "direct"});
+        set_rule_action(&mut rule, "proxy").expect("proxy offered");
+        assert_eq!(rule.get("action").and_then(Value::as_str), Some("proxy"));
+        let mut rule = serde_json::json!({"action": "direct"});
+        let error = set_rule_action(&mut rule, "warp").expect_err("warp refused");
+        assert!(error.message.contains("warp"), "{error}");
+        assert_eq!(rule.get("action").and_then(Value::as_str), Some("direct"));
+    }
+
+    /// Ticket 10 (US-29): per-attribute tabs name the matcher groups
+    /// present (Action always leads; unknown keys fold into Other).
+    #[test]
+    fn t10_rule_attribute_tabs_name_matcher_groups() {
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({"action": "direct"})),
+            vec!["Action"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(
+                &serde_json::json!({"action": "route", "domain_suffix": ["a"], "port": [25]})
+            ),
+            vec!["Action", "Domain", "Port"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(
+                &serde_json::json!({"action": "block", "network": "tcp", "custom_key": 1})
+            ),
+            vec!["Action", "Network", "Other"]
+        );
     }
 }

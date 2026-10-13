@@ -11,6 +11,7 @@ mod tray;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, Tex
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::radio::{Radio, RadioGroup};
@@ -51,6 +52,7 @@ use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
+use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
 
@@ -61,34 +63,39 @@ use engine::{
     LAN_CONFIRM_TITLE,
 };
 use health::{
-    ping_all, redact_secrets, sparkline_latencies, test_all, truncate, HealthProber, HealthStore,
-    LogLevel, LogStore, LogTagIndex, RealHealthProber, TestOutcome, TrafficSeenMap,
-    DEFAULT_TEST_URL,
+    format_speed_result, ping_all, redact_secrets, resolve_hostname, sparkline_latencies,
+    speed_group, test_all, test_group, truncate, HealthProber, HealthStore, LogLevel, LogStore,
+    LogTagIndex, RealHealthProber, SpeedtestConfig, SpeedtestMode, SpeedtestOutcome, TestOutcome,
+    TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL, RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
 };
 use import::{
-    commit_batch, effective_hint_for_text, format_import_failures, import_file_content,
-    import_multi_file_contents, import_text, is_addsub_attempt, is_library_export,
-    parse_addsub_link, AddSubRequest, ImportError,
+    classify_open_with, commit_batch, effective_hint_for_text, format_import_failures,
+    import_file_content, import_file_size_ok, import_multi_file_contents, import_text,
+    is_addsub_attempt, is_library_export, parse_addsub_link, reject_file_bytes, AddSubRequest,
+    ImportError, OpenWithKind,
 };
 use store::{
-    chain_hop_rejection, chain_nodes_of, count_importable, delete_confirm_text,
-    delete_running_confirm_text, due_for_refresh_for, export_confirm_description,
-    extra_config_prefill, fold_amneziawg_into_params, fold_anytls_into_params,
-    fold_chain_nodes_into_params, fold_dial_into_params, fold_extra_into_params,
-    fold_guided_into_params, fold_http_into_params, fold_hysteria_into_params,
-    fold_mux_into_params, fold_naive_into_params, fold_shadowsocks_inner_into_params,
-    fold_shadowtls_into_params, fold_snell_into_params, fold_socks_into_params,
-    fold_ssh_into_params, fold_tls_forced_into_params, fold_tls_optional_into_params,
-    fold_tls_vmess_into_params, fold_transport_into_params, fold_trojan_inner_into_params,
-    fold_tuic_into_params, fold_vless_inner_into_params, fold_vmess_inner_into_params,
-    fold_wireguard_into_params, fold_xray_into_params, guided_identity_fields, guided_prefill_bool,
-    guided_prefill_list, guided_prefill_value, is_virtual_protocol, now_unix,
-    pristine_template_rewrite, protocol_params_template, proxy_urls, validate_extra_params,
+    chain_hop_rejection, chain_nodes_of, clear_group_tests_confirm_text, compare_type_security,
+    count_importable, delete_confirm_text, delete_running_confirm_text, due_for_refresh_for,
+    export_confirm_description, extra_config_prefill, fold_amneziawg_into_params,
+    fold_anytls_into_params, fold_chain_nodes_into_params, fold_dial_into_params,
+    fold_extra_into_params, fold_guided_into_params, fold_http_into_params,
+    fold_hysteria_into_params, fold_mux_into_params, fold_naive_into_params,
+    fold_shadowsocks_inner_into_params, fold_shadowtls_into_params, fold_snell_into_params,
+    fold_socks_into_params, fold_ssh_into_params, fold_tls_forced_into_params,
+    fold_tls_optional_into_params, fold_tls_vmess_into_params, fold_transport_into_params,
+    fold_trojan_inner_into_params, fold_tuic_into_params, fold_vless_inner_into_params,
+    fold_vmess_inner_into_params, fold_wireguard_into_params, fold_xray_into_params,
+    guided_identity_fields, guided_prefill_bool, guided_prefill_list, guided_prefill_value,
+    is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
+    prune_duplicates_confirm_text, prune_invalid_confirm_text, prune_unavailable_confirm_text,
+    rewrite_server_to_ip, row_security_label, row_server_hostname, validate_extra_params,
     vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, ChainHopSlot, ConfigPatch,
-    DialFold, ExtraFold, HealthSnapshot, HttpFold, HysteriaFold, MuxFold, NaiveFold, NewConfig,
-    ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SshFold, Store, StoreError,
-    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
-    WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    DialFold, ExtraFold, GroupPruneKind, HealthSnapshot, HttpFold, HysteriaFold, MuxFold,
+    NaiveFold, NewConfig, ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold,
+    SshFold, Store, StoreError, Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold,
+    TransportFold, TuicFold, WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP,
+    DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 // Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
@@ -113,8 +120,12 @@ actions!(
         InspectorDetails,
         InspectorHealth,
         InspectorPresets,
+        InspectorLogs,
+        InspectorConnections,
+        InspectorTraffic,
         OpenPalette,
-        CopyUrls
+        CopyUrls,
+        UpdateCurrentGroup
     ]
 );
 
@@ -127,7 +138,7 @@ pub const APP_KEY_CONTEXT: &str = "manyproxy-library";
 /// is unaffected; dialogs are guarded at the handler, not the binding.
 /// Ticket 44: Escape clears the multi-select set (same guard).
 /// Lane B (B9): Delete edits nothing — it opens the naming confirm;
-/// Ctrl-F lands in search; Ctrl-E edits; Ctrl-1/2/3 switch inspector panes.
+/// Ctrl-F lands in search; Ctrl-E edits; Ctrl-1..6 switch inspector panes.
 /// Delete/Ctrl-E/Ctrl-F are inert while typing in a field (the focused
 /// input consumes the keystroke before the shell sees it) and while any
 /// dialog is open.
@@ -150,8 +161,15 @@ pub fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("ctrl-1", InspectorDetails, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-2", InspectorHealth, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-3", InspectorPresets, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-4", InspectorLogs, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-5", InspectorConnections, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-6", InspectorTraffic, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-k", OpenPalette, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-u", CopyUrls, Some(APP_KEY_CONTEXT)),
+        // Ticket 08 (throne-adoption): Update-current refreshes the
+        // subscriptions feeding the focused group (Ctrl-U stays on Copy
+        // URLs — its shortcut is pinned by config-completeness T08).
+        KeyBinding::new("ctrl-r", UpdateCurrentGroup, Some(APP_KEY_CONTEXT)),
     ]);
 }
 
@@ -167,6 +185,11 @@ pub const REPROBE_TICK_SECS: u64 = 60;
 /// core's loopback clash controller (fast refuse-or-reply, 2s bound per
 /// core like the probe bound above) and persists per-row deltas.
 pub const TRAFFIC_TICK_SECS: u64 = 5;
+/// Ticket 05 (throne-adoption): visible-pane traffic cadence — the traffic
+/// loop runs at 1Hz and [`AppView::spawn_traffic_poll`] throttles to the 5s
+/// base cadence while the Connections/Traffic pane is hidden (see
+/// [`traffic_poll_due`]). Incremental mirror updates keep each pass O(delta).
+pub const TRAFFIC_FAST_TICK_SECS: u64 = 1;
 /// Ticket 47: tray event-pump cadence (menu actions + left-click toggle).
 /// 500ms stays responsive to clicks without the old 150ms idle wakeups.
 pub const TRAY_PUMP_MILLIS: u64 = 500;
@@ -250,6 +273,84 @@ fn settings_clear_snapshot_text() -> String {
     "Forget the running snapshot? The next launch starts with nothing running. The live \
      engine is untouched. This cannot be undone."
         .to_string()
+}
+
+/// Ticket 01: the three Appearance choices in radio order. The store is the
+/// only persistence (`Store::appearance` / `set_appearance`); anything else
+/// reads as dark (the documented default).
+pub const APPEARANCE_CHOICES: &[(&str, &str)] =
+    &[("dark", "Dark"), ("light", "Light"), ("system", "System")];
+
+/// Ticket 01: read-only probe of the Windows app-theme flag
+/// (`HKCU\...\Personalize\AppsUseLightTheme`: nonzero = light). Read-only —
+/// never a write, so the local-only contract is untouched. `None` when the
+/// value is missing/unreadable (or off Windows); callers fall back to dark,
+/// never a guessed write.
+fn windows_apps_light_theme() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+            .ok()?
+            .get_value::<u32, _>("AppsUseLightTheme")
+            .ok()
+            .map(|value| value != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Ticket 01: pure Appearance → kit mode mapping. `system_light` is the OS
+/// flag (see [`windows_apps_light_theme`]); unknown values read dark (the
+/// documented default, matching [`Store::appearance`]). Pure so tests pin
+/// the mapping without touching the registry.
+fn appearance_theme_mode(appearance: &str, system_light: bool) -> ThemeMode {
+    match appearance {
+        "light" => ThemeMode::Light,
+        "dark" => ThemeMode::Dark,
+        "system" if system_light => ThemeMode::Light,
+        "system" => ThemeMode::Dark,
+        _ => ThemeMode::Dark,
+    }
+}
+
+/// Ticket 01: resolve a persisted Appearance choice to the live kit mode
+/// (System consults the Windows flag; missing flag reads dark).
+fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
+    appearance_theme_mode(appearance, windows_apps_light_theme().unwrap_or(false))
+}
+
+/// Ticket 01: apply a persisted Appearance choice to the kit theme (tokens
+/// only — app code carries zero hardcoded colors, so every surface follows).
+/// `window` refreshes the frame when one is handy (dialog switches); `None`
+/// at startup before the first frame.
+fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx: &mut App) {
+    Theme::change(resolve_appearance_mode(appearance), window, cx);
+}
+
+/// Ticket 01: one-line routing inventory for the Settings Routing section —
+/// preset count plus attached-row count (`None` on either broken read, so
+/// the line never prints a lying zero).
+fn routing_summary_text(presets: Option<usize>, attached: Option<usize>) -> String {
+    match (presets, attached) {
+        (Some(presets), Some(attached)) => {
+            format!("{presets} routing preset(s) · {attached} row(s) attached")
+        }
+        _ => "Routing inventory unavailable".to_string(),
+    }
+}
+
+/// Ticket 01: one-line preset inventory for the Settings Preset section
+/// (`None` on a broken read — never a lying zero).
+fn preset_summary_text(presets: Option<usize>) -> String {
+    match presets {
+        Some(presets) => format!("{presets} routing preset(s) stored"),
+        None => "Preset inventory unavailable".to_string(),
+    }
 }
 
 /// Lane B (B8): overwrite-gate copy for the logs Save — names the exact
@@ -381,6 +482,14 @@ struct LibraryDelegate {
     facet_group: Option<String>,
     facet_protocol: Option<String>,
     facet_status: Option<FacetStatus>,
+    /// Ticket 09 (throne-adoption): Show-Security column state — when on,
+    /// the meta line carries the row's `Type · security` posture (see
+    /// [`apply_show_security`]); off keeps the pinned three-fact meta.
+    show_security: bool,
+    /// Ticket 09 (throne-adoption): `Type|Security` display sort — orders
+    /// `visible` by [`compare_type_security`] (display-only; store order
+    /// and refresh reseat are untouched).
+    type_security_sort: bool,
     /// T04 (gpui-18-sweep CAP-5): back-link to the owning view, set once
     /// from [`AppView::render`] (guarded — one update, then quiet). Lets the
     /// truly-empty `Empty` host working Add/Import buttons in content, so no
@@ -614,6 +723,8 @@ impl LibraryDelegate {
             facet_group: None,
             facet_protocol: None,
             facet_status: None,
+            show_security: false,
+            type_security_sort: false,
             app_view: None,
         }
     }
@@ -676,6 +787,11 @@ impl LibraryDelegate {
                 continue;
             }
             visible.push(index);
+        }
+        // Ticket 09 (throne-adoption): `Type|Security` display sort —
+        // orders the visible indices only (store order untouched).
+        if self.type_security_sort {
+            visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
         }
         self.visible = visible;
         self.selected = selected_id.and_then(|id| {
@@ -828,6 +944,19 @@ impl LibraryDelegate {
 
     fn set_facet_status(&mut self, status: Option<FacetStatus>) {
         self.facet_status = status;
+        self.apply_filter();
+    }
+
+    /// Ticket 09 (throne-adoption): Show-Security toggle (render-only —
+    /// no re-filter; the list repaints with the posture column).
+    fn set_show_security(&mut self, show: bool) {
+        self.show_security = show;
+    }
+
+    /// Ticket 09 (throne-adoption): `Type|Security` sort toggle (re-orders
+    /// `visible` via [`apply_filter`]; store order untouched).
+    fn set_type_security_sort(&mut self, sort: bool) {
+        self.type_security_sort = sort;
         self.apply_filter();
     }
 
@@ -1158,9 +1287,15 @@ impl ListDelegate for LibraryDelegate {
         if !selected {
             card = card.hover(|this| this.bg(cx.theme().list_hover));
         }
-        let mut lines =
-            library_row_dense_lines_with_upstream(&row, &upstream, health, is_running, traffic)
-                .into_iter();
+        let mut rendered =
+            library_row_dense_lines_with_upstream(&row, &upstream, health, is_running, traffic);
+        // Ticket 09 (throne-adoption): Show-Security splices the posture
+        // into the meta line (render-only; the pinned line builder above
+        // is untouched).
+        if self.show_security {
+            apply_show_security(&mut rendered, &row);
+        }
+        let mut lines = rendered.into_iter();
         // Operate polish: name at base weight via Label, meta + badge at
         // small size. Meta rides muted; the badge rides the serving color
         // (danger on dead-while-serving, success while running, muted when
@@ -1271,7 +1406,34 @@ impl ListDelegate for LibraryDelegate {
                 card = card.child(div().text_sm().text_color(badge_color).child(line));
             }
         }
-        Some(item.child(card))
+        // Throne-adoption 03: single-click still selects (the outer List
+        // row owns that — untouched). Double-click opens Edit for THAT row
+        // and right-click opens the row-targeted menu — both close over
+        // this row's id, never the selection. Signal Box geometry, ids,
+        // and styling are unchanged.
+        let rendered = match self.app_view.clone() {
+            Some(app_view) => {
+                let edit_view = app_view.clone();
+                let edit_id = row_id.clone();
+                let menu_view = app_view.clone();
+                let menu_id = row_id.clone();
+                item.child(
+                    card.on_click(move |event, window, cx| {
+                        if event.click_count() == 2 {
+                            let id = edit_id.clone();
+                            edit_view.update(cx, |view, cx| {
+                                view.open_edit_for_row(&id, window, cx);
+                            });
+                        }
+                    })
+                    .context_menu(move |menu, _, _| {
+                        AppView::row_context_menu(menu, &menu_id, &menu_view)
+                    }),
+                )
+            }
+            None => item.child(card),
+        };
+        Some(rendered)
     }
 
     fn render_empty(
@@ -1468,6 +1630,11 @@ type DialogRepaint = Rc<dyn Fn(&mut Window, &mut App)>;
 /// no side effects, and destructive work stays on alert confirms carrying
 /// `ButtonVariant::Danger` (never on this plain path). Both buttons ride
 /// `.small()` so footers stay inside the minimum-frame paint budget.
+/// Ticket 03 (US-3): pure-close dialogs render Close-only — when the commit
+/// label reads `Close` there is no commit to offer, so the footer is the
+/// single close button (kept on `ok_id`, which the pins click) and no
+/// `Cancel` sibling. `Esc` still closes through the dialog's Cancel key
+/// path, which never depended on the sibling button existing.
 fn dialog_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
@@ -1478,6 +1645,15 @@ fn dialog_footer(
         !ok_label.eq_ignore_ascii_case("ok") && !ok_label.eq_ignore_ascii_case("okay"),
         "Ticket 05: honest footers never use a bare OK label"
     );
+    if ok_label.eq_ignore_ascii_case("close") {
+        return DialogFooter::new().child(Button::new(ok_id).small().label(ok_label).on_click(
+            move |_, window, cx| {
+                if commit(window, cx) {
+                    window.close_all_dialogs(cx);
+                }
+            },
+        ));
+    }
     let commit_click = commit.clone();
     DialogFooter::new()
         .child(
@@ -1558,7 +1734,7 @@ fn sheet_footer(
 /// Closing without saving reads `Close` (settings, groups, and the preset
 /// picker, whose per-row `Attach` buttons do the real attaching while the
 /// footer itself just closes); commits name their verb (`Add`, `Save`,
-/// `Import`, `Export`, `Move`, `Rename`); the Logs filter commit reads
+/// `Import`, `Export`, `Move`, `Rename`, `Copy link`); the Logs filter commit reads
 /// `Apply filter` so committing the typed filter is distinct from discarding
 /// it via `Cancel` (a second `Save` would collide with the file-writing
 /// `logs-save` button in the same dialog). Never a bare `OK` (see DESIGN.md
@@ -1579,8 +1755,60 @@ fn footer_commit_label(dialog: &str) -> &'static str {
         "export" => "Export",
         "bulk-move" => "Move",
         "group-rename" => "Rename",
+        "share" => "Copy link",
         _ => "Close",
     }
+}
+
+/// Ticket 10 (US-28): share-dialog credential warning (the export-dialog
+/// plaintext pattern — a share link rebuilds the endpoint elsewhere).
+const SHARE_WARNING: &str = "This link carries the endpoint's credentials — anyone holding it can use it. Prefer Copy URLs for credential-free sharing.";
+
+/// Ticket 06 (throne-adoption): the `Advanced Settings` button behind the
+/// Common box — opens the second small dialog (Dial Fields + TLS extras)
+/// over the same form entities. One stable id; hidden when the protocol
+/// carries nothing advanced (see [`has_advanced_dialog`]).
+fn advanced_settings_button(view: &Entity<AppView>, form: &ConfigForm) -> impl IntoElement {
+    let adv_view = view.clone();
+    let adv_form = form.clone();
+    Button::new("advanced-settings")
+        .small()
+        .label("Advanced Settings")
+        .tooltip("Dial fields and TLS extras — edits apply directly, no extra checks")
+        .accessibility_label("Open Advanced Settings: dial fields and TLS extras")
+        .on_click(move |_, window, cx| {
+            adv_view.update(cx, |view, cx| {
+                view.open_advanced_dialog(&adv_form, window, cx);
+            });
+        })
+}
+
+/// Ticket 06: one masked-password row with the Throne presence caption —
+/// the secret input plus a `Not Set`/`Already Set` state line underneath
+/// (presence only, the value never renders). `id` pins the input
+/// wrapper; `{id}-state` pins the caption. Callers pass the full label
+/// (with ` *` exactly when blank fails validation).
+fn password_row(label: &str, id: &'static str, secret: &Entity<InputState>, cx: &App) -> Field {
+    let presence = secret_state_caption(secret.read(cx).value().as_ref()).to_string();
+    field().label(label.to_string()).child(
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .id(id)
+                    .test_support()
+                    .child(Input::new(secret).mask_toggle()),
+            )
+            .child(
+                div()
+                    .id(format!("{id}-state"))
+                    .test_support()
+                    .text_sm()
+                    .child(presence),
+            ),
+    )
 }
 
 /// Ticket 05: the Advanced disclosure toggle — one behavior, two
@@ -1667,8 +1895,10 @@ struct ConfigForm {
     vless_flow: Entity<SelectState<PanelChoiceList>>,
     vless_packet_encoding: Entity<SelectState<PanelChoiceList>>,
     /// Config-completeness T02: shared Transport panel (S1) — network
-    /// picker plus conditional text inputs. Entities persist while hidden
-    /// (R5: hiding never wipes), so ws→tcp keeps path/host for reopen.
+    /// picker (the Network box) plus conditional disguise inputs (the
+    /// Camouflage box: ws path/host, http host/path/method, grpc service
+    /// name). Entities persist while hidden (R5: hiding never wipes), so
+    /// ws→tcp keeps path/host for reopen.
     s1_network: Entity<SelectState<PanelChoiceList>>,
     s1_path: Entity<InputState>,
     s1_host: Entity<InputState>,
@@ -1676,8 +1906,10 @@ struct ConfigForm {
     s1_service_name: Entity<InputState>,
     s1_open: Rc<RefCell<bool>>,
     /// Config-completeness T02: shared TLS panel, optional variant (S2) —
-    /// enable toggle plus credential inputs. Disabling folds `security`
-    /// away while every other key stays preserved (R5).
+    /// enable toggle (TLS box) plus SNI/ALPN/fingerprint (TLS Security box).
+    /// Disabling folds `security` away while every other key stays preserved
+    /// (R5). Ticket 06: insecure + REALITY keys ride the Advanced dialog's
+    /// TLS extras.
     s2_enable: Rc<RefCell<bool>>,
     s2_sni: Entity<InputState>,
     s2_alpn: Entity<InputState>,
@@ -1696,8 +1928,9 @@ struct ConfigForm {
     s3_down: Entity<InputState>,
     s3_open: Rc<RefCell<bool>>,
     /// Config-completeness T02: shared Advanced dial panel (S4, dial half) —
-    /// four toggles plus timeout/bind text inputs (TLS extras are a later
-    /// ticket with their own engine `tls{}` mapping).
+    /// four toggles plus timeout/bind text inputs. Ticket 06: rendered in
+    /// the Advanced dialog (see [`AppView::open_advanced_dialog`]), never
+    /// in the main form.
     s4_reuse: Rc<RefCell<bool>>,
     s4_fastopen: Rc<RefCell<bool>>,
     s4_fragment: Rc<RefCell<bool>>,
@@ -1706,7 +1939,6 @@ struct ConfigForm {
     s4_bind: Entity<InputState>,
     s4_inet4: Entity<InputState>,
     s4_inet6: Entity<InputState>,
-    s4_open: Rc<RefCell<bool>>,
     /// Config-completeness T02: outer VLESS disclosure (see
     /// [`ConfigForm::vless_block`]) — collapsed by default per the t11
     /// minimum-frame contract.
@@ -1732,7 +1964,8 @@ struct ConfigForm {
     /// Config-completeness T03: Shadowsocks inner fields — method + plugin
     /// pickers, masked password secret, plugin_opts text, uot cell.
     /// Rendered (and folded) only while the live protocol is `shadowsocks`;
-    /// the page carries S3+S4 only (no S1/S2 — Throne HasMux parity).
+    /// the page carries S3 + Advanced-dialog S4 only (no S1/S2 — Throne
+    /// HasMux parity).
     ss_method: Entity<SelectState<PanelChoiceList>>,
     ss_password: Entity<InputState>,
     ss_plugin: Entity<SelectState<PanelChoiceList>>,
@@ -1744,8 +1977,8 @@ struct ConfigForm {
     /// Config-completeness T04: WireGuard inner fields — masked private-key
     /// secret + keygen, peer public/preshared keys, reserved/keepalive/
     /// local-addr/dns/mtu/workers texts, sys_ifc cell. Rendered (and folded)
-    /// only while the live protocol is `wireguard`; the page carries S4
-    /// only (no Transport/TLS/Mux — endpoint parity).
+    /// only while the live protocol is `wireguard`; the page carries
+    /// Advanced-dialog S4 only (no Transport/TLS/Mux — endpoint parity).
     wg_private: Entity<InputState>,
     wg_public: Entity<InputState>,
     wg_preshared: Entity<InputState>,
@@ -1764,7 +1997,8 @@ struct ConfigForm {
     /// T03 protocol-scoping) plus the AWG matrix: enable marker, version
     /// picker, junk-train Jc/Jmin/Jmax, S-lengths, H-ranges, I-chains, v3
     /// fields, trailers/cookies cells. Rendered (and folded) only while the
-    /// live protocol is `amneziawg`; the page carries S4 only.
+    /// live protocol is `amneziawg`; the page carries Advanced-dialog S4
+    /// only.
     awg_private: Entity<InputState>,
     awg_public: Entity<InputState>,
     awg_preshared: Entity<InputState>,
@@ -1829,7 +2063,7 @@ struct ConfigForm {
     /// button, uuid-row precedent) + password secret, congestion_control +
     /// udp_relay_mode keep-blank pickers, udp_over_stream + zero_rtt cells,
     /// heartbeat text. Rendered (and folded) only while the live protocol is
-    /// `tuic`; the page carries S2-forced + S4.
+    /// `tuic`; the page carries S2-forced + Advanced-dialog S4.
     tuic_uuid: Entity<InputState>,
     tuic_password: Entity<InputState>,
     tuic_cc: Entity<SelectState<PanelChoiceList>>,
@@ -1842,8 +2076,8 @@ struct ConfigForm {
     tuic_open: Rc<RefCell<bool>>,
     /// Config-completeness T06: SOCKS inner fields — version + network
     /// pickers, username/password texts, udp_over_tcp cell. Rendered (and
-    /// folded) only while the live protocol is `socks`; the page carries S4
-    /// only (no Transport/TLS/Mux — inner parity).
+    /// folded) only while the live protocol is `socks`; the page carries
+    /// Advanced-dialog S4 only (no Transport/TLS/Mux — inner parity).
     socks_version: Entity<SelectState<PanelChoiceList>>,
     socks_username: Entity<InputState>,
     socks_password: Entity<InputState>,
@@ -1856,7 +2090,7 @@ struct ConfigForm {
     /// path/headers texts (path/headers are parity+). One entity set serves
     /// both `http` and `https` (hysteria v1/v2 precedent); rendered (and
     /// folded) only while the live protocol is either; the page carries
-    /// S2-optional + S4.
+    /// S2-optional + Advanced-dialog S4.
     http_username: Entity<InputState>,
     http_password: Entity<InputState>,
     http_path: Entity<InputState>,
@@ -1867,7 +2101,7 @@ struct ConfigForm {
     /// Config-completeness T06: AnyTLS inner fields — masked password secret
     /// plus the idle-session tunables (interval/timeout durations, min
     /// count). Rendered (and folded) only while the live protocol is
-    /// `anytls`; the page carries S2-forced + S4.
+    /// `anytls`; the page carries S2-forced + Advanced-dialog S4.
     anytls_password: Entity<InputState>,
     anytls_interval: Entity<InputState>,
     anytls_timeout: Entity<InputState>,
@@ -1878,7 +2112,7 @@ struct ConfigForm {
     /// Config-completeness T06: Naïve inner fields — username + masked
     /// password secrets, uot/quic cells, congestion_control picker.
     /// Rendered (and folded) only while the live protocol is `naive`; the
-    /// page carries S2-forced + S4.
+    /// page carries S2-forced + Advanced-dialog S4.
     naive_username: Entity<InputState>,
     naive_password: Entity<InputState>,
     naive_uot: Rc<RefCell<bool>>,
@@ -1890,8 +2124,8 @@ struct ConfigForm {
     /// Config-completeness T06: SSH inner fields — user text, masked password
     /// secret, private-key blob area + path input + Browse picker + masked
     /// passphrase, host-key + algs comma lists, client version. Rendered (and
-    /// folded) only while the live protocol is `ssh`; the page carries S4
-    /// only (no TLS — inner parity).
+    /// folded) only while the live protocol is `ssh`; the page carries
+    /// Advanced-dialog S4 only (no TLS — inner parity).
     ssh_user: Entity<InputState>,
     ssh_password: Entity<InputState>,
     ssh_private_key: Entity<TextareaState>,
@@ -1907,7 +2141,7 @@ struct ConfigForm {
     /// version picker (4|6), obfs_mode/host + userkey + network + mode texts,
     /// reuse cell. Engine-driven list (no Throne editor exists); rendered
     /// (and folded) only while the live protocol is `snell`; the page carries
-    /// S4 only (no Transport/TLS/Mux — inner parity).
+    /// Advanced-dialog S4 only (no Transport/TLS/Mux — inner parity).
     snell_psk: Entity<InputState>,
     snell_version: Entity<SelectState<PanelChoiceList>>,
     snell_obfs_mode: Entity<InputState>,
@@ -1922,7 +2156,7 @@ struct ConfigForm {
     /// Config-completeness T07: ShadowTLS inner fields — version picker
     /// (1|2|3) + password text (v2/v3-only; v1 rows omit it). Rendered (and
     /// folded) only while the live protocol is `shadowtls`; the page carries
-    /// S2-forced + S4.
+    /// S2-forced + Advanced-dialog S4.
     shadowtls_version: Entity<SelectState<PanelChoiceList>>,
     shadowtls_password: Entity<InputState>,
     /// Config-completeness T07: outer ShadowTLS disclosure (see
@@ -2156,8 +2390,8 @@ impl ConfigForm {
             bind: Self::field(window, cx, "Bind address", Some(DEFAULT_BIND)),
             port: Self::field(window, cx, "Port (blank or auto = auto-assign)", None),
             test_url: Self::field(window, cx, "Test URL (blank = global)", None),
-            guided_server: Self::field(window, cx, "Upstream server", None),
-            guided_port: Self::field(window, cx, "Upstream port", None),
+            guided_server: Self::field(window, cx, "Server (e.g. example.com)", None),
+            guided_port: Self::field(window, cx, "Port (e.g. 443)", None),
             guided_identity: Self::secret_field(window, cx, "Identity secret", None),
             // Config-completeness T02: panels open blank (every fold
             // no-ops, so the template stands) under collapsed disclosures
@@ -2192,7 +2426,6 @@ impl ConfigForm {
             s4_bind: Self::field(window, cx, "Bind interface", None),
             s4_inet4: Self::field(window, cx, "IPv4 bind address", None),
             s4_inet6: Self::field(window, cx, "IPv6 bind address", None),
-            s4_open: Rc::new(RefCell::new(false)),
             vless_open: Rc::new(RefCell::new(false)),
             // Config-completeness T03: panels open blank (every fold
             // no-ops, so the template stands) under collapsed disclosures.
@@ -2417,7 +2650,7 @@ impl ConfigForm {
             guided_server: Self::field(
                 window,
                 cx,
-                "Upstream server",
+                "Server (e.g. example.com)",
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server", "address"],
@@ -2426,7 +2659,7 @@ impl ConfigForm {
             guided_port: Self::field(
                 window,
                 cx,
-                "Upstream port",
+                "Port (e.g. 443)",
                 Some(&guided_prefill_value(
                     &config.params,
                     &["server_port", "port"],
@@ -2584,7 +2817,6 @@ impl ConfigForm {
                 "IPv6 bind address",
                 Some(&guided_prefill_value(params, &["inet6_bind_address"])),
             ),
-            s4_open: Rc::new(RefCell::new(false)),
             vless_open: Rc::new(RefCell::new(false)),
             // Config-completeness T03: inner pages echo the row's params
             // JSON (untouched values fold back byte-identical — no spurious
@@ -3442,43 +3674,63 @@ impl ConfigForm {
     /// `<prefix>-uuid-generate`. Same kit pieces as the T02 inline row
     /// (`Input` + `mask_toggle`, `.small()` `Button` + tooltip, honest
     /// toast naming the protocol-neutral outcome).
+    /// Ticket 06: the label carries `*` (blank fails validation) and a
+    /// `Not Set`/`Already Set` presence caption rides under the row
+    /// (`<prefix>-uuid-state`; presence only, the value never renders).
     fn uuid_row(
         &self,
         view: &Entity<AppView>,
         secret: &Entity<InputState>,
         id_prefix: &str,
+        cx: &App,
     ) -> impl IntoElement {
         let secret_entity = secret.clone();
         let uuid_view = view.clone();
-        field().label("UUID".to_string()).child(
+        let presence = secret_state_caption(secret.read(cx).value().as_ref()).to_string();
+        field().label("UUID *".to_string()).child(
             div()
                 .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
+                .flex_col()
+                .gap_1()
                 .child(
                     div()
-                        .flex_1()
-                        .id(format!("{id_prefix}-uuid"))
-                        .test_support()
-                        .child(Input::new(secret).mask_toggle()),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id(format!("{id_prefix}-uuid"))
+                                .test_support()
+                                .child(Input::new(secret).mask_toggle()),
+                        )
+                        .child(
+                            Button::new(format!("{id_prefix}-uuid-generate"))
+                                .small()
+                                .label("Generate")
+                                .tooltip("Generate a random UUIDv4")
+                                .accessibility_label("Generate a random UUIDv4")
+                                .on_click(move |_, window, cx| {
+                                    let generated = generate_uuid_v4();
+                                    uuid_view.update(cx, |_, cx| {
+                                        secret_entity.update(cx, |state, cx| {
+                                            state.set_value(generated, &mut *window, cx);
+                                        });
+                                    });
+                                    window.push_notification(
+                                        Notification::info("Generated a new UUID"),
+                                        cx,
+                                    );
+                                }),
+                        ),
                 )
                 .child(
-                    Button::new(format!("{id_prefix}-uuid-generate"))
-                        .small()
-                        .label("Generate")
-                        .tooltip("Generate a random UUIDv4")
-                        .accessibility_label("Generate a random UUIDv4")
-                        .on_click(move |_, window, cx| {
-                            let generated = generate_uuid_v4();
-                            uuid_view.update(cx, |_, cx| {
-                                secret_entity.update(cx, |state, cx| {
-                                    state.set_value(generated, &mut *window, cx);
-                                });
-                            });
-                            window
-                                .push_notification(Notification::info("Generated a new UUID"), cx);
-                        }),
+                    div()
+                        .id(format!("{id_prefix}-uuid-state"))
+                        .test_support()
+                        .text_sm()
+                        .child(presence),
                 ),
         )
     }
@@ -3555,65 +3807,32 @@ impl ConfigForm {
             .content(div().id(section_id).test_support().child(block))
     }
 
-    /// Config-completeness T03: shared Transport panel (S1) — the exact T02
-    /// section (network picker plus per-network conditionals; `headers` /
-    /// early-data have no inputs by decision — hand JSON carrying them fails
-    /// typed at generate, never silently), shared by the
-    /// vless/vmess/trojan pages (one rule, three pages).
-    fn s1_section(&self, view: &Entity<AppView>, cx: &App) -> impl IntoElement {
-        // S1: Transport — network picker plus per-network conditionals
-        // (only keys `apply_transport` maps; `headers`/early-data have no
-        // inputs, and hand JSON carrying them fails typed at generate).
-        let network = Self::panel_value(&self.s1_network, cx, "tcp");
+    /// Ticket 06 (throne-adoption): shared Network box (S1, picker half) —
+    /// the stream transport network picker. The per-network disguise inputs
+    /// (ws path/host, httpupgrade/http host/path/method, grpc service name)
+    /// live in [`ConfigForm::s1_camouflage_section`] (the right-column
+    /// `Camouflage` box), so rare knobs stop crowding the transport row.
+    fn s1_network_section(&self, view: &Entity<AppView>, _cx: &App) -> impl IntoElement {
+        // S1: Transport picker only — conditionals ride the Camouflage box.
         let network_select = self.s1_network.clone();
-        let mut s1_body = div().flex().flex_col().gap_1().child(
-            field().label("Network".to_string()).child(
-                div()
-                    .id("s1-network-tip")
-                    .test_support()
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| Tooltip::new("Stream transport network".to_string()))
-                            .into()
-                    })
-                    .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        Select::new(&network_select)
-                            .id("s1-network")
-                            .small()
-                            .accessibility_label("Stream transport network"),
-                    ),
-            ),
+        let picker = field().label("Network".to_string()).child(
+            div()
+                .id("s1-network-tip")
+                .test_support()
+                .tooltip(move |_, cx| {
+                    cx.new(|_| Tooltip::new("Stream transport network".to_string()))
+                        .into()
+                })
+                .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    Select::new(&network_select)
+                        .id("s1-network")
+                        .small()
+                        .accessibility_label("Stream transport network"),
+                ),
         );
-        let conditional = |id: &'static str, label: &str, state: &Entity<InputState>| {
-            field()
-                .label(label.to_string())
-                .child(div().id(id).test_support().child(Input::new(state)))
-        };
-        match network.as_str() {
-            "ws" => {
-                s1_body = s1_body
-                    .child(conditional("s1-path", "Path", &self.s1_path))
-                    .child(conditional("s1-host", "Host", &self.s1_host));
-            }
-            "httpupgrade" | "http" => {
-                s1_body = s1_body
-                    .child(conditional("s1-host", "Host", &self.s1_host))
-                    .child(conditional("s1-path", "Path", &self.s1_path));
-                if network == "http" {
-                    s1_body = s1_body.child(conditional("s1-method", "Method", &self.s1_method));
-                }
-            }
-            "grpc" => {
-                s1_body = s1_body.child(conditional(
-                    "s1-service-name",
-                    "Service name",
-                    &self.s1_service_name,
-                ));
-            }
-            _ => {}
-        }
         field().label_indent(false).child(
             Collapsible::new()
                 .open(*self.s1_open.borrow())
@@ -3628,7 +3847,7 @@ impl ConfigForm {
                                 .flex_1()
                                 .id("s1-caption")
                                 .test_support()
-                                .child(Label::new("Transport")),
+                                .child(Label::new("Network")),
                         )
                         .child(panel_toggle_button(
                             "s1-toggle",
@@ -3641,35 +3860,97 @@ impl ConfigForm {
                             &self.s1_open,
                         )),
                 )
-                .content(div().id("s1-section").test_support().child(s1_body)),
+                .content(div().id("s1-section").test_support().child(picker)),
         )
     }
 
-    /// Config-completeness T03: shared TLS panel, optional variant (S2) —
-    /// the exact T02 section (enable toggle plus credential inputs;
-    /// disabling folds `security` away while every other key stays
-    /// preserved), shared by the vless/vmess/trojan pages.
-    /// Config-completeness T05: `forced` renders the MustTLS variant (same
-    /// credential inputs over the shared entities, no enable toggle — the
-    /// forced fold locks `security` to tls/reality instead); the caption
-    /// names the lock honestly.
-    fn s2_section(
+    /// Ticket 06: shared Camouflage box (S1, disguise half) — the
+    /// per-network conditional inputs, always expanded (they are two rows
+    /// at most and only render for disguise-capable transports). `None`
+    /// for plain transports (tcp and friends carry no disguise keys), so
+    /// the right column stays honest about what applies. Same input ids
+    /// (`s1-path`/`s1-host`/`s1-method`/`s1-service-name`) as before the
+    /// split — only the box moved.
+    fn s1_camouflage_section(&self, cx: &App) -> Option<AnyElement> {
+        let network = Self::panel_value(&self.s1_network, cx, "tcp");
+        let conditional = |id: &'static str, label: &str, state: &Entity<InputState>| {
+            field()
+                .label(label.to_string())
+                .child(div().id(id).test_support().child(Input::new(state)))
+        };
+        let mut body = div().flex().flex_col().gap_1();
+        let disguised = match network.as_str() {
+            "ws" => {
+                body = body
+                    .child(conditional("s1-path", "Path", &self.s1_path))
+                    .child(conditional("s1-host", "Host", &self.s1_host));
+                true
+            }
+            "httpupgrade" | "http" => {
+                body = body
+                    .child(conditional("s1-host", "Host", &self.s1_host))
+                    .child(conditional("s1-path", "Path", &self.s1_path));
+                if network == "http" {
+                    body = body.child(conditional("s1-method", "Method", &self.s1_method));
+                }
+                true
+            }
+            "grpc" => {
+                body = body.child(conditional(
+                    "s1-service-name",
+                    "Service name",
+                    &self.s1_service_name,
+                ));
+                true
+            }
+            _ => false,
+        };
+        if !disguised {
+            return None;
+        }
+        Some(
+            field()
+                .label_indent(false)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("camouflage-caption")
+                                .test_support()
+                                .child(Label::new("Camouflage")),
+                        )
+                        .child(div().id("camouflage-section").test_support().child(body)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Ticket 06: retired in favor of the split halves — pages render
+    /// [`ConfigForm::s1_network_section`] in the main form and the dialog
+    /// shell renders [`ConfigForm::s1_camouflage_section`] in the right
+    /// column.
+    /// Ticket 06 (throne-adoption): shared TLS box (S2, switch half) — the
+    /// enable toggle (optional variant) or the always-on note (forced
+    /// variant, the fold locks `security` instead). Credentials ride the
+    /// right-column `TLS Security` box ([`ConfigForm::s2_security_section`])
+    /// and the Advanced dialog's `TLS extras`
+    /// ([`ConfigForm::s2_extras_section`]), so rare knobs stop crowding the
+    /// TLS row. Same caption/toggle/content ids as before the split.
+    fn s2_tls_section(
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
         cx: &App,
         forced: bool,
     ) -> impl IntoElement {
-        // S2: TLS, optional variant — enable toggle plus credential inputs.
-        // Disabling folds `security` away; every other key stays preserved.
-        // Forced variant: no toggle (the fold locks security instead).
         let _ = cx;
-        let s2_insecure = self.s2_insecure.clone();
-        let s2_repaint_insecure = repaint.clone();
-        let fp_select = self.s2_fp.clone();
-        let mut s2_body = div().flex().flex_col().gap_1();
+        let mut tls_body = div().flex().flex_col().gap_1();
         if forced {
-            s2_body = s2_body.child(
+            tls_body = tls_body.child(
                 field().label_indent(false).child(
                     div()
                         .id("s2-forced-note")
@@ -3680,7 +3961,7 @@ impl ConfigForm {
         } else {
             let s2_enable = self.s2_enable.clone();
             let s2_repaint = repaint.clone();
-            s2_body = s2_body.child(
+            tls_body = tls_body.child(
             field().label_indent(false).child(
                 div().id("s2-enable").test_support().child(
                     Switch::new("s2-enable-switch")
@@ -3699,7 +3980,51 @@ impl ConfigForm {
             ),
         );
         }
-        s2_body = s2_body
+        field().label_indent(false).child(
+            Collapsible::new()
+                .open(*self.s2_open.borrow())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("s2-caption")
+                                .test_support()
+                                .child(Label::new(
+                                    if forced { "TLS (always on)" } else { "TLS" }.to_string(),
+                                )),
+                        )
+                        .child(panel_toggle_button(
+                            "s2-toggle",
+                            if *self.s2_open.borrow() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                            view,
+                            &self.s2_open,
+                        )),
+                )
+                .content(div().id("s2-section").test_support().child(tls_body)),
+        )
+    }
+
+    /// Ticket 06: right-column `TLS Security` box — SNI, ALPN and the uTLS
+    /// fingerprint over the shared entities, always expanded (three rows;
+    /// the enable toggle stays on the left TLS box). Same input ids
+    /// (`s2-sni`/`s2-alpn`/`s2-fp`) as before the split — only the box
+    /// moved. Secret-free (hostnames and fingerprints, never keys).
+    fn s2_security_section(&self, cx: &App) -> impl IntoElement {
+        let _ = cx;
+        let fp_select = self.s2_fp.clone();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_1()
             .child(
                 field().label("SNI".to_string()).child(
                     div()
@@ -3735,7 +4060,36 @@ impl ConfigForm {
                                 .accessibility_label("uTLS fingerprint"),
                         ),
                 ),
-            )
+            );
+        field().label_indent(false).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .id("tls-security-caption")
+                        .test_support()
+                        .child(Label::new("TLS Security")),
+                )
+                .child(div().id("tls-security-section").test_support().child(body)),
+        )
+    }
+
+    /// Ticket 06: Advanced-dialog `TLS extras` — the testing-only insecure
+    /// switch plus the REALITY public key / short id over the shared
+    /// entities, always expanded. Same ids (`s2-insecure`/`s2-pbk`/
+    /// `s2-sid`) as before the split; rendered only in the Advanced dialog
+    /// ([`AppView::open_advanced_dialog`]), so rare knobs stay out of the
+    /// main form. Secret-free labels (presence only, never values).
+    fn s2_extras_section(&self, repaint: &DialogRepaint) -> impl IntoElement {
+        let s2_insecure = self.s2_insecure.clone();
+        let s2_repaint_insecure = repaint.clone();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_1()
             .child(
                 field().label_indent(false).child(
                     div().id("s2-insecure").test_support().child(
@@ -3769,38 +4123,33 @@ impl ConfigForm {
                 ),
             );
         field().label_indent(false).child(
-            Collapsible::new()
-                .open(*self.s2_open.borrow())
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .id("s2-caption")
-                                .test_support()
-                                .child(Label::new(
-                                    if forced { "TLS (always on)" } else { "TLS" }.to_string(),
-                                )),
-                        )
-                        .child(panel_toggle_button(
-                            "s2-toggle",
-                            if *self.s2_open.borrow() {
-                                "Hide"
-                            } else {
-                                "Show"
-                            },
-                            view,
-                            &self.s2_open,
-                        )),
+                        .flex_1()
+                        .id("tls-extras-caption")
+                        .test_support()
+                        .child(Label::new("TLS extras")),
                 )
-                .content(div().id("s2-section").test_support().child(s2_body)),
+                .child(div().id("tls-extras-section").test_support().child(body)),
         )
     }
 
+    /// Config-completeness T03: shared TLS panel, optional variant (S2) —
+    /// the exact T02 section (enable toggle plus credential inputs;
+    /// disabling folds `security` away while every other key stays
+    /// preserved), shared by the vless/vmess/trojan pages.
+    /// Config-completeness T05: `forced` renders the MustTLS variant (same
+    /// credential inputs over the shared entities, no enable toggle — the
+    /// forced fold locks `security` to tls/reality instead); the caption
+    /// names the lock honestly.
+    /// Ticket 06: retired in favor of the split halves — pages render
+    /// [`ConfigForm::s2_tls_section`] in the main form,
+    /// [`ConfigForm::s2_security_section`] in the right column, and
+    /// [`ConfigForm::s2_extras_section`] in the Advanced dialog.
     /// Config-completeness T03: shared Mux+Brutal panel (S3) — the exact
     /// T02 section (`flow=vision` unmounts the section with reason text,
     /// stored keys preserved, fold skipped; brutal forces On). `vision`
@@ -3938,14 +4287,15 @@ impl ConfigForm {
             .into_any_element()
     }
 
-    /// Config-completeness T03: shared Advanced dial panel (S4, dial half)
-    /// — the exact T02 section (four toggles plus timeout/bind inputs; TLS
-    /// extras are a later ticket with their own engine `tls{}` mapping),
-    /// shared by all four pages. Kit: `Switch` (`checked` + `on_change`
-    /// over shared cells) + `Input`.
+    /// Config-completeness T03: shared dial-fields section (S4) — four
+    /// toggles plus timeout/bind inputs. Ticket 06 renders it in the
+    /// Advanced dialog only (see [`AppView::open_advanced_dialog`]): the
+    /// small sheet shows the whole section, no inner disclosure, so its
+    /// fields never wait on a repaint round-trip. Kit: `Switch` (`checked`
+    /// + `on_change` over shared cells) + `Input`.
     fn s4_section(
         &self,
-        view: &Entity<AppView>,
+        _view: &Entity<AppView>,
         repaint: &DialogRepaint,
         cx: &App,
     ) -> impl IntoElement {
@@ -4038,40 +4388,29 @@ impl ConfigForm {
                         .child(Input::new(&self.s4_inet6)),
                 ),
             );
+        // Ticket 06: the Advanced dialog shows the whole section (small
+        // dialog, everything visible) — no inner disclosure, so the dialog
+        // never depends on a repaint round-trip to reveal its fields.
         field().label_indent(false).child(
-            Collapsible::new()
-                .open(*self.s4_open.borrow())
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .id("s4-caption")
-                                .test_support()
-                                .child(Label::new("Advanced dial")),
-                        )
-                        .child(panel_toggle_button(
-                            "s4-toggle",
-                            if *self.s4_open.borrow() {
-                                "Hide"
-                            } else {
-                                "Show"
-                            },
-                            view,
-                            &self.s4_open,
-                        )),
+                        .flex_1()
+                        .id("s4-caption")
+                        .test_support()
+                        .child(Label::new("Dial Fields")),
                 )
-                .content(div().id("s4-section").test_support().child(s4_body)),
+                .child(div().id("s4-section").test_support().child(s4_body)),
         )
     }
 
     /// Config-completeness T03: VMess guided page — uuid (+uuidgen button),
-    /// aid, cipher and packet_encoding inner plus the shared S1–S4 panels
-    /// (same section fns as VLESS — one rule, four pages). Rendered only
+    /// aid, cipher and packet_encoding inner plus the shared Network/TLS/Mux
+    /// panels (same section fns as VLESS — one rule, four pages; dial rides
+    /// the Advanced dialog). Rendered only
     /// while the live protocol is `vmess`; every other protocol keeps its
     /// form. The whole page rides ONE outer collapsed disclosure (a single
     /// header row at the 880x620 minimum — t11 pins the core form in-frame).
@@ -4086,7 +4425,7 @@ impl ConfigForm {
         cx: &App,
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
-        block = block.child(self.uuid_row(view, &self.vmess_uuid, "vmess"));
+        block = block.child(self.uuid_row(view, &self.vmess_uuid, "vmess", cx));
         block = block.child(
             field().label("Alter ID".to_string()).child(
                 div()
@@ -4111,10 +4450,11 @@ impl ConfigForm {
             "VMess packet encoding",
             &self.vmess_packet_encoding,
         ));
-        block = block.child(self.s1_section(view, cx));
-        block = block.child(self.s2_section(view, repaint, cx, false));
+        block = block.child(self.s1_network_section(view, cx));
+        block = block.child(self.s2_tls_section(view, repaint, cx, false));
         block = block.child(self.s3_section(view, repaint, cx, false));
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         Self::page_disclosure(
             "VMess settings",
             "vmess-section-caption",
@@ -4127,7 +4467,8 @@ impl ConfigForm {
     }
 
     /// Config-completeness T03: Trojan guided page — masked password inner
-    /// plus the full shared S1+S2+S3+S4 panels (same section fns as VLESS).
+    /// plus the full shared Network/TLS/Mux panels (same section fns as
+    /// VLESS; dial rides the Advanced dialog).
     /// Rendered only while the live protocol is `trojan`. Same kit set and
     /// outer-disclosure contract as [`ConfigForm::vmess_block`].
     fn trojan_block(
@@ -4137,18 +4478,17 @@ impl ConfigForm {
         cx: &App,
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
-        block = block.child(
-            field().label("Password".to_string()).child(
-                div()
-                    .id("trojan-password")
-                    .test_support()
-                    .child(Input::new(&self.trojan_password).mask_toggle()),
-            ),
-        );
-        block = block.child(self.s1_section(view, cx));
-        block = block.child(self.s2_section(view, repaint, cx, false));
+        block = block.child(password_row(
+            "Password *",
+            "trojan-password",
+            &self.trojan_password,
+            cx,
+        ));
+        block = block.child(self.s1_network_section(view, cx));
+        block = block.child(self.s2_tls_section(view, repaint, cx, false));
         block = block.child(self.s3_section(view, repaint, cx, false));
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         Self::page_disclosure(
             "Trojan settings",
             "trojan-section-caption",
@@ -4163,7 +4503,8 @@ impl ConfigForm {
     /// Config-completeness T03: Shadowsocks guided page — method, password,
     /// plugin, plugin_opts and uot inner with Mux-only Settings (no
     /// Transport/Security panels — Throne HasMux parity) plus the shared
-    /// S4 dial panel (dial fields only — no TLS section, HasTLS gating).
+    /// Advanced-dialog S4 dial (dial fields only — no TLS section, HasTLS
+    /// gating).
     /// Same kit set and outer-disclosure contract as
     /// [`ConfigForm::vmess_block`]. The plugin footer is honest: any
     /// non-empty plugin fails generate naming the field until its
@@ -4183,14 +4524,12 @@ impl ConfigForm {
             "Shadowsocks method",
             &self.ss_method,
         ));
-        block = block.child(
-            field().label("Password".to_string()).child(
-                div()
-                    .id("ss-password")
-                    .test_support()
-                    .child(Input::new(&self.ss_password).mask_toggle()),
-            ),
-        );
+        block = block.child(password_row(
+            "Password *",
+            "ss-password",
+            &self.ss_password,
+            cx,
+        ));
         block = block.child(Self::panel_select_row(
             "Plugin",
             "ss-plugin-tip",
@@ -4233,7 +4572,8 @@ impl ConfigForm {
             ));
         }
         block = block.child(self.s3_section(view, repaint, cx, false));
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         Self::page_disclosure(
             "Shadowsocks settings",
             "ss-section-caption",
@@ -4256,11 +4596,14 @@ impl ConfigForm {
         &self,
         view: &Entity<AppView>,
         repaint: &DialogRepaint,
+        cx: &App,
         peer: WgPeerRefs<'_>,
     ) -> impl IntoElement {
         let prefix = peer.prefix;
         let secret_entity = peer.private_key.clone();
         let keygen_view = view.clone();
+        let key_presence =
+            secret_state_caption(peer.private_key.read(cx).value().as_ref()).to_string();
         let sys_cell = peer.sys_ifc.clone();
         let sys_repaint = repaint.clone();
         let row = |id: String, label: &str, state: &Entity<InputState>| {
@@ -4281,21 +4624,26 @@ impl ConfigForm {
             .flex_col()
             .gap_2()
             .child(
-                field().label("Private key".to_string()).child(
+                field().label("Private key *".to_string()).child(
                     div()
                         .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1()
                         .child(
                             div()
-                                .flex_1()
-                                .id(format!("{prefix}-private-key"))
-                                .test_support()
-                                .child(Input::new(peer.private_key).mask_toggle()),
-                        )
-                        .child(
-                            Button::new(format!("{prefix}-private-key-generate"))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .id(format!("{prefix}-private-key"))
+                                        .test_support()
+                                        .child(Input::new(peer.private_key).mask_toggle()),
+                                )
+                                .child(
+                                    Button::new(format!("{prefix}-private-key-generate"))
                                 .small()
                                 .label("Generate")
                                 .tooltip(
@@ -4314,9 +4662,16 @@ impl ConfigForm {
                                         cx,
                                     );
                                 }),
+                        )
+                        .child(
+                            div()
+                                .id(format!("{prefix}-private-key-state"))
+                                .test_support()
+                                .text_sm()
+                                .child(key_presence),
                         ),
                 ),
-            )
+            ))
             .child(row(
                 format!("{prefix}-public-key"),
                 "Public key (peer)",
@@ -4371,7 +4726,7 @@ impl ConfigForm {
     }
 
     /// Config-completeness T04: WireGuard guided page — the shared peer/net
-    /// rows plus the shared S4 dial panel (no Transport/TLS/Mux — endpoint
+    /// rows plus the Advanced-dialog S4 dial (no Transport/TLS/Mux — endpoint
     /// parity). Rendered only while the live protocol is `wireguard`. Same
     /// outer-disclosure contract as [`ConfigForm::vmess_block`].
     fn wireguard_block(
@@ -4384,6 +4739,7 @@ impl ConfigForm {
         block = block.child(self.wg_peer_block(
             view,
             repaint,
+            cx,
             WgPeerRefs {
                 prefix: "wg",
                 private_key: &self.wg_private,
@@ -4398,7 +4754,8 @@ impl ConfigForm {
                 sys_ifc: &self.wg_sys_ifc,
             },
         ));
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("wg-notes").test_support().child(
                 "WireGuard rows become endpoints[] at generate. Blank AllowedIPs defaults to \
@@ -4419,7 +4776,7 @@ impl ConfigForm {
     /// Config-completeness T04: AmneziaWG guided page (headline) — all WG
     /// peer/net rows + enable marker + `awg_version` 2.0|3.x picker + the
     /// full J/S/H/I matrix + v3 fields + trailers/cookies switches, plus
-    /// the shared S4 dial panel. The v3 section hides unless 3.x is picked
+    /// the Advanced-dialog S4 dial. The v3 section hides unless 3.x is picked
     /// (entities persist, the fold always folds — R5 hide-preserve, never a
     /// wipe). Rendered only while the live protocol is `amneziawg`. Same
     /// kit set and outer-disclosure contract as
@@ -4470,6 +4827,7 @@ impl ConfigForm {
         block = block.child(self.wg_peer_block(
             view,
             repaint,
+            cx,
             WgPeerRefs {
                 prefix: "awg",
                 private_key: &self.awg_private,
@@ -4582,7 +4940,8 @@ impl ConfigForm {
                 ),
             );
         }
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("awg-notes").test_support().child(
                 "AmneziaWG rows run in the fork sidecar (sing-box-awg). v3-only keys on a 2.0 row \
@@ -4610,7 +4969,8 @@ impl ConfigForm {
     /// layouts swap as kit primitives with hidden halves preserved in their
     /// entities (R5 — the fold always folds both halves, credentials excepted:
     /// each folds only where its engine arm consumes it). Plus the shared
-    /// S2-forced + S4 panels. Same kit set and outer-disclosure contract as
+    /// S2-forced panels (S4 dial rides the Advanced dialog). Same kit set and
+    /// outer-disclosure contract as
     /// [`ConfigForm::wireguard_block`]: `RadioGroup` (`selected_index` +
     /// `on_change`), `Select::new(&state)` +
     /// `.id().small().accessibility_label()`, masked `Input` +
@@ -4718,14 +5078,12 @@ impl ConfigForm {
             .child(row("hy-down", "Down Mbps", &self.hy_down))
             .child(row("hy-obfs", "Obfs", &self.hy_obfs));
         if is_v2 {
-            block = block.child(
-                field().label("Password".to_string()).child(
-                    div()
-                        .id("hy-password")
-                        .test_support()
-                        .child(Input::new(&self.hy_password).mask_toggle()),
-                ),
-            );
+            block = block.child(password_row(
+                "Password *",
+                "hy-password",
+                &self.hy_password,
+                cx,
+            ));
         } else {
             block = block.child(Self::panel_select_row(
                 "Auth type",
@@ -4735,14 +5093,7 @@ impl ConfigForm {
                 "Hysteria auth type",
                 &self.hy_auth_type,
             ));
-            block = block.child(
-                field().label("Auth".to_string()).child(
-                    div()
-                        .id("hy-auth")
-                        .test_support()
-                        .child(Input::new(&self.hy_auth).mask_toggle()),
-                ),
-            );
+            block = block.child(password_row("Auth *", "hy-auth", &self.hy_auth, cx));
             block = block
                 .child(row(
                     "hy-recv-window-conn",
@@ -4759,8 +5110,9 @@ impl ConfigForm {
                 repaint,
             ));
         }
-        block = block.child(self.s2_section(view, repaint, cx, true));
-        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(self.s2_tls_section(view, repaint, cx, true));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("hy-notes").test_support().child(
                 "Hysteria v1 rows require up/down (blank refuses naming up_mbps/down_mbps); \
@@ -4781,7 +5133,8 @@ impl ConfigForm {
     /// Config-completeness T05: TUIC guided page — uuid (+uuidgen button) +
     /// password secrets, congestion_control + udp_relay_mode keep-blank
     /// pickers, udp_over_stream + zero_rtt switches, heartbeat text, plus the
-    /// shared S2-forced + S4 panels. Rendered only while the live protocol is
+    /// shared S2-forced panels (S4 dial rides the Advanced dialog). Rendered
+    /// only while the live protocol is
     /// `tuic`. Same kit set and outer-disclosure contract as
     /// [`ConfigForm::hysteria_block`].
     fn tuic_block(
@@ -4816,15 +5169,13 @@ impl ConfigForm {
             )
         };
         let mut block = div().flex().flex_col().gap_2();
-        block = block.child(self.uuid_row(view, &self.tuic_uuid, "tuic"));
-        block = block.child(
-            field().label("Password".to_string()).child(
-                div()
-                    .id("tuic-password")
-                    .test_support()
-                    .child(Input::new(&self.tuic_password).mask_toggle()),
-            ),
-        );
+        block = block.child(self.uuid_row(view, &self.tuic_uuid, "tuic", cx));
+        block = block.child(password_row(
+            "Password *",
+            "tuic-password",
+            &self.tuic_password,
+            cx,
+        ));
         block = block.child(Self::panel_select_row(
             "Congestion control",
             "tuic-cc-tip",
@@ -4865,8 +5216,9 @@ impl ConfigForm {
                     .child(Input::new(&self.tuic_heartbeat)),
             ),
         );
-        block = block.child(self.s2_section(view, repaint, cx, true));
-        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(self.s2_tls_section(view, repaint, cx, true));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("tuic-notes").test_support().child(
                 "TUIC runs TLS always-on (security locked tls). Blank congestion/relay stay unset.",
@@ -4885,7 +5237,7 @@ impl ConfigForm {
 
     /// Config-completeness T06: SOCKS guided page — version + network
     /// keep-blank/S1-rule pickers, username/password texts, udp_over_tcp
-    /// switch, plus the shared S4 dial panel (no Transport/TLS/Mux — inner
+    /// switch, plus the Advanced-dialog S4 dial (no Transport/TLS/Mux — inner
     /// parity). Rendered only while the live protocol is `socks`. The footer
     /// is honest: blank version leaves the stock 5, and 4 fails generate
     /// naming the field. Same kit set and outer-disclosure contract as
@@ -4918,14 +5270,12 @@ impl ConfigForm {
                     .child(Input::new(&self.socks_username)),
             ),
         );
-        block = block.child(
-            field().label("Password".to_string()).child(
-                div()
-                    .id("socks-password")
-                    .test_support()
-                    .child(Input::new(&self.socks_password).mask_toggle()),
-            ),
-        );
+        block = block.child(password_row(
+            "Password",
+            "socks-password",
+            &self.socks_password,
+            cx,
+        ));
         block = block.child(Self::panel_select_row(
             "Network",
             "socks-network-tip",
@@ -4950,7 +5300,8 @@ impl ConfigForm {
                 ),
             ),
         );
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("socks-notes").test_support().child(
                 "SOCKS serves version 5 stock (blank leaves the default); 4 fails generate \
@@ -4970,11 +5321,11 @@ impl ConfigForm {
 
     /// Config-completeness T06: HTTP/HTTPS guided page — username/password/
     /// path/headers texts (path/headers are parity+: Throne `edit_http.ui`
-    /// lacks them, both engines accept them) plus the shared S2-optional +
-    /// S4 panels. One block serves both `http` and `https` (hysteria v1/v2
-    /// precedent — one entity set, two protocols). The footer is honest:
-    /// `https` rows serve TLS-on even with the panel off, and `check` judges
-    /// the headers shape. Same kit set and outer-disclosure contract as
+    /// lacks them, both engines accept them) plus the shared S2-optional
+    /// (S4 dial rides the Advanced dialog). One block serves both `http` and
+    /// `https` (hysteria v1/v2 precedent — one entity set, two protocols).
+    /// The footer is honest: `https` rows serve TLS-on even with the panel
+    /// off, and `check` judges the headers shape. Same kit set and outer-disclosure contract as
     /// [`ConfigForm::socks_block`].
     fn http_block(
         &self,
@@ -4992,14 +5343,12 @@ impl ConfigForm {
                         .child(Input::new(&self.http_username)),
                 ),
             )
-            .child(
-                field().label("Password".to_string()).child(
-                    div()
-                        .id("http-password")
-                        .test_support()
-                        .child(Input::new(&self.http_password).mask_toggle()),
-                ),
-            )
+            .child(password_row(
+                "Password",
+                "http-password",
+                &self.http_password,
+                cx,
+            ))
             .child(
                 field().label("Path".to_string()).child(
                     div()
@@ -5016,8 +5365,9 @@ impl ConfigForm {
                         .child(Input::new(&self.http_headers)),
                 ),
             );
-        block = block.child(self.s2_section(view, repaint, cx, false));
-        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(self.s2_tls_section(view, repaint, cx, false));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("http-notes").test_support().child(
                 "HTTPS rows serve TLS-on (security=tls) even with the panel off. \
@@ -5037,7 +5387,8 @@ impl ConfigForm {
 
     /// Config-completeness T06: AnyTLS guided page — masked password secret
     /// plus the idle-session tunables (interval/timeout durations, min
-    /// count), plus the shared S2-forced + S4 panels. Rendered only while the
+    /// count), plus the shared S2-forced panels (S4 dial rides the Advanced
+    /// dialog). Rendered only while the
     /// live protocol is `anytls`. The footer is honest about the duration
     /// shapes. Same kit set and outer-disclosure contract as
     /// [`ConfigForm::socks_block`].
@@ -5048,15 +5399,13 @@ impl ConfigForm {
         cx: &App,
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
+        block = block.child(password_row(
+            "Password *",
+            "anytls-password",
+            &self.anytls_password,
+            cx,
+        ));
         block = block
-            .child(
-                field().label("Password".to_string()).child(
-                    div()
-                        .id("anytls-password")
-                        .test_support()
-                        .child(Input::new(&self.anytls_password).mask_toggle()),
-                ),
-            )
             .child(
                 field().label("Idle check interval".to_string()).child(
                     div()
@@ -5081,8 +5430,9 @@ impl ConfigForm {
                         .child(Input::new(&self.anytls_min)),
                 ),
             );
-        block = block.child(self.s2_section(view, repaint, cx, true));
-        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(self.s2_tls_section(view, repaint, cx, true));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("anytls-notes").test_support().child(
                 "AnyTLS runs TLS always-on (security locked tls). Interval/timeout are \
@@ -5102,7 +5452,8 @@ impl ConfigForm {
 
     /// Config-completeness T06: Naïve guided page — username + masked
     /// password secrets, uot/quic switches, congestion_control keep-blank
-    /// picker, plus the shared S2-forced + S4 panels. Rendered only while the
+    /// picker, plus the shared S2-forced panels (S4 dial rides the Advanced
+    /// dialog). Rendered only while the
     /// live protocol is `naive`. The footer is honest about the 1.14.2
     /// shapes. Same kit set and outer-disclosure contract as
     /// [`ConfigForm::socks_block`].
@@ -5140,21 +5491,19 @@ impl ConfigForm {
         let mut block = div().flex().flex_col().gap_2();
         block = block
             .child(
-                field().label("Username".to_string()).child(
+                field().label("Username *".to_string()).child(
                     div()
                         .id("naive-username")
                         .test_support()
                         .child(Input::new(&self.naive_username)),
                 ),
             )
-            .child(
-                field().label("Password".to_string()).child(
-                    div()
-                        .id("naive-password")
-                        .test_support()
-                        .child(Input::new(&self.naive_password).mask_toggle()),
-                ),
-            );
+            .child(password_row(
+                "Password *",
+                "naive-password",
+                &self.naive_password,
+                cx,
+            ));
         block = block.child(switch_row(
             "naive-uot",
             "naive-uot-switch".to_string(),
@@ -5179,8 +5528,9 @@ impl ConfigForm {
             "Naive congestion control",
             &self.naive_cc,
         ));
-        block = block.child(self.s2_section(view, repaint, cx, true));
-        block = block.child(self.s4_section(view, repaint, cx));
+        block = block.child(self.s2_tls_section(view, repaint, cx, true));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("naive-notes").test_support().child(
                 "Naïve runs TLS always-on (security locked tls). Blank congestion control \
@@ -5201,7 +5551,7 @@ impl ConfigForm {
     /// Config-completeness T06: SSH guided page — user text, masked password
     /// secret, private-key blob area + path input + Browse picker + masked
     /// passphrase, host-key + algs comma lists, client version, plus the
-    /// shared S4 dial panel (no TLS — inner parity). Rendered only while the
+    /// Advanced-dialog S4 dial (no TLS — inner parity). Rendered only while the
     /// live protocol is `ssh`. The key area is a kit `Textarea` (Throne
     /// text-area parity; `Input::mask_toggle` exists only on `Input` in kit
     /// 0.6.6, so the blob stays visible while both secrets stay masked). The
@@ -5210,7 +5560,7 @@ impl ConfigForm {
     fn ssh_block(
         &self,
         view: &Entity<AppView>,
-        repaint: &DialogRepaint,
+        _repaint: &DialogRepaint,
         cx: &App,
     ) -> impl IntoElement {
         let browse_view = view.clone();
@@ -5226,14 +5576,12 @@ impl ConfigForm {
                         .child(Input::new(&self.ssh_user)),
                 ),
             )
-            .child(
-                field().label("Password".to_string()).child(
-                    div()
-                        .id("ssh-password")
-                        .test_support()
-                        .child(Input::new(&self.ssh_password).mask_toggle()),
-                ),
-            )
+            .child(password_row(
+                "Password",
+                "ssh-password",
+                &self.ssh_password,
+                cx,
+            ))
             .child(
                 field().label("Private key".to_string()).child(
                     div()
@@ -5311,7 +5659,8 @@ impl ConfigForm {
                         .child(Input::new(&self.ssh_client_version)),
                 ),
             );
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("ssh-notes").test_support().child(
                 "Browse fills the path and loads the key file (no hand-paste). Host key \
@@ -5331,7 +5680,7 @@ impl ConfigForm {
 
     /// Config-completeness T07: Snell guided page — masked psk secret +
     /// version picker + obfs_mode/host + userkey + reuse Switch + network +
-    /// mode texts, plus the shared S4 panel. Engine-driven list (the Throne
+    /// mode texts, plus the Advanced-dialog S4. Engine-driven list (the Throne
     /// source snapshot has zero `snell` hits, so there is no Throne editor to
     /// copy — fields come from `engine.rs` + `import.rs`). Same kit set and
     /// outer-disclosure contract as [`ConfigForm::socks_block`].
@@ -5345,14 +5694,7 @@ impl ConfigForm {
         let reuse_repaint = repaint.clone();
         let mut block = div().flex().flex_col().gap_2();
         block = block
-            .child(
-                field().label("PSK".to_string()).child(
-                    div()
-                        .id("snell-psk")
-                        .test_support()
-                        .child(Input::new(&self.snell_psk).mask_toggle()),
-                ),
-            )
+            .child(password_row("PSK *", "snell-psk", &self.snell_psk, cx))
             .child(Self::panel_select_row(
                 "Version",
                 "snell-version-tip",
@@ -5417,7 +5759,8 @@ impl ConfigForm {
                 ),
             ),
         );
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("snell-notes").test_support().child(
                 "Snell serves version 4 when blank; 6 needs a v6 peer. \
@@ -5436,7 +5779,8 @@ impl ConfigForm {
     }
 
     /// Config-completeness T07: ShadowTLS guided page (version picker 1|2|3
-    /// with password text, plus the shared S2-forced and S4 panels). Rendered
+    /// with password text, plus the shared S2-forced (S4 dial rides the
+    /// Advanced dialog). Rendered
     /// only while the live protocol is `shadowtls`. Same kit set and
     /// outer-disclosure contract as [`ConfigForm::socks_block`].
     fn shadowtls_block(
@@ -5455,16 +5799,15 @@ impl ConfigForm {
                 "ShadowTLS version",
                 &self.shadowtls_version,
             ))
-            .child(
-                field().label("Password".to_string()).child(
-                    div()
-                        .id("shadowtls-password")
-                        .test_support()
-                        .child(Input::new(&self.shadowtls_password).mask_toggle()),
-                ),
-            );
-        block = block.child(self.s2_section(view, repaint, cx, true));
-        block = block.child(self.s4_section(view, repaint, cx));
+            .child(password_row(
+                "Password",
+                "shadowtls-password",
+                &self.shadowtls_password,
+                cx,
+            ));
+        block = block.child(self.s2_tls_section(view, repaint, cx, true));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         block = block.child(field().label_indent(false).child(
             div().id("shadowtls-notes").test_support().child(
                 "ShadowTLS runs TLS always-on (security locked tls). Version blank takes \
@@ -5497,7 +5840,7 @@ impl ConfigForm {
     ) -> impl IntoElement {
         let _ = repaint;
         let mut block = div().flex().flex_col().gap_2();
-        block = block.child(self.uuid_row(view, &self.xray_uuid, "xray"));
+        block = block.child(self.uuid_row(view, &self.xray_uuid, "xray", _cx));
         block = block
             .child(
                 field().label("Encryption".to_string()).child(
@@ -5847,7 +6190,8 @@ impl ConfigForm {
     }
 
     /// Config-completeness T02: VLESS guided page — inner fields plus the
-    /// shared S1–S4 panels as kit-maximal `Collapsible` sections (controlled
+    /// shared Network/TLS/Mux panels as kit-maximal `Collapsible` sections
+    /// (controlled
     /// `open`, no motion id — closed content unmounts, entities persist, so
     /// hiding never wipes per R5). Rendered only while the live protocol is
     /// `vless`; every other protocol keeps the T01 form byte-for-byte.
@@ -5868,7 +6212,7 @@ impl ConfigForm {
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
         // Inner: uuid (masked + generate) + flow + packet_encoding.
-        block = block.child(self.uuid_row(view, &self.vless_uuid, "vless"));
+        block = block.child(self.uuid_row(view, &self.vless_uuid, "vless", cx));
         let flow_select = self.vless_flow.clone();
         let packet_select = self.vless_packet_encoding.clone();
         block = block.child(
@@ -5911,15 +6255,16 @@ impl ConfigForm {
                     ),
             ),
         );
-        // S1: Transport (shared section — see `s1_section`).
-        block = block.child(self.s1_section(view, cx));
+        // S1: Transport picker (shared section — see `s1_network_section`).
+        block = block.child(self.s1_network_section(view, cx));
         // S2: TLS, optional variant (shared section — see `s2_section`).
-        block = block.child(self.s2_section(view, repaint, cx, false));
+        block = block.child(self.s2_tls_section(view, repaint, cx, false));
         // S3: Mux+Brutal (shared section — see `s3_section`).
         let flow = Self::panel_value(&self.vless_flow, cx, "");
         block = block.child(self.s3_section(view, repaint, cx, flow == "xtls-rprx-vision"));
         // S4: Advanced dial (shared section — see `s4_section`).
-        block = block.child(self.s4_section(view, repaint, cx));
+        // Ticket 06: dial fields ride the Advanced dialog (see
+        // `open_advanced_dialog`), never the main form.
         // One outer collapsed disclosure: a single header row at the minimum
         // frame (t11), the full page one click away.
         Self::page_disclosure(
@@ -6088,9 +6433,43 @@ impl ConfigForm {
         // below the minimum-frame fold — verified by
         // `t11_add_dialog_paints_inside_minimum_frame`); the toggle rides the
         // hint row when collapsed and the params buttons row when expanded.
-        let mut form = v_form()
-            .small()
-            .child(dialog_field("field-name", "Name", self.name));
+        let mut form = v_form().small();
+        // Ticket 06: the Common box head (Type/Name/Server/Server port/
+        // Identity + Advanced Settings button) — caption plus the second
+        // dialog opener; the rows join below (protocol row next, endpoint
+        // rows in the guided branch). `*` marks required fill-ins; hover
+        // copy stays secret-free by construction (static strings only).
+        let mut common_head = div().flex().flex_row().items_center().gap_2().child(
+            div()
+                .flex_1()
+                .id("common-caption")
+                .test_support()
+                .child(Label::new("Common")),
+        );
+        if has_advanced_dialog(&protocol_text) {
+            common_head = common_head.child(advanced_settings_button(&view, &toggle_form));
+        }
+        let mut common = div().flex().flex_col().gap_1().child(common_head).child(
+            field().label("Name *".to_string()).child(
+                div()
+                    .id("field-name-tip")
+                    .test_support()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| {
+                            Tooltip::new(
+                                "Display name for this row (cards and toasts name it)".to_string(),
+                            )
+                        })
+                        .into()
+                    })
+                    .child(
+                        div()
+                            .id("field-name")
+                            .test_support()
+                            .child(Input::new(&self.name)),
+                    ),
+            ),
+        );
         // Config-completeness T01: protocol is a kit `Select` over the 23
         // canonical types on Add (no free-text typos possible) and read-only
         // `protocol-lock` text on Edit (type locked once created, Throne §7.7
@@ -6099,7 +6478,7 @@ impl ConfigForm {
         // wrapper (kit `Select` has no tooltip slot — facet-bar precedent).
         if self.protocol_locked {
             let locked = self.locked_protocol.clone();
-            form = form.child(
+            common = common.child(
                 field().label("Protocol".to_string()).child(
                     div()
                         .id("protocol-lock")
@@ -6113,7 +6492,7 @@ impl ConfigForm {
             );
         } else {
             let select = self.protocol_select.clone();
-            form = form.child(
+            common = common.child(
                 field().label("Protocol".to_string()).child(
                     div()
                         .id("protocol-select-tip")
@@ -6143,70 +6522,125 @@ impl ConfigForm {
                 ),
             );
         }
-        // Config-completeness T02/T03: guided page (inner + shared panels,
-        // prebuilt above) between the protocol row and the guided/JSON
-        // swap — other protocols keep the T01 form byte-for-byte.
-        if let Some(panels) = guided_panels {
-            form = form.child(field().label_indent(false).child(panels));
-        }
+        // Ticket 06: two-column Throne regroup — the Common box and the
+        // `<Type>` box ride the left column, `TLS Security` + `Camouflage`
+        // ride the right column where applicable. The guided/JSON swap keeps
+        // its contract (expanded shows the raw box only — rare knobs live
+        // in the Advanced dialog either way). Folds, validation and the
+        // params toggle flow below never read layout.
+        let has_page = guided_panels.is_some();
+        let camouflage = if has_page && has_network_panel(&protocol_text) {
+            self.s1_camouflage_section(cx)
+        } else {
+            None
+        };
+        let show_right =
+            (has_page && tls_panel_plan(&protocol_text).is_some()) || camouflage.is_some();
         if expanded {
+            form = form.child(
+                field()
+                    .label_indent(false)
+                    .child(div().id("common-section").test_support().child(common)),
+            );
             form = form.child(
                 field()
                     .label_indent(false)
                     .child(Collapsible::new().open(expanded).content(params_row)),
             );
         } else {
-            // The guided mini-form rides ONE labelless field — side-by-side
-            // Server/Server port, the optional masked Identity, then the hint
-            // + Advanced toggle row — so the guided block costs a single grid
-            // row set instead of three.
-            let mut guided_block = div().flex().flex_col().gap_1();
+            // The endpoint rows join the Common box (side-by-side Server /
+            // Server port, the optional masked Identity, then the hint +
+            // raw-JSON toggle row).
             // Config-completeness T01: virtual rows hide the endpoint inputs
             // (see `virtual_row` above); Identity already hides for these via
             // the `guided.key` gate below, and the params JSON keeps its slots
             // for explicit edits. Hidden values are never wiped (fold no-ops
             // on blank inputs).
             if !virtual_row {
-                guided_block = guided_block.child(
+                common = common.child(
                     div()
                         .flex()
                         .flex_row()
                         .gap_2()
                         .child(
-                            div().flex_1().child(
-                                field().label("Server").child(
+                            div().flex_1().min_w_0().child(
+                                field().label("Server *").child(
                                     div()
-                                        .id("field-guided-server")
+                                        .id("field-guided-server-tip")
                                         .test_support()
-                                        .child(Input::new(&self.guided_server)),
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| {
+                                                Tooltip::new(
+                                                    "Upstream server address (IP or hostname)"
+                                                        .to_string(),
+                                                )
+                                            })
+                                            .into()
+                                        })
+                                        .child(
+                                            div()
+                                                .id("field-guided-server")
+                                                .test_support()
+                                                .child(Input::new(&self.guided_server)),
+                                        ),
                                 ),
                             ),
                         )
                         .child(
-                            div().flex_1().child(
-                                field().label("Server port").child(
+                            div().flex_1().min_w_0().child(
+                                field().label("Server port *").child(
                                     div()
-                                        .id("field-guided-port")
+                                        .id("field-guided-port-tip")
                                         .test_support()
-                                        .child(Input::new(&self.guided_port)),
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| {
+                                                Tooltip::new("Upstream server port".to_string())
+                                            })
+                                            .into()
+                                        })
+                                        .child(
+                                            div()
+                                                .id("field-guided-port")
+                                                .test_support()
+                                                .child(Input::new(&self.guided_port)),
+                                        ),
                                 ),
                             ),
                         ),
                 );
             }
-            if guided.is_some_and(|guided| guided.key.is_some()) {
-                guided_block = guided_block.child(
+            // Ticket 06: the generic Identity row hides where the `<Type>`
+            // box owns the same secret (see [`block_owns_identity`]) — one
+            // password input, never two stacked duplicates. The label names
+            // the live params key with a `*`; the presence caption reads
+            // `Not Set`/`Already Set` (the value never renders).
+            if guided.is_some_and(|guided| guided.key.is_some())
+                && !block_owns_identity(&protocol_text)
+            {
+                let identity_presence =
+                    secret_state_caption(self.guided_identity.read(cx).value().as_ref())
+                        .to_string();
+                common = common.child(
                     field()
-                        // Ticket 05: the label names the live params key
-                        // (`Identity (uuid)`); the secret renders masked with
-                        // a reveal toggle (kit `mask_toggle`) — credentials
-                        // stay out of sight and out of the clipboard.
-                        .label(guided_identity_label(&protocol_text))
+                        .label(format!("{} *", guided_identity_label(&protocol_text)))
                         .child(
                             div()
-                                .id("field-guided-identity")
-                                .test_support()
-                                .child(Input::new(&self.guided_identity).mask_toggle()),
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id("field-guided-identity")
+                                        .test_support()
+                                        .child(Input::new(&self.guided_identity).mask_toggle()),
+                                )
+                                .child(
+                                    div()
+                                        .id("field-guided-identity-state")
+                                        .test_support()
+                                        .text_sm()
+                                        .child(identity_presence),
+                                ),
                         ),
                 );
             }
@@ -6217,12 +6651,40 @@ impl ConfigForm {
             } else {
                 hint_row = hint_row.child(div().flex_1());
             }
-            guided_block = guided_block.child(hint_row.child(advanced_toggle_button(
+            common = common.child(hint_row.child(advanced_toggle_button(
                 "Advanced (raw JSON)",
                 &view,
                 &toggle_form,
             )));
-            form = form.child(field().label_indent(false).child(guided_block));
+            let mut left_col = div().flex().flex_col().gap_2().flex_1().min_w_0().child(
+                field()
+                    .label_indent(false)
+                    .child(div().id("common-section").test_support().child(common)),
+            );
+            if let Some(panels) = guided_panels {
+                left_col = left_col.child(field().label_indent(false).child(panels));
+            }
+            if show_right {
+                let mut right_col = div().flex().flex_col().gap_2().flex_1().min_w_0();
+                if has_page && tls_panel_plan(&protocol_text).is_some() {
+                    right_col = right_col.child(self.s2_security_section(cx));
+                }
+                if let Some(camouflage) = camouflage {
+                    right_col = right_col.child(camouflage);
+                }
+                form = form.child(
+                    field().label_indent(false).child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(left_col)
+                            .child(right_col),
+                    ),
+                );
+            } else {
+                form = form.child(field().label_indent(false).child(left_col));
+            }
         }
         form = form.child(dialog_field("field-group", "Group", self.group));
         form = form.child(
@@ -6231,16 +6693,16 @@ impl ConfigForm {
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child(div().flex_1().child(dialog_field(
+                    .child(div().flex_1().min_w_0().child(dialog_field(
                         "field-bind",
                         "Bind address",
                         self.bind,
                     )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(dialog_field("field-port", "Port", self.port)),
-                    ),
+                    .child(div().flex_1().min_w_0().child(dialog_field(
+                        "field-port",
+                        "Port",
+                        self.port,
+                    ))),
             ),
         );
         if let Some(budget) = port_budget {
@@ -8366,6 +8828,9 @@ fn subscription_failures_text(failures: &[crate::import::ImportFailure]) -> Stri
 /// `None` when there is nothing to report (never an empty toast).
 /// The bool is the warning flag (any failed member — or any preserved user
 /// edit — warns).
+/// Ticket 08 (throne-adoption): bracket diff counts plus `[=] Still in
+/// use` for kept serving rows (see [`refresh_summary_text`]).
+#[allow(clippy::too_many_arguments)]
 fn coalesced_refresh_message(
     subs: usize,
     added: usize,
@@ -8373,12 +8838,17 @@ fn coalesced_refresh_message(
     removed: usize,
     failed: usize,
     conflicts: usize,
+    in_use: usize,
 ) -> Option<(bool, String)> {
     if subs == 0 {
         return None;
     }
-    let text =
-        format!("Background refresh: {subs} subscription(s): +{added} ~{updated} -{removed}");
+    let mut text = format!(
+        "Background refresh: {subs} subscription(s): [+]Added {added} / [~]Updated {updated} / [-]Deleted {removed}"
+    );
+    if in_use > 0 {
+        text.push_str(&format!(" / [=] Still in use {in_use}"));
+    }
     if failed == 0 && conflicts == 0 {
         Some((false, text))
     } else {
@@ -8553,6 +9023,139 @@ fn probe_summary_toast(count: usize, live: usize, dead: usize) -> String {
     format!("Tested {count} endpoint(s): {live} live · {dead} dead")
 }
 
+/// Ticket 09 (throne-adoption): splice the row's transport-security
+/// posture into the rendered meta line (index 1 of the dense lines) when
+/// Show-Security is on. Pure seam; the pinned line builder is untouched.
+fn apply_show_security(lines: &mut [String], row: &ProxyConfig) {
+    if let Some(meta) = lines.get_mut(1) {
+        *meta = format!(
+            "{} · {}",
+            meta,
+            row_security_label(&row.protocol, &row.params)
+        );
+    }
+}
+
+/// Ticket 09 (throne-adoption): group-test summary toast — names the group
+/// scope, the run size, and the outcome counts (plus the early-stop mark
+/// when `Stop Testing` cut the run short).
+fn group_test_summary_toast(
+    group: &str,
+    count: usize,
+    live: usize,
+    dead: usize,
+    stopped: bool,
+) -> String {
+    let base =
+        format!("Tested {count} endpoint(s) in group \"{group}\": {live} live · {dead} dead");
+    if stopped {
+        format!("{base} (stopped early)")
+    } else {
+        base
+    }
+}
+
+/// Ticket 09 (throne-adoption): speedtest summary toast — names the scope,
+/// the mode, and measured vs failed counts.
+fn speed_test_summary_toast(
+    scope: &str,
+    mode: SpeedtestMode,
+    measured: usize,
+    failed: usize,
+) -> String {
+    format!(
+        "Speedtest ({}): {scope}: {measured} measured · {failed} failed",
+        mode.as_str()
+    )
+}
+
+/// Ticket 09 (throne-adoption): one speedtest outcome rendered as a toast —
+/// names the row plus the measured rate or the named failure.
+fn speed_result_toast(name: &str, outcome: &SpeedtestOutcome) -> String {
+    match (outcome.mbps, outcome.error.as_deref()) {
+        (Some(_), _) => format!("Speedtest \"{name}\": {}", format_speed_result(outcome)),
+        (None, Some(cause)) => format!("Speedtest \"{name}\": failed — {cause}"),
+        (None, None) => format!("Speedtest \"{name}\": no result"),
+    }
+}
+
+/// Ticket 09 (throne-adoption): out-IP summary toast — names the scope,
+/// the resolved addresses (deduped, at most 3 shown), and failures.
+fn out_ip_summary_toast(scope: &str, ips: &[String], failed: &[String]) -> String {
+    let mut unique: Vec<&String> = Vec::new();
+    for ip in ips {
+        if !unique.contains(&ip) {
+            unique.push(ip);
+        }
+    }
+    let shown: Vec<&str> = unique.iter().take(3).map(|ip| ip.as_str()).collect();
+    let mut text = if shown.is_empty() {
+        format!("Out-IP {scope}: no address resolved")
+    } else {
+        format!("Out-IP {scope}: {}", shown.join(", "))
+    };
+    if unique.len() > shown.len() {
+        text.push_str(&format!(" (+{} more)", unique.len() - shown.len()));
+    }
+    if !failed.is_empty() {
+        text.push_str(&format!(
+            " · {} failed: {}",
+            failed.len(),
+            failed.join(", ")
+        ));
+    }
+    text
+}
+
+/// Ticket 09 (throne-adoption): group Resolve-Domain confirm — names the
+/// group scope and the rows whose server is a domain.
+fn resolve_domain_confirm_text(group: &str, names: &[String]) -> String {
+    let mut text = format!(
+        "Rewrite {} domain server(s) in group \"{group}\" to their resolved IPs? \
+         Rows are saved with the looked-up address. This cannot be undone.",
+        names.len()
+    );
+    if !names.is_empty() {
+        let preview: Vec<&str> = names.iter().take(20).map(String::as_str).collect();
+        text.push_str(&format!(" Rows: {}.", preview.join(", ")));
+        if names.len() > preview.len() {
+            text.push_str(&format!(" (+{} more)", names.len() - preview.len()));
+        }
+    }
+    text
+}
+
+/// Ticket 09 (throne-adoption): Resolve-Domain result toast — names
+/// rewrites (`old → new`) plus failures; nothing-resolved reads honestly.
+fn resolve_domain_result_message(
+    rewritten: &[(String, String, String)],
+    failed: &[String],
+) -> String {
+    if rewritten.is_empty() && failed.is_empty() {
+        return "Resolve domain: nothing to rewrite".to_string();
+    }
+    let mut parts: Vec<String> = rewritten
+        .iter()
+        .take(3)
+        .map(|(name, old, new)| format!("\"{name}\": {old} → {new}"))
+        .collect();
+    if rewritten.len() > parts.len() {
+        parts.push(format!("(+{} more)", rewritten.len() - parts.len()));
+    }
+    let mut text = format!("Resolve domain: {} rewritten", rewritten.len());
+    if !parts.is_empty() {
+        text.push_str(&format!(" ({})", parts.join(", ")));
+    }
+    if !failed.is_empty() {
+        text.push_str(&format!(
+            " · {} failed: {}",
+            failed.len(),
+            failed.join(", ")
+        ));
+    }
+    text
+}
+
 /// Ticket 17: honest stop-on-stopped copy naming the row.
 fn already_stopped_message(name: &str) -> String {
     format!("\"{name}\" is already stopped")
@@ -8692,6 +9295,68 @@ fn start_busy_message() -> String {
     "Starting… already in progress".to_string()
 }
 
+/// Ticket 02 (throne-adoption): global Start/Stop presentation — the glyph
+/// plus the accessible name for a `(running, busy)` state. Idle (nothing
+/// running) offers Start-all, Running offers Stop-all, and a start in
+/// flight offers only the `Connecting…` busy state (never clickable into
+/// a second apply — see [`AppView::toggle_global_engines`]).
+fn global_toggle_present(running: usize, busy: bool) -> (&'static str, &'static str) {
+    if busy {
+        ("…", "Connecting…")
+    } else if running == 0 {
+        ("▶", "Start all")
+    } else {
+        ("■", "Stop all")
+    }
+}
+
+/// Ticket 02 (throne-adoption): one top-bar menu row — a labelled `div`
+/// with a stable id on a custom element because `PopupMenuItem` carries no
+/// id of its own. Custom rows are silent (no a11y label), so role + name
+/// are exposed for assistive tech; `shortcut` is
+/// `(parse-key, chip-fallback, aria-key)` for bound actions (the visible
+/// `Kbd` chip plus the shortcut property) and `None` for unbound rows.
+fn topbar_menu_row(
+    id: &'static str,
+    label: &'static str,
+    accessible: &'static str,
+    tip: &'static str,
+    shortcut: Option<(&'static str, &'static str, &'static str)>,
+) -> AnyElement {
+    // Method order mirrors the previously inline rows (role + name first,
+    // shortcut property beside the visible chip): `aria_keyshortcuts`
+    // retypes the chain, so each arm builds its own chain and erases to
+    // `AnyElement` instead of sharing one builder.
+    match shortcut {
+        Some((parse, chip, aria)) => div()
+            .id(id)
+            .test_support()
+            .role(Role::MenuItem)
+            .aria_label(accessible)
+            .aria_keyshortcuts(aria)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip)).into())
+            .child(label)
+            .child(shortcut_kbd(parse, chip))
+            .into_any_element(),
+        None => div()
+            .id(id)
+            .test_support()
+            .role(Role::MenuItem)
+            .aria_label(accessible)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip)).into())
+            .child(label)
+            .into_any_element(),
+    }
+}
+
 /// Ticket 30: partial start-all copy — names the failed rows plus both
 /// counts so the toast never claims a clean sweep over failures.
 fn start_all_partial_message(started: usize, failed_names: &[String]) -> String {
@@ -8822,8 +9487,13 @@ fn refresh_summary_text(
     duplicates: usize,
     failures: usize,
     conflicts: usize,
+    in_use: usize,
 ) -> (bool, String) {
-    let mut summary = format!("{label}: +{added} ~{updated} -{removed}");
+    let mut summary =
+        format!("{label}: [+]Added {added} / [~]Updated {updated} / [-]Deleted {removed}");
+    if in_use > 0 {
+        summary.push_str(&format!(" / [=] Still in use {in_use}"));
+    }
     if skipped > 0 {
         summary.push_str(&format!(" · {skipped} skipped"));
     }
@@ -8853,6 +9523,36 @@ fn restore_done_message(outcome: &RestoreOutcome) -> String {
 /// paths can carry OS usernames), never swallowed.
 fn unreadable_drop_message(names: &[String]) -> String {
     format!("Skipped unreadable file(s): {}", names.join(", "))
+}
+
+/// Ticket 07 (throne-adoption): one dropped/picked file after the intake
+/// guards (50MB cap, image/binary/non-UTF8 reject). `Refused` carries the
+/// static reason (never file bytes); `Unreadable` is a bare read error.
+enum ImportFileRead {
+    Text(String),
+    Unreadable,
+    Refused(&'static str),
+}
+
+/// Ticket 07 (throne-adoption): read one dropped/picked file with the intake
+/// guards. Oversize files are rejected before buffering the whole read into
+/// the dialog; image, NUL-carrying, and non-UTF8 bytes are refused with a
+/// static reason (loud per-file problems, never silent skips).
+fn read_import_file(path: &std::path::Path) -> ImportFileRead {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return ImportFileRead::Unreadable,
+    };
+    if !import_file_size_ok(bytes.len() as u64) {
+        return ImportFileRead::Refused("over 50MB");
+    }
+    if let Some(reason) = reject_file_bytes(&bytes) {
+        return ImportFileRead::Refused(reason);
+    }
+    match String::from_utf8(bytes) {
+        Ok(content) => ImportFileRead::Text(content),
+        Err(_) => ImportFileRead::Unreadable,
+    }
 }
 
 /// Ticket 19: upstream `host:port` for a library row, read from the params
@@ -9328,6 +10028,97 @@ fn guided_hint_line(protocol_raw: &str) -> Option<String> {
     }
 }
 
+/// Ticket 06 (throne-adoption): guided-page ownership of the identity
+/// secret — these protocols render their own credential input inside the
+/// `<Type>` box for the same params key the generic Identity row would
+/// fill, so the generic row hides and AnyTLS-style stacking disappears
+/// (one password input, never two). Protocols without a guided page
+/// (mieru/juicity/parse-only, socks/http trust-on-first-use, virtual
+/// rows) keep the generic row. Secret-free (protocol names only).
+fn block_owns_identity(protocol_raw: &str) -> bool {
+    matches!(
+        protocol_raw.trim(),
+        "vless"
+            | "vmess"
+            | "trojan"
+            | "shadowsocks"
+            | "wireguard"
+            | "amneziawg"
+            | "hysteria"
+            | "hysteria2"
+            | "tuic"
+            | "anytls"
+            | "naive"
+            | "ssh"
+            | "snell"
+            | "xray"
+    )
+}
+
+/// Ticket 06: TLS panel plan per protocol — `None` means the protocol
+/// carries no TLS UI at all; `Some(false)` renders the optional TLS box
+/// (enable toggle); `Some(true)` renders the always-on variant (the fold
+/// locks `security`, so there is no toggle). Mirrors exactly which
+/// `*_block` fns call `s2_section` today, so layout can never disagree
+/// with the commit fold about what a row carries.
+fn tls_panel_plan(protocol_raw: &str) -> Option<bool> {
+    match protocol_raw.trim() {
+        "vless" | "vmess" | "trojan" | "http" | "https" => Some(false),
+        "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls" => Some(true),
+        _ => None,
+    }
+}
+
+/// Ticket 06: protocols carrying the shared Network box (the Transport
+/// panel). Mirrors the `s1_network_section` call sites.
+fn has_network_panel(protocol_raw: &str) -> bool {
+    matches!(protocol_raw.trim(), "vless" | "vmess" | "trojan")
+}
+
+/// Ticket 06: protocols carrying Dial Fields in the Advanced dialog.
+/// Mirrors the `s4_section` call sites (xray/chain/extra-core rows carry
+/// no endpoint tuning, so they get no Advanced dialog half).
+fn has_dial_panel(protocol_raw: &str) -> bool {
+    matches!(
+        protocol_raw.trim(),
+        "vless"
+            | "vmess"
+            | "trojan"
+            | "shadowsocks"
+            | "wireguard"
+            | "amneziawg"
+            | "hysteria"
+            | "hysteria2"
+            | "tuic"
+            | "socks"
+            | "http"
+            | "https"
+            | "anytls"
+            | "naive"
+            | "ssh"
+            | "snell"
+            | "shadowtls"
+    )
+}
+
+/// Ticket 06: the `Advanced Settings` button shows exactly when the
+/// second dialog would carry something (Dial Fields and/or TLS extras).
+fn has_advanced_dialog(protocol_raw: &str) -> bool {
+    has_dial_panel(protocol_raw) || tls_panel_plan(protocol_raw).is_some()
+}
+
+/// Ticket 06: Throne `Not Set`/`Already Set` cert-label parity — a
+/// secret's presence reads as a caption beside the masked input (the
+/// value itself never renders). Secret-free by construction (one
+/// presence bit, never the value).
+fn secret_state_caption(value: &str) -> &'static str {
+    if value.trim().is_empty() {
+        "Not Set"
+    } else {
+        "Already Set"
+    }
+}
+
 /// Ticket 31: owning dialog field for a save error — the first invalid
 /// field's name plus its message, so the dialog can show it inline and move
 /// focus to it. `None` for non-field errors (`NotFound`/database). Carries
@@ -9403,7 +10194,21 @@ fn already_subscribed_message(label: &str) -> String {
 /// hostile host rebinding between hops is invisible here — accepted
 /// because subscription URLs are user-supplied and user-trusted (see the
 /// wiring note on `subscription_fetch_policy_resolved`).
-async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Result<String, String> {
+/// Ticket 08 (throne-adoption): one fetched subscription — the body plus
+/// the quota snapshot parsed from the final response's
+/// `Subscription-Userinfo` header (`None` when the provider sends none;
+/// see [`store::parse_subscription_userinfo`]). The header is read from
+/// the final response only, never from redirect hops.
+#[derive(Debug, Clone)]
+pub struct FetchedSubscription {
+    pub body: String,
+    pub userinfo: Option<store::SubscriptionQuota>,
+}
+
+async fn fetch_subscription_body(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+) -> Result<FetchedSubscription, String> {
     use futures::AsyncReadExt as _;
     const MAX_BYTES: usize = store::SUBSCRIPTION_MAX_BYTES;
     const TIMEOUT_SECS: u64 = store::SUBSCRIPTION_TIMEOUT_SECS;
@@ -9440,6 +10245,13 @@ async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Resu
                 response.status().as_u16()
             ));
         }
+        // Ticket 08: quota header off the final response (before the body
+        // is consumed — headers borrow the response).
+        let userinfo = response
+            .headers()
+            .get("subscription-userinfo")
+            .and_then(|value| value.to_str().ok())
+            .and_then(store::parse_subscription_userinfo);
         let mut buf = Vec::new();
         let mut chunk = [0u8; 65_536];
         loop {
@@ -9456,7 +10268,9 @@ async fn fetch_subscription_body(client: Arc<dyn HttpClient>, url: &str) -> Resu
                 return Err("subscription body too large".to_string());
             }
         }
-        return String::from_utf8(buf).map_err(|_| "subscription body is not UTF-8".to_string());
+        return String::from_utf8(buf)
+            .map(|body| FetchedSubscription { body, userinfo })
+            .map_err(|_| "subscription body is not UTF-8".to_string());
     }
     Err("subscription fetch failed (too many redirects)".to_string())
 }
@@ -9959,6 +10773,183 @@ fn subscription_row(
     )
 }
 
+/// Ticket 08 (throne-adoption): quota expiry copy. Missing data is omitted
+/// by the caller (no provider data reads as no claim, never a guessed
+/// date); the past reads `expired`, never a negative countdown.
+fn format_expire(expire_at: i64, now: i64) -> String {
+    let delta = expire_at.saturating_sub(now);
+    if delta <= 0 {
+        "expired".to_string()
+    } else if delta < 5_400 {
+        format!("{}m left", (delta / 60).max(1))
+    } else if delta < 172_800 {
+        format!("{}h left", delta / 3_600)
+    } else {
+        format!("{}d left", delta / 86_400)
+    }
+}
+
+/// Ticket 08: one Manage-Groups row snapshot — pure data over row counts +
+/// feeding subscriptions, so the sheet body and the tests share it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupRowView {
+    name: String,
+    count: usize,
+    kind: String,
+    quota: Option<String>,
+    skip: bool,
+    sub_ids: Vec<String>,
+}
+
+/// Ticket 08: build Manage-Groups rows from live group counts plus every
+/// subscription. Groups with rows but no subscription read `Basic`;
+/// groups fed by N subscriptions read `Subscription (N)` with a
+/// `Last update | Used / Remain / Expire` line from the
+/// `Subscription-Userinfo` snapshots (plus an auto-skip marker when
+/// flagged). Subscription-fed groups with zero rows still list (a fresh
+/// or fully-pruned feed is still a group). Ordered by name.
+fn group_row_views(
+    counts: &[(String, usize)],
+    subs: &[ProxySubscription],
+    skip: &dyn Fn(&str) -> bool,
+    now: i64,
+) -> Vec<GroupRowView> {
+    use std::collections::BTreeMap;
+    let mut counts_map: BTreeMap<&str, usize> = BTreeMap::new();
+    for (group, count) in counts {
+        counts_map.insert(group.as_str(), *count);
+    }
+    let mut feeding: BTreeMap<&str, Vec<&ProxySubscription>> = BTreeMap::new();
+    for sub in subs {
+        feeding.entry(sub.group.as_str()).or_default().push(sub);
+    }
+    let mut names: Vec<&str> = counts_map.keys().copied().collect();
+    for name in feeding.keys() {
+        if !counts_map.contains_key(name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let feeding = feeding.get(name).cloned().unwrap_or_default();
+            let count = counts_map.get(name).copied().unwrap_or(0);
+            let kind = if feeding.is_empty() {
+                "Basic".to_string()
+            } else {
+                format!("Subscription ({})", feeding.len())
+            };
+            let mut quota = group_quota_line(&feeding, now);
+            let skipped = skip(name);
+            if skipped {
+                let marker = "auto-refresh skipped".to_string();
+                quota = Some(match quota {
+                    Some(line) => format!("{line} · {marker}"),
+                    None => marker,
+                });
+            }
+            GroupRowView {
+                name: name.to_string(),
+                count,
+                kind,
+                quota,
+                skip: skipped,
+                sub_ids: feeding.iter().map(|sub| sub.id.clone()).collect(),
+            }
+        })
+        .collect()
+}
+
+/// Ticket 08: the second Manage-Groups line for subscription-fed groups.
+/// `None` for basic groups. Used/Remain/Expire segments appear only when
+/// the feed reports them (sums across feeds, earliest expiry); last
+/// update is the latest success across feeds.
+fn group_quota_line(subs: &[&ProxySubscription], now: i64) -> Option<String> {
+    if subs.is_empty() {
+        return None;
+    }
+    let last = subs.iter().filter_map(|sub| sub.last_refresh_at).max();
+    let mut segments = vec![format!("Last update {}", format_last_refresh(last, now))];
+    let mut used: i64 = 0;
+    let mut used_known = false;
+    let mut total: i64 = 0;
+    let mut total_known = false;
+    let mut expire: Option<i64> = None;
+    for sub in subs {
+        if let Some(value) = sub.quota_used {
+            used = used.saturating_add(value.max(0));
+            used_known = true;
+        }
+        if let Some(value) = sub.quota_total {
+            total = total.saturating_add(value.max(0));
+            total_known = true;
+        }
+        expire = match (expire, sub.quota_expire) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
+    }
+    if used_known {
+        segments.push(format!("Used {}", format_bytes(used.max(0) as u64)));
+    }
+    if total_known {
+        segments.push(format!(
+            "Remain {}",
+            format_bytes(total.saturating_sub(used).max(0) as u64)
+        ));
+    }
+    if let Some(expire) = expire {
+        segments.push(format!("Expire {}", format_expire(expire, now)));
+    }
+    Some(segments.join(" | "))
+}
+
+/// Ticket 08: subscriptions feeding one group, in stable numeric id order —
+/// the Update-current / per-row Update selection seam (pure; starting the
+/// fetches stays on the caller, which owns the network).
+fn update_target_subs(subs: &[ProxySubscription], group: &str) -> Vec<ProxySubscription> {
+    let mut out: Vec<ProxySubscription> = subs
+        .iter()
+        .filter(|sub| sub.group == group)
+        .cloned()
+        .collect();
+    out.sort_by_key(|sub| sub.id.parse::<i64>().unwrap_or(i64::MAX));
+    out
+}
+
+/// Ticket 08: Update-all selection — every subscription outside
+/// skip-flagged groups runs; flagged ones are reported, never fetched.
+/// Returns (included, skipped). Pure; the caller owns the confirm + fetch.
+fn update_all_targets(
+    subs: Vec<ProxySubscription>,
+    flagged: &HashSet<String>,
+) -> (Vec<ProxySubscription>, Vec<ProxySubscription>) {
+    let mut included = Vec::new();
+    let mut skipped = Vec::new();
+    for sub in subs {
+        if flagged.contains(sub.group.as_str()) {
+            skipped.push(sub);
+        } else {
+            included.push(sub);
+        }
+    }
+    (included, skipped)
+}
+
+/// Ticket 08: Update-all confirm copy — names the run set size plus the
+/// skip-flagged remainder, never a blind fetch.
+fn update_all_confirm_text(included: usize, skipped: usize) -> String {
+    if skipped == 0 {
+        format!("Update all {included} subscription(s)?")
+    } else {
+        format!(
+            "Update {included} subscription(s)? {skipped} skipped (auto-refresh off for their group)."
+        )
+    }
+}
+
 /// Ticket 37: single-line `throne://route/...` / `throne://remoteroute/...`
 /// failure text. Surfaces the intake's own reason — parse errors never echo
 /// payloads or URLs, so this is safe for notifications.
@@ -10079,6 +11070,19 @@ fn preset_row(
     let remove_id = preset.id.clone();
     let edit_view = view.clone();
     let edit_preset = preset.clone();
+    let export_view = view.clone();
+    let export_preset = preset.clone();
+    row = row.child(
+        Button::new(format!("preset-export-{}", preset.id))
+            .label("Export link")
+            .tooltip("Copy this preset's throne://route share link")
+            .on_click(move |_, window, cx| {
+                let preset = export_preset.clone();
+                export_view.update(cx, |view, cx| {
+                    view.commit_preset_export_link(&preset, window, cx);
+                });
+            }),
+    );
     row = row.child(
         Button::new(format!("preset-edit-{}", preset.id))
             .label("Edit")
@@ -10108,6 +11112,115 @@ fn preset_row(
                 let id = remove_id.clone();
                 remove_view.update(cx, |view, cx| {
                     view.commit_preset_remove(&id, window, cx);
+                });
+            }),
+    )
+}
+
+/// Ticket 10 (US-29): one Advanced rules-box rewrite — cycle one rule's
+/// action (`direct → proxy → block → direct`), remove one rule, or append
+/// a fresh `direct` rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresetRulesOp {
+    CycleAction(usize),
+    Remove(usize),
+    Add,
+}
+
+/// Ticket 10 (US-29): the Advanced section of the preset edit dialog — one
+/// line per stored rule (`Rule i — action · tab · tab`) with an Action
+/// cycle and a Delete button, plus an Add-rule button. Ops rewrite the
+/// dialog's rules box in place (see
+/// [`AppView::rewrite_preset_rules_box`]); corrupt stored rules render
+/// their loud message instead of a list.
+fn preset_advanced_section(
+    view: Entity<AppView>,
+    preset: &store::RoutePreset,
+    form: PresetForm,
+) -> impl IntoElement {
+    let mut section = div().flex().flex_col().gap_1().child(
+        div()
+            .id(format!("preset-advanced-{}", preset.id))
+            .test_support()
+            .text_sm()
+            .child("Advanced"),
+    );
+    let rules = match preset.rules() {
+        Ok(rules) => rules,
+        Err(message) => {
+            return section.child(
+                div()
+                    .id(format!("preset-advanced-invalid-{}", preset.id))
+                    .test_support()
+                    .text_sm()
+                    .child(message),
+            );
+        }
+    };
+    for (index, rule) in rules.iter().enumerate() {
+        let action = rule
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let tabs = crate::preset::rule_attribute_tabs(rule).join(" · ");
+        let cycle_view = view.clone();
+        let cycle_form = form.clone();
+        let remove_view = view.clone();
+        let remove_form = form.clone();
+        section = section.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .child(format!("Rule {index} — {action} · {tabs}")),
+                )
+                .child(
+                    Button::new(format!("preset-rule-action-{}-{index}", preset.id))
+                        .small()
+                        .label(format!("Action: {action}"))
+                        .tooltip("Cycle this rule's action (direct → proxy → block)")
+                        .on_click(move |_, window, cx| {
+                            cycle_view.update(cx, |_, cx| {
+                                AppView::rewrite_preset_rules_box(
+                                    &cycle_form,
+                                    &PresetRulesOp::CycleAction(index),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(format!("preset-rule-delete-{}-{index}", preset.id))
+                        .small()
+                        .label("Delete rule")
+                        .tooltip("Remove this rule from the rules box")
+                        .on_click(move |_, window, cx| {
+                            remove_view.update(cx, |_, cx| {
+                                AppView::rewrite_preset_rules_box(
+                                    &remove_form,
+                                    &PresetRulesOp::Remove(index),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                ),
+        );
+    }
+    let add_view = view.clone();
+    section.child(
+        Button::new(format!("preset-rule-add-{}", preset.id))
+            .small()
+            .label("Add rule")
+            .tooltip("Append a fresh direct rule to the rules box")
+            .on_click(move |_, window, cx| {
+                add_view.update(cx, |_, cx| {
+                    AppView::rewrite_preset_rules_box(&form, &PresetRulesOp::Add, window, cx);
                 });
             }),
     )
@@ -11088,6 +12201,8 @@ enum PaletteOp {
     PresetManager,
     Groups,
     Logs,
+    RuntimeStats,
+    TrafficStats,
     Settings,
     About,
     StartAll,
@@ -11097,15 +12212,217 @@ enum PaletteOp {
     ExportLibrary,
 }
 
+/// Ticket 05 (throne-adoption): one connections-table row — honest stored
+/// fields only. The clash entry carries `id`, `row_id`, cumulative
+/// `rx`/`tx`, and `dest`; `delta_rx`/`delta_tx` is this poll's session
+/// delta from the same diff that persists traffic. No per-connection
+/// protocol/outbound/rate exists here by construction — the row protocol
+/// resolves from the joined library row at render time, and unclaimed
+/// connections (no row claims them) render as unclaimed, never guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnRow {
+    core: String,
+    id: String,
+    dest: String,
+    row_id: Option<String>,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    delta_rx: u64,
+    delta_tx: u64,
+}
+
+impl ConnRow {
+    fn total(&self) -> u64 {
+        self.rx_bytes.saturating_add(self.tx_bytes)
+    }
+}
+
+/// Ticket 05: filter a connections snapshot to the selected row (when the
+/// toggle is on and a row is selected — with no selection, or toggled off,
+/// every live connection shows) and sort by cumulative traffic, descending
+/// by default. Probes are excluded at commit time (see
+/// [`AppView::apply_traffic_results`]), so this stays a pure display seam.
+fn build_conn_rows(
+    snapshot: &[(String, crate::health::ClashConn)],
+    deltas: &HashMap<String, (u64, u64)>,
+    selected_row: Option<&str>,
+    selected_only: bool,
+    desc: bool,
+) -> Vec<ConnRow> {
+    let mut rows: Vec<ConnRow> = snapshot
+        .iter()
+        .filter(
+            |(_, entry)| match (selected_only, selected_row, entry.row_id.as_deref()) {
+                (true, Some(selected), Some(row)) => row == selected,
+                (true, Some(_), None) => false,
+                _ => true,
+            },
+        )
+        .map(|(core, entry)| {
+            let key = format!("{core}/{}", entry.id);
+            let (delta_rx, delta_tx) = deltas.get(&key).copied().unwrap_or((0, 0));
+            ConnRow {
+                core: core.clone(),
+                id: entry.id.clone(),
+                dest: entry.dest.clone(),
+                row_id: entry.row_id.clone(),
+                rx_bytes: entry.rx_bytes,
+                tx_bytes: entry.tx_bytes,
+                delta_rx,
+                delta_tx,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        if desc {
+            b.total().cmp(&a.total())
+        } else {
+            a.total().cmp(&b.total())
+        }
+    });
+    rows
+}
+
+/// Ticket 05: one per-exit traffic aggregate for the Traffic pane — the
+/// library row plus its persisted totals (which already fold in clash-poll
+/// deltas). Idle rows stay quiet (no lying zero bars); there is deliberately
+/// no Direct line (presets emit no per-rule decisions yet, so a Direct
+/// aggregate would be fabricated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExitTraffic {
+    row_id: String,
+    name: String,
+    bind: String,
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+impl ExitTraffic {
+    fn total(&self) -> u64 {
+        self.rx_bytes.saturating_add(self.tx_bytes)
+    }
+}
+
+/// Ticket 05: exit join for one connection row — `(name, bind:port,
+/// protocol)` from the library row the entry's `row_id` claims. Unclaimed
+/// entries (or rows removed since the poll) render as unclaimed placeholders
+/// — never a guessed protocol or endpoint. Pure seam for tests.
+fn conn_exit_of(rows: &[ProxyConfig], row_id: Option<&str>) -> (String, String, String) {
+    match row_id.and_then(|id| rows.iter().find(|row| row.id == id)) {
+        Some(row) => (
+            row.name.clone(),
+            format!("{}:{}", row.bind_ip, row.port),
+            row.protocol.clone(),
+        ),
+        None => ("unclaimed".to_string(), "—".to_string(), "—".to_string()),
+    }
+}
+
+/// Ticket 05: per-exit aggregates over stored rows, heaviest exit first.
+fn aggregate_exit_traffic(
+    rows: &[ProxyConfig],
+    totals: &HashMap<String, (u64, u64)>,
+) -> Vec<ExitTraffic> {
+    let mut exits: Vec<ExitTraffic> = rows
+        .iter()
+        .filter_map(|row| {
+            let (rx, tx) = totals.get(&row.id).copied().unwrap_or((0, 0));
+            if rx == 0 && tx == 0 {
+                return None;
+            }
+            Some(ExitTraffic {
+                row_id: row.id.clone(),
+                name: row.name.clone(),
+                bind: format!("{}:{}", row.bind_ip, row.port),
+                rx_bytes: rx,
+                tx_bytes: tx,
+            })
+        })
+        .collect();
+    exits.sort_by_key(|exit| std::cmp::Reverse(exit.total()));
+    exits
+}
+
+/// Ticket 10 (US-23): uptime line for Runtime Stats (`3d 4h`, `5h 12m`,
+/// `45s` — largest two units, never empty).
+fn format_uptime(total_secs: u64) -> String {
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let secs = total_secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Ticket 10 (US-22): one stacked Traffic Stats bar (12 cells: `█` rx,
+/// `▓` tx, `░` empty), split proportionally over the heaviest exit.
+/// Pure seam so bars always match the stored totals.
+fn traffic_stacked_bar(rx: u64, tx: u64, max_total: u64) -> String {
+    const CELLS: usize = 12;
+    let max = max_total.max(1);
+    let rx_fill = ((rx as f64 / max as f64) * CELLS as f64).round() as usize;
+    let tx_fill = ((tx as f64 / max as f64) * CELLS as f64).round() as usize;
+    let rx_fill = rx_fill.min(CELLS);
+    let tx_fill = tx_fill.min(CELLS.saturating_sub(rx_fill));
+    format!(
+        "{}{}{}",
+        "█".repeat(rx_fill),
+        "▓".repeat(tx_fill),
+        "░".repeat(CELLS.saturating_sub(rx_fill + tx_fill))
+    )
+}
+
+/// Ticket 10 (US-22): Traffic Stats summary line — period label plus the
+/// all-time caveat (only cumulative totals persist), exit count, and
+/// byte totals. Never names one profile (the bars do that per exit).
+fn traffic_stats_summary_text(
+    period: store::TrafficPeriod,
+    exits: usize,
+    rx: u64,
+    tx: u64,
+) -> String {
+    format!(
+        "{} (all-time totals) · {exits} exit(s) · ↓{} ↑{}",
+        period.label(),
+        format_bytes(rx),
+        format_bytes(tx),
+    )
+}
+
+/// Ticket 05: traffic-poll cadence — 1Hz while the Connections or Traffic
+/// pane is visible, else the 5s base cadence. Pure seam over the throttle
+/// stamp (see [`AppView::spawn_traffic_poll`]); the headless tick stays
+/// unthrottled.
+fn traffic_poll_due(tab: InspectorTab, now: i64, last_poll_at: i64) -> bool {
+    if matches!(tab, InspectorTab::Connections | InspectorTab::Traffic) {
+        return true;
+    }
+    now.saturating_sub(last_poll_at) >= TRAFFIC_TICK_SECS as i64
+}
+
 /// Ticket 05: bottom-inspector tab over the existing detail builders.
 /// `Details` is the default overview; `Health` surfaces health + history
 /// with the row ops; `Presets` carries the attached routing preset.
+/// Ticket 05 (throne-adoption): `Logs` replays the redacted visible lines
+/// with the include/exclude/regex legs + level row; `Connections` is the
+/// honest stored-fields-only live table; `Traffic` aggregates per-exit
+/// totals (never a fabricated Direct line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum InspectorTab {
     #[default]
     Details,
     Health,
     Presets,
+    Logs,
+    Connections,
+    Traffic,
 }
 
 impl InspectorTab {
@@ -11114,6 +12431,9 @@ impl InspectorTab {
             InspectorTab::Details => 0,
             InspectorTab::Health => 1,
             InspectorTab::Presets => 2,
+            InspectorTab::Logs => 3,
+            InspectorTab::Connections => 4,
+            InspectorTab::Traffic => 5,
         }
     }
 
@@ -11121,6 +12441,9 @@ impl InspectorTab {
         match index {
             1 => InspectorTab::Health,
             2 => InspectorTab::Presets,
+            3 => InspectorTab::Logs,
+            4 => InspectorTab::Connections,
+            5 => InspectorTab::Traffic,
             _ => InspectorTab::Details,
         }
     }
@@ -11134,6 +12457,9 @@ impl InspectorTab {
             InspectorTab::Details => "Inspector Details tab (Ctrl-1)",
             InspectorTab::Health => "Inspector Health tab (Ctrl-2)",
             InspectorTab::Presets => "Inspector Presets tab (Ctrl-3)",
+            InspectorTab::Logs => "Inspector Logs tab (Ctrl-4)",
+            InspectorTab::Connections => "Inspector Connections tab (Ctrl-5)",
+            InspectorTab::Traffic => "Inspector Traffic tab (Ctrl-6)",
         }
     }
 }
@@ -11219,6 +12545,7 @@ struct AppView {
     refresh_batch_removed: usize,
     refresh_batch_failed: usize,
     refresh_batch_conflicts: usize,
+    refresh_batch_in_use: usize,
     refresh_generation: u64,
     inflight_refreshes: HashSet<String>,
     /// Ticket 26: a health probe (URL test or ping) is running off-thread.
@@ -11230,6 +12557,18 @@ struct AppView {
     /// is busy and retries next round).
     probe_url_in_flight: bool,
     probe_ping_in_flight: bool,
+    /// Ticket 09 (throne-adoption): stop flag for group test/speed/resolve
+    /// runs (see `Stop Testing`). Set on start, raised by the stop action;
+    /// runners stop pulling new rows once raised (in-flight rows complete).
+    probe_stop: Arc<AtomicBool>,
+    /// Ticket 09 (throne-adoption): a group test/speed/resolve run is
+    /// off-thread. A second group run toasts instead of stacking; single
+    /// probes keep their per-kind flags above.
+    group_test_in_flight: bool,
+    /// Ticket 09 (throne-adoption): speedtest mode for the next run
+    /// (the mode menu item cycles it; the timeout stays pinned to
+    /// [`SPEED_TEST_TIMEOUT`]).
+    speedtest_mode: SpeedtestMode,
     /// Ticket 26: the live subscriptions-dialog add form, stashed on open so
     /// a genuine reopen (background refresh completion) can carry
     /// in-progress text across instead of rebuilding a blank form. `None`
@@ -11278,9 +12617,40 @@ struct AppView {
     /// `Copy` field — the `TabBar` is `RenderOnce`, so it is rebuilt from
     /// this every frame; no entity is created in render.
     inspector_tab: InspectorTab,
+    /// Ticket 05 (throne-adoption): last live-connections snapshot —
+    /// `(serving core, entry)` pairs with probes already excluded (see
+    /// [`AppView::apply_traffic_results`]). Honest stored fields only
+    /// (`ClashConn` carries `id`, `row_id`, cumulative `rx`/`tx`, `dest` —
+    /// never a fabricated protocol/outbound/rate).
+    conn_snapshot: Vec<(String, crate::health::ClashConn)>,
+    /// Ticket 05: this poll's per-connection session delta (`core/conn-id`
+    /// → `(delta_rx, delta_tx)`), keyed like [`TrafficSeenMap`]. Pruned to
+    /// the snapshot on every commit; missing keys read as zero delta.
+    conn_delta: HashMap<String, (u64, u64)>,
+    /// Ticket 05: connections pane shows only the selected row's flows
+    /// (default on, like the logs pane); with no selection it shows all.
+    conn_selected_only: bool,
+    /// Ticket 05: connections sort direction (default descending — the
+    /// heaviest flow first).
+    conn_sort_desc: bool,
+    /// Ticket 05: last traffic-poll start (`now_unix` epoch). The 1Hz loop
+    /// skips while the Connections/Traffic pane is hidden until the 5s base
+    /// cadence elapses (see [`traffic_poll_due`]).
+    last_traffic_poll_at: i64,
+    /// Ticket 05 (throne-adoption): logs-pane exclude keyword (lines
+    /// containing it are dropped) alongside the `log_filter` include.
+    log_exclude: String,
+    /// Ticket 05: logs-pane regex pattern over the redacted display line.
+    /// Empty means inactive; an invalid pattern fails open (ignored).
+    log_regex: String,
     /// Command-palette state, created on open (never in render) and held
     /// so the dialog builder owns stable interaction state.
     palette: Option<Entity<CommandState>>,
+    /// Ticket 10 (US-22): Traffic Stats dialog period selector (default
+    /// 24h). Plain `Copy` field — the dialog rebuilds from this on open.
+    traffic_period: store::TrafficPeriod,
+    /// Ticket 10 (US-23): process start for the Runtime Stats uptime line.
+    started_at: std::time::Instant,
 }
 
 impl AppView {
@@ -11331,6 +12701,12 @@ impl AppView {
             window,
             cx,
         );
+        // Ticket 01: apply the persisted Appearance before the first frame
+        // (dark when unset — `gpui_kit::init` leaves Light behind, so an
+        // explicit change is what makes dark the real default). System
+        // consults the Windows app-theme flag; a later OS flip applies on
+        // the next launch or Settings open (no silent watcher).
+        apply_appearance(&store.appearance(), Some(window), cx);
         // Ticket 38: seed the snapshot guard from the stored set so the
         // first reload does not rewrite an unchanged snapshot.
         let last_snapshot = store.load_running_snapshot();
@@ -11366,6 +12742,8 @@ impl AppView {
             health_store: HealthStore::default(),
             logs: LogStore::default(),
             log_filter: String::new(),
+            log_exclude: String::new(),
+            log_regex: String::new(),
             log_level: None,
             log_tail: true,
             logs_open: false,
@@ -11387,10 +12765,14 @@ impl AppView {
             refresh_batch_removed: 0,
             refresh_batch_failed: 0,
             refresh_batch_conflicts: 0,
+            refresh_batch_in_use: 0,
             refresh_generation: 0,
             inflight_refreshes: HashSet::new(),
             probe_url_in_flight: false,
             probe_ping_in_flight: false,
+            probe_stop: Arc::new(AtomicBool::new(false)),
+            group_test_in_flight: false,
+            speedtest_mode: SpeedtestMode::Download,
             subs_form: None,
             preset_form: None,
             import_parse_in_flight: false,
@@ -11410,7 +12792,14 @@ impl AppView {
             facet_protocol,
             facet_status,
             inspector_tab: InspectorTab::Details,
+            conn_snapshot: Vec::new(),
+            conn_delta: HashMap::new(),
+            conn_selected_only: true,
+            conn_sort_desc: true,
+            last_traffic_poll_at: 0,
             palette: None,
+            traffic_period: store::TrafficPeriod::Day,
+            started_at: std::time::Instant::now(),
         };
         let mut view = view;
         let rows = match view.store.list() {
@@ -12065,12 +13454,59 @@ impl AppView {
         }
     }
 
-    /// Config-completeness T08 (CAP-11): `Clone` is an alias over
-    /// [`AppView::commit_duplicate`] — same disabled copy, fresh auto port,
-    /// identical params. No new dupe logic lives here by construction.
-    fn commit_clone(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_duplicate(id, window, cx);
+    /// Throne-adoption 03: fresh row lookup for row-targeted actions (card
+    /// double-click + right-click menu). `None` on ghost rows and store
+    /// failures alike — callers warn `Already removed` like
+    /// [`AppView::commit_duplicate`], never a stale delegate snapshot.
+    fn row_config(&self, id: &str) -> Option<ProxyConfig> {
+        self.store.get(id).ok().flatten()
     }
+
+    /// Throne-adoption 03: open Edit for THAT row (double-click + menu),
+    /// never the selection. Ghost rows warn; the selection is untouched.
+    fn open_edit_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        self.open_edit_dialog(config, window, cx);
+    }
+
+    /// Throne-adoption 03: delete confirm for THAT row (menu), never the
+    /// selection. Ghost rows warn.
+    fn open_remove_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        self.open_remove_confirm(config, window, cx);
+    }
+
+    /// Throne-adoption 03: traffic-reset confirm for THAT row (menu).
+    /// Ghost rows warn.
+    fn open_traffic_reset_for_row(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        self.open_traffic_reset_confirm(config, window, cx);
+    }
+
+    /// Throne-adoption 03: usage-reset confirm for THAT row (menu).
+    /// Ghost rows warn.
+    fn open_usage_reset_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        self.open_usage_reset_confirm(config, window, cx);
+    }
+
     /// Ticket 43: reset one row's traffic totals (post-confirm). Store and
     /// session mirror zero together, then the rows repaint; the toast names
     /// the row. Ghost rows warn loudly.
@@ -12489,13 +13925,82 @@ impl AppView {
 
     /// Ticket 43: no selection explains itself — never a dead click.
     fn copy_selected_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(config) = self.selected_config(cx) {
-            let (socks, http) = proxy_urls(&config.bind_ip, config.port);
-            cx.write_to_clipboard(ClipboardItem::new_string(format!("{socks}\n{http}")));
-            window.push_notification(Notification::success("Copied proxy URLs"), cx);
-        } else {
+        let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
-        }
+            return;
+        };
+        self.copy_row_urls(&config.id, window, cx);
+    }
+
+    /// Throne-adoption 03: copy THAT row's bind endpoints (menu), never the
+    /// selection and never secrets — `bind:port` only, like the selected
+    /// path above. Ghost rows warn.
+    fn copy_row_urls(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        let (socks, http) = proxy_urls(&config.bind_ip, config.port);
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("{socks}\n{http}")));
+        window.push_notification(Notification::success("Copied proxy URLs"), cx);
+    }
+
+    /// Ticket 10 (US-28): share-out dialog for THAT row (menu) — the
+    /// `ExportToLink || ExportJsonLink` copy, never an empty string.
+    /// Unlike Copy URLs this link carries credentials, so the dialog says
+    /// so up front (the export-dialog plaintext pattern). Ghost rows warn.
+    fn open_share_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        let link =
+            crate::import::share_link_for_config(&config.protocol, &config.name, &config.params);
+        let title = format!("Share \"{}\"", config.name);
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
+            window.push_notification(Notification::success("Copied share link"), cx);
+            true
+        });
+        let commit_key = commit.clone();
+        let dialog_link =
+            crate::import::share_link_for_config(&config.protocol, &config.name, &config.params);
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
+                .title(title.clone())
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div().id("share-warning").test_support().child(
+                                Alert::error("share-warning-box", SHARE_WARNING.to_string())
+                                    .title("Share links carry credentials"),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .id("share-link-text")
+                                .test_support()
+                                .text_sm()
+                                .child(dialog_link.clone()),
+                        ),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "share-dialog-ok",
+                    "share-dialog-cancel",
+                    footer_commit_label("share"),
+                    commit_click,
+                ))
+        });
     }
 
     /// Ticket 05: surface a detected sidecar crash on every reload so the
@@ -12614,6 +14119,17 @@ impl AppView {
         // never a dead click.
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        };
+        self.start_row(&config.id, window, cx);
+    }
+
+    /// Throne-adoption 03: start THAT row (card menu), never the selection.
+    /// Same gates as the selected path above (busy guard, LAN confirm,
+    /// test-synchronous commit). Ghost rows warn.
+    fn start_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
             return;
         };
         // Ticket 30: a second Start while one is in flight is ignored (no
@@ -12740,6 +14256,16 @@ impl AppView {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         };
+        self.stop_row(&config.id, window, cx);
+    }
+
+    /// Throne-adoption 03: stop THAT row (card menu), never the selection.
+    /// Same toasts as the selected path above. Ghost rows warn.
+    fn stop_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
         let id = config.id.clone();
         let (removed, stop_error) = self.engine.stop_one_result(&id);
         if removed {
@@ -12789,6 +14315,24 @@ impl AppView {
                 Notification::warning(already_stopped_message(&config.name)),
                 cx,
             );
+        }
+    }
+
+    /// Ticket 02 (throne-adoption): the round global Start/Stop toggle —
+    /// Idle (nothing running) starts all, Running stops all, and a start
+    /// in flight toasts the busy guard instead of double-applying. Both
+    /// arms reuse the same gated handlers as the menus, palette, and tray
+    /// (LAN confirm, stop confirm, honest toasts), so the toggle can never
+    /// drift from them.
+    fn toggle_global_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.start_in_flight {
+            window.push_notification(Notification::info(start_busy_message()), cx);
+            return;
+        }
+        if self.engine.running_count() == 0 {
+            self.start_all_engines(window, cx);
+        } else {
+            self.stop_all_engines(window, cx);
         }
     }
 
@@ -13250,6 +14794,10 @@ impl AppView {
     /// see [`AppView::poll_tray_once`]). Start/Stop first restore the
     /// window so their confirm dialogs never open modal on a hidden
     /// window (which looks hung); Show itself is the restore.
+    /// Ticket 10 (US-30): Select exit opens the preset picker for the
+    /// selected row (the ROUTING chooser twin); Select preset opens the
+    /// presets manager; Open config folder copies the data folder path
+    /// (copy, never a shell-out — the shell never launches an explorer).
     fn handle_tray_action(
         &mut self,
         action: crate::tray::TrayAction,
@@ -13258,6 +14806,14 @@ impl AppView {
     ) {
         match action {
             crate::tray::TrayAction::Show => self.show_window_from_tray(window, cx),
+            crate::tray::TrayAction::SelectExit => {
+                self.show_window_from_tray(window, cx);
+                self.open_tray_exit_picker(window, cx);
+            }
+            crate::tray::TrayAction::SelectPreset => {
+                self.show_window_from_tray(window, cx);
+                self.open_presets_dialog(window, cx);
+            }
             crate::tray::TrayAction::StartAll => {
                 self.show_window_from_tray(window, cx);
                 self.start_all_engines(window, cx);
@@ -13266,8 +14822,39 @@ impl AppView {
                 self.show_window_from_tray(window, cx);
                 self.stop_all_engines(window, cx);
             }
+            crate::tray::TrayAction::OpenConfig => {
+                self.show_window_from_tray(window, cx);
+                self.copy_config_folder(window, cx);
+            }
             crate::tray::TrayAction::Quit => self.quit_from_tray(),
         }
+    }
+
+    /// Ticket 10 (US-30): tray Select-exit — the preset picker for the
+    /// selected row. No selection explains itself (never a dead click).
+    fn open_tray_exit_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_preset_chooser_for_selected(window, cx);
+    }
+
+    /// Ticket 10 (US-29/30): the ROUTING chooser — the preset picker for
+    /// the selected row (tray Select-exit rides the same path). No
+    /// selection explains itself (never a dead click).
+    fn open_preset_chooser_for_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selected_config(cx) {
+            Some(config) => self.open_preset_attach_dialog(config, window, cx),
+            None => window.push_notification(Notification::info(no_selection_message()), cx),
+        }
+    }
+
+    /// Ticket 10 (US-30): tray Open-config-folder — copies the data folder
+    /// path (copy, never a shell-out).
+    fn copy_config_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = crate::tray::config_folder();
+        cx.write_to_clipboard(ClipboardItem::new_string(folder.clone()));
+        window.push_notification(
+            Notification::success(format!("Copied config folder path ({folder})")),
+            cx,
+        );
     }
 
     /// Ticket 38: tray Quit — stops every endpoint, clears the snapshot
@@ -13353,6 +14940,65 @@ impl AppView {
         }
     }
 
+    /// Ticket 10 (US-30): skip-delete-confirm commit — the explicit
+    /// Settings opt-in behind the toggle. Returns true on success (the
+    /// switch cell advances only then, like the restore opt-in).
+    fn commit_skip_delete_confirm(
+        &mut self,
+        skip: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_skip_delete_confirm(skip) {
+            Ok(()) => {
+                let message = if skip {
+                    "Delete confirms off — single and bulk deletes run at once (preset detach-deletes still ask)"
+                } else {
+                    "Delete confirms on"
+                };
+                window.push_notification(Notification::success(message), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Delete-confirm setting failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Ticket 01: Appearance commit — persist the choice, then apply it to
+    /// the kit theme at once (no restart; every surface rides theme tokens).
+    /// Returns true on success (see [`AppView::commit_autostart`] for the
+    /// honesty contract: the radio cell advances only on success).
+    fn commit_appearance(
+        &mut self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.store.set_appearance(value) {
+            Ok(()) => {
+                apply_appearance(value, Some(window), cx);
+                window.push_notification(Notification::success(format!("Appearance: {value}")), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Appearance change failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
     /// Ticket 38: Settings dialog — the two explicit opt-ins (autostart +
     /// session restore, both default off) with their exact side effects
     /// stated inline. Switches are controlled values over shared cells:
@@ -13365,6 +15011,28 @@ impl AppView {
         let view = cx.entity();
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
+        // Ticket 10 (US-30): skip-delete-confirm snapshot (same
+        // commit-on-success cell pattern as the opt-ins above).
+        let skip_delete_state = Rc::new(RefCell::new(self.store.skip_delete_confirm()));
+        // Ticket 01: Appearance snapshot (the radio cell advances only on a
+        // successful commit, like the opt-in switches below) plus a System
+        // re-resolve on every open, so an OS flip since launch paints no
+        // later than the next Settings visit.
+        let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
+        let appearance_view = view.clone();
+        apply_appearance(&self.store.appearance(), Some(window), cx);
+        // Ticket 01: routing inventory snapshot for the Routing/Preset
+        // sections (pure reads — a broken store reads unavailable, never a
+        // lying zero).
+        let preset_total = self.store.list_presets().ok().map(|presets| presets.len());
+        let attached_total = self
+            .store
+            .list()
+            .ok()
+            .map(|rows| rows.iter().filter(|row| row.preset_id.is_some()).count());
+        let routing_summary = routing_summary_text(preset_total, attached_total);
+        let preset_summary = preset_summary_text(preset_total);
+        let presets_view = view.clone();
         // Ticket 43: test-URL field prefilled with the override (blank means
         // the documented default); the commit validates + persists.
         let current_test_url = self.store.test_url().unwrap_or_default();
@@ -13386,8 +15054,21 @@ impl AppView {
             let restore_view = view.clone();
             let autostart_cell = autostart_state.clone();
             let restore_cell = restore_state.clone();
+            // Ticket 10 (US-30): per-render clones for the skip-delete
+            // switch (the builder is `Fn` — handlers own these, never
+            // the outer bindings).
+            let skip_delete_view = view.clone();
+            let skip_delete_cell = skip_delete_state.clone();
+            // Ticket 01: per-render clones (the builder is `Fn` — handlers
+            // own these, never the outer bindings).
+            let appearance_render_view = appearance_view.clone();
+            let appearance_render_cell = appearance_state.clone();
+            let presets_render_view = presets_view.clone();
+            let routing_summary_render = routing_summary.clone();
+            let preset_summary_render = preset_summary.clone();
             let autostart_on = *autostart_state.borrow();
             let restore_on = *restore_state.borrow();
+            let skip_delete_on = *skip_delete_state.borrow();
             let save_reader = test_url_reader.clone();
             let save_view = test_url_view.clone();
             let copy_db_view = test_url_view.clone();
@@ -13404,6 +15085,23 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_2()
+                        // Ticket 02 (US-2/CAP-2): tail clearance — bottom
+                        // padding on the shared body stack (never a per-line
+                        // nudge) so the last content row clears the sticky
+                        // footer when the body is scrolled to its end; any
+                        // future section tail inherits the clearance.
+                        .pb_4()
+                        // Ticket 01: Basic section — the pre-existing Startup /
+                        // Probe / Paths / Maintenance blocks verbatim (their
+                        // ids and fold positions stay pinned); Appearance
+                        // closes the section so nothing above moves.
+                        .child(
+                            div()
+                                .id("settings-section-basic")
+                                .test_support()
+                                .text_sm()
+                                .child("Basic"),
+                        )
                         .child(
                             div()
                                 .id("settings-section-startup")
@@ -13511,6 +15209,41 @@ impl AppView {
                                 .test_support()
                                 .child(format!("Timers: {}", tick_interval_summary())),
                         )
+                        // Ticket 10 (US-30): skip-delete-confirm toggle —
+                        // single + bulk deletes run at once when on (stop-
+                        // first still applies); preset detach-deletes always
+                        // ask. Default off (fail-closed to the confirm).
+                        // Kept below Probe so Startup/Probe keep their fold
+                        // slots.
+                        .child(
+                            div()
+                                .id("settings-skip-delete")
+                                .test_support()
+                                .child(
+                                    Switch::new("settings-skip-delete-switch")
+                                        .checked(skip_delete_on)
+                                        .label("Skip delete confirms")
+                                        .on_change(move |next: &bool, window, cx| {
+                                            let next = *next;
+                                            let cell = skip_delete_cell.clone();
+                                            skip_delete_view.update(cx, |view, cx| {
+                                                if view.commit_skip_delete_confirm(next, window, cx) {
+                                                    *cell.borrow_mut() = next;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("settings-skip-delete-note")
+                                .test_support()
+                                .child(
+                                    "On deletes a row (or the checked set) at once. \
+                                     Preset detach-deletes still ask. Default off.",
+                                ),
+                        )
                         // Ticket 43: paths (display + copy; reveal = copy —
                         // the shell never shells out to an explorer).
                         .child(Separator::horizontal())
@@ -13603,6 +15336,149 @@ impl AppView {
                                     });
                                 }),
                         )
+                        // Ticket 01: Appearance closes Basic (positioned here
+                        // so the pre-existing blocks keep their fold slots).
+                        // Exclusive choices ride kit `Radio` with real checked
+                        // state, like the interval picker and log-level row.
+                        .child(
+                            div()
+                                .id("settings-appearance-caption")
+                                .test_support()
+                                .child(Label::new("Appearance")),
+                        )
+                        .child(
+                            div()
+                                .id("settings-appearance-group")
+                                .test_support()
+                                .child({
+                                    let current = appearance_render_cell.borrow().clone();
+                                    let selected = APPEARANCE_CHOICES
+                                        .iter()
+                                        .position(|(value, _)| *value == current);
+                                    let mut group = RadioGroup::horizontal(
+                                        "settings-appearance-options",
+                                    )
+                                    .selected_index(selected)
+                                    .on_change(move |ix, window, cx| {
+                                        let Some((value, _)) = APPEARANCE_CHOICES.get(*ix)
+                                        else {
+                                            return;
+                                        };
+                                        let value = value.to_string();
+                                        let cell = appearance_render_cell.clone();
+                                        appearance_render_view.update(cx, |view, cx| {
+                                            if view.commit_appearance(&value, window, cx) {
+                                                *cell.borrow_mut() = value;
+                                                cx.notify();
+                                            }
+                                        });
+                                    });
+                                    for (value, label) in APPEARANCE_CHOICES {
+                                        let tip = match *value {
+                                            "system" => "Follow the Windows app theme",
+                                            "light" => "Light theme",
+                                            _ => "Dark theme",
+                                        };
+                                        group = group.child(
+                                            Radio::new(*label)
+                                                .label(label.to_string())
+                                                .tooltip(tip),
+                                        );
+                                    }
+                                    group
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("settings-appearance-note")
+                                .test_support()
+                                .child(
+                                    "System follows the Windows app theme flag \
+                                     (AppsUseLightTheme). A change paints at once — no restart.",
+                                ),
+                        )
+                        // Ticket 01: Routing section — the single copy of the
+                        // routing controls lives in the presets manager; this
+                        // section links there (the ROUTING menu opens these
+                        // settings, never a second copy).
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-routing")
+                                .test_support()
+                                .text_sm()
+                                .child("Routing"),
+                        )
+                        .child(
+                            div()
+                                .id("settings-routing-summary")
+                                .test_support()
+                                .child(routing_summary_render.clone()),
+                        )
+                        .child(
+                            Button::new("settings-open-routing-presets")
+                                .label("Manage routing presets")
+                                .on_click(move |_, window, cx| {
+                                    presets_render_view.update(cx, |view, cx| {
+                                        view.open_presets_dialog(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("settings-routing-note")
+                                .test_support()
+                                .child(
+                                    "Routing rules edit only in the presets manager \
+                                     (proxy | direct | block — no system paths).",
+                                ),
+                        )
+                        // Ticket 01: Preset section — read-only inventory; edits
+                        // stay in the presets manager, per-row attach in the
+                        // inspector Presets pane.
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-preset")
+                                .test_support()
+                                .text_sm()
+                                .child("Preset"),
+                        )
+                        .child(
+                            div()
+                                .id("settings-preset-summary")
+                                .test_support()
+                                .child(preset_summary_render.clone()),
+                        )
+                        .child(
+                            div()
+                                .id("settings-preset-note")
+                                .test_support()
+                                .child(
+                                    "Attach a preset to a row from the inspector Presets pane.",
+                                ),
+                        )
+                        // Ticket 01: Hotkey section — the same
+                        // [`SHORTCUT_LINES`] the About dialog prints (a
+                        // read-only reference, never a second binding).
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-hotkey")
+                                .test_support()
+                                .text_sm()
+                                .child("Hotkey"),
+                        )
+                        .child(
+                            div().id("settings-hotkey-list").test_support().children(
+                                SHORTCUT_LINES
+                                    .iter()
+                                    .map(|(action, keys)| {
+                                        div().child(format!("{action}: {keys}"))
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                        )
                         .child(
                             div().id("settings-tray-note").test_support().child(
                                 "Closing the window hides to the tray while endpoints run; \
@@ -13610,7 +15486,10 @@ impl AppView {
                             ),
                         ),
                 )
-                .button_props(DialogButtonProps::default().show_cancel(true))
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "settings-dialog-ok",
                     "settings-dialog-cancel",
@@ -13737,6 +15616,202 @@ impl AppView {
     /// data paths + shortcuts list. Informational only; OK just closes.
     /// Ticket 47: presence lines come from the startup cache (no
     /// filesystem re-probe per open).
+    /// Ticket 10 (US-23): Tools > Runtime Stats — one screen for health
+    /// checks: uptime, running endpoints, stored traffic, live connections,
+    /// session deltas, subscription refresh state, DB size, and the selected
+    /// row's health. CPU/RAM process counters have no sampler in
+    /// this build, so the dialog says so (never a fabricated chart).
+    fn open_runtime_stats_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let uptime = format_uptime(self.started_at.elapsed().as_secs());
+        let running = self.engine.running_count();
+        let rows = self.store.list().unwrap_or_default();
+        let total = rows.len();
+        let running_binds: Vec<String> = rows
+            .iter()
+            .filter(|row| self.engine.is_running(&row.id))
+            .map(|row| format!("{}:{}", row.bind_ip, row.port))
+            .collect();
+        let traffic_line =
+            summed_traffic_text(&self.store).unwrap_or_else(|| "usage unavailable".to_string());
+        let conns = self.conn_snapshot.len();
+        let (delta_rx, delta_tx) = self
+            .conn_delta
+            .values()
+            .fold((0u64, 0u64), |(rx, tx), (d_rx, d_tx)| {
+                (rx.saturating_add(*d_rx), tx.saturating_add(*d_tx))
+            });
+        let subs = self.store.list_subscriptions().unwrap_or_default();
+        let now = now_unix();
+        let due = subs
+            .iter()
+            .filter(|sub| due_for_refresh_for(sub, now))
+            .count();
+        let subs_line = if self.store.subs_auto_refresh_enabled() {
+            format!("{} subscription(s), {due} due", subs.len())
+        } else {
+            format!(
+                "{} subscription(s), {due} due (auto-refresh off)",
+                subs.len()
+            )
+        };
+        let db_line = self
+            .store
+            .db_path()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| format_bytes(meta.len()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let selected_line = match self.selected_config(cx) {
+            Some(config) => {
+                let health = self.health_store.row_summary(&config.id);
+                let health = health.trim();
+                if health.is_empty() {
+                    format!("{} (no probes this session)", config.name)
+                } else {
+                    format!("{} ({health})", config.name)
+                }
+            }
+            None => "none selected".to_string(),
+        };
+        let lines = vec![
+            format!("Uptime: {uptime}"),
+            format!("Endpoints: {running} running / {total} stored"),
+            format!(
+                "Running: {}",
+                if running_binds.is_empty() {
+                    "—".to_string()
+                } else {
+                    running_binds.join(", ")
+                }
+            ),
+            format!("Traffic: {traffic_line}"),
+            format!("Connections: {conns} live"),
+            format!(
+                "Session Δ: ↓{} ↑{}",
+                format_bytes(delta_rx),
+                format_bytes(delta_tx)
+            ),
+            format!("Subscriptions: {subs_line}"),
+            format!("Database: {db_line}"),
+            format!("Selected: {selected_line}"),
+            "Process CPU/RAM: not sampled in this build (phase 2)".to_string(),
+        ];
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let mut body = div().flex().flex_col().gap_1();
+            for (ix, line) in lines.iter().enumerate() {
+                body = body.child(
+                    div()
+                        .id(format!("runtime-stat-{ix}"))
+                        .test_support()
+                        .text_sm()
+                        .child(line.clone()),
+                );
+            }
+            dialog
+                .title("Runtime stats")
+                .child(body)
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "runtime-stats-ok",
+                    "runtime-stats-cancel",
+                    footer_commit_label("runtime-stats"),
+                    Rc::new(|_, _| true),
+                ))
+        });
+    }
+
+    /// Ticket 10 (US-22): Tools > Traffic Stats — period selector plus
+    /// stacked per-exit bars (By Profile: one row per exit, heaviest
+    /// first) with the period summary. Periods summarize the same stored
+    /// cumulative totals (per-period history is phase-2), so the summary
+    /// labels itself all-time and the bars always match it.
+    fn open_traffic_stats_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let period = self.traffic_period;
+        let rows = self.store.list().unwrap_or_default();
+        let totals = self.store.traffic_totals().unwrap_or_default();
+        let exits = aggregate_exit_traffic(&rows, &totals);
+        let (exit_count, rx, tx) = store::Store::traffic_period_summary(&totals, period);
+        let summary = traffic_stats_summary_text(period, exit_count, rx, tx);
+        let max = exits
+            .iter()
+            .map(ExitTraffic::total)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let cycle_view = view.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let cycle_view = cycle_view.clone();
+            let mut body = div().flex().flex_col().gap_1();
+            body = body.child(
+                div()
+                    .id("traffic-stats-summary")
+                    .test_support()
+                    .text_sm()
+                    .child(summary.clone()),
+            );
+            body = body.child(
+                Button::new("traffic-stats-period")
+                    .small()
+                    .label(format!("Period: {}", period.label()))
+                    .tooltip("Cycle 24h → 7d → 30d → 90d (all-time totals throughout)")
+                    .on_click(move |_, window, cx| {
+                        cycle_view.update(cx, |view, cx| {
+                            let next = match view.traffic_period {
+                                store::TrafficPeriod::Day => store::TrafficPeriod::Week,
+                                store::TrafficPeriod::Week => store::TrafficPeriod::Month,
+                                store::TrafficPeriod::Month => store::TrafficPeriod::Quarter,
+                                store::TrafficPeriod::Quarter => store::TrafficPeriod::Day,
+                            };
+                            view.traffic_period = next;
+                            window.close_all_dialogs(cx);
+                            view.open_traffic_stats_dialog(window, cx);
+                        });
+                    }),
+            );
+            if exits.is_empty() {
+                body = body.child(
+                    div()
+                        .id("traffic-stats-empty")
+                        .test_support()
+                        .text_sm()
+                        .child("No traffic recorded yet — start an exit and pass data."),
+                );
+            }
+            for exit in &exits {
+                body = body.child(
+                    div()
+                        .id(format!("traffic-stat-{}", exit.row_id))
+                        .test_support()
+                        .text_sm()
+                        .child(format!(
+                            "{} {} · {} ↓{} ↑{}",
+                            traffic_stacked_bar(exit.rx_bytes, exit.tx_bytes, max),
+                            exit.name,
+                            exit.bind,
+                            format_bytes(exit.rx_bytes),
+                            format_bytes(exit.tx_bytes),
+                        )),
+                );
+            }
+            dialog
+                .title("Traffic stats")
+                .child(body)
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "traffic-stats-ok",
+                    "traffic-stats-cancel",
+                    footer_commit_label("traffic-stats"),
+                    Rc::new(|_, _| true),
+                ))
+        });
+    }
+
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sidecars = self.sidecar_presence.clone();
         let body = about_body(
@@ -13756,7 +15831,7 @@ impl AppView {
     }
 
     /// Map a palette (section, row) to its op. Section 0 is Library (15
-    /// rows), section 1 is Manage (9 rows) — the same order the dialog
+    /// rows), section 1 is Manage (11 rows) — the same order the dialog
     /// builds below.
     fn palette_op_at(index: IndexPath) -> Option<PaletteOp> {
         match (index.section, index.row) {
@@ -13787,6 +15862,10 @@ impl AppView {
             (1, 6) => Some(PaletteOp::StartAll),
             (1, 7) => Some(PaletteOp::StopAll),
             (1, 8) => Some(PaletteOp::TestAll),
+            // Ticket 10 (throne-adoption): stats ride the Manage tail so
+            // no existing row renumbers.
+            (1, 9) => Some(PaletteOp::RuntimeStats),
+            (1, 10) => Some(PaletteOp::TrafficStats),
             _ => None,
         }
     }
@@ -13885,6 +15964,15 @@ impl AppView {
                             CommandItem::new()
                                 .label("Test all")
                                 .keywords(["test", "all", "probe"]),
+                            // Ticket 10 (throne-adoption): stats ride the
+                            // Manage tail ((1, 9) + (1, 10)) so no existing
+                            // row renumbers.
+                            CommandItem::new()
+                                .label("Runtime stats")
+                                .keywords(["runtime", "stats", "health", "cpu", "memory"]),
+                            CommandItem::new()
+                                .label("Traffic stats")
+                                .keywords(["traffic", "stats", "usage", "profile"]),
                         ]))
                     .on_confirm(move |index, window, cx| {
                         view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
@@ -13926,6 +16014,8 @@ impl AppView {
             PaletteOp::TestAll => {
                 self.test_all_health(window, cx);
             }
+            PaletteOp::RuntimeStats => self.open_runtime_stats_dialog(window, cx),
+            PaletteOp::TrafficStats => self.open_traffic_stats_dialog(window, cx),
             // T08 (gpui-18-sweep CAP-9): menu-only twins dispatch through
             // the same handlers the Library menu items use.
             PaletteOp::ImportClipboard => self.open_import_from_clipboard(window, cx),
@@ -14036,6 +16126,17 @@ impl AppView {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         };
+        self.test_row(&config.id, window, cx);
+    }
+
+    /// Throne-adoption 03: URL-test THAT row (card menu), never the
+    /// selection. Same guards + toast as the selected path above. Ghost
+    /// rows warn.
+    fn test_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
         if !self.engine.running_ids().contains(&config.id) {
             window.push_notification(
                 Notification::warning(format!("\"{}\" is not running", config.name)),
@@ -14050,12 +16151,975 @@ impl AppView {
         self.spawn_probe(vec![config], false, true, Some(window.window_handle()), cx);
     }
 
+    /// Ticket 09 (throne-adoption): running rows of one group (display
+    /// order). Empty when the store fails — callers toast, never probe.
+    fn group_running_rows(&self, group: &str) -> Vec<ProxyConfig> {
+        let running = self.engine.running_ids();
+        self.store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.group == *group && running.contains(&row.id))
+            .collect()
+    }
+
+    /// Ticket 09 (throne-adoption): URL-test the focused group (facet
+    /// filter first, selected row's group second). Only running rows probe
+    /// (Test-all rule); the run is stoppable and toasts its group summary.
+    fn test_group_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.current_group(cx) else {
+            window.push_notification(
+                Notification::info("No group in focus — select a row or filter by group"),
+                cx,
+            );
+            return;
+        };
+        let rows = self.group_running_rows(&group);
+        if rows.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "Group \"{group}\" has no running endpoints to test"
+                )),
+                cx,
+            );
+            return;
+        }
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        self.spawn_group_probe(rows, group, Some(window.window_handle()), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): run one group's URL tests off the UI
+    /// thread with `Stop Testing` support. Completion records + persists
+    /// like [`AppView::record_and_persist`], then toasts the group summary
+    /// (stopped runs say so).
+    fn spawn_group_probe(
+        &mut self,
+        rows: Vec<ProxyConfig>,
+        group: String,
+        window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        use std::sync::atomic::Ordering;
+        if rows.is_empty() || self.group_test_in_flight {
+            return;
+        }
+        let count = rows.len();
+        let url = self.effective_test_url(&rows);
+        self.group_test_in_flight = true;
+        self.probe_stop.store(false, Ordering::SeqCst);
+        let stop = self.probe_stop.clone();
+        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let (outcomes, prober, stopped) = cx
+                .background_executor()
+                .spawn(async move {
+                    let prober = prober;
+                    let outcomes = test_group(&rows, &url, &*prober, &stop, |_, _| {});
+                    let stopped = stop.load(Ordering::SeqCst);
+                    (outcomes, prober, stopped)
+                })
+                .await;
+            cx.update(|cx| {
+                let recorded = weak.update(cx, |view, _| {
+                    view.prober = prober;
+                    view.group_test_in_flight = false;
+                    view.record_and_persist(&outcomes);
+                    let (live, dead) = view.health_counts();
+                    (live, dead)
+                });
+                let Ok((live, dead)) = recorded else {
+                    return;
+                };
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let message = group_test_summary_toast(&group, count, live, dead, stopped);
+                if let Some(handle) = window {
+                    if handle
+                        .update(cx, |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.reload(window, cx);
+                                window.push_notification(Notification::success(message), cx);
+                            });
+                        })
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                view.update(cx, |view, cx| view.reload_quiet(cx));
+            });
+        })
+        .detach();
+    }
+
+    /// Ticket 09 (throne-adoption): `Stop Testing` — raise the stop flag
+    /// so group test/speed/resolve runs stop pulling new rows. In-flight
+    /// rows still record; the completion toast says the run stopped early.
+    /// Quiet when nothing runs (never a fake stop).
+    fn stop_group_tests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        if !self.group_test_in_flight {
+            window.push_notification(Notification::info("No group test is running"), cx);
+            return;
+        }
+        self.probe_stop.store(true, Ordering::SeqCst);
+        window.push_notification(Notification::info("Stopping the group test…"), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): speedtest THAT row (card menu), never
+    /// the selection. Ghost rows warn; stopped rows probe and report
+    /// honestly through the runner (a refused dial is a named failure).
+    fn speedtest_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        self.speedtest_rows(vec![config], None, Some(window.window_handle()), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): speedtest the selected row's endpoint
+    /// (mode + pinned timeout). Records samples without traffic credit.
+    fn speedtest_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        };
+        self.speedtest_rows(vec![config], None, Some(window.window_handle()), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): speedtest the focused group's running
+    /// rows (same group focus as URL tests, same stop support).
+    fn speedtest_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.current_group(cx) else {
+            window.push_notification(
+                Notification::info("No group in focus — select a row or filter by group"),
+                cx,
+            );
+            return;
+        };
+        let rows = self.group_running_rows(&group);
+        if rows.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "Group \"{group}\" has no running endpoints to speedtest"
+                )),
+                cx,
+            );
+            return;
+        }
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        self.speedtest_rows(rows, Some(group), Some(window.window_handle()), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): run speedtests off-thread (sequential —
+    /// concurrent transfers would share the pipe). `scope` names the toast
+    /// (`Some(group)` for groups, the row name for singles).
+    fn speedtest_rows(
+        &mut self,
+        rows: Vec<ProxyConfig>,
+        group: Option<String>,
+        window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        use std::sync::atomic::Ordering;
+        if rows.is_empty() || self.group_test_in_flight {
+            return;
+        }
+        let mode = self.speedtest_mode;
+        let config = SpeedtestConfig {
+            mode,
+            timeout: SPEED_TEST_TIMEOUT,
+        };
+        let url = self.effective_test_url(&rows);
+        let scope = group.unwrap_or_else(|| {
+            rows.first()
+                .map(|row| format!("\"{}\"", row.name))
+                .unwrap_or_default()
+        });
+        let single_name: Option<String> = if rows.len() == 1 {
+            rows.first().map(|row| row.name.clone())
+        } else {
+            None
+        };
+        self.group_test_in_flight = true;
+        self.probe_stop.store(false, Ordering::SeqCst);
+        let stop = self.probe_stop.clone();
+        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let (outcomes, prober) = cx
+                .background_executor()
+                .spawn(async move {
+                    let prober = prober;
+                    let outcomes = speed_group(
+                        &rows,
+                        &url,
+                        config.mode,
+                        config.timeout,
+                        &*prober,
+                        &stop,
+                        |_, _| {},
+                    );
+                    (outcomes, prober)
+                })
+                .await;
+            cx.update(|cx| {
+                let summary = weak.update(cx, |view, _| {
+                    view.prober = prober;
+                    view.group_test_in_flight = false;
+                    view.record_and_persist_speed(&outcomes);
+                    let measured = outcomes.iter().filter(|o| o.mbps.is_some()).count();
+                    let failed = outcomes.len() - measured;
+                    let single = single_name.as_deref().and_then(|name| {
+                        outcomes
+                            .first()
+                            .map(|outcome| speed_result_toast(name, outcome))
+                    });
+                    (measured, failed, outcomes.len(), single)
+                });
+                let Ok((measured, failed, count, single)) = summary else {
+                    return;
+                };
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let message = single.unwrap_or_else(|| {
+                    if count == 1 {
+                        format!("Speedtest {scope}: {measured} measured · {failed} failed")
+                    } else {
+                        speed_test_summary_toast(&scope, mode, measured, failed)
+                    }
+                });
+                if let Some(handle) = window {
+                    if handle
+                        .update(cx, |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.reload(window, cx);
+                                window.push_notification(Notification::success(message), cx);
+                            });
+                        })
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                view.update(cx, |view, cx| view.reload_quiet(cx));
+            });
+        })
+        .detach();
+    }
+
+    /// Ticket 09 (throne-adoption): record speedtest outcomes — samples
+    /// plus restart persistence, never traffic (see
+    /// [`HealthStore::record_speed_sample`]).
+    fn record_and_persist_speed(&mut self, outcomes: &[SpeedtestOutcome]) {
+        let mut snapshots = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            self.health_store.record_speed_sample(outcome, now_unix());
+            snapshots.push(HealthSnapshot {
+                config_id: outcome.config_id.clone(),
+                at: now_unix(),
+                kind: "url-test".to_string(),
+                latency_ms: outcome.latency_ms,
+                error: outcome.error.clone(),
+            });
+        }
+        if !snapshots.is_empty() {
+            if let Err(error) = self.store.save_health_snapshots(&snapshots) {
+                eprintln!("speed snapshot persist failed: {error}");
+            }
+        }
+    }
+
+    /// Ticket 09 (throne-adoption): cycle the speedtest mode
+    /// (download → upload → download). The timeout stays pinned.
+    fn cycle_speedtest_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.speedtest_mode = self.speedtest_mode.next();
+        window.push_notification(
+            Notification::info(format!("Speedtest mode: {}", self.speedtest_mode.as_str())),
+            cx,
+        );
+    }
+
+    /// Ticket 09 (throne-adoption): resolve THAT row's out-IP (card menu),
+    /// never the selection. Ghost rows warn.
+    fn resolve_out_ip_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        self.resolve_out_ip_rows(vec![config], None, Some(window.window_handle()), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): resolve the selected row's out-IP
+    /// through its endpoint (toast shows the address or the named failure).
+    fn resolve_out_ip_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_config(cx) else {
+            window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        };
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        self.resolve_out_ip_rows(vec![config], None, Some(window.window_handle()), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): resolve the focused group's running
+    /// rows' out-IPs (stoppable; summary toast dedupes addresses).
+    fn resolve_out_ip_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.current_group(cx) else {
+            window.push_notification(
+                Notification::info("No group in focus — select a row or filter by group"),
+                cx,
+            );
+            return;
+        };
+        let rows = self.group_running_rows(&group);
+        if rows.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "Group \"{group}\" has no running endpoints to resolve"
+                )),
+                cx,
+            );
+            return;
+        }
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        self.resolve_out_ip_rows(
+            rows,
+            Some(format!("in group \"{group}\"")),
+            Some(window.window_handle()),
+            cx,
+        );
+    }
+
+    /// Ticket 09 (throne-adoption): fetch out-IPs off-thread. Results are
+    /// toasted, never stored (no row field carries the egress IP).
+    fn resolve_out_ip_rows(
+        &mut self,
+        rows: Vec<ProxyConfig>,
+        scope: Option<String>,
+        window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        use std::sync::atomic::Ordering;
+        if rows.is_empty() || self.group_test_in_flight {
+            return;
+        }
+        let scope = scope.unwrap_or_else(|| {
+            rows.first()
+                .map(|row| format!("of \"{}\"", row.name))
+                .unwrap_or_default()
+        });
+        self.group_test_in_flight = true;
+        self.probe_stop.store(false, Ordering::SeqCst);
+        let stop = self.probe_stop.clone();
+        let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let (resolved, prober) = cx
+                .background_executor()
+                .spawn(async move {
+                    let prober = prober;
+                    let mut ips = Vec::new();
+                    let mut failed = Vec::new();
+                    for row in &rows {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if prober.supports(row) {
+                            match prober.out_ip(row, &row.bind_ip, row.port, RESOLVE_IP_URL) {
+                                Ok(ip) => ips.push(ip),
+                                Err(cause) => failed.push(format!("\"{}\": {cause}", row.name)),
+                            }
+                        } else {
+                            failed.push(format!(
+                                "\"{}\": unsupported protocol for out-ip resolve",
+                                row.name
+                            ));
+                        }
+                    }
+                    ((ips, failed), prober)
+                })
+                .await;
+            cx.update(|cx| {
+                let done = weak.update(cx, |view, _| {
+                    view.prober = prober;
+                    view.group_test_in_flight = false;
+                });
+                if done.is_err() {
+                    return;
+                }
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let (ips, failed) = resolved;
+                let message = out_ip_summary_toast(&scope, &ips, &failed);
+                if let Some(handle) = window {
+                    if handle
+                        .update(cx, |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.reload(window, cx);
+                                window.push_notification(Notification::success(message), cx);
+                            });
+                        })
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                view.update(cx, |view, cx| view.reload_quiet(cx));
+            });
+        })
+        .detach();
+    }
+
+    /// Ticket 09 (throne-adoption): row Resolve-Domain — resolve the row's
+    /// server hostname and save the looked-up IP into params. IP literals
+    /// and keyless rows toast honestly instead of rewriting.
+    fn resolve_domain_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        let Some(host) = row_server_hostname(&config.params) else {
+            window.push_notification(
+                Notification::info(format!(
+                    "\"{}\" has no domain server to resolve",
+                    config.name
+                )),
+                cx,
+            );
+            return;
+        };
+        if self.group_test_in_flight {
+            window.push_notification(Notification::info("A group test is already running"), cx);
+            return;
+        }
+        self.group_test_in_flight = true;
+        let handle = window.window_handle();
+        let weak = cx.entity().downgrade();
+        let id = config.id.clone();
+        let name = config.name.clone();
+        let params = config.params.clone();
+        cx.spawn(async move |_entity, cx| {
+            let lookup = host.clone();
+            let found = cx
+                .background_executor()
+                .spawn(async move { resolve_hostname(&lookup, RESOLVE_TIMEOUT) })
+                .await;
+            cx.update(|cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.group_test_in_flight = false;
+                        let Some(ip) = found else {
+                            window.push_notification(
+                                Notification::warning(format!(
+                                    "Could not resolve \"{name}\" — server unchanged"
+                                )),
+                                cx,
+                            );
+                            return;
+                        };
+                        let Some(rewritten) = rewrite_server_to_ip(&params, &ip.to_string()) else {
+                            window.push_notification(
+                                Notification::warning(format!(
+                                    "\"{name}\" has no domain server to resolve"
+                                )),
+                                cx,
+                            );
+                            return;
+                        };
+                        let patch = ConfigPatch {
+                            params: Some(rewritten),
+                            ..Default::default()
+                        };
+                        match view.store.update(&id, patch) {
+                            Ok(_) => {
+                                view.reload(window, cx);
+                                window.push_notification(
+                                    Notification::success(format!(
+                                        "\"{name}\": server now {ip} (was {host})"
+                                    )),
+                                    cx,
+                                );
+                            }
+                            Err(error) => {
+                                window
+                                    .push_notification(Notification::error(error.to_string()), cx);
+                            }
+                        }
+                    });
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Ticket 09 (throne-adoption): group Resolve-Domain behind a confirm
+    /// naming the group scope and the domain rows. Each domain resolves and
+    /// saves; the toast names rewrites plus failures.
+    fn open_resolve_domain_group_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.current_group(cx) else {
+            window.push_notification(
+                Notification::info("No group in focus — select a row or filter by group"),
+                cx,
+            );
+            return;
+        };
+        let candidates: Vec<(String, String, String)> = self
+            .store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.group == group)
+            .filter_map(|row| {
+                row_server_hostname(&row.params)
+                    .map(|host| (row.id.clone(), row.name.clone(), host))
+            })
+            .collect();
+        if candidates.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "Group \"{group}\" has no domain servers to resolve"
+                )),
+                cx,
+            );
+            return;
+        }
+        let names: Vec<String> = candidates.iter().map(|(_, name, _)| name.clone()).collect();
+        let description = resolve_domain_confirm_text(&group, &names);
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let candidates = candidates.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Rewrite")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .title(format!("Resolve domains in group \"{group}\"?"))
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    let candidates = candidates.clone();
+                    view.update(cx, |view, cx| {
+                        view.commit_resolve_domain_group(&candidates, window, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Ticket 09 (throne-adoption): commit the group Resolve-Domain —
+    /// resolve each candidate off-thread, save rewrites, toast the result.
+    fn commit_resolve_domain_group(
+        &mut self,
+        candidates: &[(String, String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if candidates.is_empty() || self.group_test_in_flight {
+            return;
+        }
+        self.group_test_in_flight = true;
+        self.probe_stop
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let stop = self.probe_stop.clone();
+        let handle = window.window_handle();
+        let weak = cx.entity().downgrade();
+        let candidates = candidates.to_vec();
+        let store_snapshot: Vec<(String, String)> = self
+            .store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.id, row.params))
+            .collect();
+        cx.spawn(async move |_entity, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut rewritten = Vec::new();
+                    let mut failed = Vec::new();
+                    for (id, name, host) in &candidates {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        let params = store_snapshot
+                            .iter()
+                            .find(|(row_id, _)| row_id == id)
+                            .map(|(_, params)| params.clone())
+                            .unwrap_or_default();
+                        match resolve_hostname(host, RESOLVE_TIMEOUT) {
+                            Some(ip) => match rewrite_server_to_ip(&params, &ip.to_string()) {
+                                Some(new_params) => rewritten.push((
+                                    id.clone(),
+                                    name.clone(),
+                                    host.clone(),
+                                    new_params,
+                                )),
+                                None => failed.push(format!("\"{name}\": no domain server")),
+                            },
+                            None => failed.push(format!("\"{name}\": could not resolve {host}")),
+                        }
+                    }
+                    (rewritten, failed)
+                })
+                .await;
+            cx.update(|cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.group_test_in_flight = false;
+                        let (rewritten, failed) = done;
+                        let mut saved: Vec<(String, String, String)> = Vec::new();
+                        let mut save_failed = failed;
+                        for (id, name, host, new_params) in rewritten {
+                            let patch = ConfigPatch {
+                                params: Some(new_params),
+                                ..Default::default()
+                            };
+                            match view.store.update(&id, patch) {
+                                Ok(updated) => {
+                                    let new_host = row_server_hostname(&updated.params)
+                                        .unwrap_or_else(|| updated.params.clone());
+                                    saved.push((name, host, new_host));
+                                }
+                                Err(error) => save_failed.push(format!("\"{name}\": {error}")),
+                            }
+                        }
+                        view.reload(window, cx);
+                        let message = resolve_domain_result_message(&saved, &save_failed);
+                        window.push_notification(Notification::success(message), cx);
+                    });
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Ticket 09 (throne-adoption): group prunes behind scope-naming
+    /// confirms (see the `*_confirm_text` store seams). Each confirm names
+    /// the group plus the count (duplicates also preview ≤20 names);
+    /// commits stop running endpoints first (bulk-delete precedent), then
+    /// remove, then toast the actually-removed rows.
+    fn open_prune_confirm(
+        &mut self,
+        kind: GroupPruneKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(
+            GroupPruneKind::ALL.contains(&kind),
+            "prune kinds stay the pinned four"
+        );
+        let Some(group) = self.current_group(cx) else {
+            window.push_notification(
+                Notification::info("No group in focus — select a row or filter by group"),
+                cx,
+            );
+            return;
+        };
+        let (title, description, ok) = match kind {
+            GroupPruneKind::Duplicates => {
+                let (total, preview) = self
+                    .store
+                    .duplicate_preview_in_group(&group)
+                    .unwrap_or((0, Vec::new()));
+                if total == 0 {
+                    window.push_notification(
+                        Notification::info(format!("Group \"{group}\" has no duplicates")),
+                        cx,
+                    );
+                    return;
+                }
+                (
+                    format!("Remove {total} duplicate(s) in group \"{group}\"?"),
+                    prune_duplicates_confirm_text(&group, total, &preview),
+                    "Remove",
+                )
+            }
+            GroupPruneKind::Unavailable => {
+                let count = self
+                    .store
+                    .unavailable_rows_in_group(&group)
+                    .map(|rows| rows.len())
+                    .unwrap_or(0);
+                if count == 0 {
+                    window.push_notification(
+                        Notification::info(format!("Group \"{group}\" has no unavailable rows")),
+                        cx,
+                    );
+                    return;
+                }
+                (
+                    format!("Remove {count} unavailable row(s) in group \"{group}\"?"),
+                    prune_unavailable_confirm_text(&group, count),
+                    "Remove",
+                )
+            }
+            GroupPruneKind::Invalid => {
+                let count = self
+                    .store
+                    .invalid_rows_in_group(&group)
+                    .map(|rows| rows.len())
+                    .unwrap_or(0);
+                if count == 0 {
+                    window.push_notification(
+                        Notification::info(format!("Group \"{group}\" has no invalid rows")),
+                        cx,
+                    );
+                    return;
+                }
+                (
+                    format!("Remove {count} invalid row(s) in group \"{group}\"?"),
+                    prune_invalid_confirm_text(&group, count),
+                    "Remove",
+                )
+            }
+            GroupPruneKind::ClearTests => {
+                let count = self.group_test_sample_count(&group);
+                if count == 0 {
+                    window.push_notification(
+                        Notification::info(format!("Group \"{group}\" has no test results")),
+                        cx,
+                    );
+                    return;
+                }
+                (
+                    format!("Clear {count} test result(s) in group \"{group}\"?"),
+                    clear_group_tests_confirm_text(&group, count),
+                    "Clear",
+                )
+            }
+        };
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let title = title.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text(ok)
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .title(title)
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit_prune(kind, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Ticket 09 (throne-adoption): persisted test-sample count for one
+    /// group (the Clear-tests confirm input).
+    fn group_test_sample_count(&self, group: &str) -> usize {
+        let ids: HashSet<String> = self
+            .store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.group == group)
+            .map(|row| row.id)
+            .collect();
+        self.store
+            .load_health_snapshots()
+            .unwrap_or_default()
+            .iter()
+            .filter(|snap| ids.contains(&snap.config_id))
+            .count()
+    }
+
+    /// Ticket 09 (throne-adoption): commit one group prune over the
+    /// currently focused group (re-resolved at commit; the toast names the
+    /// actually-removed rows so a mid-confirm change never lies).
+    fn commit_prune(&mut self, kind: GroupPruneKind, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.current_group(cx) else {
+            window.push_notification(
+                Notification::info("No group in focus — select a row or filter by group"),
+                cx,
+            );
+            return;
+        };
+        // Stop-first (bulk-delete precedent): deleting a running row
+        // without stopping would orphan its endpoint.
+        let stop_running = |view: &mut Self, rows: &[ProxyConfig]| {
+            for row in rows {
+                let _ = view.engine.stop_one(&row.id);
+            }
+        };
+        let removed: Vec<String> = match kind {
+            GroupPruneKind::Duplicates => {
+                let targets = self
+                    .store
+                    .duplicate_rows_in_group(&group)
+                    .unwrap_or_default();
+                stop_running(self, &targets);
+                self.store
+                    .remove_duplicates_in_group(&group)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| row.name)
+                    .collect()
+            }
+            GroupPruneKind::Unavailable => {
+                let targets = self
+                    .store
+                    .unavailable_rows_in_group(&group)
+                    .unwrap_or_default();
+                stop_running(self, &targets);
+                self.store
+                    .remove_unavailable_in_group(&group)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| row.name)
+                    .collect()
+            }
+            GroupPruneKind::Invalid => {
+                let targets = self.store.invalid_rows_in_group(&group).unwrap_or_default();
+                stop_running(self, &targets);
+                self.store
+                    .remove_invalid_in_group(&group)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| row.name)
+                    .collect()
+            }
+            GroupPruneKind::ClearTests => match self.store.clear_tests_in_group(&group) {
+                Ok(cleared) => {
+                    self.health_store_prune_group(&group);
+                    self.reload(window, cx);
+                    window.push_notification(
+                        Notification::success(format!(
+                            "Cleared {cleared} test result(s) in group \"{group}\""
+                        )),
+                        cx,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    window.push_notification(Notification::error(error.to_string()), cx);
+                    return;
+                }
+            },
+        };
+        self.reload(window, cx);
+        if removed.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "{} in group \"{group}\": nothing removed — rows changed",
+                    kind.label()
+                )),
+                cx,
+            );
+            return;
+        }
+        let shown: Vec<&str> = removed.iter().take(3).map(String::as_str).collect();
+        let mut text = format!(
+            "{} in group \"{group}\": {} removed ({})",
+            kind.label(),
+            removed.len(),
+            shown.join(", ")
+        );
+        if removed.len() > shown.len() {
+            text.push_str(&format!(" (+{} more)", removed.len() - shown.len()));
+        }
+        window.push_notification(Notification::success(text), cx);
+    }
+
+    /// Ticket 09 (throne-adoption): drop the session health samples of one
+    /// group's rows after `Clear tests` (persisted snapshots go through
+    /// the store; the session ring here must agree).
+    fn health_store_prune_group(&mut self, group: &str) {
+        let ids: HashSet<String> = self
+            .store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.group == group)
+            .map(|row| row.id)
+            .collect();
+        self.health_store.prune_configs(&ids);
+    }
+
+    /// Ticket 09 (throne-adoption): Show-Security toggle (list repaint).
+    fn toggle_show_security(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let show = !self.libraries.read(cx).delegate().show_security;
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_show_security(show);
+            list_cx.notify();
+        });
+        window.push_notification(
+            Notification::info(if show {
+                "Show security: on".to_string()
+            } else {
+                "Show security: off".to_string()
+            }),
+            cx,
+        );
+    }
+
+    /// Ticket 09 (throne-adoption): `Type|Security` sort toggle (display
+    /// order only; store order untouched).
+    fn toggle_type_security_sort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sort = !self.libraries.read(cx).delegate().type_security_sort;
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_type_security_sort(sort);
+            list_cx.notify();
+        });
+        window.push_notification(
+            Notification::info(if sort {
+                "Sort: Type|Security".to_string()
+            } else {
+                "Sort: library order".to_string()
+            }),
+            cx,
+        );
+    }
+
     /// Ticket 06: TCP-ping just the selected config's endpoint.
     /// Ticket 26: off-thread via [`AppView::spawn_probe`] (silent record).
     /// Ticket 43: the selected ping toasts its result like the test above.
     fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
+            return;
+        };
+        self.ping_row(&config.id, window, cx);
+    }
+
+    /// Throne-adoption 03: TCP-ping THAT row (card menu), never the
+    /// selection. Same guards as the selected path above. Ghost rows warn.
+    fn ping_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
             return;
         };
         if !self.engine.running_ids().contains(&config.id) {
@@ -14228,6 +17292,23 @@ impl AppView {
         self.visible_log_lines(cx)
     }
 
+    /// Ticket 05 (throne-adoption): one visible log line against the extra
+    /// legs — exclude keyword (the line drops when it contains it) plus a
+    /// regex over the redacted display line (post-redaction, so a pattern
+    /// can never pull a secret back into view). Empty legs are inactive; an
+    /// invalid regex fails open at the compile site (ignored, never a silent
+    /// empty). Pure seam for tests.
+    fn log_line_passes_filters(
+        line: &str,
+        exclude_lower: &str,
+        pattern: Option<&regex::Regex>,
+    ) -> bool {
+        if !exclude_lower.is_empty() && line.to_lowercase().contains(exclude_lower) {
+            return false;
+        }
+        pattern.is_none_or(|re| re.is_match(line))
+    }
+
     /// Ticket 45: the level filter (`log_level`) applies first; the tail
     /// toggle picks the newest 200 (tail on) or the oldest 200 (tail off,
     /// paused at the head). This is the single source behind the dialog,
@@ -14254,6 +17335,19 @@ impl AppView {
             .collect();
         if !filter.is_empty() {
             lines.retain(|line| line.to_lowercase().contains(&filter));
+        }
+        // Ticket 05 (throne-adoption): the exclude-keyword + regex legs
+        // (include stays above). The pattern compiles once per render; an
+        // invalid pattern fails open — see `log_line_passes_filters`.
+        let exclude = self.log_exclude.trim().to_lowercase();
+        let raw_pattern = self.log_regex.trim();
+        let pattern = if raw_pattern.is_empty() {
+            None
+        } else {
+            regex::Regex::new(raw_pattern).ok()
+        };
+        if !exclude.is_empty() || pattern.is_some() {
+            lines.retain(|line| Self::log_line_passes_filters(line, &exclude, pattern.as_ref()));
         }
         if lines.len() > 200 {
             if self.log_tail {
@@ -14382,6 +17476,10 @@ impl AppView {
     /// confirmation).
     fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.log_filter.clear();
+        // Ticket 05: the extra legs clear together — clearing text alone
+        // while an exclude/regex hides everything would look broken.
+        self.log_exclude.clear();
+        self.log_regex.clear();
         self.log_level = None;
         if self.logs_open && window.has_active_sheet(cx) {
             window.close_sheet(cx);
@@ -14402,8 +17500,27 @@ impl AppView {
     /// Ticket 05: logs filter commit — stores the typed filter so the list
     /// re-renders around it. The footer commit path calls this; Cancel never
     /// does (discarding leaves the previous filter intact).
+    /// Throne-adoption 05 keeps this single-leg seam for headless tests; the
+    /// sheet commits the triple via [`AppView::apply_log_filters`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
         self.log_filter = filter;
+        cx.notify();
+    }
+
+    /// Ticket 05 (throne-adoption): include + exclude + regex commit behind
+    /// the logs-sheet footer (same close-exactly-once rhythm as the single
+    /// commit; Cancel never reaches here, discarding all three edits).
+    fn apply_log_filters(
+        &mut self,
+        include: String,
+        exclude: String,
+        pattern: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.log_filter = include;
+        self.log_exclude = exclude;
+        self.log_regex = pattern;
         cx.notify();
     }
 
@@ -14414,8 +17531,24 @@ impl AppView {
                 .placeholder("Filter logs")
                 .default_value(current)
         });
+        // Ticket 05 (throne-adoption): exclude-keyword + regex fields beside
+        // the include filter (same per-open entity pattern, same commit).
+        let current_exclude = self.log_exclude.clone();
+        let exclude_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Exclude keyword")
+                .default_value(current_exclude)
+        });
+        let current_pattern = self.log_regex.clone();
+        let pattern_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Regex (empty = off)")
+                .default_value(current_pattern)
+        });
         let view = cx.entity();
         let reader = filter_state.clone();
+        let exclude_reader = exclude_state.clone();
+        let pattern_reader = pattern_state.clone();
         let lines = self.log_lines(cx);
         // T07 (gpui-18-sweep CAP-8): the virtualized viewport syncs from the
         // same snapshot the dialog shows — kit `List` mounts only viewport
@@ -14446,8 +17579,10 @@ impl AppView {
         let commit_view = view.clone();
         let commit: DialogCommit = Rc::new(move |_window, cx| {
             let filter = reader.read(cx).value().to_string();
+            let exclude = exclude_reader.read(cx).value().to_string();
+            let pattern = pattern_reader.read(cx).value().to_string();
             commit_view.update(cx, |view, cx| {
-                view.apply_log_filter(filter, cx);
+                view.apply_log_filters(filter, exclude, pattern, cx);
             });
             true
         });
@@ -14610,6 +17745,16 @@ impl AppView {
                         "field-log-filter",
                         "Filter",
                         filter_state.clone(),
+                    ))
+                    .child(dialog_field(
+                        "field-log-exclude",
+                        "Exclude",
+                        exclude_state.clone(),
+                    ))
+                    .child(dialog_field(
+                        "field-log-regex",
+                        "Regex",
+                        pattern_state.clone(),
                     ));
             let mut list = div().id("log-lines").test_support().w_full();
             // T07 (gpui-18-sweep CAP-8): lines render through the kit `List`
@@ -15014,6 +18159,75 @@ impl AppView {
         Ok(())
     }
 
+    /// Ticket 06 (throne-adoption): the second small dialog behind
+    /// `Advanced Settings` — Dial Fields plus TLS extras over the SAME
+    /// form entities, so typing writes direct to the object: closing keeps
+    /// everything with no extra validation (the main commit still gates).
+    /// A stacked `Dialog` over the Add/Edit dialog: kit sheets do not
+    /// deliver mouse events to their content in 0.6.6 (proven headless —
+    /// sheet buttons never fire), while stacked dialogs use the same
+    /// proven layer mechanics as every other form. Back pops only the top
+    /// dialog and the main form is never dropped, so no edit is ever lost.
+    fn open_advanced_dialog(
+        &mut self,
+        form: &ConfigForm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let adv_view = view.clone();
+        let repaint_view = view.clone();
+        let adv_form = form.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
+            let repaint: DialogRepaint = Rc::new({
+                let repaint_view = repaint_view.clone();
+                move |_window, cx| {
+                    repaint_view.update(cx, |_, cx| cx.notify());
+                }
+            });
+            let body_view = adv_view.clone();
+            let protocol = adv_form.protocol_text(cx);
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .id("advanced-dialog")
+                .test_support();
+            if has_dial_panel(&protocol) {
+                body = body.child(adv_form.s4_section(&body_view, &repaint, cx));
+            }
+            if tls_panel_plan(&protocol).is_some() {
+                body = body.child(adv_form.s2_extras_section(&repaint));
+            }
+            // Enter behaves like Back (nothing to commit — edits already
+            // apply direct to the object): pop exactly the top dialog and
+            // report `false` so the kit does not close a second layer.
+            let back = Rc::new(|window: &mut Window, cx: &mut App| {
+                window.close_dialog(cx);
+            });
+            let back_key = back.clone();
+            dialog
+                .title("Advanced Settings")
+                .child(body)
+                .button_props(DialogButtonProps::default().show_cancel(false).on_ok(
+                    move |_, window, cx| {
+                        back_key(window, cx);
+                        false
+                    },
+                ))
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("advanced-dialog-back")
+                            .small()
+                            .label("Back")
+                            .tooltip("Back to the main form — edits already apply")
+                            .accessibility_label("Back to the main form")
+                            .on_click(move |_, window, cx| back(window, cx)),
+                    ),
+                )
+        });
+    }
+
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut form = ConfigForm::blank(window, cx);
         let view = cx.entity();
@@ -15068,6 +18282,10 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title("Add proxy configuration")
+                // Ticket 06: the Advanced dialog stacks above this dialog —
+                // overlay clicks must not discard the form (Cancel/Escape
+                // still close).
+                .overlay_closable(false)
                 .child(form.clone().element(
                     element_view.clone(),
                     cx,
@@ -15166,6 +18384,10 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title(title.clone())
+                // Ticket 06: the Advanced dialog stacks above this dialog —
+                // overlay clicks must not discard the form (Cancel/Escape
+                // still close).
+                .overlay_closable(false)
                 .child(form.clone().element(
                     element_view.clone(),
                     cx,
@@ -15195,6 +18417,13 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ticket 10 (US-30): skip-delete-confirm toggle — the explicit
+        // Settings opt-in deletes without asking (stop-first still rides
+        // `commit_remove`, like the confirm path).
+        if self.store.skip_delete_confirm() {
+            self.commit_remove(&config.id, window, cx);
+            return;
+        }
         let view = cx.entity();
         let id = config.id.clone();
         let name = config.name.clone();
@@ -15361,16 +18590,177 @@ impl AppView {
 
     /// Ticket 03: clipboard entry point. Clipboard text prefills the same
     /// dialog (same group choice, same commit path).
+    /// Ticket 08 (cua-fixes): prose on the clipboard toasts honestly
+    /// instead of opening a junk-prefilled dialog — never silent, and never
+    /// an echo (clipboard text may carry secrets, so both toasts are static
+    /// copy).
     fn open_import_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
             .unwrap_or_default();
-        if text.trim().is_empty() {
-            window.push_notification(Notification::warning("Clipboard has no text to import"), cx);
-            return;
+        match Self::paste_intake_refusal(&text) {
+            None => self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx),
+            Some(reason) => {
+                window.push_notification(Notification::warning(reason), cx);
+            }
         }
-        self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx);
+    }
+
+    /// Ticket 08 (cua-fixes): paste-intake gate for the Ctrl+V handler
+    /// above (the same handler as the palette `ImportClipboard` op and the
+    /// Library-menu "From clipboard" item). `None` opens the prefilled
+    /// dialog exactly as before; `Some(reason)` is the honest toast. The
+    /// shaped arms mirror the commit diversions in
+    /// [`commit_import_with_context`] (library export, addsub,
+    /// route/remoteroute, preset JSON), and the fallback asks
+    /// [`import_text`] — the same parse the dialog preview and commit use —
+    /// so the gate can never block a valid import.
+    fn paste_intake_refusal(text: &str) -> Option<&'static str> {
+        use crate::preset::{is_remote_route_attempt, is_route_attempt, looks_like_preset_json};
+        if text.trim().is_empty() {
+            return Some("Clipboard has no text to import");
+        }
+        if is_library_export(text) {
+            return None;
+        }
+        let trimmed = text.trim();
+        let single_line = !trimmed.contains('\n');
+        if single_line && is_addsub_attempt(trimmed) {
+            return None;
+        }
+        if single_line && (is_route_attempt(trimmed) || is_remote_route_attempt(trimmed)) {
+            return None;
+        }
+        if looks_like_preset_json(trimmed) {
+            return None;
+        }
+        if import_text(text).configs.is_empty() {
+            return Some(
+                "Clipboard text is not importable — nothing imported (paste a share link, JSON, conf, or preset link)",
+            );
+        }
+        None
+    }
+
+    /// Ticket 07 (throne-adoption): OS open-with handoff. Bare `http(s)` URLs
+    /// are ambiguous (subscription feed vs proxy) and get the chooser;
+    /// everything else arrives pre-disambiguated and prefills one import
+    /// dialog (the commit path diverts addsub/preset/restore identically —
+    /// one argv string is one batch result with one honest toast).
+    fn handle_launch_intake(
+        &mut self,
+        intake: OpenWithKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match intake {
+            OpenWithKind::BareHttp(url) => self.open_bare_url_chooser(url, window, cx),
+            OpenWithKind::Batch(text) => {
+                self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx)
+            }
+        }
+    }
+
+    /// Ticket 07: bare-`http(s)` chooser — the URL never parses silently as
+    /// a proxy row (the batch path would read it as one). Both options are
+    /// explicit; Cancel (or footer Close) drops the handoff with nothing
+    /// stored. Body buttons close the chooser before acting (no stacked
+    /// dialogs).
+    fn open_bare_url_chooser(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let proxy_view = view.clone();
+        let proxy_url = url.clone();
+        let sub_view = view.clone();
+        let sub_url = url.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            // Per-render clones: the builder is `Fn`, so each render hands
+            // the handlers fresh clones instead of moving the captured
+            // originals (which `Fn` forbids).
+            let proxy_view = proxy_view.clone();
+            let proxy_url = proxy_url.clone();
+            let sub_view = sub_view.clone();
+            let sub_url = sub_url.clone();
+            dialog
+                .title("Add HTTP link")
+                .child(
+                    div()
+                        .id("bare-url-chooser")
+                        .test_support()
+                        .child(format!(
+                            "\"{url}\" can be a subscription feed or a proxy — choose how to add it:"
+                        ))
+                        .child(
+                            {
+                                let view = proxy_view.clone();
+                                let url = proxy_url.clone();
+                                Button::new("bare-url-import-proxy")
+                                    .label("Import as proxy here")
+                                    .on_click(move |_, window, cx| {
+                                        window.close_all_dialogs(cx);
+                                        view.update(cx, |view, cx| {
+                                            view.open_import_dialog(
+                                                &url,
+                                                DEFAULT_GROUP,
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    })
+                            },
+                        )
+                        .child(
+                            {
+                                let view = sub_view.clone();
+                                let url = sub_url.clone();
+                                Button::new("bare-url-add-subscription")
+                                    .label("Add as subscription")
+                                    .on_click(move |_, window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.commit_bare_url_subscription(
+                                                url.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    })
+                            },
+                        ),
+                )
+                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
+                // shared footer renders the single `Close` and `Esc` still
+                // closes through the dialog Cancel key path.
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "bare-url-close",
+                    "bare-url-cancel",
+                    footer_commit_label("bare-url"),
+                    Rc::new(|_, _| true),
+                ))
+        });
+    }
+
+    /// Ticket 07: chooser "Add as subscription" — records the feed with the
+    /// host-derived label and starts the first refresh (the same tail as the
+    /// addsub fast path). The chooser closes first either way.
+    fn commit_bare_url_subscription(
+        &mut self,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        let label = subscription_label_from_url(&url);
+        self.commit_subscription_add(
+            label,
+            url,
+            DEFAULT_GROUP.to_string(),
+            true,
+            store::DEFAULT_AUTO_REFRESH_SECS,
+            window,
+            cx,
+        );
     }
 
     /// Ticket 03: drag-drop/file entry point. Readable files are concatenated
@@ -15403,17 +18793,27 @@ impl AppView {
         let mut names: Vec<String> = Vec::new();
         let mut files: Vec<(String, String)> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
+        // Ticket 07 (throne-adoption): the 50MB cap + content-sniff run on
+        // every dropped file (oversize, image, binary, and non-UTF8 bytes
+        // are named with their reason — never silently skipped, never
+        // buffered into the dialog).
         for path in paths.0.iter() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if !merged.is_empty() {
-                    merged.push('\n');
+            let display = path.to_string_lossy().into_owned();
+            match read_import_file(path) {
+                ImportFileRead::Text(content) => {
+                    if !merged.is_empty() {
+                        merged.push('\n');
+                    }
+                    merged.push_str(&content);
+                    names.push(display.clone());
+                    files.push((display, content));
                 }
-                merged.push_str(&content);
-                let name = path.to_string_lossy().into_owned();
-                names.push(name.clone());
-                files.push((name, content));
-            } else {
-                unreadable.push(file_basename(&path.to_string_lossy()));
+                ImportFileRead::Unreadable => {
+                    unreadable.push(file_basename(&display));
+                }
+                ImportFileRead::Refused(reason) => {
+                    unreadable.push(format!("{} ({reason})", file_basename(&display)));
+                }
             }
         }
         if merged.trim().is_empty() {
@@ -15474,10 +18874,21 @@ impl AppView {
             };
             let mut files: Vec<(String, String)> = Vec::new();
             let mut unreadable: Vec<String> = Vec::new();
+            // Ticket 07 (throne-adoption): picked files run the same guards
+            // as drops (50MB cap + content-sniff; refusals ride the
+            // unreadable line with their reason).
             for path in &paths {
-                match std::fs::read_to_string(path) {
-                    Ok(content) => files.push((path.to_string_lossy().into_owned(), content)),
-                    Err(_) => unreadable.push(file_basename(&path.to_string_lossy())),
+                let display = path.to_string_lossy().into_owned();
+                match read_import_file(path) {
+                    ImportFileRead::Text(content) => {
+                        files.push((display, content));
+                    }
+                    ImportFileRead::Unreadable => {
+                        unreadable.push(file_basename(&display));
+                    }
+                    ImportFileRead::Refused(reason) => {
+                        unreadable.push(format!("{} ({reason})", file_basename(&display)));
+                    }
                 }
             }
             if files.is_empty() && unreadable.is_empty() {
@@ -16155,6 +19566,8 @@ impl AppView {
     /// immediately instead of accumulating.
     /// Ticket 26: conflicts (preserved user edits) accumulate alongside the
     /// churn counts for the coalesced copy.
+    /// Ticket 08: `in_use` (kept serving rows) accumulates alongside.
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_batch_member(
         &mut self,
         sub_id: &str,
@@ -16163,6 +19576,7 @@ impl AppView {
         removed: usize,
         failed: usize,
         conflicts: usize,
+        in_use: usize,
     ) -> bool {
         if !self.refresh_batch_members.remove(sub_id) {
             return false;
@@ -16172,6 +19586,7 @@ impl AppView {
         self.refresh_batch_removed += removed;
         self.refresh_batch_failed += failed;
         self.refresh_batch_conflicts += conflicts;
+        self.refresh_batch_in_use += in_use;
         self.refresh_batch_members.is_empty()
     }
 
@@ -16204,9 +19619,19 @@ impl AppView {
     /// Ticket 17: close one batch slot, flushing the single coalesced toast
     /// when the last member lands. No-op for non-members.
     fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
-        if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0) {
+        if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0) {
             self.flush_refresh_batch(window, cx);
         }
+    }
+
+    /// Ticket 08 (throne-adoption): log one refresh completion to Logs.
+    /// Every completion logs — manual, batch, and headless alike — while
+    /// the toast still fires only on manual paths (see
+    /// [`AppView::route_refresh_completion`]). The `error`/`warning`
+    /// prefix drives the log's keyword severity; labels here name the
+    /// subscription (never its token-bearing URL).
+    fn push_refresh_log(&mut self, line: &str) {
+        self.logs.push_raw(line, &LogTagIndex::default());
     }
 
     /// Ticket 17: route one refresh completion. Batch members accumulate
@@ -16222,11 +19647,14 @@ impl AppView {
         removed: usize,
         failed: usize,
         conflicts: usize,
+        in_use: usize,
         window: &mut Window,
         cx: &mut App,
     ) {
         if self.is_batch_member(sub_id) {
-            if self.accumulate_batch_member(sub_id, added, updated, removed, failed, conflicts) {
+            if self
+                .accumulate_batch_member(sub_id, added, updated, removed, failed, conflicts, in_use)
+            {
                 self.flush_refresh_batch(window, cx);
             }
         } else {
@@ -16237,7 +19665,7 @@ impl AppView {
     /// Ticket 26: take every batch counter (plus the member set size) and
     /// reset the batch in one step — the atomic swap. A completion racing a
     /// flush can never observe a half-reset batch.
-    fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize) {
+    fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize, usize) {
         self.refresh_batch_members.clear();
         let total = std::mem::take(&mut self.refresh_batch_total);
         let added = std::mem::take(&mut self.refresh_batch_added);
@@ -16245,16 +19673,17 @@ impl AppView {
         let removed = std::mem::take(&mut self.refresh_batch_removed);
         let failed = std::mem::take(&mut self.refresh_batch_failed);
         let conflicts = std::mem::take(&mut self.refresh_batch_conflicts);
-        (total, added, updated, removed, failed, conflicts)
+        let in_use = std::mem::take(&mut self.refresh_batch_in_use);
+        (total, added, updated, removed, failed, conflicts, in_use)
     }
 
     /// Ticket 17: flush a completed batch as at most one toast, then reset.
     /// `total` is always ≥ 1 here (batches never open empty), so the message
     /// helper always returns `Some`.
     fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
-        let (total, added, updated, removed, failed, conflicts) = self.take_batch_counts();
+        let (total, added, updated, removed, failed, conflicts, in_use) = self.take_batch_counts();
         let (warn, text) =
-            coalesced_refresh_message(total, added, updated, removed, failed, conflicts)
+            coalesced_refresh_message(total, added, updated, removed, failed, conflicts, in_use)
                 .unwrap_or((false, String::new()));
         if text.is_empty() {
             return;
@@ -16414,7 +19843,7 @@ impl AppView {
         &mut self,
         sub_id: &str,
         label: &str,
-        fetched: Result<String, String>,
+        fetched: Result<FetchedSubscription, String>,
         now: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -16436,6 +19865,9 @@ impl AppView {
                 return;
             }
             Err(error) => {
+                self.push_refresh_log(&format!(
+                    "error cannot refresh subscription \"{label}\": {error}"
+                ));
                 self.route_refresh_completion(
                     sub_id,
                     Notification::error(format!("Cannot refresh subscription: {error}")),
@@ -16444,6 +19876,7 @@ impl AppView {
                     0,
                     1,
                     0,
+                    0,
                     window,
                     cx,
                 );
@@ -16451,78 +19884,114 @@ impl AppView {
             }
             Ok(Some(_)) => {}
         }
+        // Ticket 08: the live-endpoint set makes the merge sticky —
+        // vanished-but-serving rows are kept, never deleted under us.
+        let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
-            Ok(body) => match self.store.refresh_with_body(sub_id, &body, now) {
-                Ok(outcome) => {
-                    self.reload(window, cx);
-                    if let Some(error) = outcome.error {
-                        self.route_refresh_completion(
-                            sub_id,
-                            Notification::error(format!("{label}: refresh failed ({error})")),
-                            0,
-                            0,
-                            0,
-                            1,
-                            0,
-                            window,
-                            cx,
-                        );
-                    } else {
-                        // Ticket 26 (ticket-25 consumer): conflicts surface —
-                        // the merge kept the user's edits, and the toast says
-                        // so instead of reporting a clean sync.
-                        let failed = outcome.failures.len();
-                        let (warn, summary) = refresh_summary_text(
-                            label,
-                            outcome.added,
-                            outcome.updated,
-                            outcome.removed,
-                            outcome.skipped,
-                            outcome.duplicates,
-                            failed,
-                            outcome.conflicts,
-                        );
-                        let notice = if warn {
-                            Notification::warning(summary)
-                        } else {
-                            Notification::success(summary)
-                        };
-                        self.route_refresh_completion(
-                            sub_id,
-                            notice,
-                            outcome.added,
-                            outcome.updated,
-                            outcome.removed,
-                            failed,
-                            outcome.conflicts,
-                            window,
-                            cx,
-                        );
-                    }
-                }
-                Err(error) => {
-                    if matches!(error, StoreError::NotFound(_)) {
-                        // Deleted between the check above and the merge.
+            Ok(fetched) => {
+                match self
+                    .store
+                    .refresh_with_body_running(sub_id, &fetched.body, now, &running)
+                {
+                    Ok(outcome) => {
                         self.reload(window, cx);
-                        self.close_batch_slot(sub_id, window, cx);
-                    } else {
-                        self.route_refresh_completion(
-                            sub_id,
-                            Notification::error(format!("{label}: refresh failed ({error})")),
-                            0,
-                            0,
-                            0,
-                            1,
-                            0,
-                            window,
-                            cx,
-                        );
+                        if let Some(error) = outcome.error {
+                            self.push_refresh_log(&format!(
+                                "error subscription refresh \"{label}\": refresh failed ({error})"
+                            ));
+                            self.route_refresh_completion(
+                                sub_id,
+                                Notification::error(format!("{label}: refresh failed ({error})")),
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                window,
+                                cx,
+                            );
+                        } else {
+                            // Ticket 26 (ticket-25 consumer): conflicts surface —
+                            // the merge kept the user's edits, and the toast says
+                            // so instead of reporting a clean sync.
+                            // Ticket 08: quota commits only on a clean merge —
+                            // a success without a header clears stale numbers;
+                            // parse/fetch failures never reach this arm, so
+                            // last-good quota survives them.
+                            let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
+                            let failed = outcome.failures.len();
+                            let (warn, summary) = refresh_summary_text(
+                                label,
+                                outcome.added,
+                                outcome.updated,
+                                outcome.removed,
+                                outcome.skipped,
+                                outcome.duplicates,
+                                failed,
+                                outcome.conflicts,
+                                outcome.in_use,
+                            );
+                            // Ticket 08: every completion logs; the toast below
+                            // fires only for manual single refreshes (batch
+                            // members coalesce inside route_refresh_completion).
+                            if warn {
+                                self.push_refresh_log(&format!(
+                                    "warning subscription refresh {summary}"
+                                ));
+                            } else {
+                                self.push_refresh_log(&format!("subscription refresh {summary}"));
+                            }
+                            let notice = if warn {
+                                Notification::warning(summary)
+                            } else {
+                                Notification::success(summary)
+                            };
+                            self.route_refresh_completion(
+                                sub_id,
+                                notice,
+                                outcome.added,
+                                outcome.updated,
+                                outcome.removed,
+                                failed,
+                                outcome.conflicts,
+                                outcome.in_use,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if matches!(error, StoreError::NotFound(_)) {
+                            // Deleted between the check above and the merge.
+                            self.reload(window, cx);
+                            self.close_batch_slot(sub_id, window, cx);
+                        } else {
+                            self.push_refresh_log(&format!(
+                                "error subscription refresh \"{label}\": refresh failed ({error})"
+                            ));
+                            self.route_refresh_completion(
+                                sub_id,
+                                Notification::error(format!("{label}: refresh failed ({error})")),
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                window,
+                                cx,
+                            );
+                        }
                     }
                 }
-            },
+            }
             Err(error) => match self.store.record_subscription_error(sub_id, &error) {
                 Ok(_) => {
                     self.reload(window, cx);
+                    self.push_refresh_log(&format!(
+                        "error subscription refresh \"{label}\": {error}"
+                    ));
                     self.route_refresh_completion(
                         sub_id,
                         Notification::error(format!("{label}: {error}")),
@@ -16530,6 +19999,7 @@ impl AppView {
                         0,
                         0,
                         1,
+                        0,
                         0,
                         window,
                         cx,
@@ -16541,6 +20011,9 @@ impl AppView {
                     self.close_batch_slot(sub_id, window, cx);
                 }
                 Err(db_error) => {
+                    self.push_refresh_log(&format!(
+                        "error cannot refresh subscription \"{label}\": {db_error}"
+                    ));
                     self.route_refresh_completion(
                         sub_id,
                         Notification::error(format!("Cannot refresh subscription: {db_error}")),
@@ -16548,6 +20021,7 @@ impl AppView {
                         0,
                         0,
                         1,
+                        0,
                         0,
                         window,
                         cx,
@@ -16569,30 +20043,77 @@ impl AppView {
     fn finish_subscription_refresh_no_window(
         &mut self,
         sub_id: &str,
-        fetched: Result<String, String>,
+        fetched: Result<FetchedSubscription, String>,
         now: i64,
         cx: &mut Context<Self>,
     ) {
         self.inflight_refreshes.remove(sub_id);
+        // Ticket 08: the live-endpoint set makes the merge sticky —
+        // vanished-but-serving rows are kept, never deleted under us.
+        let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
-            Ok(body) => match self.store.refresh_with_body(sub_id, &body, now) {
-                Ok(outcome) => {
-                    self.accumulate_batch_member(
-                        sub_id,
-                        outcome.added,
-                        outcome.updated,
-                        outcome.removed,
-                        outcome.failures.len(),
-                        outcome.conflicts,
-                    );
+            Ok(fetched) => {
+                match self
+                    .store
+                    .refresh_with_body_running(sub_id, &fetched.body, now, &running)
+                {
+                    Ok(outcome) => {
+                        // Ticket 08: quota commits only on a clean merge; the
+                        // log line lands headless exactly like windowed.
+                        if outcome.error.is_none() {
+                            let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
+                        }
+                        let label = self
+                            .store
+                            .get_subscription(sub_id)
+                            .ok()
+                            .flatten()
+                            .map(|sub| sub.label)
+                            .unwrap_or_else(|| sub_id.to_string());
+                        let failed = outcome.failures.len();
+                        if let Some(error) = outcome.error {
+                            self.push_refresh_log(&format!(
+                                "error subscription refresh \"{label}\": refresh failed ({error})"
+                            ));
+                            self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                        } else {
+                            let (warn, summary) = refresh_summary_text(
+                                &label,
+                                outcome.added,
+                                outcome.updated,
+                                outcome.removed,
+                                outcome.skipped,
+                                outcome.duplicates,
+                                failed,
+                                outcome.conflicts,
+                                outcome.in_use,
+                            );
+                            if warn {
+                                self.push_refresh_log(&format!(
+                                    "warning subscription refresh {summary}"
+                                ));
+                            } else {
+                                self.push_refresh_log(&format!("subscription refresh {summary}"));
+                            }
+                            self.accumulate_batch_member(
+                                sub_id,
+                                outcome.added,
+                                outcome.updated,
+                                outcome.removed,
+                                failed,
+                                outcome.conflicts,
+                                outcome.in_use,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                    }
                 }
-                Err(_) => {
-                    self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0);
-                }
-            },
+            }
             Err(error) => {
                 let _ = self.store.record_subscription_error(sub_id, &error);
-                self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0);
+                self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
             }
         }
         if self.refresh_batch_members.is_empty() {
@@ -16817,6 +20338,242 @@ impl AppView {
         }
     }
 
+    /// Ticket 10 (US-29): New-Structured commit — name plus one Basic
+    /// action (`direct`/`proxy`/`block`) builds the catch-all rule. Empty
+    /// names keep the dialog open with the error; success reloads and
+    /// reopens the manager.
+    fn commit_preset_create_structured(
+        &mut self,
+        name: String,
+        action: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if name.trim().is_empty() {
+            window.push_notification(
+                Notification::error("Invalid routing preset: preset needs a name"),
+                cx,
+            );
+            return false;
+        }
+        let rules = match crate::preset::structured_preset_rules(&action) {
+            Ok(rules) => rules,
+            Err(error) => {
+                window.push_notification(Notification::error(preset_error_message(&error)), cx);
+                return false;
+            }
+        };
+        match self
+            .store
+            .create_preset(name.trim(), "manual", None, &rules)
+        {
+            Ok(preset) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(preset_imported_message(&preset.name, rules.len())),
+                    cx,
+                );
+                self.reopen_presets_if_open(window, cx);
+                true
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                false
+            }
+        }
+    }
+
+    /// Ticket 10 (US-29): New-Structured dialog — name plus the Basic
+    /// action radio (`Direct`/`Proxy`/`Block`; no warp-bypass — warp has
+    /// no endpoint design). Stacks above the manager, which stays intact
+    /// underneath.
+    fn open_preset_structured_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Preset name"));
+        let action_cell = Rc::new(RefCell::new("direct".to_string()));
+        let view = cx.entity();
+        let name_reader = name_state.clone();
+        let action_reader = action_cell.clone();
+        let commit_view = view.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let name = name_reader.read(cx).value().to_string();
+            let action = action_reader.borrow().clone();
+            commit_view.update(cx, |view, cx| {
+                view.commit_preset_create_structured(name, action, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _cx| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            let cell = action_cell.clone();
+            let current = cell.borrow().clone();
+            let selected = ["direct", "proxy", "block"]
+                .iter()
+                .position(|value| *value == current);
+            dialog
+                .title("New structured preset")
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(dialog_field(
+                            "field-structured-preset-name",
+                            "Name",
+                            name_state.clone(),
+                        ))
+                        .child(
+                            div()
+                                .id("field-structured-preset-action")
+                                .test_support()
+                                .child({
+                                    let mut group =
+                                        RadioGroup::horizontal("structured-preset-action-options")
+                                            .selected_index(selected)
+                                            .on_change(move |ix, _, _| {
+                                                let actions = ["direct", "proxy", "block"];
+                                                if let Some(action) = actions.get(*ix) {
+                                                    *cell.borrow_mut() = action.to_string();
+                                                }
+                                            });
+                                    for label in ["Direct", "Proxy", "Block"] {
+                                        group = group.child(
+                                            Radio::new(label)
+                                                .label(label.to_string())
+                                                .tooltip(format!("Catch-all rule: {label}")),
+                                        );
+                                    }
+                                    group
+                                }),
+                        ),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "structured-preset-ok",
+                    "structured-preset-cancel",
+                    footer_commit_label("presets"),
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 10 (US-29): New-Remote commit — name plus preset URL records
+    /// an empty-rules shell and starts the explicit fetch (same refresh
+    /// path as pasted `remoteroute` links). Non-http(s) and internal-host
+    /// URLs fail with the SSRF reason (never the URL); success reloads
+    /// and reopens the manager.
+    fn commit_preset_create_remote(
+        &mut self,
+        name: String,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if name.trim().is_empty() {
+            window.push_notification(
+                Notification::error("Invalid routing preset: preset needs a name"),
+                cx,
+            );
+            return false;
+        }
+        match crate::store::subscription_fetch_policy(url.trim()) {
+            crate::store::SubscriptionFetchPolicy::Block { reason } => {
+                window.push_notification(
+                    Notification::error(format!("Invalid preset URL: {reason}")),
+                    cx,
+                );
+                return false;
+            }
+            crate::store::SubscriptionFetchPolicy::Warn { reason } => {
+                window.push_notification(Notification::warning(reason.to_string()), cx);
+            }
+            crate::store::SubscriptionFetchPolicy::Allow => {}
+        }
+        match self
+            .store
+            .import_remote_preset_shell(name.trim(), url.trim())
+        {
+            Ok(preset) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Routing preset \"{}\" added — fetching rules",
+                        preset.name
+                    )),
+                    cx,
+                );
+                self.start_preset_refresh(preset, cx);
+                self.reopen_presets_if_open(window, cx);
+                true
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                false
+            }
+        }
+    }
+
+    /// Ticket 10 (US-29): New-Remote dialog — name plus preset URL (the
+    /// remote source). Stacks above the manager, which stays intact
+    /// underneath.
+    fn open_preset_remote_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Preset name"));
+        let url_state =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/preset.json"));
+        let view = cx.entity();
+        let name_reader = name_state.clone();
+        let url_reader = url_state.clone();
+        let commit_view = view.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let name = name_reader.read(cx).value().to_string();
+            let url = url_reader.read(cx).value().to_string();
+            if name.trim().is_empty() && url.trim().is_empty() {
+                return true;
+            }
+            commit_view.update(cx, |view, cx| {
+                view.commit_preset_create_remote(name, url, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
+                .title("New remote preset")
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(dialog_field(
+                            "field-remote-preset-name",
+                            "Name",
+                            name_state.clone(),
+                        ))
+                        .child(dialog_field(
+                            "field-remote-preset-url",
+                            "Preset URL",
+                            url_state.clone(),
+                        )),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "remote-preset-ok",
+                    "remote-preset-cancel",
+                    footer_commit_label("presets"),
+                    commit_click,
+                ))
+        });
+    }
+
     /// Ticket 43: edit a preset's name + rules (manager edit path). Rules
     /// validate pre-commit via the same parser as create; failures keep the
     /// dialog open with the error. Success reloads, reopens the manager, and
@@ -16872,6 +20629,45 @@ impl AppView {
         }
     }
 
+    /// Ticket 10 (US-29): manager Export-copy-link — copies the preset's
+    /// `throne://route` share link (never empty by construction of
+    /// [`crate::preset::preset_share_link`]). Corrupt stored rules fail
+    /// loudly instead of copying nothing; ghosts warn.
+    fn commit_preset_export_link(
+        &mut self,
+        preset: &store::RoutePreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fresh = match self.store.get_preset(&preset.id) {
+            Ok(Some(fresh)) => fresh,
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+                return;
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot export routing preset: {error}")),
+                    cx,
+                );
+                return;
+            }
+        };
+        match fresh.rules() {
+            Ok(rules) => {
+                let link = crate::preset::preset_share_link(&fresh.name, &rules);
+                cx.write_to_clipboard(ClipboardItem::new_string(link));
+                window.push_notification(
+                    Notification::success(format!("Copied preset link for \"{}\"", fresh.name)),
+                    cx,
+                );
+            }
+            Err(message) => {
+                window.push_notification(Notification::error(message), cx);
+            }
+        }
+    }
+
     /// Ticket 43: duplicate a preset — same source/rules under a unique
     /// `… copy` name. Ghost rows warn; the toast names the copy.
     fn commit_preset_duplicate(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -16917,6 +20713,10 @@ impl AppView {
     /// Ticket 43: preset edit dialog — name + rules prefilled from the
     /// record (re-read fresh so a stale row cannot overwrite a removed
     /// preset). Stacks above the manager, which stays intact underneath.
+    /// Ticket 10 (US-29): an Advanced section lists the stored rules with
+    /// their per-attribute tabs plus an Action cycle and Delete per rule
+    /// (ops rewrite the dialog's rules box in place — Save still commits
+    /// everything at once, so nothing writes half-edited).
     fn open_preset_edit_dialog(
         &mut self,
         preset: store::RoutePreset,
@@ -16932,6 +20732,9 @@ impl AppView {
         let reader = form.clone();
         let id = preset.id.clone();
         let title = format!("Edit preset {}", preset.name);
+        let builder_view = view.clone();
+        let builder_preset = preset.clone();
+        let builder_form = form.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let name = reader.name.read(cx).value().to_string();
             let rules = reader.rules.read(cx).value().to_string();
@@ -16946,6 +20749,11 @@ impl AppView {
             dialog
                 .title(title.clone())
                 .child(form.clone().element(cx))
+                .child(preset_advanced_section(
+                    builder_view.clone(),
+                    &builder_preset,
+                    builder_form.clone(),
+                ))
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
@@ -16958,6 +20766,67 @@ impl AppView {
                     footer_commit_label("preset-edit"),
                     commit_click,
                 ))
+        });
+    }
+
+    /// Ticket 10 (US-29): rewrite the edit dialog's rules box in place —
+    /// parse the live text (failures toast and keep the dialog open),
+    /// apply `op` to the rules, and write the box back. The store is
+    /// untouched until Save.
+    fn rewrite_preset_rules_box(
+        form: &PresetForm,
+        op: &PresetRulesOp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = form.name.read(cx).value().to_string();
+        let text = form.rules.read(cx).value().to_string();
+        let fallback = if name.trim().is_empty() {
+            "preset"
+        } else {
+            name.trim()
+        };
+        let mut parsed = match crate::preset::parse_preset_json(&text, fallback) {
+            Ok(parsed) => parsed.rules,
+            Err(error) => {
+                window.push_notification(Notification::error(preset_error_message(&error)), cx);
+                return;
+            }
+        };
+        match op {
+            PresetRulesOp::CycleAction(index) => {
+                let Some(rule) = parsed.get_mut(*index) else {
+                    window.push_notification(Notification::warning("Already removed"), cx);
+                    return;
+                };
+                let current = rule
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("direct");
+                let next = match current {
+                    "direct" => "proxy",
+                    "proxy" => "block",
+                    _ => "direct",
+                };
+                if let Err(error) = crate::preset::set_rule_action(rule, next) {
+                    window.push_notification(Notification::error(preset_error_message(&error)), cx);
+                    return;
+                }
+            }
+            PresetRulesOp::Remove(index) => {
+                if *index >= parsed.len() {
+                    window.push_notification(Notification::warning("Already removed"), cx);
+                    return;
+                }
+                parsed.remove(*index);
+            }
+            PresetRulesOp::Add => {
+                parsed.push(serde_json::json!({"action": "direct"}));
+            }
+        }
+        let next_text = serde_json::Value::Array(parsed).to_string();
+        form.rules.update(cx, |state, cx| {
+            state.set_value(next_text, window, cx);
         });
     }
 
@@ -17205,12 +21074,12 @@ impl AppView {
         &mut self,
         id: &str,
         name: &str,
-        fetched: Result<String, String>,
+        fetched: Result<FetchedSubscription, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let body = match fetched {
-            Ok(body) => body,
+            Ok(fetched) => fetched.body,
             Err(reason) => {
                 window.push_notification(
                     Notification::error(format!("Cannot refresh routing preset: {reason}")),
@@ -17257,12 +21126,13 @@ impl AppView {
     fn finish_preset_refresh_no_window(
         &mut self,
         id: &str,
-        fetched: Result<String, String>,
+        fetched: Result<FetchedSubscription, String>,
         cx: &mut Context<Self>,
     ) {
-        let Ok(body) = fetched else {
+        let Ok(fetched) = fetched else {
             return;
         };
+        let body = fetched.body;
         let name = self
             .store
             .get_preset(id)
@@ -17358,6 +21228,42 @@ impl AppView {
                     preset.clone(),
                     attached.get(&preset.id).cloned().unwrap_or_default(),
                 ));
+            }
+            // Ticket 10 (US-29): Manage-Routes creation paths — Structured
+            // (name + Basic action → catch-all rule), Raw (the name + JSON
+            // form below), Remote (name + URL shell, explicit fetch fills
+            // the rules). Import stays in PROGRAM (single-line route links
+            // and preset JSON divert there identically).
+            {
+                let structured_view = view_for_rows.clone();
+                let remote_view = view_for_rows.clone();
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("preset-new-structured")
+                                .label("New Structured")
+                                .tooltip("Name + Direct|Proxy|Block catch-all rule")
+                                .on_click(move |_, window, cx| {
+                                    structured_view.update(cx, |view, cx| {
+                                        view.open_preset_structured_dialog(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("preset-new-remote")
+                                .label("New Remote")
+                                .tooltip("Name + preset URL (explicit fetch fills the rules)")
+                                .on_click(move |_, window, cx| {
+                                    remote_view.update(cx, |view, cx| {
+                                        view.open_preset_remote_dialog(window, cx);
+                                    });
+                                }),
+                        ),
+                );
             }
             body = body.child(form.clone().element(cx));
             dialog
@@ -17480,8 +21386,10 @@ impl AppView {
                 .title(format!("Routing preset for \"{config_name}\""))
                 .child(body)
                 .button_props(
+                    // Ticket 03 (US-3): pure-close footer — no kit Cancel
+                    // affordance; the shared footer renders the single
+                    // `Close`. The Confirm-key commit stays a no-op close.
                     DialogButtonProps::default()
-                        .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
                 .footer(dialog_footer(
@@ -17984,7 +21892,13 @@ impl AppView {
         if !self.store.subs_auto_refresh_enabled() {
             return Vec::new();
         }
+        // Ticket 08: skip-flagged groups never auto-refresh (ticks are not
+        // explicit consent). Manual paths (Refresh-all-due, per-row Update,
+        // Update-current, Update-all) decide for themselves.
         self.due_for_manual_refresh()
+            .into_iter()
+            .filter(|sub| !self.store.group_skip_refresh(&sub.group))
+            .collect()
     }
 
     /// Ticket 45: due subscriptions ignoring the global kill-switch — the
@@ -18026,6 +21940,153 @@ impl AppView {
         }
         self.reopen_subscriptions_if_open(window, cx);
         started
+    }
+
+    /// Ticket 08 (throne-adoption): the focused group — facet filter first,
+    /// selected row's group second. `None` when neither names a group.
+    fn current_group(&self, cx: &App) -> Option<String> {
+        if let Some(group) = self.libraries.read(cx).delegate().facet_group.clone() {
+            return Some(group);
+        }
+        self.selected_config(cx).map(|config| config.group)
+    }
+
+    /// Ticket 08: start fetches for an explicit subscription set. One sub
+    /// takes the manual-single path (immediate toast); several share one
+    /// coalescing batch. Returns the fetches started.
+    fn start_explicit_refresh(
+        &mut self,
+        subs: Vec<ProxySubscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if subs.len() == 1 {
+            let sub = subs.into_iter().next().expect("one sub");
+            if self.refresh_subscription_by_id(&sub.id, window, cx) {
+                return 1;
+            }
+            return 0;
+        }
+        let ids: Vec<String> = subs.iter().map(|sub| sub.id.clone()).collect();
+        self.begin_refresh_batch(&ids);
+        let mut started = 0;
+        for sub in subs {
+            if self.start_subscription_refresh(sub, cx) {
+                started += 1;
+            }
+        }
+        self.reopen_subscriptions_if_open(window, cx);
+        started
+    }
+
+    /// Ticket 08: Update-current — refresh the subscriptions feeding the
+    /// focused group (see [`AppView::current_group`]). Explicit consent, so
+    /// skip-flagged groups still run (the flag gates automatic refresh,
+    /// never a direct order). Empty/no-sub groups toast honestly instead of
+    /// dead-clicking.
+    fn update_current_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.current_group(cx) else {
+            window.push_notification(
+                Notification::info("No group in focus — select a row or filter by group"),
+                cx,
+            );
+            return;
+        };
+        let subs = self
+            .store
+            .list_subscriptions()
+            .map(|subs| update_target_subs(&subs, &group))
+            .unwrap_or_default();
+        if subs.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "Group \"{group}\" has no subscriptions — nothing to update"
+                )),
+                cx,
+            );
+            return;
+        }
+        self.start_explicit_refresh(subs, window, cx);
+    }
+
+    /// Ticket 08: per-row Update from Manage Groups — refresh one group's
+    /// subscriptions (explicit consent, like Update-current).
+    fn update_group_subs(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let subs = self
+            .store
+            .list_subscriptions()
+            .map(|subs| update_target_subs(&subs, group))
+            .unwrap_or_default();
+        if subs.is_empty() {
+            window.push_notification(
+                Notification::info(format!(
+                    "Group \"{group}\" has no subscriptions — nothing to update"
+                )),
+                cx,
+            );
+            return;
+        }
+        self.start_explicit_refresh(subs, window, cx);
+    }
+
+    /// Ticket 08: Update-all behind an explicit confirm — every
+    /// subscription outside skip-flagged groups refreshes; flagged ones
+    /// are named in the confirm and never fetched. An empty run set toasts
+    /// instead of opening a confirm over nothing.
+    fn open_update_all_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let subs = self.store.list_subscriptions().unwrap_or_default();
+        let flagged: HashSet<String> = self
+            .store
+            .group_skip_flags()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let (included, skipped) = update_all_targets(subs, &flagged);
+        if included.is_empty() {
+            window.push_notification(
+                Notification::info(if skipped.is_empty() {
+                    "No subscriptions to update".to_string()
+                } else {
+                    format!(
+                        "No subscriptions to update — {} skipped (auto-refresh off for their group)",
+                        skipped.len()
+                    )
+                }),
+                cx,
+            );
+            return;
+        }
+        let view = cx.entity();
+        let ids: Vec<String> = included.iter().map(|sub| sub.id.clone()).collect();
+        let description = update_all_confirm_text(included.len(), skipped.len());
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let ids = ids.clone();
+            alert
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Update all"),
+                )
+                .title("Update all subscriptions?")
+                .description(description.clone())
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.begin_refresh_batch(&ids);
+                        // Re-read at commit (a tick may have removed one
+                        // since the confirm rendered — missing rows skip,
+                        // in-flight fetches dedupe, never stack).
+                        for id in &ids {
+                            if let Ok(Some(sub)) = view.store.get_subscription(id) {
+                                view.start_subscription_refresh(sub, cx);
+                            }
+                        }
+                        view.reopen_subscriptions_if_open(window, cx);
+                    });
+                    true
+                })
+        });
     }
 
     /// Ticket 45: the global auto-refresh kill-switch commit. Persists the
@@ -18217,6 +22278,15 @@ impl AppView {
         if !self.ticks_enabled || self.traffic_tick_in_flight {
             return 0;
         }
+        // Ticket 05: 1Hz while the Connections/Traffic pane is visible, else
+        // the 5s base cadence (the loop itself runs at 1Hz — see
+        // [`TRAFFIC_FAST_TICK_SECS`]). A skipped tick returns 0 and never
+        // touches the throttle stamp, so the next due pass still fires.
+        let now = now_unix();
+        if !traffic_poll_due(self.inspector_tab, now, self.last_traffic_poll_at) {
+            return 0;
+        }
+        self.last_traffic_poll_at = now;
         let targets = self.engine.live_clash_targets();
         if targets.is_empty() {
             return 0;
@@ -18271,19 +22341,23 @@ impl AppView {
         let mut ok_cores: HashSet<String> = HashSet::new();
         // Ticket 41: rows freshly polled on live cores (clears stale below).
         let mut fresh_rows: HashSet<String> = HashSet::new();
+        // Ticket 05: the live-connections snapshot rides the same pass —
+        // one `(core, entry)` per non-probe connection (unclaimed entries
+        // stay: they render as unclaimed, never guessed) plus this poll's
+        // per-connection session delta. Committed wholesale after the loop.
+        let mut snapshot: Vec<(String, crate::health::ClashConn)> = Vec::new();
+        let mut conn_deltas: HashMap<String, (u64, u64)> = HashMap::new();
         for (target, result) in &results {
             let Ok(entries) = result else {
                 continue;
             };
             ok_cores.insert(target.core.clone());
             for entry in entries {
-                let Some(row) = entry.row_id.as_deref() else {
-                    continue;
-                };
+                // Probe flows never reach the traffic columns, the persisted
+                // totals, or the connections snapshot.
                 if crate::health::is_probe_destination_with_ips(&entry.dest, probe, probe_ips) {
                     continue;
                 }
-                fresh_rows.insert(row.to_string());
                 let key = format!("{}/{}", target.core, entry.id);
                 let (rx, tx) = (entry.rx_bytes, entry.tx_bytes);
                 let (last_rx, last_tx) = self.traffic_last_seen.get(&key).unwrap_or((0, 0));
@@ -18295,7 +22369,15 @@ impl AppView {
                     (rx, tx)
                 };
                 self.traffic_last_seen.insert(key.clone(), rx, tx, now);
-                seen.insert(key);
+                seen.insert(key.clone());
+                snapshot.push((target.core.clone(), entry.clone()));
+                if delta_rx > 0 || delta_tx > 0 {
+                    conn_deltas.insert(key, (delta_rx, delta_tx));
+                }
+                let Some(row) = entry.row_id.as_deref() else {
+                    continue;
+                };
+                fresh_rows.insert(row.to_string());
                 if delta_rx > 0 || delta_tx > 0 {
                     let slot = deltas.entry(row.to_string()).or_insert((0, 0));
                     slot.0 = slot.0.saturating_add(delta_rx);
@@ -18314,6 +22396,13 @@ impl AppView {
             .collect();
         self.traffic_last_seen
             .sweep(now, &ok_cores, &seen, &live_cores);
+        // Ticket 05: publish the live-connections snapshot + session deltas
+        // (closed connections leave with the sweep — their persisted bytes
+        // stay in the store). The stamp keeps the 1Hz loop honest even for
+        // headless ticks that bypass the spawn throttle.
+        self.conn_snapshot = snapshot;
+        self.conn_delta = conn_deltas;
+        self.last_traffic_poll_at = now;
         let mut updated = 0;
         // Ticket 40: one transaction per tick (batched, saturating
         // single-statement UPDATEs). Unknown ids skip (a row removed mid-tick
@@ -18376,7 +22465,7 @@ impl AppView {
         spawn_tick(cx, REPROBE_TICK_SECS, |view, cx| {
             view.tick_reprobe_running(cx);
         });
-        spawn_tick(cx, TRAFFIC_TICK_SECS, |view, cx| {
+        spawn_tick(cx, TRAFFIC_FAST_TICK_SECS, |view, cx| {
             view.spawn_traffic_poll(cx);
         });
     }
@@ -18597,6 +22686,10 @@ impl AppView {
     /// 05 inspector tabs driving the per-section builders below.
     /// `config-detail` id, 240px cap, internal scroll, and the resizable
     /// 240..480 range are unchanged.
+    /// Ticket 04 (throne-adoption): the detail header + Endpoints render
+    /// once in the shared overview leading the pane body (not once per
+    /// pane builder), so tab switches never repaint identical blocks; each
+    /// pane below the overview carries only its tab-specific sections.
     fn render_detail_selected(
         &self,
         cx: &mut Context<Self>,
@@ -18624,6 +22717,15 @@ impl AppView {
             // panel and paints empty space below a still-scrolling box.
             .h_full()
             .min_h_0()
+            // Ticket 04 (throne-adoption): the tab bar stays pinned above
+            // the scrolling body; the shared overview (header + failure
+            // alert when failed + Endpoints, one call site) leads the body
+            // itself, so every pane opens on the same acting row without
+            // per-tab copies. CAP-7 frozen order holds geometrically on
+            // every pane: Header → [Alert] → Endpoints → tab-specific.
+            // (Pinning the 140px overview above the bar instead would
+            // collapse the body viewport to ~22px in the 240px panel,
+            // hiding usage/history/presets and the alert itself.)
             .child(self.render_inspector_tabs(cx))
             // The tab bar stays pinned: only the pane body scrolls, so the
             // tabs never scroll away and the operate row is always one
@@ -18633,15 +22735,21 @@ impl AppView {
             // wrapper keyed per tab, so every switch remounts the fade
             // while `config-detail-body` and all pane ids keep unset
             // opacity (headless paint seams never read a mid-fade parent).
+            // The shared overview sits outside the fade so tab switches
+            // never remount it — only the tab-specific section re-enters.
             .child(
                 div()
                     .id("config-detail-body")
                     .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .overflow_x_hidden()
                     .track_scroll(&self.detail_scroll)
+                    .child(self.render_inspector_overview(cx, config))
                     .child(Self::motion_enter(
                         match self.inspector_tab {
                             InspectorTab::Details => {
@@ -18652,6 +22760,13 @@ impl AppView {
                             }
                             InspectorTab::Presets => {
                                 self.render_inspector_presets(cx, config).into_any_element()
+                            }
+                            InspectorTab::Logs => self.render_inspector_logs(cx).into_any_element(),
+                            InspectorTab::Connections => {
+                                self.render_inspector_connections(cx).into_any_element()
+                            }
+                            InspectorTab::Traffic => {
+                                self.render_inspector_traffic(cx).into_any_element()
                             }
                         },
                         format!("inspector-pane-enter-{}", self.inspector_tab.index()),
@@ -18684,8 +22799,9 @@ impl AppView {
     }
 
     /// Ticket 05: `Details / Health / Presets` segmented bar over the
-    /// existing detail builders. Stable per-tab ids ride as zero-size marker
-    /// children (the `Tab` element id is owned by the bar's index), tabs
+    /// existing detail builders, extended by throne-adoption 05 with
+    /// `Logs / Connections / Traffic`. Stable per-tab ids ride as zero-size
+    /// marker children (the `Tab` element id is owned by the bar's index), tabs
     /// carry aria labels, and selection lives in
     /// [`AppView::inspector_tab`] — the bar is `RenderOnce`, so it is
     /// rebuilt from the field each frame; no entity is created in render.
@@ -18729,12 +22845,72 @@ impl AppView {
                         .aria_label(InspectorTab::Presets.a11y_label())
                         .suffix(shortcut_kbd("ctrl-3", "(Ctrl-3)"))
                         .child(div().id("inspector-tab-presets").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Logs")
+                        .aria_label(InspectorTab::Logs.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-4", "(Ctrl-4)"))
+                        .child(div().id("inspector-tab-logs").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Connections")
+                        .aria_label(InspectorTab::Connections.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-5", "(Ctrl-5)"))
+                        .child(div().id("inspector-tab-connections").test_support()),
+                )
+                .child(
+                    Tab::new()
+                        .label("Traffic")
+                        .aria_label(InspectorTab::Traffic.a11y_label())
+                        .suffix(shortcut_kbd("ctrl-6", "(Ctrl-6)"))
+                        .child(div().id("inspector-tab-traffic").test_support()),
                 ),
         )
     }
 
-    /// Ticket 05: Details pane — header + endpoints + usage + the full
-    /// action row. Health/history/preset sections own the other panes.
+    /// Ticket 04 (throne-adoption): single shared inspector overview —
+    /// the detail header + Endpoints rendered ONCE at the top of the pane
+    /// body and reused by all three panes (not copy-pasted per pane). The
+    /// builders stay shared (`render_detail_header` +
+    /// `render_detail_endpoints`), so the acting-row echo, serving badge,
+    /// and endpoint copies cannot diverge between tabs; ids paint exactly
+    /// once per frame. A failed row (see [`detail_failed`]) additionally
+    /// carries the failure Alert directly under the acting row — the same
+    /// pinned copy + ids the Health module used to own — so the evidence
+    /// stays inside the minimum pane and reads on every tab without
+    /// resizing; the Health module keeps only the data line, never a
+    /// second Alert.
+    fn render_inspector_overview(
+        &self,
+        cx: &mut Context<Self>,
+        config: &ProxyConfig,
+    ) -> impl IntoElement {
+        let mut overview = div()
+            .id("inspector-overview")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.render_detail_header(cx, config));
+        if self.detail_failed(config) {
+            overview = overview.child(
+                div().id("config-health-alert").test_support().child(
+                    Alert::error(
+                        "config-health-alert-box",
+                        self.health_store.detail_line(&config.id),
+                    )
+                    .title("Endpoint failed"),
+                ),
+            );
+        }
+        overview.child(self.render_detail_endpoints(cx, config))
+    }
+
+    /// Ticket 05: Details pane — usage only (the shared overview leading
+    /// the pane body already carries header + failure alert + endpoints;
+    /// Ticket 04). Health/history/preset sections own the other panes.
     fn render_inspector_details(
         &self,
         cx: &mut Context<Self>,
@@ -18744,8 +22920,6 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.render_detail_header(cx, config))
-            .child(self.render_detail_endpoints(cx, config))
             .child(self.render_detail_usage(cx, config))
     }
 
@@ -18753,35 +22927,34 @@ impl AppView {
     /// row (same handlers, ids, and loading states as the Details pane;
     /// only one pane renders per frame, so the ids never collide). Logs
     /// open in the dialog — no inline tail.
-    /// Lane B (B6): opens with the shared detail header (acting row +
-    /// protocol/group tags + bind endpoint + serving Badge), so every pane
-    /// names the same row the operate row acts on.
+    /// Lane B (B6): the shared overview leading the pane body names the
+    /// row the operate row acts on (acting row + protocol/group tags +
+    /// bind endpoint + serving Badge), so every pane shares one header.
+    /// Ticket 04 (throne-adoption): CAP-7 frozen order holds geometrically
+    /// — Header → [failure Alert] → Endpoints (shared overview) → health /
+    /// history (here) — so Endpoints stays above the fold, every tab scans
+    /// the same, and the failure evidence reads without resizing.
     fn render_inspector_health(
         &self,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.render_detail_header(cx, config))
-            // T06 (CAP-7): frozen pane order Header → Endpoints →
-            // tab-specific on every pane, so Endpoints stays above the fold
-            // and every tab scans the same. The health evidence follows the
-            // endpoints it explains; the pane-body scroll (reset on every
-            // switch via `set_inspector_tab`) reaches it, and the operate
-            // row stays pinned below the scroller either way.
-            .child(self.render_detail_endpoints(cx, config))
             .child(self.render_detail_health(config))
             .child(self.render_detail_history(config))
     }
 
     /// Ticket 05: Presets pane — attached routing preset plus the attach
     /// picker entry point (same dialog as before).
-    /// Lane B (B6): opens with the shared detail header like the other
-    /// panes (same acting-row echo, same ids, no collisions — one pane
-    /// renders per frame).
+    /// Lane B (B6): the shared overview leading the pane body names the
+    /// acting row like on the other panes (same echo, same ids, no
+    /// collisions — one pane renders per frame).
+    /// Ticket 04 (throne-adoption): CAP-7 frozen order holds geometrically
+    /// — Header → [failure Alert] → Endpoints (shared overview) → preset
+    /// block (here) — so Endpoints stays above the fold on every tab.
     fn render_inspector_presets(
         &self,
         cx: &mut Context<Self>,
@@ -18791,12 +22964,6 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.render_detail_header(cx, config))
-            // T06 (CAP-7): frozen pane order Header → Endpoints →
-            // tab-specific, matching the Health pane — the preset block
-            // follows the endpoints table so Endpoints stays above the
-            // fold on every tab.
-            .child(self.render_detail_endpoints(cx, config))
             // Ticket 37: attached routing preset plus the picker entry
             // point. Lane B (B9): the line carries the rule count and an
             // attached row detaches inline (no dialog round-trip); rules
@@ -18899,9 +23066,422 @@ impl AppView {
             })
     }
 
+    /// Ticket 05: click-copies one connection destination (the raw dest — a
+    /// host/IP from clash metadata, never credentials). Empty warns instead
+    /// of copying nothing.
+    fn copy_connection_dest(&mut self, dest: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if dest.is_empty() {
+            window.push_notification(Notification::warning("No destination to copy"), cx);
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(dest.to_string()));
+        window.push_notification(Notification::success(format!("Copied {dest}")), cx);
+    }
+
+    /// Ticket 05 (throne-adoption): Logs pane — the same redacted visible
+    /// lines the dialog shows (the shared [`AppView::visible_log_lines`]
+    /// seam, so dialog, Save, Copy, and this pane always agree), with the
+    /// level row, the active-filter summary, and the sheet entry point where
+    /// the include/exclude/regex fields live. Filter inputs own entities, so
+    /// they live in the dialog — never built in render.
+    fn render_inspector_logs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lines = self.visible_log_lines(cx);
+        // The single level control (same labels + `from_label` mapping as the
+        // sheet; its own state key so sheet and pane never collide).
+        const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
+        let current_level = self.log_level;
+        let selected_level = LOG_LEVEL_LABELS
+            .iter()
+            .position(|label| LogLevel::from_label(label) == current_level);
+        let mut level_group = RadioGroup::horizontal("log-pane-level-options")
+            .selected_index(selected_level)
+            .on_change({
+                let group_view = cx.entity();
+                move |ix, window, cx| {
+                    let level = LOG_LEVEL_LABELS
+                        .get(*ix)
+                        .map(|label| LogLevel::from_label(label))
+                        .unwrap_or(current_level);
+                    let level_view = group_view.clone();
+                    level_view.update(cx, |view, cx| {
+                        view.set_log_level(level, window, cx);
+                    });
+                }
+            });
+        for label in LOG_LEVEL_LABELS {
+            level_group = level_group.child(
+                Radio::new(label)
+                    .label(label)
+                    .tooltip(format!("Show {label} and above")),
+            );
+        }
+        let mut parts = Vec::new();
+        if !self.log_filter.trim().is_empty() {
+            parts.push(format!("include {:?}", self.log_filter.trim()));
+        }
+        if !self.log_exclude.trim().is_empty() {
+            parts.push(format!("exclude {:?}", self.log_exclude.trim()));
+        }
+        if !self.log_regex.trim().is_empty() {
+            parts.push(format!("regex {:?}", self.log_regex.trim()));
+        }
+        if let Some(level) = self.log_level {
+            parts.push(format!("level {}", level.as_str()));
+        }
+        let summary = if parts.is_empty() {
+            "No filters — showing everything.".to_string()
+        } else {
+            format!("Filters: {}", parts.join(" · "))
+        };
+        let filter_active = !self.log_filter.trim().is_empty()
+            || !self.log_exclude.trim().is_empty()
+            || !self.log_regex.trim().is_empty()
+            || self.log_level.is_some();
+        let mut pane = div()
+            .id("config-logs")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                GroupBox::new()
+                    .title(format!("Logs ({})", lines.len()))
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("log-pane-level-row")
+                            .test_support()
+                            .child(level_group),
+                    )
+                    .child(
+                        div()
+                            .id("log-pane-filters")
+                            .test_support()
+                            .text_sm()
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("log-pane-edit-filters")
+                                    .small()
+                                    .label("Edit filters")
+                                    .tooltip(
+                                        "Open the logs sheet to edit include, exclude, and regex",
+                                    )
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.open_logs_dialog(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("log-pane-copy")
+                                    .small()
+                                    .label("Copy visible")
+                                    .tooltip("Copy the visible log lines (redacted)")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.copy_visible_logs(window, cx);
+                                    })),
+                            ),
+                    ),
+            );
+        if lines.is_empty() {
+            let mut empty = div()
+                .id("log-pane-empty")
+                .test_support()
+                .text_sm()
+                .child("No log lines to show.");
+            if filter_active {
+                empty = empty.child(
+                    Button::new("log-pane-clear")
+                        .small()
+                        .label("Clear filter")
+                        .tooltip("Clear the log text filters and level")
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.clear_log_filter(window, cx);
+                        })),
+                );
+            }
+            pane = pane.child(empty);
+        } else {
+            let mut list = div().id("log-pane-lines").test_support().w_full();
+            for line in &lines {
+                list = list.child(line.clone());
+            }
+            pane = pane.child(list);
+        }
+        pane
+    }
+
+    /// Ticket 05 (throne-adoption): Connections pane — honest v1 table over
+    /// the live snapshot: `Destination / Exit row + bind:port / Row protocol
+    /// / Traffic ↓↑ / Session Δ`. Clicking a destination copies it; rows
+    /// sort by traffic (descending default) and filter to the selected row
+    /// while the toggle is on; probes never reach the snapshot.
+    /// Ticket 10 (US-26): the destination column rides the persisted width
+    /// ([`Store::conn_column_widths`]); Columns −/+ resize every column by
+    /// 20px and Refresh Column Widths restores the defaults.
+    fn render_inspector_connections(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected_config(cx).map(|config| config.id);
+        let rows = build_conn_rows(
+            &self.conn_snapshot,
+            &self.conn_delta,
+            selected.as_deref(),
+            self.conn_selected_only,
+            self.conn_sort_desc,
+        );
+        let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
+        // Ticket 10 (US-26): persisted destination-column width snapshot
+        // (handlers below re-read live state — never this snapshot).
+        let dest_width_px = self.store.conn_column_widths()[0] as f32;
+        let mut pane = div()
+            .id("config-connections")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                GroupBox::new()
+                    .title(format!("Connections ({})", rows.len()))
+                    .gap_1()
+                    .child(div().text_sm().child(
+                        "Destination · Exit · Proto · Traffic ↓↑ · Session Δ — click a destination to copy it.",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("conn-toggle-scope")
+                                    .small()
+                                    .label(if self.conn_selected_only {
+                                        "Selected row only: on"
+                                    } else {
+                                        "Selected row only: off"
+                                    })
+                                    .tooltip("Show only the selected row's flows (all when nothing is selected)")
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.conn_selected_only = !view.conn_selected_only;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("conn-toggle-sort")
+                                    .small()
+                                    .label(if self.conn_sort_desc {
+                                        "Sort: traffic ↓"
+                                    } else {
+                                        "Sort: traffic ↑"
+                                    })
+                                    .tooltip("Sort connections by cumulative traffic")
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.conn_sort_desc = !view.conn_sort_desc;
+                                        cx.notify();
+                                    })),
+                            )
+                            // Ticket 10 (US-26): persisted column widths —
+                            // resize all five columns or restore defaults.
+                            .child(
+                                Button::new("conn-columns-narrow")
+                                    .small()
+                                    .label("Columns −")
+                                    .tooltip("Narrow every connections column by 20px (persisted)")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.adjust_conn_column_widths(-20, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("conn-columns-widen")
+                                    .small()
+                                    .label("Columns +")
+                                    .tooltip("Widen every connections column by 20px (persisted)")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.adjust_conn_column_widths(20, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("conn-columns-refresh")
+                                    .small()
+                                    .label("Refresh Column Widths")
+                                    .tooltip("Restore the default connections column widths")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.refresh_conn_column_widths(window, cx);
+                                    })),
+                            )
+                    ),
+            );
+        if rows.is_empty() {
+            pane = pane.child(
+                div()
+                    .id("config-connections-empty")
+                    .test_support()
+                    .text_sm()
+                    .child("No live connections yet — start an exit to see flows here. Health probes never appear."),
+            );
+        } else {
+            for (ix, row) in rows.iter().enumerate() {
+                let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
+                let dest = row.dest.clone();
+                let dest_label = if dest.is_empty() {
+                    "(no destination)".to_string()
+                } else {
+                    redact_secrets(&dest)
+                };
+                pane = pane.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .id(format!("conn-col-dest-{ix}"))
+                                .test_support()
+                                .w(px(dest_width_px))
+                                .overflow_hidden()
+                                .child(
+                                    Button::new(format!("conn-copy-{ix}"))
+                                        .small()
+                                        .label(dest_label)
+                                        .tooltip("Copy destination")
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.copy_connection_dest(&dest, window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(div().text_sm().child(format!(
+                            "{} · {} · {} · ↓{} ↑{} · Δ{}",
+                            name,
+                            bind,
+                            protocol,
+                            format_bytes(row.rx_bytes),
+                            format_bytes(row.tx_bytes),
+                            format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
+                        ))),
+                );
+            }
+        }
+        pane
+    }
+
+    /// Ticket 10 (US-26): resize every Connections column by `delta` px
+    /// (persisted per column, clamped 40..=600 by the store seam). Loud
+    /// on store failure; the pane repaints from the persisted widths.
+    fn adjust_conn_column_widths(
+        &mut self,
+        delta: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let widths = self.store.conn_column_widths();
+        for (index, width) in widths.iter().enumerate() {
+            let next = (*width as i32 + delta).clamp(40, 600) as u32;
+            if let Err(error) = self.store.set_conn_column_width(index, next) {
+                window.push_notification(
+                    Notification::error(format!("Column width failed: {error}")),
+                    cx,
+                );
+                return;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ticket 10 (US-26): Refresh Column Widths — restore the defaults
+    /// (explicit button only; ticks never touch widths).
+    fn refresh_conn_column_widths(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.reset_conn_column_widths() {
+            Ok(()) => {
+                window.push_notification(
+                    Notification::success("Column widths reset to defaults"),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Column width reset failed: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Ticket 05 (throne-adoption): Traffic pane — per-exit aggregates from
+    /// the persisted totals (which already fold in clash-poll deltas),
+    /// heaviest exit first. There is deliberately no Direct line: presets
+    /// emit no per-rule decisions yet, so a Direct aggregate would be
+    /// fabricated.
+    fn render_inspector_traffic(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
+        let totals = self.store.traffic_totals().unwrap_or_default();
+        let exits = aggregate_exit_traffic(&library, &totals);
+        let max = exits
+            .iter()
+            .map(ExitTraffic::total)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let mut pane = div()
+            .id("config-traffic")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                GroupBox::new()
+                    .title("Traffic (per-exit)")
+                    .gap_1()
+                    .child(div().text_sm().child(
+                        summed_traffic_text(&self.store)
+                            .unwrap_or_else(|| "usage unavailable".to_string()),
+                    ))
+                    .child(div().text_sm().child(
+                        "Per-exit aggregates from stored totals — no Direct line (presets emit no per-rule decisions).",
+                    )),
+            );
+        if exits.is_empty() {
+            pane = pane.child(
+                div()
+                    .id("config-traffic-empty")
+                    .test_support()
+                    .text_sm()
+                    .child("No traffic recorded yet — start an exit and pass data."),
+            );
+        } else {
+            for exit in &exits {
+                let filled = ((exit.total() as f64 / max as f64) * 12.0).round() as usize;
+                let bar = format!(
+                    "{}{}",
+                    "█".repeat(filled.min(12)),
+                    "░".repeat(12usize.saturating_sub(filled.min(12)))
+                );
+                pane = pane.child(
+                    div()
+                        .id(format!("traffic-exit-{}", exit.row_id))
+                        .test_support()
+                        .text_sm()
+                        .child(format!(
+                            "{} {} · {} ↓{} ↑{}",
+                            bar,
+                            exit.name,
+                            exit.bind,
+                            format_bytes(exit.rx_bytes),
+                            format_bytes(exit.tx_bytes),
+                        )),
+                );
+            }
+        }
+        pane
+    }
+
     /// W1/failed evidence shared by the detail builders: a crashed sidecar
     /// shard or a `dead` health summary. One helper so the call sites
-    /// cannot diverge.
+    /// (the shared overview's Alert, the serving badge tone, the Start
+    /// label phase) cannot diverge.
     fn detail_failed(&self, config: &ProxyConfig) -> bool {
         self.engine.ids_on_crashed_shards().contains(&config.id)
             || self.health_store.row_summary(&config.id).trim() == "dead"
@@ -19121,31 +23701,21 @@ impl AppView {
             .child(value_row)
     }
 
-    /// Detail health section (failed rows render the error Alert).
+    /// Detail health section (the data line; the failure Alert chrome for
+    /// failed rows lives once in the shared overview, never here).
     /// Ticket 44 sweep (T02): `gap_1` like every other module — the lone
     /// `gap_2` broke the shared container rhythm for no reading gain.
+    /// Ticket 04 (throne-adoption): a dead/crashed row keeps the same
+    /// pinned health copy as its plain line; the error Alert rendering
+    /// that copy moved to [`render_inspector_overview`] (directly under
+    /// the acting row, on every tab), so the `config-health-alert` id
+    /// never paints twice in one frame.
     fn render_detail_health(&self, config: &ProxyConfig) -> impl IntoElement {
-        let failed = self.detail_failed(config);
         div().id("config-health").test_support().child(
             GroupBox::new().title("Health").gap_1().child(
-                // T05: a dead/crashed row renders the same pinned
-                // health copy inside an error Alert; healthy rows keep
-                // the plain line (no Alert element at all).
-                if failed {
-                    div()
-                        .id("config-health-alert")
-                        .test_support()
-                        .child(
-                            Alert::error(
-                                "config-health-alert-box",
-                                self.health_store.detail_line(&config.id),
-                            )
-                            .title("Endpoint failed"),
-                        )
-                        .into_any_element()
-                } else {
-                    self.health_store.detail_line(&config.id).into_any_element()
-                },
+                // T05: the plain line for every row (no Alert element at
+                // all — failed rows read their Alert from the overview).
+                self.health_store.detail_line(&config.id).into_any_element(),
             ),
         )
     }
@@ -19391,6 +23961,184 @@ impl AppView {
             .child(self.render_row_menu(cx))
     }
 
+    /// Throne-adoption 03: one card-menu item closing over THAT row's id.
+    /// The div carries a stable `rowctx-<verb>-<row id>` id (never the
+    /// detail `row-menu` ids — both menus can paint at once); the click
+    /// resolves the row fresh so the menu acts on the right-clicked row,
+    /// never the selection. Ghost rows warn; the selection is untouched.
+    /// Ticket 07 (CUA US-5/CAP-5): role + name through the accessibility
+    /// bridge — `Role::MenuItem` with the visible label as the accessible
+    /// name, the same contract `topbar_menu_row` already carries, so the
+    /// UIA walk names every card-menu item. No synthetic nodes: the div is
+    /// the real clickable row, and keyboard (arrows/`Enter`/`Esc`) rides
+    /// the kit `PopupMenu` bindings.
+    fn row_menu_item(
+        verb: &str,
+        row_id: &str,
+        label: &str,
+        tip: &str,
+        view: &Entity<AppView>,
+        act: impl Fn(&mut AppView, &str, &mut Window, &mut Context<AppView>) + 'static,
+    ) -> PopupMenuItem {
+        let id = format!("rowctx-{verb}-{row_id}");
+        let label = label.to_string();
+        let tip = tip.to_string();
+        let target = row_id.to_string();
+        let view = view.clone();
+        PopupMenuItem::element(move |_, _| {
+            let tip = tip.clone();
+            div()
+                .id(id.clone())
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(label.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                .child(label.clone())
+        })
+        .on_click(move |_, window, cx| {
+            let target = target.clone();
+            view.update(cx, |view, cx| {
+                act(view, &target, window, cx);
+            });
+        })
+    }
+
+    /// Throne-adoption 03: the card right-click menu — one item per row
+    /// action (`Start/Stop/Test/Ping/Copy URLs/Edit/Duplicate/Delete/
+    /// Reset traffic/Reset usage/Move to group`), each closing over THAT
+    /// row's id. `Duplicate` is the only copy verb (`Clone` alias
+    /// removed); `Copy URLs` carries `bind:port` only, never secrets.
+    /// Ticket 09 (throne-adoption): plus `Speedtest`, `Resolve Out-IP`,
+    /// and `Resolve domain` (the row half of resolve-domain rewrite).
+    /// Ticket 10 (throne-adoption): plus `Share` (the link share-out —
+    /// `ExportToLink || ExportJsonLink`, never an empty copy).
+    fn row_context_menu(menu: PopupMenu, row_id: &str, view: &Entity<AppView>) -> PopupMenu {
+        menu.item(Self::row_menu_item(
+            "start",
+            row_id,
+            "Start",
+            "Start this row's endpoint",
+            view,
+            AppView::start_row,
+        ))
+        .item(Self::row_menu_item(
+            "stop",
+            row_id,
+            "Stop",
+            "Stop this row's endpoint",
+            view,
+            AppView::stop_row,
+        ))
+        .item(Self::row_menu_item(
+            "test",
+            row_id,
+            "Test",
+            "URL-test this row's endpoint",
+            view,
+            AppView::test_row,
+        ))
+        .item(Self::row_menu_item(
+            "ping",
+            row_id,
+            "Ping",
+            "TCP-ping this row's endpoint",
+            view,
+            AppView::ping_row,
+        ))
+        .item(Self::row_menu_item(
+            "speedtest",
+            row_id,
+            "Speedtest",
+            "Measure this row's transfer rate (mode + timeout)",
+            view,
+            AppView::speedtest_row,
+        ))
+        .item(Self::row_menu_item(
+            "out-ip",
+            row_id,
+            "Resolve Out-IP",
+            "Show this row's egress IP address",
+            view,
+            AppView::resolve_out_ip_row,
+        ))
+        .item(Self::row_menu_item(
+            "resolve-domain",
+            row_id,
+            "Resolve domain",
+            "Resolve this row's server domain to an IP and save it",
+            view,
+            AppView::resolve_domain_row,
+        ))
+        .item(Self::row_menu_item(
+            "copy",
+            row_id,
+            "Copy URLs",
+            "Copy bind endpoints (no secrets)",
+            view,
+            AppView::copy_row_urls,
+        ))
+        .item(Self::row_menu_item(
+            "share",
+            row_id,
+            "Share",
+            "Copy this row's share link (carries credentials)",
+            view,
+            AppView::open_share_for_row,
+        ))
+        .item(Self::row_menu_item(
+            "edit",
+            row_id,
+            "Edit",
+            "Edit this row",
+            view,
+            AppView::open_edit_for_row,
+        ))
+        .item(Self::row_menu_item(
+            "duplicate",
+            row_id,
+            "Duplicate",
+            "Duplicate this row (disabled copy)",
+            view,
+            AppView::commit_duplicate,
+        ))
+        .item(Self::row_menu_item(
+            "delete",
+            row_id,
+            "Delete",
+            "Delete this row",
+            view,
+            AppView::open_remove_for_row,
+        ))
+        .item(Self::row_menu_item(
+            "reset-traffic",
+            row_id,
+            "Reset traffic",
+            "Reset this row's traffic counters",
+            view,
+            AppView::open_traffic_reset_for_row,
+        ))
+        .item(Self::row_menu_item(
+            "reset-usage",
+            row_id,
+            "Reset usage",
+            "Reset this row's usage counters",
+            view,
+            AppView::open_usage_reset_for_row,
+        ))
+        .item(Self::row_menu_item(
+            "move",
+            row_id,
+            "Move to group",
+            "Move this row to a group",
+            view,
+            AppView::open_row_move_dialog,
+        ))
+    }
+
     /// Signal-box 04: row menu — Edit, Delete, Duplicate, Reset traffic,
     /// and Reset usage behind one `row-menu` trigger (same labels,
     /// tooltips, and handlers the manage row and Usage module carried;
@@ -19486,41 +24234,6 @@ impl AppView {
                             view.update(cx, |view, cx| {
                                 if let Some(config) = view.selected_config(cx) {
                                     view.commit_duplicate(&config.id, window, cx);
-                                } else {
-                                    window.push_notification(
-                                        Notification::info(no_selection_message()),
-                                        cx,
-                                    );
-                                }
-                            });
-                        }
-                    }),
-                )
-                // Config-completeness T08 (CAP-11): `Clone` alias over the
-                // same `commit_duplicate` handler (no new dupe logic; the
-                // row menu names both spellings). No shortcut bound, so no
-                // `Kbd` chip and no `Name (Key)` suffix (kit-maximal rule).
-                .item(
-                    PopupMenuItem::element(|_, _| {
-                        div()
-                            .id("clone-config")
-                            .test_support()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tooltip::new("Clone the selected row (disabled copy)"))
-                                    .into()
-                            })
-                            .child("Clone")
-                    })
-                    .on_click({
-                        let view = row_view.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                if let Some(config) = view.selected_config(cx) {
-                                    view.commit_clone(&config.id, window, cx);
                                 } else {
                                     window.push_notification(
                                         Notification::info(no_selection_message()),
@@ -20470,6 +25183,13 @@ impl AppView {
             .iter()
             .map(|row| (row.id.clone(), row.name.clone()))
             .collect();
+        // Ticket 10 (US-30): skip-delete-confirm toggle — the explicit
+        // Settings opt-in deletes without asking (stop-first still rides
+        // `commit_bulk_delete`, like the confirm path).
+        if self.store.skip_delete_confirm() {
+            view.update(cx, |view, cx| view.commit_bulk_delete(&targets, window, cx));
+            return;
+        }
         let names: Vec<String> = targets.iter().map(|(_, name)| name.clone()).collect();
         let count = targets.len();
         let description = bulk_delete_confirm_description(count, &names);
@@ -20594,6 +25314,55 @@ impl AppView {
         });
     }
 
+    /// Throne-adoption 03: single-row move dialog for the card menu. Same
+    /// Input + [`AppView::commit_bulk_move`] path as the bulk dialog above
+    /// (one id, never the checked set); the title names the row so the
+    /// commit target is never ambiguous. Ghost rows warn.
+    fn open_row_move_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.row_config(id) else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        let ids_for_commit = vec![config.id.clone()];
+        let name = config.name.clone();
+        let group_state = cx.new(|cx| InputState::new(window, cx).placeholder("Group"));
+        let view = cx.entity();
+        let reader = group_state.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let group = reader.read(cx).value().to_string();
+            view.update(cx, |view, cx| {
+                view.commit_bulk_move(&ids_for_commit, &group, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
+                .title(format!("Move \"{name}\" to group"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Label::new("Group"))
+                        .child(Input::new(&group_state)),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "row-move-ok",
+                    "row-move-cancel",
+                    // Ticket 05: commit names its verb.
+                    footer_commit_label("bulk-move"),
+                    commit_click,
+                ))
+        });
+    }
+
     /// Ticket 44: bulk move commit. Returns false (keeps the dialog open) on
     /// empty-group validation so the user can fix it in place.
     fn commit_bulk_move(
@@ -20629,7 +25398,20 @@ impl AppView {
     /// (dialog) and delete (empty-only, refuses loudly while rows remain).
     fn open_groups_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
-        let groups = self.store.group_counts().unwrap_or_default();
+        let counts = self.store.group_counts().unwrap_or_default();
+        let subs = self.store.list_subscriptions().unwrap_or_default();
+        let flagged: HashSet<String> = self
+            .store
+            .group_skip_flags()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // Ticket 08: GroupItem-style rows — kind badge (`Basic` vs
+        // `Subscription (N)`) plus the `Last update | Used/Remain/Expire`
+        // line from the Subscription-Userinfo snapshots, per-row Update,
+        // and Edit (rename + auto-skip). Snapshot the rows first: the
+        // sheet closure owns plain data, never the store.
+        let rows = group_row_views(&counts, &subs, &|group| flagged.contains(group), now_unix());
         let commit: DialogCommit = Rc::new(|_, _| true);
         // T08 (gpui-18-sweep CAP-9): reference flow — the groups manager is
         // a `Sheet` via `WindowExt::open_sheet` (no `Sheet::open`), with the
@@ -20643,50 +25425,140 @@ impl AppView {
             // reads in the same form language as the other dialogs. Row
             // button ids are unchanged.
             let mut form = v_form().small();
-            if groups.is_empty() {
+            // Ticket 08: bulk verbs ride the manager (per-row Update lives
+            // on each subscription row below).
+            {
+                let current_view = view.clone();
+                let all_view = view.clone();
+                form = form.child(
+                    field().label_indent(false).child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                        .child(
+                            Button::new("groups-update-current")
+                                .label("Update current")
+                                .tooltip(
+                                    "Refresh the subscriptions feeding the focused group \
+                                     (facet filter, else selected row) — Ctrl-R",
+                                )
+                                .on_click(move |_, window, cx| {
+                                    current_view.update(cx, |view, cx| {
+                                        view.update_current_group(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("groups-update-all")
+                                .label("Update all")
+                                .tooltip(
+                                    "Refresh every subscription outside auto-skipped groups (asks first)",
+                                )
+                                .on_click(move |_, window, cx| {
+                                    all_view.update(cx, |view, cx| {
+                                        view.open_update_all_confirm(window, cx);
+                                    });
+                                }),
+                        ),
+                    ),
+                );
+            }
+            if rows.is_empty() {
                 form = form.child(
                     field()
                         .label_indent(false)
                         .child("No groups yet — groups appear when rows use them"),
                 );
             }
-            for (group, count) in &groups {
+            for row in &rows {
                 let rename_view = view.clone();
+                let edit_view = view.clone();
+                let update_view = view.clone();
                 let delete_view = view.clone();
-                let rename_group = group.clone();
-                let delete_group = group.clone();
-                form = form.child(
-                    field().label(format!("{group} ({count})")).child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                // Ticket 44: manager ids slug the label (slashes never
-                                // reach an element id); the row label stays verbatim.
-                                Button::new(format!("group-rename-{}", slugify_group_id(group)))
-                                    .label("Rename")
-                                    .on_click(move |_, window, cx| {
-                                        let group = rename_group.clone();
-                                        rename_view.update(cx, |view, cx| {
-                                            view.open_group_rename_dialog(&group, window, cx);
-                                        });
-                                    }),
+                let rename_group = row.name.clone();
+                let edit_group = row.name.clone();
+                let update_group = row.name.clone();
+                let delete_group = row.name.clone();
+                let slug = slugify_group_id(&row.name);
+                let mut buttons = div().flex().flex_row().items_center().gap_2().child(
+                    // Ticket 44: manager ids slug the label (slashes never
+                    // reach an element id); the row label stays verbatim.
+                    Button::new(format!("group-rename-{slug}"))
+                        .label("Rename")
+                        .on_click(move |_, window, cx| {
+                            let group = rename_group.clone();
+                            rename_view.update(cx, |view, cx| {
+                                view.open_group_rename_dialog(&group, window, cx);
+                            });
+                        }),
+                );
+                buttons = buttons.child(
+                    Button::new(format!("group-edit-{slug}"))
+                        .label("Edit")
+                        .tooltip("Rename + auto-refresh skip for this group")
+                        .on_click(move |_, window, cx| {
+                            let group = edit_group.clone();
+                            edit_view.update(cx, |view, cx| {
+                                view.open_group_edit_dialog(&group, window, cx);
+                            });
+                        }),
+                );
+                // Ticket 08: per-row Update only on subscription-fed rows —
+                // basic groups have nothing to fetch (no dead button).
+                if !row.sub_ids.is_empty() {
+                    buttons = buttons.child(
+                        Button::new(format!("group-update-{slug}"))
+                            .label("Update")
+                            .tooltip(
+                                "Refresh this group's subscription(s) now (manual — runs even when auto-skipped)"
                             )
-                            .child(
-                                // Ticket 44: manager ids slug the label (slashes never
-                                // reach an element id); the row label stays verbatim.
-                                Button::new(format!("group-delete-{}", slugify_group_id(group)))
-                                    .label("Delete")
-                                    .on_click(move |_, window, cx| {
-                                        let group = delete_group.clone();
-                                        delete_view.update(cx, |view, cx| {
-                                            view.open_group_delete_confirm(&group, window, cx);
-                                        });
-                                    }),
-                            ),
-                    ),
+                            .on_click(move |_, window, cx| {
+                                let group = update_group.clone();
+                                update_view.update(cx, |view, cx| {
+                                    view.update_group_subs(&group, window, cx);
+                                });
+                            }),
+                    );
+                }
+                buttons = buttons.child(
+                    // Ticket 44: manager ids slug the label (slashes never
+                    // reach an element id); the row label stays verbatim.
+                    Button::new(format!("group-delete-{slug}"))
+                        .label("Delete")
+                        .on_click(move |_, window, cx| {
+                            let group = delete_group.clone();
+                            delete_view.update(cx, |view, cx| {
+                                view.open_group_delete_confirm(&group, window, cx);
+                            });
+                        }),
+                );
+                // Ticket 08: kind badge + quota line stack under the actions
+                // (same field, so the row reads as one GroupItem).
+                let mut column = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(buttons)
+                    .child(
+                        div()
+                            .id(format!("group-kind-{slug}"))
+                            .test_support()
+                            .child(row.kind.clone()),
+                    );
+                if let Some(quota) = row.quota.clone() {
+                    column = column.child(
+                        div()
+                            .id(format!("group-quota-{slug}"))
+                            .test_support()
+                            .child(quota),
+                    );
+                }
+                form = form.child(
+                    field()
+                        .label(format!("{} ({})", row.name, row.count))
+                        .child(column),
                 );
             }
             sheet
@@ -20748,6 +25620,136 @@ impl AppView {
                     commit_click,
                 ))
         });
+    }
+
+    /// Ticket 08 (throne-adoption): Edit-group dialog — rename plus the
+    /// skip-automatic-refresh switch. Same `v_form` + footer language as
+    /// the rename dialog; the switch mirrors the subscription add-form
+    /// `Switch` (shared cell, committed on Save).
+    fn open_group_edit_dialog(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let old_name = group.to_string();
+        let name_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Group name")
+                .default_value(old_name.clone())
+        });
+        let skip = Rc::new(RefCell::new(self.store.group_skip_refresh(group)));
+        let skip_for_change = skip.clone();
+        let skip_for_commit = skip.clone();
+        let skip_checked = *skip.borrow();
+        let view = cx.entity();
+        let reader = name_state.clone();
+        let old_for_commit = old_name.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let new_name = reader.read(cx).value().to_string();
+            let skip = *skip_for_commit.borrow();
+            view.update(cx, |view, cx| {
+                view.commit_edit_group(&old_for_commit, &new_name, skip, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _cx| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit.clone();
+            dialog
+                .title(format!("Edit group \"{old_name}\""))
+                .child(
+                    v_form()
+                        .small()
+                        .child(dialog_field(
+                            "field-group-edit-name",
+                            "Group name",
+                            name_state.clone(),
+                        ))
+                        .child(field().label_indent(false).child(
+                            div().id("field-group-edit-skip").test_support().child(
+                                Switch::new("group-edit-skip")
+                                    .checked(skip_checked)
+                                    .label("Skip automatic refresh")
+                                    .tooltip(
+                                        "Skip this group's subscriptions on ticks and Update-all. \
+                                         Manual Update still works.",
+                                    )
+                                    .accessibility_label(
+                                        "Skip automatic refresh of this group's subscriptions. \
+                                         Manual Update still works.",
+                                    )
+                                    .on_change({
+                                        // Clone per build: the dialog body
+                                        // rebuilds (Fn), so the switch keeps
+                                        // a private handle on the shared cell.
+                                        let skip_for_change = skip_for_change.clone();
+                                        move |next: &bool, _, _| {
+                                            *skip_for_change.borrow_mut() = *next;
+                                        }
+                                    }),
+                            ),
+                        )),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "group-edit-ok",
+                    "group-edit-cancel",
+                    // Ticket 05: commit names its verb.
+                    footer_commit_label("group-edit"),
+                    commit_click,
+                ))
+        });
+    }
+
+    /// Ticket 08: edit-group commit. False keeps the dialog open on
+    /// validation/store failure (like the rename commit); success reloads,
+    /// follows a rename in the facet filter, toasts, and reopens the
+    /// manager fresh.
+    fn commit_edit_group(
+        &mut self,
+        old: &str,
+        new: &str,
+        skip: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let renamed = new.trim().to_string();
+        if renamed != old {
+            match self.store.rename_group(old, &renamed) {
+                Ok(_) => {}
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(format!("Cannot rename group: {error}")),
+                        cx,
+                    );
+                    return false;
+                }
+            }
+        }
+        if let Err(error) = self.store.set_group_skip_refresh(&renamed, skip) {
+            window.push_notification(
+                Notification::error(format!("Cannot change auto-refresh skip: {error}")),
+                cx,
+            );
+            return false;
+        }
+        self.reload(window, cx);
+        // Ticket 44: a facet pinned to the old label follows the rename.
+        self.libraries.update(cx, |state, list_cx| {
+            let delegate = state.delegate_mut();
+            if delegate.facet_group.as_deref() == Some(old) {
+                delegate.set_facet_group(Some(renamed.clone()));
+            }
+            list_cx.notify();
+        });
+        self.sync_facet_pickers(window, cx);
+        window.push_notification(
+            Notification::success(format!("Updated group \"{renamed}\"")),
+            cx,
+        );
+        window.close_all_dialogs(cx);
+        self.open_groups_dialog(window, cx);
+        true
     }
 
     /// Ticket 44: rename-group commit. False keeps the dialog open on empty
@@ -20957,6 +25959,17 @@ impl AppView {
                 }
                 view.copy_selected_urls(window, cx);
             }))
+            // Ticket 08 (throne-adoption): Update-current (Ctrl-R) refreshes
+            // the subscriptions feeding the focused group — facet filter
+            // first, selected row's group second. Same overlay guard as
+            // every other shortcut (the groups sheet carries its own
+            // Update buttons, which need no guard).
+            .on_action(cx.listener(|view, _: &UpdateCurrentGroup, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.update_current_group(window, cx);
+            }))
             // Lane B (B9): row edit/delete + search focus + inspector tabs.
             // Each handler no-ops while any overlay is open (same guard as
             // the Ticket 26 actions); Delete opens the naming confirm and
@@ -21008,6 +26021,27 @@ impl AppView {
                 view.set_inspector_tab(InspectorTab::Presets);
                 cx.notify();
             }))
+            .on_action(cx.listener(|view, _: &InspectorLogs, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.set_inspector_tab(InspectorTab::Logs);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|view, _: &InspectorConnections, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.set_inspector_tab(InspectorTab::Connections);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|view, _: &InspectorTraffic, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.set_inspector_tab(InspectorTab::Traffic);
+                cx.notify();
+            }))
             .on_drop(move |paths: &ExternalPaths, window, cx| {
                 drop_view.update(cx, |view, cx| {
                     view.import_dropped_files(paths, window, cx);
@@ -21019,26 +26053,42 @@ impl AppView {
     /// inside [Render::render]'s single builder chain, so a debug first frame no
     /// longer nests the whole window tree in one function frame (main-thread stack
     /// overflow at startup - see .planning/follow-ups/startup-stack-overflow.md).
-    /// Ticket 10: 4 dedicated buttons plus Library / Manage / Engine / Help
-    /// dropdown menus — same ids, labels, tooltips, and handlers throughout.
+    /// Ticket 02 (throne-adoption): PROGRAM | SETTINGS | GROUPS | ROUTING |
+    /// TOOLS dropdown menus plus a trailing round global Start/Stop — the
+    /// same handlers throughout (top menus, palette, tray, and keys share
+    /// every op, so nothing is orphaned).
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Ticket 10: the 14-button strip is 5 dedicated core-flow buttons
-        // (Add, Start selected, Stop selected, Test selected, Import — same ids,
-        // labels, Kbd chips, tooltips, handlers) plus Library / Manage /
-        // Engine / Help dropdown triggers, so the strip fits narrow
-        // windows. The other 10 actions moved verbatim (label, tooltip,
-        // handler) into menu items; each item keeps its stable id on a
-        // custom element because `PopupMenuItem` carries no id of its own.
-        // Shortcuts, SHORTCUT_LINES, and the About list are untouched.
-        let library_view = cx.entity();
-        let manage_view = cx.entity();
-        let engine_view = cx.entity();
-        let help_view = cx.entity();
+        // Ticket 02 (throne-adoption): five menus in fixed order —
+        // PROGRAM (single-config intake + app lifecycle) | SETTINGS |
+        // GROUPS (subscriptions + group ops) | ROUTING (preset manager +
+        // settings link) | TOOLS (selection ops, diagnostics, palette) —
+        // plus a trailing round global Start/Stop (Start-all / Stop-all).
+        // Every item keeps its stable id; handlers are the same ones the
+        // palette, tray, bulk bar, and keys use. Shortcuts,
+        // SHORTCUT_LINES, and the About list are untouched.
+        let program_view = cx.entity();
+        let settings_view = cx.entity();
+        let groups_view = cx.entity();
+        let routing_view = cx.entity();
+        let tools_view = cx.entity();
+        // Global toggle state: a start in flight renders the `Connecting…`
+        // spinner; otherwise play offers Start-all and stop offers
+        // Stop-all. Only Idle/Running act — busy toasts the guard.
+        let running = self.engine.running_count();
+        let busy = self.start_in_flight;
+        let (glyph, name) = global_toggle_present(running, busy);
+        let toggle_tip = if busy {
+            "Starting every endpoint…"
+        } else if running == 0 {
+            "Start every configuration"
+        } else {
+            "Stop every endpoint"
+        };
         div()
             .id("manyproxy-toolbar")
             .flex()
             .flex_row()
-            // Ticket 02: the 880px minimum fits all nine controls on one
+            // Ticket 02: the 880px minimum fits all six controls on one
             // row (small density pins the single-row strip); BUG-5 wrap is
             // replaced by nowrap so nothing wraps or clips at the minimum.
             // Ticket 02: tight gaps (sm) keep the nowrap strip inside 880.
@@ -21050,153 +26100,53 @@ impl AppView {
             // band on the same theme tokens as the rest of the shell.
             .border_b_1()
             .border_color(cx.theme().border)
-            // Ticket 33: shortcut hints ride in the labels (F5/Shift-F5/
-            // Ctrl-T/Ctrl-N/Ctrl-O) so the bindings in [`bind_app_keys`]
-            // are visible without opening About. Button ids are
-            // unchanged. Separators group core actions / library menus /
-            // help; tooltips name each action.
-            // Signal-box 03: the five levers ride one frame (plate) —
-            // group_box ground, hairline rim, theme radius; the separators
-            // guard the throws inside and the frame edge outside. Button
-            // ids, labels, Kbd chips, tooltips, and handlers are untouched.
+            // Ticket 33: shortcut hints ride in the menu rows
+            // (F5/Shift-F5/Ctrl-T/Ctrl-N/Ctrl-O/Ctrl-V/Ctrl-K) so the
+            // bindings in [`bind_app_keys`] stay visible without opening
+            // About. Bound rows carry `Kbd` chips; tooltips name each
+            // action.
+            // Ticket 02 (throne-adoption): PROGRAM — single-config intake
+            // plus app lifecycle (user story 1: New/clipboard/file live in
+            // one predictable place; QR-file/batch parity lands with the
+            // intake tickets, same handlers).
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    // Ticket 02: tight inner gaps (sm) keep the five levers
-                    // inside the 880px nowrap strip.
-                    .gap_1()
-                    .px_1()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().group_box)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        Button::new("add-config")
-                            .small()
-                            .primary()
-                            // T08: keystroke rides as a `Kbd` chip; the
-                            // pinned string stays on the accessible name.
-                            .label("Add")
-                            .accessibility_label("Add (Ctrl-N)")
-                            .child(shortcut_kbd("ctrl-n", "(Ctrl-N)"))
-                            .tooltip("Add a proxy configuration")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_add_dialog(window, cx);
-                            })),
-                    )
-                    .child(Separator::vertical())
-                    // Ticket 43: the F5 key starts the SELECTED row (see
-                    // [`bind_app_keys`]) — the old "Start all (F5)" label
-                    // lied. Selected actions carry their key hints; bulk
-                    // actions carry none.
-                    .child(
-                        Button::new("start-selected")
-                            .small()
-                            .primary()
-                            // Ticket 10: short visible label (the strip must fit the
-                            // 1000px frame); the pinned `Start selected (F5)` string
-                            // stays on the accessible name + tooltip + Kbd chip.
-                            .label("Start")
-                            .accessibility_label("Start selected (F5)")
-                            .child(shortcut_kbd("f5", "(F5)"))
-                            .tooltip("Start the selected endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.start_selected_engine(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("stop-selected")
-                            .small()
-                            // Ticket 10: short visible label; pinned
-                            // `Stop selected (Shift-F5)` stays on the accessible name.
-                            .label("Stop")
-                            .accessibility_label("Stop selected (Shift-F5)")
-                            .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-                            .tooltip("Stop the selected endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.stop_selected_engine(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("test-selected")
-                            .small()
-                            // Ticket 10: short visible label; pinned
-                            // `Test selected (Ctrl-T)` stays on the accessible name.
-                            .label("Test")
-                            .accessibility_label("Test selected (Ctrl-T)")
-                            .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-                            .tooltip("Test the selected endpoint")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.test_selected_health(window, cx);
-                            })),
-                    )
-                    // Signal-box 03: Import returns as a persistent fifth lever —
-                    // same `import-config` id, label, tooltip, Kbd chip, and handler
-                    // the Library-menu item carried. The pinned `Import (Ctrl-O)`
-                    // string stays on the accessible name + chip.
-                    .child(
-                        Button::new("import-config")
-                            .small()
-                            .label("Import")
-                            .accessibility_label("Import (Ctrl-O)")
-                            .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
-                            .tooltip("Import share links or files")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                            })),
-                    ),
-            )
-            .child(Separator::vertical())
-            // Ticket 10: Library menu — the import/export buttons moved
-            // verbatim (label, tooltip, handler) into items keeping their
-            // stable ids.
-            .child(
-                Button::new("library-menu")
+                Button::new("program-menu")
                     .small()
-                    .label("Library")
-                    // Ticket 02: trigger announces its visible label (no
-                    // shortcut bound, so no `Name (Key)` suffix).
-                    .accessibility_label("Library")
-                    .tooltip("Import and export the library")
+                    .label("Program")
+                    .accessibility_label("Program")
+                    .tooltip("App and single-config intake")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    // Signal-box 03: distinct from the
-                                    // toolbar `import-config` button (same
-                                    // dialog, different element — duplicate
-                                    // ids panic headless lookups as ambiguous
-                                    // while the menu is open, same as the
-                                    // `groups-dialog` / `menu-groups-dialog`
-                                    // pair). Keeps the Ctrl-O hint inside the
-                                    // Library menu.
-                                    .id("menu-import-config")
-                                    .test_support()
-                                    // Ticket 02: custom menu rows are silent
-                                    // (`PopupMenuItem::element` carries no
-                                    // a11y label) — expose role + name so
-                                    // assistive tech announces the item; the
-                                    // Ctrl-O binding rides the shortcut
-                                    // property as well as the visible chip.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Import (Ctrl-O)")
-                                    .aria_keyshortcuts("Ctrl-O")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Import share links or files"))
-                                            .into()
-                                    })
-                                    .child("Import")
-                                    .child(shortcut_kbd("ctrl-o", "(Ctrl-O)"))
+                                topbar_menu_row(
+                                    "menu-add-config",
+                                    "Add configuration",
+                                    "Add configuration (Ctrl-N)",
+                                    "Add a proxy configuration",
+                                    Some(("ctrl-n", "(Ctrl-N)", "Ctrl-N")),
+                                )
                             })
                             .on_click({
-                                let view = library_view.clone();
+                                let view = program_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_add_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "menu-import-config",
+                                    "Import",
+                                    "Import (Ctrl-O)",
+                                    "Import share links or files",
+                                    Some(("ctrl-o", "(Ctrl-O)", "Ctrl-O")),
+                                )
+                            })
+                            .on_click({
+                                let view = program_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.open_import_dialog(
@@ -21212,31 +26162,16 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("import-clipboard")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    // Config-completeness T08 (CAP-11): Ctrl-V
-                                    // is bound (see `bind_app_keys`), so the
-                                    // binding rides the shortcut property as
-                                    // well as the visible chip (Import-item
-                                    // precedent — `Kbd` only on bound actions).
-                                    .role(Role::MenuItem)
-                                    .aria_label("From clipboard (Ctrl-V)")
-                                    .aria_keyshortcuts("Ctrl-V")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Import from clipboard text"))
-                                            .into()
-                                    })
-                                    .child("From clipboard")
-                                    .child(shortcut_kbd("ctrl-v", "(Ctrl-V)"))
+                                topbar_menu_row(
+                                    "import-clipboard",
+                                    "From clipboard",
+                                    "From clipboard (Ctrl-V)",
+                                    "Import from clipboard text",
+                                    Some(("ctrl-v", "(Ctrl-V)", "Ctrl-V")),
+                                )
                             })
                             .on_click({
-                                let view = library_view.clone();
+                                let view = program_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.open_import_from_clipboard(window, cx);
@@ -21246,23 +26181,45 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("export-library")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Export")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Export library to JSON")).into()
-                                    })
-                                    .child("Export")
+                                // Ticket 07 (throne-adoption): direct
+                                // file-picker entry (same picker as the
+                                // dialog Browse button — All-files, 50MB
+                                // cap, content-sniff). Ctrl-O stays on the
+                                // Import dialog (pinned binding).
+                                topbar_menu_row(
+                                    "import-files",
+                                    "From file(s)",
+                                    "From file(s)",
+                                    "Pick config files to import (any type, 50MB each)",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = library_view.clone();
+                                let view = program_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.browse_for_import_files(
+                                            String::new(),
+                                            DEFAULT_GROUP.to_string(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "export-library",
+                                    "Export",
+                                    "Export",
+                                    "Export library to JSON",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = program_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.open_export_dialog(window, cx);
@@ -21270,39 +26227,81 @@ impl AppView {
                                 }
                             }),
                         )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "about-dialog",
+                                    "About",
+                                    "About",
+                                    "Version, sidecars, shortcuts",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = program_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_about_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
                     }),
             )
-            // Ticket 10: Manage menu — subscriptions and presets moved
-            // verbatim from the strip; Groups opens the same dialog as the
-            // facet-bar `groups-dialog` button (which stays put).
+            // Ticket 02 (throne-adoption): SETTINGS — the dialog owns every
+            // control (user story 18: one copy of each); the menu only
+            // opens it.
             .child(
-                Button::new("manage-menu")
+                Button::new("settings-menu")
                     .small()
-                    .label("Manage")
-                    // Ticket 02: trigger announces its visible label (no
-                    // shortcut bound).
-                    .accessibility_label("Manage")
-                    .tooltip("Subscriptions, presets, and groups")
+                    .label("Settings")
+                    .accessibility_label("Settings")
+                    .tooltip("Settings")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("subscriptions")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Subscriptions")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Manage subscription lists")).into()
-                                    })
-                                    .child("Subscriptions")
+                                topbar_menu_row(
+                                    "settings-dialog",
+                                    "Settings",
+                                    "Settings",
+                                    "Autostart, restore, test URL",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = manage_view.clone();
+                                let view = settings_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_settings_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                    }),
+            )
+            // Ticket 02 (throne-adoption): GROUPS — subscriptions only
+            // (user story 5: group ops never confuse row ops). The
+            // facet-bar `groups-dialog` button stays put (same dialog,
+            // distinct element id).
+            .child(
+                Button::new("groups-menu")
+                    .small()
+                    .label("Groups")
+                    .accessibility_label("Groups")
+                    .tooltip("Subscriptions and groups")
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "subscriptions",
+                                    "Subscriptions",
+                                    "Subscriptions",
+                                    "Manage subscription lists",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = groups_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.open_subscriptions_dialog(window, cx);
@@ -21312,23 +26311,145 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("routing-presets")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Presets")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Manage routing presets")).into()
-                                    })
-                                    .child("Presets")
+                                topbar_menu_row(
+                                    "menu-groups-dialog",
+                                    "Groups",
+                                    "Groups",
+                                    "Rename or merge groups",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = manage_view.clone();
+                                let view = groups_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_groups_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        // Ticket 09 (throne-adoption): group prunes — each
+                        // resolves the focused group and confirms naming
+                        // the scope (never a blind sweep).
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "prune-duplicates",
+                                    GroupPruneKind::Duplicates.label(),
+                                    GroupPruneKind::Duplicates.label(),
+                                    "Remove later copies in the focused group (asks first)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = groups_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_prune_confirm(
+                                            GroupPruneKind::Duplicates,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "prune-unavailable",
+                                    GroupPruneKind::Unavailable.label(),
+                                    GroupPruneKind::Unavailable.label(),
+                                    "Remove dead rows in the focused group (asks first)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = groups_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_prune_confirm(
+                                            GroupPruneKind::Unavailable,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "prune-invalid",
+                                    GroupPruneKind::Invalid.label(),
+                                    GroupPruneKind::Invalid.label(),
+                                    "Remove validation-failing rows in the focused group (asks first)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = groups_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_prune_confirm(
+                                            GroupPruneKind::Invalid,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "prune-clear-tests",
+                                    GroupPruneKind::ClearTests.label(),
+                                    GroupPruneKind::ClearTests.label(),
+                                    "Clear test results in the focused group (rows kept, asks first)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = groups_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_prune_confirm(
+                                            GroupPruneKind::ClearTests,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }),
+                        )
+                    }),
+            )
+            // Ticket 02 (throne-adoption): ROUTING — preset chooser plus
+            // the manager link (user story 29 v1: the presets manager is
+            // the single copy; the Settings Routing section links there
+            // too, never a second copy).
+            // Ticket 10 (throne-adoption): plus the chooser — attach a
+            // preset to the selected row without opening the manager.
+            .child(
+                Button::new("routing-menu")
+                    .small()
+                    .label("Routing")
+                    .accessibility_label("Routing")
+                    .tooltip("Routing presets and settings")
+                    .dropdown_menu(move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "routing-presets",
+                                    "Routing presets",
+                                    "Routing presets",
+                                    "Manage routing presets",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = routing_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.open_presets_dialog(window, cx);
@@ -21338,66 +26459,182 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                // Distinct from the facet-bar `groups-dialog`
-                                // button (same dialog, different element):
-                                // duplicate ids panic headless lookups as
-                                // ambiguous while the menu is open.
-                                div()
-                                    .id("menu-groups-dialog")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Groups")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Rename or merge groups")).into()
-                                    })
-                                    .child("Groups")
+                                topbar_menu_row(
+                                    "routing-attach-selected",
+                                    "Attach preset to selected row",
+                                    "Attach preset to selected row",
+                                    "Pick a routing preset for the selected row",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = manage_view.clone();
+                                let view = routing_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
-                                        view.open_groups_dialog(window, cx);
+                                        view.open_preset_chooser_for_selected(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "routing-open-settings",
+                                    "Routing settings",
+                                    "Routing settings",
+                                    "Open Settings at the Routing section",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = routing_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_settings_dialog(window, cx);
                                     });
                                 }
                             }),
                         )
                     }),
             )
-            // Ticket 10: Engine menu — bulk start/stop/test moved verbatim
-            // (no key hints, matching the strip).
+            // Ticket 02 (throne-adoption): TOOLS — selection ops (the same
+            // handlers the bulk bar, cards, and keys use), diagnostics,
+            // and the palette entry point. No mode checkboxes anywhere on
+            // this bar (no Tun / System Proxy / System DNS — local-only).
             .child(
-                Button::new("engine-menu")
+                Button::new("tools-menu")
                     .small()
-                    .label("Engine")
-                    // Ticket 02: trigger announces its visible label (no
-                    // shortcut bound).
-                    .accessibility_label("Engine")
-                    .tooltip("Start, stop, and test every endpoint")
+                    .label("Tools")
+                    .accessibility_label("Tools")
+                    .tooltip("Selection, diagnostics, and commands")
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("engine-start-all")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Start all")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Start every configuration")).into()
-                                    })
-                                    .child("Start all")
+                                // Ticket 43: F5 starts the SELECTED row (see
+                                // [`bind_app_keys`]) — selected actions
+                                // carry their key hints; bulk actions carry
+                                // none.
+                                topbar_menu_row(
+                                    "start-selected",
+                                    "Start selected",
+                                    "Start selected (F5)",
+                                    "Start the selected endpoint",
+                                    Some(("f5", "(F5)", "F5")),
+                                )
                             })
                             .on_click({
-                                let view = engine_view.clone();
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.start_selected_engine(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "stop-selected",
+                                    "Stop selected",
+                                    "Stop selected (Shift-F5)",
+                                    "Stop the selected endpoint",
+                                    Some(("shift-f5", "(Shift-F5)", "Shift-F5")),
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.stop_selected_engine(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "test-selected",
+                                    "Test selected",
+                                    "Test selected (Ctrl-T)",
+                                    "Test the selected endpoint",
+                                    Some(("ctrl-t", "(Ctrl-T)", "Ctrl-T")),
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.test_selected_health(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row("menu-logs", "Logs", "Logs", "Sidecar output", None)
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_logs_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                // Ticket 10 (throne-adoption): runtime +
+                                // traffic stats (user stories 22-23) ride
+                                // the diagnostics cluster behind Logs.
+                                topbar_menu_row(
+                                    "runtime-stats",
+                                    "Runtime stats",
+                                    "Runtime stats",
+                                    "Process health on one screen",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_runtime_stats_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "traffic-stats",
+                                    "Traffic stats",
+                                    "Traffic stats",
+                                    "Per-exit traffic with period and By Profile",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_traffic_stats_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "engine-start-all",
+                                    "Start all",
+                                    "Start all",
+                                    "Start every configuration",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.start_all_engines(window, cx);
@@ -21407,23 +26644,16 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("engine-stop-all")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Stop all")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Stop every endpoint")).into()
-                                    })
-                                    .child("Stop all")
+                                topbar_menu_row(
+                                    "engine-stop-all",
+                                    "Stop all",
+                                    "Stop all",
+                                    "Stop every endpoint",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = engine_view.clone();
+                                let view = tools_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.stop_all_engines(window, cx);
@@ -21433,24 +26663,16 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("health-test-all")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Test all")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Test every running endpoint"))
-                                            .into()
-                                    })
-                                    .child("Test all")
+                                topbar_menu_row(
+                                    "health-test-all",
+                                    "Test all",
+                                    "Test all",
+                                    "Test every running endpoint",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = engine_view.clone();
+                                let view = tools_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.test_all_health(window, cx);
@@ -21458,100 +26680,214 @@ impl AppView {
                                 }
                             }),
                         )
-                    }),
-            )
-            .child(Separator::vertical())
-            // Ticket 10: Help menu — About and Settings moved verbatim.
-            .child(
-                Button::new("help-menu")
-                    .small()
-                    .label("Help")
-                    // Ticket 02: trigger announces its visible label (no
-                    // shortcut bound).
-                    .accessibility_label("Help")
-                    .tooltip("About and settings")
-                    .dropdown_menu(move |menu, _, _| {
-                        menu.item(
+                        // Ticket 09 (throne-adoption): Selected-vs-Group test
+                        // split — group URL test, selected/group speedtest
+                        // (mode + pinned timeout), selected/group out-IP,
+                        // group domain rewrite, Stop Testing, Show-Security,
+                        // and the Type|Security sort. No new shortcuts
+                        // (Ctrl-R stays Update-current, Ctrl-U stays Copy URLs).
+                        .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("about-dialog")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("About")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Version, sidecars, shortcuts"))
-                                            .into()
-                                    })
-                                    .child("About")
+                                topbar_menu_row(
+                                    "test-group",
+                                    "Test group",
+                                    "Test group",
+                                    "URL-test the focused group's running endpoints",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = help_view.clone();
+                                let view = tools_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
-                                        view.open_about_dialog(window, cx);
+                                        view.test_group_health(window, cx);
                                     });
                                 }
                             }),
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("settings-dialog")
-                                    .test_support()
-                                    // Ticket 02: expose role + name.
-                                    .role(Role::MenuItem)
-                                    .aria_label("Settings")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| Tooltip::new("Autostart, restore, test URL"))
-                                            .into()
-                                    })
-                                    .child("Settings")
+                                topbar_menu_row(
+                                    "speedtest-selected",
+                                    "Speedtest selected",
+                                    "Speedtest selected",
+                                    "Measure the selected endpoint's transfer rate",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = help_view.clone();
+                                let view = tools_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
-                                        view.open_settings_dialog(window, cx);
+                                        view.speedtest_selected(window, cx);
                                     });
                                 }
                             }),
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                div()
-                                    .id("open-palette")
-                                    .test_support()
-                                    // Ticket 02: palette is bound to Ctrl-K,
-                                    // so the name carries the shortcut (no
-                                    // visual Kbd chip added — headless + AT
-                                    // announce the binding via label +
-                                    // keyshortcuts).
-                                    .role(Role::MenuItem)
-                                    .aria_label("Command palette (Ctrl-K)")
-                                    .aria_keyshortcuts("Ctrl-K")
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| {
-                                            Tooltip::new("Every action, searchable (Ctrl-K)")
-                                        })
-                                        .into()
-                                    })
-                                    .child("Command palette")
+                                topbar_menu_row(
+                                    "speedtest-group",
+                                    "Speedtest group",
+                                    "Speedtest group",
+                                    "Measure the focused group's running endpoints",
+                                    None,
+                                )
                             })
                             .on_click({
-                                let view = help_view.clone();
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.speedtest_group(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "speedtest-mode",
+                                    "Speedtest mode",
+                                    "Speedtest mode",
+                                    "Cycle download → upload (timeout stays 5s)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.cycle_speedtest_mode(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "out-ip-selected",
+                                    "Resolve Out-IP selected",
+                                    "Resolve Out-IP selected",
+                                    "Show the selected row's egress IP address",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.resolve_out_ip_selected(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "out-ip-group",
+                                    "Resolve Out-IP group",
+                                    "Resolve Out-IP group",
+                                    "Show the focused group's egress IP addresses",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.resolve_out_ip_group(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "resolve-domain-group",
+                                    "Resolve domain group",
+                                    "Resolve domain group",
+                                    "Rewrite the focused group's domain servers to IPs (asks first)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_resolve_domain_group_confirm(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "stop-testing",
+                                    "Stop Testing",
+                                    "Stop Testing",
+                                    "Stop the running group test",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.stop_group_tests(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "show-security",
+                                    "Show security",
+                                    "Show security",
+                                    "Toggle the transport-security column",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.toggle_show_security(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "sort-type-security",
+                                    "Sort Type|Security",
+                                    "Sort Type|Security",
+                                    "Toggle Type-then-Security display order",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.toggle_type_security_sort(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "open-palette",
+                                    "Command palette",
+                                    "Command palette (Ctrl-K)",
+                                    "Every action, searchable (Ctrl-K)",
+                                    Some(("ctrl-k", "(Ctrl-K)", "Ctrl-K")),
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.open_palette(window, cx);
@@ -21560,6 +26896,28 @@ impl AppView {
                             }),
                         )
                     }),
+            )
+            // The spacer pins the global toggle at the trailing end, after
+            // all five menus in PROGRAM | SETTINGS | GROUPS | ROUTING |
+            // TOOLS order.
+            .child(div().flex_1())
+            // Ticket 02 (throne-adoption): round global Start/Stop (user
+            // story 9 — one throw controls the room). Play offers
+            // Start-all, stop offers Stop-all, and a start in flight shows
+            // the `Connecting…` spinner; only Idle/Running act (busy
+            // toasts the guard). Full-radius pill over the glyph reads
+            // round; the pinned name rides the accessible label.
+            .child(
+                Button::new("global-start-stop")
+                    .small()
+                    .rounded(px(999.))
+                    .label(glyph)
+                    .accessibility_label(name)
+                    .loading(busy)
+                    .tooltip(toggle_tip)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.toggle_global_engines(window, cx);
+                    })),
             )
     }
 }
@@ -21664,7 +27022,14 @@ fn main() {
     // Ticket 38: drop a dead autostart entry (target exe gone) at startup so
     // a moved/uninstalled copy never lingers in HKCU Run. Best-effort.
     let _ = crate::tray::clear_dead_autostart_target();
-    gpui_kit::application().run(|cx| {
+    // Ticket 07 (throne-adoption): open-with payload — the first launch
+    // argument that classifies as intake (`manyproxy://add|addsub`, throne
+    // equivalents, a bare `http(s)` URL, or a share link). Flags (`--tray`),
+    // file paths, and junk classify as nothing and are ignored.
+    let launch_intake = std::env::args()
+        .skip(1)
+        .find_map(|arg| classify_open_with(&arg));
+    gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         // Ticket 26: app keyboard shortcuts (Add/Import/Start/Stop/Test).
         bind_app_keys(cx);
@@ -21686,6 +27051,12 @@ fn main() {
                     // hidden in the tray instead of popping a window.
                     if crate::tray::launched_minimized() {
                         view.hide_to_tray(window, cx);
+                    }
+                    // Ticket 07 (throne-adoption): open-with handoff after
+                    // first paint ordering (tray/restore first — the handoff
+                    // opens a dialog, never a silent commit).
+                    if let Some(intake) = launch_intake.clone() {
+                        view.handle_launch_intake(intake, window, cx);
                     }
                 });
                 // Ticket 38: tray event pump (menu actions + left-click
@@ -22111,8 +27482,9 @@ mod tests {
     /// type — a missing row would come back `None`).
     /// Config-completeness T08: `direct` (CAP-12 trivial final) is the 24th
     /// row, appended last so the existing order never shifts.
+    /// Ticket 07 (throne-adoption): 24 + mieru/juicity/trusttunnel.
     #[gpui_kit::test]
-    fn t01_protocol_picker_lists_24_canonical_types(cx: &mut TestAppContext) {
+    fn t01_protocol_picker_lists_27_canonical_types(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
         use crate::ConfigForm;
         cx.update(gpui_kit::init);
@@ -22142,15 +27514,15 @@ mod tests {
         paint_dialog_open(cx);
         assert_absent(cx, "protocol-option-vless".to_string());
         // Full membership: every canonical type resolves through the picker
-        // delegate (24 rows, `VALID_PROTOCOLS` order — the store owns it).
+        // delegate (27 rows, `VALID_PROTOCOLS` order — the store owns it).
         assert_eq!(
             VALID_PROTOCOLS.len(),
-            24,
+            27,
             "picker covers the canonical list"
         );
         assert_eq!(
             crate::protocol_choices().len(),
-            24,
+            27,
             "one picker row per canonical type"
         );
         cx.update(|window, cx| {
@@ -22408,7 +27780,7 @@ mod tests {
         });
     }
 
-    /// Config-completeness T02: VLESS Add renders inner + S1–S4 as kit
+    /// Config-completeness T02: VLESS Add renders inner + Network/TLS/Mux as kit
     /// primitives with pinned ids; default tcp shows no conditionals.
     /// The page rides one outer collapsed disclosure (t11 minimum-frame
     /// contract) with per-panel sections inside — the test pins the
@@ -22437,7 +27809,10 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Inner fields paint; panel sections stay collapsed inside.
+        // Inner fields paint; left-column panel sections stay collapsed
+        // inside; the right column (TLS Security, always expanded) and the
+        // Common-box Advanced opener paint alongside. Dial Fields left the
+        // main form for the Advanced dialog (Ticket 06).
         for id in [
             "vless-uuid",
             "vless-uuid-generate",
@@ -22446,11 +27821,12 @@ mod tests {
             "s1-caption",
             "s2-caption",
             "s3-caption",
-            "s4-caption",
+            "tls-security-caption",
+            "advanced-settings",
         ] {
             assert_painted(cx, id);
         }
-        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle"] {
             cx.update(|window, cx| {
                 window.click(toggle, cx);
             });
@@ -22470,21 +27846,65 @@ mod tests {
             "s2-enable",
             "s2-sni",
             "s2-fp",
-            "s2-insecure",
-            "s2-pbk",
             "s3-caption",
             "s3-mux-group",
             "s3-brutal",
             "s3-up",
             "s3-down",
-            "s4-caption",
-            "s4-reuse",
-            "s4-timeout",
         ] {
             assert_painted(cx, id);
         }
         assert_absent(cx, "s1-path".to_string());
         assert_absent(cx, "s3-vision-note".to_string());
+        // Ticket 06: dial + TLS extras ride the Advanced dialog, never the
+        // main form — the main dialog carries no trace of them.
+        for id in [
+            "s4-caption",
+            "s4-reuse",
+            "s2-insecure",
+            "s2-pbk",
+            "tls-extras-caption",
+        ] {
+            assert_absent(cx, id.to_string());
+        }
+        // The Advanced Settings button opens the second small dialog with
+        // Dial Fields + TLS extras only — the small dialog shows every
+        // section expanded, no inner toggles.
+        cx.update(|window, cx| {
+            window.click("advanced-settings", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        for id in [
+            "advanced-dialog",
+            "s4-caption",
+            "s4-reuse",
+            "s4-timeout",
+            "tls-extras-caption",
+            "s2-insecure",
+            "s2-pbk",
+            "s2-sid",
+        ] {
+            assert_painted(cx, id);
+        }
+        // Escape dismisses the topmost layer (the advanced dialog); the
+        // main dialog survives with its form untouched.
+        let esc = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(esc.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("advanced-dialog").is_none()),
+            "escape drops the advanced dialog"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("vless-section-caption").is_some()),
+            "the main dialog stays open under the advanced dialog"
+        );
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
@@ -22910,7 +28330,6 @@ mod tests {
             "s1-caption",
             "s2-caption",
             "s3-caption",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
@@ -22923,7 +28342,7 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
-        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle"] {
             cx.update(|window, cx| {
                 window.click(toggle, cx);
             });
@@ -22938,8 +28357,6 @@ mod tests {
             "s2-enable",
             "s2-sni",
             "s3-mux-group",
-            "s4-reuse",
-            "s4-timeout",
         ] {
             assert_painted(cx, id);
         }
@@ -22996,7 +28413,8 @@ mod tests {
     }
 
     /// Config-completeness T03: Trojan Edit renders the masked password +
-    /// full S1+S2+S3+S4 as kit primitives; nothing from the other pages.
+    /// full S1+S2+S3 as kit primitives (S4 dial rides the Advanced dialog);
+    /// nothing from the other pages.
     #[gpui_kit::test]
     fn t03_trojan_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -23038,19 +28456,13 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        for id in [
-            "trojan-password",
-            "s1-caption",
-            "s2-caption",
-            "s3-caption",
-            "s4-caption",
-        ] {
+        for id in ["trojan-password", "s1-caption", "s2-caption", "s3-caption"] {
             assert_painted(cx, id);
         }
         for id in ["vmess-aid", "ss-method", "vless-uuid", "s3-vision-note"] {
             assert_absent(cx, id.to_string());
         }
-        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle", "s4-toggle"] {
+        for toggle in ["s1-toggle", "s2-toggle", "s3-toggle"] {
             cx.update(|window, cx| {
                 window.click(toggle, cx);
             });
@@ -23059,14 +28471,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        for id in [
-            "s1-network",
-            "s2-enable",
-            "s2-pbk",
-            "s3-mux-group",
-            "s3-brutal",
-            "s4-reuse",
-        ] {
+        for id in ["s1-network", "s2-enable", "s3-mux-group", "s3-brutal"] {
             assert_painted(cx, id);
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
@@ -23074,9 +28479,9 @@ mod tests {
 
     /// Config-completeness T03: Shadowsocks Edit renders method, password,
     /// plugin, plugin_opts and uot with Mux-only Settings (no
-    /// Network/Security panels — Throne HasMux parity); Advanced shows the
-    /// dial fields with no TLS section (HasTLS gating). All 18 methods and
-    /// all 3 plugin spellings resolve through the delegate.
+    /// Network/Security panels — Throne HasMux parity); dial fields ride
+    /// the Advanced dialog with no TLS extras (HasTLS gating). All 18
+    /// methods and all 3 plugin spellings resolve through the delegate.
     #[gpui_kit::test]
     fn t03_ss_page_paints_mux_only(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -23126,7 +28531,6 @@ mod tests {
             "ss-plugin-opts",
             "ss-uot",
             "s3-caption",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
@@ -23142,23 +28546,46 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
-        for toggle in ["s3-toggle", "s4-toggle"] {
-            cx.update(|window, cx| {
-                window.click(toggle, cx);
-            });
-            cx.run_until_parked();
-        }
+        cx.update(|window, cx| {
+            window.click("s3-toggle", cx);
+        });
+        cx.run_until_parked();
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Advanced dial paints with no TLS section (HasTLS gating holds —
-        // the dial half carries no TLS extras by construction).
-        for id in ["s3-mux-group", "s4-reuse", "s4-timeout", "s4-bind"] {
-            assert_painted(cx, id);
-        }
+        // Mux paints in the main form; dial fields ride the Advanced
+        // dialog with no TLS extras (HasTLS gating holds — the dialog
+        // carries no extras section for a TLS-less row).
+        assert_painted(cx, "s3-mux-group");
         for id in ["s1-caption", "s2-caption", "s2-enable", "s2-pbk"] {
             assert_absent(cx, id.to_string());
         }
+        // The Advanced dialog carries dial fields only here — everything
+        // expanded, no inner toggles.
+        cx.update(|window, cx| {
+            window.click("advanced-settings", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert_painted(cx, "advanced-dialog");
+        assert_painted(cx, "s4-caption");
+        for id in ["s4-reuse", "s4-timeout", "s4-bind"] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "tls-extras-caption".to_string());
+        // Back pops only the top dialog; the main dialog survives (see the
+        // VLESS test for the Escape path).
+        cx.update(|window, cx| {
+            window.click("advanced-dialog-back", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("advanced-dialog").is_none()),
+            "back drops the advanced dialog"
+        );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         // Delegate membership: all 18 methods + all 3 plugin spellings.
         let row = ProxyConfig {
@@ -23517,7 +28944,7 @@ mod tests {
     }
 
     /// Config-completeness T04: WireGuard Edit renders the nine peer/net
-    /// rows + keygen + S4 as kit primitives with pinned ids; no
+    /// rows + keygen as kit primitives with pinned ids (dial rides Advanced); no
     /// Transport/TLS/Mux panels (endpoint parity) and nothing from the
     /// other pages.
     #[gpui_kit::test]
@@ -23574,7 +29001,6 @@ mod tests {
             "wg-workers",
             "wg-sys-ifc",
             "wg-notes",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
@@ -23591,16 +29017,28 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
+        // Dial fields ride the Advanced dialog (Ticket 06) — expanded.
         cx.update(|window, cx| {
-            window.click("s4-toggle", cx);
+            window.click("advanced-settings", cx);
         });
         cx.run_until_parked();
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        for id in ["s4-reuse", "s4-timeout"] {
+        for id in ["advanced-dialog", "s4-caption", "s4-reuse", "s4-timeout"] {
             assert_painted(cx, id);
         }
+        // Back pops only the top dialog and keeps the main dialog (see the
+        // VLESS test for the Escape path).
+        cx.update(|window, cx| {
+            window.click("advanced-dialog-back", cx);
+        });
+        cx.run_until_parked();
+        paint_tall_dialog(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("advanced-dialog").is_none()),
+            "back drops the advanced dialog"
+        );
         // Keygen toasts once and keeps the dialog open (the key backend is
         // pinned by `t04_generate_wireguard_key_shape`).
         assert_eq!(notification_count(cx), 0, "no toast before Generate");
@@ -23617,9 +29055,9 @@ mod tests {
     }
 
     /// Config-completeness T04: AmneziaWG Edit renders WG rows + enable +
-    /// version + the J/S/H/I matrix + S4; the v3 section hides until 3.x is
-    /// picked (entities persist — hide-preserve is pinned at fold level by
-    /// `t04_awg_version_toggle_hide_preserves`). The page is the longest
+    /// version + the J/S/H/I matrix (dial rides Advanced); the v3 section hides
+    /// until 3.x is picked (entities persist — hide-preserve is pinned at fold
+    /// level by `t04_awg_version_toggle_hide_preserves`). The page is the longest
     /// guided page, so it paints jumbo-tall (the t11 minimum-frame contract
     /// pins the collapsed core, not open pages).
     #[gpui_kit::test]
@@ -23693,7 +29131,6 @@ mod tests {
             "awg-h1",
             "awg-i1",
             "awg-notes",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
@@ -24203,7 +29640,6 @@ mod tests {
             "hy-mtu",
             "hy-notes",
             "s2-caption",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
@@ -24226,16 +29662,12 @@ mod tests {
         paint_jumbo_dialog(cx);
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
-        for id in [
-            "s2-forced-note",
-            "s2-sni",
-            "s2-alpn",
-            "s2-fp",
-            "s2-insecure",
-            "s2-pbk",
-            "s2-sid",
-        ] {
+        for id in ["s2-forced-note", "s2-sni", "s2-alpn", "s2-fp"] {
             assert_painted(cx, id);
+        }
+        // TLS extras + dial left the main form for the Advanced dialog.
+        for id in ["s2-insecure", "s2-pbk", "s2-sid", "s4-caption"] {
+            assert_absent(cx, id.to_string());
         }
         assert_absent(cx, "s2-enable".to_string());
         // Toggle to v2: the auth family unmounts, the password mounts,
@@ -24397,7 +29829,8 @@ mod tests {
     }
 
     /// Config-completeness T05: TUIC Edit renders uuid (+uuidgen) + password
-    /// + cc/relay + uot/zero-rtt/heartbeat + S2-forced + S4, all kit; an
+    /// + cc/relay + uot/zero-rtt/heartbeat + S2-forced (dial rides Advanced),
+    /// all kit; an
     /// untouched row refolds byte-identical.
     #[gpui_kit::test]
     fn t05_tuic_edit_round_trips(cx: &mut TestAppContext) {
@@ -24462,7 +29895,6 @@ mod tests {
             "tuic-heartbeat",
             "tuic-notes",
             "s2-caption",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
@@ -24486,8 +29918,12 @@ mod tests {
         paint_jumbo_dialog(cx);
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
-        for id in ["s2-forced-note", "s2-sni", "s2-fp", "s2-insecure"] {
+        for id in ["s2-forced-note", "s2-sni", "s2-fp"] {
             assert_painted(cx, id);
+        }
+        // TLS extras + dial left the main form for the Advanced dialog.
+        for id in ["s2-insecure", "s4-caption"] {
+            assert_absent(cx, id.to_string());
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
         // Prefill + refold at the form level (no typing simulation).
@@ -24698,8 +30134,8 @@ mod tests {
     }
 
     /// Config-completeness T06: SOCKS Add renders version + credentials +
-    /// network + uot + S4-only as kit primitives; a stored "5" echoes into
-    /// the picker and delegate membership covers blank + both versions
+    /// network + uot as kit primitives (dial rides Advanced); a stored "5" echoes
+    /// into the picker and delegate membership covers blank + both versions
     /// (virtualized popups paint visible rows only, so membership pins here).
     #[gpui_kit::test]
     fn t06_socks_page_paints(cx: &mut TestAppContext) {
@@ -24769,12 +30205,11 @@ mod tests {
             "socks-network",
             "socks-uot",
             "socks-notes",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
         // S4-only page: no Transport/TLS/Mux panels, nothing from the other
-        // small pages.
+        // small pages; dial rides the Advanced dialog.
         for id in [
             "s1-caption",
             "s2-caption",
@@ -24783,6 +30218,7 @@ mod tests {
             "anytls-password",
             "naive-cc",
             "ssh-user",
+            "s4-caption",
         ] {
             assert_absent(cx, id.to_string());
         }
@@ -24823,8 +30259,9 @@ mod tests {
     }
 
     /// Config-completeness T06: HTTP Add renders username/password/path/
-    /// headers + S2-optional + S4; HTTPS renders the same block (one entity
-    /// set, two protocols) with the enable toggle present.
+    /// headers + S2-optional (S4 dial rides the Advanced dialog); HTTPS
+    /// renders the same block (one entity set, two protocols) with the
+    /// enable toggle present.
     #[gpui_kit::test]
     fn t06_http_page_paints(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -24904,7 +30341,6 @@ mod tests {
                 "http-headers",
                 "http-notes",
                 "s2-caption",
-                "s4-caption",
             ] {
                 assert_painted(cx, id);
             }
@@ -24932,7 +30368,11 @@ mod tests {
     }
 
     /// Config-completeness T06: AnyTLS Add renders password + the three
-    /// session tunables + S2-forced + S4, all kit; no enable toggle anywhere.
+    /// session tunables + S2-forced (S4 dial rides the Advanced dialog),
+    /// all kit; no enable toggle anywhere.
+    /// Ticket 06: the edit shows a single password input (the generic
+    /// Identity row hides — the type box owns the secret), TLS and dial
+    /// ride separate labeled boxes, and Advanced opens the second dialog.
     #[gpui_kit::test]
     fn t06_anytls_page_paints(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -24996,32 +30436,206 @@ mod tests {
         paint_jumbo_dialog(cx);
         for id in [
             "anytls-password",
+            "anytls-password-state",
             "anytls-interval",
             "anytls-timeout",
             "anytls-min",
             "anytls-notes",
             "s2-caption",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
+        // Ticket 06: single password — the generic Identity row (and its
+        // state caption) stays unmounted while the type box owns it.
+        for id in ["field-guided-identity", "field-guided-identity-state"] {
+            assert_absent(cx, id.to_string());
+        }
+        let toggle_snap = cx.update(|window, _| {
+            window
+                .try_find("s2-toggle")
+                .map(|s| (s.bounds(), s.visible()))
+        });
+        assert!(
+            toggle_snap.is_some_and(|(_, visible)| visible),
+            "s2-toggle visible in-frame after min-w-0 columns: {toggle_snap:?}"
+        );
         cx.update(|window, cx| {
             window.click("s2-toggle", cx);
+        });
+        cx.run_until_parked();
+        for id in ["s2-enable", "s1-caption", "s3-caption", "ssh-user"] {
+            assert_absent(cx, id.to_string());
+        }
+        // Ticket 06: Advanced opens the second small dialog — Dial Fields
+        // + TLS extras only, rare knobs absent from the main form.
+        for id in ["s4-caption", "tls-extras-caption", "s2-insecure"] {
+            assert_absent(cx, id.to_string());
+        }
+        cx.update(|window, cx| {
+            window.click("advanced-settings", cx);
         });
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
-        assert_painted(cx, "s2-forced-note");
-        for id in ["s2-enable", "s1-caption", "s3-caption", "ssh-user"] {
-            assert_absent(cx, id.to_string());
+        for id in ["advanced-dialog", "s4-caption", "tls-extras-caption"] {
+            assert_painted(cx, id);
         }
+        for id in ["s4-reuse", "s2-insecure", "s2-pbk"] {
+            assert_painted(cx, id);
+        }
+        // Back pops only the top dialog (keyboard Escape is covered in the
+        // VLESS test); the main dialog survives with its form untouched.
+        cx.update(|window, cx| {
+            window.click("advanced-dialog-back", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("advanced-dialog").is_none()),
+            "back drops the advanced dialog"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("anytls-section-caption").is_some()),
+            "the main dialog stays open under the advanced dialog"
+        );
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
+    /// Ticket 06: AnyTLS Edit regroup — the edit opens with the protocol
+    /// locked, a single password input (generic Identity hidden), the
+    /// Common box + right-column TLS Security beside the type box, and
+    /// Dial Fields confined to the Advanced dialog.
+    #[gpui_kit::test]
+    fn t06_anytls_edit_regroups_single_password(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
+            cx.simulate_resize(size(px(1000.), px(3600.)));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+        };
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(NewConfig {
+                name: "AnyRow".to_string(),
+                protocol: "anytls".to_string(),
+                params: "{\"type\":\"anytls\",\"server\":\"a.example.com\",\"server_port\":443,\
+                    \"password\":\"secret\"}"
+                    .to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let target = seeded.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_edit_dialog(target, window, cx));
+        });
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        // Protocol stays locked on Edit (no type switch, Throne §7.7).
+        assert_painted(cx, "protocol-lock");
+        assert_absent(cx, "protocol-select".to_string());
+        // Edit opens on the raw JSON — collapse into the guided page.
+        cx.update(|window, cx| {
+            window.click("params-advanced-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        // Common box + Advanced opener + right-column TLS Security paint;
+        // the generic Identity row stays unmounted (single password).
+        for id in [
+            "common-caption",
+            "advanced-settings",
+            "tls-security-caption",
+        ] {
+            assert_painted(cx, id);
+        }
+        for id in ["field-guided-identity", "field-guided-identity-state"] {
+            assert_absent(cx, id.to_string());
+        }
+        assert_painted(cx, "anytls-section-caption");
+        cx.update(|window, cx| {
+            window.click("anytls-section-toggle", cx);
+        });
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        cx.run_until_parked();
+        paint_jumbo_dialog(cx);
+        // The type box owns the one password; TLS and dial ride separate
+        // labeled boxes (dial only in the Advanced dialog).
+        for id in ["anytls-password", "anytls-password-state", "s2-caption"] {
+            assert_painted(cx, id);
+        }
+        assert_absent(cx, "s4-caption".to_string());
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        // The untouched edit refolds byte-identical (the hidden generic
+        // echoes the same password the type box owns).
+        let folded = cx.update(|window, cx| {
+            view.update(cx, |_, cx| {
+                let form = crate::ConfigForm::prefilled(window, cx, &seeded, None);
+                form.effective_params(cx)
+            })
+        });
+        assert_eq!(
+            folded, seeded.params,
+            "untouched anytls edit refolds byte-identical"
+        );
+    }
+
+    /// Ticket 06: invalid params keep the dialog open — the commit reports
+    /// the owning field inline (no close, no row written). Port collisions
+    /// stay a warning line, never a save gate (see
+    /// `bind_port_collision_warning`).
+    #[gpui_kit::test]
+    fn t06_invalid_port_stays_open_naming_field(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::blank(window, cx);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("BadPort", window, cx);
+                });
+                form.guided_server.update(cx, |state, cx| {
+                    state.set_value("a.example.com", window, cx);
+                });
+                form.guided_port.update(cx, |state, cx| {
+                    state.set_value("443", window, cx);
+                });
+                form.guided_identity.update(cx, |state, cx| {
+                    state.set_value("11111111-2222-4333-8444-555555555555", window, cx);
+                });
+                form.port.update(cx, |state, cx| {
+                    state.set_value("not-a-port", window, cx);
+                });
+                view.commit_add_with_focus(&form, &form_error, window, cx)
+            })
+        });
+        assert!(!closed, "invalid port keeps the dialog open");
+        let (field, message) = form_error
+            .borrow()
+            .clone()
+            .expect("inline error names the field");
+        assert_eq!(field, "port", "error owns the port field");
+        assert!(!message.is_empty(), "error carries a reason");
+        let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
+        assert!(rows.is_empty(), "nothing stored on failed commit");
+    }
+
     /// Config-completeness T06: Naïve Add renders username/password/uot/
-    /// quic/cc + S2-forced + S4, all kit; delegate membership covers blank +
-    /// all four modes.
+    /// quic/cc + S2-forced (dial rides Advanced), all kit; delegate membership
+    /// covers blank + all four modes.
     #[gpui_kit::test]
     fn t06_naive_page_paints(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -25091,11 +30705,16 @@ mod tests {
             "naive-cc",
             "naive-notes",
             "s2-caption",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
-        for id in ["s2-enable", "s1-caption", "s3-caption", "tuic-cc"] {
+        for id in [
+            "s2-enable",
+            "s1-caption",
+            "s3-caption",
+            "tuic-cc",
+            "s4-caption",
+        ] {
             assert_absent(cx, id.to_string());
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
@@ -25135,10 +30754,10 @@ mod tests {
     }
 
     /// Config-completeness T06: SSH Edit renders user/password/key blob +
-    /// path picker + passphrase + host-key lists + client version + S4-only;
-    /// an untouched row refolds byte-identical (stored host-key arrays echo
-    /// as comma text); simulating the Browse completion fills the path and
-    /// loads the key without hand-paste.
+    /// path picker + passphrase + host-key lists + client version (S4 dial
+    /// rides the Advanced dialog); an untouched row refolds byte-identical
+    /// (stored host-key arrays echo as comma text); simulating the Browse
+    /// completion fills the path and loads the key without hand-paste.
     #[gpui_kit::test]
     fn t06_ssh_edit_round_trips_and_key_pick(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -25200,11 +30819,11 @@ mod tests {
             "ssh-host-key-algs",
             "ssh-client-version",
             "ssh-notes",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
-        // No TLS/Transport/Mux panels, nothing from the other small pages.
+        // No TLS/Transport/Mux panels, nothing from the other small pages;
+        // dial rides the Advanced dialog.
         for id in [
             "s1-caption",
             "s2-caption",
@@ -25213,6 +30832,7 @@ mod tests {
             "http-username",
             "anytls-password",
             "naive-cc",
+            "s4-caption",
         ] {
             assert_absent(cx, id.to_string());
         }
@@ -25529,8 +31149,8 @@ mod tests {
     }
 
     /// Config-completeness T07: Snell Add renders psk + version + obfs/host +
-    /// userkey + reuse + network + mode + S4-only as kit primitives, all with
-    /// pinned ids; no Transport/TLS/Mux panels, nothing from sibling pages.
+    /// userkey + reuse + network + mode as kit primitives (dial rides Advanced),
+    /// all with pinned ids; no Transport/TLS/Mux panels, nothing from sibling pages.
     #[gpui_kit::test]
     fn t07_snell_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -25556,7 +31176,6 @@ mod tests {
             "snell-network",
             "snell-mode",
             "snell-notes",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
@@ -25564,6 +31183,7 @@ mod tests {
             "s1-caption",
             "s2-caption",
             "s3-caption",
+            "s4-caption",
             "shadowtls-version",
             "xray-uuid",
             "chain-pick",
@@ -25575,8 +31195,8 @@ mod tests {
     }
 
     /// Config-completeness T07: ShadowTLS Add renders version + password +
-    /// S2-forced + S4 as kit primitives; the TLS panel reads forced (no
-    /// enable toggle page), S1/S3 stay off.
+    /// S2-forced as kit primitives (S4 dial rides the Advanced dialog);
+    /// the TLS panel reads forced (no enable toggle page), S1/S3 stay off.
     #[gpui_kit::test]
     fn t07_shadowtls_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -25597,13 +31217,13 @@ mod tests {
             "shadowtls-password",
             "shadowtls-notes",
             "s2-caption",
-            "s4-caption",
         ] {
             assert_painted(cx, id);
         }
         for id in [
             "s1-caption",
             "s3-caption",
+            "s4-caption",
             "snell-psk",
             "xray-uuid",
             "chain-pick",
@@ -26205,10 +31825,11 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // Ticket 10: Export lives in the Library menu — open it first.
-        assert!(cx.update(|window, _| window.try_find("library-menu").is_some()));
+        // Ticket 02 (throne-adoption): Export lives in the PROGRAM menu —
+        // open it first.
+        assert!(cx.update(|window, _| window.try_find("program-menu").is_some()));
         cx.update(|window, cx| {
-            window.click("library-menu", cx);
+            window.click("program-menu", cx);
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -26791,6 +32412,337 @@ mod tests {
         server.join().expect("stub drains");
     }
 
+    /// Ticket 05 (throne-adoption): multi-flow clash body — one data flow
+    /// per `(row, rx, tx)` with a distinct destination, plus the
+    /// health-probe flow the Connections pane must exclude. Synthetic bytes
+    /// only — never the live DB, never real credentials.
+    fn traffic_body_multi(flows: &[(&str, u64, u64)]) -> String {
+        let mut connections: Vec<serde_json::Value> = flows
+            .iter()
+            .enumerate()
+            .map(|(ix, (row, rx, tx))| {
+                serde_json::json!({
+                    "download": rx, "id": format!("conn-{ix}"),
+                    "metadata": {"destinationIP": "93.184.216.34", "destinationPort": "80",
+                                 "host": format!("flow-{ix}.example.com"), "network": "tcp",
+                                 "sourceIP": "127.0.0.1", "sourcePort": "51241",
+                                 "type": format!("mixed/in-{row}")},
+                    "upload": tx
+                })
+            })
+            .collect();
+        connections.push(serde_json::json!({
+            "download": 500, "id": "probe-9",
+            "metadata": {"destinationIP": "93.184.216.34", "destinationPort": "80",
+                         "host": "www.gstatic.com", "network": "tcp",
+                         "sourceIP": "127.0.0.1", "sourcePort": "51242",
+                         "type": format!("mixed/in-{}", flows[0].0)},
+            "upload": 60
+        }));
+        serde_json::json!({
+            "connections": connections,
+            "downloadTotal": 1500, "uploadTotal": 110,
+        })
+        .to_string()
+    }
+
+    /// Ticket 05, scenarios 1+2: two exits passing traffic → the Connections
+    /// pane shows one row per live connection (exit name + bind:port join,
+    /// traffic deltas move on poll) with probe destinations excluded;
+    /// click-copies the dest and nothing else.
+    #[gpui_kit::test]
+    fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+        use gpui_kit::component::IndexPath;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10856"))
+            .expect("seed works");
+        let beta = store.add(tick12_seed("Beta", "10857")).expect("seed works");
+
+        let (port, server) = stub_clash_server(
+            vec![
+                traffic_body_multi(&[(&alpha.id, 1000, 50), (&beta.id, 3000, 90)]),
+                traffic_body_multi(&[(&alpha.id, 1500, 70), (&beta.id, 3600, 120)]),
+            ],
+            "s3cret",
+        );
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (mut engine, _) = EngineController::fake();
+                engine.set_clash_targets(vec![ClashTarget {
+                    core: "stock".to_string(),
+                    port,
+                    secret: "s3cret".to_string(),
+                }]);
+                view.engine = engine;
+            });
+        });
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 2, "both exits gain data-plane bytes");
+        // Snapshot: one row per live connection, the probe flow excluded.
+        let snapshot = view.read_with(cx, |view, _| view.conn_snapshot.clone());
+        assert_eq!(snapshot.len(), 2, "probe flow never reaches the snapshot");
+        for (_, entry) in &snapshot {
+            assert!(
+                !entry.dest.contains("gstatic"),
+                "no probe dest in the snapshot: {}",
+                entry.dest
+            );
+        }
+        // Display rows sort by traffic, descending by default (Beta first).
+        let (first, second) = view.read_with(cx, |view, _| {
+            let rows =
+                crate::build_conn_rows(&view.conn_snapshot, &view.conn_delta, None, false, true);
+            (rows[0].row_id.clone(), rows[1].row_id.clone())
+        });
+        assert_eq!(first.as_deref(), Some(beta.id.as_str()), "heaviest first");
+        assert_eq!(second.as_deref(), Some(alpha.id.as_str()));
+        // The exit join names the row honestly (name + bind:port + protocol);
+        // unclaimed entries are never guessed.
+        let (join, unclaimed) = view.read_with(cx, |view, cx| {
+            let rows = view.libraries.read(cx).delegate().rows.clone();
+            (
+                crate::conn_exit_of(&rows, Some(&alpha.id)),
+                crate::conn_exit_of(&rows, Some("no-such-row")),
+            )
+        });
+        assert_eq!(join.0, "Alpha", "exit name joins");
+        assert!(
+            join.1.ends_with(":10856"),
+            "exit bind:port joins: {}",
+            join.1
+        );
+        assert_eq!(
+            join.2, "vless",
+            "row protocol joins (stored, never sniffed)"
+        );
+        assert_eq!(
+            unclaimed,
+            ("unclaimed".to_string(), "—".to_string(), "—".to_string()),
+            "unclaimed rows read unclaimed"
+        );
+
+        // Second poll: session deltas move, and the hidden-pane throttle
+        // holds (the spawn path skips while the 5s base cadence elapses).
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 2, "grown connections persist the delta");
+        let deltas = view.read_with(cx, |view, _| view.conn_delta.clone());
+        assert_eq!(deltas.get("stock/conn-0"), Some(&(500, 20)));
+        assert_eq!(deltas.get("stock/conn-1"), Some(&(600, 30)));
+        let throttled = cx.update(|_, cx| view.update(cx, |view, cx| view.spawn_traffic_poll(cx)));
+        assert_eq!(
+            throttled, 0,
+            "hidden Connections pane throttles the 1Hz loop to the base cadence"
+        );
+
+        // The pane paints one copyable row per live connection; selecting
+        // Beta filters to its flow; clicking copies the dest alone.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector_tab = crate::InspectorTab::Connections;
+                view.conn_selected_only = false;
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_painted(cx, "config-connections");
+        assert!(
+            cx.update(|window, _| window.try_find("conn-copy-0".to_string()).is_some()),
+            "first flow copies"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("conn-copy-1".to_string()).is_some()),
+            "second flow copies"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.conn_selected_only = true;
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(1));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("conn-copy-0".to_string()).is_some()),
+            "selected row keeps its flow"
+        );
+        assert_absent(cx, "conn-copy-1".to_string());
+        // Click-copies the dest: the handler path is exercised directly
+        // (the inspector has no scroll seam for below-fold clicks — the t06
+        // rationale); presence above proves the copy affordance renders.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.copy_connection_dest("flow-1.example.com", window, cx)
+            });
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(clip, "flow-1.example.com", "click copies the dest: {clip}");
+        for canary in ["11111111", "198.51.100.9", "uuid", "password"] {
+            assert!(
+                !clip.contains(canary),
+                "connection copy carries the dest only, found {canary}: {clip}"
+            );
+        }
+        server.join().expect("stub drains");
+    }
+
+    /// Ticket 05, traffic watcher: per-exit aggregates read heaviest-first
+    /// with no fabricated Direct line; idle rows stay quiet.
+    #[gpui_kit::test]
+    fn t05_traffic_aggregates_per_exit_without_direct(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10856"))
+            .expect("seed works");
+        let beta = store.add(tick12_seed("Beta", "10857")).expect("seed works");
+        store
+            .add_traffic_batch(&[(alpha.id.clone(), 1000, 50), (beta.id.clone(), 3000, 90)])
+            .expect("traffic persists");
+        let rows = store.list().expect("rows list");
+        let totals = store.traffic_totals().expect("totals read");
+        let exits = crate::aggregate_exit_traffic(&rows, &totals);
+        assert_eq!(
+            exits.len(),
+            2,
+            "one aggregate per exit with traffic — never a Direct line"
+        );
+        assert_eq!(exits[0].row_id, beta.id, "heaviest exit first");
+        assert_eq!(exits[1].row_id, alpha.id);
+        for exit in &exits {
+            assert_ne!(
+                exit.name.to_ascii_lowercase(),
+                "direct",
+                "no fabricated Direct aggregate"
+            );
+        }
+        // An idle row adds no quiet zero bar.
+        store
+            .add(tick12_seed("Gamma", "10858"))
+            .expect("seed works");
+        let rows = store.list().expect("rows list");
+        let totals = store.traffic_totals().expect("totals read");
+        assert_eq!(
+            crate::aggregate_exit_traffic(&rows, &totals).len(),
+            2,
+            "idle rows stay quiet"
+        );
+    }
+
+    /// Ticket 05, log reader: include narrows, exclude drops the noisy leg,
+    /// and regex replaces the keywords — redaction holding on every leg,
+    /// invalid patterns failing open, the level row still composing.
+    #[gpui_kit::test]
+    fn t05_log_include_exclude_regex_keep_redaction(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let tags = crate::health::LogTagIndex::default();
+                view.logs
+                    .push_raw("info alpha connection established", &tags);
+                view.logs.push_raw("info alpha probe finished", &tags);
+                view.logs
+                    .push_raw("error beta failed password=hunter2-secret", &tags);
+                view.log_tail = true;
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.log_filter = "alpha".to_string();
+                view.log_exclude.clear();
+                view.log_regex.clear();
+                view.log_level = None;
+                assert_eq!(view.visible_log_lines(cx).len(), 2, "include narrows");
+                view.log_exclude = "probe".to_string();
+                assert_eq!(
+                    view.visible_log_lines(cx),
+                    vec!["[info] info alpha connection established".to_string()],
+                    "exclude drops the noisy leg"
+                );
+                view.log_filter.clear();
+                view.log_exclude.clear();
+                view.log_regex = "established|failed".to_string();
+                let visible = view.visible_log_lines(cx);
+                assert_eq!(visible.len(), 2, "regex replaces the keywords");
+                for line in &visible {
+                    assert!(
+                        !line.contains("hunter2-secret"),
+                        "redacted on the regex leg: {line}"
+                    );
+                }
+                view.log_regex = "((".to_string();
+                assert_eq!(
+                    view.visible_log_lines(cx).len(),
+                    3,
+                    "invalid regex fails open, never a silent empty"
+                );
+                view.log_regex.clear();
+                view.log_level = Some(crate::health::LogLevel::Error);
+                let visible = view.visible_log_lines(cx);
+                assert_eq!(visible.len(), 1, "level still composes");
+                assert!(visible[0].starts_with("[error]"));
+                assert!(
+                    !visible[0].contains("hunter2-secret"),
+                    "redacted on the level leg"
+                );
+            });
+        });
+    }
+
+    /// Ticket 05, poll tuning: 1Hz while the Connections/Traffic pane is
+    /// visible, else the 5s base cadence. Pure seam over the throttle stamp.
+    #[gpui_kit::test]
+    fn t05_traffic_poll_cadence_visible_fast_hidden_slow(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        use crate::InspectorTab;
+        let now = 1_000_000i64;
+        assert!(
+            crate::traffic_poll_due(InspectorTab::Connections, now, now),
+            "visible Connections polls immediately"
+        );
+        assert!(
+            crate::traffic_poll_due(InspectorTab::Traffic, now, now),
+            "visible Traffic polls immediately"
+        );
+        assert!(
+            !crate::traffic_poll_due(InspectorTab::Details, now, now),
+            "hidden pane skips a just-ran poll"
+        );
+        assert!(
+            !crate::traffic_poll_due(InspectorTab::Logs, now, now - 4),
+            "hidden pane waits the base cadence"
+        );
+        assert!(
+            crate::traffic_poll_due(InspectorTab::Details, now, now - 5),
+            "hidden pane fires once the base cadence elapses"
+        );
+    }
+
     /// Ticket 36: restart resumes data-plane counters from persisted
     /// totals (never zeroed) with no new polling.
     /// Ticket 47: totals hydrate LAZILY — the fresh view shows no mirror
@@ -27063,11 +33015,13 @@ mod tests {
             window.render_frame(cx);
         });
         assert!(cx.update(|window, _| window.try_find("engine-status").is_some()));
-        // Ticket 10: bulk engine actions live in the Engine menu — menu
-        // reachability is proven by `command_strip_all_ids_present` (this
-        // test owns start/stop behavior, and menu popovers race toast
-        // overlays under full-suite load, so it does not reopen them here).
-        assert!(cx.update(|window, _| window.try_find("engine-menu").is_some()));
+        // Ticket 02 (throne-adoption): bulk engine actions live in the
+        // TOOLS menu plus the global toggle — menu reachability is proven
+        // by `command_strip_all_ids_present` (this test owns start/stop
+        // behavior, and menu popovers race toast overlays under full-suite
+        // load, so it does not reopen them here).
+        assert!(cx.update(|window, _| window.try_find("tools-menu").is_some()));
+        assert!(cx.update(|window, _| window.try_find("global-start-stop").is_some()));
 
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.commit_stop_all(window, cx));
@@ -27186,10 +33140,12 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // Ticket 10: bulk test lives in the Engine menu — menu reachability
-        // is proven by `command_strip_all_ids_present` (same toast-overlay
-        // rationale as above); this test owns probe behavior.
-        assert!(cx.update(|window, _| window.try_find("engine-menu").is_some()));
+        // Ticket 02 (throne-adoption): bulk test lives in the TOOLS menu
+        // plus the global toggle — menu reachability is proven by
+        // `command_strip_all_ids_present` (same toast-overlay rationale
+        // as above); this test owns probe behavior.
+        assert!(cx.update(|window, _| window.try_find("tools-menu").is_some()));
+        assert!(cx.update(|window, _| window.try_find("global-start-stop").is_some()));
         assert!(cx.update(|window, _| window.try_find("health-status").is_some()));
     }
 
@@ -27948,7 +33904,10 @@ mod tests {
                 view.finish_subscription_refresh(
                     &sub_id,
                     &label,
-                    Ok("bogus://x".to_string()),
+                    Ok(crate::FetchedSubscription {
+                        body: "bogus://x".to_string(),
+                        userinfo: None,
+                    }),
                     999,
                     window,
                     cx,
@@ -27982,7 +33941,10 @@ mod tests {
                 view.finish_subscription_refresh(
                     &sub_id,
                     &label,
-                    Ok("bogus://x\nbogus://y".to_string()),
+                    Ok(crate::FetchedSubscription {
+                        body: "bogus://x\nbogus://y".to_string(),
+                        userinfo: None,
+                    }),
                     999,
                     window,
                     cx,
@@ -28674,7 +34636,7 @@ mod tests {
             "explicit refresh still sees One"
         );
         // The reported outcome names its own sub (pure copy seam).
-        let (_, summary) = refresh_summary_text(&one_label, 1, 0, 0, 0, 0, 0, 0);
+        let (_, summary) = refresh_summary_text(&one_label, 1, 0, 0, 0, 0, 0, 0, 0);
         assert!(
             summary.starts_with("One:"),
             "outcome names its sub: {summary}"
@@ -28685,10 +34647,11 @@ mod tests {
                 view.finish_subscription_refresh(
                     &one_id,
                     &one_label,
-                    Ok(
-                        "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#solo"
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#solo"
                             .to_string(),
-                    ),
+                        userinfo: None,
+                    }),
                     now + 10,
                     window,
                     cx,
@@ -28763,19 +34726,19 @@ mod tests {
     #[test]
     fn coalesced_refresh_message_single_toast() {
         use crate::coalesced_refresh_message;
-        assert_eq!(coalesced_refresh_message(0, 0, 0, 0, 0, 0), None);
-        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0, 0).expect("batch reports");
+        assert_eq!(coalesced_refresh_message(0, 0, 0, 0, 0, 0, 0), None);
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0, 0, 0).expect("batch reports");
         assert!(!warn);
         assert!(
-            text.contains('3') && text.contains("+5"),
+            text.contains('3') && text.contains("[+]Added 5"),
             "one line: {text}"
         );
-        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 2, 0).expect("batch reports");
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 2, 0, 0).expect("batch reports");
         assert!(warn, "failures warn: {text}");
         assert!(text.contains('2'), "failed count in: {text}");
         // Ticket 26: preserved user edits surface in the coalesced copy and
         // warn (a "clean" sync that silently kept yours would lie).
-        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0, 2).expect("batch reports");
+        let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0, 2, 0).expect("batch reports");
         assert!(warn, "conflicts warn: {text}");
         assert!(
             text.contains('2') && text.contains("conflict"),
@@ -28810,10 +34773,12 @@ mod tests {
                     view.finish_subscription_refresh(
                         &id,
                         &label,
-                        Ok(
-                            "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
-                                .to_string(),
-                        ),
+                        Ok(crate::FetchedSubscription {
+                            body:
+                                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                                    .to_string(),
+                            userinfo: None,
+                        }),
                         999,
                         window,
                         cx,
@@ -29271,34 +35236,108 @@ mod tests {
         assert_eq!(copy.params, alpha.params);
     }
 
-    /// Config-completeness T08 (CAP-11): the `Clone` alias duplicates
-    /// through the existing `commit_duplicate` logic — new disabled row,
-    /// fresh auto port, identical params (no rebuilt dupe path).
+    /// Throne-adoption 03: two rows, row A selected → row-targeted
+    /// actions (the seams the card right-click menu closes over) act on
+    /// row B, never the selection. Clipboard carries `bind:port` only —
+    /// never secrets.
     #[gpui_kit::test]
-    fn t08_clone_alias_duplicates_row(cx: &mut TestAppContext) {
+    fn t03_row_actions_target_clicked_row_not_selection(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let alpha = store
             .add(ticket43_seed("Alpha", "10854"))
             .expect("seed works");
+        let beta = store
+            .add(ticket43_seed("Beta", "10855"))
+            .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        let before = notification_count(cx);
-        cx.update(|window, cx| {
-            view.update(cx, |view, cx| view.commit_clone(&alpha.id, window, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
         });
-        assert_eq!(notification_count(cx), before + 1, "clone toasts");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.copy_row_urls(&beta.id, window, cx));
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        let (socks, http) = crate::store::proxy_urls(&beta.bind_ip, beta.port);
+        assert_eq!(
+            clip,
+            format!("{socks}\n{http}"),
+            "clipboard carries row B endpoints only"
+        );
+        let selected = view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id));
+        assert_eq!(
+            selected.as_deref(),
+            Some(alpha.id.as_str()),
+            "selection still row A"
+        );
+    }
+
+    /// Throne-adoption 03: duplicate + move through row ids ignore the
+    /// selection too — the copy derives from row B (disabled, fresh
+    /// auto-port) and the move lands row B in the new group while row A
+    /// stays put.
+    #[gpui_kit::test]
+    fn t03_row_duplicate_and_move_ignore_selection(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10854"))
+            .expect("seed works");
+        let beta = store
+            .add(ticket43_seed("Beta", "10855"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_duplicate(&beta.id, window, cx);
+                assert!(view.commit_bulk_move(std::slice::from_ref(&beta.id), "team", window, cx));
+            });
+        });
         let rows = view.read_with(cx, |view, _| view.store.list().expect("list works"));
-        assert_eq!(rows.len(), 2, "copy lands");
+        assert_eq!(rows.len(), 3, "duplicate lands beside both rows");
         let copy = rows
             .iter()
-            .find(|row| row.id != alpha.id)
-            .expect("copy there");
-        assert_eq!(copy.name, "Alpha copy");
+            .find(|row| row.name == "Beta copy")
+            .expect("copy of B there");
         assert!(!copy.enabled, "copy lands disabled");
-        assert_ne!(copy.port, alpha.port, "fresh auto port");
+        assert_ne!(copy.port, beta.port, "fresh auto port");
         assert!(crate::store::is_auto_port(copy.port), "port is auto-range");
-        assert_eq!(copy.protocol, alpha.protocol);
-        assert_eq!(copy.params, alpha.params);
+        let moved = rows
+            .iter()
+            .find(|row| row.id == beta.id)
+            .expect("row B there");
+        assert_eq!(moved.group, "team", "row B moved");
+        let kept = rows
+            .iter()
+            .find(|row| row.id == alpha.id)
+            .expect("row A there");
+        assert_ne!(kept.group, "team", "row A untouched");
+        let selected = view.read_with(cx, |view, cx| view.selected_config(cx).map(|row| row.id));
+        assert_eq!(
+            selected.as_deref(),
+            Some(alpha.id.as_str()),
+            "selection still row A"
+        );
     }
 
     /// Config-completeness T08 (CAP-11): a share link on the clipboard +
@@ -29338,6 +35377,61 @@ mod tests {
         assert_painted(cx, "import-preview");
         assert_painted(cx, "import-first-failure");
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Ticket 08 (cua-fixes): the paste-intake gate — importable shapes
+    /// pass (`None`, dialog opens as before), empty/non-importable
+    /// clipboards refuse with static copy (`Some`). The refusal never
+    /// echoes clipboard text (it may carry secrets). Pure gate, no window
+    /// needed.
+    #[test]
+    fn cua08_paste_intake_refusal_gates_prose_not_links() {
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(""),
+            Some("Clipboard has no text to import")
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal("  \n "),
+            Some("Clipboard has no text to import")
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x"
+            ),
+            None,
+            "partially-valid paste still opens the dialog"
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(
+                "throne://addsub/demo?url=https://example.com/feed"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal("throne://route/demo"),
+            None
+        );
+        assert_eq!(
+            crate::AppView::paste_intake_refusal(r#"{"rules": [{"action": "direct"}]}"#),
+            None
+        );
+        let prose = crate::AppView::paste_intake_refusal("just some meeting notes for Thursday")
+            .expect("prose refuses");
+        assert!(
+            !prose.contains("Thursday"),
+            "refusal echoes nothing, got {prose}"
+        );
+        let bogus = crate::AppView::paste_intake_refusal("bogus://x").expect("bogus refuses");
+        assert!(
+            !bogus.contains("bogus"),
+            "refusal echoes nothing, got {bogus}"
+        );
     }
 
     /// Config-completeness T08 (CAP-12): the `direct` page is label-only —
@@ -30011,11 +36105,11 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 03 (throne-density): the consolidated command strip keeps
-    /// every command reachable from one row with unchanged ids/handlers.
-    /// Ticket 10: the strip is 4 dedicated buttons plus Library / Manage /
-    /// Engine / Help menu triggers — menu items render on open, so each
-    /// menu is opened (click its trigger) before asserting its items.
+    /// Ticket 02 (throne-adoption): the top bar is exactly five menus in
+    /// PROGRAM | SETTINGS | GROUPS | ROUTING | TOOLS order plus the
+    /// trailing round global Start/Stop — every command reachable with
+    /// unchanged handlers. Menu items render on open, so each menu is
+    /// opened (click its trigger) before asserting its items.
     #[gpui_kit::test]
     fn command_strip_all_ids_present(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -30023,15 +36117,24 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Always-visible strip: dedicated buttons plus menu triggers.
-        // Signal-box 03: Import is a persistent fifth lever again
-        // (`import-config` on the strip); the Library menu keeps its own
-        // `menu-import-config` entry (same dialog, distinct element).
+        // Always-visible strip: five menu triggers plus the global toggle.
+        for id in [
+            "program-menu",
+            "settings-menu",
+            "groups-menu",
+            "routing-menu",
+            "tools-menu",
+            "global-start-stop",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} renders in the command strip"
+            );
+        }
+        // Retired lever/trigger ids never render (the five-menu rewrite
+        // supersedes the lever strip plus the interim menus).
         for id in [
             "add-config",
-            "start-selected",
-            "stop-selected",
-            "test-selected",
             "import-config",
             "library-menu",
             "manage-menu",
@@ -30039,11 +36142,37 @@ mod tests {
             "help-menu",
         ] {
             assert!(
-                cx.update(|window, _| window.try_find(id).is_some()),
-                "{id} renders in the command strip"
+                cx.update(|window, _| window.try_find(id).is_none()),
+                "{id} stays retired"
             );
         }
-        // Open-then-assert: each menu shows its items (the Manage menu
+        // Left-to-right order: five triggers, then the global toggle last
+        // (row-major x positions on one nowrap row).
+        let xs = cx.update(|window, _| {
+            [
+                "program-menu",
+                "settings-menu",
+                "groups-menu",
+                "routing-menu",
+                "tools-menu",
+                "global-start-stop",
+            ]
+            .iter()
+            .map(|id| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .bounds()
+                    .origin
+                    .x
+            })
+            .collect::<Vec<_>>()
+        });
+        assert!(
+            xs.windows(2).all(|pair| pair[0] <= pair[1]),
+            "menus read PROGRAM | SETTINGS | GROUPS | ROUTING | TOOLS + global last: {xs:?}"
+        );
+        // Open-then-assert: each menu shows its items (the Groups menu
         // Groups item carries `menu-groups-dialog`: same dialog as the
         // facet-bar `groups-dialog` button, distinct element id so headless
         // lookups never see duplicates as ambiguous). Menus use
@@ -30052,18 +36181,57 @@ mod tests {
         // trigger and the click never reaches it.
         for (trigger, items) in [
             (
-                "library-menu",
-                &["menu-import-config", "import-clipboard", "export-library"][..],
+                "program-menu",
+                &[
+                    "menu-add-config",
+                    "menu-import-config",
+                    "import-clipboard",
+                    "import-files",
+                    "export-library",
+                    "about-dialog",
+                ][..],
+            ),
+            ("settings-menu", &["settings-dialog"][..]),
+            // Ticket 09 (throne-adoption): group prunes ride the GROUPS menu.
+            (
+                "groups-menu",
+                &[
+                    "subscriptions",
+                    "menu-groups-dialog",
+                    "prune-duplicates",
+                    "prune-unavailable",
+                    "prune-invalid",
+                    "prune-clear-tests",
+                ][..],
             ),
             (
-                "manage-menu",
-                &["subscriptions", "routing-presets", "menu-groups-dialog"][..],
+                "routing-menu",
+                &["routing-presets", "routing-open-settings"][..],
             ),
             (
-                "engine-menu",
-                &["engine-start-all", "engine-stop-all", "health-test-all"][..],
+                "tools-menu",
+                &[
+                    "start-selected",
+                    "stop-selected",
+                    "test-selected",
+                    "menu-logs",
+                    "engine-start-all",
+                    "engine-stop-all",
+                    "health-test-all",
+                    // Ticket 09 (throne-adoption): Selected-vs-Group tests.
+                    "test-group",
+                    "speedtest-selected",
+                    "speedtest-group",
+                    "speedtest-mode",
+                    "out-ip-selected",
+                    "out-ip-group",
+                    "resolve-domain-group",
+                    "stop-testing",
+                    "show-security",
+                    "sort-type-security",
+                    "open-palette",
+                ][..],
             ),
-            ("help-menu", &["about-dialog", "settings-dialog"][..]),
         ] {
             cx.update(|window, cx| {
                 window.click(trigger, cx);
@@ -30088,9 +36256,10 @@ mod tests {
         }
     }
 
-    /// Ticket 02 (a11y): every toolbar lever, menu trigger, and menu item
-    /// announces its visible label (plus shortcut where bound); no silent
-    /// menu items. Headless `label()` reads the native accessibility name.
+    /// Ticket 02 (throne-adoption a11y): every menu trigger, menu item,
+    /// and the global toggle announces its visible label (plus shortcut
+    /// where bound); no silent menu items. Headless `label()` reads the
+    /// native accessibility name.
     #[gpui_kit::test]
     fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -30098,33 +36267,15 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Levers keep their pinned `Name (Key)` accessible strings.
-        for (id, pinned) in [
-            ("add-config", "Add (Ctrl-N)"),
-            ("start-selected", "Start selected (F5)"),
-            ("stop-selected", "Stop selected (Shift-F5)"),
-            ("test-selected", "Test selected (Ctrl-T)"),
-            ("import-config", "Import (Ctrl-O)"),
-        ] {
-            let label = cx.update(|window, _| {
-                window
-                    .try_find(id.to_string())
-                    .unwrap_or_else(|| panic!("{id} renders"))
-                    .label()
-                    .map(str::to_string)
-            });
-            assert_eq!(
-                label.as_deref(),
-                Some(pinned),
-                "{id} keeps its pinned accessible label"
-            );
-        }
         // Menu triggers announce their visible labels (no shortcuts bound).
+        // The idle global toggle offers Start-all on an empty library.
         for (id, pinned) in [
-            ("library-menu", "Library"),
-            ("manage-menu", "Manage"),
-            ("engine-menu", "Engine"),
-            ("help-menu", "Help"),
+            ("program-menu", "Program"),
+            ("settings-menu", "Settings"),
+            ("groups-menu", "Groups"),
+            ("routing-menu", "Routing"),
+            ("tools-menu", "Tools"),
+            ("global-start-stop", "Start all"),
         ] {
             let label = cx.update(|window, _| {
                 window
@@ -30142,36 +36293,58 @@ mod tests {
         // Menu items announce visible label + shortcut where bound.
         for (trigger, items) in [
             (
-                "library-menu",
+                "program-menu",
                 &[
+                    ("menu-add-config", "Add configuration (Ctrl-N)"),
                     ("menu-import-config", "Import (Ctrl-O)"),
-                    // Config-completeness T08: Ctrl-V is now bound, so the
-                    // pinned `Name (Key)` string moves onto this item.
                     ("import-clipboard", "From clipboard (Ctrl-V)"),
+                    // Ticket 07 (throne-adoption): direct file-picker entry.
+                    ("import-files", "From file(s)"),
                     ("export-library", "Export"),
+                    ("about-dialog", "About"),
                 ][..],
             ),
+            ("settings-menu", &[("settings-dialog", "Settings")][..]),
             (
-                "manage-menu",
+                "groups-menu",
                 &[
                     ("subscriptions", "Subscriptions"),
-                    ("routing-presets", "Presets"),
                     ("menu-groups-dialog", "Groups"),
+                    // Ticket 09 (throne-adoption): prune labels pinned.
+                    ("prune-duplicates", "Remove duplicates"),
+                    ("prune-unavailable", "Remove unavailable"),
+                    ("prune-invalid", "Remove invalid"),
+                    ("prune-clear-tests", "Clear tests"),
                 ][..],
             ),
             (
-                "engine-menu",
+                "routing-menu",
                 &[
+                    ("routing-presets", "Routing presets"),
+                    ("routing-open-settings", "Routing settings"),
+                ][..],
+            ),
+            (
+                "tools-menu",
+                &[
+                    ("start-selected", "Start selected (F5)"),
+                    ("stop-selected", "Stop selected (Shift-F5)"),
+                    ("test-selected", "Test selected (Ctrl-T)"),
+                    ("menu-logs", "Logs"),
                     ("engine-start-all", "Start all"),
                     ("engine-stop-all", "Stop all"),
                     ("health-test-all", "Test all"),
-                ][..],
-            ),
-            (
-                "help-menu",
-                &[
-                    ("about-dialog", "About"),
-                    ("settings-dialog", "Settings"),
+                    // Ticket 09 (throne-adoption): test-action labels pinned.
+                    ("test-group", "Test group"),
+                    ("speedtest-selected", "Speedtest selected"),
+                    ("speedtest-group", "Speedtest group"),
+                    ("speedtest-mode", "Speedtest mode"),
+                    ("out-ip-selected", "Resolve Out-IP selected"),
+                    ("out-ip-group", "Resolve Out-IP group"),
+                    ("resolve-domain-group", "Resolve domain group"),
+                    ("stop-testing", "Stop Testing"),
+                    ("show-security", "Show security"),
+                    ("sort-type-security", "Sort Type|Security"),
                     ("open-palette", "Command palette (Ctrl-K)"),
                 ][..],
             ),
@@ -30207,8 +36380,317 @@ mod tests {
         }
     }
 
-    /// Ticket 02 (layout): at the 880x620 minimum every lever and menu
-    /// trigger shares one row with nothing clipped.
+    /// Ticket 07 (CUA US-5/CAP-5): PROGRAM menu UIA-walk snapshot — every
+    /// item exposes role MenuItem + its pinned accessible name through the
+    /// native accessibility facts (`role()`/`label()` read the same
+    /// AccessKit properties the OS UIA bridge serves). The committed
+    /// fixture `tests/fixtures/uia-program-menu.json` is the contract; the
+    /// live walk must match it entry for entry. The ticket names five
+    /// entries (`Add configuration`, `Import`, `From clipboard`,
+    /// `From file(s)`, `Export`); `About` rides the same menu and pins too.
+    #[gpui_kit::test]
+    fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("program-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/uia-program-menu.json"))
+                .expect("program menu fixture parses");
+        let items = fixture["items"].as_array().expect("fixture lists items");
+        let names: Vec<&str> = items
+            .iter()
+            .map(|item| item["name"].as_str().expect("fixture name"))
+            .collect();
+        for expected in [
+            "Add configuration",
+            "Import",
+            "From clipboard",
+            "From file(s)",
+            "Export",
+        ] {
+            assert!(
+                names.iter().any(|name| name.contains(expected)),
+                "PROGRAM walk names {expected}: {names:?}"
+            );
+        }
+        for item in items {
+            let id = item["id"].as_str().expect("fixture id");
+            let (role, label) = cx.update(|window, _| {
+                let snapshot = window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders in the PROGRAM menu"));
+                (
+                    snapshot.role().map(|role| format!("{role:?}")),
+                    snapshot.label().map(str::to_string),
+                )
+            });
+            assert_eq!(
+                role.as_deref(),
+                Some(item["role"].as_str().expect("fixture role")),
+                "{id} exposes its fixture role"
+            );
+            assert_eq!(
+                label.as_deref(),
+                item["name"].as_str(),
+                "{id} announces its fixture name"
+            );
+        }
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    }
+
+    /// Ticket 07 (CUA US-5/CAP-5): card context-menu UIA-walk snapshot —
+    /// all 15 items expose role MenuItem + name, and no sixteenth node
+    /// rides the `rowctx-` prefix. The committed fixture
+    /// `tests/fixtures/uia-card-context-menu.json` is the contract; the
+    /// observed native-fact walk (the same properties UIA serves) must
+    /// match it exactly as a set.
+    #[gpui_kit::test]
+    fn cua07_card_context_menu_exposes_fifteen_items(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let card = format!("row-card-{}", row.id);
+        assert!(
+            cx.update(|window, _| window.try_find(card.clone()).is_some()),
+            "seeded card paints"
+        );
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/uia-card-context-menu.json"))
+                .expect("card menu fixture parses");
+        let items = fixture["items"].as_array().expect("fixture lists items");
+        assert_eq!(items.len(), 15, "card menu pins exactly 15 items");
+        for item in items {
+            let verb = item["verb"].as_str().expect("fixture verb");
+            let id = format!("rowctx-{verb}-{}", row.id);
+            let (role, label) = cx.update(|window, _| {
+                let snapshot = window
+                    .try_find(id.clone())
+                    .unwrap_or_else(|| panic!("{id} renders in the card menu"));
+                (
+                    snapshot.role().map(|role| format!("{role:?}")),
+                    snapshot.label().map(str::to_string),
+                )
+            });
+            assert_eq!(
+                role.as_deref(),
+                Some(item["role"].as_str().expect("fixture role")),
+                "{id} exposes its fixture role"
+            );
+            assert_eq!(
+                label.as_deref(),
+                item["name"].as_str(),
+                "{id} announces its fixture name"
+            );
+        }
+        // No sixteenth: every observed `rowctx-` node is one of the 15.
+        let wanted: std::collections::HashSet<String> = items
+            .iter()
+            .map(|item| {
+                format!(
+                    "rowctx-{}-{}",
+                    item["verb"].as_str().expect("fixture verb"),
+                    row.id
+                )
+            })
+            .collect();
+        let observed: Vec<String> = cx.update(|window, _| {
+            gpui_kit::base::test_support::snapshots(window)
+                .iter()
+                .filter_map(|snapshot| {
+                    snapshot.path().last().and_then(|last| {
+                        let id = format!("{last:?}");
+                        if id.contains("rowctx-") {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        });
+        assert_eq!(
+            observed.len(),
+            15,
+            "card menu walks exactly 15 items, no sixteenth: {observed:?}"
+        );
+        for id in &observed {
+            assert!(
+                wanted.iter().any(|want| id.contains(want)),
+                "walked node {id} is one of the 15 pinned items"
+            );
+        }
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+    }
+
+    /// Ticket 07 (CUA US-5/CAP-5): keyboard fallback contract — the kit
+    /// `PopupMenu` bindings (arrows move, `Enter` confirms, `Esc`
+    /// dismisses) operate both menus with no mouse. PROGRAM: open, `Down`
+    /// selects the first item, `Enter` opens Add, `Esc` closes it with
+    /// nothing committed. Card menu: right-click opens, `Esc` dismisses.
+    #[gpui_kit::test]
+    fn cua07_menus_keyboard_operable(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("program-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            let down = Keystroke::parse("down").expect("test keystroke parses");
+            window.dispatch_keystroke(down, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            let enter = Keystroke::parse("enter").expect("test keystroke parses");
+            window.dispatch_keystroke(enter, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Enter on the first PROGRAM item opens Add"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Esc closes Add"
+        );
+        assert_eq!(notification_count(cx), before, "Esc commits nothing");
+        let card = format!("row-card-{}", row.id);
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let edit = format!("rowctx-edit-{}", row.id);
+        assert!(
+            cx.update(|window, _| window.try_find(edit.clone()).is_some()),
+            "card menu opens from the keyboard path too"
+        );
+        cx.update(|window, cx| {
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, _| window.try_find(edit.clone()).is_none()),
+            "Esc dismisses the card menu"
+        );
+    }
+
+    /// Ticket 07 (CUA US-5/CAP-5): invoke parity spot-check — the Edit and
+    /// Test card-menu items reach the same postconditions as their
+    /// handlers: Edit opens the Edit dialog for THAT row, Test on a
+    /// stopped row toasts the honest not-running warning (no fakes needed:
+    /// a stopped row never touches the network).
+    #[gpui_kit::test]
+    fn cua07_card_menu_invoke_matches_click(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let card = format!("row-card-{}", row.id);
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click(format!("rowctx-edit-{}", row.id), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "card-menu Edit opens the Edit dialog"
+        );
+        cx.update(|window, cx| {
+            window.close_all_dialogs(cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.right_click(card.clone(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click(format!("rowctx-test-{}", row.id), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "card-menu Test toasts on a stopped row"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "stopped-row Test opens no dialog and probes nothing"
+        );
+    }
+
+    /// Ticket 02 (throne-adoption layout): at the 880x620 minimum all five
+    /// menu triggers plus the global toggle share one row with nothing
+    /// clipped.
     #[gpui_kit::test]
     fn t02_toolbar_fits_one_row_at_880(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -30220,15 +36702,12 @@ mod tests {
         cx.run_until_parked();
         paint_frame_min(cx);
         let ids = [
-            "add-config",
-            "start-selected",
-            "stop-selected",
-            "test-selected",
-            "import-config",
-            "library-menu",
-            "manage-menu",
-            "engine-menu",
-            "help-menu",
+            "program-menu",
+            "settings-menu",
+            "groups-menu",
+            "routing-menu",
+            "tools-menu",
+            "global-start-stop",
         ];
         for id in ids {
             assert_painted(cx, id);
@@ -30258,8 +36737,9 @@ mod tests {
         );
     }
 
-    /// Ticket 02 (handlers): each menu's item runs the same handler as its
-    /// button/palette twin (one item per menu exercised headlessly).
+    /// Ticket 02 (throne-adoption handlers): each menu's item runs the
+    /// same handler as its palette twin (one item per menu exercised
+    /// headlessly).
     #[gpui_kit::test]
     fn t02_menu_items_run_same_handlers(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -30267,26 +36747,31 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Library: menu Import opens the import dialog (same as the lever).
-        cx.update(|window, cx| {
-            window.click("library-menu", cx);
-        });
-        cx.run_until_parked();
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
-        cx.update(|window, cx| {
-            window.click("menu-import-config", cx);
-        });
-        cx.run_until_parked();
-        paint_dialog_open(cx);
-        assert_painted(cx, "import-dialog-ok");
-        cx.update(|window, cx| window.close_all_dialogs(cx));
-        cx.run_until_parked();
-        paint_frame(cx);
         // Ticket 02: menus use `overlay_closable(false)` — dismiss with
         // Escape before the next opens, otherwise an open popover covers
         // the next trigger and the click never reaches it.
+        //
+        // PROGRAM: menu Add opens the add dialog (same handler the
+        // palette Add dispatches).
+        cx.update(|window, cx| {
+            window.click("program-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("menu-add-config", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("field-name").is_some()),
+            "PROGRAM Add runs its handler"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        paint_frame(cx);
         cx.update(|window, cx| {
             use gpui_kit::Keystroke;
             let escape = Keystroke::parse("escape").expect("test keystroke parses");
@@ -30294,9 +36779,9 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // Manage: Subscriptions opens the subscriptions dialog.
+        // GROUPS: Subscriptions opens the subscriptions dialog.
         cx.update(|window, cx| {
-            window.click("manage-menu", cx);
+            window.click("groups-menu", cx);
         });
         cx.run_until_parked();
         paint_frame(cx);
@@ -30318,28 +36803,52 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // Help: About opens the about alert (same handler the palette
-        // About dispatches). Runs before the toast-only engine item so
-        // the engine toast never covers the Help trigger.
+        // ROUTING: Routing presets opens the presets manager.
         cx.update(|window, cx| {
-            window.click("help-menu", cx);
+            window.click("routing-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("routing-presets", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert_painted(cx, "presets-dialog-ok");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        // SETTINGS: Settings opens the settings dialog. Runs before the
+        // toast-only tools item so the tools toast never covers a later
+        // trigger.
+        cx.update(|window, cx| {
+            window.click("settings-menu", cx);
         });
         cx.run_until_parked();
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
         assert!(
-            cx.update(|window, _| window.try_find("about-dialog").is_some()),
-            "about-dialog renders in the Help menu"
+            cx.update(|window, _| window.try_find("settings-dialog").is_some()),
+            "settings-dialog renders in the SETTINGS menu"
         );
         cx.update(|window, cx| {
-            window.click("about-dialog", cx);
+            window.click("settings-dialog", cx);
         });
         cx.run_until_parked();
         paint_dialog_open(cx);
         assert!(
             cx.update(|window, cx| window.has_active_dialog(cx)),
-            "Help About runs its handler"
+            "SETTINGS Settings runs its handler"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
@@ -30351,12 +36860,12 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // Engine: Start all on an empty library toasts honestly (same
+        // TOOLS: Start all on an empty library toasts honestly (same
         // handler the palette StartAll dispatches). Last so its toast
         // never covers a later trigger.
         let before = notification_count(cx);
         cx.update(|window, cx| {
-            window.click("engine-menu", cx);
+            window.click("tools-menu", cx);
         });
         cx.run_until_parked();
         paint_frame(cx);
@@ -30370,14 +36879,286 @@ mod tests {
         assert_eq!(
             notification_count(cx),
             before + 1,
-            "engine Start all runs its handler"
+            "TOOLS Start all runs its handler"
         );
     }
 
-    /// Signal-box 03: the persistent Import lever opens the same import
-    /// dialog through the existing `import-config` id/handler (regroup,
-    /// not rewiring — verified by click), while the Library menu keeps its
-    /// own `menu-import-config` entry carrying the Ctrl-O hint.
+    /// Ticket 02 (throne-adoption): global toggle presentation pins the
+    /// three states at the pure seam — Idle offers Start-all, Running
+    /// offers Stop-all, busy offers only `Connecting…` (never a second
+    /// apply — see [`AppView::toggle_global_engines`]).
+    #[test]
+    fn t02_global_toggle_present_pins_three_states() {
+        assert_eq!(crate::global_toggle_present(0, false), ("▶", "Start all"));
+        assert_eq!(crate::global_toggle_present(3, false), ("■", "Stop all"));
+        assert_eq!(crate::global_toggle_present(0, true), ("…", "Connecting…"));
+        assert_eq!(crate::global_toggle_present(2, true), ("…", "Connecting…"));
+    }
+
+    /// Ticket 02 scenario: all stopped → global Start starts everything —
+    /// the toggle morphs to the stop glyph and one honest toast fires.
+    #[gpui_kit::test]
+    fn t02_global_start_all_stopped_starts_all(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        store
+            .add(t30_engine_seed("Beta", "10952"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        paint_frame(cx);
+        // Idle toggle offers Start-all.
+        let label = cx.update(|window, _| {
+            window
+                .try_find("global-start-stop".to_string())
+                .expect("global toggle renders")
+                .label()
+                .map(str::to_string)
+        });
+        assert_eq!(label.as_deref(), Some("Start all"));
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("global-start-stop", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            2,
+            "global Start starts every endpoint"
+        );
+        assert_eq!(notification_count(cx), before + 1, "one honest toast");
+        // Toggle morphs to the stop glyph.
+        let label = cx.update(|window, _| {
+            window
+                .try_find("global-start-stop".to_string())
+                .expect("global toggle renders")
+                .label()
+                .map(str::to_string)
+        });
+        assert_eq!(label.as_deref(), Some("Stop all"));
+    }
+
+    /// Ticket 02 scenario: empty library → global Start toasts honestly
+    /// (`Nothing to start`, pinned at the pure seam) — no crash, nothing
+    /// running, toggle stays on Start.
+    #[gpui_kit::test]
+    fn t02_global_start_empty_library_toasts_honestly(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        paint_frame(cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("global-start-stop", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing to run"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "honest empty-library toast"
+        );
+        assert!(crate::start_all_message(0).contains("Nothing to start"));
+        let label = cx.update(|window, _| {
+            window
+                .try_find("global-start-stop".to_string())
+                .expect("global toggle renders")
+                .label()
+                .map(str::to_string)
+        });
+        assert_eq!(label.as_deref(), Some("Start all"));
+    }
+
+    /// Ticket 02 scenario: a LAN-bound row gates the global Start behind
+    /// the confirm — the dialog opens naming the row, nothing serves yet
+    /// (same gate the menus, palette, and tray share).
+    #[gpui_kit::test]
+    fn t02_global_start_lan_rows_confirm_first(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut lan = t30_engine_seed("Lan", "10953");
+        lan.bind_ip = "0.0.0.0".to_string();
+        store.add(lan).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("global-start-stop", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "LAN gate confirms first"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing serves before confirm"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Ticket 02 prohibited side effect: no Tun / System Proxy / System
+    /// DNS (or adjacent system-mutation) controls anywhere on the top bar
+    /// — triggers and every menu item read clean (local-only promise).
+    #[gpui_kit::test]
+    fn t02_topbar_has_no_mode_controls(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        let mut names: Vec<String> = Vec::new();
+        // Trigger names first (global toggle idle on an empty library).
+        for id in [
+            "program-menu",
+            "settings-menu",
+            "groups-menu",
+            "routing-menu",
+            "tools-menu",
+            "global-start-stop",
+        ] {
+            names.push(cx.update(|window, _| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .label()
+                    .map(str::to_string)
+                    .unwrap_or_default()
+            }));
+        }
+        // Then every menu item (same homes `command_strip_all_ids_present`
+        // pins — menus open one at a time, Escape between).
+        for (trigger, items) in [
+            (
+                "program-menu",
+                &[
+                    "menu-add-config",
+                    "menu-import-config",
+                    "import-clipboard",
+                    "import-files",
+                    "export-library",
+                    "about-dialog",
+                ][..],
+            ),
+            ("settings-menu", &["settings-dialog"][..]),
+            // Ticket 09 (throne-adoption): group prunes ride the GROUPS menu.
+            (
+                "groups-menu",
+                &[
+                    "subscriptions",
+                    "menu-groups-dialog",
+                    "prune-duplicates",
+                    "prune-unavailable",
+                    "prune-invalid",
+                    "prune-clear-tests",
+                ][..],
+            ),
+            (
+                "routing-menu",
+                &["routing-presets", "routing-open-settings"][..],
+            ),
+            (
+                "tools-menu",
+                &[
+                    "start-selected",
+                    "stop-selected",
+                    "test-selected",
+                    "menu-logs",
+                    "engine-start-all",
+                    "engine-stop-all",
+                    "health-test-all",
+                    // Ticket 09 (throne-adoption): Selected-vs-Group tests.
+                    "test-group",
+                    "speedtest-selected",
+                    "speedtest-group",
+                    "speedtest-mode",
+                    "out-ip-selected",
+                    "out-ip-group",
+                    "resolve-domain-group",
+                    "stop-testing",
+                    "show-security",
+                    "sort-type-security",
+                    "open-palette",
+                ][..],
+            ),
+        ] {
+            cx.update(|window, cx| {
+                window.click(trigger, cx);
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+            cx.run_until_parked();
+            paint_frame(cx);
+            for &id in items {
+                names.push(cx.update(|window, _| {
+                    window
+                        .try_find(id.to_string())
+                        .unwrap_or_else(|| panic!("{id} renders in the {trigger} menu"))
+                        .label()
+                        .map(str::to_string)
+                        .unwrap_or_default()
+                }));
+            }
+            cx.update(|window, cx| {
+                use gpui_kit::Keystroke;
+                let escape = Keystroke::parse("escape").expect("test keystroke parses");
+                window.dispatch_keystroke(escape, cx);
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+        }
+        for name in &names {
+            let lowered = name.to_lowercase();
+            for banned in [
+                "tun",
+                "system proxy",
+                "system dns",
+                "hijack",
+                "warp",
+                "elevation",
+            ] {
+                assert!(
+                    !lowered.contains(banned),
+                    "no mode control on the top bar, got {name:?}"
+                );
+            }
+        }
+        assert!(!names.is_empty(), "scanned the whole bar");
+    }
+
+    /// Ticket 02 (throne-adoption): the PROGRAM menu Import entry opens
+    /// the same import dialog (regroup, not rewiring — verified by click),
+    /// carrying the Ctrl-O hint.
     #[gpui_kit::test]
     fn t03_toolbar_import_opens_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -30385,22 +37166,8 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        assert_painted(cx, "import-config");
         cx.update(|window, cx| {
-            window.click("import-config", cx);
-        });
-        cx.run_until_parked();
-        paint_dialog_open(cx);
-        assert!(
-            cx.update(|window, cx| window.has_active_dialog(cx)),
-            "toolbar Import opens the import dialog"
-        );
-        assert_painted(cx, "import-dialog-ok");
-        cx.update(|window, cx| window.close_all_dialogs(cx));
-        cx.run_until_parked();
-        paint_frame(cx);
-        cx.update(|window, cx| {
-            window.click("library-menu", cx);
+            window.click("program-menu", cx);
         });
         cx.run_until_parked();
         paint_frame(cx);
@@ -30408,8 +37175,21 @@ mod tests {
         paint_frame(cx);
         assert!(
             cx.update(|window, _| window.try_find("menu-import-config").is_some()),
-            "menu-import-config renders in the Library menu"
+            "menu-import-config renders in the PROGRAM menu"
         );
+        cx.update(|window, cx| {
+            window.click("menu-import-config", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "PROGRAM Import opens the import dialog"
+        );
+        assert_painted(cx, "import-dialog-ok");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        paint_frame(cx);
     }
 
     /// Signal-box 03: the visible search affordance focuses the library
@@ -30480,13 +37260,15 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Ticket 43: selected-vs-bulk buttons exist with honest labels (the
-        // toolbar overflows at test width, so presence — not paint — is the
-        // assertion here, matching the existing engine-status precedent).
+        // Ticket 02 (throne-adoption): the lever strip is five menus plus
+        // the global toggle — selected ops live in TOOLS (same handlers)
+        // and stay on the cards/bulk bar, so presence here pins the new
+        // homes (the toolbar overflows at test width, so presence — not
+        // paint — is the assertion here, matching the existing
+        // engine-status precedent).
         for id in [
-            "start-selected",
-            "stop-selected",
-            "test-selected",
+            "tools-menu",
+            "global-start-stop",
             "empty-add",
             "empty-import",
         ] {
@@ -30515,9 +37297,11 @@ mod tests {
         paint_dialog_open(cx);
         // Ticket 05: the add dialog opens guided-first — the mini-form and
         // the Advanced toggle paint while the raw JSON stays disclosed.
+        // Ticket 06: the default type (vless) owns its secret in the type
+        // box, so the generic Identity row stays unmounted (single secret).
         assert_painted(cx, "field-guided-server");
         assert_painted(cx, "field-guided-port");
-        assert_painted(cx, "field-guided-identity");
+        assert_absent(cx, "field-guided-identity".to_string());
         assert_painted(cx, "guided-hint");
         assert_painted(cx, "params-advanced-toggle");
         assert_absent(cx, "field-params".to_string());
@@ -31097,6 +37881,145 @@ mod tests {
         assert_eq!(delegate.bulk_label(), "");
         delegate.clear_checked();
         assert_eq!(delegate.bulk_label(), "");
+    }
+
+    /// Ticket 09 (throne-adoption): Show-Security splices the posture into
+    /// the meta line only when on; `Type|Security` reorders the visible
+    /// indices only (store order untouched).
+    #[test]
+    fn t09_show_security_and_type_security_sort() {
+        use crate::apply_show_security;
+        use crate::store::ProxyConfig;
+        use crate::LibraryDelegate;
+        fn row(id: &str, name: &str, protocol: &str, params: &str) -> ProxyConfig {
+            ProxyConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                protocol: protocol.to_string(),
+                params: params.to_string(),
+                group: "g".to_string(),
+                enabled: true,
+                bind_ip: "127.0.0.1".to_string(),
+                port: 10801,
+                subscription_id: None,
+                identity_key: None,
+                preset_id: None,
+            }
+        }
+        let tls_row = row("1", "A", "vless", r#"{"security":"tls"}"#);
+        let mut lines = vec![
+            "A".to_string(),
+            "vless · h:1".to_string(),
+            "badge".to_string(),
+        ];
+        apply_show_security(&mut lines, &tls_row);
+        assert_eq!(lines[1], "vless · h:1 · tls", "posture spliced");
+        assert_eq!(lines.len(), 3, "no new lines");
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            row("1", "T", "trojan", "{}"),
+            row("2", "Vtls", "vless", r#"{"security":"tls"}"#),
+            row("3", "Vreal", "vless", r#"{"security":"reality"}"#),
+        ]);
+        let order = |delegate: &LibraryDelegate| {
+            delegate
+                .visible
+                .iter()
+                .map(|&index| delegate.rows[index].name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&delegate), vec!["T", "Vtls", "Vreal"]);
+        delegate.set_type_security_sort(true);
+        assert_eq!(order(&delegate), vec!["T", "Vreal", "Vtls"]);
+        assert_eq!(
+            delegate
+                .rows
+                .iter()
+                .map(|row| row.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["T", "Vtls", "Vreal"],
+            "store order untouched"
+        );
+        assert!(!delegate.show_security);
+        delegate.set_show_security(true);
+        assert!(delegate.show_security);
+    }
+
+    /// Ticket 09 (throne-adoption): group/speed/out-ip/resolve texts name
+    /// their scope (never a blind toast).
+    #[test]
+    fn t09_group_toast_texts_name_scope() {
+        use crate::health::{SpeedtestMode, SpeedtestOutcome};
+        use crate::{
+            group_test_summary_toast, out_ip_summary_toast, resolve_domain_confirm_text,
+            resolve_domain_result_message, speed_result_toast, speed_test_summary_toast,
+        };
+        assert_eq!(
+            group_test_summary_toast("g", 3, 2, 1, false),
+            "Tested 3 endpoint(s) in group \"g\": 2 live · 1 dead"
+        );
+        assert!(
+            group_test_summary_toast("g", 3, 1, 0, true).contains("(stopped early)"),
+            "stop marked"
+        );
+        assert_eq!(
+            speed_test_summary_toast("in group \"g\"", SpeedtestMode::Download, 2, 1),
+            "Speedtest (download): in group \"g\": 2 measured · 1 failed"
+        );
+        let measured = SpeedtestOutcome {
+            config_id: "1".to_string(),
+            mode: SpeedtestMode::Download,
+            latency_ms: Some(40),
+            mbps: Some(24.5),
+            error: None,
+        };
+        assert_eq!(
+            speed_result_toast("A", &measured),
+            "Speedtest \"A\": download 24.5 Mbps"
+        );
+        let failed = SpeedtestOutcome {
+            config_id: "1".to_string(),
+            mode: SpeedtestMode::Upload,
+            latency_ms: None,
+            mbps: None,
+            error: Some("dial refused".to_string()),
+        };
+        assert_eq!(
+            speed_result_toast("A", &failed),
+            "Speedtest \"A\": failed — dial refused"
+        );
+        assert_eq!(
+            out_ip_summary_toast("of \"A\"", &["1.2.3.4".to_string()], &[]),
+            "Out-IP of \"A\": 1.2.3.4"
+        );
+        assert_eq!(
+            out_ip_summary_toast(
+                "in group \"g\"",
+                &["1.2.3.4".to_string(), "1.2.3.4".to_string()],
+                &["\"B\": egress down".to_string()]
+            ),
+            "Out-IP in group \"g\": 1.2.3.4 · 1 failed: \"B\": egress down"
+        );
+        let names: Vec<String> = (0..25).map(|i| format!("R{i}")).collect();
+        let confirm = resolve_domain_confirm_text("g", &names);
+        assert!(confirm.contains("\"g\""), "names scope: {confirm}");
+        assert!(confirm.contains("25"), "names count: {confirm}");
+        assert!(confirm.contains("+5 more"), "overflow named: {confirm}");
+        assert_eq!(
+            resolve_domain_result_message(&[], &[]),
+            "Resolve domain: nothing to rewrite"
+        );
+        let rewritten = vec![(
+            "A".to_string(),
+            "a.example.com".to_string(),
+            "93.184.216.34".to_string(),
+        )];
+        let message = resolve_domain_result_message(&rewritten, &["\"B\": nope".to_string()]);
+        assert!(
+            message.contains("\"A\": a.example.com → 93.184.216.34"),
+            "names rewrite: {message}"
+        );
+        assert!(message.contains("1 failed"), "names failures: {message}");
     }
 
     /// Ticket 01: selection grammar at the delegate seam — checked rows
@@ -32508,6 +39431,8 @@ mod tests {
     /// commit label, so a future lie fails here instead of hiding inline.
     /// Pure-close dialogs read `Close`; commits name their verb; the Logs
     /// filter commit is distinct from discarding; never a bare `OK`.
+    /// Ticket 03 (US-3): the pure-close set pins `Close` (the shared footer
+    /// renders Close-only exactly for these labels).
     #[test]
     fn honest_footer_labels_name_their_effect() {
         use crate::footer_commit_label;
@@ -32515,6 +39440,9 @@ mod tests {
             "settings",
             "groups",
             "preset-attach",
+            "runtime-stats",
+            "traffic-stats",
+            "bare-url",
             "logs",
             "presets",
             "subscriptions",
@@ -32536,6 +39464,9 @@ mod tests {
         assert_eq!(footer_commit_label("settings"), "Close");
         assert_eq!(footer_commit_label("groups"), "Close");
         assert_eq!(footer_commit_label("preset-attach"), "Close");
+        assert_eq!(footer_commit_label("runtime-stats"), "Close");
+        assert_eq!(footer_commit_label("traffic-stats"), "Close");
+        assert_eq!(footer_commit_label("bare-url"), "Close");
         assert_eq!(
             footer_commit_label("logs"),
             "Apply filter",
@@ -32551,6 +39482,73 @@ mod tests {
         assert_eq!(footer_commit_label("export"), "Export");
         assert_eq!(footer_commit_label("bulk-move"), "Move");
         assert_eq!(footer_commit_label("group-rename"), "Rename");
+    }
+
+    /// Ticket 03 (US-3): single-close footers — Settings and Runtime stats
+    /// each render exactly one footer button (`Close`, no `Cancel` sibling),
+    /// every stats line still paints, and `Esc` closes with nothing
+    /// committed.
+    #[gpui_kit::test]
+    fn single_close_footers_render_one_close_and_esc_closes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let esc = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
+        // Settings: exactly one Close, no Cancel; Esc closes silently.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(
+            cx.update(|window, _| window.try_find("settings-dialog-ok").is_some()),
+            "Settings renders its Close"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("settings-dialog-cancel").is_none()),
+            "Settings renders no Cancel sibling"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(esc.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Esc closes Settings"
+        );
+        assert_eq!(notification_count(cx), before, "Esc commits nothing");
+        // Runtime stats: same single Close, every stats line paints, Esc closes.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        for ix in 0..10 {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("runtime-stat-{ix}")).is_some()),
+                "runtime-stat-{ix} paints"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("runtime-stats-ok").is_some()),
+            "Runtime stats renders its Close"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("runtime-stats-cancel").is_none()),
+            "Runtime stats renders no Cancel sibling"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(esc.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Esc closes Runtime stats"
+        );
+        assert_eq!(notification_count(cx), before, "Esc commits nothing");
     }
 
     /// Ticket 05 scenario 1: pure-close footers commit nothing — Settings,
@@ -33060,6 +40058,78 @@ mod tests {
             Some("No secret needed for socks.")
         );
         assert_eq!(guided_hint_line("bogus"), None);
+    }
+
+    /// Ticket 06: panel-plan helpers mirror the guided pages — the generic
+    /// Identity row hides exactly where a `<Type>` box owns the secret
+    /// (AnyTLS single password), TLS/Network/Mux/Dial applicability matches
+    /// the section call sites, and secret presence reads `Not Set` vs
+    /// `Already Set` without ever rendering the value.
+    #[test]
+    fn t06_panel_plan_helpers_mirror_guided_pages() {
+        use crate::{
+            block_owns_identity, has_advanced_dialog, has_dial_panel, has_network_panel,
+            secret_state_caption, tls_panel_plan,
+        };
+        for protocol in [
+            "vless",
+            "vmess",
+            "trojan",
+            "shadowsocks",
+            "wireguard",
+            "amneziawg",
+            "hysteria",
+            "hysteria2",
+            "tuic",
+            "anytls",
+            "naive",
+            "ssh",
+            "snell",
+            "xray",
+        ] {
+            assert!(
+                block_owns_identity(protocol),
+                "{protocol} owns its secret in the type box"
+            );
+        }
+        for protocol in [
+            "socks",
+            "http",
+            "https",
+            "shadowtls",
+            "direct",
+            "chain",
+            "extra-core",
+            "mieru",
+            "bogus",
+        ] {
+            assert!(
+                !block_owns_identity(protocol),
+                "{protocol} keeps the generic identity row"
+            );
+        }
+        assert_eq!(tls_panel_plan("vless"), Some(false), "optional TLS box");
+        assert_eq!(tls_panel_plan("http"), Some(false), "https shares http");
+        assert_eq!(tls_panel_plan("anytls"), Some(true), "always-on TLS box");
+        assert_eq!(tls_panel_plan("tuic"), Some(true), "forced TLS box");
+        assert_eq!(tls_panel_plan("shadowsocks"), None, "mux-only settings");
+        assert_eq!(tls_panel_plan("wireguard"), None, "endpoint parity");
+        assert_eq!(tls_panel_plan("bogus"), None, "unknown has no TLS");
+        assert!(has_network_panel("trojan"), "trojan takes Network");
+        assert!(!has_network_panel("anytls"), "anytls has no transport");
+        assert!(has_dial_panel("ssh"), "ssh takes dial fields");
+        assert!(!has_dial_panel("xray"), "xray bridge has no dial");
+        assert!(!has_dial_panel("chain"), "chain has no dial");
+        assert!(has_advanced_dialog("anytls"), "dial plus TLS extras");
+        assert!(has_advanced_dialog("socks"), "dial fields alone");
+        assert!(!has_advanced_dialog("xray"), "nothing advanced on xray");
+        assert!(!has_advanced_dialog("mieru"), "no guided page, no dialog");
+        assert_eq!(secret_state_caption(""), "Not Set", "blank reads Not Set");
+        assert_eq!(
+            secret_state_caption("pw"),
+            "Already Set",
+            "presence never renders the value"
+        );
     }
 
     /// Ticket 05 scenario 1: a new user completes Add through the guided
@@ -33953,13 +41023,13 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        assert_painted(cx, "config-health");
-        // T06 (same-ticket rationale): frozen pane order (Header →
-        // Endpoints → tab-specific) puts the endpoints above the health
-        // evidence, so the tall dead-row alert starts below the fold of
-        // the 240px panel — scroll the pane body and the alert paints in
-        // place (reachable, not just present), the pinned operate row
-        // untouched.
+        // Ticket 04 (throne-adoption): the shared overview carries the
+        // failure Alert directly under the acting row, so the alert
+        // paints in place with no scroll (visible, not just present).
+        assert_painted(cx, "config-health-alert");
+        // The Health module sits below the taller failed overview — scroll
+        // the pane body and it paints in place (reachable, not just
+        // present), the pinned operate row untouched.
         cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -33971,7 +41041,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        assert_painted(cx, "config-health-alert");
+        assert_painted(cx, "config-health");
         // Live again: the Alert leaves with the failure.
         cx.update(|_, cx| {
             view.update(cx, |view, _cx| {
@@ -34052,23 +41122,27 @@ mod tests {
             "inspector-tab-details",
             "inspector-tab-health",
             "inspector-tab-presets",
+            "inspector-tab-logs",
+            "inspector-tab-connections",
+            "inspector-tab-traffic",
         ] {
             assert!(
                 cx.update(|window, _| window.try_find(id.to_string()).is_some()),
                 "{id} renders"
             );
         }
-        // Named failure paints in the Health pane, with the endpoints above
-        // it (endpoints ride every pane — the URL stays readable beside
-        // the failure it explains)...
+        // Named failure paints in the Health pane, directly under the
+        // acting row with the endpoints below it (one shared overview on
+        // every pane — the URL stays readable beside the failure it
+        // explains)...
         assert_painted(cx, "config-endpoints");
-        assert_painted(cx, "config-health");
-        // T06 (same-ticket rationale): frozen pane order (Header →
-        // Endpoints → tab-specific) puts the endpoints above the health
-        // evidence — the comment above already read that way — so the
-        // tall dead-row alert starts below the fold of the 240px panel.
-        // Scroll the pane body and the alert paints in place (reachable,
-        // not just present), the pinned operate row untouched.
+        // Ticket 04 (throne-adoption): the shared overview carries the
+        // failure Alert directly under the acting row, so the alert
+        // paints in place with no scroll (visible, not just present).
+        assert_painted(cx, "config-health-alert");
+        // The Health module sits below the taller failed overview — scroll
+        // the pane body and it paints in place (reachable, not just
+        // present), the pinned operate row untouched.
         cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -34080,7 +41154,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        assert_painted(cx, "config-health-alert");
+        assert_painted(cx, "config-health");
         // ...history exists on the pane (below the fold at short panel
         // heights — the tab bar stays pinned and the body scrolls to it).
         assert!(
@@ -34120,6 +41194,9 @@ mod tests {
             crate::InspectorTab::Details,
             crate::InspectorTab::Health,
             crate::InspectorTab::Presets,
+            crate::InspectorTab::Logs,
+            crate::InspectorTab::Connections,
+            crate::InspectorTab::Traffic,
         ] {
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
@@ -34191,6 +41268,9 @@ mod tests {
             PaletteOp::StartAll,
             PaletteOp::StopAll,
             PaletteOp::TestAll,
+            // Ticket 10 (throne-adoption): stats ride the Manage tail.
+            PaletteOp::RuntimeStats,
+            PaletteOp::TrafficStats,
         ];
         for (row, want) in manage.into_iter().enumerate() {
             assert_eq!(
@@ -34200,7 +41280,7 @@ mod tests {
             );
         }
         assert_eq!(AppView::palette_op_at(IndexPath::new(15).section(0)), None);
-        assert_eq!(AppView::palette_op_at(IndexPath::new(9).section(1)), None);
+        assert_eq!(AppView::palette_op_at(IndexPath::new(11).section(1)), None);
         assert_eq!(AppView::palette_op_at(IndexPath::new(0).section(2)), None);
     }
 
@@ -34450,7 +41530,7 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
-                    !view.accumulate_batch_member(&a, 1, 0, 0, 0, 0),
+                    !view.accumulate_batch_member(&a, 1, 0, 0, 0, 0, 0),
                     "first of two keeps the batch open"
                 );
             });
@@ -34479,7 +41559,7 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
-                    view.accumulate_batch_member(&b, 0, 0, 0, 0, 0),
+                    view.accumulate_batch_member(&b, 0, 0, 0, 0, 0, 0),
                     "last member closes the batch"
                 );
                 view.inflight_refreshes.remove(&b);
@@ -34499,7 +41579,6 @@ mod tests {
     fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, TestOutcome};
         use gpui_kit::component::IndexPath;
-        use gpui_kit::point;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let seeded = store
@@ -34536,19 +41615,10 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // T06 handoff: the frozen pane order puts the alert below the fold
-        // of the 240px panel — scroll first, then assert paints.
-        cx.update(|window, cx| {
-            window.scroll(
-                "config-detail-body",
-                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-                cx,
-            );
-        });
-        cx.run_until_parked();
-        paint_frame(cx);
-        cx.run_until_parked();
-        paint_frame(cx);
+        // Ticket 04 (throne-adoption): the shared overview leading the
+        // pane body carries header + Endpoints once, and the failure Alert
+        // directly under the acting row — the alert paints in place with
+        // no scroll.
         assert_painted(cx, "config-health-alert");
         assert_painted(cx, "detail-operate");
     }
@@ -34699,13 +41769,14 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        assert_painted(cx, "config-health");
-        // T06 (same-ticket rationale): frozen pane order (Header →
-        // Endpoints → tab-specific) puts the endpoints above the health
-        // evidence, so the tall dead-row alert starts below the fold of
-        // the 240px panel — scroll the pane body and the alert paints in
-        // place (reachable, not just present), the pinned operate row
-        // untouched.
+        // Ticket 04 (throne-adoption): the shared overview leading the
+        // pane body carries header + Endpoints once, and the dead-row
+        // Alert directly under the acting row — it paints in place with
+        // no scroll (visible, not just present).
+        assert_painted(cx, "config-health-alert");
+        // The Health module sits below the taller failed overview — scroll
+        // the pane body and it paints in place (reachable, not just
+        // present), the pinned operate row untouched.
         cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -34717,7 +41788,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        assert_painted(cx, "config-health-alert");
+        assert_painted(cx, "config-health");
         assert!(
             cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
             "detail-operate renders on the Health pane row"
@@ -34767,6 +41838,9 @@ mod tests {
             (crate::InspectorTab::Details, "Details"),
             (crate::InspectorTab::Health, "Health"),
             (crate::InspectorTab::Presets, "Presets"),
+            (crate::InspectorTab::Logs, "Logs"),
+            (crate::InspectorTab::Connections, "Connections"),
+            (crate::InspectorTab::Traffic, "Traffic"),
         ] {
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
@@ -35073,7 +42147,6 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
-            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -35083,8 +42156,8 @@ mod tests {
 
     /// Ticket 05 (CAP-6): primaries ride one `ButtonGroup`, management stays
     /// behind the single `Row actions…` trigger, and operate Start reaches the
-    /// selected row through the same handler as toolbar Start (same outcome,
-    /// same toast — scope-named labels only).
+    /// selected row through the same handler as the TOOLS menu Start (same
+    /// outcome, same toast — scope-named labels only).
     /// Ledger Ruling: headless snapshots expose presence + bounds, not DOM
     /// order, so "grouped" asserts as row-major Start/Stop/Test adjacency and
     /// "same handler" asserts as equal outcomes + equal toast counts across
@@ -35147,23 +42220,48 @@ mod tests {
             primaries[0] <= primaries[1] && primaries[1] <= primaries[2],
             "primaries group in Start/Stop/Test order: {primaries:?}"
         );
-        // Same handler: toolbar Start and operate Start reach the same
-        // outcome (running + one toast each) on the same mount.
+        // Same handler: the TOOLS menu Start and operate Start reach the
+        // same outcome (running + one toast each) on the same mount
+        // (Ticket 02: selected ops moved from the lever strip into TOOLS
+        // with unchanged handlers — the menu opens per click because it
+        // closes on select).
         let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("tools-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         cx.update(|window, cx| {
             window.click("start-selected", cx);
         });
         cx.run_until_parked();
+        paint_frame(cx);
         assert_eq!(
             view.read_with(cx, |view, _| view.engine.running_count()),
             1,
-            "toolbar Start starts the selected row"
+            "TOOLS Start starts the selected row"
         );
         assert_eq!(
             notification_count(cx),
             before + 1,
-            "toolbar Start toasts once"
+            "TOOLS Start toasts once"
         );
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("tools-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         cx.update(|window, cx| {
             window.click("stop-selected", cx);
         });
@@ -35171,7 +42269,7 @@ mod tests {
         assert_eq!(
             view.read_with(cx, |view, _| view.engine.running_count()),
             0,
-            "toolbar Stop stops it again"
+            "TOOLS Stop stops it again"
         );
         // Re-pin the selection across the stop's reload (the same row a
         // user still has selected) before the operate-Start click.
@@ -35322,8 +42420,8 @@ mod tests {
     /// Ticket 05 (CAP-6): management hides behind exactly one disclosed
     /// `Row actions…` trigger — the five items stay unmounted while closed
     /// (t04 pins the closed half) and all five paint once opened.
-    /// Config-completeness T08: the `Clone` alias paints beside `Duplicate`
-    /// (same handler, no new dupe logic).
+    /// Throne-adoption 03: the `Clone` alias is gone — `Duplicate` is the
+    /// only copy verb, so `clone-config` stays absent even while open.
     #[gpui_kit::test]
     fn t05_row_menu_opens_management_items(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -35350,7 +42448,6 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
-            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
@@ -35367,12 +42464,12 @@ mod tests {
             "edit-config",
             "delete-config",
             "duplicate-config",
-            "clone-config",
             "reset-traffic",
             "usage-reset",
         ] {
             assert_painted(cx, id);
         }
+        assert_absent(cx, "clone-config".to_string());
     }
 
     /// Ticket 04: every pane (Details, Health, Presets) names the acted-on
@@ -35397,6 +42494,9 @@ mod tests {
             crate::InspectorTab::Details,
             crate::InspectorTab::Health,
             crate::InspectorTab::Presets,
+            crate::InspectorTab::Logs,
+            crate::InspectorTab::Connections,
+            crate::InspectorTab::Traffic,
         ] {
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
@@ -35560,6 +42660,9 @@ mod tests {
             crate::InspectorTab::Details,
             crate::InspectorTab::Health,
             crate::InspectorTab::Presets,
+            crate::InspectorTab::Logs,
+            crate::InspectorTab::Connections,
+            crate::InspectorTab::Traffic,
         ] {
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
@@ -35594,7 +42697,11 @@ mod tests {
                         assert_painted(cx, id);
                     }
                 }
-                crate::InspectorTab::Health | crate::InspectorTab::Presets => {
+                crate::InspectorTab::Health
+                | crate::InspectorTab::Presets
+                | crate::InspectorTab::Logs
+                | crate::InspectorTab::Connections
+                | crate::InspectorTab::Traffic => {
                     for id in [
                         "endpoint-value-socks",
                         "endpoint-value-http",
@@ -35628,11 +42735,30 @@ mod tests {
                 crate::InspectorTab::Presets => {
                     assert_painted(cx, "config-preset");
                 }
+                crate::InspectorTab::Logs => {
+                    assert_painted(cx, "config-logs");
+                }
+                crate::InspectorTab::Connections => {
+                    assert_painted(cx, "config-connections");
+                }
+                crate::InspectorTab::Traffic => {
+                    assert_painted(cx, "config-traffic");
+                }
             }
         }
         // Unattached row on the Presets pane: the inline detach stays
         // unmounted behind its idle marker (attached detach is pinned by
-        // `laneb_preset_pane_detaches_inline_with_rule_count`).
+        // `laneb_preset_pane_detaches_inline_with_rule_count`). Reopen the
+        // Presets pane first — the tab loop above ends elsewhere.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.set_inspector_tab(crate::InspectorTab::Presets);
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         assert!(
             cx.update(|window, _| window.try_find("preset-detach-idle".to_string()).is_some()),
             "idle detach marker holds the row"
@@ -35944,6 +43070,9 @@ mod tests {
             (0, "config-usage"),
             (1, "config-health"),
             (2, "config-preset"),
+            (3, "config-logs"),
+            (4, "config-connections"),
+            (5, "config-traffic"),
         ] {
             cx.update(|_, cx| {
                 view.update(cx, |view, cx| {
@@ -36048,9 +43177,12 @@ mod tests {
         assert!(home, "bulk clear returns keyboard focus to the shell");
     }
 
-    /// T08: shortcut buttons keep their exact pinned accessible strings even
-    /// though the keystroke renders as a `Kbd` chip beside the name (the
-    /// accessible name — what tests and assistive tech read — never changes).
+    /// T08 (throne-adoption): shortcut rows keep their exact pinned
+    /// accessible strings even though the keystroke renders as a `Kbd` chip
+    /// beside the name (the accessible name — what tests and assistive tech
+    /// read — never changes). Ticket 02 moved the strip buttons into
+    /// PROGRAM / TOOLS menus with unchanged `Name (Key)` strings; the
+    /// operate-row buttons stay put.
     #[gpui_kit::test]
     fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -36073,16 +43205,73 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
+        // PROGRAM menu rows keep their pinned `Name (Key)` strings.
+        cx.update(|window, cx| {
+            window.click("program-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
         for (id, pinned) in [
-            ("add-config", "Add (Ctrl-N)"),
-            // Signal-box 03: `import-config` is a persistent strip button
-            // again (a `Button` exposes its accessibility label), while the
-            // Library-menu row (`menu-import-config`) carries none — same as
-            // every other menu-row div.
-            ("import-config", "Import (Ctrl-O)"),
+            ("menu-add-config", "Add configuration (Ctrl-N)"),
+            ("menu-import-config", "Import (Ctrl-O)"),
+        ] {
+            let label = cx.update(|window, _| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .label()
+                    .map(str::to_string)
+            });
+            assert_eq!(
+                label.as_deref(),
+                Some(pinned),
+                "{id} keeps its pinned accessible label"
+            );
+        }
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        // TOOLS menu rows keep theirs.
+        cx.update(|window, cx| {
+            window.click("tools-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for (id, pinned) in [
             ("start-selected", "Start selected (F5)"),
             ("stop-selected", "Stop selected (Shift-F5)"),
             ("test-selected", "Test selected (Ctrl-T)"),
+        ] {
+            let label = cx.update(|window, _| {
+                window
+                    .try_find(id.to_string())
+                    .unwrap_or_else(|| panic!("{id} renders"))
+                    .label()
+                    .map(str::to_string)
+            });
+            assert_eq!(
+                label.as_deref(),
+                Some(pinned),
+                "{id} keeps its pinned accessible label"
+            );
+        }
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            let escape = Keystroke::parse("escape").expect("test keystroke parses");
+            window.dispatch_keystroke(escape, cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        // Operate-row buttons are untouched.
+        for (id, pinned) in [
             ("engine-stop", "Stop (Shift-F5)"),
             ("health-test", "Test (Ctrl-T)"),
         ] {
@@ -36881,10 +44070,11 @@ mod tests {
                 view.finish_subscription_refresh(
                     &ids[0].0,
                     &ids[0].1,
-                    Ok(
-                        "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
                             .to_string(),
-                    ),
+                        userinfo: None,
+                    }),
                     999,
                     window,
                     cx,
@@ -36916,10 +44106,12 @@ mod tests {
                     view.finish_subscription_refresh(
                         &id,
                         &label,
-                        Ok(
-                            "vless://11111111-2222-4333-8444-555555555555@b.example.com:443#two"
-                                .to_string(),
-                        ),
+                        Ok(crate::FetchedSubscription {
+                            body:
+                                "vless://11111111-2222-4333-8444-555555555555@b.example.com:443#two"
+                                    .to_string(),
+                            userinfo: None,
+                        }),
                         999,
                         window,
                         cx,
@@ -36961,10 +44153,11 @@ mod tests {
                 view.finish_subscription_refresh(
                     &sub_id,
                     "Nightly",
-                    Ok(
-                        "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
                             .to_string(),
-                    ),
+                        userinfo: None,
+                    }),
                     999,
                     window,
                     cx,
@@ -36975,6 +44168,397 @@ mod tests {
             notification_count(cx),
             1,
             "adopted completion notifies once"
+        );
+    }
+
+    /// Ticket 08: `[=] Still in use` surfaces kept serving rows in both the
+    /// single and coalesced copy; zero keeps the old shape (pure copy).
+    #[test]
+    fn t08_still_in_use_counts_in_single_and_coalesced_copy() {
+        use crate::{coalesced_refresh_message, refresh_summary_text};
+        let (warn, text) = refresh_summary_text("Nightly", 0, 0, 1, 0, 0, 0, 0, 1);
+        assert!(!warn);
+        assert!(text.contains("[=] Still in use 1"), "{text}");
+        let (warn, text) = coalesced_refresh_message(2, 0, 0, 1, 0, 0, 1).expect("batch reports");
+        assert!(!warn);
+        assert!(text.contains("[=] Still in use 1"), "{text}");
+        let (_, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0);
+        assert!(!text.contains("[=]"), "quiet when nothing serves: {text}");
+    }
+
+    /// Ticket 08: manual single refresh with a userinfo header commits
+    /// quota, logs the completion, and pops exactly one toast.
+    #[gpui_kit::test]
+    fn t08_manual_refresh_commits_quota_and_logs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    "Nightly",
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                            .to_string(),
+                        userinfo: crate::store::parse_subscription_userinfo(
+                            "upload=1; download=2; total=100; expire=1735689600",
+                        ),
+                    }),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "manual single pops once");
+        let (quota, lines) = view.read_with(cx, |view, _| {
+            let kept = view
+                .store
+                .get_subscription(&sub_id)
+                .expect("get works")
+                .expect("sub there");
+            let lines: Vec<String> = view
+                .logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect();
+            (
+                (kept.quota_used, kept.quota_total, kept.quota_expire),
+                lines,
+            )
+        });
+        assert_eq!(
+            quota,
+            (Some(3), Some(100), Some(1_735_689_600)),
+            "header quota commits"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Nightly") && line.contains("[+]Added 1")),
+            "completion logs: {lines:?}"
+        );
+    }
+
+    /// Ticket 08 scenario 2 (UI half): fetch failure keeps last-good
+    /// members AND the failure toast names the subscription; the
+    /// completion logs too.
+    #[gpui_kit::test]
+    fn t08_refresh_failure_names_subscription_and_logs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        store
+            .refresh_with_body(
+                &sub.id,
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one",
+                100,
+            )
+            .expect("seed member");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    "Nightly",
+                    Err("subscription fetch failed".to_string()),
+                    200,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "failure pops once");
+        let (members, error, lines) = view.read_with(cx, |view, _| {
+            let members = view.store.list().expect("list works").len();
+            let error = view
+                .store
+                .get_subscription(&sub_id)
+                .expect("get works")
+                .expect("sub there")
+                .last_error
+                .clone();
+            let lines: Vec<String> = view
+                .logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect();
+            (members, error, lines)
+        });
+        assert_eq!(members, 1, "last-good kept");
+        assert!(error.is_some(), "error recorded");
+        assert!(
+            lines.iter().any(|line| line.contains("Nightly")),
+            "log names the sub: {lines:?}"
+        );
+    }
+
+    /// Ticket 08: Manage-Groups rows — `Basic` vs `Subscription (N)`
+    /// kinds, the quota line from the header snapshot, the skip marker,
+    /// and name order (pure data seam).
+    #[test]
+    fn t08_group_rows_kind_quota_skip() {
+        use crate::{group_quota_line, group_row_views};
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(NewConfig {
+                name: "Hand".to_string(),
+                protocol: "vless".to_string(),
+                params: "{}".to_string(),
+                group: "basic".to_string(),
+                bind_ip: String::new(),
+                port: String::new(),
+            })
+            .expect("hand add works");
+        let fed = store
+            .add_subscription("S1", "https://example.com/s1.txt", "sub", true)
+            .expect("sub works");
+        let now = 1_700_000_100;
+        store
+            .refresh_with_body(
+                &fed.id,
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one",
+                now,
+            )
+            .expect("refresh works");
+        store
+            .set_subscription_quota(
+                &fed.id,
+                crate::store::parse_subscription_userinfo("upload=2048; download=0; total=1048576")
+                    .map(|mut quota| {
+                        quota.expire = Some(now + 259_200);
+                        quota
+                    }),
+            )
+            .expect("quota works");
+        store
+            .add_subscription("S2", "https://example.com/s2.txt", "empty", true)
+            .expect("sub works");
+        store
+            .set_group_skip_refresh("sub", true)
+            .expect("flag works");
+        let counts = store.group_counts().expect("counts work");
+        let subs = store.list_subscriptions().expect("subs work");
+        let rows = group_row_views(
+            &counts,
+            &subs,
+            &|group| store.group_skip_refresh(group),
+            now,
+        );
+        assert_eq!(rows.len(), 3, "union of row groups + fed groups");
+        assert_eq!(rows[0].name, "basic");
+        assert_eq!(rows[0].kind, "Basic");
+        assert_eq!(rows[0].quota, None);
+        assert!(!rows[0].skip);
+        assert!(rows[0].sub_ids.is_empty());
+        assert_eq!(rows[1].name, "empty");
+        assert_eq!(rows[1].kind, "Subscription (1)");
+        assert_eq!(
+            rows[1].quota.as_deref(),
+            Some("Last update never refreshed")
+        );
+        assert_eq!(rows[2].name, "sub");
+        assert_eq!(rows[2].kind, "Subscription (1)");
+        assert!(rows[2].skip);
+        assert_eq!(rows[2].sub_ids, vec![fed.id.clone()]);
+        let quota = rows[2].quota.clone().expect("quota line");
+        assert!(quota.contains("Last update just now"), "{quota}");
+        assert!(quota.contains("Used 2.0 KB"), "{quota}");
+        assert!(quota.contains("Remain 1022.0 KB"), "{quota}");
+        assert!(quota.contains("Expire 3d left"), "{quota}");
+        assert!(quota.contains("auto-refresh skipped"), "{quota}");
+        assert_eq!(
+            group_quota_line(&[], now),
+            None,
+            "basic groups have no line"
+        );
+    }
+
+    /// Ticket 08: expiry buckets (pure copy).
+    #[test]
+    fn t08_format_expire_buckets() {
+        use crate::format_expire;
+        let now = 1_700_000_000;
+        assert_eq!(format_expire(now - 1, now), "expired");
+        assert_eq!(format_expire(now, now), "expired");
+        assert_eq!(format_expire(now + 60, now), "1m left");
+        assert_eq!(format_expire(now + 3_600, now), "60m left");
+        assert_eq!(format_expire(now + 7_200, now), "2h left");
+        assert_eq!(format_expire(now + 259_200, now), "3d left");
+    }
+
+    /// Ticket 08: Update-current selection (one group's subs in stable
+    /// order) and Update-all partition (flagged groups reported, never
+    /// fetched) plus the confirm copy (pure seams).
+    #[test]
+    fn t08_update_targets_partition_and_confirm() {
+        use crate::{update_all_confirm_text, update_all_targets, update_target_subs};
+        use std::collections::HashSet;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let a = store
+            .add_subscription("A", "https://example.com/a.txt", "g1", true)
+            .expect("sub works");
+        let b = store
+            .add_subscription("B", "https://example.com/b.txt", "g1", true)
+            .expect("sub works");
+        store
+            .add_subscription("C", "https://example.com/c.txt", "g2", true)
+            .expect("sub works");
+        let subs = store.list_subscriptions().expect("subs work");
+        let targets = update_target_subs(&subs, "g1");
+        assert_eq!(
+            targets.iter().map(|sub| sub.id.clone()).collect::<Vec<_>>(),
+            vec![a.id.clone(), b.id.clone()]
+        );
+        assert!(update_target_subs(&subs, "missing").is_empty());
+        let flagged: HashSet<String> = ["g2".to_string()].into_iter().collect();
+        let (included, skipped) = update_all_targets(subs, &flagged);
+        assert_eq!(included.len(), 2);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            update_all_confirm_text(2, 1),
+            "Update 2 subscription(s)? 1 skipped (auto-refresh off for their group)."
+        );
+        assert_eq!(
+            update_all_confirm_text(2, 0),
+            "Update all 2 subscription(s)?"
+        );
+    }
+
+    /// Ticket 08: the Groups sheet paints per-row Update/Edit plus the
+    /// kind/quota lines and the bulk verbs.
+    #[gpui_kit::test]
+    fn t08_groups_sheet_paints_update_edit_quota(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("S1", "https://example.com/s1.txt", "travel", true)
+            .expect("sub works");
+        store
+            .refresh_with_body(
+                &sub.id,
+                "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one",
+                999,
+            )
+            .expect("refresh works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_groups_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert_painted(cx, "groups-update-current");
+        assert_painted(cx, "groups-update-all");
+        assert_painted(cx, "group-edit-travel");
+        assert_painted(cx, "group-update-travel");
+        assert_painted(cx, "group-kind-travel");
+        assert_painted(cx, "group-quota-travel");
+    }
+
+    /// Ticket 08: Edit-group commit renames, flips the skip flag, toasts
+    /// once, and reopens the manager; empty renames keep it open.
+    #[gpui_kit::test]
+    fn t08_edit_group_commit_renames_and_flags(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("S1", "https://example.com/s1.txt", "travel", true)
+            .expect("sub works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        let closed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit_group("travel", "team", true, window, cx)
+            })
+        });
+        assert!(closed, "success closes the edit dialog");
+        let (flag, group) = view.read_with(cx, |view, _| {
+            (
+                view.store.group_skip_refresh("team"),
+                view.store
+                    .get_subscription(&sub_id)
+                    .expect("get works")
+                    .map(|sub| sub.group),
+            )
+        });
+        assert!(flag, "skip persists");
+        assert_eq!(group.as_deref(), Some("team"), "sub follows rename");
+        assert_eq!(notification_count(cx), 1, "one outcome toast");
+        paint_dialog_open(cx);
+        assert_painted(cx, "groups-update-all");
+        let kept = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_edit_group("team", "   ", false, window, cx)
+            })
+        });
+        assert!(!kept, "empty rename keeps the dialog open");
+    }
+
+    /// Ticket 08: skip-flagged groups never auto-refresh (the tick
+    /// selection reads empty); unflagged due subs still list. The tick
+    /// itself is windowless — no dialog can exist without a window.
+    #[gpui_kit::test]
+    fn t08_due_subscriptions_respect_skip_flag(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add_subscription("S1", "https://example.com/s1.txt", "travel", true)
+            .expect("sub works");
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.due_subscriptions().len()),
+            1,
+            "never-refreshed auto sub is due"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store
+                    .set_group_skip_refresh("travel", true)
+                    .expect("flag works");
+            });
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.due_subscriptions())
+                .is_empty(),
+            "flagged group never auto-refreshes"
+        );
+    }
+
+    /// Ticket 08: Update-current focuses the facet group first, else the
+    /// selected row's group; nothing focused reads None.
+    #[gpui_kit::test]
+    fn t08_current_group_prefers_facet(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(seed_input("Work")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.current_group(cx)),
+            None,
+            "nothing focused"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state
+                        .delegate_mut()
+                        .set_facet_group(Some("travel".to_string()));
+                });
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.current_group(cx)),
+            Some("travel".to_string()),
+            "facet wins"
         );
     }
 
@@ -37156,6 +44740,146 @@ mod tests {
         );
     }
 
+    /// Ticket 07 (throne-adoption): file guards on the read seam — plain
+    /// text passes, image/NUL/non-UTF8 refuse with static reasons, and the
+    /// cap constant is exactly 50MB.
+    #[test]
+    fn t07_read_import_file_guards() {
+        use crate::import::MAX_IMPORT_FILE_BYTES;
+        use crate::{read_import_file, ImportFileRead};
+        assert_eq!(MAX_IMPORT_FILE_BYTES, 50_000_000, "50MB cap");
+        let dir = std::env::temp_dir();
+        let tag = format!("manyproxy-t07-guard-{}", std::process::id());
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(format!("{tag}-{name}"));
+            std::fs::write(&path, bytes).expect("temp write works");
+            path
+        };
+        let ok = write("ok.txt", b"vless://u@a.example.com:443#x");
+        assert!(matches!(read_import_file(&ok), ImportFileRead::Text(_)));
+        let png = write("img.png", b"\x89PNG\r\n\x1a\nnot-really-an-image");
+        assert!(matches!(
+            read_import_file(&png),
+            ImportFileRead::Refused(reason) if reason.contains("image")
+        ));
+        let bin = write("bin.dat", b"ab\x00cd");
+        assert!(matches!(
+            read_import_file(&bin),
+            ImportFileRead::Refused(reason) if reason.contains("NUL")
+        ));
+        let utf = write("utf.dat", b"\xFF\xFE\xFD");
+        assert!(matches!(
+            read_import_file(&utf),
+            ImportFileRead::Refused(_) | ImportFileRead::Unreadable
+        ));
+        let ghost = dir.join(format!("{tag}-ghost.txt"));
+        assert!(matches!(
+            read_import_file(&ghost),
+            ImportFileRead::Unreadable
+        ));
+        for path in [ok, png, bin, utf] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Ticket 07 (throne-adoption): a mixed drop (one link file, one image,
+    /// one binary, one oversize) opens one dialog for the readable bytes and
+    /// names every refused file with its reason — a single honest result,
+    /// nothing stored silently.
+    #[gpui_kit::test]
+    fn t07_drop_names_refused_files_with_reasons(cx: &mut TestAppContext) {
+        use crate::import::MAX_IMPORT_FILE_BYTES;
+        use gpui_kit::ExternalPaths;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let dir = std::env::temp_dir();
+        let tag = format!("manyproxy-t07-drop-{}", std::process::id());
+        let link_path = dir.join(format!("{tag}-ok.txt"));
+        let img_path = dir.join(format!("{tag}-qr.png"));
+        let bin_path = dir.join(format!("{tag}-junk.dat"));
+        let big_path = dir.join(format!("{tag}-big.txt"));
+        std::fs::write(&link_path, b"trojan://p@a.example.com:443#ok").expect("write works");
+        std::fs::write(&img_path, b"\x89PNG\r\n\x1a\nfake-qr").expect("write works");
+        std::fs::write(&bin_path, b"\x00\x01binary").expect("write works");
+        std::fs::write(&big_path, vec![b'x'; (MAX_IMPORT_FILE_BYTES + 1) as usize])
+            .expect("write works");
+        let paths = ExternalPaths(
+            vec![
+                link_path.clone(),
+                img_path.clone(),
+                bin_path.clone(),
+                big_path.clone(),
+            ]
+            .into(),
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.import_dropped_files(&paths, window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(notification_count(cx), 1, "one toast names every refusal");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "readable bytes still open the dialog"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "a drop never commits by itself"
+        );
+        for path in [link_path, img_path, bin_path, big_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Ticket 07 (throne-adoption): the bare-URL chooser renders both
+    /// explicit options; "Import as proxy here" lands in the import dialog
+    /// (nothing parses silently, nothing commits on open).
+    #[gpui_kit::test]
+    fn t07_bare_url_chooser_offers_both_paths(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        // Settle the dialog entrance animation so the click lands (the
+        // dialog-footer tests do the same).
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_bare_url_chooser("https://example.com/feed".to_string(), window, cx)
+            });
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "bare-url-chooser",
+            "bare-url-import-proxy",
+            "bare-url-add-subscription",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders"
+            );
+        }
+        cx.update(|window, cx| {
+            window.click("bare-url-import-proxy", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, _| window.try_find("field-import-text".to_string()).is_some()),
+            "proxy arm opens the import dialog"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "opening the dialog stores nothing"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
     /// Scenario: Ctrl+N opens Add; a second Ctrl+N with the dialog open is a
     /// no-op (never steals dialog keys, never stacks dialogs).
     #[gpui_kit::test]
@@ -37274,6 +44998,24 @@ mod tests {
             crate::InspectorTab::Presets,
             "Ctrl-3 switches pane"
         );
+        press(cx, "ctrl-4");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Logs,
+            "Ctrl-4 switches pane"
+        );
+        press(cx, "ctrl-5");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Connections,
+            "Ctrl-5 switches pane"
+        );
+        press(cx, "ctrl-6");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Traffic,
+            "Ctrl-6 switches pane"
+        );
         press(cx, "ctrl-1");
         assert_eq!(
             view.read_with(cx, |view, _| view.inspector_tab),
@@ -37369,10 +45111,13 @@ mod tests {
     #[test]
     fn refresh_summary_text_names_conflicts() {
         use crate::refresh_summary_text;
-        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0);
+        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0);
         assert!(!warn);
-        assert!(text.contains("Nightly") && text.contains("+1"), "{text}");
-        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 2);
+        assert!(
+            text.contains("Nightly") && text.contains("[+]Added 1"),
+            "{text}"
+        );
+        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 2, 0);
         assert!(warn, "conflicts warn: {text}");
         assert!(
             text.contains('2') && text.contains("conflict"),
@@ -38674,6 +46419,18 @@ mod tests {
             crate::InspectorTab::Presets.a11y_label(),
             "Inspector Presets tab (Ctrl-3)"
         );
+        assert_eq!(
+            crate::InspectorTab::Logs.a11y_label(),
+            "Inspector Logs tab (Ctrl-4)"
+        );
+        assert_eq!(
+            crate::InspectorTab::Connections.a11y_label(),
+            "Inspector Connections tab (Ctrl-5)"
+        );
+        assert_eq!(
+            crate::InspectorTab::Traffic.a11y_label(),
+            "Inspector Traffic tab (Ctrl-6)"
+        );
         // Select the row so every pane renders its sections.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
@@ -38692,6 +46449,9 @@ mod tests {
             (crate::InspectorTab::Details, "config-usage"),
             (crate::InspectorTab::Health, "config-health"),
             (crate::InspectorTab::Presets, "config-preset"),
+            (crate::InspectorTab::Logs, "config-logs"),
+            (crate::InspectorTab::Connections, "config-connections"),
+            (crate::InspectorTab::Traffic, "config-traffic"),
         ] {
             cx.update(|_, cx| {
                 view.update(cx, |view, _| {
@@ -38707,6 +46467,9 @@ mod tests {
                 "inspector-tab-details",
                 "inspector-tab-health",
                 "inspector-tab-presets",
+                "inspector-tab-logs",
+                "inspector-tab-connections",
+                "inspector-tab-traffic",
             ] {
                 assert!(
                     cx.update(|window, _| window.try_find(id.to_string()).is_some()),
@@ -38780,7 +46543,7 @@ mod tests {
             px(0.),
             "the Details pane starts scrolled to the top, not mid-pane"
         );
-        // Ctrl-2/3 drive the other two panes through the same actions.
+        // Ctrl-2..6 drive the other panes through the same actions.
         press(cx, "ctrl-2");
         assert_eq!(
             view.read_with(cx, |view, _| view.inspector_tab),
@@ -38793,6 +46556,116 @@ mod tests {
             crate::InspectorTab::Presets,
             "Ctrl-3 switches pane"
         );
+        press(cx, "ctrl-4");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Logs,
+            "Ctrl-4 switches pane"
+        );
+        press(cx, "ctrl-5");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Connections,
+            "Ctrl-5 switches pane"
+        );
+        press(cx, "ctrl-6");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.inspector_tab),
+            crate::InspectorTab::Traffic,
+            "Ctrl-6 switches pane"
+        );
+    }
+
+    /// Ticket 04 (throne-adoption): one shared overview for all panes — a
+    /// failing row shows the acting row, the failure Alert directly under
+    /// it, and Endpoints on every pane alike (no per-pane
+    /// copies), with CAP-7 order Header → Alert → Endpoints → tab-specific
+    /// on every pane. Healthy rows keep Header → Endpoints with no Alert
+    /// element at all (pinned by `dead_row_health_section_renders_alert`).
+    #[gpui_kit::test]
+    fn throne04_inspector_overview_shared_across_panes(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        // Dead outcome: errored sample, no success.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _cx| {
+                view.health_store.record_outcome(&TestOutcome {
+                    sample: HealthSample {
+                        config_id: seeded.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: None,
+                        error: Some("timeout".to_string()),
+                    },
+                    success: None,
+                });
+            });
+        });
+        for (tab, specific) in [
+            (crate::InspectorTab::Details, "config-usage"),
+            (crate::InspectorTab::Health, "config-health"),
+            (crate::InspectorTab::Presets, "config-preset"),
+            (crate::InspectorTab::Logs, "config-logs"),
+            (crate::InspectorTab::Connections, "config-connections"),
+            (crate::InspectorTab::Traffic, "config-traffic"),
+        ] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, _| {
+                    view.set_inspector_tab(tab);
+                });
+            });
+            cx.run_until_parked();
+            paint_frame(cx);
+            cx.run_until_parked();
+            paint_frame(cx);
+            // One shared overview on every pane: header, failure Alert,
+            // and Endpoints all paint (the Alert reads without scrolling).
+            for id in [
+                "inspector-overview",
+                "detail-acting-on",
+                "config-health-alert",
+                "config-endpoints",
+            ] {
+                assert_painted(cx, id);
+            }
+            // CAP-7 order holds geometrically on every pane.
+            let tops = cx.update(|window, _| {
+                [
+                    "detail-acting-on",
+                    "config-health-alert",
+                    "config-endpoints",
+                    specific,
+                ]
+                .iter()
+                .map(|id| {
+                    window
+                        .try_find(id.to_string())
+                        .unwrap_or_else(|| panic!("{id} renders on {tab:?}"))
+                        .bounds()
+                        .origin
+                        .y
+                })
+                .collect::<Vec<_>>()
+            });
+            assert!(
+                tops[0] < tops[1] && tops[1] < tops[2] && tops[2] < tops[3],
+                "pane order frozen Header → Alert → Endpoints → tab-specific on {tab:?}: {tops:?}"
+            );
+        }
     }
 
     /// Scenario: empty library paints Add/Import CTAs (never a bare blank).
@@ -39622,6 +47495,187 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Ticket 01: pure Appearance → kit mode mapping (dark default, light,
+    /// System follows the flag, junk reads dark) plus the inventory lines.
+    #[test]
+    fn appearance_mapping_and_summaries() {
+        use crate::{appearance_theme_mode, preset_summary_text, routing_summary_text};
+        use gpui_kit::component::ThemeMode;
+        assert_eq!(appearance_theme_mode("dark", true), ThemeMode::Dark);
+        assert_eq!(appearance_theme_mode("dark", false), ThemeMode::Dark);
+        assert_eq!(appearance_theme_mode("light", false), ThemeMode::Light);
+        assert_eq!(appearance_theme_mode("system", true), ThemeMode::Light);
+        assert_eq!(appearance_theme_mode("system", false), ThemeMode::Dark);
+        assert_eq!(appearance_theme_mode("midnight", true), ThemeMode::Dark);
+        let line = routing_summary_text(Some(2), Some(1));
+        assert!(
+            line.contains("2 routing preset(s)"),
+            "counts presets: {line}"
+        );
+        assert!(
+            line.contains("1 row(s) attached"),
+            "counts attached: {line}"
+        );
+        assert!(
+            routing_summary_text(None, Some(1)).contains("unavailable"),
+            "broken read never prints a lying zero"
+        );
+        assert!(
+            preset_summary_text(Some(0)).contains("0 routing preset(s)"),
+            "honest zero"
+        );
+        assert!(
+            preset_summary_text(None).contains("unavailable"),
+            "broken read never prints a lying zero"
+        );
+    }
+
+    /// Ticket 01: Settings restructured to exactly Basic | Routing | Preset |
+    /// Hotkey top to bottom — Basic carries the Appearance radio (dark
+    /// default) plus the pre-existing blocks, Routing links once into the
+    /// presets manager, Hotkey references the shortcut list.
+    #[gpui_kit::test]
+    fn settings_dialog_has_four_sections_and_appearance(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(store.appearance(), "dark", "fresh store reads dark");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        let sections = [
+            "settings-section-basic",
+            "settings-section-routing",
+            "settings-section-preset",
+            "settings-section-hotkey",
+        ];
+        for id in sections {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} renders"
+            );
+        }
+        let tops: Vec<f32> = sections
+            .iter()
+            .map(|id| cx.update(|window, _| window.find(*id).bounds().origin.y.as_f32()))
+            .collect();
+        assert!(
+            tops.windows(2).all(|pair| pair[0] < pair[1]),
+            "sections read Basic | Routing | Preset | Hotkey top to bottom: {tops:?}"
+        );
+        for id in [
+            "settings-appearance-caption",
+            "settings-appearance-group",
+            "settings-appearance-note",
+            "settings-section-startup",
+            "settings-section-probe",
+            "settings-section-paths",
+            "settings-section-maintenance",
+            "settings-routing-summary",
+            "settings-open-routing-presets",
+            "settings-routing-note",
+            "settings-preset-summary",
+            "settings-preset-note",
+            "settings-hotkey-list",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} renders"
+            );
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+    }
+
+    /// Ticket 01: the ROUTING menu entry links into Settings (the dialog
+    /// holding the single copy of the Routing section).
+    #[gpui_kit::test]
+    fn routing_menu_links_into_settings(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            window.click("routing-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("routing-open-settings").is_some()),
+            "routing-open-settings renders in the Routing menu"
+        );
+        cx.update(|window, cx| {
+            window.click("routing-open-settings", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Routing settings opens the Settings dialog"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("settings-section-routing").is_some()),
+            "the dialog carries the Routing section"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        let _ = view;
+    }
+
+    /// Ticket 01: the Appearance choice persists and repaints live with no
+    /// restart (kit mode follows the commit); junk fails loudly.
+    #[gpui_kit::test]
+    fn appearance_choice_persists_and_paints_live(cx: &mut TestAppContext) {
+        use gpui_kit::component::ActiveTheme as _;
+        use gpui_kit::component::ThemeMode;
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        // Fresh mount applies the persisted choice (dark default).
+        cx.update(|_, cx| {
+            assert_eq!(cx.theme().mode, ThemeMode::Dark, "dark paints by default");
+        });
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.commit_appearance("light", window, cx), "light commits");
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.appearance()),
+            "light",
+            "choice persists"
+        );
+        cx.update(|_, cx| {
+            assert_eq!(cx.theme().mode, ThemeMode::Light, "light paints live");
+        });
+        assert_eq!(notification_count(cx), before + 1, "commit toasts once");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.commit_appearance("dark", window, cx), "dark commits");
+            });
+        });
+        cx.update(|_, cx| {
+            assert_eq!(cx.theme().mode, ThemeMode::Dark, "dark paints live");
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(
+                    !view.commit_appearance("midnight", window, cx),
+                    "junk fails loudly"
+                );
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.appearance()),
+            "dark",
+            "failed write keeps the old choice"
+        );
+    }
+
     /// Ticket 37: attached start serves preset rules ahead of the isolation
     /// rule end to end (store → engine sync → fake sidecar config).
     #[gpui_kit::test]
@@ -39692,6 +47746,551 @@ mod tests {
             "isolation closes the table"
         );
     }
+    // -- Ticket 10: routing manager + stats + share-out + tray -----------
+
+    /// Ticket 10 (US-23): uptime reads largest-two-units, never empty.
+    #[test]
+    fn t10_format_uptime_units() {
+        use crate::format_uptime;
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(125), "2m 5s");
+        assert_eq!(format_uptime(5 * 3_600 + 12 * 60), "5h 12m");
+        assert_eq!(format_uptime(3 * 86_400 + 4 * 3_600), "3d 4h");
+    }
+
+    /// Ticket 10 (US-22): stacked bars split rx/tx over 12 cells and the
+    /// heaviest exit fills the bar.
+    #[test]
+    fn t10_traffic_stacked_bar_splits_rx_tx() {
+        use crate::traffic_stacked_bar;
+        let full = traffic_stacked_bar(800, 200, 1000);
+        assert_eq!(full.chars().count(), 12, "{full}");
+        assert!(full.starts_with("██"), "rx leads: {full}");
+        assert!(full.contains('▓'), "tx stacks: {full}");
+        let empty = traffic_stacked_bar(0, 0, 0);
+        assert_eq!(empty, "░".repeat(12), "zero max never divides: {empty}");
+        let heaviest = traffic_stacked_bar(500, 500, 1000);
+        assert!(!heaviest.contains('░'), "heaviest fills: {heaviest}");
+    }
+
+    /// Ticket 10 (US-22): the period summary labels itself all-time and
+    /// names counts + bytes, never one profile.
+    #[test]
+    fn t10_traffic_stats_summary_labels_all_time() {
+        use crate::store::TrafficPeriod;
+        use crate::traffic_stats_summary_text;
+        let text = traffic_stats_summary_text(TrafficPeriod::Week, 2, 4_000, 140);
+        assert!(text.contains("7d"), "{text}");
+        assert!(text.contains("all-time"), "{text}");
+        assert!(text.contains("2 exit(s)"), "{text}");
+    }
+
+    /// Ticket 10 (US-28): the share dialog copies a non-empty link; ghosts
+    /// warn instead of copying nothing.
+    #[gpui_kit::test]
+    fn t10_share_dialog_copies_nonempty_link(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(tick12_seed("Work", "10871")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_share_for_row(&row.id, window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "share opens a dialog"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("share-link-text").is_some()),
+            "dialog shows the link"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("share-warning").is_some()),
+            "credential warning rides along"
+        );
+        // The footer Copy-link commits the copy.
+        cx.update(|window, cx| {
+            window.click("share-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(!clip.is_empty(), "share copy never empty");
+        assert!(clip.starts_with("manyproxy://add/"), "{clip}");
+        // Re-imports through the batch path with identity intact.
+        let back = crate::import::parse_link(&clip).expect("share re-imports");
+        assert_eq!(back.protocol, "vless");
+        assert_eq!(back.host, "198.51.100.9");
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_share_for_row("9999", window, cx));
+        });
+        assert_eq!(notification_count(cx), before + 1, "ghost warns");
+    }
+
+    /// Ticket 10 (US-29): manager Export-copy-link copies a throne://route
+    /// link that decodes to the stored name + rules.
+    #[gpui_kit::test]
+    fn t10_preset_export_link_copies_decodable_link(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .create_preset(
+                "office",
+                "manual",
+                None,
+                &[serde_json::json!({"action":"direct"})],
+            )
+            .expect("preset seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_export_link(&preset, window, cx)
+            });
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(!clip.is_empty(), "export copy never empty");
+        let parsed = crate::preset::decode_route_link(&clip).expect("export decodes");
+        assert_eq!(parsed.name, "office");
+        assert_eq!(parsed.rules.len(), 1);
+    }
+
+    /// Ticket 10 (US-29): New-Structured builds the catch-all rule for
+    /// each Basic action; nameless and non-basic commits fail with the
+    /// dialog kept open (no silent preset).
+    #[gpui_kit::test]
+    fn t10_structured_commit_builds_catch_all(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        for action in ["direct", "proxy", "block"] {
+            let closed = cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_preset_create_structured(
+                        format!("basic-{action}"),
+                        action.to_string(),
+                        window,
+                        cx,
+                    )
+                })
+            });
+            assert!(closed, "{action} commits");
+        }
+        let presets = view.read_with(cx, |view, _| view.store.list_presets().expect("list works"));
+        assert_eq!(presets.len(), 3, "one preset per Basic action");
+        for preset in &presets {
+            assert_eq!(preset.rules().expect("rules decode").len(), 1);
+        }
+        let before = notification_count(cx);
+        let kept = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_create_structured(
+                    String::new(),
+                    "direct".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!kept, "nameless stays open");
+        assert_eq!(notification_count(cx), before + 1, "nameless errors");
+        let kept = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_create_structured(
+                    "warp".to_string(),
+                    "warp".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!kept, "warp never stores");
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .store
+                .list_presets()
+                .expect("list works")
+                .len()),
+            3,
+            "no warp preset stored"
+        );
+    }
+
+    /// Ticket 10 (US-29): New-Remote refuses internal hosts before any
+    /// fetch (SSRF reason, never the URL); nameless refuses too.
+    #[gpui_kit::test]
+    fn t10_remote_commit_blocks_internal_hosts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let kept = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_create_remote(
+                    "lan".to_string(),
+                    "http://127.0.0.1:8080/preset.json".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!kept, "loopback stays open");
+        assert!(
+            view.read_with(cx, |view, _| view
+                .store
+                .list_presets()
+                .expect("list works")
+                .is_empty()),
+            "blocked URL stores nothing"
+        );
+        let kept = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_create_remote(
+                    String::new(),
+                    "https://example.com/preset.json".to_string(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(!kept, "nameless stays open");
+    }
+
+    /// Ticket 10 (US-29): Update lands fetched rules through the tested
+    /// refresh path (no network — the body is handed in directly).
+    #[gpui_kit::test]
+    fn t10_preset_update_lands_fetched_rules(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .import_remote_preset_shell("office", "https://example.com/preset.json")
+            .expect("shell seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_preset_refresh(
+                    &preset.id,
+                    &preset.name,
+                    Ok(crate::FetchedSubscription {
+                        body: r#"{"name":"office","rules":[{"action":"block"}]}"#.to_string(),
+                        userinfo: None,
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+        let rules = view.read_with(cx, |view, _| {
+            view.store
+                .get_preset(&preset.id)
+                .expect("read works")
+                .expect("preset kept")
+                .rules()
+                .expect("rules decode")
+        });
+        assert_eq!(rules.len(), 1, "fetched rules land");
+        assert_eq!(rules[0]["action"], serde_json::json!("block"));
+    }
+
+    /// Ticket 10 (US-29): the Advanced action cycle rewrites the dialog's
+    /// rules box in place (`direct → proxy → block → direct`); Delete
+    /// drops the rule; Add appends a fresh direct rule. The store is
+    /// untouched until Save.
+    #[gpui_kit::test]
+    fn t10_advanced_rule_ops_rewrite_rules_box(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let text = cx.update(|window, cx| {
+            view.update(cx, |_view, cx| {
+                let form = crate::PresetForm::restored(
+                    window,
+                    cx,
+                    "office",
+                    r#"[{"action":"direct"},{"action":"route","outbound":"tag"}]"#,
+                );
+                crate::AppView::rewrite_preset_rules_box(
+                    &form,
+                    &crate::PresetRulesOp::CycleAction(0),
+                    window,
+                    cx,
+                );
+                form.rules.read(cx).value().to_string()
+            })
+        });
+        let rules: Vec<serde_json::Value> = serde_json::from_str(&text).expect("box stays JSON");
+        assert_eq!(
+            rules[0]["action"],
+            serde_json::json!("proxy"),
+            "direct cycles to proxy"
+        );
+        let text = cx.update(|window, cx| {
+            view.update(cx, |_view, cx| {
+                let form = crate::PresetForm::restored(window, cx, "office", &text);
+                crate::AppView::rewrite_preset_rules_box(
+                    &form,
+                    &crate::PresetRulesOp::Remove(1),
+                    window,
+                    cx,
+                );
+                form.rules.read(cx).value().to_string()
+            })
+        });
+        let rules: Vec<serde_json::Value> = serde_json::from_str(&text).expect("box stays JSON");
+        assert_eq!(rules.len(), 1, "delete drops the rule");
+        let text = cx.update(|window, cx| {
+            view.update(cx, |_view, cx| {
+                let form = crate::PresetForm::restored(window, cx, "office", &text);
+                crate::AppView::rewrite_preset_rules_box(
+                    &form,
+                    &crate::PresetRulesOp::Add,
+                    window,
+                    cx,
+                );
+                form.rules.read(cx).value().to_string()
+            })
+        });
+        let rules: Vec<serde_json::Value> = serde_json::from_str(&text).expect("box stays JSON");
+        assert_eq!(rules.len(), 2, "add appends");
+        assert_eq!(rules[1]["action"], serde_json::json!("direct"));
+    }
+
+    /// Ticket 10 (US-23/US-22): both stats dialogs open with their pinned
+    /// ids; Traffic Stats cycles the period and its bars match the stored
+    /// totals.
+    #[gpui_kit::test]
+    fn t10_stats_dialogs_open_with_matching_bars(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10871"))
+            .expect("seed works");
+        let beta = store.add(tick12_seed("Beta", "10872")).expect("seed works");
+        store
+            .add_traffic_batch(&[(alpha.id.clone(), 1000, 50), (beta.id.clone(), 3000, 90)])
+            .expect("traffic persists");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("runtime-stat-0").is_some()),
+            "runtime lines paint"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("traffic-stats-summary").is_some()),
+            "traffic summary paints"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("traffic-stat-{}", beta.id))
+                .is_some()),
+            "heaviest exit paints its By Profile row"
+        );
+        let before = view.read_with(cx, |view, _| view.traffic_period);
+        cx.update(|window, cx| {
+            window.click("traffic-stats-period", cx);
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert_ne!(
+            view.read_with(cx, |view, _| view.traffic_period),
+            before,
+            "period cycles"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Ticket 10 (US-29): the ROUTING chooser opens the attach picker for
+    /// the selected row; with no selection it explains itself instead of
+    /// opening nothing.
+    #[gpui_kit::test]
+    fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
+        use gpui_kit::component::IndexPath;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(tick12_seed("Work", "10871")).expect("seed works");
+        store
+            .create_preset(
+                "ads",
+                "manual",
+                None,
+                &[serde_json::json!({"action":"direct"})],
+            )
+            .expect("preset seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_chooser_for_selected(window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "chooser opens the attach picker"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().clear_selection();
+                    list_cx.notify();
+                });
+            });
+        });
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_chooser_for_selected(window, cx)
+            });
+        });
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "no selection explains itself"
+        );
+    }
+
+    /// Ticket 10 (US-26/US-30): Columns −/+ persist, Refresh restores
+    /// defaults; skip-delete-confirm round-trips and skips the single
+    /// confirm (stop-first still applies).
+    #[gpui_kit::test]
+    fn t10_widths_persist_and_skip_confirm_skips(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(tick12_seed("Work", "10871")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let defaults = Store::default_conn_column_widths();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.adjust_conn_column_widths(20, window, cx)
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.conn_column_widths()[0]),
+            defaults[0] + 20,
+            "widen persists"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.refresh_conn_column_widths(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.conn_column_widths()),
+            defaults,
+            "refresh restores defaults"
+        );
+        assert!(
+            !view.read_with(cx, |view, _| view.store.skip_delete_confirm()),
+            "default asks"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_skip_delete_confirm(true, window, cx)
+            });
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.skip_delete_confirm()),
+            "toggle persists"
+        );
+        // Skipped: no confirm dialog, the row is gone at once.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let config = view.row_config(&row.id).expect("row reads");
+                view.open_remove_confirm(config, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "skip opens no confirm"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view
+                .store
+                .get(&row.id)
+                .expect("read works")
+                .is_none()),
+            "row removed at once"
+        );
+    }
+
+    /// Ticket 10 (US-30): tray Select-preset opens the manager,
+    /// Select-exit with no selection explains itself, and Open-config
+    /// copies the folder path (never a shell-out).
+    #[gpui_kit::test]
+    fn t10_tray_select_and_config_copy(cx: &mut TestAppContext) {
+        use crate::tray::TrayAction;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add(tick12_seed("Work", "10871")).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::SelectPreset, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Select preset opens the manager"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::SelectExit, window, cx)
+            });
+        });
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "no selection explains itself"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(TrayAction::OpenConfig, window, cx)
+            });
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(clip, crate::tray::config_folder(), "config folder copies");
+        assert!(!clip.is_empty(), "folder never empty");
+    }
+
     // -- Ticket 38: tray + autostart + session restore ------------------------
 
     fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
@@ -39875,9 +48474,10 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // Ticket 10: Settings lives in the Help menu — open it first.
+        // Ticket 02 (throne-adoption): Settings lives in the SETTINGS menu
+        // — open it first.
         cx.update(|window, cx| {
-            window.click("help-menu", cx);
+            window.click("settings-menu", cx);
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -40303,12 +48903,13 @@ mod tests {
                 t48_response(200, None, "cdn-body")
             }
         });
-        let body = futures::executor::block_on(crate::fetch_subscription_body(
+        let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
             client,
             "https://example.com/sub.txt",
         ))
         .expect("public redirect followed");
-        assert_eq!(body, "cdn-body");
+        assert_eq!(downloaded.body, "cdn-body");
+        assert_eq!(downloaded.userinfo, None, "no header means no quota");
         assert_eq!(
             *fetched.lock().expect("read works"),
             vec![
@@ -40421,25 +49022,21 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
 
-        // Command strip: the leading action paints inside the frame (the
+        // Command strip: the leading menu paints inside the frame (the
         // strip container carries no test anchor; every command pins
-        // reachability by presence while `add-config` — the first child,
-        // never the clipped end — pins paint). Ticket 10: the strip is 4
-        // dedicated buttons plus 4 menu triggers; signal-box 03 restores
-        // Import as a persistent fifth (`import-config`); menu items render
-        // on open (see `command_strip_all_ids_present`).
-        assert_painted(cx, "add-config");
-        assert_within_frame(cx, "add-config");
+        // reachability by presence while `program-menu` — the first child,
+        // never the clipped end — pins paint). Ticket 02 (throne-adoption):
+        // the strip is five menu triggers plus the global toggle; menu
+        // items render on open (see `command_strip_all_ids_present`).
+        assert_painted(cx, "program-menu");
+        assert_within_frame(cx, "program-menu");
         for id in [
-            "add-config",
-            "start-selected",
-            "stop-selected",
-            "test-selected",
-            "import-config",
-            "library-menu",
-            "manage-menu",
-            "engine-menu",
-            "help-menu",
+            "program-menu",
+            "settings-menu",
+            "groups-menu",
+            "routing-menu",
+            "tools-menu",
+            "global-start-stop",
         ] {
             assert!(
                 cx.update(|window, _| window.try_find(id).is_some()),
@@ -40578,18 +49175,16 @@ mod tests {
         paint_frame_min(cx);
 
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
-        // BUG-5: the toolbar wraps at the 880px minimum — every lever and
-        // menu trigger (trailing `help-menu` included) paints inside 880.
+        // Ticket 02 (throne-adoption): five menus plus the global toggle
+        // share one row at the 880px minimum — every trigger (trailing
+        // `global-start-stop` included) paints inside 880.
         for id in [
-            "add-config",
-            "start-selected",
-            "stop-selected",
-            "test-selected",
-            "import-config",
-            "library-menu",
-            "manage-menu",
-            "engine-menu",
-            "help-menu",
+            "program-menu",
+            "settings-menu",
+            "groups-menu",
+            "routing-menu",
+            "tools-menu",
+            "global-start-stop",
         ] {
             assert_painted(cx, id);
             assert_within_frame_min(cx, id);
@@ -40749,6 +49344,111 @@ mod tests {
             filter.contains("protocol: vless"),
             "filter segment names the facet: {filter}"
         );
+    }
+
+    /// Ticket 04 (throne-adoption): status strip aggregates — 2 live +
+    /// 1 dead reads `2 live · 1 dead` beside the engine endpoint count,
+    /// the `:port` list, and traffic totals, never naming one profile.
+    /// No per-row start tracking is invented (aggregate counts only);
+    /// stopped rows carry no fabricated latency (unprobed rows count as
+    /// neither live nor dead — see `health_counts`).
+    #[gpui_kit::test]
+    fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let rows = ["Alpha", "Beta", "Gamma"]
+            .into_iter()
+            .zip(["10931", "10932", "10933"])
+            .map(|(name, port)| store.add(t30_engine_seed(name, port)).expect("seed works"))
+            .collect::<Vec<_>>();
+        store
+            .add_traffic_batch(&[(rows[0].id.clone(), 2_048, 1_024)])
+            .expect("traffic accrues");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            3,
+            "three endpoints serve"
+        );
+        // Two live outcomes, one dead (same headless seam as the T05
+        // dead-row tests — no per-row start bookkeeping invented).
+        for (index, row) in rows.iter().enumerate() {
+            let live = index < 2;
+            cx.update(|_, cx| {
+                view.update(cx, |view, _cx| {
+                    view.health_store.record_outcome(&TestOutcome {
+                        sample: HealthSample {
+                            config_id: row.id.clone(),
+                            at: 1,
+                            kind: HealthKind::UrlTest,
+                            latency_ms: live.then_some(12),
+                            error: if live {
+                                None
+                            } else {
+                                Some("timeout".to_string())
+                            },
+                        },
+                        success: live.then_some(ProbeSuccess {
+                            latency_ms: 12,
+                            bytes_rx: 0,
+                            bytes_tx: 0,
+                        }),
+                    });
+                });
+            });
+        }
+        let (total, engine_text, health_text, totals) = view.read_with(cx, |view, cx| {
+            (
+                view.libraries.read(cx).delegate().counts().0,
+                view.engine.status_text(),
+                view.health_status_text(),
+                crate::summed_traffic_text(&view.store),
+            )
+        });
+        assert_eq!(total, 3, "three rows counted");
+        assert_eq!(health_text, "health: 2 live · 1 dead");
+        assert_eq!(engine_text, "engine running · 3 endpoint(s)");
+        assert_eq!(
+            crate::serving_ports_text(&[10931, 10932, 10933]),
+            Some(":10931 :10932 :10933".to_string())
+        );
+        let totals = totals.expect("traffic totals render once bytes flow");
+        assert!(
+            totals.contains('↓') && totals.contains('↑'),
+            "traffic totals read: {totals}"
+        );
+        for text in [&engine_text, &health_text, &totals] {
+            for name in ["Alpha", "Beta", "Gamma"] {
+                assert!(
+                    !text.contains(name),
+                    "footer never names one profile ({name} in {text})"
+                );
+            }
+        }
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "status-count",
+            "engine-status",
+            "health-status",
+            "status-ports",
+            "traffic-status",
+        ] {
+            assert_painted(cx, id);
+        }
     }
 
     /// Ticket 11 (b): status strip at minimum width — library totals stay
@@ -40938,7 +49638,9 @@ mod tests {
             "protocol-select",
             "field-guided-server",
             "field-guided-port",
-            "field-guided-identity",
+            // Ticket 06: the default type (vless) owns its secret in the
+            // type box — the generic Identity row stays out of the
+            // minimum-frame paint (single secret, no stacked duplicate).
             "guided-hint",
             "params-advanced-toggle",
             "field-group",
@@ -40950,6 +49652,7 @@ mod tests {
             assert_painted(cx, id);
             assert_within_frame_min(cx, id);
         }
+        assert_absent(cx, "field-guided-identity".to_string());
         // Advanced disclosure: the raw JSON paints in place on expand.
         cx.update(|window, cx| {
             window.click("params-advanced-toggle", cx);
@@ -41456,5 +50159,98 @@ mod tests {
         assert!(body.contains("library"), "payload has library section");
         let _ = std::fs::remove_file(&target);
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    /// Ticket 02 (CUA US-2/CAP-2): settings body tail-clearance rule — at
+    /// the 1000x700 desktop frame and the 880x620 minimum, first paint
+    /// keeps the pinned Startup/Probe sections above the fold in order
+    /// (their fold slots never move), and with the body scrolled to its
+    /// end the last content row paints fully clear of the sticky footer
+    /// (the shared body bottom pad, never a per-line nudge — future tails
+    /// inherit it). The mid-body Timers line itself stays a presence pin
+    /// at first paint: it rides below the fold until scrolled to.
+    #[gpui_kit::test]
+    fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
+        use gpui_kit::point;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        for paint in [
+            paint_frame as fn(&mut VisualTestContext),
+            paint_frame_min as fn(&mut VisualTestContext),
+        ] {
+            cx.run_until_parked();
+            paint(cx);
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+            });
+            paint_dialog_open(cx);
+            // Fold slots preserved: Startup and Probe paint, in order.
+            assert_painted(cx, "settings-section-startup");
+            assert_painted(cx, "settings-section-probe");
+            let (startup_top, probe_top) = cx.update(|window, _| {
+                (
+                    window
+                        .try_find("settings-section-startup".to_string())
+                        .expect("startup renders")
+                        .bounds()
+                        .origin
+                        .y,
+                    window
+                        .try_find("settings-section-probe".to_string())
+                        .expect("probe renders")
+                        .bounds()
+                        .origin
+                        .y,
+                )
+            });
+            assert!(
+                startup_top < probe_top,
+                "Startup keeps its fold slot above Probe"
+            );
+            // Timers renders (below the fold at first paint — presence,
+            // not paint, is the pin).
+            assert!(
+                cx.update(|window, _| window.try_find("settings-ticks".to_string()).is_some()),
+                "Timers renders"
+            );
+            // Scroll the body to its end through a painted anchor, then
+            // the tail must paint fully clear of the sticky footer.
+            cx.update(|window, cx| {
+                window.scroll(
+                    "settings-section-probe",
+                    gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_frame(cx);
+            });
+            assert_painted(cx, "settings-tray-note");
+            let (tail_bottom, footer_top) = cx.update(|window, _| {
+                (
+                    window
+                        .try_find("settings-tray-note".to_string())
+                        .expect("tail renders")
+                        .bounds()
+                        .bottom(),
+                    window
+                        .try_find("settings-dialog-ok".to_string())
+                        .expect("footer renders")
+                        .bounds()
+                        .origin
+                        .y,
+                )
+            });
+            assert!(
+                tail_bottom + px(24.) <= footer_top,
+                "tail clears the footer by the body pad: tail {tail_bottom:?} vs footer {footer_top:?}"
+            );
+            cx.update(|window, cx| window.close_all_dialogs(cx));
+            cx.run_until_parked();
+        }
     }
 }

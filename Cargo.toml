@@ -15,6 +15,9 @@ raw-window-handle = "0.6"
 # Ticket 41 (spec-approved, research-first): 128-bit clash secrets.
 getrandom = "0.4"
 zeroize = "1.9"
+# Ticket 05 (throne-adoption): logs-pane regex filtering. Already a
+# transitive dep in Cargo.lock (offline-safe: served from the local cache).
+regex = "1"
 
 [dev-dependencies]
 gpui-kit = { version = "0.6", features = ["test-support"] }

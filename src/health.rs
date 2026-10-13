@@ -38,8 +38,14 @@ use crate::store::{now_unix, HealthSnapshot, ProxyConfig};
 /// HTTP-proxy GET directly; `https` would need a CONNECT+TLS stack v1 does
 /// not carry) returning 204.
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
-/// Per-test ceiling so 5 rows finish inside the 30s scenario budget.
-pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ticket 09 (throne-adoption): adopted batch-test values — at most 100
+/// rows per probe chunk, 200ms between chunks (progress cadence), 10-way
+/// overlap, 3000ms URL-test ceiling, 5000ms speedtest ceiling.
+pub const GROUP_TEST_BATCH_SIZE: usize = 100;
+pub const GROUP_TEST_POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub const GROUP_TEST_CONCURRENCY: usize = 10;
+pub const URL_TEST_TIMEOUT: Duration = Duration::from_secs(3);
+pub const SPEED_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ticket 36: host of the health-test URL — clash flows to this host are
 /// probes, never data-plane bytes (single source of truth derived from
 /// [`DEFAULT_TEST_URL`], never a second literal to drift).
@@ -127,6 +133,39 @@ pub trait HealthProber {
     /// probe threads; semantics unchanged).
     fn tcp_ping(&self, config: &ProxyConfig, bind: &str, port: u16)
         -> Result<ProbeSuccess, String>;
+    /// Ticket 09 (throne-adoption): timed transfer through the endpoint
+    /// (`mode` + `timeout`). The default driver has no transfer stack, so
+    /// it reports unsupported (named per row, never silent).
+    fn speed_test(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+        url: &str,
+        mode: SpeedtestMode,
+        timeout: Duration,
+    ) -> Result<SpeedtestOutcome, String> {
+        let _ = (bind, port, url, mode, timeout);
+        Err(format!(
+            "speed test not supported for \"{}\" by this driver",
+            redact_secrets(&config.name)
+        ))
+    }
+    /// Ticket 09 (throne-adoption): fetch the egress IP through the
+    /// endpoint. Default: unsupported (named per row, never silent).
+    fn out_ip(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+        url: &str,
+    ) -> Result<String, String> {
+        let _ = (bind, port, url);
+        Err(format!(
+            "out-ip resolve not supported for \"{}\" by this driver",
+            redact_secrets(&config.name)
+        ))
+    }
 }
 
 /// Protocols measurable in this slice. Mirrors the ticket-05 standard set
@@ -197,7 +236,7 @@ impl RealHealthProber {
 
 impl Default for RealHealthProber {
     fn default() -> Self {
-        Self::new(DEFAULT_PROBE_TIMEOUT)
+        Self::new(URL_TEST_TIMEOUT)
     }
 }
 
@@ -375,6 +414,237 @@ impl HealthProber for RealHealthProber {
             bytes_tx: 0,
         })
     }
+
+    fn speed_test(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+        url: &str,
+        mode: SpeedtestMode,
+        timeout: Duration,
+    ) -> Result<SpeedtestOutcome, String> {
+        let outcome =
+            |latency_ms: Option<u64>, mbps: Option<f64>, error: Option<String>| SpeedtestOutcome {
+                config_id: config.id.clone(),
+                mode,
+                latency_ms,
+                mbps,
+                error,
+            };
+        let endpoint =
+            endpoint_addr(bind, port, timeout).map_err(|cause| named_speed_error(config, cause))?;
+        let (scheme, host) =
+            split_http_url(url).map_err(|cause| named_speed_error(config, cause))?;
+        if !scheme.eq_ignore_ascii_case("http") {
+            return Err(named_speed_error(
+                config,
+                format!(
+                    "unsupported url scheme \"{scheme}\" for speed test (use an http:// test url)"
+                ),
+            ));
+        }
+        match mode {
+            SpeedtestMode::Download => {
+                let request = format!(
+                    "GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: ManyProxy-health\r\n\r\n"
+                );
+                let started = Instant::now();
+                match exchange(endpoint, &request, timeout, 8 * 1024 * 1024) {
+                    Ok((code, body)) if (200..300).contains(&code) => Ok(outcome(
+                        Some(started.elapsed().as_millis() as u64),
+                        Some(mbps_of(body.len() as u64, started.elapsed())),
+                        None,
+                    )),
+                    Ok((code, _)) => Err(named_speed_error(
+                        config,
+                        format!("speed test via {endpoint}: unexpected status {code}"),
+                    )),
+                    Err(cause) => Err(named_speed_error(config, cause)),
+                }
+            }
+            SpeedtestMode::Upload => {
+                // Fixed 256KB payload POSTed at the test URL; the rate
+                // counts bytes pushed through the egress. A target that
+                // refuses POST names itself in the outcome (honest dead,
+                // never a fabricated zero).
+                let payload = vec![b'M'; 256 * 1024];
+                let request = format!(
+                    "POST {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: ManyProxy-health\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let started = Instant::now();
+                match post_exchange(endpoint, &request, &payload, timeout) {
+                    Ok(code) if (200..300).contains(&code) => Ok(outcome(
+                        Some(started.elapsed().as_millis() as u64),
+                        Some(mbps_of(payload.len() as u64, started.elapsed())),
+                        None,
+                    )),
+                    Ok(code) => Err(named_speed_error(
+                        config,
+                        format!("speed test via {endpoint}: unexpected status {code}"),
+                    )),
+                    Err(cause) => Err(named_speed_error(config, cause)),
+                }
+            }
+        }
+    }
+
+    fn out_ip(
+        &self,
+        config: &ProxyConfig,
+        bind: &str,
+        port: u16,
+        url: &str,
+    ) -> Result<String, String> {
+        let named = |cause: String| {
+            format!(
+                "out-ip resolve failed for \"{}\": {}",
+                redact_secrets(&config.name),
+                redact_secrets(&cause)
+            )
+        };
+        let endpoint = endpoint_addr(bind, port, self.timeout).map_err(named)?;
+        let (scheme, host) = split_http_url(url).map_err(named)?;
+        if !scheme.eq_ignore_ascii_case("http") {
+            return Err(named(format!(
+                "unsupported url scheme \"{scheme}\" for out-ip resolve (use an http:// url)"
+            )));
+        }
+        let request = format!(
+            "GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: ManyProxy-health\r\n\r\n"
+        );
+        let (_, body) = exchange(endpoint, &request, self.timeout, 4096).map_err(named)?;
+        let text = String::from_utf8_lossy(&body);
+        // The body past the headers is the echo payload; a status line or
+        // HTML error page is never an IP.
+        let candidate = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or(text.as_ref())
+            .trim();
+        candidate
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.to_string())
+            .map_err(|_| named("unexpected out-ip response (not an IP address)".to_string()))
+    }
+}
+
+/// Ticket 09: name a speedtest failure with its row (redacted like every
+/// other probe cause).
+fn named_speed_error(config: &ProxyConfig, cause: impl Into<String>) -> String {
+    format!(
+        "speed test failed for \"{}\": {}",
+        redact_secrets(&config.name),
+        redact_secrets(&cause.into())
+    )
+}
+
+/// Ticket 09: one HTTP exchange through `endpoint` — write `request`, read
+/// to close/deadline/`cap`. Returns the status code + full raw bytes.
+/// Overall-deadline bound like [`RealHealthProber::url_test`]: per-read
+/// timeouts alone never bound a slow drip.
+fn exchange(
+    endpoint: SocketAddr,
+    request: &str,
+    timeout: Duration,
+    cap: usize,
+) -> Result<(u16, Vec<u8>), String> {
+    use std::io::{Read as _, Write as _};
+    let started = Instant::now();
+    let mut stream = TcpStream::connect_timeout(&endpoint, timeout)
+        .map_err(|error| format!("speed test via {endpoint}: dial failed ({error})"))?;
+    stream.set_write_timeout(Some(timeout)).ok();
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("speed test via {endpoint}: write failed ({error})"))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(format!("speed test via {endpoint}: timed out"));
+        }
+        stream.set_read_timeout(Some(timeout - elapsed)).ok();
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= cap {
+                    break;
+                }
+            }
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    return Err(format!("speed test via {endpoint}: timed out"));
+                }
+                return Err(format!("speed test via {endpoint}: read failed ({error})"));
+            }
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let code = head
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("speed test via {endpoint}: bad proxy response"))?;
+    Ok((code, buf))
+}
+
+/// Ticket 09: write headers + payload, read the status line only (upload
+/// rate counts bytes sent, not the reply body).
+fn post_exchange(
+    endpoint: SocketAddr,
+    headers: &str,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<u16, String> {
+    use std::io::{Read as _, Write as _};
+    let started = Instant::now();
+    let mut stream = TcpStream::connect_timeout(&endpoint, timeout)
+        .map_err(|error| format!("speed test via {endpoint}: dial failed ({error})"))?;
+    stream.set_write_timeout(Some(timeout)).ok();
+    stream
+        .write_all(headers.as_bytes())
+        .map_err(|error| format!("speed test via {endpoint}: write failed ({error})"))?;
+    stream
+        .write_all(payload)
+        .map_err(|error| format!("speed test via {endpoint}: write failed ({error})"))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Err(format!("speed test via {endpoint}: timed out"));
+        }
+        stream.set_read_timeout(Some(timeout - elapsed)).ok();
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if find_headers_end(&buf).is_some() || buf.len() >= 65_536 {
+                    break;
+                }
+            }
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    return Err(format!("speed test via {endpoint}: timed out"));
+                }
+                return Err(format!("speed test via {endpoint}: read failed ({error})"));
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("speed test via {endpoint}: bad proxy response"))
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
@@ -391,7 +661,9 @@ type ProbeFn = fn(&dyn HealthProber, &ProxyConfig, &str, u16, &str) -> Result<Pr
 /// Ticket 47: max probe threads per round. Test-all on N rows overlaps at
 /// most this many blocking dials; outcomes still land in input order, so
 /// probe semantics (per-egress routing, skip/failure shapes) are unchanged.
-pub const MAX_PROBE_CONCURRENCY: usize = 8;
+/// Ticket 09 (throne-adoption): adopted Throne value 10 (was 8) — kept as
+/// the alias of [`GROUP_TEST_CONCURRENCY`] so the bound cannot drift.
+pub const MAX_PROBE_CONCURRENCY: usize = GROUP_TEST_CONCURRENCY;
 
 /// Ticket 47: one probe of one config (the per-row body shared by the
 /// sequential and concurrent runners — one skip/probe/failure shape).
@@ -485,6 +757,9 @@ fn run_all(
 /// into input order, so callers observe exactly the sequential contract.
 /// `prober` is shared (`&(dyn HealthProber + Sync)`); drivers must be
 /// `Sync` (the real driver is stateless, the fake is `Arc<Mutex>`).
+/// Ticket 09 (throne-adoption): `stop` aborts the run — workers stop
+/// pulling new rows once set (in-flight rows still record, so every
+/// returned outcome carries latency or a named failure, never a blank).
 fn run_all_concurrent(
     configs: &[ProxyConfig],
     prober: &(dyn HealthProber + Sync),
@@ -493,8 +768,23 @@ fn run_all_concurrent(
     probe: ProbeFn,
     url: &str,
 ) -> Vec<TestOutcome> {
+    run_all_concurrent_stoppable(configs, prober, kind, verb, probe, url, None)
+}
+
+fn run_all_concurrent_stoppable(
+    configs: &[ProxyConfig],
+    prober: &(dyn HealthProber + Sync),
+    kind: HealthKind,
+    verb: &str,
+    probe: ProbeFn,
+    url: &str,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Vec<TestOutcome> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     if configs.is_empty() {
+        return Vec::new();
+    }
+    if stop.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Vec::new();
     }
     if configs.len() == 1 {
@@ -507,6 +797,9 @@ fn run_all_concurrent(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
+                if stop.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                    break;
+                }
                 let index = next.fetch_add(1, Ordering::SeqCst);
                 let Some(config) = configs.get(index) else {
                     break;
@@ -595,6 +888,265 @@ pub fn ping_all_concurrent(
         ping_probe,
         "",
     )
+}
+
+/// Ticket 09 (throne-adoption): stoppable URL-test runner — the group-test
+/// engine. `stop` (see `Stop Testing`) halts new pulls; in-flight rows
+/// still record latency or a named failure.
+pub fn test_all_stoppable(
+    configs: &[ProxyConfig],
+    url: &str,
+    prober: &(dyn HealthProber + Sync),
+    stop: &std::sync::atomic::AtomicBool,
+) -> Vec<TestOutcome> {
+    run_all_concurrent_stoppable(
+        configs,
+        prober,
+        HealthKind::UrlTest,
+        "url test",
+        url_probe,
+        url,
+        Some(stop),
+    )
+}
+
+/// Ticket 09 (throne-adoption): stoppable TCP-ping runner (group-ping engine).
+/// Test-only seam until a ping-group action ships.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn ping_all_stoppable(
+    configs: &[ProxyConfig],
+    prober: &(dyn HealthProber + Sync),
+    stop: &std::sync::atomic::AtomicBool,
+) -> Vec<TestOutcome> {
+    run_all_concurrent_stoppable(
+        configs,
+        prober,
+        HealthKind::TcpPing,
+        "tcp ping",
+        ping_probe,
+        "",
+        Some(stop),
+    )
+}
+
+/// Ticket 09 (throne-adoption): one group's URL tests in
+/// [`GROUP_TEST_BATCH_SIZE`] chunks — `on_progress(done, total)` fires per
+/// chunk (including the last), [`GROUP_TEST_POLL_INTERVAL`] parks between
+/// chunks, and `stop` aborts before the next chunk (workers also stop
+/// pulling mid-chunk). Returned outcomes stay in input order; a stopped
+/// run returns the completed prefix only.
+pub fn test_group(
+    configs: &[ProxyConfig],
+    url: &str,
+    prober: &(dyn HealthProber + Sync),
+    stop: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Vec<TestOutcome> {
+    run_group(configs, stop, &mut on_progress, |chunk| {
+        test_all_stoppable(chunk, url, prober, stop)
+    })
+}
+
+/// Ticket 09 (throne-adoption): one group's TCP pings, chunked like
+/// [`test_group`]. Test-only seam until a ping-group action ships (see
+/// `t09_ping_group_chunks_and_stops`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn ping_group(
+    configs: &[ProxyConfig],
+    prober: &(dyn HealthProber + Sync),
+    stop: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Vec<TestOutcome> {
+    run_group(configs, stop, &mut on_progress, |chunk| {
+        ping_all_stoppable(chunk, prober, stop)
+    })
+}
+
+fn run_group(
+    configs: &[ProxyConfig],
+    stop: &std::sync::atomic::AtomicBool,
+    on_progress: &mut impl FnMut(usize, usize),
+    mut run_chunk: impl FnMut(&[ProxyConfig]) -> Vec<TestOutcome>,
+) -> Vec<TestOutcome> {
+    use std::sync::atomic::Ordering;
+    let total = configs.len();
+    let mut out = Vec::with_capacity(total);
+    for chunk in configs.chunks(GROUP_TEST_BATCH_SIZE) {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        out.extend(run_chunk(chunk));
+        on_progress(out.len().min(total), total);
+        if out.len() < total && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(GROUP_TEST_POLL_INTERVAL);
+        }
+    }
+    out
+}
+
+/// Ticket 09 (throne-adoption): one group's speedtests — SEQUENTIAL with
+/// stop checks between rows. Concurrent transfers would share the pipe
+/// and distort every rate, so the 10-way overlap stays on url/ping only.
+/// `on_progress(done, total)` fires per row. Unsupported rows record a
+/// named skip; a panicking driver fails its own row, never the run.
+pub fn speed_group(
+    configs: &[ProxyConfig],
+    url: &str,
+    mode: SpeedtestMode,
+    timeout: Duration,
+    prober: &dyn HealthProber,
+    stop: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Vec<SpeedtestOutcome> {
+    use std::sync::atomic::Ordering;
+    let total = configs.len();
+    let mut out = Vec::with_capacity(total);
+    for config in configs {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if !prober.supports(config) {
+            out.push(SpeedtestOutcome {
+                config_id: config.id.clone(),
+                mode,
+                latency_ms: None,
+                mbps: None,
+                error: Some(format!(
+                    "unsupported protocol \"{}\" for \"{}\" (no speed test for this protocol yet)",
+                    config.protocol,
+                    redact_secrets(&config.name)
+                )),
+            });
+        } else {
+            let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prober.speed_test(config, &config.bind_ip, config.port, url, mode, timeout)
+            }));
+            out.push(match probed {
+                Ok(Ok(measured)) => measured,
+                Ok(Err(cause)) => SpeedtestOutcome {
+                    config_id: config.id.clone(),
+                    mode,
+                    latency_ms: None,
+                    mbps: None,
+                    error: Some(cause),
+                },
+                Err(_) => SpeedtestOutcome {
+                    config_id: config.id.clone(),
+                    mode,
+                    latency_ms: None,
+                    mbps: None,
+                    error: Some(format!(
+                        "speed test failed for \"{}\": probe panicked",
+                        redact_secrets(&config.name)
+                    )),
+                },
+            });
+        }
+        on_progress(out.len(), total);
+    }
+    out
+}
+
+/// Ticket 09 (throne-adoption): speedtest direction. Download reads a full
+/// response body through the endpoint; upload POSTs a fixed payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpeedtestMode {
+    #[default]
+    Download,
+    Upload,
+}
+
+impl SpeedtestMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpeedtestMode::Download => "download",
+            SpeedtestMode::Upload => "upload",
+        }
+    }
+
+    /// Parse a mode label (`None` = the unknown position, never a silent
+    /// default — the UI only offers known labels anyway). Test-pinned seam
+    /// for the mode picker vocabulary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_label(label: &str) -> Option<SpeedtestMode> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "download" => Some(SpeedtestMode::Download),
+            "upload" => Some(SpeedtestMode::Upload),
+            _ => None,
+        }
+    }
+
+    /// Cycle for the mode menu item (download → upload → download).
+    pub fn next(self) -> SpeedtestMode {
+        match self {
+            SpeedtestMode::Download => SpeedtestMode::Upload,
+            SpeedtestMode::Upload => SpeedtestMode::Download,
+        }
+    }
+}
+
+/// Ticket 09 (throne-adoption): speedtest parameters — a mode plus a
+/// timeout (pinned default [`SPEED_TEST_TIMEOUT`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeedtestConfig {
+    pub mode: SpeedtestMode,
+    pub timeout: Duration,
+}
+
+impl Default for SpeedtestConfig {
+    fn default() -> Self {
+        Self {
+            mode: SpeedtestMode::Download,
+            timeout: SPEED_TEST_TIMEOUT,
+        }
+    }
+}
+
+/// Ticket 09 (throne-adoption): one speedtest result. `mbps` is set on
+/// measured success only; failures name the cause. Recorded via
+/// [`HealthStore::record_speed_sample`] — samples only, never traffic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeedtestOutcome {
+    pub config_id: String,
+    pub mode: SpeedtestMode,
+    pub latency_ms: Option<u64>,
+    pub mbps: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// Ticket 09 (throne-adoption): megabits per second over `bytes` moved in
+/// `elapsed` (zero elapsed reads 0, never infinite).
+pub fn mbps_of(bytes: u64, elapsed: Duration) -> f64 {
+    (bytes as f64 * 8.0) / elapsed.as_secs_f64().max(1e-9) / 1e6
+}
+
+/// Ticket 09 (throne-adoption): Throne speed result string — `12.4 Mbps`
+/// on measured success, the named failure otherwise.
+pub fn format_speed_result(outcome: &SpeedtestOutcome) -> String {
+    match (outcome.mbps, outcome.error.as_deref()) {
+        (Some(mbps), _) => format!("{} {mbps:.1} Mbps", outcome.mode.as_str()),
+        (None, Some(cause)) => cause.to_string(),
+        (None, None) => "untested".to_string(),
+    }
+}
+
+/// Ticket 09 (throne-adoption): default out-IP echo target (plain `http`
+/// like [`DEFAULT_TEST_URL`] — the local mixed inbound serves
+/// HTTP-proxy GET directly). User-initiated only, never background.
+pub const RESOLVE_IP_URL: &str = "http://api.ipify.org";
+
+/// Ticket 09 (throne-adoption): ceiling for one out-IP fetch and one
+/// domain resolution (user-initiated; detached-thread lookups never hang
+/// a probe round past this).
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ticket 09 (throne-adoption): resolve a bare hostname to its first IP
+/// with a deadline (detached thread + drop, like
+/// [`resolve_endpoint_host`] — a hung resolver never hangs the caller).
+/// `None` on failure or timeout. Pure network, no loopback restriction:
+/// server hostnames are remote by definition.
+pub fn resolve_hostname(host: &str, timeout: Duration) -> Option<std::net::IpAddr> {
+    resolve_endpoint_host(host.trim(), 80, timeout).map(|addr| addr.ip())
 }
 
 /// Liveness derived from the latest sample.
@@ -1469,6 +2021,18 @@ impl HealthStore {
         self.data_traffic.get(config_id).copied()
     }
 
+    /// Ticket 09 (throne-adoption): drop every sample, traffic counter,
+    /// and stale marker of the given configs (the Clear-tests session
+    /// half — persisted snapshots go through the store).
+    pub fn prune_configs(&mut self, ids: &HashSet<String>) {
+        self.samples
+            .retain(|sample| !ids.contains(&sample.config_id));
+        self.traffic.retain(|id, _| !ids.contains(id));
+        self.data_traffic.retain(|id, _| !ids.contains(id));
+        self.stale.retain(|id| !ids.contains(id));
+        self.rebuild_latest_index();
+    }
+
     /// Ticket 41: mark one row's totals stale (its core crashed and ticks
     /// skip it — last totals are kept but flagged, never trusted fresh).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1627,6 +2191,57 @@ impl HealthStore {
             }
         }
         (live, dead)
+    }
+
+    /// Ticket 09 (throne-adoption): record a speedtest sample — latency
+    /// and dead flag only, NEVER traffic. Speed runs measure the pipe;
+    /// crediting probe bytes to usage would bill the measurement as data
+    /// plane (see the `speed_runs_never_credit_probe_bytes` test).
+    pub fn record_speed_sample(&mut self, outcome: &SpeedtestOutcome, at: i64) {
+        self.push_sample(HealthSample {
+            config_id: outcome.config_id.clone(),
+            at,
+            kind: HealthKind::UrlTest,
+            latency_ms: outcome.latency_ms,
+            error: outcome.error.clone(),
+        });
+    }
+}
+
+/// Ticket 09 (throne-adoption): Throne latency colors — one tone per
+/// sample. Untested rows are `Unknown` (never green); under 500ms is
+/// `Fast`, under 1500ms is `Slow`, anything slower is `Poor`. The UI maps
+/// tones to theme tokens (code never names a color). Test-pinned mapping
+/// seam; the card/inspector paint mapping is the render follow-up.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatencyTone {
+    Unknown,
+    Fast,
+    Slow,
+    Poor,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn latency_tone(latency_ms: Option<u64>) -> LatencyTone {
+    match latency_ms {
+        None => LatencyTone::Unknown,
+        Some(ms) if ms < 500 => LatencyTone::Fast,
+        Some(ms) if ms < 1500 => LatencyTone::Slow,
+        _ => LatencyTone::Poor,
+    }
+}
+
+/// Ticket 09 (throne-adoption): Throne result string for one outcome —
+/// `33ms` on success, the named failure otherwise (`untested` when the
+/// sample carries neither, which a runner never emits). Test-pinned seam
+/// for the per-row result vocabulary.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn test_result_string(outcome: &TestOutcome) -> String {
+    match (outcome.sample.latency_ms, outcome.sample.error.as_deref()) {
+        (Some(ms), _) => format!("{ms}ms"),
+        (None, Some(cause)) => cause.to_string(),
+        (None, None) => "untested".to_string(),
     }
 }
 
@@ -2111,6 +2726,8 @@ struct FakeProbeState {
     latency: HashMap<String, u64>,
     failures: HashMap<String, String>,
     denied: HashSet<String>,
+    speed_mbps: HashMap<String, f64>,
+    out_ips: HashMap<String, String>,
 }
 
 /// One recorded probe call (asserts per-egress routing: each call carries
@@ -2170,6 +2787,24 @@ impl FakeHealthHandle {
             .filter(|call| call.config_id == config_id)
             .cloned()
             .collect()
+    }
+
+    /// Script a speedtest rate for one row (default 10.0 Mbps unscripted).
+    pub fn script_speed(&self, config_id: &str, mbps: f64) {
+        self.state
+            .lock()
+            .unwrap()
+            .speed_mbps
+            .insert(config_id.to_string(), mbps);
+    }
+
+    /// Script an out-IP answer for one row (default `203.0.113.7`).
+    pub fn script_out_ip(&self, config_id: &str, ip: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .out_ips
+            .insert(config_id.to_string(), ip.to_string());
     }
 }
 
@@ -2258,6 +2893,52 @@ impl HealthProber for FakeHealthProber {
         });
         self.scripted(config)
     }
+
+    fn speed_test(
+        &self,
+        config: &ProxyConfig,
+        _bind: &str,
+        _port: u16,
+        _url: &str,
+        mode: SpeedtestMode,
+        _timeout: Duration,
+    ) -> Result<SpeedtestOutcome, String> {
+        let state = self.state.lock().unwrap();
+        if let Some(cause) = state.failures.get(&config.id) {
+            return Err(cause.clone());
+        }
+        let latency = state
+            .latency
+            .get(&config.id)
+            .copied()
+            .unwrap_or(self.default_latency);
+        let mbps = state.speed_mbps.get(&config.id).copied().unwrap_or(10.0);
+        Ok(SpeedtestOutcome {
+            config_id: config.id.clone(),
+            mode,
+            latency_ms: Some(latency),
+            mbps: Some(mbps),
+            error: None,
+        })
+    }
+
+    fn out_ip(
+        &self,
+        config: &ProxyConfig,
+        _bind: &str,
+        _port: u16,
+        _url: &str,
+    ) -> Result<String, String> {
+        let state = self.state.lock().unwrap();
+        if let Some(cause) = state.failures.get(&config.id) {
+            return Err(cause.clone());
+        }
+        Ok(state
+            .out_ips
+            .get(&config.id)
+            .cloned()
+            .unwrap_or_else(|| "203.0.113.7".to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -2343,6 +3024,331 @@ mod tests {
         assert_eq!(store.row_summary("c0"), "20ms");
         assert_eq!(store.row_summary("c3"), "dead");
         assert_eq!(store.row_summary("missing"), "");
+    }
+
+    // -- Ticket 09 (throne-adoption): prunes + test semantics -------------
+
+    /// Adopted Throne batch values stay pinned.
+    #[test]
+    fn t09_group_values_pinned() {
+        assert_eq!(GROUP_TEST_BATCH_SIZE, 100, "batch pinned");
+        assert_eq!(
+            GROUP_TEST_POLL_INTERVAL,
+            std::time::Duration::from_millis(200),
+            "poll pinned"
+        );
+        assert_eq!(GROUP_TEST_CONCURRENCY, 10, "concurrency pinned");
+        assert_eq!(MAX_PROBE_CONCURRENCY, 10, "runner matches");
+        assert_eq!(URL_TEST_TIMEOUT, std::time::Duration::from_secs(3));
+        assert_eq!(SPEED_TEST_TIMEOUT, std::time::Duration::from_secs(5));
+    }
+
+    /// Scenario: group test chunks at 100 with per-chunk progress; every
+    /// row shows latency or a named failure.
+    #[test]
+    fn t09_test_group_chunks_with_progress() {
+        let configs: Vec<ProxyConfig> = (0..205)
+            .map(|i| {
+                fixture(
+                    &i.to_string(),
+                    &format!("Row{i}"),
+                    "vless",
+                    "127.0.0.1",
+                    10801,
+                )
+            })
+            .collect();
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_failure("7", "upstream refused");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = Vec::new();
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |done, total| {
+            progress.push((done, total));
+        });
+        assert_eq!(outcomes.len(), 205, "one outcome per row");
+        assert_eq!(
+            progress,
+            vec![(100, 205), (200, 205), (205, 205)],
+            "per-chunk progress"
+        );
+        for outcome in &outcomes {
+            let text = test_result_string(outcome);
+            if outcome.sample.config_id == "7" {
+                assert!(outcome.sample.latency_ms.is_none());
+                assert!(text.contains("upstream refused"), "named failure: {text}");
+            } else {
+                assert_eq!(text, "42ms", "latency string: {text}");
+            }
+        }
+        // Tones: untested never reads good; boundaries pinned.
+        assert_eq!(latency_tone(None), LatencyTone::Unknown);
+        assert_eq!(latency_tone(Some(33)), LatencyTone::Fast);
+        assert_eq!(latency_tone(Some(499)), LatencyTone::Fast);
+        assert_eq!(latency_tone(Some(500)), LatencyTone::Slow);
+        assert_eq!(latency_tone(Some(1499)), LatencyTone::Slow);
+        assert_eq!(latency_tone(Some(1500)), LatencyTone::Poor);
+    }
+
+    /// Scenario: stop aborts the run — a pre-set flag probes nothing, and
+    /// a flag raised on the first probe still records only completed rows
+    /// (every returned row carries latency or a named failure).
+    #[test]
+    fn t09_test_group_stop_aborts() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let configs: Vec<ProxyConfig> = (0..50)
+            .map(|i| {
+                fixture(
+                    &i.to_string(),
+                    &format!("Row{i}"),
+                    "vless",
+                    "127.0.0.1",
+                    10801,
+                )
+            })
+            .collect();
+        // Pre-set stop: no outcomes, no probe calls.
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        let (prober, handle) = FakeHealthProber::shared();
+        let mut progress = Vec::new();
+        let outcomes = test_group(
+            &configs,
+            DEFAULT_TEST_URL,
+            &prober,
+            &stopped,
+            |done, total| {
+                progress.push((done, total));
+            },
+        );
+        assert!(outcomes.is_empty(), "stopped run records nothing");
+        assert!(progress.is_empty(), "no progress on abort");
+        for config in &configs {
+            assert!(
+                handle.calls_for(&config.id).is_empty(),
+                "no pulls after stop"
+            );
+        }
+        // Mid-run stop: the prober raises the flag on its first call; the
+        // run still records only completed rows (at most one worker wave).
+        struct StopOnFirst {
+            stop: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl HealthProber for StopOnFirst {
+            fn url_test(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+                _url: &str,
+            ) -> Result<ProbeSuccess, String> {
+                self.stop.store(true, Ordering::SeqCst);
+                Ok(ProbeSuccess {
+                    latency_ms: 9,
+                    bytes_rx: 0,
+                    bytes_tx: 0,
+                })
+            }
+            fn tcp_ping(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+            ) -> Result<ProbeSuccess, String> {
+                unreachable!("url path only");
+            }
+        }
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prober = StopOnFirst { stop: flag.clone() };
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &flag, |_, _| {});
+        assert!(!outcomes.is_empty(), "in-flight rows still record");
+        assert!(
+            outcomes.len() < configs.len(),
+            "stop aborts the run ({} of {})",
+            outcomes.len(),
+            configs.len()
+        );
+        for outcome in &outcomes {
+            assert_eq!(test_result_string(outcome), "9ms");
+        }
+    }
+
+    /// Speed runs record samples but never credit probe bytes to usage.
+    #[test]
+    fn t09_speed_runs_never_credit_probe_bytes() {
+        let config = fixture("1", "Alpha", "vless", "127.0.0.1", 10801);
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_speed("1", 24.5);
+        let outcome = prober
+            .speed_test(
+                &config,
+                "127.0.0.1",
+                10801,
+                DEFAULT_TEST_URL,
+                SpeedtestMode::Download,
+                SPEED_TEST_TIMEOUT,
+            )
+            .expect("fake measures");
+        assert_eq!(outcome.mbps, Some(24.5));
+        assert_eq!(format_speed_result(&outcome), "download 24.5 Mbps");
+        let mut store = HealthStore::default();
+        store.record_speed_sample(&outcome, 1_700_000_000);
+        assert_eq!(
+            store.traffic("1"),
+            TrafficStats::default(),
+            "no usage credit"
+        );
+        assert_eq!(store.status("1").latency_ms, Some(42), "sample recorded");
+        // Modes round-trip through labels; failures name their cause.
+        assert_eq!(
+            SpeedtestMode::from_label("upload"),
+            Some(SpeedtestMode::Upload)
+        );
+        assert_eq!(SpeedtestMode::from_label("bogus"), None);
+        assert_eq!(SpeedtestMode::Download.next(), SpeedtestMode::Upload);
+        let failed = SpeedtestOutcome {
+            config_id: "1".to_string(),
+            mode: SpeedtestMode::Upload,
+            latency_ms: None,
+            mbps: None,
+            error: Some("dial refused".to_string()),
+        };
+        assert_eq!(format_speed_result(&failed), "dial refused");
+        // ...while a real URL probe DOES credit its bytes (contrast guard).
+        let probe = prober
+            .url_test(&config, "127.0.0.1", 10801, DEFAULT_TEST_URL)
+            .expect("fake probes");
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "1".to_string(),
+                at: 1_700_000_001,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(probe.latency_ms),
+                error: None,
+            },
+            success: Some(probe),
+        });
+        assert_ne!(
+            store.traffic("1"),
+            TrafficStats::default(),
+            "url probes credit"
+        );
+        // Pure Mbps math pinned (zero elapsed never infinite).
+        assert!((mbps_of(1_250_000, std::time::Duration::from_secs(1)) - 10.0).abs() < 1e-9);
+        assert_eq!(mbps_of(100, std::time::Duration::ZERO), 800.0 / 1e6 * 1e9);
+    }
+
+    /// Group speedtests measure every row (sequential) and stop aborts.
+    #[test]
+    fn t09_speed_group_measures_and_stops() {
+        let configs = vec![
+            fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
+            fixture("2", "Beta", "trojan", "127.0.0.1", 10802),
+        ];
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_speed("2", 50.0);
+        handle.deny_protocol("vless");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = Vec::new();
+        let outcomes = speed_group(
+            &configs,
+            DEFAULT_TEST_URL,
+            SpeedtestMode::Download,
+            SPEED_TEST_TIMEOUT,
+            &prober,
+            &stop,
+            |done, total| progress.push((done, total)),
+        );
+        assert_eq!(outcomes.len(), 2, "denied rows record named skips");
+        assert!(outcomes[0].error.as_deref().unwrap_or("").contains("vless"));
+        assert_eq!(outcomes[1].mbps, Some(50.0));
+        assert_eq!(progress, vec![(1, 2), (2, 2)], "per-row progress");
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        let outcomes = speed_group(
+            &configs,
+            DEFAULT_TEST_URL,
+            SpeedtestMode::Download,
+            SPEED_TEST_TIMEOUT,
+            &prober,
+            &stopped,
+            |_, _| {},
+        );
+        assert!(outcomes.is_empty(), "stopped speed run records nothing");
+    }
+
+    /// Ping groups chunk like test groups and stop aborts (seam coverage
+    /// for the unshipped ping-group action).
+    #[test]
+    fn t09_ping_group_chunks_and_stops() {
+        let configs: Vec<ProxyConfig> = (0..105)
+            .map(|i| {
+                fixture(
+                    &i.to_string(),
+                    &format!("Row{i}"),
+                    "vless",
+                    "127.0.0.1",
+                    10801,
+                )
+            })
+            .collect();
+        let (prober, _) = FakeHealthProber::shared();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = Vec::new();
+        let outcomes = ping_group(&configs, &prober, &stop, |done, total| {
+            progress.push((done, total));
+        });
+        assert_eq!(outcomes.len(), 105);
+        assert_eq!(progress, vec![(100, 105), (105, 105)]);
+        let stopped = std::sync::atomic::AtomicBool::new(true);
+        let outcomes = ping_group(&configs, &prober, &stopped, |_, _| {});
+        assert!(outcomes.is_empty(), "stopped ping run records nothing");
+    }
+
+    /// Clear-tests session half: pruning drops samples + traffic of the
+    /// cleared ids while the other group's rows stay intact.
+    #[test]
+    fn t09_prune_configs_drops_session_state() {
+        let configs = vec![
+            fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
+            fixture("2", "Beta", "vless", "127.0.0.1", 10802),
+        ];
+        let (prober, _) = FakeHealthProber::shared();
+        let mut store = HealthStore::default();
+        for outcome in test_all(&configs, DEFAULT_TEST_URL, &prober) {
+            store.record_outcome(&outcome);
+        }
+        assert!(store.latest("1").is_some());
+        assert_ne!(store.traffic("1"), TrafficStats::default());
+        store.prune_configs(&["1".to_string()].into_iter().collect());
+        assert!(store.latest("1").is_none(), "samples pruned");
+        assert_eq!(
+            store.traffic("1"),
+            TrafficStats::default(),
+            "traffic pruned"
+        );
+        assert!(store.latest("2").is_some(), "other rows kept");
+    }
+
+    /// Fake out-IP answers script per row; failures name the row.
+    #[test]
+    fn t09_out_ip_scripts_per_row() {
+        let config = fixture("1", "Alpha", "vless", "127.0.0.1", 10801);
+        let (prober, handle) = FakeHealthProber::shared();
+        assert_eq!(
+            prober.out_ip(&config, "127.0.0.1", 10801, RESOLVE_IP_URL),
+            Ok("203.0.113.7".to_string()),
+            "documented default"
+        );
+        handle.script_out_ip("1", "198.51.100.9");
+        assert_eq!(
+            prober.out_ip(&config, "127.0.0.1", 10801, RESOLVE_IP_URL),
+            Ok("198.51.100.9".to_string())
+        );
+        handle.script_failure("1", "egress down");
+        assert_eq!(
+            prober.out_ip(&config, "127.0.0.1", 10801, RESOLVE_IP_URL),
+            Err("egress down".to_string())
+        );
     }
 
     /// Scenario 3: a killed upstream flags only its own row; the others keep
@@ -3362,7 +4368,8 @@ mod tests {
     }
 
     /// Ticket 47 (RED): bounded concurrent probes — 16 slow probes finish in
-    /// ~2 waves (8-way) with at most 8 in flight, outcomes in input order.
+    /// ~2 waves (10-way) with at most 10 in flight, outcomes in input order.
+    /// Ticket 09 (throne-adoption): Throne value 10 (was 8).
     #[test]
     fn t47_concurrent_probes_bounded_and_ordered() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3409,7 +4416,7 @@ mod tests {
             }
         }
 
-        assert_eq!(MAX_PROBE_CONCURRENCY, 8, "bound pinned");
+        assert_eq!(MAX_PROBE_CONCURRENCY, 10, "bound pinned");
         let configs: Vec<ProxyConfig> = (0..16)
             .map(|i| {
                 fixture(
@@ -3440,7 +4447,7 @@ mod tests {
         assert!(peak >= 2, "probes overlap, peak was {peak}");
         assert!(
             peak <= MAX_PROBE_CONCURRENCY,
-            "bounded at 8-way, peak was {peak}"
+            "bounded at 10-way, peak was {peak}"
         );
         assert!(
             wall < std::time::Duration::from_millis(800),

@@ -4257,6 +4257,7 @@ dependencies = [
  "gpui-kit",
  "png 0.18.1",
  "raw-window-handle",
+ "regex",
  "rusqlite",
  "serde_json",
  "tray-icon",

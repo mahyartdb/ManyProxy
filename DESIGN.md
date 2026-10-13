@@ -2,19 +2,34 @@
 name: ManyProxy
 description: Local-only proxy library for Windows — a railway signal-box instrument panel.
 colors:
-  primary-ink: "#171717"
-  primary-ink-foreground: "#fafafa"
-  primary-ink-hover: "#262626"
-  paper: "#ffffff"
-  ink: "#0a0a0a"
-  quiet-surface: "#f5f5f5"
-  hairline: "#e5e5e5"
-  muted-ink: "#737373"
-  selection-wash: "#bfdbfe33"
-  selection-rim: "#60a5fa"
-  signal-go: "#22c55e"
-  signal-stop: "#ef4444"
-  chrome-band: "#F8F8F8"
+  dark:
+    primary-ink: "#fafafa"
+    primary-ink-foreground: "#171717"
+    primary-ink-hover: "#e5e5e5"
+    paper: "#101010"
+    ink: "#fafafa"
+    quiet-surface: "#1e1e1e"
+    hairline: "#333333"
+    muted-ink: "#a3a3a3"
+    selection-wash: "#bfdbfe33"
+    selection-rim: "#60a5fa"
+    signal-go: "#22c55e"
+    signal-stop: "#ef4444"
+    chrome-band: "#171717"
+  light:
+    primary-ink: "#171717"
+    primary-ink-foreground: "#fafafa"
+    primary-ink-hover: "#262626"
+    paper: "#ffffff"
+    ink: "#0a0a0a"
+    quiet-surface: "#f5f5f5"
+    hairline: "#e5e5e5"
+    muted-ink: "#737373"
+    selection-wash: "#bfdbfe33"
+    selection-rim: "#60a5fa"
+    signal-go: "#22c55e"
+    signal-stop: "#ef4444"
+    chrome-band: "#F8F8F8"
 typography:
   body:
     fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif"
@@ -71,20 +86,24 @@ Color is signal-only and rides gpui-kit theme tokens everywhere — app code car
 
 Ink, paper, signal: a monochrome working surface where color is information, never ornament. Every value below rides the kit theme — `group_box`, `border`, `radius`, `accent`, `list_hover`, `list_active`, `success`, `danger`, `secondary`, `muted_foreground`, `description_list_label_foreground` — so a future theme propagates without touching app code.
 
+**Dual palettes.** `{colors.X}` anywhere in this file means the active palette's `X` (`colors.dark.X` when Appearance is Dark, `colors.light.X` when Light). Dark is the default; System follows the Windows app-theme flag (`AppsUseLightTheme`) and resolves to one of the two. The monochrome ramps invert between palettes while the signal hues stay byte-identical — green is serving, red is dead-or-destructive, blue is selected-or-checked in both.
+
 ### Primary
 
-- **Switchboard Ink** ({colors.primary-ink}): primary actions (Add, Start) and primary text on light surfaces. Hover deepens to ({colors.primary-ink-hover}).
-- **Paper White** ({colors.paper}): app background, list background, dialog and popover surfaces.
+- **Switchboard Ink** ({colors.primary-ink}): primary actions (Add, Start) and primary text on light surfaces (near-black on light, near-white on dark). Hover deepens to ({colors.primary-ink-hover}).
+- **Paper** ({colors.paper}): app background, list background, dialog and popover surfaces (white on light, near-black on dark).
 
 ### Neutral
 
-- **Working Ink** ({colors.ink}): body foreground on paper.
+- **Working Ink** ({colors.ink}): body foreground on paper (near-black on light, near-white on dark).
 - **Quiet Surface** ({colors.quiet-surface}): row cards and lever-frame plate (`group_box`), list hover ground (`list_hover`), tab bar background.
 - **Hairline** ({colors.hairline}): every 1px separator (`border`) — toolbar base, facet-bar base, card rims, plate rim, title/status bar edges.
 - **Muted Ink** ({colors.muted-ink}): secondary text (`muted_foreground`, `description_list_label_foreground`) — row metadata, stopped badges, endpoint labels, search context, the `Acting on:` echo.
 - **Chrome Band** ({colors.chrome-band}): title bar and status bar bands, edged with hairlines.
 
 ### Selection and signal
+
+Signal meanings are identical in both palettes: the wash and rim stay blue, serving stays green, dead-or-destructive stays red, stopped stays gray. Only the monochrome ground inverts.
 
 - **Selection Wash** ({colors.selection-wash}): the selected row's card fill (`list_active` when the theme highlights, else `accent`) — selection only, never the checked set.
 - **Checked Rim** ({colors.selection-rim}): a 2px accent border on checked rows plus a numeral count chip (`row-check-chip-<id>`, 1-based position in the checked set) — shape and text, never hue alone.
@@ -152,7 +171,7 @@ Restrained and consistent: one button voice, one field voice, one chip voice per
 ### Buttons
 
 - **Shape:** theme-radius corners ({rounded.md}).
-- **Primary:** near-black fill ({colors.primary-ink}) with paper text; hover deepens ({colors.primary-ink-hover}). Used for Add and Start — the two constructive commitments.
+- **Primary:** switchboard-ink fill ({colors.primary-ink}) with contrasting text ({colors.primary-ink-foreground}); hover deepens ({colors.primary-ink-hover}). Used for Add and Start — the two constructive commitments.
 - **Hover / Focus:** kit hover tints plus visible keyboard focus; shortcuts ride as Kbd chips beside labels (Add, Start, Stop, Test, Import, Search) with the full `Name (Key)` string on the accessible name. Destructive commits (remove, bulk delete, clear-checked) return focus to the shell, since the control they acted from unmounts. The inspector header carries the status role so selection changes announce.
 - **Danger:** alarm-red fill ({colors.signal-stop}) with paper text (destructive confirms; the row-menu Delete gates through a naming confirm instead of carrying danger styling).
 - **Small density:** `.small()` variant across toolbar, facet, bulk, detail operate row, and endpoint rows so the full control set fits without scrolling (the nine toolbar buttons ride small so the strip fits the 880px minimum on one row).
@@ -166,7 +185,7 @@ Five persistent throws — Add (`add-config`), Start (`start-selected`), Stop (`
 ### Chips
 
 - **Style:** Tag chips for protocol and group in the detail header; Kbd chips for shortcut hints; Badge with dot for the serving line (green serving, red failed, gray stopped); numeral check chips (`row-check-chip-<id>`) for checked-set position.
-- **State:** chips are read-only labels except Kbd hints, which are part of their buttons. Exclusive choices ride kit `Radio` with real checked state — the subscription interval picker and the log-level row — never bracketed (`[3600]`) or prefixed (`● Error`) text conventions.
+- **State:** chips are read-only labels except Kbd hints, which are part of their buttons. Exclusive choices ride kit `Radio` with real checked state — the subscription interval picker, the log-level row, and the Settings Appearance picker — never bracketed (`[3600]`) or prefixed (`● Error`) text conventions.
 
 ### Cards / Containers
 
@@ -205,7 +224,7 @@ Compact one-line rows (fixed small muted label in the description-label token, t
 
 ### Dialogs
 
-Titled modal, stacked fields, named commit footer sharing one commit closure (mouse and keyboard confirm identically — Add, Save, Import, Export, Move, Attach, Rename, Done, Close — never a bare OK; the export dialog joins the shared footers audit). Confirms resolve with a named affirmative carrying its result (`Delete` / `Overwrite` / `Reset` / `Clear` / `Start` / `Restore` / `Stop all and close`), danger variant on destructive ones. Settings groups into labelled sections (Startup, Probe, Paths, Maintenance) with hairline separators and danger styling on its three destructive buttons. Import previews live valid/invalid counts; export states its plaintext-secret warning verbatim inside a kit error Alert (`export-warning-box`) with a visible safer path (`Copy URLs never carries secrets`); LAN binds stop at an explicit naming confirm naming the config and bind before start, with a post-start warning toast.
+Titled modal, stacked fields, named commit footer sharing one commit closure (mouse and keyboard confirm identically — Add, Save, Import, Export, Move, Attach, Rename, Done, Close — never a bare OK; the export dialog joins the shared footers audit). Confirms resolve with a named affirmative carrying its result (`Delete` / `Overwrite` / `Reset` / `Clear` / `Start` / `Restore` / `Stop all and close`), danger variant on destructive ones. Settings groups into exactly four labelled sections — Basic (Appearance radio `Dark (default) / Light / System→Windows AppsUseLightTheme`, persisted and live with no restart, plus Startup, Probe, Paths, Maintenance), Routing (single-copy link into the presets manager), Preset (read-only inventory), Hotkey (the shortcut reference) — with hairline separators and danger styling on the three destructive Maintenance buttons. Import previews live valid/invalid counts; export states its plaintext-secret warning verbatim inside a kit error Alert (`export-warning-box`) with a visible safer path (`Copy URLs never carries secrets`); LAN binds stop at an explicit naming confirm naming the config and bind before start, with a post-start warning toast.
 
 ## Do's and Don'ts
 
