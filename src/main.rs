@@ -250,7 +250,7 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Inspector details", "Ctrl-1"),
     ("Inspector health", "Ctrl-2"),
     ("Inspector presets", "Ctrl-3"),
-    ("Clear checked", "Esc"),
+    ("Uncheck all", "Esc"),
     ("Copy URLs", "Ctrl-U"),
     ("Command palette", "Ctrl-K"),
 ];
@@ -1358,6 +1358,28 @@ impl ListDelegate for LibraryDelegate {
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                         })
                         .child(Label::new(first)),
+                )
+                // Signal-refined P1: the local port is the row's identity, so
+                // it rides pinned in a fixed trailing cell (never truncated)
+                // instead of hiding last inside the truncating meta line. The
+                // meta line keeps its pinned strings; this cell duplicates
+                // only the port (display-safe, no secrets).
+                .child(
+                    div()
+                        .id(format!("row-port-{row_id}"))
+                        .test_support()
+                        .flex_shrink_0()
+                        .text_sm()
+                        .px_1()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .tooltip({
+                            let tip = format!("Local endpoint {}:{}", row.bind_ip, row.port);
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .aria_label(format!("Local port {} on {}", row.port, row.bind_ip))
+                        .child(format!(":{}", row.port)),
                 );
             if let Some(position) = check_chip {
                 let chip_tip = check_chip_tip(position, checked_total);
@@ -8479,6 +8501,22 @@ impl ImportForm {
         // labelless fields under the inputs.
         let mut form = v_form()
             .small()
+            // Signal-refined P2: the blank box was a leap of faith — one
+            // compact reassurance + shape line rides above the box
+            // (read-only text, never a toast). Single block so the live
+            // preview and first-failure lines stay above the fold.
+            .child(
+                field().label_indent(false).child(
+                    div()
+                        .id("import-guide")
+                        .test_support()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "Paste links — nothing is added until you press Import. vless · vmess · trojan · ss · hysteria · tuic · wg · socks · http · anytls · naive · clash · conf files. e.g. vless://uuid@host:443#name. Drops land anywhere on the window.",
+                        ),
+                ),
+            )
             .child(
                 field().label("Links, JSON, or conf").child(
                     div()
@@ -23815,7 +23853,9 @@ impl AppView {
             .child(
                 Switch::new(switch_id)
                     .checked(config.enabled)
-                    .label("Enabled")
+                    .label("Auto-start")
+                    .accessibility_label("Auto-start")
+                    .tooltip("Auto-start with Start-all — Start/Stop control serving now")
                     .on_change(move |enabled: &bool, window, cx| {
                         let enabled = *enabled;
                         let id = switch_id_for_handler.clone();
@@ -24777,14 +24817,27 @@ impl AppView {
                 .bg(cx.theme().group_box)
                 .border_b_1()
                 .border_color(cx.theme().border)
-                .child(div().id("bulk-label").test_support().child(label))
+                .child(
+                    div()
+                        .id("bulk-label")
+                        .test_support()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| {
+                                Tooltip::new(
+                                    "Blue wash = selected (F5). Blue rim + number = checked (bulk).",
+                                )
+                            })
+                            .into()
+                        })
+                        .child(label),
+                )
                 // T05 (CAP-6): selection verbs first (the opposite pair
-                // stays adjacent so Check-visible / Clear-checked read as
+                // stays adjacent so Check-all-visible / Uncheck-all read as
                 // one choice), then a separator into the state verbs.
                 .child(
                     Button::new("bulk-select-visible")
                         .small()
-                        .label("Check visible")
+                        .label("Check all visible")
                         .tooltip("Check every visible row")
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.select_visible_checked(window, cx);
@@ -24793,8 +24846,8 @@ impl AppView {
                 .child(
                     Button::new("bulk-clear")
                         .small()
-                        .label("Clear checked")
-                        .tooltip("Clear checked (Esc)")
+                        .label("Uncheck all")
+                        .tooltip("Uncheck all (Esc)")
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.clear_checked(window, cx);
                         })),
@@ -24803,7 +24856,7 @@ impl AppView {
                 .child(
                     Button::new("bulk-start")
                         .small()
-                        .label("Start")
+                        .label("Start checked")
                         .tooltip("Start every checked endpoint")
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_start(window, cx);
@@ -24812,7 +24865,7 @@ impl AppView {
                 .child(
                     Button::new("bulk-stop")
                         .small()
-                        .label("Stop")
+                        .label("Stop checked")
                         .tooltip("Stop every checked endpoint")
                         .on_click(cx.listener(|view, _, window, cx| {
                             view.commit_bulk_stop(window, cx);
@@ -26901,17 +26954,18 @@ impl AppView {
             // all five menus in PROGRAM | SETTINGS | GROUPS | ROUTING |
             // TOOLS order.
             .child(div().flex_1())
-            // Ticket 02 (throne-adoption): round global Start/Stop (user
+            // Ticket 02 (throne-adoption): labeled global Start/Stop (user
             // story 9 — one throw controls the room). Play offers
             // Start-all, stop offers Stop-all, and a start in flight shows
             // the `Connecting…` spinner; only Idle/Running act (busy
-            // toasts the guard). Full-radius pill over the glyph reads
-            // round; the pinned name rides the accessible label.
+            // toasts the guard). The glyph + name read together on the
+            // button (a glyph-only toggle violates the short-visible-labels
+            // rule); the pinned name stays on the accessible label.
             .child(
                 Button::new("global-start-stop")
                     .small()
                     .rounded(px(999.))
-                    .label(glyph)
+                    .label(format!("{glyph} {name}"))
                     .accessibility_label(name)
                     .loading(busy)
                     .tooltip(toggle_tip)
@@ -49704,7 +49758,7 @@ mod tests {
             ("Inspector details", "Ctrl-1"),
             ("Inspector health", "Ctrl-2"),
             ("Inspector presets", "Ctrl-3"),
-            ("Clear checked", "Esc"),
+            ("Uncheck all", "Esc"),
             ("Copy URLs", "Ctrl-U"),
             ("Command palette", "Ctrl-K"),
         ];
