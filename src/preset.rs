@@ -1,35 +1,10 @@
-//! Ticket 37: routing-rule presets (Throne-compatible).
-//!
-//! Pure parsers and validators for routing presets. A preset is a named,
-//! ordered list of sing-box route-rule objects applied per row: on start the
-//! rules merge ahead of the row's own isolation rule (see `engine.rs`).
-//!
-//! This module does no I/O, writes nothing, and never fetches: preset URLs
-//! are decoded (never retrieved) here; fetching stays behind an explicit UI
-//! action. Errors name rule indices and fields only — never values, names of
-//! upstreams, or tokens.
-
 use base64::Engine as _;
 use serde_json::Value;
 
-/// Display names (preset names, remote names) truncate here (same cap as the
-/// import grammar — bounded display strings, never unbounded input).
 pub const MAX_PRESET_NAME_CHARS: usize = 256;
 
-/// Route-rule actions a preset may carry. `route` means "route to the
-/// attached row's outbound" (the engine rewrites `outbound` at merge);
-/// `proxy` is the Throne alias of `route` (normalized at merge);
-/// `direct` passes through verbatim; `block` is the Throne spelling of the
-/// sing-box `reject` action and is normalized at merge (live-proven: stock
-/// sing-box 1.14.2 has no `block` action — see [`served_action`]).
-/// `warp`/`warp-bypass` never validate (see [`validate_preset_rules`]):
-/// warp needs an endpoint design, so it fails with a guidance error.
 pub const VALID_PRESET_ACTIONS: &[&str] = &["route", "proxy", "direct", "block", "reject"];
 
-/// Merge-time spelling for a validated preset action. Stored rules keep the
-/// intake spelling (`block` stays `block` in the database); the served
-/// config carries what the sidecar accepts (`reject`, and `proxy` as
-/// `route`).
 pub fn served_action(action: &str) -> &str {
     if action == "block" {
         "reject"
@@ -40,7 +15,6 @@ pub fn served_action(action: &str) -> &str {
     }
 }
 
-/// Machine-readable failure codes for preset parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresetErrorKind {
     Empty,
@@ -66,8 +40,6 @@ impl PresetErrorKind {
     }
 }
 
-/// One rejected preset import. `message` never contains values or secrets —
-/// rule errors name the rule index and the field only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetError {
     pub kind: PresetErrorKind,
@@ -89,15 +61,12 @@ impl std::fmt::Display for PresetError {
     }
 }
 
-/// A decoded preset: name plus ordered route-rule objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetImport {
     pub name: String,
     pub rules: Vec<Value>,
 }
 
-/// A decoded `throne://remoteroute/...` intake: a preset URL plus its name.
-/// Fetching the URL is an explicit UI action elsewhere — never here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePresetRequest {
     pub url: String,
@@ -115,9 +84,6 @@ fn fnv1a_64(text: &str) -> u64 {
 
 pub(crate) fn cap_name(name: String) -> String {
     if name.chars().count() > MAX_PRESET_NAME_CHARS {
-        // Overlong names keep uniqueness with a hash suffix instead of a
-        // bare truncation (two names sharing a 256-char prefix would
-        // otherwise collide into one stored preset).
         let suffix = format!("-{:016x}", fnv1a_64(&name));
         let keep = MAX_PRESET_NAME_CHARS.saturating_sub(suffix.len());
         let mut truncated: String = name.chars().take(keep).collect();
@@ -135,9 +101,6 @@ fn bad_rule(index: usize, detail: impl Into<String>) -> PresetError {
     )
 }
 
-/// Validate ordered route-rule objects field-by-field. Every rejection names
-/// the rule index and the field — never values. Shape check only (object +
-/// known `action`); sing-box `check` stays authoritative for matcher shapes.
 pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
     for (index, rule) in rules.iter().enumerate() {
         let obj = rule
@@ -147,9 +110,7 @@ pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
             .get("action")
             .and_then(Value::as_str)
             .ok_or_else(|| bad_rule(index, "field \"action\" is required"))?;
-        // Ticket 42 (US-29): `warp`/`warp-bypass` have no endpoint to point
-        // at — a guidance error naming the missing design, never a bare
-        // BadRule and never a silent drop.
+
         if action == "warp" || action == "warp-bypass" {
             return Err(bad_rule(
                 index,
@@ -167,12 +128,7 @@ pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
                 ),
             ));
         }
-        // Ticket 42: `proxy` aliases `route` (both point at the row's
-        // serving tag at merge). The `outbound` rule mirrors the engine
-        // merge: route-like actions may carry a string `outbound`
-        // (overwritten with the serving tag at merge); every other action
-        // must not carry one (the merge rejects it — intake must too,
-        // never a late failure after the preset stored).
+
         if action == "route" || action == "proxy" {
             if let Some(outbound) = obj.get("outbound") {
                 if !outbound.is_string() {
@@ -196,9 +152,6 @@ fn preset_name_from(obj: &serde_json::Map<String, Value>) -> Option<String> {
         .map(cap_name)
 }
 
-/// Strip leading UTF-8 BOMs (mirrors the import grammar: a BOM is not
-/// whitespace to `str::trim`, so BOM-prefixed bodies strip here before any
-/// `{`/`[` sniffing).
 fn strip_preset_bom(text: &str) -> &str {
     let mut rest = text;
     while let Some(stripped) = rest.strip_prefix('\u{FEFF}') {
@@ -207,9 +160,6 @@ fn strip_preset_bom(text: &str) -> &str {
     rest
 }
 
-/// Parse preset JSON: an object with a name plus a `rules` array, or a bare
-/// rules array (named by `default_name`, e.g. the file stem). Rejections name
-/// the field, or the rule index + field for bad rules.
 pub fn parse_preset_json(text: &str, default_name: &str) -> Result<PresetImport, PresetError> {
     let trimmed = strip_preset_bom(text.trim()).trim();
     if trimmed.is_empty() {
@@ -241,9 +191,7 @@ pub fn parse_preset_json(text: &str, default_name: &str) -> Result<PresetImport,
             "preset must be an object or a rules array",
         )
     })?;
-    // Ticket 42 (US-28): the Throne kind envelope is checked when present
-    // (`kind` must be `throne-route-profile`, `v` must be 1) — a foreign
-    // envelope never stores silently as routing policy.
+
     if let Some(kind) = obj.get("kind").and_then(Value::as_str) {
         if kind != "throne-route-profile" {
             return Err(PresetError::new(
@@ -293,11 +241,6 @@ pub fn parse_preset_json(text: &str, default_name: &str) -> Result<PresetImport,
     Ok(PresetImport { name, rules })
 }
 
-/// True when pasted/dropped text is preset JSON rather than endpoint input.
-/// Preset shape: an object carrying a `rules` array and none of the endpoint
-/// container keys (`outbounds`, `type`/`protocol`, `servers`, `proxies`,
-/// `library`) — a full sing-box config has `outbounds` and stays on the
-/// endpoint path.
 pub fn looks_like_preset_json(text: &str) -> bool {
     let trimmed = strip_preset_bom(text.trim()).trim();
     if trimmed.starts_with('{') {
@@ -314,9 +257,6 @@ pub fn looks_like_preset_json(text: &str) -> bool {
             _ => false,
         }
     } else if trimmed.starts_with('[') {
-        // A bare rules array (the parser names it by the file stem): every
-        // element must be an object carrying an `action` string. Anything
-        // else (endpoint batches, link lists) stays on the endpoint path.
         match serde_json::from_str::<Value>(trimmed) {
             Ok(Value::Array(items)) if !items.is_empty() => items.iter().all(|item| {
                 item.as_object()
@@ -329,8 +269,6 @@ pub fn looks_like_preset_json(text: &str) -> bool {
     }
 }
 
-/// Standard-base64 decode with the addsub contract (standard alphabet only:
-/// urlsafe bytes are rejected; whitespace is ignored).
 fn decode_std_b64(payload: &str) -> Result<Vec<u8>, PresetError> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
     let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
@@ -352,8 +290,6 @@ fn decode_std_b64(payload: &str) -> Result<Vec<u8>, PresetError> {
         .map_err(|_| PresetError::new(PresetErrorKind::BadBase64, "bad base64 payload"))
 }
 
-/// Byte-safe `throne://<command>/...` split (never slices inside a
-/// non-ASCII char — the prefix match is ASCII so the split is safe).
 fn split_throne_command(line: &str) -> Result<(&str, &str), PresetError> {
     let text = line.trim();
     let sep = text
@@ -372,8 +308,6 @@ fn split_throne_command(line: &str) -> Result<(&str, &str), PresetError> {
     }
 }
 
-/// True for single-line `throne://route/...` intake (scheme and command both
-/// case-insensitive, mirroring the addsub routing check).
 pub fn is_route_attempt(line: &str) -> bool {
     let trimmed = line.trim();
     let Some(sep) = trimmed.find("://") else {
@@ -389,7 +323,6 @@ pub fn is_route_attempt(line: &str) -> bool {
         .eq_ignore_ascii_case("route")
 }
 
-/// True for single-line `throne://remoteroute/...` intake.
 pub fn is_remote_route_attempt(line: &str) -> bool {
     let trimmed = line.trim();
     let Some(sep) = trimmed.find("://") else {
@@ -405,8 +338,6 @@ pub fn is_remote_route_attempt(line: &str) -> bool {
         .eq_ignore_ascii_case("remoteroute")
 }
 
-/// Urlsafe-base64 decode (the route-link counterpart to [`decode_std_b64`]:
-/// standard bytes are rejected, whitespace is ignored).
 fn decode_urlsafe_b64(payload: &str) -> Result<Vec<u8>, PresetError> {
     use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
     let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
@@ -428,10 +359,6 @@ fn decode_urlsafe_b64(payload: &str) -> Result<Vec<u8>, PresetError> {
         .map_err(|_| PresetError::new(PresetErrorKind::BadBase64, "bad base64 payload"))
 }
 
-/// Decode `throne://route/...` (the addsub envelope contract, extended by
-/// ticket 42): standard-base64 of preset JSON, urlsafe-base64 of preset
-/// JSON, or the raw preset JSON itself. The kind envelope (`kind`/`v`) is
-/// checked when present; rejections never echo the payload.
 pub fn decode_route_link(line: &str) -> Result<PresetImport, PresetError> {
     let (command, payload) = split_throne_command(line)?;
     if !command.eq_ignore_ascii_case("route") {
@@ -456,10 +383,6 @@ pub fn decode_route_link(line: &str) -> Result<PresetImport, PresetError> {
     parse_preset_json(&inner, "")
 }
 
-/// True for loopback/private/link-local/unspecified hosts (IP literals only;
-/// hostnames are never internal without DNS). Mirrors the store subscription
-/// policy — preset.rs is a leaf module (the store depends on it), so the
-/// classifier lives here too instead of importing the store.
 fn is_internal_host(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
     let bare = lower.strip_suffix('.').unwrap_or(&lower);
@@ -470,11 +393,6 @@ fn is_internal_host(host: &str) -> bool {
         match ip {
             std::net::IpAddr::V4(v4) => return is_internal_v4(&v4),
             std::net::IpAddr::V6(v6) => {
-                // IPv4-mapped forms (`::ffff:127.0.0.1`) carry an IPv4
-                // loopback/private address — judge the mapped address,
-                // never the wrapper. (`to_ipv4_mapped`, not `to_ipv4`:
-                // the latter also maps `::1` to `0.0.0.1`, which would
-                // slip the loopback gate.)
                 if let Some(mapped) = v6.to_ipv4_mapped() {
                     return is_internal_v4(&mapped);
                 }
@@ -501,10 +419,6 @@ fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
         || octets[0] == 127
 }
 
-/// Decode `throne://remoteroute/<base64 of "<url>[#name]">` (standard or
-/// urlsafe alphabet, like the route link). The URL must be `http(s)` and
-/// must not target an internal host (same SSRF guard as subscription
-/// intake); the name falls back to the URL host.
 pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, PresetError> {
     let (command, payload) = split_throne_command(line)?;
     if !command.eq_ignore_ascii_case("remoteroute") {
@@ -549,7 +463,7 @@ pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, Prese
             "preset url must use http(s)",
         ));
     };
-    // Errors never echo the URL (tokens hide in queries).
+
     let authority = after_scheme.split('/').next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or(authority);
     let host = if let Some(rest) = host.strip_prefix('[') {
@@ -580,12 +494,6 @@ pub fn decode_remote_route_link(line: &str) -> Result<RemotePresetRequest, Prese
     })
 }
 
-/// Ticket 10 (throne-adoption US-29): share a stored preset as a
-/// `throne://route/...` link (standard-base64 of the preset object —
-/// the first encoding [`decode_route_link`] accepts, so the link always
-/// round-trips). Never empty: even a zero-rule preset encodes its name.
-/// Rule content rides the link by design (routing policy, not secrets —
-/// presets carry no credentials); error text never echoes payloads.
 pub fn preset_share_link(name: &str, rules: &[Value]) -> String {
     use base64::Engine as _;
     let body = serde_json::json!({"name": name, "rules": rules}).to_string();
@@ -593,17 +501,8 @@ pub fn preset_share_link(name: &str, rules: &[Value]) -> String {
     format!("throne://route/{payload}")
 }
 
-/// Ticket 10 (US-29): actions the Basic builder and the Advanced action
-/// combo may offer. `route`/`proxy` both point at the attached row's
-/// outbound at merge ([`served_action`]); `warp`/`warp-bypass` are never
-/// offered (no endpoint design — see [`validate_preset_rules`]).
 pub const BASIC_PRESET_ACTIONS: &[&str] = &["direct", "proxy", "block"];
 
-/// Ticket 10 (US-29): build the rules for a New-Structured preset — one
-/// catch-all rule carrying `action` (the Basic 2×2 collapses to one row:
-/// every category Direct|Proxy|Block). Rejects anything outside
-/// [`BASIC_PRESET_ACTIONS`] (warp fails with the same guidance error as
-/// [`validate_preset_rules`], never a silent drop).
 pub fn structured_preset_rules(action: &str) -> Result<Vec<Value>, PresetError> {
     if !BASIC_PRESET_ACTIONS.contains(&action) {
         if action == "warp" || action == "warp-bypass" {
@@ -623,10 +522,6 @@ pub fn structured_preset_rules(action: &str) -> Result<Vec<Value>, PresetError> 
     Ok(rules)
 }
 
-/// Ticket 10 (US-29): rewrite one rule's action in place (the Advanced
-/// action combo). The rewrite validates like intake: unknown actions and
-/// warp fail with the indexed error, and a `direct`/`block` rule keeps no
-/// stale `outbound` (the merge would refuse it — intake refuses first).
 pub fn set_rule_action(rule: &mut Value, action: &str) -> Result<(), PresetError> {
     if !VALID_PRESET_ACTIONS.contains(&action) && action != "proxy" {
         return validate_preset_rules(&[serde_json::json!({"action": action})]);
@@ -641,16 +536,12 @@ pub fn set_rule_action(rule: &mut Value, action: &str) -> Result<(), PresetError
     validate_preset_rules(std::slice::from_ref(rule))
 }
 
-/// Ticket 10 (US-29): per-attribute tabs present on one rule — the matcher
-/// groups the Advanced editor shows as tabs. `Action` always leads (every
-/// rule carries one); matcher keys map to their tab; unknown keys fold
-/// into `Other` (never dropped, never a new tab per key).
 pub fn rule_attribute_tabs(rule: &Value) -> Vec<&'static str> {
     let mut tabs = vec!["Action"];
     let Some(obj) = rule.as_object() else {
         return tabs;
     };
-    // (matcher key, tab) in stable tab order.
+
     const GROUPS: &[(&str, &str)] = &[
         ("domain", "Domain"),
         ("domain_suffix", "Domain"),
@@ -852,10 +743,6 @@ mod tests {
         validate_preset_rules(&sample_rules()).expect("sample rules validate");
     }
 
-    // -- Ticket 42: envelope + aliases -----------------------------------
-    // Route links accept three encodings with a checked kind envelope;
-    // `proxy` aliases `route`; `warp` fails with a guidance error; BOMs parse.
-
     fn t42_route_payload(inner: &str) -> (String, String) {
         use base64::Engine as _;
         let std = base64::engine::general_purpose::STANDARD.encode(inner.as_bytes());
@@ -863,8 +750,6 @@ mod tests {
         (std, urlsafe)
     }
 
-    /// Ticket 42 (US-28): route links store in standard-b64, urlsafe-b64,
-    /// and raw JSON encodings.
     #[test]
     fn t42_route_link_three_encodings_decode() {
         let inner = r#"{"name":"t42","rules":[{"action":"direct"}]}"#;
@@ -880,8 +765,6 @@ mod tests {
         }
     }
 
-    /// Ticket 42 (US-28): the kind envelope is checked when present
-    /// (`kind` must be `throne-route-profile`, `v` must be 1).
     #[test]
     fn t42_route_link_kind_envelope_checked() {
         let ok =
@@ -901,15 +784,12 @@ mod tests {
         assert!(error.message.contains("\"v\""), "names v: {error}");
     }
 
-    /// Ticket 42 (US-29): `proxy` validates like `route` and serves as it.
     #[test]
     fn t42_proxy_action_valid_and_served_as_route() {
         validate_preset_rules(&[serde_json::json!({"action": "proxy"})]).expect("proxy validates");
         assert_eq!(served_action("proxy"), "route");
     }
 
-    /// Ticket 42 (US-29): `warp`/`warp-bypass` fail with a guidance error
-    /// naming the missing endpoint design (never a bare BadRule).
     #[test]
     fn t42_warp_action_guidance_error() {
         for action in ["warp", "warp-bypass"] {
@@ -924,7 +804,6 @@ mod tests {
         }
     }
 
-    /// Ticket 42 (US-28): BOM-prefixed preset JSON parses (strip like import).
     #[test]
     fn t42_preset_bom_parses() {
         let parsed = parse_preset_json(
@@ -935,9 +814,6 @@ mod tests {
         assert_eq!(parsed.name, "bom");
     }
 
-    /// Ticket 42 (US-28): a remoteroute URL blocked at decode time is also
-    /// blocked at fetch time (the fetch re-checks the SSRF policy — decode
-    /// alone is insufficient against redirect/plain-http drift).
     #[test]
     fn t42_remoteroute_fetch_policy_parity() {
         use base64::Engine as _;
@@ -951,9 +827,6 @@ mod tests {
         ));
     }
 
-    /// Ticket 48 (US-66): BOM-prefixed preset bodies parse (object, bare
-    /// array, doubled BOM); `looks_like` spots the shape through the BOM.
-    /// (Single-object BOM parsing itself is ticket-42 covered above.)
     #[test]
     fn t48_bom_prefixed_preset_json_parses() {
         let object = "\u{FEFF}{\"name\":\"bom\",\"rules\":[{\"action\":\"direct\"}]}";
@@ -975,8 +848,6 @@ mod tests {
         assert!(!looks_like_preset_json("\u{FEFF}vless://u@h:1"));
     }
 
-    /// Overlong preset names stay bounded at 256 chars with a hash suffix
-    /// (two names sharing a prefix never collide into one preset).
     #[test]
     fn long_preset_name_truncates_to_256_chars() {
         let long = "a".repeat(300);
@@ -989,7 +860,6 @@ mod tests {
         assert_ne!(parsed.name, parsed_other.name, "prefix collision avoided");
     }
 
-    /// A remote-route link without `#name` falls back to the URL host.
     #[test]
     fn remote_route_link_without_name_falls_back_to_host() {
         let payload = b64("https://example.com/preset.json");
@@ -999,9 +869,6 @@ mod tests {
         assert_eq!(request.name, "example.com");
     }
 
-    /// Intake mirrors the engine merge: `outbound` needs a route-like
-    /// action (a stored direct/reject rule carrying one would fail at
-    /// serve time instead).
     #[test]
     fn non_route_outbound_rejected_at_intake() {
         for action in ["direct", "reject", "block"] {
@@ -1018,8 +885,6 @@ mod tests {
         .expect("route may carry outbound");
     }
 
-    /// Bare rules arrays route to the preset path (objects with actions);
-    /// anything else stays on the endpoint path.
     #[test]
     fn bare_array_routes_to_preset_path() {
         assert!(looks_like_preset_json(r#"[{"action":"direct"}]"#));
@@ -1029,13 +894,10 @@ mod tests {
         assert!(!looks_like_preset_json("vless://u@h:1"));
     }
 
-    /// Remote-route links accept the urlsafe alphabet (mirrors route links).
     #[test]
     fn remote_route_link_accepts_urlsafe_base64() {
         use base64::Engine as _;
-        // U+FFFF (bytes EF BF BF) urlsafe-encodes to a chunk containing
-        // `-_`, which standard decoding rejects — deterministically
-        // exercising the urlsafe fallback.
+
         let inner = "https://example.com/p.json#\u{FFFF}";
         let payload = base64::engine::general_purpose::URL_SAFE.encode(inner.as_bytes());
         assert!(payload.contains('-') || payload.contains('_'));
@@ -1048,8 +910,6 @@ mod tests {
         assert_eq!(request.name, "\u{FFFF}");
     }
 
-    /// IPv4-mapped loopback and localhost subdomains never pass the SSRF
-    /// guard (same policy the fetch re-checks).
     #[test]
     fn internal_host_blocks_mapped_loopback_and_localhost() {
         assert!(is_internal_host("::ffff:127.0.0.1"));
@@ -1059,12 +919,6 @@ mod tests {
         assert!(!is_internal_host("93.184.216.34"));
     }
 
-    // -- Ticket 10: manager seams ----------------------------------------
-    // Share-out links round-trip; the structured builder and the action
-    // combo stay inside proxy|direct|block (warp never serves).
-
-    /// Ticket 10 (US-29): the manager Export-copy-link round-trips through
-    /// the intake (name + rules survive; even zero-rule shells encode).
     #[test]
     fn t10_preset_share_link_round_trips() {
         let rules = sample_rules();
@@ -1080,8 +934,6 @@ mod tests {
         assert!(parsed.rules.is_empty());
     }
 
-    /// Ticket 10 (US-29): the structured builder serves one catch-all rule
-    /// per Basic action; anything else (incl. warp) fails loudly.
     #[test]
     fn t10_structured_preset_rules_cover_basic_actions() {
         for action in ["direct", "proxy", "block"] {
@@ -1096,8 +948,6 @@ mod tests {
         }
     }
 
-    /// Ticket 10 (US-29): the Advanced action combo rewrites in place,
-    /// drops stale `outbound` off route-like actions, and refuses warp.
     #[test]
     fn t10_set_rule_action_rewrites_and_cleans_outbound() {
         let mut rule = serde_json::json!({"action": "route", "outbound": "tag"});
@@ -1113,8 +963,6 @@ mod tests {
         assert_eq!(rule.get("action").and_then(Value::as_str), Some("direct"));
     }
 
-    /// Ticket 10 (US-29): per-attribute tabs name the matcher groups
-    /// present (Action always leads; unknown keys fold into Other).
     #[test]
     fn t10_rule_attribute_tabs_name_matcher_groups() {
         assert_eq!(

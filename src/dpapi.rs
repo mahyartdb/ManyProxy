@@ -1,16 +1,9 @@
-//! Ticket 35: Windows DPAPI (user scope) for secrets at rest.
-//!
-//! Hand-rolled `crypt32.dll` FFI — two calls, no `windows`-crate weight.
-//! `protect`/`unprotect` are bytes in/bytes out; the `dpapi1:` storage
-//! marker lives in [`seal_params`]/[`unseal_params`]. Errors name the
-//! operation only (never secret bytes, never lengths that leak shape).
-
 #[cfg(windows)]
 use std::ffi::c_void;
 
 #[cfg(windows)]
 const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
-/// Storage marker: `dpapi1:<base64(ciphertext)>`.
+
 pub const MARKER: &str = "dpapi1:";
 
 #[cfg(windows)]
@@ -59,10 +52,6 @@ unsafe extern "system" {
     fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
 }
 
-/// Encrypt `plaintext` for the current Windows user. Fails loudly when
-/// DPAPI is unavailable (never silently returns plaintext).
-/// Ticket 48: off Windows this is a loud stub — secrets at rest need
-/// Windows DPAPI, so the app is documented Windows-only (see README).
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     if fail_for_test() {
         return Err("dpapi protect failed (injected for test)".to_string());
@@ -72,9 +61,6 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(windows)]
 fn protect_platform(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    // SAFETY: in-blob borrows the caller's slice for the duration of the
-    // call; all pointers are null except the input; UI is forbidden so the
-    // call never blocks on a dialog. The out-blob is copied then freed.
     unsafe {
         let input = DataBlob {
             cb_data: plaintext.len() as u32,
@@ -102,8 +88,6 @@ fn protect_platform(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Ticket 48: non-Windows loud stub (documented Windows-only). Never
-/// returns plaintext, never succeeds without the OS key.
 #[cfg(not(windows))]
 fn protect_platform(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
     Err(
@@ -112,14 +96,12 @@ fn protect_platform(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
     )
 }
 
-/// Decrypt a blob from [`protect`]. Tampered or foreign blobs fail loudly.
 pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
     unprotect_platform(blob)
 }
 
 #[cfg(windows)]
 fn unprotect_platform(blob: &[u8]) -> Result<Vec<u8>, String> {
-    // SAFETY: same contract as [`protect`].
     unsafe {
         let input = DataBlob {
             cb_data: blob.len() as u32,
@@ -151,7 +133,6 @@ fn unprotect_platform(blob: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Ticket 48: non-Windows loud stub (documented Windows-only).
 #[cfg(not(windows))]
 fn unprotect_platform(_blob: &[u8]) -> Result<Vec<u8>, String> {
     Err(
@@ -160,7 +141,6 @@ fn unprotect_platform(_blob: &[u8]) -> Result<Vec<u8>, String> {
     )
 }
 
-/// Seal a params string for storage: `dpapi1:<base64>`.
 pub fn seal_params(plaintext: &str) -> Result<String, String> {
     if fail_for_test() {
         return Err("dpapi protect failed (injected for test)".to_string());
@@ -174,13 +154,9 @@ pub fn seal_params(plaintext: &str) -> Result<String, String> {
     })
 }
 
-/// Open a stored params string. Sealed values decrypt; legacy plaintext
-/// passes through (migration window only — migration seals everything).
-/// Unknown markers fail loudly (never guessed).
 pub fn unseal_params(stored: &str) -> Result<String, String> {
     use base64::Engine as _;
-    // Trim both sides consistently: detection and decoding agree whether
-    // the caller pasted leading whitespace, trailing newlines, or neither.
+
     let trimmed = stored.trim();
     if let Some(rest) = trimmed.strip_prefix(MARKER) {
         let bytes = base64::engine::general_purpose::STANDARD
@@ -190,9 +166,7 @@ pub fn unseal_params(stored: &str) -> Result<String, String> {
         return String::from_utf8(plain)
             .map_err(|_| "dpapi params are not valid utf-8".to_string());
     }
-    // Legacy plaintext passes through ONLY as a JSON object: `"{garbage"`
-    // (or any other non-JSON) fails loudly instead of smuggling corrupt
-    // params into the library as a trusted row.
+
     if trimmed.starts_with('{') {
         let is_object = serde_json::from_str::<serde_json::Value>(trimmed)
             .map(|value| value.is_object())
@@ -209,7 +183,6 @@ thread_local! {
     static FAIL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test seam: force [`protect`]/[`seal_params`] to fail loudly on this thread.
 #[allow(dead_code)]
 pub fn set_fail_for_test(fail: bool) {
     FAIL_FOR_TEST.with(|flag| flag.set(fail));
@@ -223,8 +196,6 @@ fn fail_for_test() -> bool {
 mod tests {
     use super::*;
 
-    /// Reset the fail seam on drop so a panicking assertion never poisons
-    /// a later test sharing this thread.
     struct FailGuard;
 
     impl FailGuard {
@@ -240,7 +211,6 @@ mod tests {
         }
     }
 
-    /// Ticket 48 (US-60): bytes round-trip, including empty and unicode.
     #[cfg(windows)]
     #[test]
     fn t48_protect_roundtrip() {
@@ -257,7 +227,6 @@ mod tests {
         }
     }
 
-    /// Ticket 48 (US-60): sealed storage round-trips with the marker shape.
     #[cfg(windows)]
     #[test]
     fn t48_seal_roundtrip() {
@@ -266,16 +235,9 @@ mod tests {
         assert_eq!(unseal_params(&sealed).expect("unseal works"), "{\"a\":1}");
     }
 
-    /// Ticket 48 (US-60): rejection table — every bad shape fails loudly
-    /// with a named cause, never silent plaintext, never a guess.
     #[cfg(windows)]
     #[test]
     fn t48_unseal_rejection_table() {
-        // Tampered blob: still valid base64, but DPAPI integrity fails.
-        // The flip lands near the tail inside the encrypted payload:
-        // DPAPI MACs the payload, not the header, so a header flip (or
-        // a last-char flip that only appends a tolerated zero byte when
-        // it replaces padding) still decrypts.
         let sealed = seal_params("{\"a\":1}").expect("seal works");
         let mut tampered = sealed.clone();
         let at = tampered.len() - 8;
@@ -291,7 +253,7 @@ mod tests {
             unseal_params(&tampered).is_err(),
             "tampered blob fails loudly"
         );
-        // Random bytes are no DPAPI blob either (foreign-blob class).
+
         {
             use base64::Engine as _;
             let foreign = format!(
@@ -303,9 +265,7 @@ mod tests {
                 "foreign blob fails loudly"
             );
         }
-        // NOTE: the non-UTF8 arm needs DPAPI itself to decrypt to
-        // non-UTF8 bytes, which no same-profile ciphertext can produce;
-        // the foreign-blob arms above pin loud failure for that class.
+
         for (stored, needle) in [
             (format!("{MARKER}!!!"), "base64"),
             (MARKER.to_string(), "dpapi"),
@@ -319,7 +279,7 @@ mod tests {
                 "named cause ({needle}), got {error}"
             );
         }
-        // Legacy migration-window plaintext passes through verbatim.
+
         for legacy in ["{\"a\":1}", "   {\"a\":1}  "] {
             assert_eq!(
                 unseal_params(legacy).expect("legacy passes through"),
@@ -328,7 +288,6 @@ mod tests {
         }
     }
 
-    /// Ticket 48 (US-60): the injected DPAPI outage fails writes loudly.
     #[test]
     fn t48_fail_seam_aborts_writes_loudly() {
         let _guard = FailGuard::on();
@@ -340,8 +299,6 @@ mod tests {
         }
     }
 
-    /// Sealed values tolerate trailing whitespace (copy/paste with a
-    /// newline still opens to the same params).
     #[cfg(windows)]
     #[test]
     fn unseal_tolerates_trailing_whitespace() {
@@ -359,8 +316,6 @@ mod tests {
         }
     }
 
-    /// An empty blob is no DPAPI ciphertext: it fails loudly, never
-    /// silent plaintext, never an empty success.
     #[test]
     fn unprotect_empty_blob_fails_loud() {
         let error = unprotect(&[]).expect_err("empty blob must fail");
@@ -371,9 +326,6 @@ mod tests {
         );
     }
 
-    /// Brace-led but not a JSON object (`"{garbage"`) is refused, never
-    /// passed through as legacy plaintext; sealed detection trims both
-    /// sides like the trailing-whitespace arm.
     #[test]
     fn unseal_rejects_brace_led_non_json() {
         for bad in ["{garbage", "{", "[1,2]", "\"str\"", "   {oops"] {
@@ -389,9 +341,6 @@ mod tests {
         );
     }
 
-    /// Ticket 48 (US-66): off Windows every DPAPI op is a loud stub —
-    /// never silent plaintext, never a success without the OS key. Legacy
-    /// plaintext still passes through (there is nothing to seal with).
     #[cfg(not(windows))]
     #[test]
     fn t48_non_windows_dpapi_is_a_loud_stub() {

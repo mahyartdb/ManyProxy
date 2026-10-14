@@ -1,20 +1,3 @@
-# Ticket 48: opt-in live sidecar proofs (pinned sing-box, default off).
-#
-# The default suite (`cargo test`) is hermetic: the live tests below
-# return immediately unless their gate env vars are set, so normal CI
-# and local runs never download anything or spawn real sidecars.
-# This workflow is the ONLY place that sets the gates. It runs only on
-# manual dispatch (workflow_dispatch) — never on push/PR — with a
-# pinned sing-box version (default 1.14.2, the version the generator
-# targets; see the 1.14.2 schema contract in the research brief).
-#
-# Gates (see engine.rs live tests):
-# - MANYPROXY_LIVE_CHECK=1   — stock sing-box `check` over every
-#   generated row shape (TEMP config files only, removed afterwards).
-# - MANYPROXY_LIVE_TRAFFIC=1 — real sidecar run + clash-controller
-#   totals/Auth/totals-move proof (loopback + TEMP files only; the
-#   sidecar is killed before the test returns).
-# - MANYPROXY_SINGBOX_BIN    — the pinned binary under test.
 
 name: live
 

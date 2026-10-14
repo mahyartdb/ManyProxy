@@ -1,43 +1,3 @@
-//! Ticket 05: standard multi-engine (one combined sidecar config).
-//!
-//! One generated engine config serves N active library rows: one `mixed`
-//! (SOCKS5+HTTP) inbound per active config on its loopback-default bind, N
-//! outbounds/`endpoints` built from the stored protocol params, and
-//! `route.rules[]` mapping each inbound to exactly its own outbound
-//! (`{"action":"route","outbound":...}` form) with a `direct` catch-all
-//! (`route.final`). WireGuard clients become `endpoints[]` (sing-box ≥1.11).
-//!
-//! The engine runs as a supervised sidecar child process. Unit and headless
-//! UI tests never touch a real binary or remote server: [`EngineBackend`] is
-//! the trait seam, [`FakeEngineBackend`] is the mock driver.
-//!
-//! Hard prohibitions (spec + contracts): never set the system proxy, never
-//! TUN, never DNS rewrite, no admin for loopback use. The generator emits
-//! none of those keys and [`generate`] rejects them structurally.
-//!
-//! Ticket 07 (fork-core exotic, extends — never rewrites — ticket 05):
-//! AmneziaWG-variant and Noise/XHTTP rows run beside standard rows via a
-//! compatible fork-core binary (`sing-box-awg`). AWG params validate against
-//! an explicit version matrix (2.0: jc/jmin/jmax/s1-s4/h1-h4/i1-i5; 3.x adds
-//! header-protection/padding/trailers/ranged-timings per the official
-//! AmneziaWG docs); cross-version and unknown fields fail with named errors.
-//! Wrong-layer mixes (AWG fields on stock rows, Xray noise/finalmask on AWG
-//! rows) fail at validation, never silently. XHTTP transports route via the
-//! fork with known-bug notes surfaced in errors. The fork never replaces
-//! stock handling: stock-only sets never probe the fork binary, and a missing
-//! fork binary fails only exotic rows.
-//!
-//! Ticket 08 (Xray sidecar + custom + chaining, extends — never rewrites —
-//! tickets 05/07): Xray-only VLESS rows run in a supervised `xray` sidecar
-//! bridged to the main config over loopback ingress listeners (research 02
-//! sidecar-bridge model). Custom outbound JSON rows merge into their owning
-//! core's generated config (`core`: stock/fork/xray); custom full-config rows
-//! replace the generated config for their owning core. One user extra-core
-//! executable slot runs unprivileged from the app dir with its config file
-//! passed through. Chains carry inline hops (or same-sidecar id references)
-//! with the egress-only rule: Extra/Custom/Xray nodes must be last.
-//! Standard + AWG handling below is untouched.
-
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -52,38 +12,20 @@ use std::time::{Duration, Instant};
 
 use crate::store::ProxyConfig;
 
-/// Base name of the sidecar binary (resolved in the app dir).
 pub const ENGINE_BINARY_BASE: &str = "sing-box";
 
-/// Ticket 07: base name of the compatible fork-core binary (AWG/Noise/XHTTP
-/// capable sing-box fork). Stock handling never consults it: only exotic
-/// rows resolve it.
 pub const FORK_BINARY_BASE: &str = "sing-box-awg";
 
-/// Ticket 07: known fork issue surfaced in every XHTTP-related error
-/// (research 02): fork XHTTP `stream-one`/`auto` modes are unreliable, and
-/// sidecar XHTTP pins the Xray version.
 pub const XHTTP_KNOWN_BUGS: &str = "known fork issue: XHTTP stream-one/auto modes are unreliable (research 02); if streams stall, pin a working mode or Xray-sidecar version";
 
-/// Ticket 08: base name of the Xray-core sidecar binary (Xray-only VLESS
-/// rows run here, bridged to the main config over loopback ingress
-/// listeners; research 02 sidecar-bridge model).
 pub const XRAY_BINARY_BASE: &str = "xray";
 
-/// Ticket 36: loopback clash-controller range for per-core traffic
-/// metering. Disjoint from endpoints (10801-10999 + 18081 spillover),
-/// the xray bridge (11801-11999), and row binds.
 pub const CLASH_PORT_START: u16 = 18501;
 pub const CLASH_PORT_END: u16 = 18999;
 
-/// Ticket 41: human names for the controller-reserved listen ranges.
-/// User rows must never bind inside either range: the clash controllers
-/// and the xray bridge listeners live there. Validation names the range
-/// before any spawn (and the save gate names it before any write).
 pub const CLASH_RESERVED_NAME: &str = "clash-controller range 18501-18999";
 pub const XRAY_RESERVED_NAME: &str = "xray-bridge range 11801-11999";
 
-/// Ticket 41: the reserved range containing `port`, if any.
 pub fn reserved_range_of(port: u16) -> Option<&'static str> {
     if (CLASH_PORT_START..=CLASH_PORT_END).contains(&port) {
         Some(CLASH_RESERVED_NAME)
@@ -94,7 +36,6 @@ pub fn reserved_range_of(port: u16) -> Option<&'static str> {
     }
 }
 
-/// Ticket 36: one clash controller identity per serving core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClashTarget {
     pub core: String,
@@ -102,11 +43,6 @@ pub struct ClashTarget {
     pub secret: String,
 }
 
-/// Ticket 36: loopback bearer secret (32 hex chars = 128 bits, regenerated
-/// per start, in-memory only, never persisted).
-/// Ticket 41: 128-bit via `getrandom` (OS CSPRNG). A `getrandom` failure
-/// falls back to two domain-separated hashes (pid + wall clock + atomic
-/// nonce + core) — still 32 hex chars, still never panics, never logged.
 fn clash_secret(core: &str) -> String {
     let mut bytes = [0u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
@@ -132,21 +68,10 @@ fn clash_secret(core: &str) -> String {
     out
 }
 
-/// Ticket 41: bind-and-hold one clash-controller port. The returned
-/// listener stays alive in `holds` until the sidecar has taken the port,
-/// so no sibling process can win the race between reservation and spawn
-/// (the old pick-then-probe sequence had that TOCTOU window). Iterates the
-/// whole range, so a transient holder just shifts the pick (retry by
-/// construction). `None` only when the range is truly exhausted.
 fn reserve_clash_port(holds: &mut Vec<std::net::TcpListener>) -> Option<u16> {
     reserve_port_in_range(holds, CLASH_PORT_START, CLASH_PORT_END)
 }
 
-/// Ticket 48: range-generic bind-and-hold behind [`reserve_clash_port`].
-/// Tests prove the exhausted-`None` arm on a small private range (the
-/// live clash range is shared with parallel controller tests, so a
-/// full-range exhaustion assert would race their holds); production
-/// delegates here unchanged, so the proof transfers to the real range.
 fn reserve_port_in_range(
     holds: &mut Vec<std::net::TcpListener>,
     start: u16,
@@ -163,16 +88,6 @@ fn reserve_port_in_range(
     )
 }
 
-/// Ticket 36: splice a loopback-only clash controller into a generated
-/// sidecar config (shape proven live against stock 1.14.2 `check`).
-/// Refuses non-JSON input typed (never emits a half-document). Never
-/// called on user-owned custom JSON (generated cores only). No
-/// re-validation here: `generate()` already validated the pre-image and
-/// the added `experimental` block cannot affect route structure.
-/// Ticket 41: merge, never clobber — a generated config that already
-/// carries an `experimental` object keeps every existing key; only
-/// `clash_api` is (over)written. A non-object `experimental` is replaced
-/// (nothing mergeable to preserve).
 fn inject_clash_api(json: &str, port: u16, secret: &str) -> Result<String, EngineError> {
     let invalid = |detail: &str| EngineError::InvalidGenerated {
         detail: detail.to_string(),
@@ -204,23 +119,12 @@ fn inject_clash_api(json: &str, port: u16, secret: &str) -> Result<String, Engin
         .map_err(|_| invalid("clash-injected config does not serialize"))
 }
 
-/// Ticket 36: listen (bind, port) pairs served by a sidecar config, read
-/// best-effort for the re-apply probe skip. Garbage fails open to an
-/// empty set (probe everything — never skip on a guess).
-/// Ticket 41: also reads the xray inbound shape (`listen` + `port` — the
-/// bridge listeners never appeared here, so re-apply kept tripping
-/// PortUnavailable on its own bridge).
 fn served_listen_ports(json: &str) -> Vec<(String, u16)> {
     custom_config_listens(
         &serde_json::from_str::<serde_json::Value>(json).unwrap_or(serde_json::Value::Null),
     )
 }
 
-/// Ticket 41: best-effort listen extraction from any sidecar-shaped JSON
-/// document (generated stock/fork configs, xray configs, custom full-config
-/// replacements). Reads `inbounds[]` with sing-box `listen`/`listen_port`
-/// and xray `listen`/`port`. Garbage fails open to an empty set
-/// (allowlisted — probe everything, never skip on a guess).
 pub fn custom_config_listens(document: &serde_json::Value) -> Vec<(String, u16)> {
     let mut out = Vec::new();
     let Some(inbounds) = document
@@ -247,10 +151,6 @@ pub fn custom_config_listens(document: &serde_json::Value) -> Vec<(String, u16)>
     out
 }
 
-/// Ticket 36: recover a clash target from a served sidecar config (the
-/// injected `experimental.clash_api` block). Anything else (user-owned
-/// replacements, extra slots, garbage) yields nothing — those cores stay
-/// untracked.
 fn clash_target_from_served(core: &str, json: &str) -> Option<ClashTarget> {
     let document: serde_json::Value = serde_json::from_str(json).ok()?;
     let api = document.get("experimental")?.get("clash_api")?;
@@ -270,28 +170,16 @@ fn clash_target_from_served(core: &str, json: &str) -> Option<ClashTarget> {
     })
 }
 
-/// Ticket 08: loopback bridge-port range for Xray ingress listeners.
-/// Disjoint from the library auto-port range (10801-10999) so bridge
-/// listeners never collide with user endpoints by construction; the
-/// allocator still skips taken user ports defensively.
 pub const XRAY_BRIDGE_PORT_START: u16 = 11801;
 pub const XRAY_BRIDGE_PORT_END: u16 = 11999;
 
-/// Ticket 08: exact Throne-contract violation errors (research 02).
-/// Mid-chain Extra/Custom/Xray placement is rejected with
-/// [`CHAIN_EGRESS_RULE`]; a tag-count skew between the Xray sidecar config
-/// and the bridge bookkeeping fails start with
-/// [`XRAY_BRIDGE_COUNT_SIGNATURE`].
 pub const CHAIN_EGRESS_RULE: &str = "Cannot use Extracore or Custom or Xray configs in a chain";
 pub const XRAY_BRIDGE_COUNT_SIGNATURE: &str = "xray ingress tags size does not match bridge count!";
 
-/// Ticket 28: the five kind predicates share one alias-table lookup.
 fn matches_protocol_aliases(protocol: &str, aliases: &[&str]) -> bool {
     aliases.contains(&protocol.trim().to_ascii_lowercase().as_str())
 }
 
-/// Ticket 08: Xray-only VLESS rows (research 02 semantics live here, never
-/// in the stock schema).
 pub fn is_xray_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(
         protocol,
@@ -299,8 +187,6 @@ pub fn is_xray_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Ticket 08: single-outbound custom JSON rows (merged into the owning
-/// core's generated config; `core` picks stock/fork/xray).
 pub fn is_custom_outbound_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(
         protocol,
@@ -314,8 +200,6 @@ pub fn is_custom_outbound_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Ticket 08: full-config custom rows (replace the owning core's generated
-/// config wholesale; the user owns its inbounds).
 pub fn is_custom_config_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(
         protocol,
@@ -329,8 +213,6 @@ pub fn is_custom_config_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Ticket 08: user extra-core executable slot (ticket 27: N named slots —
-/// one sidecar per active row, each serving its own endpoint).
 pub fn is_extra_core_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(
         protocol,
@@ -338,8 +220,6 @@ pub fn is_extra_core_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Ticket 08: chained-outbound rows (inline hops, or id references within
-/// the same sidecar config).
 pub fn is_chain_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(
         protocol,
@@ -347,8 +227,6 @@ pub fn is_chain_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Ticket 08: egress-only kinds (research 02 chain rule): Extra, Custom
-/// (both shapes), and Xray nodes must terminate a chain, never sit mid-chain.
 pub fn is_egress_only_protocol(protocol: &str) -> bool {
     is_extra_core_protocol(protocol)
         || is_custom_outbound_protocol(protocol)
@@ -356,15 +234,10 @@ pub fn is_egress_only_protocol(protocol: &str) -> bool {
         || is_xray_protocol(protocol)
 }
 
-/// Config-completeness T08 (CAP-12): trivial `direct` rows (no fields —
-/// Throne `edit_direct.ui` label-only) serve as a bare direct final under
-/// the row's own tag. Case folds like every other kind predicate.
 pub fn is_direct_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(protocol, &["direct"])
 }
 
-/// Ticket 08: which generated config owns a custom row. Stock is the
-/// default; unknown values name the `core` field instead of guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwningCore {
     Stock,
@@ -382,9 +255,6 @@ impl OwningCore {
     }
 }
 
-/// Ticket 08: read the owning core from a custom row's params (`core`;
-/// missing means stock). Values are matched case-insensitively; anything
-/// else is a [`EngineError::BadCustom`] naming `core`.
 fn owning_core_of(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -409,15 +279,6 @@ fn owning_core_of(
     }
 }
 
-/// Canonical sing-box outbound/endpoint type for the ticket-05 standard set
-/// plus ticket-27 natives (AnyTLS, SSH) plus ticket-42 natives (socks, http,
-/// naive, snell, shadowtls — all 1.14.2 upstream schema members).
-/// Anything else (custom kinds, mieru/juicity-style schema-less protocols)
-/// is an [`EngineError::UnsupportedProtocol`] owned by import-time rejection
-/// or a later ticket.
-/// Ticket 28: kept parallel to the import/store/health tables — this maps
-/// to sing-box outbound types for codegen, the others to stored names,
-/// grammar acceptance, and probe capability.
 fn canonical_type(protocol: &str) -> Option<&'static str> {
     match protocol.trim().to_ascii_lowercase().as_str() {
         "shadowsocks" | "ss" => Some("shadowsocks"),
@@ -428,10 +289,10 @@ fn canonical_type(protocol: &str) -> Option<&'static str> {
         "hysteria2" | "hy2" => Some("hysteria2"),
         "tuic" => Some("tuic"),
         "wireguard" | "wg" => Some("wireguard"),
-        // Ticket 27: native sing-box outbounds (stock sidecar, own endpoint).
+
         "anytls" => Some("anytls"),
         "ssh" => Some("ssh"),
-        // Ticket 42: native 1.14.2 outbounds (stock sidecar, own endpoint).
+
         "socks" | "socks5" => Some("socks"),
         "http" | "https" => Some("http"),
         "naive" => Some("naive"),
@@ -441,29 +302,19 @@ fn canonical_type(protocol: &str) -> Option<&'static str> {
     }
 }
 
-/// Ticket 27: native SSH rows (sing-box `ssh` outbound, stock sidecar).
-/// Ticket 28: same alias table as the other kind predicates (ASCII case
-/// folding matches the old `eq_ignore_ascii_case` exactly).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_ssh_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(protocol, &["ssh"])
 }
 
-/// Ticket 27: standalone Noise rows (fork sidecar via [`needs_fork`]).
-/// Amnezia Noise ≠ Xray Noise (research 02): Noise rows carry their own
-/// `password`/`key` and must never mix AWG obfuscation fields.
 pub fn is_noise_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(protocol, &["noise"])
 }
 
-/// Inbound tag for a library row (unique: ids are never reused).
-/// Ticket 28: shares the prefix join with [`outbound_tag`] (one sanitize
-/// pass; the `in-`/`out-` prefixes themselves are load-bearing routing).
 pub fn inbound_tag(id: &str) -> String {
     tagged("in", id)
 }
 
-/// Outbound/endpoint tag for a library row.
 pub fn outbound_tag(id: &str) -> String {
     tagged("out", id)
 }
@@ -478,129 +329,140 @@ fn sanitize_tag(raw: &str) -> String {
         .collect()
 }
 
-/// Failures of the activation seam. Messages name configs, binds, ports, and
-/// protocols — never secrets (no params values, keys, or passwords).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {
-    /// Two active configs want the same local endpoint.
     PortConflict {
         bind: String,
         port: u16,
         first: String,
         second: String,
     },
-    /// Protocol belongs to a later (exotic/custom-core) ticket.
-    UnsupportedProtocol { name: String, protocol: String },
-    /// Stored params are not a JSON object (never echoes the params).
-    InvalidParamsJson { name: String },
-    /// Stored params miss a required sing-box field (names the field only).
-    BadParams { name: String, field: &'static str },
-    /// Nothing to run.
+
+    UnsupportedProtocol {
+        name: String,
+        protocol: String,
+    },
+
+    InvalidParamsJson {
+        name: String,
+    },
+
+    BadParams {
+        name: String,
+        field: &'static str,
+    },
+
     NoActiveConfigs,
-    /// Generated JSON fails the structural self-check.
-    InvalidGenerated { detail: String },
-    /// The engine's own `check` rejected the generated config.
-    CheckFailed { detail: String },
-    /// No `sing-box` binary in the app dir (never `PATH`, never downloads).
-    /// Ticket A6: names the EXPECTED FILE plus the searched dir, like the
-    /// fork/xray/extra variants (never a bare dir that leaves the user
-    /// guessing which filename to place).
-    MissingBinary { binary: String, searched: String },
-    /// Ticket 07: no fork-core binary for exotic rows (names the rows and
-    /// the expected binary; stock rows are unaffected).
+
+    InvalidGenerated {
+        detail: String,
+    },
+
+    CheckFailed {
+        detail: String,
+    },
+
+    MissingBinary {
+        binary: String,
+        searched: String,
+    },
+
     MissingForkBinary {
         rows: String,
         binary: String,
         searched: String,
         xhttp: bool,
     },
-    /// Ticket 07: AmneziaWG version-matrix failure (names the field; the
-    /// detail echoes version strings only, never key material).
+
     BadAwg {
         name: String,
         field: String,
         detail: String,
     },
-    /// Ticket 07: wrong-layer obfuscation mix (names the field, never values).
+
     WrongLayer {
         name: String,
         field: String,
         detail: String,
     },
-    /// Ticket 08: custom-row schema failure (names the offending field and
-    /// the reason; never echoes values, keys, or tokens).
+
     BadCustom {
         name: String,
         field: String,
         detail: String,
     },
-    /// Ticket 08: chain egress-only violation (research 02 contract text is
-    /// always included; the detail names the row and the offending node).
-    ChainViolation { name: String, detail: String },
-    /// Ticket 08: Xray bridge bookkeeping skew (research 02 breakage
-    /// signature is always included; start fails instead of serving a
-    /// half-bridged set).
-    XrayBridgeMismatch { detail: String },
-    /// Ticket 08: loopback hygiene failure (sidecar traffic must never loop:
-    /// ingress binds loopback, bridge ports avoid user endpoints, egresses
-    /// never point at loopback).
-    XrayLoopback { name: String, detail: String },
-    /// Ticket 08: no `xray` binary for Xray rows (names the rows and the
-    /// expected binary; stock/fork rows are unaffected).
+
+    ChainViolation {
+        name: String,
+        detail: String,
+    },
+
+    XrayBridgeMismatch {
+        detail: String,
+    },
+
+    XrayLoopback {
+        name: String,
+        detail: String,
+    },
+
     MissingXrayBinary {
         rows: String,
         binary: String,
         searched: String,
     },
-    /// Ticket 08: no user extra-core executable in the app dir (names the
-    /// rows and the expected file; stock/fork/xray rows are unaffected).
+
     MissingExtraBinary {
         rows: String,
         binary: String,
         searched: String,
     },
-    /// Ticket 08: extra-core slot failure (names the field; never echoes
-    /// paths with secrets or config contents).
+
     BadExtra {
         name: String,
         field: String,
         detail: String,
     },
-    /// Ticket 37: attached routing-preset failure (names the row and the
-    /// rule index + field; never echoes rule content).
-    BadPreset { name: String, detail: String },
-    /// The sidecar process could not be spawned.
-    SpawnFailed { detail: String },
-    /// Ticket 23: a local endpoint is already held (by another process or a
-    /// sibling sidecar). Names the bind, port, and row only — never secrets.
+
+    BadPreset {
+        name: String,
+        detail: String,
+    },
+
+    SpawnFailed {
+        detail: String,
+    },
+
     PortUnavailable {
         bind: String,
         port: u16,
         name: String,
     },
-    /// Ticket 23: a start would serve a non-loopback bind without an explicit
-    /// LAN confirm. Names the rows + binds only — never secrets.
-    LanConfirmRequired { names: String },
-    /// Ticket 41: a row claims a listen port inside a controller-reserved
-    /// range (clash 18501-18999, xray bridge 11801-11999). Names the row,
-    /// the port, and the range before any spawn (and before any save via
-    /// the save gate).
+
+    LanConfirmRequired {
+        names: String,
+    },
+
     ReservedPort {
         name: String,
         port: u16,
         range: &'static str,
     },
-    /// Ticket 41: `bind_ip` is not a parseable IP address or `localhost`
-    /// (blank means the loopback default and stays valid). Names the row
-    /// and the bind before any spawn.
-    BadBind { name: String, bind: String },
-    /// Ticket 41: the row's local `port` cannot serve (0, or privileged
-    /// <1024 without elevation). Names the row with guidance, never secrets.
-    BadPort { name: String, detail: String },
-    /// Ticket 41: an egress `server` hostname failed to resolve at
-    /// validation. Names the row and the server: a DNS failure, never
-    /// confused with an egress (reachability) failure.
-    DnsFailure { name: String, server: String },
+
+    BadBind {
+        name: String,
+        bind: String,
+    },
+
+    BadPort {
+        name: String,
+        detail: String,
+    },
+
+    DnsFailure {
+        name: String,
+        server: String,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -630,12 +492,12 @@ impl std::fmt::Display for EngineError {
                 write!(f, "invalid generated engine config ({detail})")
             }
             EngineError::CheckFailed { detail } => {
-                // Ticket 29: `check` stderr arrives with ANSI color escapes
-                // (the raw `[31mFATAL[0m` toast); the surfaced error keeps the
-                // text and drops the codes.
-                // Ticket A7: stderr is UNTRUSTED (echoes config fragments) —
-                // redact secrets after stripping (strip first: ANSI codes
-                // never carry secrets and only obscure the patterns).
+
+
+
+
+
+
                 write!(
                     f,
                     "engine config check failed ({})",
@@ -756,11 +618,6 @@ impl std::fmt::Display for EngineError {
     }
 }
 
-// -- Ticket 07: fork-core exotic helpers (AWG version matrix, wrong-layer
-// guards, XHTTP path, fork resolution) -------------------------------------
-
-/// AmneziaWG-variant protocol names (canonical stored form is `amneziawg`;
-/// import accepts every alias here).
 pub fn is_awg_protocol(protocol: &str) -> bool {
     matches!(
         protocol.trim().to_ascii_lowercase().as_str(),
@@ -768,18 +625,11 @@ pub fn is_awg_protocol(protocol: &str) -> bool {
     )
 }
 
-/// AmneziaWG 2.0 obfuscation fields (official docs: junk-train Jc/Jmin/Jmax,
-/// length prefixes S1-S4, header ranges H1-H4, CPS chains I1-I5). Compared
-/// lowercase — links/docs spell them `Jc`, `S1`, … — values pass through
-/// verbatim.
 const AWG_V2_KEYS: &[&str] = &[
     "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4",
     "i5",
 ];
 
-/// AmneziaWG 3.x additions (official docs: HeaderProtectionKey,
-/// ContentPaddingAddition, ranged timings Rekey*/Keepalive*/MaxHandshake*,
-/// RandomTrailers, DisableCookies). Valid only with `awg_version` 3.x.
 const AWG_V3_ONLY_KEYS: &[&str] = &[
     "headerprotectionkey",
     "contentpaddingaddition",
@@ -792,9 +642,6 @@ const AWG_V3_ONLY_KEYS: &[&str] = &[
     "disablecookies",
 ];
 
-/// Plain WireGuard/endpoint fields allowed on AWG rows at any version (the
-/// fork extends the wireguard endpoint schema; its own `check` is
-/// authoritative for shapes this list does not know).
 const AWG_BASE_KEYS: &[&str] = &[
     "type",
     "tag",
@@ -817,18 +664,11 @@ const AWG_BASE_KEYS: &[&str] = &[
     "peers",
     "awg_version",
     "version",
-    // Config-completeness T04: `enable_amnezia` is a UI-state marker
-    // (Throne parity) — allowed on the row so the version matrix keeps it,
-    // stripped at reshape (brutal-speeds precedent: preserved in stored
-    // JSON, never emitted).
     "enable_amnezia",
 ];
 
-/// Xray-side noise semantics (research 02: "Amnezia Noise" ≠ "Xray Noise").
-/// These keys on an AWG row are a wrong-layer mix, never silently accepted.
 const XRAY_NOISE_KEYS: &[&str] = &["noise", "finalmask", "final_mask", "xray_noise"];
 
-/// Explicit AWG version matrix: 2.0 vs 3.x (research 02 version-skew risk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AwgVersion {
     V2,
@@ -848,8 +688,6 @@ fn is_awg_layer_key(lower: &str) -> bool {
     lower == "awg_version" || AWG_V2_KEYS.contains(&lower) || AWG_V3_ONLY_KEYS.contains(&lower)
 }
 
-/// Declared AWG version from `awg_version` (else legacy `version`); strings
-/// and numbers both accepted. Missing/unknown values name the field.
 fn awg_version_of(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -886,11 +724,6 @@ fn awg_version_of(
     }
 }
 
-/// Wrong-layer mismatch guards (research 02 silent-mismatch class): AWG
-/// fields on non-AWG rows, Xray noise/finalmask semantics on AWG rows, and
-/// ticket-27 Noise guards — AWG obfuscation on Noise rows plus Xray-noise
-/// semantics on Noise or stock rows — fail here with explicit errors — never
-/// silently.
 fn check_wrong_layer(
     name: &str,
     protocol: &str,
@@ -955,9 +788,6 @@ fn check_wrong_layer(
     Ok(())
 }
 
-/// Validate one AWG row against the explicit version matrix: declared
-/// version, required WireGuard credentials, then per-version field
-/// membership (cross-version and unknown fields name the field).
 fn validate_awg_row(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1001,10 +831,6 @@ fn validate_awg_row(
     Ok(version)
 }
 
-/// Ticket 27: validate one standalone Noise row (fork sidecar): server +
-/// port shape plus one noise secret (`password`/`key`), verbatim
-/// passthrough otherwise. AWG-vs-Noise confusion (AWG obfuscation fields on
-/// a Noise row) fails here explicitly — never silently.
 fn validate_noise_row(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1025,8 +851,6 @@ fn validate_noise_row(
     Ok(())
 }
 
-/// Ticket 27: validate one native SSH row (stock sidecar): server shape plus
-/// user + one secret (password or private key). Errors name the field only.
 fn validate_ssh_row(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1052,8 +876,6 @@ fn validate_ssh_row(
     Ok(())
 }
 
-/// Ticket 27: validate one native AnyTLS row (stock sidecar): password
-/// required (sing-box `anytls` authenticates by password).
 fn validate_anytls_row(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1071,9 +893,6 @@ fn validate_anytls_row(
     Ok(())
 }
 
-/// Transport marker: flat v2ray-style `network` (what import writes),
-/// sing-box `transport.type`, or Xray `streamSettings.network` (what JSON
-/// import preserves verbatim).
 fn transport_of(params: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     if let Some(network) = params.get("network").and_then(serde_json::Value::as_str) {
         return Some(network.to_string());
@@ -1095,8 +914,6 @@ fn transport_of(params: &serde_json::Map<String, serde_json::Value>) -> Option<S
     None
 }
 
-/// True when the stored params select the XHTTP transport (fork-only;
-/// research 02: stock sing-box has no `xhttp`).
 pub fn config_is_xhttp(config: &ProxyConfig) -> bool {
     let Ok(serde_json::Value::Object(map)) =
         serde_json::from_str::<serde_json::Value>(&config.params)
@@ -1106,10 +923,6 @@ pub fn config_is_xhttp(config: &ProxyConfig) -> bool {
     transport_of(&map).is_some_and(|transport| transport.eq_ignore_ascii_case("xhttp"))
 }
 
-/// True for rows the stock binary cannot serve: AWG variants, standalone
-/// Noise, plus XHTTP transports on the VLESS family. Anything else (including
-/// malformed params) is not fork-routed: malformed rows fail at [`generate`]
-/// with their own named error.
 pub fn needs_fork(config: &ProxyConfig) -> bool {
     if is_awg_protocol(&config.protocol) || is_noise_protocol(&config.protocol) {
         return true;
@@ -1123,28 +936,15 @@ pub fn needs_fork(config: &ProxyConfig) -> bool {
     false
 }
 
-/// Ticket 29: VLESS `encryption` routing (live-proven 2026-09-26 against
-/// stock sing-box 1.14.2 and xray-core 26.3.27):
-/// - stock strict-decodes and rejects ANY `encryption` key on vless
-///   outbounds — even `"none"` (`unknown field "encryption"`);
-/// - xray accepts `"none"` in `users[].encryption` but validates real values
-///   (`unsupported "encryption"` for anything it cannot parse; genuine client
-///   values are full key strings minted by `xray vlessenc`).
-///
-/// Absent/blank/`"none"` drops the key and stays stock, while a real value
-/// routes the row through the xray sidecar bridge with fields passthrough
-/// (xray `streamSettings.packetEncoding` is camelCase, matching intake).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VlessEncryption {
-    /// No key, null, blank, or `"none"` (ASCII case-insensitive): stock.
     Stock,
-    /// A real value: xray bridge leg.
+
     Xray,
-    /// Present but not a string: typed error.
+
     BadType,
 }
 
-/// Ticket 29: classify one standard VLESS row's `encryption` param.
 fn vless_encryption_of(params: &serde_json::Map<String, serde_json::Value>) -> VlessEncryption {
     match params.get("encryption") {
         None | Some(serde_json::Value::Null) => VlessEncryption::Stock,
@@ -1159,16 +959,11 @@ fn vless_encryption_of(params: &serde_json::Map<String, serde_json::Value>) -> V
     }
 }
 
-/// Ticket 29: true for standard `vless` rows carrying a real `encryption`
-/// value (served through the xray sidecar bridge, never stock).
 fn vless_needs_xray(protocol: &str, params: &serde_json::Map<String, serde_json::Value>) -> bool {
     canonical_type(protocol) == Some("vless")
         && vless_encryption_of(params) == VlessEncryption::Xray
 }
 
-/// Ticket 29: row-level form of [`vless_needs_xray`] (malformed params are
-/// not xray-routed: they fail with their own named error, like every other
-/// routing predicate here).
 fn config_vless_needs_xray(config: &ProxyConfig) -> bool {
     serde_json::from_str::<serde_json::Value>(&config.params)
         .ok()
@@ -1176,8 +971,6 @@ fn config_vless_needs_xray(config: &ProxyConfig) -> bool {
         .is_some_and(|map| vless_needs_xray(&config.protocol, &map))
 }
 
-/// Ticket 29: malformed `encryption` on a VLESS row (names the field and the
-/// xray sidecar; never echoes the value).
 fn bad_vless_encryption(name: &str) -> EngineError {
     EngineError::BadCustom {
         name: name.to_string(),
@@ -1186,12 +979,6 @@ fn bad_vless_encryption(name: &str) -> EngineError {
     }
 }
 
-/// Ticket 08: true for rows served through the Xray sidecar bridge: Xray
-/// rows plus xray-core custom outbounds. Malformed params are not
-/// xray-routed: they fail at [`generate`]/[`validate_activation`] with
-/// their own named error.
-/// Ticket 29: standard VLESS rows carrying a real `encryption` value ride
-/// the same bridge (stock sing-box rejects the `encryption` key outright).
 pub fn needs_xray(config: &ProxyConfig) -> bool {
     if is_xray_protocol(&config.protocol) {
         return true;
@@ -1207,11 +994,6 @@ pub fn needs_xray(config: &ProxyConfig) -> bool {
     false
 }
 
-// -- Ticket 08: Xray sidecar bridge, custom rows, extra slot, chains -----
-// (helpers; the `generate` loop and `EngineController` below consume
-// them. Standard + AWG paths above are untouched.)
-
-/// Parse stored params into an object map (never echoes the params).
 fn params_object(
     config: &ProxyConfig,
 ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
@@ -1223,8 +1005,6 @@ fn params_object(
         })
 }
 
-/// Ticket 28: one JSON port-shape check for the custom/xray validators
-/// (numbers and digit strings in 1..=65535; presence rules stay per-shape).
 fn json_port_valid(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Number(number) => number
@@ -1237,9 +1017,6 @@ fn json_port_valid(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Ticket 28: trimmed non-empty string field — one read shape for every
-/// params validator (presence errors stay per-caller, so taxonomies never
-/// change).
 fn str_field<'a>(
     params: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1251,14 +1028,10 @@ fn str_field<'a>(
         .filter(|value| !value.is_empty())
 }
 
-/// Ticket 28: true when any of `keys` holds a non-blank string.
 fn any_field(params: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
     keys.iter().any(|key| str_field(params, key).is_some())
 }
 
-/// Ticket 08: validate one Xray-only VLESS row (server/uuid shape checked
-/// here; every other Xray-only field passes through verbatim into the
-/// sidecar config).
 fn validate_xray_row(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1290,11 +1063,6 @@ fn validate_xray_row(
     Ok(())
 }
 
-/// Ticket 08: validate one custom-outbound row. Stock/fork customs are
-/// sing-box-shaped (require `type`); xray-core customs are xray-shaped
-/// (require `protocol`). The `core` selector is stripped before the merge so
-/// it never pollutes the generated outbound. Returns the owning core and the
-/// merge-ready map.
 fn validate_custom_outbound(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1332,12 +1100,6 @@ fn validate_custom_outbound(
     Ok((core, map))
 }
 
-/// Ticket 08: extract one custom full-config replacement. Either
-/// `{"core": ..., "config": {...}}` or the params object itself when it
-/// already carries `outbounds`. Lite structural gate: the replacement must
-/// be an object with an `outbounds` array and no prohibited top-level
-/// sections (`tun`/`dns`); anything else names the offending field. The row's
-/// own endpoint lives inside the custom config (user-managed).
 fn custom_full_config(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1357,10 +1119,7 @@ fn custom_full_config(
         None => serde_json::Value::Object(params.clone()),
     };
     let top = document.as_object().expect("config is an object");
-    // Ticket 23 SEC-HIGH: the replacement is user JSON served by a bundled
-    // sidecar, so the recursive system-mutation scan runs here — not just in
-    // tests. A nested `tun`/`dns`/`set_system_proxy` at any depth names its
-    // key and path (never values).
+
     if let Some((key, path)) = find_system_mutation_key(&document) {
         return Err(EngineError::BadCustom {
             name: name.to_string(),
@@ -1383,12 +1142,6 @@ fn custom_full_config(
     Ok((core, document))
 }
 
-/// Ticket 08/41: true when an extra-core `exe` value must be refused before
-/// any filesystem access: path separators, ADS streams (`:`), reserved
-/// Windows device names (`CON`/`PRN`/`AUX`/`NUL`/`COM1`-`COM9`/`LPT1`-`LPT9`,
-/// bare or with an extension — these never resolve to a real file),
-/// trailing dots/spaces (Windows strips them, so `evil.exe ` ≡ `evil.exe`),
-/// and control characters. The app-dir join happens only after this gate.
 fn is_bad_extra_exe_name(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return true;
@@ -1399,7 +1152,7 @@ fn is_bad_extra_exe_name(name: &str) -> bool {
     if name.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return true;
     }
-    // Windows trims trailing dots/spaces before resolution.
+
     if name.ends_with(['.', ' ']) {
         return true;
     }
@@ -1417,9 +1170,6 @@ fn is_bad_extra_exe_name(name: &str) -> bool {
     false
 }
 
-/// Ticket 08: validate one extra-core slot row. Returns the executable file
-/// name (app dir only, never a path) and the config JSON string passed
-/// through to the sidecar file.
 fn validate_extra_row(config: &ProxyConfig) -> Result<(String, String), EngineError> {
     let params = params_object(config)?;
     let exe = params
@@ -1469,14 +1219,10 @@ fn validate_extra_row(config: &ProxyConfig) -> Result<(String, String), EngineEr
     Ok((exe.to_string(), config_json))
 }
 
-/// Ticket 08: the config JSON an extra-core sidecar serves (validated,
-/// never echoed back in errors).
 pub fn extra_config_json(config: &ProxyConfig) -> Result<String, EngineError> {
     validate_extra_row(config).map(|(_, config_json)| config_json)
 }
 
-/// Ticket 08: chain hop kinds. Only [`ChainHopKind::Standard`] may sit
-/// mid-chain; everything else is egress-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainHopKind {
     Standard,
@@ -1485,14 +1231,12 @@ pub enum ChainHopKind {
     Extra,
 }
 
-/// Ticket 08: one validated chain hop: an id reference into the same
-/// sidecar config, or an inline outbound object carried in the chain params.
 #[derive(Debug, Clone)]
 pub struct ChainHop {
     pub kind: ChainHopKind,
     pub ref_id: Option<String>,
     pub node: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Human hop label for errors (`node 2`, never params contents).
+
     pub label: String,
 }
 
@@ -1510,8 +1254,6 @@ fn truthy(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
     })
 }
 
-/// Ticket 08: classify one inline hop object. Nested chains are rejected
-/// outright (v1 chains are flat).
 fn inline_hop_kind(
     name: &str,
     label: &str,
@@ -1531,9 +1273,7 @@ fn inline_hop_kind(
             detail: format!("{label} nests a chain (v1 chains are flat)"),
         });
     }
-    // Ticket 29: inline vless hops carrying a real `encryption` value are
-    // xray-bridged (stock rejects the key outright); a non-string value
-    // fails typed here instead of at `check` time.
+
     if canonical_type(&marker) == Some("vless") {
         match vless_encryption_of(map) {
             VlessEncryption::Xray => return Ok(ChainHopKind::Xray),
@@ -1564,10 +1304,6 @@ fn inline_hop_kind(
     Ok(ChainHopKind::Standard)
 }
 
-/// Ticket 08: validate one chain row's `nodes` array. `lookup` maps an
-/// id-reference to its row protocol (`None` = unknown id). Mid-chain
-/// Extra/Custom/Xray nodes fail with the egress-only rule; unknown ids,
-/// nested chains, and typeless hops fail naming `nodes`.
 pub fn validate_chain_nodes(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -1669,43 +1405,29 @@ pub fn validate_chain_nodes(
     Ok(hops)
 }
 
-/// Ticket 08: ingress/egress tags for an Xray bridge leg (unique: ids are
-/// never reused; chain-hop legs suffix the hop index).
 pub fn xray_ingress_tag(id: &str) -> String {
     format!("x-in-{}", sanitize_tag(id))
 }
 
-/// Ticket 08: egress tag for an Xray bridge leg.
 pub fn xray_egress_tag(id: &str) -> String {
     format!("x-out-{}", sanitize_tag(id))
 }
 
-/// Ticket 08: one Xray sidecar egress leg: everything the bridge needs to
-/// keep the main-config pointer and the sidecar ingress/egress in agreement.
 #[derive(Debug, Clone)]
 pub struct XrayEgress {
-    /// Row or chain-hop owner name (for errors; never params values).
     pub owner: String,
-    /// VLESS-shaped row params, or xray-shaped custom params when
-    /// [`XrayEgress::xray_shaped`] is set.
+
     pub params: serde_json::Map<String, serde_json::Value>,
     pub xray_shaped: bool,
     pub bridge_port: u16,
-    /// Ticket 23 LOW: the bridge-map key for this leg (row id, or
-    /// `{chain-id}#hop{i}` for inline xray chain hops) — recorded at plan
-    /// time so `apply` reuses the bookkeeping instead of re-deriving it with
-    /// swallowed errors.
+
     pub bridge_key: String,
-    /// Pointer tag in the main config (`out-<id>` or `<chain>-hop-<i>`).
+
     pub main_tag: String,
     pub ingress_tag: String,
     pub egress_tag: String,
 }
 
-/// Ticket 08: deterministic loopback bridge-port assignment. Keys arrive in
-/// activation order; taken user ports are skipped defensively (the range is
-/// disjoint from the auto range by construction). Exhaustion is a typed
-/// error, never a silent reuse.
 pub fn assign_bridge_ports(
     keys: &[String],
     taken: &HashSet<u16>,
@@ -1730,9 +1452,6 @@ pub fn assign_bridge_ports(
     Ok(assigned)
 }
 
-/// Ticket 08: tag-count cross-check (research 02 breakage signature). The
-/// sidecar ingress count and the egress count must each equal the bridge
-/// bookkeeping count; any skew fails start instead of serving half-bridged.
 pub fn validate_bridge_counts(
     ingress: usize,
     egress: usize,
@@ -1749,8 +1468,6 @@ pub fn validate_bridge_counts(
     Ok(())
 }
 
-/// Ticket 08: loopback-egress guard — a bridge leg whose remote is itself
-/// loopback would recirculate sidecar traffic, so it fails naming the row.
 fn check_egress_not_loopback(owner: &str, server: &str, kind: &str) -> Result<(), EngineError> {
     let loopback = server
         .trim()
@@ -1768,12 +1485,6 @@ fn check_egress_not_loopback(owner: &str, server: &str, kind: &str) -> Result<()
     Ok(())
 }
 
-/// Ticket 08: build the paired Xray sidecar config for the bridge legs:
-/// one loopback SOCKS ingress per leg, one VLESS/custom egress per leg,
-/// and `routing.rules[]` binding each ingress to exactly its own egress
-/// (per-endpoint isolation, mirrored on the sidecar). Loopback hygiene:
-/// ingress binds `127.0.0.1`, bridge ports avoid user endpoints by
-/// construction, egress remotes must not be loopback.
 pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConfig, EngineError> {
     let mut inbounds = Vec::with_capacity(egresses.len());
     let mut outbounds: Vec<serde_json::Value> = Vec::with_capacity(egresses.len() + 1);
@@ -1850,12 +1561,7 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                 serde_json::Value::Array(vec![serde_json::Value::Object(vnext)]),
             );
             let mut stream = serde_json::Map::new();
-            // Ticket 29: `packetEncoding` stays camelCase per the xray schema
-            // (`streamSettings.packetEncoding`, accepted by `xray run -test`).
-            // Config-completeness T07: `spiderx` rides the same flat
-            // passthrough (the Xray page folds it; the sidecar judges the
-            // shape — without this the page would write a key the bridge
-            // drops, T02 dead-key precedent).
+
             for key in [
                 "network",
                 "security",
@@ -1874,11 +1580,7 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                     stream.insert(key.to_string(), value.clone());
                 }
             }
-            // Config-completeness review: Throne spellings the page reads as
-            // aliases also emit — `fingerprint` falls back to `fp`, either
-            // `serviceName`/`service_name` lands as Xray's `serviceName`
-            // (grpc links import these spellings; without this the reject
-            // below would break rows the dialog itself maintains).
+
             if stream.get("fp").is_none() {
                 if let Some(fp) = egress.params.get("fingerprint") {
                     stream.insert("fp".to_string(), fp.clone());
@@ -1893,12 +1595,7 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                     stream.insert("serviceName".to_string(), svc.clone());
                 }
             }
-            // Config-completeness review: keys the bridge never sees fail
-            // typed naming the field instead of riding silently past it
-            // (stored JSON still preserves them — fold-level preserve — but a
-            // Ph2 XHTTP/xmux key the sidecar ignores must never look
-            // configured). The `xray_shaped` full-config branch above is
-            // untouched: the sidecar judges that JSON itself.
+
             const XRAY_FLAT_KEYS: &[&str] = &[
                 "type",
                 "address",
@@ -1947,11 +1644,7 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                 serde_json::Value::String(egress.egress_tag.clone()),
             );
             node.insert("settings".to_string(), serde_json::Value::Object(settings));
-            // Config-completeness T07: the Xray page's `xray_mux` keep-blank
-            // select (`""` | `enabled` | `disabled`) maps to the outbound
-            // `mux` object (absent on default — never fabricated). Anything
-            // else fails typed naming the field (the page constrains its
-            // picks; hand JSON garbage must not silently become mux-off).
+
             match egress
                 .params
                 .get("xray_mux")
@@ -2018,10 +1711,8 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
     })
 }
 
-/// Ticket 08: a generated paired Xray sidecar config.
 #[derive(Debug, Clone)]
 pub struct GeneratedXrayConfig {
-    /// Compact JSON fed to the xray sidecar's `-c` file.
     pub json: String,
     #[cfg_attr(not(test), allow(dead_code))]
     pub ingress_tags: Vec<String>,
@@ -2030,16 +1721,12 @@ pub struct GeneratedXrayConfig {
 }
 
 impl GeneratedXrayConfig {
-    /// Parsed view of [`GeneratedXrayConfig::json`] (tests assert structure).
     #[cfg(test)]
     pub fn value(&self) -> serde_json::Value {
         serde_json::from_str(&self.json).expect("xray config is valid JSON")
     }
 }
 
-/// Ticket 08: verify every bridge leg's pointer survived into the main
-/// config (a stock custom-config replacement that drops a pointer breaks
-/// the bridge: start fails naming the tag instead of half-serving).
 pub fn validate_bridges_present(
     main_json: &str,
     egresses: &[XrayEgress],
@@ -2072,9 +1759,6 @@ pub fn validate_bridges_present(
     Ok(())
 }
 
-/// Ticket 08: main-config loopback pointer at one Xray ingress listener.
-/// The pointer is a plain SOCKS outbound at `127.0.0.1`; the sidecar owns
-/// the real egress, so sidecar traffic can never leak between endpoints.
 fn bridge_pointer(main_tag: &str, bridge_port: u16) -> serde_json::Value {
     serde_json::json!({
         "type": "socks",
@@ -2085,52 +1769,33 @@ fn bridge_pointer(main_tag: &str, bridge_port: u16) -> serde_json::Value {
     })
 }
 
-/// Ticket 08: the controller's per-activation build plan — one pure
-/// validation pass over the union that partitions rows per sidecar, assigns
-/// bridge ports, extracts custom-config replacements, and enforces the
-/// chain egress-only rule. A bad candidate fails here before any running
-/// sidecar is touched.
 #[derive(Debug, Clone)]
 pub struct ActivationPlan {
-    /// Rows served by the main (stock) sidecar: standard, Xray pointers,
-    /// stock-core customs, and chains.
     pub main_rows: Vec<ProxyConfig>,
-    /// Rows served by the fork sidecar: AWG/Noise/XHTTP plus fork-core customs.
+
     pub fork_rows: Vec<ProxyConfig>,
-    /// Xray sidecar legs (row VLESS, xray-core customs, xray-last chain hops).
+
     pub egresses: Vec<XrayEgress>,
-    /// Ticket 27: N named extra-core slot rows (each serves its own endpoint
-    /// in its own sidecar; replaces the ticket-08 singleton).
+
     pub extras: Vec<ProxyConfig>,
-    /// Custom full-config replacements (`(core, config json)`; at most one
-    /// per core).
+
     pub replacements: Vec<(OwningCore, String)>,
-    /// Ticket 41: listens parsed out of the custom full-config replacements
-    /// (`(owner name, bind, port)`) — joined into the conflict set and the
-    /// pre-spawn probe gate so two replacements can never silently share a
-    /// port.
+
     pub replacement_listens: Vec<(String, String, u16)>,
-    /// Ticket 41: non-fatal warnings from the plan (typo hints; emission
-    /// tables untouched). The UI surfaces these beside success toasts.
+
     pub warnings: Vec<String>,
-    /// Quoted row names per gate (fork/xray/extra binary resolution).
+
     pub fork_names: String,
     pub fork_xhttp: bool,
     pub xray_names: String,
     pub extra_names: String,
 }
 
-/// Ticket 08: build the activation plan (pure: no processes, no network, no
-/// secrets in errors). Port conflicts still name both parties; custom rows
-/// name their offending field; chains enforce the egress-only rule.
 pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, EngineError> {
     if configs.is_empty() {
         return Err(EngineError::NoActiveConfigs);
     }
-    // Port conflicts across endpoint rows (custom full-config rows are
-    // user-managed: their bind is documentation, not an endpoint we serve).
-    // Ticket 23 LOW: a duplicated id names the id (rows are keyed by id
-    // everywhere downstream, so two rows sharing one never serve sanely).
+
     let mut taken: HashMap<(String, u16), &str> = HashMap::new();
     let mut seen_ids: HashMap<&str, &str> = HashMap::new();
     for config in configs {
@@ -2146,7 +1811,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         if is_custom_config_protocol(&config.protocol) {
             continue;
         }
-        // Ticket 23: loopback aliases compare equal (localhost ≡ 127.0.0.1).
+
         let key = (normalize_bind_key(&config.bind_ip), config.port);
         if let Some(first) = taken.get(&key) {
             return Err(EngineError::PortConflict {
@@ -2158,20 +1823,17 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         }
         taken.insert(key, config.name.as_str());
     }
-    // Classify + validate every row; collect bridge keys in activation order.
+
     let mut main_rows = Vec::new();
     let mut fork_rows = Vec::new();
     let mut egresses: Vec<XrayEgress> = Vec::new();
-    // Ticket 27: N named extra-core slots (no singleton cap).
+
     let mut extras: Vec<ProxyConfig> = Vec::new();
     let mut replacements: Vec<(OwningCore, String)> = Vec::new();
     let mut bridge_keys: Vec<String> = Vec::new();
     for config in configs {
         let params = params_object(config)?;
-        // Ticket 41: early listen gate — garbage binds, port 0, privileged
-        // ports, and reserved ranges fail typed before any spawn. Custom
-        // full-config rows are exempt (their row endpoint is documentation;
-        // their parsed replacement listens join the conflict set below).
+
         if !is_custom_config_protocol(&config.protocol) {
             validate_listen_for_start(&config.name, &config.bind_ip, config.port)?;
         }
@@ -2197,9 +1859,6 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             replacements.push((core, document.to_string()));
         } else if is_xray_protocol(&config.protocol) || vless_needs_xray(&config.protocol, &params)
         {
-            // Ticket 29: standard VLESS rows carrying a real `encryption`
-            // value validate like xray rows and ride the same bridge (stock
-            // sing-box rejects the `encryption` key outright).
             check_wrong_layer(&config.name, &config.protocol, &params)?;
             validate_xray_row(&config.name, &params)?;
             bridge_keys.push(config.id.clone());
@@ -2218,18 +1877,13 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             main_rows.push(config.clone());
         } else if needs_fork(config) {
             check_wrong_layer(&config.name, &config.protocol, &params)?;
-            // Same schema gate `generate` applies (AWG matrix, server
-            // shape): the pre-check must reject bad rows before `active`
-            // moves, exactly like the ticket-05/07 seam did.
+
             let mut owned = params.clone();
             build_standard_node(config, &mut owned, "validate")?;
             fork_rows.push(config.clone());
         } else {
             check_wrong_layer(&config.name, &config.protocol, &params)?;
-            // Same schema gate `generate` applies (server shape, known
-            // protocol): unknown protocols and bad params fail here, not
-            // after `active` moves. Ticket 27: Noise is fork-routed (never
-            // UnsupportedProtocol); SSH/AnyTLS are canonical natives.
+
             if canonical_type(&config.protocol).is_none()
                 && !is_awg_protocol(&config.protocol)
                 && !is_noise_protocol(&config.protocol)
@@ -2245,9 +1899,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             main_rows.push(config.clone());
         }
     }
-    // Chains validate against the union with a same-sidecar rule: id
-    // references must resolve to rows served by the main config (v1 chains
-    // stay within one sidecar; the Xray bridge pointer lives there).
+
     let main_ids: HashSet<&str> = main_rows.iter().map(|row| row.id.as_str()).collect();
     let by_id: HashMap<&str, &ProxyConfig> =
         configs.iter().map(|row| (row.id.as_str(), row)).collect();
@@ -2286,9 +1938,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                         ),
                     });
                 }
-                // Ticket 29: VLESS-`encryption` rows are bridge legs
-                // (egress-only like xray rows, but classified Standard by
-                // protocol alone), so a mid-chain reference fails here.
+
                 if index + 1 < hops.len()
                     && by_id
                         .get(id)
@@ -2308,7 +1958,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             }
         }
     }
-    // Bridge ports: deterministic over the union's taken user ports.
+
     let taken_ports: HashSet<u16> = configs
         .iter()
         .filter(|row| !is_custom_config_protocol(&row.protocol))
@@ -2316,7 +1966,6 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         .collect();
     let ports = assign_bridge_ports(&bridge_keys, &taken_ports)?;
     for config in configs {
-        // Ticket 29: VLESS `encryption` rows ride the xray bridge too.
         if is_xray_protocol(&config.protocol) || config_vless_needs_xray(config) {
             let params = params_object(config)?;
             egresses.push(XrayEgress {
@@ -2371,14 +2020,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             }
         }
     }
-    // Ticket 41: custom full-config replacements parse their listens into
-    // the same conflict set — two replacements binding one port (or a
-    // replacement colliding with a served row) fail naming both parties.
-    // Unparseable documents fail open here (the schema gate above already
-    // rejected them; never double-report).
-    // Bridge ingress is ours too: a replacement squatting an assigned
-    // bridge port would break the bridge silently, so it conflicts naming
-    // the bridge owner.
+
     let bridge_owner_by_port: HashMap<u16, String> = egresses
         .iter()
         .map(|egress| (egress.bridge_port, egress.owner.clone()))
@@ -2418,8 +2060,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             replacement_listens.push((config.name.clone(), bind, port));
         }
     }
-    // Ticket 41: typo hints ride the plan as warnings (never errors, never
-    // silent drops).
+
     let mut warnings: Vec<String> = Vec::new();
     for config in configs {
         if let Ok(params) = params_object(config) {
@@ -2461,8 +2102,6 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     })
 }
 
-/// Ticket 08: shape-check one inline xray chain hop (VLESS fields; the
-/// sidecar carries them verbatim). Errors name `nodes`, never values.
 fn validate_xray_hop(
     name: &str,
     label: &str,
@@ -2482,8 +2121,7 @@ fn validate_xray_hop(
             detail: format!("{label} xray hop is missing \"uuid\""),
         });
     }
-    // Ticket 29: xray itself rejects unparsable values at load (`unsupported
-    // "encryption""); a non-string never reaches it — typed here instead.
+
     if map
         .get("encryption")
         .is_some_and(|value| !value.is_string())
@@ -2497,8 +2135,6 @@ fn validate_xray_hop(
     Ok(())
 }
 
-/// One row of the per-endpoint isolation mapping: traffic arriving on
-/// `inbound_tag` exits only via `outbound_tag`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolationEntry {
     pub config_id: String,
@@ -2506,51 +2142,31 @@ pub struct IsolationEntry {
     pub outbound_tag: String,
 }
 
-/// A generated combined engine config plus its isolation mapping.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct GeneratedConfig {
-    /// Compact JSON fed to `check` and the sidecar's `-c` file.
     pub json: String,
     pub inbound_tags: Vec<String>,
     pub outbound_tags: Vec<String>,
     pub isolation: Vec<IsolationEntry>,
-    /// Ticket 07: true when any row needs the fork-core binary (AWG/XHTTP).
-    /// The controller partitions such sets: stock rows stay on the stock
-    /// sidecar, exotic rows go to the fork sidecar.
+
     pub requires_fork: bool,
-    /// Ticket 08: true when any row needs the Xray sidecar (Xray-only
-    /// VLESS, xray-core customs, xray-last chain hops).
+
     pub requires_xray: bool,
 }
 
 impl GeneratedConfig {
-    /// Parsed view of [`GeneratedConfig::json`] (tests assert structure).
     #[cfg(test)]
     pub fn value(&self) -> serde_json::Value {
         serde_json::from_str(&self.json).expect("generated config is valid JSON")
     }
 }
 
-/// Build one combined engine config from the active library rows.
-///
-/// Order: conflict check → per-row outbound/endpoint mapping → route table →
-/// structural self-check. Pure: no processes, no network, no secrets in
-/// errors.
-///
-/// Ticket 37: rows without an attached preset generate exactly as before;
-/// use [`generate_with_presets`] to merge per-row preset rules. Production
-/// serves through the controller (which always threads its preset map);
-/// this entry stays for preset-less callers and the test suite.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError> {
     generate_with_presets(configs, &HashMap::new())
 }
 
-/// Ticket 37: [`generate`] plus per-row routing presets. `presets` maps
-/// preset id → ordered route-rule objects (see [`Store::preset_rules_map`]);
-/// each attached row's rules merge ahead of its own isolation rule. An empty
-/// map is byte-identical to [`generate`].
 pub fn generate_with_presets(
     configs: &[ProxyConfig],
     presets: &HashMap<String, Vec<serde_json::Value>>,
@@ -2560,13 +2176,10 @@ pub fn generate_with_presets(
     }
     let mut taken: HashMap<(String, u16), &str> = HashMap::new();
     for config in configs {
-        // Ticket 32: custom full-config rows are user-managed (their bind
-        // is documentation, not an endpoint we serve), so they never
-        // conflict — exactly like `validate_activation`.
         if is_custom_config_protocol(&config.protocol) {
             continue;
         }
-        // Ticket 23: loopback aliases compare equal (localhost ≡ 127.0.0.1).
+
         let key = (normalize_bind_key(&config.bind_ip), config.port);
         if let Some(first) = taken.get(&key) {
             return Err(EngineError::PortConflict {
@@ -2579,9 +2192,7 @@ pub fn generate_with_presets(
         taken.insert(key, config.name.as_str());
     }
     let keys = bridge_keys_for(configs)?;
-    // Ticket 23 LOW: bridge preview/apply agreement — custom full-config rows
-    // are user-managed (their bind is documentation), so their ports never
-    // reserve bridge space, exactly like `validate_activation`.
+
     let taken_ports: HashSet<u16> = configs
         .iter()
         .filter(|row| !is_custom_config_protocol(&row.protocol))
@@ -2591,15 +2202,6 @@ pub fn generate_with_presets(
     build_main_config(configs, &bridges, presets)
 }
 
-/// Ticket 37: resolve one row's attached preset into merge-ready route rules.
-/// Route actions point at the row's serving tag (route to row outbound).
-/// Direct passes through, and the Throne `block` spelling is served as
-/// `reject` (live-proven: stock sing-box 1.14.2 has no `block` action).
-/// Rules without an `inbound` scope to the row's inbound. Presets are
-/// per-row policy, so an unscoped rule must never leak onto sibling rows
-/// sharing the sidecar; an explicit `inbound` is kept verbatim. Stored rules
-/// re-validate here (index and field, never values). A dangling preset id
-/// fails loudly instead of serving preset-less.
 fn preset_rules_for(
     config: &ProxyConfig,
     serving_tag: &str,
@@ -2627,9 +2229,7 @@ fn preset_rules_for(
             .get("action")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| bad(format!("rule {index}: field \"action\" is required")))?;
-        // Ticket 42: `warp` never serves (no endpoint to point at) — a
-        // guidance error here too, so a warp rule stored before the intake
-        // gate still fails loudly instead of serving preset-less.
+
         if action == "warp" || action == "warp-bypass" {
             return Err(bad(format!(
                 "rule {index}: action \"{action}\" is not servable (warp needs an endpoint design — no sing-box outbound to point at; use \"route\", \"proxy\", \"direct\", or \"reject\")"
@@ -2641,8 +2241,7 @@ fn preset_rules_for(
                 crate::preset::VALID_PRESET_ACTIONS.join(", ")
             )));
         }
-        // Ticket 42: `proxy` aliases `route` (both point at the row's
-        // serving tag); `block` already serves as `reject`.
+
         let route_like = action == "route" || action == "proxy";
         if route_like {
             if let Some(outbound) = obj.get("outbound") {
@@ -2658,27 +2257,20 @@ fn preset_rules_for(
             )));
         }
         let mut merged = obj.clone();
-        // Normalize the served spelling (`block` → `reject`, `proxy` →
-        // `route`); direct/reject spellings are already what the sidecar
-        // accepts.
+
         merged.insert(
             "action".to_string(),
             serde_json::Value::String(crate::preset::served_action(action).to_string()),
         );
         if route_like {
             match obj.get("outbound").and_then(serde_json::Value::as_str) {
-                // No explicit outbound: route through the attached row.
                 None => {
                     merged.insert(
                         "outbound".to_string(),
                         serde_json::Value::String(serving_tag.to_string()),
                     );
                 }
-                // An explicit outbound is preserved, never silently
-                // overwritten: only this row's serving tag or `direct`
-                // resolve in the served exits — a sibling's tag or a typo
-                // fails loudly instead of serving the row's outbound while
-                // claiming otherwise.
+
                 Some(explicit) if explicit == serving_tag || explicit == "direct" => {}
                 Some(_) => {
                     return Err(bad(format!(
@@ -2687,10 +2279,7 @@ fn preset_rules_for(
                 }
             }
         }
-        // Presets are per-row policy: an unscoped rule is scoped to this
-        // row's inbound automatically, and an explicit `inbound` must name
-        // exactly this row's inbound — keeping a foreign inbound verbatim
-        // would apply this row's rule to a sibling row's traffic.
+
         match merged.get("inbound") {
             None => {
                 merged.insert(
@@ -2712,13 +2301,10 @@ fn preset_rules_for(
     }
     Ok(out)
 }
-/// rows and xray-core customs; `{id}#hop{i}` for xray-last inline chain
-/// hops). Both [`generate`] and [`validate_activation`] derive keys this
-/// way so one shared port map keeps pointers and ingress in agreement.
+
 fn bridge_keys_for(configs: &[ProxyConfig]) -> Result<Vec<String>, EngineError> {
     let mut keys = Vec::new();
     for config in configs {
-        // Ticket 29: VLESS `encryption` rows take bridge ports too.
         if is_xray_protocol(&config.protocol) || config_vless_needs_xray(config) {
             keys.push(config.id.clone());
             continue;
@@ -2748,19 +2334,11 @@ fn bridge_keys_for(configs: &[ProxyConfig]) -> Result<Vec<String>, EngineError> 
     Ok(keys)
 }
 
-/// Ticket 05/07 standard node builder (extracted verbatim for chain-hop
-/// reuse): stored params → sing-box outbound/endpoint node. Returns the
-/// node, whether it belongs in `endpoints[]` (wireguard), and whether it
-/// needs the fork sidecar.
 fn build_standard_node(
     config: &ProxyConfig,
     params: &mut serde_json::Map<String, serde_json::Value>,
     out_tag: &str,
 ) -> Result<(serde_json::Value, bool, bool), EngineError> {
-    // Config-completeness T08 (CAP-12): trivial `direct` rows carry no
-    // endpoint — serve a bare direct outbound under the row's tag (the
-    // row's own isolation rule routes its inbound there). Stored extras
-    // are ignored, never emitted (a final takes no fields).
     if is_direct_protocol(&config.protocol) {
         let node = serde_json::json!({"type": "direct", "tag": out_tag});
         return Ok((node, false, false));
@@ -2769,19 +2347,11 @@ fn build_standard_node(
         name: config.name.clone(),
         field: "server",
     })?;
-    // Ticket 07: wrong-layer guards run before dispatch so obfuscation
-    // mixes fail explicitly instead of connecting nowhere.
+
     check_wrong_layer(&config.name, &config.protocol, params)?;
     let xhttp =
         transport_of(params).is_some_and(|transport| transport.eq_ignore_ascii_case("xhttp"));
-    // Ticket 07: AWG variants validate against the version matrix and
-    // become fork `wireguard` endpoints (the fork extends the wireguard
-    // endpoint schema with the AWG fields, passed through verbatim); the
-    // fork's own `check` stays authoritative for value shapes. XHTTP on
-    // the VLESS family is fork-routed with its params verbatim.
-    // Ticket 27: standalone Noise validates its own shape and becomes a
-    // fork `noise` outbound (fork sidecar path); native SSH/AnyTLS validate
-    // their credentials and stay stock outbounds.
+
     let (canonical, fork_row) = if is_awg_protocol(&config.protocol) {
         validate_awg_row(&config.name, params)?;
         ("wireguard", true)
@@ -2810,10 +2380,7 @@ fn build_standard_node(
             protocol: config.protocol.clone(),
         });
     };
-    // Ticket 42: stored `https` rows serve through the `http` outbound
-    // with TLS on — without an explicit marker the http arm would serve
-    // them plaintext. (Link intake already stores `security=tls`; this
-    // covers JSON rows typed `https`.)
+
     if canonical == "http"
         && config.protocol.trim().eq_ignore_ascii_case("https")
         && !params.contains_key("security")
@@ -2824,10 +2391,7 @@ fn build_standard_node(
             serde_json::Value::String("tls".to_string()),
         );
     }
-    // Ticket 29: stock sing-box rejects ANY `encryption` key on vless
-    // outbounds, so absent/blank/`"none"` drops the key here (stays stock).
-    // A real value never reaches stock emission (routing sends it xray-ward)
-    // and fails typed if it does; a non-string fails typed naming the field.
+
     if canonical == "vless" {
         match vless_encryption_of(params) {
             VlessEncryption::Stock => {
@@ -2843,14 +2407,7 @@ fn build_standard_node(
             }
         }
     }
-    // Ticket 32: v2ray-flat stored params → stock sing-box 1.14.2 schema
-    // (live-probed: strict decode rejects top-level `security`/`sni`/
-    // `path`/… on outbounds). TLS intent folds into a `tls` object,
-    // stream settings into a `transport` object; keys meaningless for the
-    // protocol are dropped (other clients ignore them too); keys
-    // meaningful but unmappable fail named (never a silently wrong
-    // connection). Anything unrecognized passes through for the engine's
-    // own `check` to judge loudly.
+
     translate_outbound(canonical, &config.name, params)?;
     let server_port = match params.get("server_port") {
         Some(serde_json::Value::Number(number)) => number
@@ -2885,9 +2442,6 @@ fn build_standard_node(
     Ok((node, canonical == "wireguard", fork_row))
 }
 
-/// Ticket 32: first non-blank string among `keys` (exact-case, matching
-/// every other params reader here); removes ALL listed keys whether or
-/// not one matched, so alias spellings never leak into the emission.
 fn take_flat(
     params: &mut serde_json::Map<String, serde_json::Value>,
     keys: &[&str],
@@ -2905,9 +2459,6 @@ fn take_flat(
     found
 }
 
-/// Ticket 42: true when any of `keys` holds a truthy flat spelling
-/// (`1`/`true`/`yes`/`on`, JSON bools/numbers included). Consumes ALL
-/// listed keys either way, so alias spellings never leak into the emission.
 fn take_truthy(params: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
     let mut on = false;
     for key in keys {
@@ -2930,11 +2481,6 @@ fn take_truthy(params: &mut serde_json::Map<String, serde_json::Value>, keys: &[
     on
 }
 
-/// Ticket 42: fold ECH intake spellings into one native `tls.ech` block
-/// (or `None` for no ECH). A truthy `ech` mark enables with an empty
-/// config (HTTPS-record DNS lookup per docs); any other non-empty mark is
-/// the config itself; explicit `ech_config`/`ech_config_path` attach to
-/// either form.
 fn ech_block(
     mark: Option<String>,
     config: Option<String>,
@@ -2989,8 +2535,6 @@ fn ech_block(
     Some(serde_json::Value::Object(block))
 }
 
-/// Ticket 32: `{"field": ...}` error naming the offending stored field
-/// (never values, keys, or tokens).
 fn bad_option(name: &str, field: &str, detail: &str) -> EngineError {
     EngineError::BadCustom {
         name: name.to_string(),
@@ -2999,8 +2543,6 @@ fn bad_option(name: &str, field: &str, detail: &str) -> EngineError {
     }
 }
 
-/// Ticket 32: split a flat `alpn` value (`"h2"`, `"h2,http/1.1"`) into the
-/// string array the sing-box `tls` object wants. Empty means omit.
 fn split_alpn(raw: Option<String>) -> Vec<serde_json::Value> {
     raw.map(|text| {
         text.split(',')
@@ -3012,14 +2554,6 @@ fn split_alpn(raw: Option<String>) -> Vec<serde_json::Value> {
     .unwrap_or_default()
 }
 
-/// Ticket 32: one sing-box `tls` outbound object. `server_name` falls back
-/// to the row's server; `reality` carries the public key (short id only
-/// when the row sets one). The uTLS fingerprint lives in the `utls`
-/// object — live-probed: 1.14.2 strict-decodes and rejects a top-level
-/// `fingerprint` on the tls object.
-/// Ticket 42: `insecure` honors the trojan `allowInsecure` intake spelling
-/// (mapped, never passed through); `ech` carries the ECH client block
-/// (empty config → HTTPS-record DNS lookup per docs).
 fn tls_object(
     server: &str,
     server_name: Option<String>,
@@ -3065,17 +2599,11 @@ fn tls_object(
     serde_json::Value::Object(tls)
 }
 
-/// Ticket 32: TLS intent behind one row's flat `security` marker.
 enum TlsIntent {
     Off,
     On { reality: bool },
 }
 
-/// Ticket 32: fold one row's flat TLS keys (`security`/`sni`/`fp`/`alpn`/
-/// `pbk`/`sid`/`peer`) into a sing-box `tls` object, or drop them when the
-/// intent is off. `default_on` serves the protocols that are definitionally
-/// TLS (trojan, tuic, hysteria, hysteria2, anytls); `mandatory` rejects an
-/// explicit `security=none` on protocols where plaintext cannot work.
 fn apply_tls(
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
@@ -3112,9 +2640,7 @@ fn apply_tls(
     let alpn = split_alpn(take_flat(params, &["alpn"]));
     let public_key = take_flat(params, &["pbk"]);
     let short_id = take_flat(params, &["sid"]);
-    // Ticket 42: trojan `allowInsecure` spellings (plus the bare `insecure`
-    // flat) fold into `tls.insecure` here, on every TLS-capable protocol —
-    // never a top-level passthrough `check` rejects cryptically.
+
     let insecure = take_truthy(
         params,
         &[
@@ -3124,10 +2650,7 @@ fn apply_tls(
             "insecure",
         ],
     );
-    // Ticket 42: ECH intake — a native `ech` object from JSON intake wins
-    // outright; a string/bool `ech` mark plus explicit config paths fold
-    // into a built block. Flats beside a native object are redundant intake
-    // spellings, not a second ECH block.
+
     let (native_ech, ech_mark) = match params.remove("ech") {
         Some(serde_json::Value::Object(map)) => (Some(serde_json::Value::Object(map)), None),
         Some(serde_json::Value::String(text)) => (None, Some(text)),
@@ -3138,10 +2661,7 @@ fn apply_tls(
     let ech_config_path = take_flat(params, &["ech_config_path", "echconfigpath"]);
     let ech = native_ech.or_else(|| ech_block(ech_mark, ech_config, ech_config_path));
     match intent {
-        TlsIntent::Off => {
-            // No TLS: key material for it is meaningless here.
-            Ok(())
-        }
+        TlsIntent::Off => Ok(()),
         TlsIntent::On { reality: false } => {
             params.insert(
                 "tls".to_string(),
@@ -3171,11 +2691,6 @@ fn apply_tls(
     }
 }
 
-/// Ticket 42 (prohibited side effect): 1.15.0-only fields must never reach
-/// an emitted 1.14.2 config. `certificate_sha256` pinning is 1.15.0+
-/// (1.14.2 pins via `certificate_public_key_sha256`, which stays allowed);
-/// feeding it fails typed naming the field instead of emitting a config
-/// `check` rejects — or worse, silently ignoring a security pin.
 fn reject_115_fields(
     name: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -3190,8 +2705,6 @@ fn reject_115_fields(
     Ok(())
 }
 
-/// Ticket 42: sing-box Dial fields accepted verbatim beside every strict
-/// per-protocol allowlist (connection tuning, never protocol semantics).
 const DIAL_KEYS: &[&str] = &[
     "bind_interface",
     "routing_mark",
@@ -3204,10 +2717,6 @@ const DIAL_KEYS: &[&str] = &[
     "domain_resolver",
 ];
 
-/// Ticket 42: unknown params on strict protocols (hy2/tuic/snell/
-/// shadowtls/socks/http/naive) fail typed naming the field instead of
-/// dying inside `check`. `type`/`tag`/`server`/`server_port` are structural
-/// and always allowed; [`DIAL_KEYS`] ride along everywhere.
 fn reject_unknown_params(
     name: &str,
     canonical: &str,
@@ -3232,11 +2741,6 @@ fn reject_unknown_params(
     Ok(())
 }
 
-/// Ticket 42: coerce an hysteria2 speed flat (any of the `up`/`down`
-/// spellings) to whole Mbps. JSON numbers pass through (`100` → 100);
-/// strings take a leading-number parse, so provider spellings like
-/// "100 Mbps" map. `None` means BBR-by-omission; anything else fails typed
-/// naming the Mbps field (never a silently dropped explicit speed).
 fn take_speed(
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
@@ -3279,16 +2783,10 @@ fn take_speed(
     }
 }
 
-/// Ticket 32: fold one row's flat stream keys (`network`/`path`/`host`/…)
-/// into a sing-box `transport` object (`None` for plain TCP). Only shapes
-/// the live probe proved 1.14.2 accepts are emitted; anything else names
-/// `network` instead of emitting a guess.
 fn apply_transport(
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
-    // A native `transport` object wins outright; the flats beside it are
-    // redundant intake spellings, not a second transport.
     if let Some(native) = params.remove("transport") {
         take_flat(
             params,
@@ -3316,13 +2814,7 @@ fn apply_transport(
     let network = take_flat(params, &["network"]).unwrap_or_default();
     let path = take_flat(params, &["path"]);
     let host = take_flat(params, &["host"]);
-    // Config-completeness review: a custom `headers` map has no transport
-    // mapping on this path (only `host` survives below as the Host header)
-    // — fail typed naming the field instead of consuming it silently
-    // (ticket-42 kcp/header_type precedent: meaningful but unmappable
-    // errors at its own site). Blank and empty shapes stay no-ops so
-    // untouched rows keep working; the `http`-protocol arm never reaches
-    // here (it keeps path/headers via its own allowlist).
+
     let headers_trivial = match params.get("headers") {
         None | Some(serde_json::Value::Null) => true,
         Some(serde_json::Value::String(text)) => text.trim().is_empty(),
@@ -3342,10 +2834,7 @@ fn apply_transport(
     let method = take_flat(params, &["method"]);
     let transport = match network.to_ascii_lowercase().as_str() {
         "" | "tcp" | "raw" | "none" => None,
-        // Ticket 42 (US-23): V2Ray QUIC transport is `{"type":"quic"}` —
-        // no extra fields, no added encryption (docs: "basically duplicate
-        // encryption"). kcp stays a typed bad-option below (the ticket-42
-        // kcp decision: no stock sing-box mapping, fail named).
+
         "quic" => {
             let quic = serde_json::Map::with_capacity(1);
             Some((serde_json::Value::String("quic".to_string()), quic))
@@ -3362,8 +2851,7 @@ fn apply_transport(
         }
         "grpc" | "gun" => {
             let mut grpc = serde_json::Map::with_capacity(1);
-            // v2ray grpc names the service `serviceName`; some links use
-            // `path` (or `host`) for the same slot.
+
             let service = service_name.or(path).or(host);
             if let Some(service) = service {
                 grpc.insert(
@@ -3400,8 +2888,6 @@ fn apply_transport(
             ))
         }
         "xhttp" => {
-            // Fork-routed (stock has no xhttp): the fork judges the shape;
-            // the pointer carries the intake slots plus any mode pin.
             let mut xhttp = serde_json::Map::with_capacity(3);
             if let Some(host) = host {
                 xhttp.insert("host".to_string(), serde_json::Value::String(host));
@@ -3429,33 +2915,12 @@ fn apply_transport(
     Ok(())
 }
 
-/// Config-completeness T02 (S3): v2ray-flat mux keys → stock sing-box
-/// 1.14.2 `multiplex` outbound object, for ss/trojan/vless/vmess only.
-/// Per-key contract (live-probed shape, recorded here):
-/// - `mux` ""/absent → omit `multiplex` (sing-box default: disabled).
-/// - `mux` "on" (case-insensitive) → `{"enabled": true}`.
-/// - `mux` "off" → `{"enabled": false}` (explicitly disables).
-/// - any other `mux` spelling → typed `bad_option` (the UI constrains to
-///   the three; hand JSON garbage fails naming the field, never emits a
-///   shape `check` would reject opaquely).
-/// - `brutal_enable` + `brutal_up_mbps`/`brutal_down_mbps` (plus
-///   `brutal_up`/`brutal_down` intake spellings): consumed here, preserved
-///   in stored JSON (generation works on a clone), NEVER emitted — stock
-///   sing-box 1.14.2 has no brutal mapping. The mux-force behavior still
-///   holds: the panel writes `mux: "on"` alongside brutal (UI-forced), so
-///   emission sees it. `flow=vision` does not veto here (the VLESS page
-///   disables S3 with reason instead — dumb engine, smart UI).
-///
-/// sing-box 1.14.2 `multiplex` also knows `protocol`, `max_connections`,
-///   `min_streams`, `max_streams`, `padding` — none have panel controls in
-///   this ticket, so none emit (never invent keys the UI cannot explain).
 fn apply_mux(
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
     let mode = take_flat(params, &["mux"]);
-    // Brutal speeds are panel state, not emission: consume every spelling
-    // so provider/import junk in these keys can never fail `check`.
+
     take_truthy(params, &["brutal_enable"]);
     take_flat(
         params,
@@ -3491,11 +2956,6 @@ fn apply_mux(
     Ok(())
 }
 
-/// Ticket 32: keys that carry no meaning for protocols without TLS or
-/// stream transports (intake spellings from other protocols' links).
-/// Dropped so provider junk never fails `check`; anything meaningful but
-/// unmappable errors at its own site instead of here. `keep` spares a key
-/// that is native to the caller (the shadowsocks cipher `method`).
 fn drop_foreign_flats(params: &mut serde_json::Map<String, serde_json::Value>, keep: &[&str]) {
     for key in [
         "security",
@@ -3521,13 +2981,6 @@ fn drop_foreign_flats(params: &mut serde_json::Map<String, serde_json::Value>, k
         "method",
         "transport",
         "variant",
-        // Ticket 42: TLS-bypass/ECH/speed/obfs flats are meaningless on
-        // protocols without TLS or those shapes — drop them here so they
-        // never reach `check` as unknown fields (the TLS-capable and
-        // strict arms consume or judge their own copies first).
-        // Config-completeness T02 (S3): mux flats are meaningless outside
-        // ss/trojan/vless/vmess (those arms consume them in `apply_mux`
-        // first) — drop them here for the same reason.
         "allowInsecure",
         "allow_insecure",
         "allowinsecure",
@@ -3564,14 +3017,11 @@ fn drop_foreign_flats(params: &mut serde_json::Map<String, serde_json::Value>, k
     }
 }
 
-/// Ticket 32: v2ray-flat stored params → stock sing-box 1.14.2 outbound
-/// schema (see [`apply_tls`] / [`apply_transport`] for the contract).
 fn translate_outbound(
     canonical: &str,
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), EngineError> {
-    // Ticket 42: 1.15.0-only fields never emit — fail typed up front.
     reject_115_fields(name, params)?;
     let server = params
         .get("server")
@@ -3584,14 +3034,10 @@ fn translate_outbound(
         "vless" | "trojan" => {
             apply_tls(name, params, &server, canonical == "trojan", false)?;
             apply_transport(name, params)?;
-            // Config-completeness T02 (S3): mux emission ships with the UI
-            // (never UI-first with dead keys).
+
             apply_mux(name, params)?;
         }
         "vmess" => {
-            // Legacy links carry a `tls` bool plus a cipher `security`;
-            // new-style links carry tls-ness in `security` and the cipher
-            // in `encryption`. The bool decides which grammar owns the row.
             if params.get("tls").is_some_and(|tls| tls.is_boolean()) {
                 let on = params
                     .remove("tls")
@@ -3601,10 +3047,7 @@ fn translate_outbound(
                     let server_name = take_flat(params, &["sni"]);
                     let fingerprint = take_flat(params, &["fp", "fingerprint"]);
                     let alpn = split_alpn(take_flat(params, &["alpn"]));
-                    // Config-completeness T03: the S2 panel folds `insecure`
-                    // on every TLS-capable page incl. legacy vmess rows —
-                    // honor it here instead of dropping it (rows without the
-                    // flat keep the old shape).
+
                     let insecure = take_truthy(
                         params,
                         &[
@@ -3627,7 +3070,7 @@ fn translate_outbound(
                         ),
                     );
                 }
-                // `security` stays: it is the sing-box packet cipher here.
+
                 take_flat(params, &["pbk", "sid", "peer"]);
             } else {
                 let cipher =
@@ -3635,12 +3078,7 @@ fn translate_outbound(
                 apply_tls(name, params, &server, false, false)?;
                 params.insert("security".to_string(), serde_json::Value::String(cipher));
             }
-            // `alter_id` is numeric in sing-box; intake keeps strings.
-            // Config-completeness T03: `aid` is the link/Throne spelling of
-            // the same field (the VMess page reads both, writes `alter_id`)
-            // — fold it so hand JSON keeps working; the canonical key wins
-            // when both disagree, and the alias never leaks (t32 precedent:
-            // folded, not duplicated).
+
             let aid = take_flat(params, &["aid"]);
             if params.get("alter_id").is_none() {
                 if let Some(aid) = aid {
@@ -3678,14 +3116,12 @@ fn translate_outbound(
                 ));
             }
             apply_transport(name, params)?;
-            // Config-completeness T02 (S3): same mux arm as vless/trojan.
+
             apply_mux(name, params)?;
         }
         "tuic" | "hysteria" | "anytls" => {
             apply_tls(name, params, &server, true, true)?;
-            // Stream transports don't exist on these protocols; the flats
-            // beside them are other protocols' intake spellings. Ticket 42:
-            // tuic keeps its native `network` (tcp/udp); the rest drop.
+
             if canonical == "tuic" {
                 take_flat(
                     params,
@@ -3712,12 +3148,7 @@ fn translate_outbound(
                     ],
                 );
             }
-            // Config-completeness T06: AnyTLS session tunables — the Throne
-            // short names (`interval`/`timeout`/`min`) fold to the sing-box
-            // session fields (docs-verified 1.14.2 shapes: durations stay
-            // text, the count coerces to a number; t32 precedent: folded,
-            // not duplicated, canonical wins). Other protocols never see
-            // these keys (wrong layer would hide a mistyped row).
+
             if canonical == "anytls" {
                 if params.get("idle_session_check_interval").is_none() {
                     if let Some(interval) = take_flat(params, &["interval"]) {
@@ -3752,14 +3183,6 @@ fn translate_outbound(
                 }
             }
             if canonical == "hysteria" {
-                // sing-box holds the plaintext credential in `auth_str`;
-                // `auth` is base64 bytes there, never the link secret.
-                // Config-completeness T05: a v2-layout `password` also folds
-                // here when no v1 `auth` is present (hy2-arm precedent) — the
-                // guided page folds exactly one credential per layout, and a
-                // toggled row must still start with the typed secret instead
-                // of running auth-less. Canonical `auth` wins on conflict;
-                // the alias never leaks to `check` either way.
                 let auth = take_flat(params, &["auth"]);
                 let password = take_flat(params, &["password"]);
                 if params.get("auth_str").is_none() {
@@ -3769,9 +3192,7 @@ fn translate_outbound(
                         params.insert("auth_str".to_string(), serde_json::Value::String(password));
                     }
                 }
-                // Live-probed: 1.14.2 fails initialize without upload and
-                // download speeds. Name them instead of inventing
-                // bandwidth that would silently throttle the row.
+
                 for field in ["up", "down"] {
                     let present = params
                         .get(field)
@@ -3790,14 +3211,6 @@ fn translate_outbound(
                 }
             }
             if canonical == "tuic" {
-                // Ticket 42 (US-26): tuic extras validate against the 1.14.2
-                // shape — wild keys fail typed naming the field instead of
-                // dying inside `check`.
-                // Config-completeness T05: the Throne `zero_rtt` spelling
-                // folds to the sing-box `zero_rtt_handshake` bool (a stored
-                // false drops — the schema default — so the alias never
-                // leaks; WG t32 precedent: folded, not duplicated, canonical
-                // wins).
                 if take_truthy(params, &["zero_rtt_handshake", "zero_rtt"]) {
                     params.insert(
                         "zero_rtt_handshake".to_string(),
@@ -3823,9 +3236,6 @@ fn translate_outbound(
             }
         }
         "hysteria2" => {
-            // Ticket 42 (US-21/US-26): TLS is mandatory; speeds omit to BBR
-            // when unset (never a zero default); obfs flats fold into the
-            // native block; wild extras fail typed.
             apply_tls(name, params, &server, true, true)?;
             if let Some(variant) = take_flat(params, &["variant"]) {
                 return Err(bad_option(
@@ -3834,7 +3244,7 @@ fn translate_outbound(
                     &format!("hysteria2 variant \"{variant}\" has no stock sing-box mapping"),
                 ));
             }
-            // JSON intake may carry `auth` where links carry `password`.
+
             let auth = take_flat(params, &["auth"]);
             if params.get("password").is_none() {
                 if let Some(auth) = auth {
@@ -3920,8 +3330,7 @@ fn translate_outbound(
                     ));
                 }
             }
-            // hy2 has no stream transports, but `network` (tcp/udp) is
-            // native and survives; the rest are foreign intake spellings.
+
             take_flat(
                 params,
                 &[
@@ -3954,10 +3363,6 @@ fn translate_outbound(
             )?;
         }
         "socks" => {
-            // Ticket 42 (US-20): native `socks` outbound. `version` omits —
-            // the schema default is 5, which is what intake stores; any
-            // other version fails closed (wire format unverified for 1.14.2,
-            // never a guessed emission).
             match params.remove("version") {
                 None => {}
                 Some(serde_json::Value::Number(number)) if number.as_u64() == Some(5) => {}
@@ -3998,9 +3403,6 @@ fn translate_outbound(
             )?;
         }
         "http" => {
-            // Ticket 42 (US-20): native `http` outbound. `version` (and the
-            // HTTP2/QUIC serve options around it) are 1.15.0+ — reject
-            // loudly instead of emitting a config `check` refuses.
             if params.contains_key("version") {
                 return Err(bad_option(
                     name,
@@ -4011,8 +3413,6 @@ fn translate_outbound(
             match params.remove("tls") {
                 None => apply_tls(name, params, &server, false, false)?,
                 Some(serde_json::Value::Object(map)) => {
-                    // A native `tls` object wins; intake flats beside it
-                    // are redundant spellings, not a second TLS block.
                     take_flat(
                         params,
                         &[
@@ -4052,8 +3452,6 @@ fn translate_outbound(
             )?;
         }
         "naive" => {
-            // Ticket 42: native `naive` outbound (upstream 1.14.2 table
-            // member). TLS is definitional here — always on, never optional.
             for field in ["username", "password"] {
                 if str_field(params, field).is_none() {
                     return Err(EngineError::BadParams {
@@ -4063,14 +3461,7 @@ fn translate_outbound(
                 }
             }
             apply_tls(name, params, &server, true, true)?;
-            // Config-completeness T06: the Naïve page writes the docs-verified
-            // 1.14.2 tunables (`udp_over_tcp` bool-or-object, `quic` bool,
-            // `quic_congestion_control` bbr|bbr2|cubic|reno) — the strict gate
-            // below allows them so the page never writes a key generate
-            // rejects (T02 mux-arm precedent: UI ships with its engine arm).
-            // The Throne `uot`/`congestion_control` spellings fold to the
-            // sing-box names (t32 precedent: folded, not duplicated,
-            // canonical wins).
+
             if take_truthy(params, &["uot"]) && params.get("udp_over_tcp").is_none() {
                 params.insert("udp_over_tcp".to_string(), serde_json::Value::Bool(true));
             }
@@ -4112,9 +3503,6 @@ fn translate_outbound(
             )?;
         }
         "snell" => {
-            // Ticket 42 (US-24): native `snell` outbound (1.14.0+ schema).
-            // `version` coerces to a number (absent means 4, like links);
-            // anything outside 4|6 fails typed.
             if str_field(params, "psk").is_none() {
                 return Err(EngineError::BadParams {
                     name: name.to_string(),
@@ -4172,10 +3560,6 @@ fn translate_outbound(
             )?;
         }
         "shadowtls" => {
-            // Ticket 42 (US-24): native `shadowtls` outbound. TLS is
-            // required (always on); `version` coerces to a number (absent
-            // takes the schema default 1); password is v2/v3-only and
-            // simply omits on v1 rows.
             apply_tls(name, params, &server, true, true)?;
             match params.remove("version") {
                 None => {}
@@ -4220,9 +3604,6 @@ fn translate_outbound(
             reject_unknown_params(name, "shadowtls", params, &["version", "password", "tls"])?;
         }
         "ssh" => {
-            // Live-probed: the stock `ssh` outbound names the login `user`;
-            // intake also accepts `username`, so fold it (explicit `user`
-            // wins). No TLS or stream transports on this shape.
             if params.get("user").is_none() {
                 if let Some(user) = take_flat(params, &["username"]) {
                     params.insert("user".to_string(), serde_json::Value::String(user));
@@ -4230,10 +3611,7 @@ fn translate_outbound(
             } else {
                 params.remove("username");
             }
-            // Config-completeness T06: the Throne `private_key_pass` spelling
-            // folds to sing-box `private_key_passphrase` (t32 precedent:
-            // folded, not duplicated, canonical wins — the alias never leaks
-            // to `check` either way).
+
             if params.get("private_key_passphrase").is_none() {
                 if let Some(pass) = take_flat(params, &["private_key_pass"]) {
                     params.insert(
@@ -4247,15 +3625,9 @@ fn translate_outbound(
             drop_foreign_flats(params, &["user"]);
         }
         "wireguard" => {
-            // No TLS or stream transports on these shapes; the flats
-            // beside them are other protocols' intake spellings.
             drop_foreign_flats(params, &[]);
         }
         "shadowsocks" => {
-            // Same, except `method` is the native cipher name here. A
-            // SIP002 `plugin` names an external executable sing-box would
-            // try to run at initialize: fail named instead of emitting a
-            // config `check` rejects with "plugin not found".
             if take_flat(params, &["plugin"]).is_some() {
                 return Err(bad_option(
                     name,
@@ -4263,16 +3635,9 @@ fn translate_outbound(
                     "shadowsocks plugins need their executable beside the engine (stock check fails without it)",
                 ));
             }
-            // Config-completeness T02 (S3): mux-only Settings panel — the
-            // mux arm runs FIRST (it consumes the flats `drop_foreign_flats`
-            // would otherwise eat).
+
             apply_mux(name, params)?;
-            // Config-completeness T03: `uot` is the v2ray/Throne flat
-            // spelling of sing-box `udp_over_tcp` (the socks arm already
-            // consumes that flat; the Shadowsocks page reads both, writes
-            // the canonical bool) — fold it so hand JSON keeps working; the
-            // canonical key wins when both disagree, and the alias never
-            // leaks (t32 precedent: folded, not duplicated).
+
             if take_truthy(params, &["uot"]) && params.get("udp_over_tcp").is_none() {
                 params.insert("udp_over_tcp".to_string(), serde_json::Value::Bool(true));
             }
@@ -4280,19 +3645,13 @@ fn translate_outbound(
         }
         _ => {}
     }
-    // `flow` survives only on vless (xtls-vision); elsewhere it is junk.
+
     if canonical != "vless" {
         params.remove("flow");
     }
     Ok(())
 }
 
-/// sing-box ≥1.11 WireGuard clients are `endpoints[]`, not outbounds: the
-/// remote peer lives in `peers[]` while local material (private key,
-/// interface addresses, MTU, and AmneziaWG obfuscation fields) stays
-/// top-level. Stored rows keep outbound-style keys (`server`, `public_key`);
-/// this translates them, erroring on missing credentials instead of emitting
-/// a config the engine rejects with `unknown field "server"`.
 fn reshape_wireguard_endpoint(
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
@@ -4343,8 +3702,7 @@ fn reshape_wireguard_endpoint(
             other => serde_json::Value::Array(vec![other]),
         }
     };
-    // Endpoint list fields stay lists: interface addresses arrive as a
-    // single CIDR string from conf/URI intake.
+
     if let Some(address) = params.remove("address") {
         params.insert("address".to_string(), as_list(address));
     }
@@ -4364,19 +3722,12 @@ fn reshape_wireguard_endpoint(
     if let Some(allowed) = take_key(params, &["allowed_ips", "allowedips"]) {
         peer.insert("allowed_ips".to_string(), as_list(allowed));
     } else {
-        // Live-probed: 1.14.2 fails initialize with "missing allowed ips
-        // for peer 0". Link intake never carries AllowedIPs, and an egress
-        // that routes nothing is useless, so default to the v4 full
-        // tunnel (documented; a row that wants split tunnel sets it).
         peer.insert(
             "allowed_ips".to_string(),
             serde_json::Value::Array(vec![serde_json::Value::String("0.0.0.0/0".to_string())]),
         );
     }
-    // Per the schema (and live-probed against 1.14.2): the dial
-    // keepalive is `peers[].persistent_keepalive_interval`, numeric
-    // seconds. Intake keeps strings, so coerce; a failed parse stays
-    // verbatim for `check` to name loudly.
+
     if let Some(keepalive) = take_key(
         params,
         &["persistent_keepalive", "persistent_keepalive_interval"],
@@ -4393,17 +3744,13 @@ fn reshape_wireguard_endpoint(
     }
     params.remove("server");
     params.remove("server_port");
-    // Internal classification markers never reach the engine.
+
     params.remove("awg_version");
-    // Config-completeness T04: `enable_amnezia` is dialog state, not an
-    // endpoint field (brutal-speeds precedent — stored JSON keeps it).
+
     params.remove("enable_amnezia");
-    // Client-side resolver setting from conf files: not an endpoint field.
+
     params.remove("dns");
-    // Ticket 42 (US-25): conf/URI intake keeps `reserved` bytes as a
-    // "1,2,3" string; the endpoint schema wants a number array, so coerce
-    // comma/space-separated bytes (a failed parse stays verbatim for
-    // `check` to name loudly — identical on both intake paths).
+
     if let Some(reserved) = params.remove("reserved") {
         let coerced = match reserved {
             serde_json::Value::String(text) => text
@@ -4422,10 +3769,7 @@ fn reshape_wireguard_endpoint(
         };
         params.insert("reserved".to_string(), coerced);
     }
-    // Ticket 32: stock endpoint numerics arrive as strings from conf/URI
-    // intake (`mtu`); coerce, leaving failures verbatim for `check`.
-    // (Peer keepalive is renamed + coerced at build time above; AWG
-    // junk-train numerics get the same treatment below for the fork.)
+
     if let Some(number) = params
         .get("mtu")
         .and_then(serde_json::Value::as_str)
@@ -4433,15 +3777,7 @@ fn reshape_wireguard_endpoint(
     {
         params.insert("mtu".to_string(), serde_json::Value::Number(number.into()));
     }
-    // The fork's AmneziaWG numeric options (jc/jmin/jmax/s1-s4/h1-h4) are
-    // typed numerics; conf/URI intake keeps everything as strings, so
-    // coerce the plain-numeric fields. H-ranges ("1-100") and i-chains
-    // ("<b …><r …>") are truly opaque and pass through verbatim for the
-    // fork to judge (a failed parse keeps the original string).
-    // Config-completeness T04: `workers` and `maxhandshakeattempts` join
-    // the loop — the T04 pages fold every numeric as text (aid precedent:
-    // import spellings echo byte-identical), so string spellings must be
-    // check-safe here rather than canonicalized at fold time.
+
     for key in [
         "jc",
         "jmin",
@@ -4472,8 +3808,6 @@ fn reshape_wireguard_endpoint(
     Ok(())
 }
 
-/// Ticket 08: one row's main-config emission: its outbound/endpoint nodes
-/// plus the tag the route rule must point at.
 struct RowBuilt {
     nodes: Vec<(serde_json::Value, bool)>,
     serving_tag: String,
@@ -4481,11 +3815,6 @@ struct RowBuilt {
     requires_xray: bool,
 }
 
-/// Ticket 08: build one ticket-08 row for the main config (`None` for
-/// standard/AWG rows, which fall through to [`build_standard_node`]).
-/// Extra and full-config rows are rejected here: they run in their own
-/// sidecar / replace a core wholesale, so a bare main config can never
-/// serve them (the controller partitions them out first).
 fn build_ticket08_row(
     config: &ProxyConfig,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -4508,8 +3837,7 @@ fn build_ticket08_row(
             detail: "custom full-config rows replace their core's config instead of joining the main config".to_string(),
         });
     }
-    // Ticket 29: standard VLESS rows with a real `encryption` value emit the
-    // same loopback bridge pointer (stock rejects the key outright).
+
     if is_xray_protocol(&config.protocol) || vless_needs_xray(&config.protocol, params) {
         check_wrong_layer(&config.name, &config.protocol, params)?;
         validate_xray_row(&config.name, params)?;
@@ -4598,9 +3926,7 @@ fn build_ticket08_row(
                             ),
                         });
                     }
-                    // Ticket 29: xray rows and VLESS-`encryption` rows are
-                    // bridge legs served through the main config, so they
-                    // resolve before the fork-sidecar rejection below.
+
                     let target_bridged = is_xray_protocol(&target.protocol)
                         || params_object(target)
                             .ok()
@@ -4658,8 +3984,7 @@ fn build_ticket08_row(
                         let mut hop_params = params_object(target)?;
                         let (mut node, _, _) =
                             build_standard_node(target, &mut hop_params, &hop_tag)?;
-                        // Chain position: every hop but the last dials
-                        // through the next hop (sing-box `detour`).
+
                         if index + 1 < hops.len() {
                             node.as_object_mut().expect("hop node is an object").insert(
                                 "detour".to_string(),
@@ -4740,8 +4065,7 @@ fn build_main_config(
         let in_tag = inbound_tag(&config.id);
         let out_tag = outbound_tag(&config.id);
         let mut params = params_object(config)?;
-        // Ticket 08 rows first; standard + AWG rows fall through to the
-        // ticket-05/07 builder below (untouched).
+
         if let Some(built) = build_ticket08_row(config, &params, bridges, configs)? {
             for (node, is_endpoint) in built.nodes {
                 if is_endpoint {
@@ -4756,8 +4080,7 @@ fn build_main_config(
                 "listen": config.bind_ip,
                 "listen_port": config.port,
             }));
-            // Ticket 37: attached preset rules merge ahead of the row's own
-            // isolation rule (route→row-outbound, scoped to this inbound).
+
             for preset_rule in preset_rules_for(config, &built.serving_tag, &in_tag, presets)? {
                 rules.push(preset_rule);
             }
@@ -4791,8 +4114,7 @@ fn build_main_config(
             "listen": config.bind_ip,
             "listen_port": config.port,
         }));
-        // Ticket 37: attached preset rules merge ahead of the row's own
-        // isolation rule (route→row-outbound, scoped to this inbound).
+
         for preset_rule in preset_rules_for(config, &out_tag, &in_tag, presets)? {
             rules.push(preset_rule);
         }
@@ -4831,10 +4153,6 @@ fn build_main_config(
     })
 }
 
-/// Structural self-check run before the engine's own `check`: unique tags and
-/// binds, every rule resolves to exactly one outbound/endpoint, `final`
-/// resolves to `direct`, and none of the prohibited keys (`tun`, `dns`,
-/// `set_system_proxy`) appear anywhere in the generated shape.
 fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
     let invalid = |detail: &str| EngineError::InvalidGenerated {
         detail: detail.to_string(),
@@ -4880,9 +4198,7 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
             .get("listen_port")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| invalid("inbound without listen_port"))?;
-        // Loopback spellings (`127.0.0.1` vs `localhost` vs `::1`) are one
-        // endpoint — compare normalized keys, or a duplicate bind slips
-        // through under a different spelling.
+
         if !binds.insert((normalize_bind_key(listen), port)) {
             return Err(invalid("duplicate inbound bind"));
         }
@@ -4919,9 +4235,7 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
         .ok_or_else(|| invalid("missing \"route.rules\""))?;
     for rule in rules {
         let obj = rule.as_object().ok_or_else(|| invalid("bad route rule"))?;
-        // Ticket 32: `inbound` is an array (what stock sing-box 1.14.2
-        // accepts); every entry must name a generated inbound. A missing,
-        // empty, or non-string entry fails instead of routing nowhere.
+
         let inbound_names_list: Vec<&str> = match obj.get("inbound") {
             Some(serde_json::Value::Array(items)) if !items.is_empty() => {
                 let mut names = Vec::with_capacity(items.len());
@@ -4936,10 +4250,7 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
             _ => return Err(invalid("rule without inbound array")),
         };
         let outbound = obj.get("outbound").and_then(serde_json::Value::as_str);
-        // Ticket 37: preset rules carry `direct`/`reject` actions (no
-        // outbound); isolation rules stay `route`. A raw `block` reaching
-        // this gate means the merge skipped normalization — fail closed.
-        // Anything else fails.
+
         match obj.get("action").and_then(serde_json::Value::as_str) {
             Some("route") => {
                 let outbound = outbound.ok_or_else(|| invalid("rule without outbound"))?;
@@ -4975,47 +4286,31 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Sidecar driver seam: the real backend shells out to `sing-box`, the fake
-/// backend records configs in memory. Errors are plain strings so the fake
-/// and the real backend share one failure shape.
 pub trait EngineBackend {
-    /// Run the engine's own `check` on the generated JSON (no processes kept).
     fn check_config(&mut self, config_json: &str) -> Result<(), String>;
-    /// (Re)start the sidecar with the generated JSON.
+
     fn start(&mut self, config_json: &str) -> Result<(), String>;
-    /// Stop the sidecar if running.
+
     fn stop(&mut self);
-    /// True while a sidecar process (real or fake) is up.
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn is_running(&self) -> bool;
-    /// `Some(cause)` once when a previously running sidecar has exited.
+
     fn poll_exit(&mut self) -> Option<String>;
-    /// Ticket 13: take buffered sidecar stderr lines (empty when none).
-    /// The real backend pipes stderr and pumps it on a reader thread; the
-    /// fake backend replays scripted lines. UI ingests the lines through
-    /// `LogStore::push_raw` (tag match + redact + bounded ring).
-    /// Ticket 28: the no-op trait defaults below stay — the fake relies on
-    /// them (no files, no binaries), so dropping any default only moves
-    /// code into the fake for zero behavior gain.
+
     fn drain_log_lines(&mut self) -> Vec<String> {
         Vec::new()
     }
-    /// Ticket 08: point the extra-slot driver at one row's executable
-    /// before `start` (real driver swaps its binary; the fake ignores it
-    /// and keeps recording configs so tests stay hermetic).
+
     fn set_extra_exe(&mut self, _exe: PathBuf) {}
-    /// Ticket 23 LOW: forget the extra-slot executable when the slot empties
-    /// (default no-op; the real driver clears it).
+
     fn clear_extra_exe(&mut self) {}
-    /// Ticket 23: pin the probe-validated binary for the next `start` (no
-    /// probe/spawn skew; default no-op, the fake needs no binaries).
+
     fn pin_binary(&mut self, _path: PathBuf) {}
-    /// Ticket 23: best-effort removal of the secret config file (crash and
-    /// check paths; default no-op, the fake writes no files).
+
     fn remove_config_file(&self) {}
 }
 
-/// Binary file name for this platform.
 pub fn engine_binary_file_name() -> String {
     if cfg!(windows) {
         format!("{ENGINE_BINARY_BASE}.exe")
@@ -5024,16 +4319,12 @@ pub fn engine_binary_file_name() -> String {
     }
 }
 
-/// Ticket 28: the real app directory behind every bundled-core lookup.
 fn current_app_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
-/// Ticket 28: shared app-dir join for bundled cores (executable-gated).
-/// `Err` is the searched directory; each `resolve_*` keeps its own error
-/// type because the controller names different rows/binaries.
 fn resolve_bundled_in(app_dir: Option<&Path>, file: &str) -> Result<PathBuf, String> {
     match app_dir {
         Some(dir) => {
@@ -5048,20 +4339,12 @@ fn resolve_bundled_in(app_dir: Option<&Path>, file: &str) -> Result<PathBuf, Str
     }
 }
 
-/// Resolve the sidecar binary in the app directory (never `PATH`, never
-/// downloads anything); the [`EngineError::MissingBinary`] names the
-/// directory searched. Candidates must be executable.
 pub fn resolve_engine_binary() -> Result<PathBuf, EngineError> {
     let app_dir = current_app_dir();
     let path_env = std::env::var("PATH").unwrap_or_default();
     resolve_engine_binary_in(app_dir.as_deref(), &path_env)
 }
 
-/// Testable core of [`resolve_engine_binary`] (explicit search root).
-///
-/// Ticket 23: app directory ONLY (never `PATH` — the bundled core must be
-/// the placed binary, not whatever the environment resolves; the extra slot
-/// was already app-dir-only). Candidates must also be executable.
 pub fn resolve_engine_binary_in(
     app_dir: Option<&Path>,
     _path_env: &str,
@@ -5074,7 +4357,6 @@ pub fn resolve_engine_binary_in(
     })
 }
 
-/// Ticket 07: binary file name for the fork core on this platform.
 pub fn fork_binary_file_name() -> String {
     if cfg!(windows) {
         format!("{FORK_BINARY_BASE}.exe")
@@ -5083,17 +4365,10 @@ pub fn fork_binary_file_name() -> String {
     }
 }
 
-/// Ticket 07: resolve the fork-core binary (app dir ONLY, never `PATH` —
-/// ticket 23: same rule as every bundled core; candidates must be
-/// executable). Never downloads; `Err` is the searched directory.
-/// Stock paths never call this: only exotic rows do.
 pub fn resolve_fork_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
     resolve_bundled_in(app_dir, &fork_binary_file_name())
 }
 
-/// Ticket 07: resolve the fork-core binary, naming the expected binary on
-/// failure. Row names are filled in by the controller ([`EngineController`]
-/// knows the exotic set); direct callers get the unnamed form.
 pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
     let app_dir = current_app_dir();
     let path_env = std::env::var("PATH").unwrap_or_default();
@@ -5107,26 +4382,12 @@ pub fn resolve_fork_binary() -> Result<PathBuf, EngineError> {
     })
 }
 
-/// Ticket 07: probe the fork binary version (`<binary> version`, first
-/// line). Lets a wrong/plain binary fail fast with a named error instead of
-/// serving exotic rows badly. Paths echoed are binary locations, never
-/// secrets.
-/// Ticket A6: bounded by [`FORK_PROBE_TIMEOUT`] — a hung binary is killed
-/// and reported, never waited on forever (the old `output()` had no
-/// deadline). See [`probe_fork_version_with_timeout`] for the test seam.
 pub fn probe_fork_version(binary: &Path) -> Result<String, String> {
     probe_fork_version_with_timeout(binary, FORK_PROBE_TIMEOUT)
 }
 
-/// Ticket A6: fork-probe deadline for [`probe_fork_version`] (the
-/// `version` subprocess only; clash poll threads carry their own per-core
-/// and total budgets in `health`).
 pub const FORK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Ticket A6: testable core of [`probe_fork_version`] (explicit deadline).
-/// Spawn + poll (`try_wait` every 10 ms); past the deadline the child is
-/// killed, reaped, and reported as a timeout. Stdout past 64 KiB is cut
-/// (a `version` line is bytes; a pathological peer cannot grow us).
 pub fn probe_fork_version_with_timeout(
     binary: &Path,
     timeout: std::time::Duration,
@@ -5193,7 +4454,6 @@ pub fn probe_fork_version_with_timeout(
     }
 }
 
-/// Ticket 08: binary file name for the Xray core on this platform.
 pub fn xray_binary_file_name() -> String {
     if cfg!(windows) {
         format!("{XRAY_BINARY_BASE}.exe")
@@ -5202,17 +4462,10 @@ pub fn xray_binary_file_name() -> String {
     }
 }
 
-/// Ticket 08: resolve the Xray-core binary (app dir ONLY, never `PATH` —
-/// ticket 23: same rule as every bundled core; candidates must be
-/// executable). Never downloads; `Err` is the searched directory.
-/// Stock/fork paths never call this: only Xray rows do.
 pub fn resolve_xray_binary_in(app_dir: Option<&Path>, _path_env: &str) -> Result<PathBuf, String> {
     resolve_bundled_in(app_dir, &xray_binary_file_name())
 }
 
-/// Ticket 08: resolve the Xray-core binary, naming the expected binary on
-/// failure. Row names are filled in by the controller ([`EngineController`]
-/// knows the Xray set); direct callers get the unnamed form.
 pub fn resolve_xray_binary() -> Result<PathBuf, EngineError> {
     let app_dir = current_app_dir();
     let path_env = std::env::var("PATH").unwrap_or_default();
@@ -5225,12 +4478,6 @@ pub fn resolve_xray_binary() -> Result<PathBuf, EngineError> {
     })
 }
 
-/// Ticket 08: resolve one user extra-core executable. App directory ONLY
-/// (never `PATH`): the slot is explicit user placement, and the lookup
-/// stays auditable. The name must be a plain file name (no directories,
-/// no absolute paths); traversal attempts fail without touching the
-/// filesystem. Execution is always unprivileged (plain spawn, never
-/// elevated). `Err` is a human reason or the searched directory.
 pub fn resolve_extra_binary_in(app_dir: Option<&Path>, exe: &str) -> Result<PathBuf, String> {
     let name = exe.trim();
     if is_bad_extra_exe_name(name) {
@@ -5254,9 +4501,6 @@ pub fn resolve_extra_binary_in(app_dir: Option<&Path>, exe: &str) -> Result<Path
     }
 }
 
-/// Ticket 08: resolve one user extra-core executable against the real app
-/// dir. Row names are filled in by the controller; direct callers get the
-/// unnamed form.
 pub fn resolve_extra_binary(exe: &str) -> Result<PathBuf, EngineError> {
     let app_dir = current_app_dir();
     resolve_extra_binary_in(app_dir.as_deref(), exe).map_err(|searched| {
@@ -5272,10 +4516,6 @@ fn truncate_detail(detail: &str) -> String {
     crate::health::truncate(detail, 1000)
 }
 
-/// Ticket 29: strip ANSI CSI escape sequences (`ESC [ params final-byte`,
-/// the SGR colors/bold that `sing-box check` paints its `FATAL` line with)
-/// so engine errors stay human-readable in toasts. Keeps the text, drops
-/// only the codes. Hand-rolled (no new deps); a trailing bare ESC is dropped.
 pub fn strip_ansi_codes(text: &str) -> String {
     const CSI_FINAL: std::ops::RangeInclusive<char> = '@'..='~';
     let mut out = String::with_capacity(text.len());
@@ -5303,24 +4543,8 @@ pub fn strip_ansi_codes(text: &str) -> String {
     out
 }
 
-// -- Ticket 41: engine reliability core -------------------------------------
-// Crash-safe sidecar lifecycle: ours-only startup reaper + stale secret-temp
-// sweep, manual Restart + opt-in auto-restart (backoff, max retries),
-// served/clash drop on crash with stale totals, clash bind-and-hold
-// reservation, experimental merge, 128-bit secrets, serialized start/stop
-// with surfaced stop failures, single-apply start-all subset, egress DNS
-// validation with a DNS-vs-egress classifier, normalized probe attribution,
-// early bind/port validation, custom-config listen parsing, xray own-skip,
-// and typo hints. Pure helpers first (tested directly); the controller
-// consumes them below. Protocol emission tables are untouched (ticket 42).
-
-/// Ticket 41: stale secret-temp file prefix (`manyproxy-<stem>-<pid>-<n>-<rand>.json`
-/// from [`unique_config_path`]). The sweep below only touches this prefix in
-/// the given directory (never a recursive scan, never another prefix).
 pub const STALE_TEMP_PREFIX: &str = "manyproxy-";
 
-/// Ticket 41: sidecar binary file names on this platform (bundled cores
-/// only — never the user's extra-core executables, never anything else).
 pub fn sidecar_binary_names() -> Vec<String> {
     let exe = |base: &str| {
         if cfg!(windows) {
@@ -5336,8 +4560,6 @@ pub fn sidecar_binary_names() -> Vec<String> {
     ]
 }
 
-/// Ticket 41: true when `image` (a bare file name or a full path) is one of
-/// our bundled sidecar binaries (case-insensitive: Windows image names).
 fn is_ours_binary_name(image: &str) -> bool {
     let base = image.rsplit(['/', '\\']).next().unwrap_or(image);
     sidecar_binary_names()
@@ -5345,20 +4567,10 @@ fn is_ours_binary_name(image: &str) -> bool {
         .any(|ours| base.eq_ignore_ascii_case(ours))
 }
 
-/// Ticket 41: ours-only reaper predicate — reap exactly when the process
-/// image is one of our sidecar binaries AND the port it holds is one of
-/// ours. Anything else (foreign image, foreign port) is never reaped.
-/// Pure: unit tests pin both the kill arm and the spare arm.
 pub fn should_reap_process(image: &str, port: u16, our_ports: &[u16]) -> bool {
     our_ports.contains(&port) && is_ours_binary_name(image)
 }
 
-/// Ticket 41: our stale secret-temp files in `dir` (prefix-filtered,
-/// non-recursive). Pure listing — the caller decides removal.
-/// A failed `read_dir` or a per-entry error is reported on stderr and
-/// skipped best-effort (a stale secret must never linger silently because
-/// the listing swallowed its error); the sweep still removes whatever the
-/// listing did find.
 pub fn stale_temp_files(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -5395,8 +4607,6 @@ pub fn stale_temp_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Ticket 41: remove our stale secret-temp files in `dir` (best-effort per
-/// file). Returns the files actually removed.
 pub fn sweep_stale_temp_files(dir: &Path) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     for path in stale_temp_files(dir) {
@@ -5407,9 +4617,6 @@ pub fn sweep_stale_temp_files(dir: &Path) -> Vec<PathBuf> {
     removed
 }
 
-/// Ticket 41: parse `netstat -ano -p TCP` output into `(local port, pid)`
-/// pairs for LISTENING rows. Best-effort per line (headers, UDP rows, and
-/// unparseable lines are skipped, never fatal).
 pub fn parse_netstat_tcp_owners(output: &str) -> Vec<(u16, u32)> {
     let mut out = Vec::new();
     for line in output.lines() {
@@ -5438,8 +4645,6 @@ pub fn parse_netstat_tcp_owners(output: &str) -> Vec<(u16, u32)> {
     out
 }
 
-/// Ticket 41: parse `tasklist /FO TABLE /NH` output into `(image, pid)`
-/// rows. Best-effort per line (the header and unparseable lines are skipped).
 pub fn parse_tasklist_table(output: &str) -> Vec<(String, u32)> {
     let mut out = Vec::new();
     for line in output.lines() {
@@ -5458,22 +4663,15 @@ pub fn parse_tasklist_table(output: &str) -> Vec<(String, u32)> {
     out
 }
 
-/// Ticket 41: outcome of the startup reaper (ours-only, best-effort, never
-/// panics, never touches the live DB).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReapReport {
-    /// Pids actually reaped (ours-only by [`should_reap_process`]).
     pub reaped_pids: Vec<u32>,
-    /// Stale secret-temp files actually swept.
+
     pub swept_files: Vec<PathBuf>,
-    /// Best-effort failures, named (never fatal).
+
     pub errors: Vec<String>,
 }
 
-/// Ticket 41: startup reaper core over injected seams (tests stub
-/// `netstat_output`, `image_of`, and `kill` — no live processes).
-/// Reaps exactly the processes that are ours AND hold our ports; sweeps
-/// our stale secret-temp files. Never kills a non-matching process.
 pub fn startup_reap_and_sweep(
     our_ports: &[u16],
     temp_dir: &Path,
@@ -5507,10 +4705,6 @@ pub fn startup_reap_and_sweep(
     report
 }
 
-/// Ticket 41: absolute path to a Windows system tool (never bare-name
-/// `PATH` lookup: a planted `netstat`/`tasklist`/`taskkill` earlier on
-/// `PATH` would execute as us at startup). `%SystemRoot%` first (the
-/// platform's own pointer), `C:\Windows` fallback.
 fn system_tool(name: &str) -> PathBuf {
     #[cfg(windows)]
     {
@@ -5523,11 +4717,6 @@ fn system_tool(name: &str) -> PathBuf {
     }
 }
 
-/// Ticket 41: production startup reaper — real `netstat`/`tasklist`/
-/// `taskkill` on Windows (best-effort, seconds at most), temp sweep on
-/// every platform. Non-Windows skips the process pass (no image lookup
-/// without new deps) but still sweeps. Never panics; failures land in
-/// `errors`, never in the user's face.
 pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
     let netstat_output = if cfg!(windows) {
         std::process::Command::new(system_tool("netstat.exe"))
@@ -5556,9 +4745,7 @@ pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
         if !cfg!(windows) {
             return false;
         }
-        // Ours-only by construction: `pid` passed this closure only after
-        // the image + port predicate above. Exact-pid kill, no image-wide
-        // kill, never a filter miss.
+
         std::process::Command::new(system_tool("taskkill.exe"))
             .args(["/PID", &pid.to_string(), "/F"])
             .output()
@@ -5573,10 +4760,6 @@ pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
     )
 }
 
-/// Ticket 41: early listen validation shared by the save gate (concrete
-/// ports only — blank/auto flows through) and the start path.
-/// `allow_zero`: save allows port 0 (auto-assign resolves later); start
-/// refuses it typed before any spawn.
 fn validate_listen(
     name: &str,
     bind_ip: &str,
@@ -5621,23 +4804,14 @@ fn validate_listen(
     Ok(())
 }
 
-/// Ticket 41: save gate — a row with a port inside a reserved range (or a
-/// garbage bind) fails typed before any write. Port 0 (auto) flows
-/// through: auto-assign never picks a reserved port.
 pub fn validate_listen_for_save(name: &str, bind_ip: &str, port: u16) -> Result<(), EngineError> {
     validate_listen(name, bind_ip, port, true)
 }
 
-/// Ticket 41: start gate — garbage binds, port 0, privileged ports, and
-/// reserved ranges all fail typed before any sidecar spawns.
 pub fn validate_listen_for_start(name: &str, bind_ip: &str, port: u16) -> Result<(), EngineError> {
     validate_listen(name, bind_ip, port, false)
 }
 
-/// Ticket 41: resolve one egress `server` value. Numeric IPs never touch
-/// the network; hostnames go through `resolver` (production: real DNS;
-/// tests: stub). Empty servers flow through (schema validation owns the
-/// missing-field error — resolution must never double-report it).
 pub fn resolve_egress_host(
     server: &str,
     resolver: &dyn Fn(&str) -> Result<(), String>,
@@ -5649,9 +4823,7 @@ pub fn resolve_egress_host(
     if trimmed.parse::<std::net::IpAddr>().is_ok() {
         return Ok(());
     }
-    // A `host/prefix` value is a local interface assignment in CIDR form
-    // (WireGuard `address`), never a DNS name: when the head parses as an
-    // IP literal there is nothing to resolve.
+
     if let Some((head, _)) = trimmed.split_once('/') {
         if head.trim().parse::<std::net::IpAddr>().is_ok() {
             return Ok(());
@@ -5660,10 +4832,6 @@ pub fn resolve_egress_host(
     resolver(trimmed)
 }
 
-/// Ticket 41: production egress resolver — one real DNS lookup via the
-/// platform resolver. `Ok` carries no addresses (callers only need
-/// resolve-vs-not); the `Err` text is redacted upstream into DnsFailure
-/// (never echoes resolver internals beyond the failure).
 pub fn default_egress_resolver(server: &str) -> Result<(), String> {
     use std::net::ToSocketAddrs as _;
     (server, 443)
@@ -5677,13 +4845,6 @@ pub fn default_egress_resolver(server: &str) -> Result<(), String> {
         })
 }
 
-/// Ticket 41: egress servers claimed by one row's params (top-level
-/// `server`/`address` string fields). A value carrying `/` is a local
-/// interface assignment in CIDR form (WireGuard `address`), never an
-/// egress hostname, so it is skipped here (and is IP-accepted anyway by
-/// [`resolve_egress_host`]). Chain rows carry no top-level
-/// server (their hops resolve at probe time under the cause classifier),
-/// and extra-core rows are opaque passthrough — both yield nothing here.
 fn egress_servers_of(params: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
     ["server", "address"]
         .into_iter()
@@ -5693,13 +4854,6 @@ fn egress_servers_of(params: &serde_json::Map<String, serde_json::Value>) -> Vec
         .collect()
 }
 
-/// Ticket 41: resolve every egress server in `configs` before any spawn.
-/// The first unresolvable hostname fails typed ([`EngineError::DnsFailure`]
-/// naming the row and the server); resolver failures never echo secrets
-/// (servers are hostnames, and the error carries the name only).
-/// Custom full-config replacements and extra-core slots are opaque user
-/// JSON/passthrough — out of scope here (their failures surface at
-/// check/spawn and probe time).
 pub fn validate_egress_resolution_with(
     configs: &[ProxyConfig],
     resolver: &dyn Fn(&str) -> Result<(), String>,
@@ -5711,9 +4865,7 @@ pub fn validate_egress_resolution_with(
         {
             continue;
         }
-        // Malformed rows fail here too — skipping them would exempt the
-        // row from the egress DNS gate (defense in depth: the plan already
-        // rejects them, but this gate never passes a row it cannot read).
+
         let params = params_object(config)?;
         for server in egress_servers_of(&params) {
             if resolve_egress_host(&server, resolver).is_err() {
@@ -5727,15 +4879,10 @@ pub fn validate_egress_resolution_with(
     Ok(())
 }
 
-/// Ticket 41: production egress-DNS gate over the real platform resolver.
 pub fn validate_egress_resolution(configs: &[ProxyConfig]) -> Result<(), EngineError> {
     validate_egress_resolution_with(configs, &default_egress_resolver)
 }
 
-/// Ticket 41: known sing-box/row param keys (the union the validators and
-/// `translate_outbound` understand, plus the row-level selectors `core`,
-/// `config`, `exe`, `binary`, and `nodes`). Anything outside this table is
-/// a typo candidate — never silently dropped without a hint.
 const KNOWN_PARAM_KEYS: &[&str] = &[
     "server",
     "server_port",
@@ -5820,7 +4967,6 @@ const KNOWN_PARAM_KEYS: &[&str] = &[
     "payload",
 ];
 
-/// Ticket 41: byte-wise edit distance over (ASCII) param keys.
 fn edit_distance(a: &str, b: &str) -> usize {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -5838,9 +4984,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Ticket 41: closest known key within distance 2 (keys shorter than 4
-/// characters never hint — `up`/`ip`-shaped noise must not warn).
-/// Case-insensitive; exact (case-folded) matches yield nothing.
 pub fn suggest_param_key(key: &str) -> Option<&'static str> {
     let lowered = key.to_ascii_lowercase();
     if lowered.len() < 4 {
@@ -5858,10 +5001,6 @@ pub fn suggest_param_key(key: &str) -> Option<&'static str> {
         .map(|(known, _)| known)
 }
 
-/// Ticket 41: typo warnings for one row's params (`securty` → `security`).
-/// Standard/fork/xray-shaped rows only — custom/extra/chain rows carry
-/// foreign schemas where unknown keys are legitimate. Pure (the plan
-/// carries the warnings; emission tables are untouched).
 pub fn typo_hints_for(
     name: &str,
     protocol: &str,
@@ -5887,9 +5026,6 @@ pub fn typo_hints_for(
     hints
 }
 
-/// Ticket 41: opt-in auto-restart policy (default: disabled — a crash never
-/// restarts anything silently). `max_retries` bounds the attempts;
-/// `base_backoff_secs` seeds the exponential backoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoRestartConfig {
     pub enabled: bool,
@@ -5907,16 +5043,10 @@ impl Default for AutoRestartConfig {
     }
 }
 
-/// Ticket 41: backoff before attempt `attempt` (0-based): `base * 2^attempt`,
-/// capped at 300s so a wedged sidecar never sleeps the day away. Pure.
 pub fn auto_restart_backoff_secs(base_secs: u64, attempt: u32) -> u64 {
     base_secs.saturating_mul(1u64 << attempt.min(6)).min(300)
 }
 
-/// Ticket 41: engine-side row-local vs union-level split for start-all
-/// (mirrors the UI's `is_row_local_start_error`, extended with the ticket-41
-/// row-local variants). Row-local failures isolate to one broken row;
-/// union-level failures stay atomic.
 pub fn is_row_local_error(error: &EngineError) -> bool {
     matches!(
         error,
@@ -5936,36 +5066,19 @@ pub fn is_row_local_error(error: &EngineError) -> bool {
     )
 }
 
-/// Ticket 41: single-apply start-all outcome — the maximal healthy subset
-/// applied exactly once, every excluded row named with its cause, plus an
-/// overall `error` when a union-level failure aborts the apply itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartAllOutcome {
-    /// Ids of the rows the single apply serves.
     pub applied: Vec<String>,
-    /// `(row name, cause)` per excluded row (row-local and dropped-conflict).
+
     pub failed: Vec<(String, String)>,
-    /// Typo/merge warnings from the applied plan.
+
     pub warnings: Vec<String>,
-    /// Union-level abort (port exhaustion, missing binary, check/spawn,
-    /// LAN gate): nothing applied.
+
     pub error: Option<String>,
 }
 
-// -- Ticket 23: lifecycle hardening -----------------------------------------
-// Sidecar lifecycle that cannot orphan processes, leak secret files, or
-// split-brain on partial failure. Pure helpers first (tested directly);
-// the `RealEngineBackend` + `EngineController` changes below consume them.
-
-/// Per-instance config-file counter (pairs with the pid suffix so the four
-/// sidecar backends — and any two ManyProxy processes — never share a path).
 static CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Per-instance unique temp config path (`manyproxy-<stem>-<pid>-<n>-<rand>.json`).
-/// The trailing random component (OS CSPRNG, time+counter fallback) makes
-/// paths unpredictable across processes; creation uses `create_new` (see
-/// [`write_config_restricted`]) so a planted file or symlink at the path is
-/// never followed or truncated.
 fn unique_config_path(stem: &str) -> PathBuf {
     let n = CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut rand = [0u8; 8];
@@ -5984,16 +5097,8 @@ fn unique_config_path(stem: &str) -> PathBuf {
     ))
 }
 
-/// Notice line pushed when the log buffer lock is found poisoned (fail-open
-/// with a marker, never a silent drop — the reader keeps serving).
 const LOG_POISON_NOTICE: &str = "log pipe unreadable (log reader failed)";
 
-/// Write the sidecar config with owner-only permissions (0600 on Unix; the
-/// Windows temp dir is per-user by construction, tightened best-effort via
-/// [`crate::store::harden_file_permissions`]). The file holds secrets, so
-/// creation uses `create_new` (never truncate-through): a planted symlink or
-/// file at the path is removed first and never followed — creation must not
-/// widen access and must never write secrets through a link.
 fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
@@ -6006,9 +5111,6 @@ fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String>
     let mut file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A leftover (or planted link) sits at our unique path: remove
-            // the link itself — `remove_file` on a symlink removes the link,
-            // never its target — then create exclusively.
             std::fs::remove_file(path)
                 .map_err(|error| format!("cannot write engine config ({error})"))?;
             options
@@ -6020,20 +5122,11 @@ fn write_config_restricted(path: &Path, config_json: &str) -> Result<(), String>
     file.write_all(config_json.as_bytes())
         .map_err(|error| format!("cannot write engine config ({error})"))?;
     drop(file);
-    // Ticket 27: user-only permissions on every platform (Unix already 0600
-    // at create; Windows ACL tightening is best-effort here).
+
     crate::store::harden_file_permissions(path);
     Ok(())
 }
 
-/// True when the path is a file the sidecar may execute: present plus the
-/// exec bit on Unix.
-/// Ticket A6 (pinned Windows behavior): Windows has no exec bit — ANY
-/// existing file counts as executable (the `.exe` association + ACLs decide
-/// launch, not us; we never consult `PATH` and never second-guess the ACL).
-/// Directories and missing paths are false on every platform (opening a
-/// directory fails or reports non-file; the handle metadata — not a re-stat
-/// — decides file-ness, so there is no check-then-use race).
 fn is_executable(path: &Path) -> bool {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -6057,10 +5150,6 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Canonical conflict key for a bind: loopback aliases (`127.0.0.1`,
-/// `localhost`, `::1`, `::ffff:127.0.0.1`; blank means the loopback default)
-/// compare equal so two rows can never claim the same local endpoint under
-/// different spellings. Anything else compares case-insensitively verbatim.
 pub(crate) fn normalize_bind_key(bind: &str) -> String {
     match bind.trim().to_ascii_lowercase().as_str() {
         "" | "localhost" | "127.0.0.1" | "::1" | "::ffff:127.0.0.1" => "loopback".to_string(),
@@ -6068,15 +5157,6 @@ pub(crate) fn normalize_bind_key(bind: &str) -> String {
     }
 }
 
-/// Probe-bind one endpoint before any sidecar is stopped: catches a foreign
-/// holder (or a sibling sidecar that kept its socket) while rollback is still
-/// cheap. Returns the bound listener — the caller holds it until just before
-/// spawn, so the reservation is atomic from probe through `check` (no
-/// bind-then-drop TOCTOU: a dropped probe re-opens the race it just closed).
-/// Probes are serialized process-wide so parallel applies (and test
-/// threads sharing fixed ports) never fail on each other; a genuinely held
-/// port still fails after bounded retries. Blank binds probe the loopback
-/// default.
 fn probe_bind_available(bind: &str, port: u16) -> Result<std::net::TcpListener, String> {
     static PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     let _guard = PROBE_LOCK
@@ -6094,7 +5174,6 @@ fn probe_bind_available(bind: &str, port: u16) -> Result<std::net::TcpListener, 
     let mut last = format!("probe failed for {host}:{port}");
     for _ in 0..10 {
         match std::net::TcpListener::bind(format!("{host}:{port}")) {
-            // Held by the caller until pre-spawn drop — never dropped here.
             Ok(listener) => return Ok(listener),
             Err(error) => {
                 last = format!("{host}:{port} is already in use ({error})");
@@ -6105,11 +5184,6 @@ fn probe_bind_available(bind: &str, port: u16) -> Result<std::net::TcpListener, 
     Err(last)
 }
 
-/// Recursive forbidden-key scan returning the offending `(key, path)` pair.
-/// Shared by [`assert_no_system_mutation`] (exact messages preserved) and the
-/// custom full-config replacement gate (ticket 23 SEC-HIGH: replacements are
-/// user JSON served by bundled sidecars, so nested `tun`/`dns` would mutate
-/// the system exactly like generated keys would).
 fn find_system_mutation_key(document: &serde_json::Value) -> Option<(String, String)> {
     fn walk(node: &serde_json::Value, path: &str) -> Option<(String, String)> {
         match node {
@@ -6119,13 +5193,7 @@ fn find_system_mutation_key(document: &serde_json::Value) -> Option<(String, Str
                     if lowered == "tun" || lowered == "dns" || lowered == "set_system_proxy" {
                         return Some((key.clone(), path.to_string()));
                     }
-                    // Value semantics, not just key names: `{"type":"tun"}`
-                    // (sing-box tun inbound/outbound) and
-                    // `{"protocol":"dns"}` (xray dns outbound) mutate the
-                    // system without any forbidden key. Only the schema
-                    // discriminator keys carry this meaning — matching
-                    // values anywhere else would false-positive on prose
-                    // (descriptions, remarks).
+
                     if lowered == "type" || lowered == "protocol" {
                         if let Some(kind) = value.as_str() {
                             let kind = kind.to_ascii_lowercase();
@@ -6159,9 +5227,6 @@ fn find_system_mutation_key(document: &serde_json::Value) -> Option<(String, Str
     walk(document, "$")
 }
 
-/// Rows in the candidate set whose non-loopback bind has no matching entry in
-/// the controller's confirmed set. `(id, name, bind)` triples; errors name
-/// rows + binds only.
 fn unconfirmed_lan(
     configs: &[ProxyConfig],
     confirmed: &HashSet<(String, String)>,
@@ -6174,13 +5239,6 @@ fn unconfirmed_lan(
         .collect()
 }
 
-/// Bounded child reap: the caller must `kill()` first; this waits up to
-/// `timeout` for the exit, escalates with a second kill, then gives up rather
-/// than hanging the UI thread (a SIGKILL-equivalent reap is near-certain, so
-/// the give-up arm is pathological only).
-/// Ticket 48: the reap target is a trait seam ([`WaitTarget`]) so the
-/// give-up arm is provable with a stub that never exits — behavior on real
-/// children is unchanged.
 trait WaitTarget {
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     fn kill(&mut self) -> std::io::Result<()>;
@@ -6219,66 +5277,26 @@ fn wait_child_bounded(target: &mut impl WaitTarget, timeout: Duration) -> bool {
     matches!(target.try_wait(), Ok(Some(_)))
 }
 
-/// Production driver: `sing-box check` validates, `sing-box run` serves. The
-/// generated JSON lives in a temp `-c` file that is removed on stop so no
-/// secrets linger on disk.
-///
-/// Ticket 13: sidecar stderr is piped (no longer nulled) and pumped by a
-/// reader thread into a bounded buffer; the UI drains it into `LogStore`
-/// (existing tag match, ingest-time redaction, bounded ring). The thread
-/// ends on EOF when the sidecar exits, so pipes close cleanly; an unreadable
-/// pipe records one named error line instead of stale output (fail-closed).
-///
-/// Ticket 07: the same driver serves the fork core ([`RealEngineBackend::fork`]
-/// resolves `sing-box-awg`, probes its version, and uses its own temp file
-/// so the stock and fork sidecars run beside each other).
-///
-/// Ticket 08: the same driver serves the Xray sidecar
-/// ([`RealEngineBackend::xray`]: `xray run -c`, own temp file) and each user
-/// extra-core slot ([`RealEngineBackend::extra_slot`]: the row's executable
-/// from the app dir, config file passed through as
-/// `-c <config>`, spawned unprivileged — never elevated — with its own
-/// temp file). Neither Xray nor extra-core has a stable cross-version
-/// `check` CLI contract in this repo's context, so their `check_config`
-/// writes the file and trusts the ticket-08 validators (structure, bridge
-/// bookkeeping, loopback hygiene); a bad runtime still surfaces via `poll`.
 pub struct RealEngineBackend {
     child: Option<std::process::Child>,
     config_path: PathBuf,
     fork: bool,
-    /// Ticket 08: xray sidecar (`xray run -c`) vs stock/fork shape.
+
     xray: bool,
-    /// Ticket 08: user extra-core executable (its config is passed through
-    /// as `-c <file>`); `None` for the bundled-core shapes.
+
     extra_exe: Option<PathBuf>,
-    /// Ticket 23: controller-pinned binary (the path the probe validated —
-    /// no probe/spawn skew). Falls back to fresh resolution when stale.
+
     pinned_binary: Option<PathBuf>,
-    /// Ticket 13: piped-stderr lines (raw until `LogStore` ingest redacts
-    /// them) plus at most one named pipe-error line; bounded, cleared on
-    /// every start/stop so restarts never replay stale lines.
-    /// Ticket 23: `(reader generation, lines)`. The generation bumps on every
-    /// stop/start so a previous start's reader thread can never interleave
-    /// stale lines after a restart.
+
     log_buffer: Arc<Mutex<(u64, VecDeque<String>)>>,
-    /// Ticket 23: current reader generation (mirrored into `log_buffer`).
+
     reader_gen: u64,
-    /// Ticket 23: the live reader thread. Reaped when finished; a still-live
-    /// handle at stop is kept for a later reap (it exits on pipe EOF after
-    /// the kill) and its lines are fenced out by the generation.
+
     reader_handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Ticket 13: pipe-reader buffer bound (the `LogStore` ring bounds display
-/// storage separately; this only caps lines awaiting drain).
 pub const LOG_PIPE_BUFFER: usize = 2000;
 
-/// Ticket 13: push one reader-thread line, dropping the oldest when full
-/// (bounded memory even if the UI never drains; `VecDeque` makes the cap
-/// O(1)).
-/// Ticket 23: lines from a stale generation are dropped (a restart's reader
-/// cannot interleave output from the previous child). A poisoned lock
-/// recovers with a named notice line instead of a silent drop.
 fn push_pipe_line(buffer: &Arc<Mutex<(u64, VecDeque<String>)>>, expected_gen: u64, line: String) {
     match buffer.lock() {
         Ok(mut slot) => {
@@ -6311,8 +5329,7 @@ impl RealEngineBackend {
     pub fn new() -> Self {
         Self {
             child: None,
-            // Ticket 23: per-instance unique path (pid suffix) so sidecars
-            // never share a secret file.
+
             config_path: unique_config_path("singbox"),
             fork: false,
             xray: false,
@@ -6324,8 +5341,6 @@ impl RealEngineBackend {
         }
     }
 
-    /// Ticket 07: fork-core driver (own binary, own temp file, version probe
-    /// on every check). Stock rows never touch this.
     pub fn fork() -> Self {
         Self {
             child: None,
@@ -6340,7 +5355,6 @@ impl RealEngineBackend {
         }
     }
 
-    /// Ticket 08: Xray sidecar driver (own binary, own temp file).
     pub fn xray() -> Self {
         Self {
             child: None,
@@ -6355,9 +5369,6 @@ impl RealEngineBackend {
         }
     }
 
-    /// Ticket 08: user extra-core slot driver (own temp file for the
-    /// passed-through config; the row's executable arrives per activation
-    /// via [`EngineBackend::set_extra_exe`]).
     pub fn extra_slot() -> Self {
         Self {
             child: None,
@@ -6382,10 +5393,7 @@ impl RealEngineBackend {
             }
             return Ok(exe.clone());
         }
-        // Ticket 23: the controller pins the probed path before `check`, so
-        // spawn uses the validated binary (no probe/spawn skew). A stale pin
-        // (deleted since) falls through to a fresh resolution, never to a
-        // stale spawn.
+
         if let Some(pinned) = &self.pinned_binary {
             if is_executable(pinned) {
                 return Ok(pinned.clone());
@@ -6400,9 +5408,6 @@ impl RealEngineBackend {
         }
     }
 
-    /// Extra-core executables take their config as `-c <file>` (v1
-    /// convention, documented at the slot); bundled cores use their own
-    /// `run -c` shape.
     fn start_args(&self) -> Vec<String> {
         if self.extra_exe.is_some() {
             vec!["-c".to_string()]
@@ -6412,19 +5417,10 @@ impl RealEngineBackend {
     }
 
     fn write_config(&self, config_json: &str) -> Result<PathBuf, String> {
-        // Ticket 23: owner-only permissions; the file holds secrets.
         write_config_restricted(&self.config_path, config_json)?;
         Ok(self.config_path.clone())
     }
 
-    /// Ticket 23: kill only the child process (bounded wait with kill
-    /// escalation, never a UI-thread hang) and fence out its reader thread.
-    /// The config file is left alone — file removal is
-    /// [`RealEngineBackend::remove_config_file`], so `start()` can
-    /// stop-then-write-then-spawn without deleting the file it just wrote.
-    /// Even on the give-up arm the kill is escalated once more before the
-    /// handle drops (dropping a `Child` never kills the process), so a
-    /// timed-out stop still ends the sidecar best-effort.
     fn stop_child(&mut self) {
         self.reader_gen = self.reader_gen.wrapping_add(1);
         let gen = self.reader_gen;
@@ -6435,8 +5431,7 @@ impl RealEngineBackend {
                 let _ = child.kill();
             }
         }
-        // Ticket 13: drop buffered (raw) lines with the sidecar so a later
-        // start never replays stale output.
+
         match self.log_buffer.lock() {
             Ok(mut slot) => {
                 slot.1.clear();
@@ -6448,13 +5443,7 @@ impl RealEngineBackend {
                 slot.0 = gen;
             }
         }
-        // Join a finished reader promptly; wait briefly for one racing pipe
-        // EOF, then join. A still-live handle (kill failed, pipe held open
-        // by a surviving child) is kept for a later reap — it exits on pipe
-        // EOF after the kill above, and its lines are fenced out by the
-        // bumped generation. Never detach: a detached thread blocked on a
-        // live pipe would run forever with no join handle. The spin is
-        // bounded so stop never hangs the caller.
+
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             if self
@@ -6488,17 +5477,12 @@ impl EngineBackend for RealEngineBackend {
     fn check_config(&mut self, config_json: &str) -> Result<(), String> {
         let binary = self.resolve_binary()?;
         if self.fork {
-            // Version probe is load-bearing: a plain/wrong binary fails fast
-            // with a named error instead of serving exotic rows badly.
             probe_fork_version(&binary)?;
         }
-        // Ticket 08: xray/extra have no stable `check` CLI contract here, so
-        // the write + ticket-08 validators gate them; runtime failures
-        // surface via `poll` like every other crash.
+
         if self.xray || self.extra_exe.is_some() {
             self.write_config(config_json)?;
-            // Ticket 23: the check file holds secrets — remove it even
-            // though no process was spawned.
+
             self.remove_config_file();
             return Ok(());
         }
@@ -6509,13 +5493,11 @@ impl EngineBackend for RealEngineBackend {
             .arg(&path)
             .output()
             .map_err(|error| format!("engine check could not run ({error})"))?;
-        // Ticket 23: `check` leaves no secret file behind either way.
+
         self.remove_config_file();
         if output.status.success() {
             Ok(())
         } else {
-            // Ticket 29: strip ANSI color escapes before truncating so the
-            // cap counts visible text and the toast keeps `FATAL` clean.
             Err(truncate_detail(&strip_ansi_codes(
                 &String::from_utf8_lossy(&output.stderr),
             )))
@@ -6524,17 +5506,10 @@ impl EngineBackend for RealEngineBackend {
 
     fn start(&mut self, config_json: &str) -> Result<(), String> {
         let binary = self.resolve_binary()?;
-        // Ticket 23 CRITICAL order: stop the previous child FIRST, then
-        // write, then spawn — the old write→stop→spawn order deleted the
-        // file it had just written, so the spawn read a deleted path.
+
         self.stop_child();
         let path = self.write_config(config_json)?;
-        // Unprivileged by construction: plain spawn, never elevated, no
-        // admin for loopback use (spec boundary).
-        // Ticket 13: stderr is piped (never nulled): a reader thread pumps
-        // lines into the bounded buffer so the pipe cannot stall the
-        // sidecar and the logs dialog shows live lines. The thread ends on
-        // EOF when the sidecar exits.
+
         let spawn = std::process::Command::new(&binary)
             .args(self.start_args())
             .arg(&path)
@@ -6544,7 +5519,7 @@ impl EngineBackend for RealEngineBackend {
             .spawn();
         let mut child = match spawn {
             Ok(child) => child,
-            // Ticket 23: a failed spawn leaves no secret file behind.
+
             Err(error) => {
                 self.remove_config_file();
                 return Err(format!("engine failed to start ({error})"));
@@ -6595,10 +5570,6 @@ impl EngineBackend for RealEngineBackend {
     }
 
     fn poll_exit(&mut self) -> Option<String> {
-        // `Ok(None)` = still running (no report); `Ok(Some)` = exited
-        // (reap once with the named cause); `Err` = the child state is
-        // unknown — fail closed with an unknown-exit report instead of
-        // pretending the sidecar is still running.
         let status = match self.child.as_mut()?.try_wait() {
             Ok(Some(status)) => status,
             Ok(None) => return None,
@@ -6609,14 +5580,11 @@ impl EngineBackend for RealEngineBackend {
             }
         };
         self.child = None;
-        // Ticket 23: a reaped crash leaves no secret file behind. Buffered
-        // lines are kept for post-mortem (the next stop/start clears them).
+
         self.remove_config_file();
         Some(format!("engine exited ({status})"))
     }
 
-    /// Ticket 13: take buffered stderr lines. A poisoned lock surfaces one
-    /// named error instead of raw state (fail-closed, never stale).
     fn drain_log_lines(&mut self) -> Vec<String> {
         match self.log_buffer.lock() {
             Ok(mut slot) => std::mem::take(&mut slot.1).into_iter().collect(),
@@ -6634,8 +5602,6 @@ impl EngineBackend for RealEngineBackend {
     }
 
     fn clear_extra_exe(&mut self) {
-        // Ticket 23 LOW: the slot must not keep pointing at a row that is no
-        // longer active.
         self.extra_exe = None;
     }
 
@@ -6648,11 +5614,6 @@ impl EngineBackend for RealEngineBackend {
     }
 }
 
-/// Ticket 23 HIGH: RAII teardown — dropping a backend (window close, panic
-/// unwind, controller teardown) runs the same teardown as `stop`: the
-/// sidecar is killed with a bounded reap (escalated even on the give-up arm)
-/// and the secret config file is removed, best-effort. No `main()` close
-/// hook is needed: teardown lives in the backend itself.
 impl Drop for RealEngineBackend {
     fn drop(&mut self) {
         self.stop();
@@ -6666,15 +5627,12 @@ struct FakeState {
     last_config: Option<String>,
     check_calls: usize,
     fail_check: Option<String>,
-    /// Ticket 23: one-shot next-`start` failure (rollback tests). `None` by
-    /// default, so every existing consumer behaves exactly as before.
+
     fail_start: Option<String>,
     exited: Option<String>,
     pending_logs: Vec<String>,
 }
 
-/// Read/write handle to a [`FakeEngineBackend`]'s recorded state (tests
-/// assert generated configs and inject check failures / crashes).
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct FakeHandle {
@@ -6683,59 +5641,43 @@ pub struct FakeHandle {
 
 #[cfg(test)]
 impl FakeHandle {
-    /// Last config JSON handed to `start`, if any.
     pub fn last_config(&self) -> Option<String> {
         self.state.borrow().last_config.clone()
     }
 
-    /// Whether the fake sidecar is up.
     pub fn is_running(&self) -> bool {
         self.state.borrow().running
     }
 
-    /// How many times `check_config` ran.
     pub fn check_calls(&self) -> usize {
         self.state.borrow().check_calls
     }
 
-    /// Make the next (and subsequent, until cleared) `check_config` fail.
     pub fn fail_check(&self, detail: &str) {
         self.state.borrow_mut().fail_check = Some(detail.to_string());
     }
 
-    /// Ticket 23: fail the next `start` once (consumed on use), then behave
-    /// normally — lets rollback tests fail one spawn while the retry path
-    /// stays healthy.
     pub fn fail_start(&self, detail: &str) {
         self.state.borrow_mut().fail_start = Some(detail.to_string());
     }
 
-    /// Ticket 23: clear injected `check`/`start` failures.
     pub fn clear_failures(&self) {
         let mut state = self.state.borrow_mut();
         state.fail_check = None;
         state.fail_start = None;
     }
 
-    /// Simulate a sidecar crash; the next [`EngineController::poll`] reports it.
     pub fn inject_crash(&self, cause: &str) {
         let mut state = self.state.borrow_mut();
         state.running = false;
         state.exited = Some(cause.to_string());
     }
 
-    /// Ticket 13: script one mock-sidecar stderr line for the next
-    /// [`EngineBackend::drain_log_lines`].
     pub fn emit_log(&self, line: &str) {
         self.state.borrow_mut().pending_logs.push(line.to_string());
     }
 }
 
-/// In-memory mock driver: records configs, never spawns processes, never
-/// touches the network. All unit and headless UI tests run against this.
-/// Ticket 28: kept mirrored with the health fake on purpose — this one is
-/// `Rc<RefCell>` (single-threaded UI harness), the health fake is
-/// `Arc<Mutex>` (shared across probe threads).
 #[cfg(test)]
 pub struct FakeEngineBackend {
     state: Rc<RefCell<FakeState>>,
@@ -6799,7 +5741,6 @@ impl EngineBackend for FakeEngineBackend {
     }
 }
 
-/// Sidecar lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineStatus {
     Stopped,
@@ -6807,94 +5748,51 @@ pub enum EngineStatus {
     Crashed { cause: String },
 }
 
-/// Supervised sidecar owner: one combined config for the active set,
-/// regenerated and re-checked on every membership change. A failed apply
-/// never clobbers a previously running sidecar: `check` runs before the old
-/// process is stopped.
-///
-/// Ticket 07: two sidecars run beside each other — stock rows stay on the
-/// stock `sing-box` sidecar, exotic (AWG/XHTTP) rows go to the fork-core
-/// sidecar. Each subset gets its own generated config, `check`, and process;
-/// port conflicts are still checked across the union first. When the fork
-/// binary is absent, stock subsets keep working and only exotic rows fail
-/// (typed [`EngineError::MissingForkBinary`]).
-///
-/// Ticket 08: four sidecars — the Xray sidecar bridges Xray-only rows over
-/// loopback ingress listeners (paired config + tag-count cross-check), and
-/// Ticket 27: N named extra-core slot sidecars (one per active extra-core
-/// row) run the user's executables unprivileged with their configs passed
-/// through. Custom full-config rows replace their owning core's generated
-/// config wholesale.
 pub struct EngineController {
     backend: Box<dyn EngineBackend>,
-    /// Ticket 07: fork-core sidecar for exotic rows only.
+
     fork_backend: Box<dyn EngineBackend>,
-    /// Ticket 08: Xray-core sidecar for Xray-only rows.
+
     xray_backend: Box<dyn EngineBackend>,
-    /// Ticket 27: one user extra-core sidecar per active extra-core row
-    /// (activation order; replaces the ticket-08 singleton).
+
     extra_backends: Vec<Box<dyn EngineBackend>>,
-    /// Ticket 07: fork-binary probe seam (default: real resolution; tests
-    /// inject present/missing without touching the filesystem).
+
     fork_probe: Box<dyn Fn() -> Result<PathBuf, EngineError>>,
-    /// Ticket 08: xray-binary probe seam (same contract as the fork probe).
+
     xray_probe: Box<dyn Fn() -> Result<PathBuf, EngineError>>,
-    /// Ticket 08: extra-executable probe seam (app dir only, per exe name).
+
     #[allow(clippy::type_complexity)]
     extra_probe: Box<dyn Fn(&str) -> Result<PathBuf, EngineError>>,
-    /// Ticket 23: stock-binary probe seam (default: real resolution; lets the
-    /// controller fail a missing stock binary typed BEFORE touching anything,
-    /// and pin the validated path for spawn).
+
     stock_probe: Box<dyn Fn() -> Result<PathBuf, EngineError>>,
-    /// Ticket 23: `(id, bind)` pairs the user explicitly confirmed for LAN
-    /// exposure. Unconfirmed starts carrying such pairs fail with
-    /// [`EngineError::LanConfirmRequired`] independent of any UI gate.
+
     lan_confirmed: HashSet<(String, String)>,
-    /// Ticket 23: last configs successfully served per shard
-    /// (stock/fork/xray) — the rollback target when a later apply's
-    /// spawn fails midway.
+
     served: [Option<String>; 3],
-    /// Ticket 27: last configs served per extra slot (parallel to
-    /// [`EngineController::extra_backends`]).
+
     served_extra: Vec<Option<String>>,
-    /// Ticket 37: preset id → ordered route-rule objects for the engine
-    /// merge (synced from the store before start; empty means no row
-    /// carries a preset). Dangling references fail loudly at merge time.
+
     preset_rules: HashMap<String, Vec<serde_json::Value>>,
     active: Vec<ProxyConfig>,
     status: EngineStatus,
     last_error: Option<String>,
     last_config_json: Option<String>,
-    /// Ticket 36: live clash controllers per serving core (port + secret).
-    /// In-memory only (regenerated per start, never persisted); cleared
-    /// with the served snapshots whenever membership empties or a core
-    /// serves a user-owned replacement (never mutated user JSON).
-    /// Ticket 41: secrets are zeroized on clear (see
-    /// [`EngineController::clear_clash_secrets`]).
+
     clash: Vec<ClashTarget>,
-    /// Ticket 41: start/stop serialization — bumped on every mutating entry
-    /// (start/stop/restart/apply). Ticks and the UI read it to order
-    /// interleaved operations; a stop landing mid-start sees the fence move
-    /// and never rolls back newer state.
+
     generation: u64,
-    /// Ticket 41: shards with an observed, not-yet-recovered crash
-    /// (`stock`/`fork`/`xray`/`extra-<id>`). Traffic/reprobe ticks skip
-    /// these; manual Restart and opt-in auto-restart clear them.
+
     crashed: HashSet<String>,
-    /// Ticket 41: set on any observed crash (served/clash dropped with it);
-    /// traffic totals from a dead core are stale until a restart recovers.
+
     totals_stale: bool,
-    /// Ticket 41: opt-in auto-restart policy (default: disabled — no silent
-    /// restarts, ever).
+
     auto_restart: AutoRestartConfig,
-    /// Ticket 41: consecutive auto-restart attempts since the last success
-    /// (bounded by `auto_restart.max_retries`).
+
     restart_attempts: u32,
-    /// Ticket 41: last auto-restart attempt (the backoff fence).
+
     last_restart_attempt: Option<Instant>,
 }
 
-/// Ticket 07: fill row names + the XHTTP note flag into a probe failure.
 fn missing_fork_for(error: EngineError, rows: &str, xhttp: bool) -> EngineError {
     match error {
         EngineError::MissingForkBinary {
@@ -6909,7 +5807,6 @@ fn missing_fork_for(error: EngineError, rows: &str, xhttp: bool) -> EngineError 
     }
 }
 
-/// Ticket 08: fill row names into an xray probe failure.
 fn missing_xray_for(error: EngineError, rows: &str) -> EngineError {
     match error {
         EngineError::MissingXrayBinary {
@@ -6923,7 +5820,6 @@ fn missing_xray_for(error: EngineError, rows: &str) -> EngineError {
     }
 }
 
-/// Ticket 08: fill row names into an extra-exe probe failure.
 fn missing_extra_for(error: EngineError, rows: &str) -> EngineError {
     match error {
         EngineError::MissingExtraBinary {
@@ -6966,36 +5862,22 @@ impl EngineController {
         }
     }
 
-    /// Production controller (real `sing-box` + real fork sidecars, lazily
-    /// resolved).
     pub fn production() -> Self {
         Self::new(Box::new(RealEngineBackend::new()))
     }
 
-    /// Test controller plus a handle to the mock driver.
     #[cfg(test)]
     pub fn fake() -> (Self, FakeHandle) {
         let (controller, stock, _) = Self::fake_pair();
         (controller, stock)
     }
 
-    /// Ticket 07: test controller with handles to both mock drivers. The
-    /// fork probe defaults to missing (deterministic without touching the
-    /// filesystem); override with [`EngineController::set_fork_probe`].
-    /// Ticket 08: xray/extra backends ride along stopped with missing
-    /// probes; use [`EngineController::fake_quartet`] for their handles.
     #[cfg(test)]
     pub fn fake_pair() -> (Self, FakeHandle, FakeHandle) {
         let (controller, stock, fork, _, _) = Self::fake_quartet();
         (controller, stock, fork)
     }
 
-    /// Ticket 08: test controller with handles to all four mock drivers.
-    /// Fork/xray/extra probes default to missing (deterministic without
-    /// touching the filesystem); override with the `set_*_probe` setters.
-    /// Ticket 27: the extra handle is the first of
-    /// [`EngineController::extra_backends`]; use
-    /// [`EngineController::push_test_extra_backend`] for more slots.
     #[cfg(test)]
     pub fn fake_quartet() -> (Self, FakeHandle, FakeHandle, FakeHandle, FakeHandle) {
         let (backend, stock) = FakeEngineBackend::shared();
@@ -7029,9 +5911,7 @@ impl EngineController {
                     searched: "test-seam (no app dir)".to_string(),
                 })
             }),
-            // Ticket 23: the stock probe defaults to present (no filesystem
-            // access); override with `set_stock_probe` for missing-binary
-            // scenarios.
+
             stock_probe: Box::new(|| Ok(PathBuf::from("test-stock-bin"))),
             lan_confirmed: HashSet::new(),
             served: [None, None, None],
@@ -7052,9 +5932,6 @@ impl EngineController {
         (controller, stock, fork, xray, extra)
     }
 
-    /// Ticket 27: test-only extra slot growth — push one more mock extra
-    /// backend and return its handle (keeps `fake_quartet` hermetic for
-    /// N-slot tests without touching the filesystem).
     #[cfg(test)]
     pub fn push_test_extra_backend(&mut self) -> FakeHandle {
         let (backend, handle) = FakeEngineBackend::shared();
@@ -7063,22 +5940,16 @@ impl EngineController {
         handle
     }
 
-    /// Ticket 07: override the fork-binary probe (tests inject present /
-    /// missing without filesystem access).
     #[cfg(test)]
     pub fn set_fork_probe(&mut self, probe: impl Fn() -> Result<PathBuf, EngineError> + 'static) {
         self.fork_probe = Box::new(probe);
     }
 
-    /// Ticket 08: override the xray-binary probe (tests inject present /
-    /// missing without filesystem access).
     #[cfg(test)]
     pub fn set_xray_probe(&mut self, probe: impl Fn() -> Result<PathBuf, EngineError> + 'static) {
         self.xray_probe = Box::new(probe);
     }
 
-    /// Ticket 08: override the extra-executable probe (tests inject
-    /// present / missing without filesystem access).
     #[cfg(test)]
     pub fn set_extra_probe(
         &mut self,
@@ -7087,32 +5958,20 @@ impl EngineController {
         self.extra_probe = Box::new(probe);
     }
 
-    /// Ticket 23: override the stock-binary probe (tests inject present /
-    /// missing without filesystem access).
     #[cfg(test)]
     pub fn set_stock_probe(&mut self, probe: impl Fn() -> Result<PathBuf, EngineError> + 'static) {
         self.stock_probe = Box::new(probe);
     }
 
-    /// Ticket 37: replace the preset rules for the engine merge (the UI
-    /// syncs these from the store before every start; tests inject
-    /// directly). Empty means no row carries a preset.
     pub fn set_preset_rules(&mut self, presets: HashMap<String, Vec<serde_json::Value>>) {
         self.preset_rules = presets;
     }
 
-    // -- Ticket 41: reliability accessors ---------------------------------
-
-    /// Ticket 41: start/stop serialization fence — bumped on every mutating
-    /// entry. Readers (ticks, UI) order interleaves against this.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// Ticket 41: shards with an observed, not-yet-recovered crash, sorted.
-    /// Production reader is the Restart entry point (test-only until the
-    /// crash-notice action lands); tests pin the set directly.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn crashed_shards(&self) -> Vec<String> {
         let mut shards: Vec<String> = self.crashed.iter().cloned().collect();
@@ -7120,29 +5979,17 @@ impl EngineController {
         shards
     }
 
-    /// Ticket 41: true when `core` (`stock`/`fork`/`xray`/`extra-<id>`) is
-    /// crashed and unrecovered — traffic/reprobe ticks skip these.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_shard_crashed(&self, core: &str) -> bool {
         self.crashed.contains(core)
     }
 
-    /// Ticket 41: owning core of a custom row, `None` when the params are
-    /// malformed or the `core` value is unknown. Callers fail closed on
-    /// `None`: an unreadable row is never attributed to a healthy shard
-    /// (the old silent-stock default would report a broken row as served).
     fn custom_core_of(row: &ProxyConfig) -> Option<OwningCore> {
         params_object(row)
             .ok()
             .and_then(|params| owning_core_of(&row.name, &params).ok())
     }
 
-    /// Ticket 41: the serving shard of one active row (`stock`/`fork`/
-    /// `xray`/`extra-<id>`) — the same routing [`EngineController::is_running`]
-    /// reports per row, so crash-drop and tick-skip always agree.
-    /// `unknown` for unreadable custom rows (validated rows never land
-    /// here — the plan rejects them first — so this is dead-defensive, but
-    /// never a silent stock attribution).
     fn shard_of_row(&self, row: &ProxyConfig) -> String {
         if is_extra_core_protocol(&row.protocol) {
             return format!("extra-{}", row.id);
@@ -7166,9 +6013,6 @@ impl EngineController {
         OwningCore::Stock.as_str().to_string()
     }
 
-    /// Ticket 41: ids of active rows served by crashed shards — the traffic
-    /// tick marks exactly these stale (last totals kept, flagged, never
-    /// trusted fresh). Empty when nothing crashed.
     pub fn ids_on_crashed_shards(&self) -> Vec<String> {
         if self.crashed.is_empty() {
             return Vec::new();
@@ -7180,22 +6024,16 @@ impl EngineController {
             .collect()
     }
 
-    /// Ticket 41: true once any crash drops served/clash — totals from a
-    /// dead core are stale until a restart recovers.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn totals_stale(&self) -> bool {
         self.totals_stale
     }
 
-    /// Ticket 41: clear the stale-totals marker (after the UI repaints from
-    /// a recovered poll).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_totals_stale(&mut self) {
         self.totals_stale = false;
     }
 
-    /// Ticket 41: clash targets of live (non-crashed) cores only — the
-    /// traffic tick polls exactly these, so dead sockets are never trusted.
     pub fn live_clash_targets(&self) -> Vec<ClashTarget> {
         self.clash
             .iter()
@@ -7204,10 +6042,6 @@ impl EngineController {
             .collect()
     }
 
-    /// Ticket 41: replace the opt-in auto-restart policy (default: disabled).
-    /// Enabling is an explicit user action; disabling resets the attempt
-    /// counter so a later opt-in starts clean. Production writer is the
-    /// settings toggle (follow-up slice); tests pin the policy directly.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_auto_restart(&mut self, config: AutoRestartConfig) {
         if !config.enabled {
@@ -7217,21 +6051,16 @@ impl EngineController {
         self.auto_restart = config;
     }
 
-    /// Ticket 41: current auto-restart policy.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn auto_restart(&self) -> &AutoRestartConfig {
         &self.auto_restart
     }
 
-    /// Ticket 41: consecutive auto-restart attempts since the last success.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn restart_attempts(&self) -> u32 {
         self.restart_attempts
     }
 
-    /// Ticket 41: true when an auto-restart attempt is due now — opt-in AND
-    /// crashed shards pending AND under the retry bound AND past the
-    /// exponential backoff fence. Pure in `now` (tests pin the clock).
     pub fn auto_restart_due(&self, now: Instant) -> bool {
         if !self.auto_restart.enabled || self.crashed.is_empty() {
             return false;
@@ -7251,14 +6080,11 @@ impl EngineController {
         }
     }
 
-    /// Ticket 41: record one auto-restart attempt (bounds + backoff advance).
     pub fn note_auto_restart_attempt(&mut self, now: Instant) {
         self.restart_attempts = self.restart_attempts.saturating_add(1);
         self.last_restart_attempt = Some(now);
     }
 
-    /// Ticket 41: record a successful recovery — attempts reset, the stale
-    /// marker clears, crashed shards are forgotten.
     pub fn note_restart_success(&mut self) {
         self.restart_attempts = 0;
         self.last_restart_attempt = None;
@@ -7266,11 +6092,6 @@ impl EngineController {
         self.totals_stale = false;
     }
 
-    /// Ticket 41: manual Restart — re-applies the full active set so every
-    /// crashed shard restarts beside its healthy siblings. No-op `Ok` when
-    /// nothing is crashed (still a full re-apply would flap healthy cores,
-    /// so an idle restart touches nothing). Success clears the crashed set
-    /// and the attempt counter via [`EngineController::note_restart_success`].
     pub fn restart_crashed(&mut self) -> Result<(), EngineError> {
         self.generation = self.generation.wrapping_add(1);
         if self.crashed.is_empty() {
@@ -7285,9 +6106,6 @@ impl EngineController {
         }
     }
 
-    /// Ticket 41: zeroize live clash secrets, then drop the targets. Called
-    /// on teardown and on crash-drop so secrets never linger in freed
-    /// memory (128-bit bearer secrets, in-memory only, cleared on stop).
     fn clear_clash_secrets(&mut self) {
         use zeroize::Zeroize as _;
         for target in self.clash.iter_mut() {
@@ -7296,8 +6114,6 @@ impl EngineController {
         self.clash.clear();
     }
 
-    /// Ticket 41: drop one crashed shard's served snapshot by name
-    /// (`stock`/`fork`/`xray`/`extra-<id>` or `extra-<index>`).
     fn drop_crashed_served(&mut self, shard: &str) {
         const SHARDS: [&str; 3] = ["stock", "fork", "xray"];
         if let Some(index) = SHARDS.iter().position(|name| *name == shard) {
@@ -7311,8 +6127,7 @@ impl EngineController {
                 .filter(|row| is_extra_core_protocol(&row.protocol))
                 .map(|row| row.id.clone())
                 .collect();
-            // Row id first (the name `poll_shards` built), numeric index as
-            // the fallback for rows that are already gone.
+
             let index = extra_ids
                 .iter()
                 .position(|known| known == id)
@@ -7325,10 +6140,6 @@ impl EngineController {
         }
     }
 
-    /// Ticket 41: stop one config with its apply outcome surfaced — `(was
-    /// a member, apply error)`. The bool still answers membership; the
-    /// `Option<EngineError>` replaces the old silent snapshot-restore so a
-    /// stop failure toasts instead of claiming false success.
     pub fn stop_one_result(&mut self, id: &str) -> (bool, Option<EngineError>) {
         self.generation = self.generation.wrapping_add(1);
         let before = self.active.len();
@@ -7348,8 +6159,6 @@ impl EngineController {
         (true, None)
     }
 
-    /// Ticket 41: stop everything with the teardown outcome surfaced
-    /// (`Some` instead of a silent half-state).
     pub fn stop_all_result(&mut self) -> Option<EngineError> {
         self.generation = self.generation.wrapping_add(1);
         let prev = self.active.clone();
@@ -7365,13 +6174,6 @@ impl EngineController {
         None
     }
 
-    /// Ticket 41: single-apply start-all — the maximal healthy subset is
-    /// computed purely (solo row-local gate, then one union validation),
-    /// then applied exactly once. Every excluded row is named with its
-    /// cause; the row-local vs union-level split is preserved
-    /// ([`is_row_local_error`]): row-local failures isolate per row, a
-    /// union-level failure aborts with nothing applied. The abort lands in
-    /// `error`.
     pub fn start_all_subset(
         &mut self,
         configs: &[ProxyConfig],
@@ -7387,7 +6189,7 @@ impl EngineController {
             }
             return outcome;
         }
-        // Solo gate: rows that fail alone are row-local by construction.
+
         let mut candidate: Vec<ProxyConfig> = Vec::with_capacity(configs.len());
         for row in configs {
             match validate_activation(std::slice::from_ref(row)) {
@@ -7397,11 +6199,7 @@ impl EngineController {
                 }
             }
         }
-        // Greedy union repair over pure validation (no sidecar touched):
-        // the row-local vs union-level split is preserved — only
-        // row-local failures isolate. A union-level failure (port
-        // conflicts, bridge skew, custom-core collisions) aborts the whole
-        // subset: nothing applied, every survivor named with the cause.
+
         let mut plan_warnings = Vec::new();
         let mut union_error: Option<EngineError> = None;
         match validate_activation(&candidate) {
@@ -7413,7 +6211,6 @@ impl EngineController {
             }
         }
         if let Some(error) = union_error {
-            // Union-level abort: nothing applied, every survivor named.
             let text = error.to_string();
             for row in &candidate {
                 outcome.failed.push((row.name.clone(), text.clone()));
@@ -7425,7 +6222,7 @@ impl EngineController {
             return outcome;
         }
         outcome.warnings = plan_warnings;
-        // One apply of the maximal healthy subset.
+
         let prev = self.active.clone();
         let prev_status = self.status.clone();
         self.generation = self.generation.wrapping_add(1);
@@ -7458,8 +6255,6 @@ impl EngineController {
         outcome
     }
 
-    /// Ticket 23: drop LAN confirms for rows that are no longer active (or
-    /// whose bind changed — confirms key on `(id, bind)`).
     fn prune_lan_confirmed(&mut self) {
         let live: HashSet<(String, String)> = self
             .active
@@ -7469,9 +6264,6 @@ impl EngineController {
         self.lan_confirmed.retain(|entry| live.contains(entry));
     }
 
-    /// Ticket 23: shard backend by index (0 stock, 1 fork, 2 xray).
-    /// Ticket 27: extra slots ride in [`EngineController::extra_backends`]
-    /// (see `apply`: per-slot start/stop, never a shared index).
     fn backend_at(&mut self, index: usize) -> &mut dyn EngineBackend {
         match index {
             0 => self.backend.as_mut(),
@@ -7480,8 +6272,6 @@ impl EngineController {
         }
     }
 
-    /// Ticket 23: true while any sidecar process handle is up (liveness is
-    /// handle presence, never a cached flag).
     fn any_backend_running(&self) -> bool {
         self.backend.is_running()
             || self.fork_backend.is_running()
@@ -7489,8 +6279,6 @@ impl EngineController {
             || self.extra_backends.iter().any(|slot| slot.is_running())
     }
 
-    /// Ticket 27: index of one extra row among the active extra slots
-    /// (activation order — the same order `apply` serves them in).
     fn extra_slot_index(&self, id: &str) -> Option<usize> {
         self.active
             .iter()
@@ -7498,18 +6286,11 @@ impl EngineController {
             .position(|row| row.id == id)
     }
 
-    /// Start one config (idempotent); restarts the sidecar with the union.
-    /// Ticket 23 SEC-MED: fails with [`EngineError::LanConfirmRequired`]
-    /// when the resulting set serves a non-loopback bind the user never
-    /// confirmed — independent of the UI dialog gate. Use
-    /// [`EngineController::start_one_confirmed`] past an explicit confirm.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_one(&mut self, config: &ProxyConfig) -> Result<(), EngineError> {
         self.start_one_inner(config, false)
     }
 
-    /// Ticket 23: [`EngineController::start_one`] past an explicit LAN
-    /// confirm (records the confirm for the set's LAN binds).
     pub fn start_one_confirmed(&mut self, config: &ProxyConfig) -> Result<(), EngineError> {
         self.start_one_inner(config, true)
     }
@@ -7525,15 +6306,12 @@ impl EngineController {
         } else {
             candidate.push(config.clone());
         }
-        // Pure pre-check: a bad candidate never disturbs the running sidecars.
+
         validate_activation(&candidate).inspect_err(|error| {
             self.last_error = Some(error.to_string());
         })?;
         self.enforce_lan_confirm(&candidate, confirmed)?;
-        // Ticket 23 HIGH: `active` commits only with a successful apply — a
-        // failed apply restores the previous membership instead of claiming
-        // rows nothing serves.
-        // Ticket 41: the serialization fence moves on every mutating entry.
+
         let prev = self.active.clone();
         let prev_status = self.status.clone();
         self.generation = self.generation.wrapping_add(1);
@@ -7552,8 +6330,6 @@ impl EngineController {
         }
     }
 
-    /// Ticket 23: fail when the candidate set serves unconfirmed LAN binds
-    /// (or record the confirm when past the gate).
     fn enforce_lan_confirm(
         &mut self,
         candidate: &[ProxyConfig],
@@ -7584,16 +6360,6 @@ impl EngineController {
         Err(error)
     }
 
-    /// Stop one config; returns true when it was active. Stops the sidecar
-    /// when the set becomes empty.
-    /// Ticket 32: a failing re-gen restores the membership snapshot (active
-    /// and the running sidecar agree) and records the error in
-    /// [`EngineController::last_error`] — never a silent half-state. The
-    /// bool answers membership (the row was active); the apply outcome is
-    /// on the `last_error` seam, like the start paths.
-    /// Ticket 41: delegates to [`EngineController::stop_one_result`] — the
-    /// bool contract is unchanged; callers that need the failure itself
-    /// (stop-failure toasts) use the `_result` variant.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn stop_one(&mut self, id: &str) -> bool {
         let (removed, error) = self.stop_one_result(id);
@@ -7603,18 +6369,11 @@ impl EngineController {
         removed
     }
 
-    /// Replace the active set (start-all path); validates before touching the
-    /// running sidecar.
-    /// Ticket 23 SEC-MED: fails with [`EngineError::LanConfirmRequired`]
-    /// when the set serves a non-loopback bind the user never confirmed.
-    /// Use [`EngineController::start_all_confirmed`] past an explicit confirm.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_all(&mut self, configs: &[ProxyConfig]) -> Result<(), EngineError> {
         self.start_all_inner(configs, false)
     }
 
-    /// Ticket 23: [`EngineController::start_all`] past an explicit LAN
-    /// confirm (records the confirm for the set's LAN binds).
     pub fn start_all_confirmed(&mut self, configs: &[ProxyConfig]) -> Result<(), EngineError> {
         self.start_all_inner(configs, true)
     }
@@ -7635,8 +6394,7 @@ impl EngineController {
             self.last_error = Some(error.to_string());
         })?;
         self.enforce_lan_confirm(&candidate, confirmed)?;
-        // Ticket 23 HIGH: `active` commits only with a successful apply.
-        // Ticket 41: the serialization fence moves on every mutating entry.
+
         let prev = self.active.clone();
         let prev_status = self.status.clone();
         self.generation = self.generation.wrapping_add(1);
@@ -7655,13 +6413,6 @@ impl EngineController {
         }
     }
 
-    /// Stop everything and take the sidecar down.
-    /// Ticket 32: like [`EngineController::stop_one`], a failing apply
-    /// restores the membership snapshot instead of leaving a silent
-    /// half-state (the empty-set apply cannot fail today; this is
-    /// defense in depth for future fallible teardown).
-    /// Ticket 41: delegates to [`EngineController::stop_all_result`] so a
-    /// stop failure surfaces instead of reading as success.
     pub fn stop_all(&mut self) {
         if let Some(error) = self.stop_all_result() {
             self.last_error = Some(error.to_string());
@@ -7675,39 +6426,30 @@ impl EngineController {
             self.xray_backend.stop();
             for slot in self.extra_backends.iter_mut() {
                 slot.stop();
-                // Ticket 23 LOW: the emptied slot forgets its executable.
+
                 slot.clear_extra_exe();
             }
-            // Ticket 23 LOW: the served snapshots reset with the membership.
+
             self.served = [None, None, None];
             for served in self.served_extra.iter_mut() {
                 *served = None;
             }
-            // Ticket 41: secrets never survive teardown — zeroized, not just
-            // forgotten.
+
             self.clear_clash_secrets();
             self.status = EngineStatus::Stopped;
             self.last_config_json = None;
             return Ok(());
         }
-        // Pure plan over the union: conflicts, schemas, chain rule,
-        // custom-config uniqueness, bridge assignment. A bad set never
-        // disturbs any running sidecar.
+
         let plan = validate_activation(&self.active).inspect_err(|error| {
             self.last_error = Some(error.to_string());
         })?;
-        // Ticket 41: egress DNS resolves before any spawn — a bad hostname
-        // fails typed here (DNS failure, never confused with egress
-        // failure), while rollback is still free.
+
         if let Err(error) = validate_egress_resolution(&self.active) {
             self.last_error = Some(error.to_string());
             return Err(error);
         }
-        // Binary gates before touching anything: a missing sidecar binary
-        // fails only its own rows; the other sidecars keep serving. Ticket
-        // 23: the stock gate is typed too (was: wrapped as CheckFailed deep
-        // in `check`), and every validated path is pinned for spawn (no
-        // probe/spawn skew).
+
         let needs_stock = !plan.main_rows.is_empty()
             || plan
                 .replacements
@@ -7742,10 +6484,7 @@ impl EngineController {
                 }
             }
         }
-        // Ticket 27: one binary gate per extra slot (each names its own exe;
-        // a missing exe fails only the extra rows, like every other gate).
-        // Grow real sidecars for slots beyond the current backends (tests
-        // pre-size via `push_test_extra_backend`, so no real spawn there).
+
         while self.extra_backends.len() < plan.extras.len() {
             self.extra_backends
                 .push(Box::new(RealEngineBackend::extra_slot()));
@@ -7765,20 +6504,14 @@ impl EngineController {
                 }
             }
         }
-        // Per-sidecar configs. Custom full-config rows replace their core
-        // wholesale; anything else generates. Subsets of a validated union
-        // cannot fail validation again, but the errors stay typed.
+
         let replacement = |core: OwningCore| {
             plan.replacements
                 .iter()
                 .find(|(owned, _)| *owned == core)
                 .map(|(_, json)| json.clone())
         };
-        // Bridge map for the main config, straight from the plan's bridge
-        // bookkeeping (`bridge_key` is the exact key scheme `build_main_config`
-        // expects, with the plan's ports). Ticket 23 LOW: no re-derivation
-        // with swallowed validation context — the validated plan is the
-        // single source of truth.
+
         let mut plan_bridges: HashMap<String, u16> = HashMap::with_capacity(plan.egresses.len());
         for egress in &plan.egresses {
             plan_bridges.insert(egress.bridge_key.clone(), egress.bridge_port);
@@ -7805,20 +6538,7 @@ impl EngineController {
                     .json,
             ),
         };
-        // Ticket 36: loopback clash controllers on generated cores only
-        // (user-owned replacements are never mutated — those cores stay
-        // untracked). Exhaustion and injection failures are typed here,
-        // before anything stops, like every other apply gate.
-        // Ticket 41: bind-and-hold reservation — each controller port stays
-        // bound in `clash_holds` through the check phase (never a
-        // bind-then-drop probe), then drops just before spawn so the sidecar
-        // can bind its own controller (a hold kept through spawn would make
-        // the sidecar collide with itself). Scoped narrowly: probe gate +
-        // checks only.
-        // Process-wide reservation window (held to the pre-spawn drop
-        // below): two concurrent applies must never fail on each other's
-        // held reservations — without it, parallel applies racing the same
-        // fixed ports flake. Never held across spawn itself.
+
         static PORT_WINDOW_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
             std::sync::OnceLock::new();
         let port_window_guard = PORT_WINDOW_LOCK
@@ -7871,17 +6591,14 @@ impl EngineController {
                     .json,
             ),
         };
-        // Ticket 27: one passed-through config per extra slot.
+
         let mut extra_gens: Vec<Option<String>> = Vec::with_capacity(plan.extras.len());
         for row in &plan.extras {
             extra_gens.push(Some(extra_config_json(row).inspect_err(|error| {
                 self.last_error = Some(error.to_string());
             })?));
         }
-        // Bridge bookkeeping cross-checks (load-bearing): the sidecar
-        // tag counts must match the bridge count, and every pointer must
-        // have survived into the serving main config (a stock replacement
-        // that drops a pointer breaks the bridge explicitly).
+
         if !plan.egresses.is_empty() {
             let xray_json = xray_gen
                 .as_deref()
@@ -7930,11 +6647,7 @@ impl EngineController {
                 self.last_error = Some(error.to_string());
             })?;
         }
-        // Ticket 23 SEC-HIGH: replacements are user JSON served by bundled
-        // sidecars — the recursive system-mutation scan covers them here too
-        // (defense in depth: `validate_activation` already scanned them via
-        // `custom_full_config`, and this holds for any future path that
-        // reaches `apply` another way).
+
         for (core, json) in &plan.replacements {
             let document: serde_json::Value =
                 serde_json::from_str(json).map_err(|_| EngineError::BadCustom {
@@ -7954,11 +6667,7 @@ impl EngineController {
                 return Err(error);
             }
         }
-        // Ticket 08/41: bridge-port hold reservation — the arithmetic
-        // assignment alone never held the ports, so a sibling process could
-        // win the race before the xray sidecar bound its ingress. Every
-        // bridge port stays bound here through the check phase and drops
-        // just before spawn (same narrow scope as the clash holds).
+
         let mut bridge_holds: Vec<std::net::TcpListener> = Vec::new();
         {
             let mut seen: HashSet<u16> = HashSet::new();
@@ -7980,21 +6689,9 @@ impl EngineController {
                 }
             }
         }
-        // Ticket 23 MED: probe-bind every serving endpoint (plus every
-        // bridge listener) BEFORE any sidecar is stopped — a foreign holder
-        // fails typed here, while rollback is still free.
-        // Ticket 36: pairs our currently-served sidecars already hold are
-        // skipped (re-apply/start-one-more/stop-one must not mistake our
-        // own sockets for a foreign holder). The skip set comes only from
-        // configs we served (never guessed); a foreign squatter on a
-        // previously-served port surfaces later as a typed spawn failure.
-        // Probe reservations are held (not dropped) through the check phase
-        // and released just before spawn — same narrow scope as above.
+
         let mut probe_holds: Vec<std::net::TcpListener> = Vec::new();
         {
-            // Own-skip set over normalized bind keys: a served `localhost`
-            // and a candidate `127.0.0.1` are the same endpoint — raw string
-            // comparison would mistake our own socket for a foreign holder.
             let mut own: std::collections::HashSet<(String, u16)> =
                 std::collections::HashSet::new();
             for served in self
@@ -8023,10 +6720,7 @@ impl EngineController {
                     egress.bridge_port,
                 ));
             }
-            // Ticket 36: clash controllers join the same probe gate.
-            // Ticket 41: our own just-reserved holds are skipped outright —
-            // the ports are bound by us by construction (probing them would
-            // always fail closed on our own reservation).
+
             let held: std::collections::HashSet<u16> =
                 clash.iter().map(|target| target.port).collect();
             let bridge_ports: std::collections::HashSet<u16> = plan
@@ -8041,9 +6735,7 @@ impl EngineController {
                     target.port,
                 ));
             }
-            // Ticket 41: custom full-config replacement listens join the
-            // probe gate (parsed, never guessed — unparseable documents were
-            // allowlisted at plan time).
+
             for (owner, bind, port) in &plan.replacement_listens {
                 endpoints.push((
                     format!("custom full-config (\"{owner}\")"),
@@ -8058,11 +6750,7 @@ impl EngineController {
                 if name.starts_with("clash controller (") && held.contains(port) {
                     continue;
                 }
-                // Bridge ingress is held by us above (loopback bind, one of
-                // our bridge ports — rows and replacements can never claim
-                // these: reserved-range validation plus the
-                // replacement-vs-bridge conflict below): probing it would
-                // fail on our own hold, so it skips the probe outright.
+
                 if normalize_bind_key(bind) == "loopback" && bridge_ports.contains(port) {
                     continue;
                 }
@@ -8090,8 +6778,7 @@ impl EngineController {
                     if label == "fork" && plan.fork_xhttp {
                         detail = format!("{detail} ({XHTTP_KNOWN_BUGS})");
                     }
-                    // Ticket 29: ANSI-clean on every backend path (stock /
-                    // fork / xray check output all surface as toasts).
+
                     detail = strip_ansi_codes(&detail);
                     let error = EngineError::CheckFailed { detail };
                     self.last_error = Some(error.to_string());
@@ -8099,13 +6786,10 @@ impl EngineController {
                 }
             }
         }
-        // Ticket 27: every extra slot checks its own passed-through config.
-        // A missing generation skips its slot only (`continue` — a `break`
-        // would silently skip every later slot's check).
+
         for (slot, gen) in self.extra_backends.iter_mut().zip(extra_gens.iter()) {
             if let Some(json) = gen {
                 if let Err(detail) = slot.check_config(json) {
-                    // Ticket 29: ANSI-clean on the extra-slot path too.
                     let error = EngineError::CheckFailed {
                         detail: strip_ansi_codes(&detail),
                     };
@@ -8116,9 +6800,7 @@ impl EngineController {
                 continue;
             }
         }
-        // Restart only populated sidecars; empty subsets stay down. Each
-        // extra slot driver is pointed at its row's executable first; slots
-        // beyond the plan forget theirs (ticket 23 LOW).
+
         for (index, slot) in self.extra_backends.iter_mut().enumerate() {
             if let Some(path) = extra_paths.get(index).and_then(|path| path.as_ref()) {
                 slot.set_extra_exe(path.clone());
@@ -8126,19 +6808,12 @@ impl EngineController {
                 slot.clear_extra_exe();
             }
         }
-        // Holds release here — after every check, before any spawn. The
-        // sidecars bind their own inbounds/ingress/controllers at spawn, so
-        // a hold kept a moment longer would collide with the very process
-        // it reserved for. The drop→bind window is one syscall wide per
-        // port (nothing runs between them but the spawn itself). The
-        // process-wide reservation window releases with the holds.
+
         drop(probe_holds);
         drop(bridge_holds);
         drop(clash_holds);
         drop(port_window_guard);
-        // Ticket 23 HIGH: a failed spawn rolls the shards this apply touched
-        // back to their previously served configs (snapshot below) instead of
-        // leaving a split brain — some shards on the new set, one shard down.
+
         const SHARDS: [&str; 3] = ["stock", "fork", "xray"];
         let gens: [Option<String>; 3] = [stock_gen, fork_gen, xray_gen];
         let prev_served = self.served.clone();
@@ -8170,8 +6845,7 @@ impl EngineController {
                 }
             }
         }
-        // Ticket 27: each extra slot serves its own endpoint; shrink the
-        // served tail when the plan holds fewer slots than the backends.
+
         for (index, gen) in extra_gens.iter().enumerate() {
             let label = format!(
                 "extra-{}",
@@ -8217,13 +6891,6 @@ impl EngineController {
             }
         }
         if !failures.is_empty() {
-            // Restore every shard to its pre-apply served config — including
-            // shards whose new spawn just failed (the failure may be
-            // transient; a persistent failure just leaves that shard down,
-            // still truthful, never half-serving). Shards already stopped
-            // with no previous config stay down. Rollback failures are
-            // surfaced (never `Err(_)`-discarded: a failed rollback is a
-            // split brain the caller must see).
             let mut rollback_errors: Vec<String> = Vec::new();
             for (index, prev) in prev_served.clone().into_iter().enumerate() {
                 let backend = self.backend_at(index);
@@ -8240,7 +6907,7 @@ impl EngineController {
                     None => self.served[index] = None,
                 }
             }
-            // Ticket 27: extra slots roll back to their own snapshots.
+
             for (index, prev) in prev_served_extra.clone().into_iter().enumerate() {
                 if let Some(slot) = self.extra_backends.get_mut(index) {
                     slot.stop();
@@ -8277,7 +6944,7 @@ impl EngineController {
             }
             self.last_error = Some(detail);
             let (_, first) = failures.into_iter().next().expect("failures non-empty");
-            // Ticket 36: controllers follow the restored served set.
+
             self.sync_clash_from_served();
             self.status = if self.any_backend_running() {
                 EngineStatus::Running
@@ -8286,9 +6953,7 @@ impl EngineController {
             };
             return Err(first);
         }
-        // Ticket 23: status agrees with per-row `is_running` — Running iff
-        // any sidecar handle is up (every running shard serves a non-empty
-        // subset, and every served row maps to its shard's handle).
+
         self.status = if self.any_backend_running() {
             EngineStatus::Running
         } else {
@@ -8299,21 +6964,12 @@ impl EngineController {
             .or_else(|| gens[1].clone())
             .or_else(|| gens[2].clone())
             .or_else(|| extra_gens.iter().find_map(|gen| gen.clone()));
-        // Ticket 36: controllers follow the newly served set.
+
         self.sync_clash_from_served();
         self.last_error = None;
         Ok(())
     }
 
-    /// Crash detection: call on UI actions; reports every crashed shard.
-    /// Ticket 23 MED: all sidecars are reaped per poll (stock first) —
-    /// a one-shot poll no longer loses N-1 causes. A single crash returns
-    /// its bare cause (previous contract); several join as
-    /// `"shard: cause; shard: cause"`. Any observed crash transitions the
-    /// status (and records `last_error`), so callers see the failure even
-    /// when they only need the per-shard list.
-    /// Ticket 27: every extra slot polls as `extra-<id>` (or `extra-<index>`
-    /// when the row is gone).
     pub fn poll_shards(&mut self) -> Vec<(String, String)> {
         let mut crashes = Vec::new();
         for (shard, backend) in [
@@ -8321,8 +6977,6 @@ impl EngineController {
             ("fork", &mut self.fork_backend),
             ("xray", &mut self.xray_backend),
         ] {
-            // Ticket 23 HIGH: the failed shard's secret file is cleaned by
-            // `poll_exit` itself; siblings keep running untouched.
             if let Some(cause) = backend.poll_exit() {
                 crashes.push((shard.to_string(), cause));
             }
@@ -8345,9 +6999,7 @@ impl EngineController {
         if crashes.is_empty() || self.active.is_empty() {
             return crashes;
         }
-        // Ticket 41: a crashed shard is dropped from served[] and the clash
-        // set (dead sockets are never trusted again) and its totals go
-        // stale. Old clash secrets are zeroized before the rebuild.
+
         for (shard, _) in &crashes {
             self.drop_crashed_served(shard);
             self.crashed.insert(shard.clone());
@@ -8371,11 +7023,6 @@ impl EngineController {
         crashes
     }
 
-    /// Ticket 30: joined per-shard crash detail — always one `shard: cause`
-    /// fragment per crashed shard, joined with `; ` (single crashes keep
-    /// their shard prefix here, unlike [`EngineController::poll`]'s bare
-    /// cause). Pure: the UI builds the error notification from this without
-    /// touching generation or schemas. Causes are already redacted upstream.
     pub fn crash_detail(crashes: &[(String, String)]) -> String {
         crashes
             .iter()
@@ -8384,9 +7031,6 @@ impl EngineController {
             .join("; ")
     }
 
-    /// Crash detection: call on UI actions; reports the named cause(s) once.
-    /// Ticket 07: watches both sidecars, stock first.
-    /// Ticket 08: watches all four sidecars, stock first.
     pub fn poll(&mut self) -> Option<String> {
         let crashes = self.poll_shards();
         if crashes.is_empty() || self.active.is_empty() {
@@ -8403,9 +7047,6 @@ impl EngineController {
         })
     }
 
-    /// Ticket 13: take buffered stderr lines from every sidecar (stock,
-    /// fork, xray, every extra slot). The UI ingests them into `LogStore` on
-    /// every reload, so live lines appear without user clicks.
     pub fn drain_log_lines(&mut self) -> Vec<String> {
         let mut lines = self.backend.drain_log_lines();
         lines.extend(self.fork_backend.drain_log_lines());
@@ -8416,38 +7057,26 @@ impl EngineController {
         lines
     }
 
-    /// Ids of the active set.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn running_ids(&self) -> Vec<String> {
         self.active.iter().map(|row| row.id.clone()).collect()
     }
 
-    /// Number of active endpoints.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn running_count(&self) -> usize {
         self.active.len()
     }
 
-    /// Ticket 36: live clash controllers per serving core (port + secret)
-    /// for the traffic poll tick. Empty when nothing generated serves
-    /// (stopped cores, user-owned replacements, extra slots).
-    /// Ticket 41: the tick polls [`EngineController::live_clash_targets`]
-    /// (crashed cores skipped); this stays as the full-set seam for tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn clash_targets(&self) -> &[ClashTarget] {
         &self.clash
     }
 
-    /// Ticket 36: test seam — point the traffic tick at stub controllers
-    /// (mirrors the `set_*_probe` setter precedent).
     #[cfg(test)]
     pub fn set_clash_targets(&mut self, targets: Vec<ClashTarget>) {
         self.clash = targets;
     }
 
-    /// Ticket 36: rebuild [`EngineController::clash`] from the served
-    /// configs (single source of truth — covers success, rollback-restore,
-    /// and teardown uniformly).
     fn sync_clash_from_served(&mut self) {
         const CORES: [&str; 2] = ["stock", "fork"];
         self.clash = CORES
@@ -8466,11 +7095,7 @@ impl EngineController {
         let Some(row) = self.active.iter().find(|row| row.id == id) else {
             return false;
         };
-        // Ticket 08: each row reports its serving sidecar. Xray rows ride
-        // the xray bridge; custom rows follow their owning core; each extra
-        // row reports its own named slot; chains are served by the main config.
-        // Ticket 27: the slot index is the row's position among active
-        // extra rows (the order `apply` serves them in).
+
         if is_extra_core_protocol(&row.protocol) {
             return self
                 .extra_slot_index(id)
@@ -8478,8 +7103,6 @@ impl EngineController {
                 .is_some_and(|slot| slot.is_running());
         }
         if is_custom_config_protocol(&row.protocol) {
-            // Unreadable rows fail closed (never reported running on a
-            // shard they cannot be attributed to).
             let Some(core) = Self::custom_core_of(row) else {
                 return false;
             };
@@ -8513,7 +7136,6 @@ impl EngineController {
         &self.status
     }
 
-    /// One-line status for the status bar.
     pub fn status_text(&self) -> String {
         match &self.status {
             EngineStatus::Stopped => "engine stopped".to_string(),
@@ -8529,8 +7151,6 @@ impl EngineController {
         self.last_error.as_deref()
     }
 
-    /// Current per-endpoint isolation mapping (each endpoint exits only via
-    /// its own remote).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn isolation_map(&self) -> Vec<IsolationEntry> {
         self.active
@@ -8543,7 +7163,6 @@ impl EngineController {
             .collect()
     }
 
-    /// Active configs bound off loopback (the UI warns before serving these).
     pub fn lan_warnings(&self) -> Vec<String> {
         self.active
             .iter()
@@ -8552,9 +7171,6 @@ impl EngineController {
             .collect()
     }
 
-    /// Ticket 09: OS-mutation proof seam — fingerprint of the controlled
-    /// surface (active binds + generated-config hash). Equal before a
-    /// session and after stop-all; different while serving.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn session_fingerprint(&self) -> SessionFingerprint {
         let mut binds: Vec<String> = self
@@ -8570,11 +7186,6 @@ impl EngineController {
     }
 }
 
-/// True for loopback literals (spec: default bind; anything else is an
-/// explicit LAN exposure). `localhost` (any case) counts as loopback so the
-/// save gate, the start gate, and the LAN-confirm gate agree (ticket A1:
-/// `normalize_bind_key` already folds it to `loopback`; this was the odd one
-/// out). Unparseable input warns rather than serves silently.
 pub fn is_loopback_bind(bind: &str) -> bool {
     let trimmed = bind.trim();
     if trimmed.eq_ignore_ascii_case("localhost")
@@ -8590,7 +7201,6 @@ pub fn is_loopback_bind(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Warning text for a non-loopback bind, if any.
 pub fn lan_exposure_warning(name: &str, bind: &str) -> Option<String> {
     if is_loopback_bind(bind) {
         None
@@ -8601,29 +7211,18 @@ pub fn lan_exposure_warning(name: &str, bind: &str) -> Option<String> {
     }
 }
 
-/// Ticket 09: confirm-dialog title shared by the single- and start-all LAN
-/// gates (spec boundary: LAN bind behind explicit warning + confirm).
 pub const LAN_CONFIRM_TITLE: &str = "Expose proxy on the local network?";
 
-/// Ticket 09: confirm-gate predicate — every non-loopback bind must pass an
-/// explicit user confirm before start. Unparseable binds fail closed
-/// (confirm required) instead of serving silently.
 pub fn requires_lan_confirm(bind: &str) -> bool {
     !is_loopback_bind(bind)
 }
 
-/// Ticket 09: confirm-dialog copy for starting one LAN-bound config. Names
-/// the config and the bind only — never params, keys, or secrets.
 pub fn lan_confirm_text(name: &str, bind: &str) -> String {
     format!(
         "\"{name}\" will listen on {bind}, reachable by anyone on the local network. Start it anyway?"
     )
 }
 
-/// Ticket 09: confirm-dialog copy for start-all with LAN-bound rows.
-/// `entries` are `(name, bind)` pairs; output names each pair, never
-/// secrets. Empty input yields the loopback-only sentence (no confirm
-/// needed upstream — callers check [`requires_lan_confirm`] first).
 pub fn lan_confirm_description(entries: &[(String, String)]) -> String {
     let mut lines: Vec<String> = entries
         .iter()
@@ -8636,10 +7235,6 @@ pub fn lan_confirm_description(entries: &[(String, String)]) -> String {
     )
 }
 
-/// Ticket 09: recursive forbidden-key scan over a generated engine JSON
-/// document (the OS-mutation structural proof). Rejects any `tun` / `dns`
-/// section and any `set_system_proxy` key at any depth. Errors name the
-/// offending key and its path only — never values.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn assert_no_system_mutation(config_json: &str) -> Result<(), String> {
     let document: serde_json::Value = serde_json::from_str(config_json)
@@ -8650,13 +7245,6 @@ pub fn assert_no_system_mutation(config_json: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Ticket 09: fingerprint of everything the app controls across a session
-/// (active `bind:port` set + hash of the last generated engine config).
-/// Snapshot before a session must equal the snapshot after stop-all; during
-/// a session it differs. OS-level proxy/DNS/route bytes still need a live
-/// run (see QUICKSTART-RUN.md) — this seam proves the app side neither
-/// retains residue nor mutates anything across the session. Carries binds
-/// and a hash only, never params or secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct SessionFingerprint {
@@ -8733,8 +7321,6 @@ mod tests {
         ]
     }
 
-    /// Slice scenario 1 (structure): 3 stopped standard configs generate 3
-    /// mixed loopback inbounds with unique tags and ports.
     #[test]
     fn three_configs_yield_three_mixed_inbounds() {
         let generated = generate(&three_standard()).expect("standard set generates");
@@ -8752,8 +7338,6 @@ mod tests {
         assert_eq!(generated.inbound_tags.len(), 3);
     }
 
-    /// Slice scenario 1 (isolation): every rule routes its own inbound to
-    /// exactly its own outbound; unmatched traffic falls to direct.
     #[test]
     fn route_rules_isolate_each_endpoint_with_direct_final() {
         let generated = generate(&three_standard()).expect("standard set generates");
@@ -8790,8 +7374,6 @@ mod tests {
         }
     }
 
-    /// Research mapping: WireGuard clients live in `endpoints[]`, never in
-    /// `outbounds[]`.
     #[test]
     fn wireguard_becomes_endpoint_not_outbound() {
         let generated = generate(&three_standard()).expect("standard set generates");
@@ -8807,13 +7389,11 @@ mod tests {
             .filter_map(|node| node["tag"].as_str().map(str::to_string))
             .collect();
         assert!(!outbound_tags.contains(&outbound_tag("3")));
-        assert_eq!(outbound_tags.len(), 3); // ss + vless + direct
-        assert_eq!(generated.outbound_tags.len(), 3); // one tag per row (wg tag lives in endpoints)
+        assert_eq!(outbound_tags.len(), 3);
+        assert_eq!(generated.outbound_tags.len(), 3);
         assert!(generated.outbound_tags.contains(&outbound_tag("1")));
     }
 
-    /// Ticket 36: clash injection adds a loopback-only controller block
-    /// (shape proven live against stock 1.14.2); garbage input fails typed.
     #[test]
     fn ticket36_inject_clash_api() {
         let doc = serde_json::json!({
@@ -8837,8 +7417,6 @@ mod tests {
         );
     }
 
-    /// Ticket 36 (re-apply prerequisite): served listen ports parse out of
-    /// served configs; garbage fails open to probing (never a skip).
     #[test]
     fn ticket36_served_listen_ports() {
         let doc = serde_json::json!({
@@ -8861,13 +7439,6 @@ mod tests {
         );
     }
 
-    /// Ticket 36 (re-apply prerequisite): starting a second row while the
-    /// first is served does not trip the bind probe on the already-served
-    /// port (the test listener stands in for our own sidecar's hold), and
-    /// stopping one of two served rows works too. A genuinely foreign
-    /// holder on a NEW port still fails typed.
-    /// Ports are ephemeral (loopback `:0` picks), never fixed: fixed ports
-    /// flake under parallel suites when a sibling test holds the same port.
     #[test]
     fn ticket36_reapply_skips_own_served_ports() {
         fn free_port() -> u16 {
@@ -8888,10 +7459,7 @@ mod tests {
             first_port,
         )];
         controller.start_all(&rows).expect("first start works");
-        // A real hold on the served port (standing in for our own
-        // sidecar's socket, which the fake backend never binds): the
-        // re-apply must recognize its own ports and skip them instead of
-        // crying foreign-holder.
+
         let held =
             std::net::TcpListener::bind(format!("127.0.0.1:{first_port}")).expect("holds port");
         controller
@@ -8919,7 +7487,7 @@ mod tests {
         controller.start_all(&two).expect("second row starts");
         assert!(controller.stop_one("1"), "stop one of two works");
         assert!(controller.is_running("2"), "other row keeps serving");
-        // A genuinely foreign hold on a NEW port still fails typed.
+
         let foreign = std::net::TcpListener::bind("127.0.0.1:0").expect("holds a port");
         let blocked_port = foreign.local_addr().expect("addr works").port();
         let blocked = vec![fixture(
@@ -8941,17 +7509,6 @@ mod tests {
         drop(foreign);
     }
 
-    /// Ticket 36 (live): a real stock sing-box 1.14.2 sidecar serves a
-    /// single-row generated config with the injected clash controller; a
-    /// throttled HTTP-proxy burst through the mixed inbound moves the
-    /// clash totals (Bearer-authenticated; wrong secret gets 401). The
-    /// row's upstream is a loopback TCP acceptor (accept + close): live
-    /// probing showed sing-box only counts connection bytes once the
-    /// outbound leg establishes, so an unreachable server counts nothing
-    /// while an accepted-then-closed leg counts the inbound bytes. Hermetic
-    /// by default — runs only with `MANYPROXY_LIVE_TRAFFIC=1` (loopback +
-    /// TEMP files only, removed afterwards; the sidecar is killed before
-    /// return).
     #[test]
     fn ticket36_live_clash_totals_move() {
         if std::env::var("MANYPROXY_LIVE_TRAFFIC").unwrap_or_default() != "1" {
@@ -8975,12 +7532,7 @@ mod tests {
                 .expect("addr works")
                 .port()
         }
-        // Dumb upstream: accepts each outbound dial then closes (no
-        // shadowsocks handshake — tunnel bytes are not the point, the
-        // established leg that starts the inbound counting is). Bound
-        // before the sidecar starts; the acceptor thread takes exactly the
-        // signalled dial count then exits (nonblocking + deadline, so the
-        // join below can never hang the suite).
+
         let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("upstream binds");
         let upstream_port = upstream.local_addr().expect("addr works").port();
         upstream.set_nonblocking(true).expect("nonblocking works");
@@ -9051,7 +7603,7 @@ mod tests {
             .expect("sidecar runs");
         let result = (|| -> Result<String, String> {
             use std::io::{Read as _, Write as _};
-            // The controller comes up with the sidecar — poll to readiness.
+
             let deadline = Instant::now() + Duration::from_secs(20);
             let (rx0, tx0) = loop {
                 match crate::health::poll_clash_totals(clash_port, secret, Duration::from_secs(2)) {
@@ -9067,16 +7619,12 @@ mod tests {
                     }
                 }
             };
-            // Wrong secret is rejected (live Bearer-auth proof).
+
             if crate::health::poll_clash_totals(clash_port, "wrong", Duration::from_secs(5)).is_ok()
             {
                 return Err("clash accepted a bad secret".to_string());
             }
-            // Throttled transfer: N plain HTTP-proxy GETs (the health-probe
-            // byte shape) at an unreachable TEST-NET host. The tunnel leg
-            // to the loopback acceptor establishes (starting the inbound
-            // counting); the request bytes then count however the relay
-            // ends.
+
             let request = "GET http://192.0.2.1/ HTTP/1.1\r\nHost: 192.0.2.1\r\n\
                  Connection: close\r\nUser-Agent: ManyProxy-live\r\n\r\n";
             let mut sent = 0u32;
@@ -9098,7 +7646,7 @@ mod tests {
                 let _ = stream.read(&mut buf);
             }
             let _ = count_tx.send(sent);
-            // Totals flush on connection close — allow a lag window.
+
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let (rx1, tx1) =
@@ -9135,18 +7683,12 @@ mod tests {
                             .starts_with("manyproxy-t36-live-")
                     })
                 })
-                // Fail closed: an unreadable temp dir proves nothing, so it
-                // must fail the litter check (a vacuous pass would hide
-                // leaked secret files).
                 .unwrap_or(false),
             "no temp litter left"
         );
         result.expect("PROBE live-traffic: clash totals move");
     }
-    /// through the tunnel): outbound-style stored keys become endpoint
-    /// schema — peer in `peers[]`, list fields as lists, numerics as
-    /// numbers, internal markers and client settings dropped. The fork
-    /// rejects `server`/`dns`/`awg_version` and string `jmin` outright.
+
     #[test]
     fn wireguard_endpoint_schema_matches_fork() {
         let row = fixture(
@@ -9189,11 +7731,6 @@ mod tests {
         assert_eq!(peer["allowed_ips"], json!(["0.0.0.0/0"]));
     }
 
-    /// Exotic protocols stay out of this slice with a named error.
-    /// Ticket 27: AnyTLS/SSH/Noise are native now — the residual
-    /// UnsupportedProtocol case is a genuinely unknown protocol.
-    /// Ticket 42: naive/socks/http/snell/shadowtls joined the natives —
-    /// the residual case is a schema-less protocol (e.g. mieru).
     #[test]
     fn unsupported_protocol_names_config_without_secrets() {
         let configs = vec![fixture(
@@ -9211,7 +7748,6 @@ mod tests {
         assert!(!text.contains("TOP-SECRET"), "no secrets: {text}");
     }
 
-    /// Slice scenario 3: a taken port blocks start, naming both configs.
     #[test]
     fn duplicate_listen_port_names_both_configs() {
         let configs = vec![
@@ -9232,7 +7768,6 @@ mod tests {
         assert!(text.contains("10821"), "names port: {text}");
     }
 
-    /// Prohibitions: no TUN, no DNS rewrite, no system-proxy keys.
     #[test]
     fn generated_json_has_no_tun_dns_or_system_proxy() {
         let generated = generate(&three_standard()).expect("standard set generates");
@@ -9247,8 +7782,6 @@ mod tests {
         assert!(top.get("dns").is_none());
     }
 
-    /// Controller on the mock: start-all 3, stop 1 (its endpoint drops, the
-    /// others keep their isolation mapping).
     #[test]
     fn controller_start_all_stop_one_restart_via_fake() {
         let (mut controller, handle) = EngineController::fake();
@@ -9280,7 +7813,6 @@ mod tests {
         assert_eq!(controller.status(), &EngineStatus::Stopped);
     }
 
-    /// A failed engine `check` blocks start and leaves nothing running.
     #[test]
     fn check_failure_blocks_start() {
         let (mut controller, handle) = EngineController::fake();
@@ -9293,7 +7825,6 @@ mod tests {
         assert!(controller.last_error().is_some());
     }
 
-    /// Crash detection surfaces the named cause exactly once.
     #[test]
     fn crash_poll_records_named_cause() {
         let (mut controller, handle) = EngineController::fake();
@@ -9308,9 +7839,6 @@ mod tests {
         assert!(controller.poll().is_none(), "cause reported once");
     }
 
-    /// Ticket 13: mock sidecars emit stderr lines; the controller drains
-    /// every sidecar, the exit is noted once, the pipe closes cleanly
-    /// (later drains are empty, later polls are silent), nothing panics.
     #[test]
     fn log_pipe_drains_all_sidecars_and_closes_cleanly_on_exit() {
         let (mut controller, stock, fork, _xray, _extra) = EngineController::fake_quartet();
@@ -9340,10 +7868,6 @@ mod tests {
         );
     }
 
-    /// Ticket 13: the pipe-reader buffer is bounded (oldest lines drop when
-    /// full, memory never grows without bound).
-    /// Ticket 23: stale generations are fenced out; a poisoned lock recovers
-    /// with a named notice instead of a silent drop.
     #[test]
     fn log_pipe_buffer_stays_bounded() {
         let buffer = Arc::new(Mutex::new((0u64, VecDeque::new())));
@@ -9363,8 +7887,6 @@ mod tests {
         );
     }
 
-    /// Ticket 23: a previous generation's reader cannot interleave lines
-    /// after a restart (generation fence).
     #[test]
     fn log_pipe_stale_generation_dropped() {
         let buffer = Arc::new(Mutex::new((1u64, VecDeque::new())));
@@ -9375,8 +7897,6 @@ mod tests {
         assert_eq!(lines, vec!["fresh line"], "stale dropped, got {lines:?}");
     }
 
-    /// Ticket 23: a poisoned log lock recovers with a named notice line —
-    /// never a silent drop.
     #[test]
     fn log_pipe_poison_recovers_with_notice() {
         let buffer = Arc::new(Mutex::new((0u64, VecDeque::new())));
@@ -9397,7 +7917,6 @@ mod tests {
         );
     }
 
-    /// Binary resolution failure names the searched directories.
     #[test]
     fn missing_binary_error_lists_searched_dirs() {
         let error = resolve_engine_binary_in(Some(Path::new("/nonexistent-manyproxy-dir")), "")
@@ -9411,7 +7930,6 @@ mod tests {
         assert!(!text.contains("password"), "no secrets: {text}");
     }
 
-    /// Param errors name the config and field, never the secret values.
     #[test]
     fn bad_params_error_names_field_not_secrets() {
         let configs = vec![fixture(
@@ -9442,9 +7960,6 @@ mod tests {
         assert!(!error.to_string().contains("not json"));
     }
 
-    /// Custom binds are allowed but flagged; loopback stays quiet.
-    /// Ticket A1: `localhost` (any case) is loopback everywhere — no LAN
-    /// confirm, no warning, consistent with `normalize_bind_key`.
     #[test]
     fn lan_warning_only_for_non_loopback() {
         assert!(is_loopback_bind("127.0.0.1"));
@@ -9462,8 +7977,7 @@ mod tests {
         let (mut controller, _) = EngineController::fake();
         let mut rows = three_standard();
         rows[0].bind_ip = "0.0.0.0".to_string();
-        // Ticket 23: the unconfirmed start refuses the LAN bind; past the
-        // confirm the bind starts and still warns.
+
         let error = controller
             .start_all(&rows)
             .expect_err("unconfirmed LAN bind fails");
@@ -9480,10 +7994,6 @@ mod tests {
         assert!(warnings[0].contains("\"Alpha\""));
     }
 
-    // -- Ticket 09: hardening + release proof --------------------------------
-
-    /// Confirm gate blocks every non-loopback bind (and fails closed on
-    /// garbage); loopback stays quiet.
     #[test]
     fn lan_confirm_gate_blocks_non_loopback_only() {
         assert!(!requires_lan_confirm("127.0.0.1"));
@@ -9496,8 +8006,6 @@ mod tests {
         assert!(requires_lan_confirm(""), "blank fails closed");
     }
 
-    /// Confirm copy names the config + bind and carries no secrets, even
-    /// when the row's params are secret-laden.
     #[test]
     fn lan_confirm_text_names_config_without_secrets() {
         let single = lan_confirm_text("Home", "0.0.0.0");
@@ -9523,10 +8031,6 @@ mod tests {
         }
     }
 
-    /// OS-mutation proof: fingerprint before a session equals the fingerprint
-    /// after stop-all, differs while serving; the generated config carries
-    /// no tun/dns/set_system_proxy anywhere; the fingerprint itself leaks
-    /// no secret material.
     #[test]
     fn session_fingerprint_roundtrip_proves_no_residue() {
         let (mut controller, _) = EngineController::fake();
@@ -9551,8 +8055,6 @@ mod tests {
         }
     }
 
-    /// The mutation scan rejects each forbidden key at top level and nested,
-    /// naming the key (never values); clean documents pass.
     #[test]
     fn mutation_scan_rejects_forbidden_keys() {
         for (label, doc) in [
@@ -9581,8 +8083,6 @@ mod tests {
         assert!(assert_no_system_mutation("{not json}").is_err());
     }
 
-    /// Release prohibitions, machine-checked half: every missing-binary error
-    /// states the never-downloads contract (no silent binary replacement).
     #[test]
     fn missing_binaries_state_never_downloads() {
         let stock = EngineError::MissingBinary {
@@ -9619,10 +8119,6 @@ mod tests {
         );
     }
 
-    /// Binary resolution searches explicit directories only: no download, no
-    /// elevation, and the searched list is reported (empty roots fail typed).
-    /// Ticket A6: the stock error names the EXPECTED FILE plus the dir
-    /// (like the fork/xray/extra variants), so the user knows what to place.
     #[test]
     fn binary_resolution_never_elevates_or_downloads() {
         let error = resolve_engine_binary_in(None, "").expect_err("empty search roots fail");
@@ -9641,9 +8137,6 @@ mod tests {
         );
     }
 
-    /// Ticket A6: `is_executable` pins — missing paths and directories are
-    /// false everywhere; a plain existing file is true on Windows (no exec
-    /// bit to consult — the `.exe` association + ACLs decide launch).
     #[test]
     fn a6_executable_bit_behavior_pinned() {
         assert!(!is_executable(Path::new(
@@ -9660,8 +8153,6 @@ mod tests {
         let _ = std::fs::remove_file(&probe);
     }
 
-    /// Ticket A6: the fork probe fails fast (never hangs) on a missing
-    /// binary, and the timeout seam reports a hung spawn as a timeout.
     #[test]
     fn a6_fork_probe_never_hangs() {
         let missing = Path::new("C:\\definitely-not-here-manyproxy\\fork.exe");
@@ -9677,18 +8168,11 @@ mod tests {
         );
     }
 
-    /// Empty activation set is a typed error, not an empty engine config.
     #[test]
     fn empty_set_is_no_active_configs() {
         assert!(matches!(generate(&[]), Err(EngineError::NoActiveConfigs)));
     }
 
-    // -- Ticket 32: engine correctness (route arrays, custom agreement,
-    // AWG coercion, stop snapshot; TDD at the generation seam) --------------
-
-    /// Ticket 32: route rules carry `inbound` as an array (what stock
-    /// sing-box 1.14.2 `check` accepts); one entry per endpoint, each
-    /// resolving to its own outbound.
     #[test]
     fn t32_route_rules_use_inbound_array() {
         let generated = generate(&three_standard()).expect("standard set generates");
@@ -9702,9 +8186,6 @@ mod tests {
         }
     }
 
-    /// Ticket 32: custom full-config rows never conflict — `generate` and
-    /// `validate_activation` agree (their bind is documentation, not an
-    /// endpoint we serve).
     #[test]
     fn t32_custom_full_config_never_conflicts() {
         fn custom_full(id: &str, name: &str, core: &str) -> ProxyConfig {
@@ -9718,20 +8199,19 @@ mod tests {
                 10801,
             )
         }
-        // Same bind+port, different cores: the pre-check plans cleanly.
+
         let rows = vec![
             custom_full("c1", "CustomA", "stock"),
             custom_full("c2", "CustomB", "fork"),
         ];
         validate_activation(&rows).expect("customs never conflict in validate");
-        // `generate` serves no custom full-config, but it must agree on the
-        // conflict verdict: never a PortConflict.
+
         let error = generate(&rows).expect_err("customs join no bare config");
         assert!(
             !matches!(error, EngineError::PortConflict { .. }),
             "generate agrees (no conflict), got {error}"
         );
-        // A custom full-config sharing a standard row's endpoint agrees too.
+
         let mixed = vec![
             fixture(
                 "1",
@@ -9750,9 +8230,6 @@ mod tests {
         );
     }
 
-    /// Ticket 32: stop with a failing re-gen restores the snapshot (active
-    /// membership and the running sidecar agree) and records the error —
-    /// never a silent half-state.
     #[test]
     fn t32_stop_with_failing_regen_restores_snapshot() {
         let rows = vec![
@@ -9785,8 +8262,6 @@ mod tests {
         assert_eq!(controller.running_ids(), vec!["2".to_string()]);
     }
 
-    /// Ticket 32: AWG string numerics (jc/jmin/jmax/s1-s4/h1-h4) coerce to
-    /// numbers; h-ranges and i-chains pass through verbatim.
     #[test]
     fn t32_awg_string_numerics_coerce_ranges_verbatim() {
         let params = awg_params(
@@ -9822,13 +8297,6 @@ mod tests {
         assert_eq!(endpoint["i2"], json!("5"), "i-chain never coerced");
     }
 
-    /// Config-completeness T04 (R7): `enable_amnezia` is UI state (stripped
-    /// like brutal speeds — never emitted); trailers/cookies + the v3 matrix
-    /// pass through verbatim for the fork `check`; WG peer/net keys land
-    /// endpoint-shaped; import-only `udp_timeout` is preserved, never
-    /// stripped. Hermetic `generate()`-shape proof (no fork binary in dev —
-    /// T02 precedent); the fork's own `check` stays authoritative for value
-    /// shapes (live-gate).
     #[test]
     fn t04_awg_markers_strip_and_matrix_passes_through() {
         let params = awg_params(
@@ -9894,8 +8362,7 @@ mod tests {
         assert_eq!(peer["pre_shared_key"], json!("PSK"));
         assert_eq!(peer["allowed_ips"], json!(["10.0.0.0/8"]));
         assert_eq!(peer["persistent_keepalive_interval"], json!(25));
-        // The version gate still holds: a v3-only key on a 2.0 row fails
-        // naming the field (hide-preserve never smuggles it past).
+
         let bad = awg_params("2.0", json!({"randomtrailers": true}));
         let error =
             generate(&[awg_fixture("8", "AwgOld", bad, 10808)]).expect_err("v3 key on 2.0 fails");
@@ -9903,13 +8370,6 @@ mod tests {
         assert!(text.contains("randomtrailers"), "names the field: {text}");
     }
 
-    /// Ticket 32 (live): every standard row shape the app emits passes the
-    /// real stock sing-box 1.14.2 `check` (EXIT 0) — route arrays, `tls` /
-    /// `transport` translation, endpoint reshape. Hermetic by default —
-    /// runs only with `MANYPROXY_LIVE_CHECK=1` (TEMP files only, removed
-    /// afterwards). The binary resolves via `MANYPROXY_SINGBOX_BIN` (else
-    /// the debug build beside the crate). Rows come from the real link
-    /// grammar so intake shapes are covered end to end.
     #[test]
     fn t32_live_singbox_check_accepts_standard_rows() {
         if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
@@ -9958,7 +8418,6 @@ mod tests {
         ];
         for (label, link) in links {
             if link == "wgfull" {
-                // Valid base64 key material plus numeric-ish endpoint opts.
                 let row = fixture(
                     "9",
                     "WgFull",
@@ -9976,8 +8435,6 @@ mod tests {
                 continue;
             }
             if link == "wgminimal" {
-                // Real keys but no address/allowed_ips: the allowed-ips
-                // default carries it (address is optional to `check`).
                 let row = fixture(
                     "9",
                     "WgMinimal",
@@ -10038,12 +8495,9 @@ mod tests {
             );
         }
     }
-    /// Ticket 32: meaningful-but-unmappable intake fails named (field +
-    /// reason, never values) instead of emitting a config `check` rejects
-    /// — or worse, a silently wrong connection.
+
     #[test]
     fn t32_translation_errors_name_field() {
-        // Shadowsocks plugin: names an external executable.
         let plugin = fixture(
             "1",
             "SsPlugin",
@@ -10066,7 +8520,7 @@ mod tests {
             !error.to_string().contains("obfs-local"),
             "no value echo: {error}"
         );
-        // Hysteria without speeds: sing-box requires up/down.
+
         let slow = fixture(
             "2",
             "HyBare",
@@ -10080,7 +8534,7 @@ mod tests {
             matches!(error, EngineError::BadParams { field: "up", .. }),
             "typed, got {error}"
         );
-        // Hysteria2 realm variant: no sing-box mapping.
+
         let realm = fixture(
             "3",
             "Hy2Realm",
@@ -10095,7 +8549,7 @@ mod tests {
             error.to_string().contains("\"variant\""),
             "names field: {error}"
         );
-        // mKCP transport: no sing-box mapping.
+
         let kcp = fixture(
             "4",
             "VlessKcp",
@@ -10110,7 +8564,7 @@ mod tests {
             error.to_string().contains("\"network\""),
             "names field: {error}"
         );
-        // Plaintext on a TLS-mandatory protocol.
+
         let plain = fixture(
             "5",
             "TuicPlain",
@@ -10128,8 +8582,6 @@ mod tests {
         );
     }
 
-    /// Ticket 32: intake spellings fold to sing-box names — `username` to
-    /// `user` on ssh, string `alter_id` to a number on vmess.
     #[test]
     fn t32_intake_spellings_fold_to_singbox_names() {
         let ssh = fixture(
@@ -10173,9 +8625,6 @@ mod tests {
         assert_eq!(node["alter_id"], json!(3), "coerced to number");
     }
 
-    // -- Ticket 07: fork-core exotic (AWG version matrix, wrong-layer
-    // guards, XHTTP path, fork gating; TDD at the validation seam) --------
-
     fn awg_params(version: &str, extra: serde_json::Value) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         map.insert("type".to_string(), json!("amneziawg"));
@@ -10203,8 +8652,6 @@ mod tests {
                "path": "/split", "mode": "stream-one"})
     }
 
-    /// Scenario 1: an AmneziaWG 2.0 row is not "unsupported type" — it
-    /// becomes a fork `wireguard` endpoint with its params verbatim.
     #[test]
     fn awg_20_generates_fork_wireguard_endpoint() {
         let params = awg_params(
@@ -10223,8 +8670,7 @@ mod tests {
         assert_eq!(endpoints[0]["tag"], json!(outbound_tag("7")));
         assert_eq!(endpoints[0]["jc"], json!(4));
         assert_eq!(endpoints[0]["jmin"], json!(40));
-        // The endpoint reshape drops internal markers (`awg_version` never
-        // reaches the engine; the fork judges the matrix fields as given).
+
         assert!(
             endpoints[0].get("awg_version").is_none(),
             "no internal marker"
@@ -10232,8 +8678,6 @@ mod tests {
         assert_eq!(generated.isolation.len(), 1);
     }
 
-    /// 3.x rows accept the documented additions (header protection, padding,
-    /// trailers, ranged timings) alongside the 2.0 base.
     #[test]
     fn awg_31_extended_params_accepted() {
         let params = awg_params(
@@ -10251,7 +8695,6 @@ mod tests {
         assert_eq!(value["endpoints"][0]["RandomTrailers"], json!("on"));
     }
 
-    /// Sub-version skew: a 3.x-only field on a 2.0 row names the field.
     #[test]
     fn awg_31_field_on_20_row_rejected_with_named_error() {
         let params = awg_params("2.0", json!({"HeaderProtectionKey": "K"}));
@@ -10267,8 +8710,6 @@ mod tests {
         assert!(text.contains("\"Skewed\""), "names config: {text}");
     }
 
-    /// Unknown AWG fields are rejected with a named error, never passed
-    /// through silently.
     #[test]
     fn awg_unknown_field_rejected() {
         let params = awg_params("2.0", json!({"frobnicate": 1}));
@@ -10279,7 +8720,6 @@ mod tests {
         assert!(text.contains("frobnicate"), "names field: {text}");
     }
 
-    /// Missing version and unknown versions name the missing param/version.
     #[test]
     fn awg_version_presence_and_range() {
         let mut bare = awg_params("2.0", json!({}));
@@ -10296,8 +8736,6 @@ mod tests {
         assert!(text.contains("awg_version"), "names param: {text}");
     }
 
-    /// AWG rows without WireGuard credentials name the missing field without
-    /// echoing any key material.
     #[test]
     fn awg_missing_credentials_name_field_not_secrets() {
         let mut params = awg_params("2.0", json!({}));
@@ -10309,8 +8747,6 @@ mod tests {
         assert!(!text.contains("LOCAL-PRIVATE"), "no secrets: {text}");
     }
 
-    /// Wrong layer, direction 1: AWG fields on stock rows are blocked with
-    /// an explicit error, never silent.
     #[test]
     fn awg_fields_on_stock_rows_are_wrong_layer() {
         let mut wg = wg_params();
@@ -10338,8 +8774,6 @@ mod tests {
         );
     }
 
-    /// Wrong layer, direction 2: Xray noise/finalmask semantics on AWG rows
-    /// are blocked (Amnezia Noise ≠ Xray Noise).
     #[test]
     fn xray_noise_on_awg_rows_is_wrong_layer() {
         for key in ["noise", "finalmask", "final_mask"] {
@@ -10359,8 +8793,6 @@ mod tests {
         }
     }
 
-    /// XHTTP on the VLESS family routes via the fork with params verbatim;
-    /// XHTTP on WireGuard is a wrong-layer mix.
     #[test]
     fn xhttp_vless_needs_fork_wireguard_rejects() {
         let configs = vec![fixture(
@@ -10376,8 +8808,7 @@ mod tests {
         assert!(generated.requires_fork);
         let value = generated.value();
         let outbounds = value["outbounds"].as_array().expect("outbounds");
-        // Ticket 32: the xhttp marker folds into the `transport` object
-        // the fork sidecar validates (no v2ray-flat top-level keys).
+
         let node = outbounds
             .iter()
             .find(|node| node["tag"] == json!(outbound_tag("2")))
@@ -10395,7 +8826,6 @@ mod tests {
         assert!(!needs_fork(&configs[0]));
     }
 
-    /// Stock-only sets never need the fork: output shape is unchanged.
     #[test]
     fn stock_sets_need_no_fork() {
         for config in three_standard() {
@@ -10405,7 +8835,6 @@ mod tests {
         assert!(!generated.requires_fork);
     }
 
-    /// Fork resolution names the expected binary and the searched dirs.
     #[test]
     fn fork_resolution_names_expected_binary() {
         assert!(fork_binary_file_name().contains("sing-box-awg"));
@@ -10431,7 +8860,6 @@ mod tests {
         );
     }
 
-    /// Version probe fails fast on a missing binary.
     #[test]
     fn fork_version_probe_fails_on_missing_binary() {
         let error = probe_fork_version(Path::new("/nonexistent-manyproxy-dir/sing-box-awg"))
@@ -10439,8 +8867,6 @@ mod tests {
         assert!(error.contains("fork version probe failed"), "got {error}");
     }
 
-    /// Mixed sets with a present fork run both sidecars side by side, each
-    /// with its own single-row config.
     #[test]
     fn mixed_set_with_fork_runs_both_sidecars() {
         let (mut controller, stock, fork) = EngineController::fake_pair();
@@ -10472,12 +8898,10 @@ mod tests {
         assert_eq!(controller.isolation_map().len(), 2);
     }
 
-    /// Prohibited side effect: a missing fork binary fails only exotic rows
-    /// with a clear error; stock rows keep working.
     #[test]
     fn missing_fork_fails_only_exotic_rows() {
         let (mut controller, stock, fork) = EngineController::fake_pair();
-        // Default fake_pair probe is missing: stock-only sets are unaffected.
+
         let rows = vec![fixture(
             "1",
             "Alpha",
@@ -10510,7 +8934,6 @@ mod tests {
         assert!(!fork.is_running(), "fork sidecar never started");
     }
 
-    /// XHTTP rows surface the known-bug note in the missing-binary error.
     #[test]
     fn xhttp_missing_fork_error_carries_bug_note() {
         let (mut controller, _, _) = EngineController::fake_pair();
@@ -10530,9 +8953,6 @@ mod tests {
         assert!(text.contains("stream-one"), "bug note: {text}");
         assert!(text.contains("sing-box-awg"), "binary: {text}");
     }
-
-    // -- Ticket 08: Xray sidecar + custom + chaining (TDD at the
-    // bridge-bookkeeping/validation seam, FakeEngineBackend pattern) --------
 
     const T08_UUID: &str = "11111111-2222-4333-8444-555555555555";
 
@@ -10578,9 +8998,6 @@ mod tests {
         )
     }
 
-    /// Scenario 1 (bridge): an Xray-only VLESS row beside a stock row
-    /// yields a loopback pointer in the main config and a paired sidecar
-    /// config whose ingress/egress agree with the bookkeeping.
     #[test]
     fn xray_row_bridges_loopback_pointer_to_sidecar() {
         let rows = vec![
@@ -10663,9 +9080,6 @@ mod tests {
         }
     }
 
-    /// Bridge bookkeeping: tag-count skew fails with the research-02
-    /// breakage signature, and a stock replacement that drops a pointer
-    /// fails start before any sidecar is touched.
     #[test]
     fn bridge_count_mismatch_fails_start_with_signature() {
         let error = validate_bridge_counts(1, 0, 1, "test").expect_err("skew fails");
@@ -10705,8 +9119,6 @@ mod tests {
         assert_eq!(stock.check_calls(), 0, "no check ran");
     }
 
-    /// Loopback hygiene: an egress pointing at loopback fails naming the
-    /// row instead of recirculating sidecar traffic.
     #[test]
     fn loopback_hygiene_rejects_loopback_egress() {
         for server in ["127.0.0.1", "localhost", "0.0.0.0"] {
@@ -10727,9 +9139,6 @@ mod tests {
         }
     }
 
-    /// Custom outbound JSON merges verbatim into the owning core's config;
-    /// a broken snippet blocks start naming the offending field while a
-    /// running stock endpoint keeps serving.
     #[test]
     fn custom_outbound_merges_and_broken_names_field() {
         let rows = vec![custom_fixture(
@@ -10781,8 +9190,6 @@ mod tests {
         assert!(stock.is_running(), "running endpoint unaffected");
     }
 
-    /// Custom full-config rows replace their owning core's generated config;
-    /// a second replacement for the same core names `core`.
     #[test]
     fn custom_full_config_replaces_owning_core() {
         let replacement = fixture(
@@ -10822,10 +9229,6 @@ mod tests {
         assert!(error.to_string().contains("\"core\""), "got {error}");
     }
 
-    /// Extra-core slots: app-dir-only resolution rejects traversal, a
-    /// missing exe names the row + file, and N named slots each serve their
-    /// own endpoint (ticket 27 replaces the ticket-08 singleton).
-    /// The active rows' configs reach their sidecars unprivileged.
     #[test]
     fn extra_slots_appdir_unprivileged_named() {
         assert!(resolve_extra_binary_in(None, "core.exe").is_err());
@@ -10892,8 +9295,7 @@ mod tests {
         );
 
         let rival = extra_fixture("6", "Rival", 10806);
-        // Ticket 27: N named slots — the second row starts beside the first
-        // (its own sidecar, its own endpoint), no singleton cap.
+
         let _rival_extra = controller.push_test_extra_backend();
         controller
             .start_one(&rival)
@@ -10903,8 +9305,6 @@ mod tests {
         assert_eq!(controller.running_count(), 3);
     }
 
-    /// Egress-only rule: Extra/Custom/Xray hops mid-chain are rejected with
-    /// the contract error; the violation names the chain, never secrets.
     #[test]
     fn chain_midchain_egress_only_violation() {
         let inline_extra = json!({"type": "extra-core", "exe": "x", "config": {}});
@@ -10921,7 +9321,6 @@ mod tests {
         assert!(text.contains(CHAIN_EGRESS_RULE), "contract text: {text}");
         assert!(text.contains("\"BadChain\""), "names chain: {text}");
 
-        // Id reference to an Xray row mid-chain (full-set validation path).
         let rows = vec![
             xray_fixture("2", "XrayOne", 10802),
             fixture(
@@ -10939,7 +9338,6 @@ mod tests {
         assert!(matches!(error, EngineError::ChainViolation { .. }));
         assert!(text.contains(CHAIN_EGRESS_RULE), "contract text: {text}");
 
-        // Custom mid-chain via id reference.
         let rows = vec![
             custom_fixture("9", "CustomOne", custom_stock_params(), 10809),
             fixture(
@@ -10956,8 +9354,6 @@ mod tests {
         assert!(error.to_string().contains(CHAIN_EGRESS_RULE), "got {error}");
     }
 
-    /// A valid stock→stock chain materializes private hops with a detour
-    /// spine and routes its own inbound to the first hop.
     #[test]
     fn chain_valid_stock_chain_generates_detour() {
         let rows = vec![
@@ -10996,10 +9392,6 @@ mod tests {
         assert_eq!(rule["outbound"], json!(hop0));
     }
 
-    /// Xray-last chains are allowed: the terminating hop bridges to the
-    /// sidecar while earlier hops stay in the main config. An id reference
-    /// reuses its row's bridge leg (one ingress, two loopback pointers —
-    /// no cross-endpoint leak: both legs exit via the referenced egress).
     #[test]
     fn chain_xray_last_bridges_to_sidecar() {
         let rows = vec![
@@ -11041,8 +9433,6 @@ mod tests {
         );
     }
 
-    /// Scenario 1 (isolation): Xray-only VLESS + custom-JSON + stock rows
-    /// start together with per-endpoint isolation on the mocks.
     #[test]
     fn mixed_xray_custom_stock_start_all_isolated() {
         let rows = vec![
@@ -11074,7 +9464,6 @@ mod tests {
         assert_eq!(isolation.len(), 3);
     }
 
-    /// A missing xray binary fails only Xray rows; stock keeps serving.
     #[test]
     fn missing_xray_fails_only_xray_rows() {
         let (mut controller, stock, _, xray, _) = EngineController::fake_quartet();
@@ -11100,7 +9489,6 @@ mod tests {
         assert!(!xray.is_running(), "xray sidecar never started");
     }
 
-    /// Xray resolution names the expected binary and searched dirs.
     #[test]
     fn xray_resolution_names_expected_binary() {
         assert!(xray_binary_file_name().contains("xray"));
@@ -11112,7 +9500,6 @@ mod tests {
         );
     }
 
-    /// Bridge ports skip taken user ports; exhaustion is typed.
     #[test]
     fn bridge_ports_skip_taken_and_exhaust_explicitly() {
         let taken: HashSet<u16> = [11801].into_iter().collect();
@@ -11123,7 +9510,6 @@ mod tests {
         assert!(matches!(error, EngineError::InvalidGenerated { .. }));
     }
 
-    /// Chain shape errors name `nodes`, never params contents.
     #[test]
     fn chain_shape_errors_name_nodes() {
         let lookup = |_: &str| None;
@@ -11145,10 +9531,6 @@ mod tests {
         }
     }
 
-    // -- Ticket 23: lifecycle hardening (TDD at the FakeEngineBackend seam) --
-
-    /// Scenario: start with no binaries → typed Missing* error, no crash, no
-    /// file left behind.
     #[test]
     fn t23_missing_binaries_fail_typed_without_side_effects() {
         let (mut controller, stock, fork, xray, extra) = EngineController::fake_quartet();
@@ -11173,7 +9555,6 @@ mod tests {
         assert_eq!(controller.running_count(), 0, "active restored");
         assert_eq!(controller.status(), &EngineStatus::Stopped);
 
-        // The check path writes no secret file when the binary is missing…
         let mut real = RealEngineBackend::xray();
         let path = real.config_path.clone();
         assert!(
@@ -11181,7 +9562,7 @@ mod tests {
             "no xray binary in test env"
         );
         assert!(!path.exists(), "no file left: {}", path.display());
-        // …and write-then-remove leaves nothing behind either.
+
         let real = RealEngineBackend::new();
         let path = real.config_path.clone();
         real.write_config("{\"password\": \"hunter2\"}")
@@ -11191,9 +9572,6 @@ mod tests {
         assert!(!path.exists(), "removed: {}", path.display());
     }
 
-    /// Scenario: one sidecar dies externally → the poll names its shard, its
-    /// file is cleaned, siblings keep running. Every crashed shard is
-    /// reported per poll (no N-1 loss).
     #[test]
     fn t23_crash_names_shard_keeps_siblings() {
         let (mut controller, stock, _fork, xray, _extra) = EngineController::fake_quartet();
@@ -11222,10 +9600,9 @@ mod tests {
         assert!(controller.poll().is_none(), "cause reported once");
         assert!(matches!(controller.status(), EngineStatus::Crashed { .. }));
 
-        // Two simultaneous crashes are both reported, shard-named.
         stock.inject_crash("signal: segmentation fault");
         xray.inject_crash("signal: killed");
-        // (xray is down already: re-arm it by restarting, then crash both)
+
         controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
         let _ = controller.start_all_confirmed(&rows);
         stock.inject_crash("signal: segmentation fault");
@@ -11238,8 +9615,6 @@ mod tests {
         assert!(controller.poll().is_none(), "causes reported once");
     }
 
-    /// Scenario: custom full-config with nested tun/dns → rejected naming the
-    /// key and its path (never values).
     #[test]
     fn t23_nested_system_mutation_rejected_with_path() {
         for (key, doc) in [
@@ -11276,9 +9651,6 @@ mod tests {
         }
     }
 
-    /// SEC-MED: controller-level LAN enforcement, independent of any UI gate.
-    /// (`0.0.0.0` stands in for a LAN bind: non-loopback, and bindable on
-    /// any host so the port probe passes.)
     #[test]
     fn t23_lan_enforcement_without_ui_gate() {
         let lan = fixture(
@@ -11309,14 +9681,13 @@ mod tests {
         assert!(stock.is_running());
         assert_eq!(controller.running_count(), 1);
 
-        // The confirm sticks to (id, bind): an edited bind re-requires it.
         let mut moved = lan.clone();
         moved.bind_ip = "10.0.0.5".to_string();
         let error = controller
             .start_one(&moved)
             .expect_err("moved bind re-requires confirm");
         assert!(matches!(error, EngineError::LanConfirmRequired { .. }));
-        // Loopback rows never trip the gate.
+
         let loopback = fixture(
             "1",
             "Alpha",
@@ -11328,8 +9699,6 @@ mod tests {
         controller.start_one(&loopback).expect("loopback starts");
     }
 
-    /// HIGH: a failed spawn rolls the touched shards back to their previously
-    /// served configs and restores the membership (no split brain, no lie).
     #[test]
     fn t23_spawn_failure_rolls_back_serving_set() {
         let (mut controller, stock, _fork) = EngineController::fake_pair();
@@ -11346,8 +9715,6 @@ mod tests {
         let served_before = stock.last_config().expect("served config");
         assert!(served_before.contains("pass1"));
 
-        // The next spawn fails once (then the driver is healthy again, so the
-        // rollback restore succeeds).
         stock.fail_start("stock: address in use");
         let beta = fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10802);
         let error = controller.start_one(&beta).expect_err("spawn fails");
@@ -11367,8 +9734,6 @@ mod tests {
         stock.clear_failures();
     }
 
-    /// MED: probe-bind catches a foreign holder before anything stops, and
-    /// loopback aliases conflict (localhost ≡ 127.0.0.1).
     #[test]
     fn t23_port_probe_and_alias_conflict() {
         let held = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
@@ -11415,7 +9780,6 @@ mod tests {
         );
     }
 
-    /// LOW: duplicated ids name the id instead of serving garbage.
     #[test]
     fn t23_duplicate_id_names_id() {
         let rows = vec![
@@ -11441,7 +9805,6 @@ mod tests {
         assert!(text.contains("\"1\""), "names the id: {text}");
     }
 
-    /// LOW: the emptied extra slot forgets its executable.
     #[test]
     fn t23_extra_exe_cleared_when_slot_empties() {
         let mut real = RealEngineBackend::extra_slot();
@@ -11451,7 +9814,6 @@ mod tests {
         assert!(real.extra_exe.is_none(), "slot forgotten");
     }
 
-    /// Unique temp paths per backend instance (pid-suffixed, never shared).
     #[test]
     fn t23_config_paths_unique_per_instance() {
         let backends = [
@@ -11473,7 +9835,6 @@ mod tests {
         }
     }
 
-    /// Restricted writes + Drop teardown leave no secret file behind.
     #[test]
     fn t23_drop_removes_secret_file() {
         let path = {
@@ -11496,8 +9857,6 @@ mod tests {
         };
         assert!(!path.exists(), "drop cleaned: {}", path.display());
     }
-
-    // -- Ticket 27: SSH + AnyTLS + Noise end-to-end -------------------------
 
     fn ssh_fixture(id: &str, name: &str, port: u16) -> ProxyConfig {
         fixture(
@@ -11535,8 +9894,6 @@ mod tests {
         )
     }
 
-    /// SSH rows generate native stock `ssh` outbounds on their own endpoint
-    /// (no fork, no UnsupportedProtocol, no secrets in errors).
     #[test]
     fn ticket27_ssh_generates_native_stock_outbound() {
         assert!(is_ssh_protocol("SSH"));
@@ -11574,8 +9931,6 @@ mod tests {
         );
     }
 
-    /// AnyTLS rows generate native stock `anytls` outbounds (the old
-    /// UnsupportedProtocol is gone).
     #[test]
     fn ticket27_anytls_generates_native_stock_outbound() {
         let generated =
@@ -11600,9 +9955,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T08 (CAP-12): trivial `direct` rows serve as a
-    /// bare direct final under their own tag (no endpoint, no fork, no
-    /// bridge) and pass activation validation with field-less params.
     #[test]
     fn t08_direct_serves_bare_final() {
         assert!(is_direct_protocol("Direct"));
@@ -11641,8 +9993,6 @@ mod tests {
         validate_activation(std::slice::from_ref(&row)).expect("direct activates");
     }
 
-    /// Standalone Noise rows ride the fork sidecar with explicit AWG-vs-Noise
-    /// mismatch guards in both directions (plus Xray-noise on stock).
     #[test]
     fn ticket27_noise_routes_fork_with_mismatch_guards() {
         assert!(is_noise_protocol("noise"));
@@ -11659,7 +10009,6 @@ mod tests {
             .expect("noise outbound present");
         assert_eq!(node["type"], json!("noise"));
 
-        // AWG obfuscation on a Noise row: explicit AWG-vs-Noise rejection.
         let mut awg_on_noise = noise_fixture("4", "Confused", 10804);
         awg_on_noise.params = json!({"type": "noise", "server": "192.0.2.44",
             "server_port": 51820, "password": "k", "jc": "4"})
@@ -11673,7 +10022,6 @@ mod tests {
         assert!(text.contains("\"jc\""), "names field: {text}");
         assert!(text.contains("Noise"), "names confusion: {text}");
 
-        // Xray noise semantics on a stock row: explicit wrong-layer rejection.
         let mut xray_on_stock = fixture(
             "5",
             "StockNoise",
@@ -11690,7 +10038,6 @@ mod tests {
             "typed, got {error}"
         );
 
-        // Fork gate: a missing fork binary fails only the Noise row.
         let (mut controller, stock, _, _, _) = EngineController::fake_quartet();
         controller
             .start_all(&[fixture(
@@ -11713,8 +10060,6 @@ mod tests {
         let _ = &mut xray_on_stock;
     }
 
-    /// Three extra-core rows start together with per-slot isolation (N named
-    /// slots, each its own endpoint and sidecar config).
     #[test]
     fn ticket27_three_extra_slots_serve_each_endpoint() {
         let rows = vec![
@@ -11743,8 +10088,6 @@ mod tests {
             );
         }
     }
-
-    // -- Ticket 29: VLESS `encryption` routing + ANSI-clean engine errors --
 
     fn t29_vless_row(
         id: &str,
@@ -11781,10 +10124,6 @@ mod tests {
             .clone()
     }
 
-    /// Scenario 1: `encryption: "none"` stays stock with the key dropped.
-    /// Stock sing-box 1.14.2 strict-decodes and rejects ANY `encryption` key
-    /// on vless outbounds (`unknown field "encryption"`, live-proven), so the
-    /// key must never reach the stock config.
     #[test]
     fn t29_vless_encryption_none_drops_key_stays_stock() {
         let row = t29_vless_row("t29a", "VlessNone", json!("none"), 19921);
@@ -11807,7 +10146,6 @@ mod tests {
         );
     }
 
-    /// Rows without `encryption` are untouched (prohibited side effect).
     #[test]
     fn t29_vless_without_encryption_unchanged() {
         let row = fixture(
@@ -11830,7 +10168,6 @@ mod tests {
         );
     }
 
-    /// Blank and case-folded `"none"` also stay stock with no key emitted.
     #[test]
     fn t29_vless_encryption_blank_and_case_fold_stay_stock() {
         for (id, value) in [
@@ -11850,9 +10187,6 @@ mod tests {
         }
     }
 
-    /// Scenario 2: a real `encryption` value routes through the xray sidecar
-    /// bridge (bridge pointer in the main config, verbatim `encryption` in
-    /// the xray `users[]` entry). Synthetic value only — never key material.
     #[test]
     fn t29_vless_real_encryption_routes_xray_bridge() {
         let row = t29_vless_row("t29x", "VlessEnc", json!("synthetic-t29-encryption"), 19924);
@@ -11890,9 +10224,6 @@ mod tests {
         );
     }
 
-    /// Scenario 2 detail: `flow` plus camelCase `packetEncoding` ride the
-    /// xray leg per the xray schema (`streamSettings.packetEncoding`,
-    /// accepted by xray 26.3.27 `run -test`).
     #[test]
     fn t29_vless_real_encryption_carries_flow_and_packet_encoding() {
         let row = fixture(
@@ -11930,8 +10261,6 @@ mod tests {
         );
     }
 
-    /// A non-string `encryption` fails typed, naming the field and the xray
-    /// sidecar — never a stock `unknown field` at check time, never values.
     #[test]
     fn t29_vless_encryption_nonstring_is_typed_error() {
         let row = t29_vless_row("t29z", "VlessBad", json!(42), 19926);
@@ -11945,8 +10274,6 @@ mod tests {
         assert!(text.contains("xray"), "names the sidecar: {text}");
     }
 
-    /// Scenario 2 end to end: the row is served via the xray sidecar on its
-    /// own endpoint; the value never lands in the stock config.
     #[test]
     fn t29_vless_real_encryption_served_by_xray_sidecar() {
         let row = t29_vless_row(
@@ -11975,14 +10302,10 @@ mod tests {
         );
     }
 
-    /// Ticket 29: build an ANSI-colored `check` stderr line without invisible
-    /// bytes in source (`char::from(27u8)` keeps the ESC byte visible).
     fn t29_ansi(detail: &str) -> String {
         detail.replace("[ESC]", &char::from(27u8).to_string())
     }
 
-    /// Ticket 29: the ANSI stripper drops CSI sequences and keeps text
-    /// (SGR colors, bold, multi-param, non-CSI escapes, trailing bare ESC).
     #[test]
     fn t29_strip_ansi_codes_drops_csi_keeps_text() {
         assert_eq!(strip_ansi_codes("plain"), "plain");
@@ -12006,8 +10329,6 @@ mod tests {
         );
     }
 
-    /// Scenario 3: engine `check` stderr arrives with ANSI color escapes; the
-    /// surfaced error keeps the text and drops the codes.
     #[test]
     fn t29_check_failed_strips_ansi_escape_codes() {
         let error = EngineError::CheckFailed {
@@ -12023,9 +10344,6 @@ mod tests {
         assert!(!text.contains("[31m"), "no SGR residue: {text}");
     }
 
-    /// Ticket A7: `check` stderr is untrusted — secrets echoing in it are
-    /// redacted in the surfaced error (strip-then-redact order; the UUID
-    /// never reaches the toast even wrapped in ANSI color).
     #[test]
     fn a7_check_failed_redacts_stderr_secrets() {
         let error = EngineError::CheckFailed {
@@ -12043,8 +10361,6 @@ mod tests {
         );
     }
 
-    /// Scenario 3 end to end: an ANSI-colored `check` failure from any
-    /// backend surfaces without escape codes (toast-safe).
     #[test]
     fn t29_controller_check_failure_has_no_ansi() {
         let row = fixture(
@@ -12068,8 +10384,6 @@ mod tests {
         let last = controller.last_error().expect("recorded");
         assert!(!last.contains(char::from(27u8)), "stored clean: {last:?}");
     }
-
-    // -- Ticket 37: routing presets --------------------------------------
 
     fn t37_preset_map() -> HashMap<String, Vec<serde_json::Value>> {
         let mut map = HashMap::new();
@@ -12097,8 +10411,6 @@ mod tests {
         row
     }
 
-    /// Ticket 37: no presets attached means byte-identical output to the
-    /// pre-preset generator (unattached rows never change behavior).
     #[test]
     fn ticket37_generate_without_presets_is_byte_identical() {
         let rows = three_standard();
@@ -12108,11 +10420,6 @@ mod tests {
         assert_eq!(plain.json, with_empty.json, "empty map changes nothing");
     }
 
-    /// Ticket 37: an attached preset merges its rules ahead of the row's
-    /// isolation rule — route actions point at the row outbound, direct
-    /// passes through, the Throne `block` spelling is served as `reject`
-    /// (what stock 1.14.2 accepts), and every preset rule is scoped to the
-    /// row inbound.
     #[test]
     fn ticket37_preset_rules_merge_before_isolation_rule() {
         let row = t37_row_with_preset();
@@ -12135,13 +10442,11 @@ mod tests {
         assert_eq!(rules[0]["domain"], json!(["example.com"]));
         assert_eq!(rules[1]["action"], json!("direct"));
         assert_eq!(rules[2]["action"], json!("reject"), "block normalizes");
-        // The isolation rule still closes the table.
+
         assert_eq!(rules[3]["inbound"], json!([in_tag]));
         assert_eq!(rules[3]["outbound"], json!(out_tag));
     }
 
-    /// Ticket 37: a second row without a preset keeps exactly its isolation
-    /// rule while the attached row carries its presets (no cross-row leak).
     #[test]
     fn ticket37_unattached_rows_keep_isolation_only() {
         let attached = t37_row_with_preset();
@@ -12167,8 +10472,6 @@ mod tests {
         assert_eq!(beta_rules[0]["action"], json!("route"));
     }
 
-    /// Ticket 37: a dangling preset reference fails loudly naming the row
-    /// (never a silent no-preset serve).
     #[test]
     fn ticket37_dangling_preset_reference_fails_loud() {
         let row = t37_row_with_preset();
@@ -12180,8 +10483,6 @@ mod tests {
         assert!(matches!(error, EngineError::BadPreset { .. }));
     }
 
-    /// Ticket 37: corrupt stored preset rules fail naming the rule index and
-    /// the field (never values).
     #[test]
     fn ticket37_bad_stored_rule_names_index_and_field() {
         let row = t37_row_with_preset();
@@ -12198,8 +10499,6 @@ mod tests {
         assert!(!text.contains("nope"), "never echoes content, got {text}");
     }
 
-    /// Ticket 37: the controller serves preset rules ahead of the isolation
-    /// rule on start (fake backend records the served config).
     #[test]
     fn ticket37_controller_start_serves_preset_rules_first() {
         let (mut controller, stock, _, _, _) = EngineController::fake_quartet();
@@ -12220,8 +10519,6 @@ mod tests {
         assert_eq!(rules[3]["outbound"], json!(outbound_tag("1")));
     }
 
-    /// Ticket 37: controller without preset rules keeps serving the
-    /// isolation-only shape (unattached start path unchanged).
     #[test]
     fn ticket37_controller_start_without_presets_unchanged() {
         let (mut controller, stock, _, _, _) = EngineController::fake_quartet();
@@ -12241,12 +10538,6 @@ mod tests {
         assert_eq!(rules.len(), 1, "isolation only, got {rules:?}");
     }
 
-    /// Ticket 37 (live): an attached preset passes the real stock sing-box
-    /// 1.14.2 `check` (EXIT 0) with the preset rules present before the
-    /// isolation rule. Hermetic by default — runs only with
-    /// `MANYPROXY_LIVE_CHECK=1` (TEMP files only, removed afterwards). The
-    /// binary resolves via `MANYPROXY_SINGBOX_BIN` (else the debug build
-    /// beside the crate).
     #[test]
     fn ticket37_live_singbox_check_accepts_preset_rules() {
         if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
@@ -12291,9 +10582,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 41: engine reliability core (TDD at the FakeEngineBackend seam) --
-
-    /// Reserved ranges fail typed at save and at start, naming the range.
     #[test]
     fn t41_reserved_ports_rejected_at_save_and_start() {
         for port in [CLASH_PORT_START, 18755, CLASH_PORT_END] {
@@ -12319,11 +10607,11 @@ mod tests {
                 "names the range: {error}"
             );
         }
-        // Ordinary + auto ports flow through the save gate.
+
         for port in [0, 10801, 10999, 18081, 10921] {
             validate_listen_for_save("Row", "127.0.0.1", port).expect("save allows it");
         }
-        // The start gate rejects reserved ranges before any spawn.
+
         let (mut controller, stock) = EngineController::fake();
         let bad = fixture(
             "9",
@@ -12341,8 +10629,6 @@ mod tests {
         assert_eq!(controller.running_count(), 0);
     }
 
-    /// Garbage binds, port 0, and privileged ports fail typed at start with
-    /// nothing spawned.
     #[test]
     fn t41_bad_bind_port_zero_privileged_fail_before_spawn() {
         let (mut controller, stock) = EngineController::fake();
@@ -12382,13 +10668,11 @@ mod tests {
         assert!(matches!(error, EngineError::BadPort { .. }), "got {error}");
         assert!(error.to_string().contains("10801-10999"), "guides: {error}");
         assert!(!stock.is_running(), "nothing spawned");
-        // Blank binds still mean the loopback default.
+
         validate_listen_for_start("Row", "", 10801).expect("blank bind is loopback");
         validate_listen_for_start("Row", "localhost", 10801).expect("localhost ok");
     }
 
-    /// Ours-only reaper: kills exactly the matching binary holding our port;
-    /// sweeps our stale temp files and nothing else.
     #[test]
     fn t41_startup_reaper_kills_only_matching() {
         assert!(should_reap_process("sing-box.exe", 10801, &[10801]));
@@ -12399,7 +10683,7 @@ mod tests {
             10801,
             &[10801]
         ));
-        // Prohibited side effects: foreign image, foreign port, both.
+
         assert!(!should_reap_process("chrome.exe", 10801, &[10801]));
         assert!(!should_reap_process("sing-box.exe", 9999, &[10801]));
         assert!(!should_reap_process("my-sing-box.exe", 10801, &[10801]));
@@ -12449,7 +10733,6 @@ Active Connections\r
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// netstat/tasklist parsers skip headers, UDP rows, and garbage lines.
     #[test]
     fn t41_netstat_tasklist_parsers() {
         let owners = parse_netstat_tcp_owners(
@@ -12473,8 +10756,6 @@ Active Connections\r
         assert!(parse_tasklist_table("").is_empty());
     }
 
-    /// Stale-temp sweep lists only ours (prefix + `.json`, sorted, files
-    /// only) and removes exactly those; missing dirs sweep to empty.
     #[test]
     fn t41_stale_temp_sweep_only_ours_sorted() {
         let missing = std::env::temp_dir().join(format!(
@@ -12529,8 +10810,6 @@ Active Connections\r
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// One crashed shard drops served/clash, marks totals stale, and skips
-    /// ticks (live targets exclude it); manual Restart recovers everything.
     #[test]
     fn t41_crash_drops_served_clash_marks_stale_and_restart_recovers() {
         let (mut controller, _stock, fork) = EngineController::fake_pair();
@@ -12576,7 +10855,6 @@ Active Connections\r
         assert!(matches!(controller.status(), EngineStatus::Running));
     }
 
-    /// Idle Restart touches nothing (no flap of healthy cores).
     #[test]
     fn t41_restart_idle_is_noop() {
         let (mut controller, stock) = EngineController::fake();
@@ -12586,7 +10864,6 @@ Active Connections\r
         assert_eq!(stock.check_calls(), checks, "no re-apply when idle");
     }
 
-    /// Auto-restart is opt-in (default off), bounded, and backoff-fenced.
     #[test]
     fn t41_auto_restart_opt_in_backoff_bounds() {
         use std::time::{Duration, Instant};
@@ -12600,7 +10877,7 @@ Active Connections\r
         stock.inject_crash("boom");
         assert!(!controller.poll_shards().is_empty());
         let now = Instant::now();
-        // Default policy: disabled — never due, no silent restart.
+
         assert!(!controller.auto_restart_due(now));
         assert!(!controller.auto_restart().enabled);
 
@@ -12626,7 +10903,6 @@ Active Connections\r
         assert_eq!(controller.restart_attempts(), 0, "disable resets");
     }
 
-    /// `experimental` merges: existing keys survive the clash inject.
     #[test]
     fn t41_experimental_merge_preserves_keys() {
         let doc = serde_json::json!({
@@ -12644,7 +10920,7 @@ Active Connections\r
             parsed["experimental"]["clash_api"]["external_controller"],
             serde_json::json!("127.0.0.1:18501")
         );
-        // No pre-existing block: created, not crashed on.
+
         let bare = serde_json::json!({"inbounds": [], "outbounds": []});
         let out = inject_clash_api(&bare.to_string(), 18501, "s3cret").expect("injects");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("JSON");
@@ -12654,7 +10930,6 @@ Active Connections\r
         );
     }
 
-    /// Clash secrets are 128-bit hex, unique per start.
     #[test]
     fn t41_clash_secret_is_128bit_unique() {
         for core in ["stock", "fork"] {
@@ -12668,8 +10943,6 @@ Active Connections\r
         assert_ne!(clash_secret("stock"), clash_secret("stock"), "unique");
     }
 
-    /// Bind-and-hold reservation: two reservations differ, the held port
-    /// reads busy, release frees it.
     #[test]
     fn t41_clash_reservation_holds_ports() {
         let mut holds = Vec::new();
@@ -12688,7 +10961,6 @@ Active Connections\r
         );
     }
 
-    /// Stop failures surface (membership + error) instead of false success.
     #[test]
     fn t41_stop_failure_surfaced_not_silent() {
         let (mut controller, stock) = EngineController::fake();
@@ -12732,7 +11004,6 @@ Active Connections\r
         );
     }
 
-    /// Start-all computes the maximal healthy subset and applies once.
     #[test]
     fn t41_start_all_subset_single_apply() {
         let (mut controller, stock) = EngineController::fake();
@@ -12752,7 +11023,7 @@ Active Connections\r
         assert_eq!(outcome.failed[0].0, "Broken");
         assert_eq!(stock.check_calls(), 1, "single apply, no per-row flap");
         assert_eq!(controller.running_count(), 3);
-        // Union-level abort (two rows, one endpoint): nothing applied.
+
         let mut controller = EngineController::fake().0;
         let dupe = vec![
             fixture(
@@ -12775,8 +11046,6 @@ Active Connections\r
         assert_eq!(controller.running_count(), 0);
     }
 
-    /// Bad egress hostnames fail typed before spawn; numeric IPs never
-    /// trigger a lookup.
     #[test]
     fn t41_dns_failure_typed_before_spawn() {
         let hostile = fixture(
@@ -12810,12 +11079,11 @@ Active Connections\r
             "names server: {text}"
         );
         assert!(text.contains("DNS failure"), "kind named: {text}");
-        // Numeric IPs never reach the resolver.
+
         calls.borrow_mut().clear();
         validate_egress_resolution_with(&three_standard(), &resolver).expect("IPs pass");
         assert!(calls.borrow().is_empty(), "no lookup for IPs");
-        // And the apply path refuses before any spawn (real DNS agrees the
-        // invalid TLD never resolves, offline or on).
+
         let (mut controller, stock) = EngineController::fake();
         let error = controller
             .start_one(&hostile)
@@ -12827,10 +11095,6 @@ Active Connections\r
         assert!(!stock.is_running());
     }
 
-    /// Interface addresses in CIDR form (`address: 100.64.9.141/32`) are
-    /// local tunnel assignments, never egress hostnames — the DNS gate
-    /// skips them without consulting the resolver (regression: AmneziaWG
-    /// rows were refused at start).
     #[test]
     fn t41_dns_gate_skips_cidr_interface_address() {
         let wg = fixture(
@@ -12851,15 +11115,13 @@ Active Connections\r
         validate_egress_resolution_with(std::slice::from_ref(&wg), &resolver)
             .expect("CIDR address + literal server pass with no lookup");
         assert!(calls.borrow().is_empty(), "no lookup at all");
-        // Belt-and-braces: a bare CIDR reaching the host check directly is
-        // still an IP literal, never a DNS name.
+
         assert!(
             resolve_egress_host("10.0.0.2/32", &resolver).is_ok(),
             "CIDR literal passes"
         );
     }
 
-    /// Row-local vs union-level split covers the new variants.
     #[test]
     fn t41_row_local_split_covers_new_variants() {
         for error in [
@@ -12907,8 +11169,6 @@ Active Connections\r
         }
     }
 
-    /// Misspelled params warn with the likely key; exact and foreign-schema
-    /// keys stay quiet; the plan carries the warnings.
     #[test]
     fn t41_typo_hints_name_likely_key() {
         assert_eq!(suggest_param_key("securty"), Some("security"));
@@ -12924,23 +11184,18 @@ Active Connections\r
         assert_eq!(hints.len(), 1, "{hints:?}");
         assert!(hints[0].contains("securty"), "{hints:?}");
         assert!(hints[0].contains("security"), "{hints:?}");
-        // Custom rows carry foreign schemas — never hinted.
+
         let custom = json!({"type": "vless", "securty": "tls"})
             .as_object()
             .expect("object")
             .clone();
         assert!(typo_hints_for("C", "custom-outbound", &custom).is_empty());
-        // The plan surfaces them as warnings, not errors.
+
         let row = fixture("1", "Typo", "vless", params, "127.0.0.1", 10801);
         let plan = validate_activation(std::slice::from_ref(&row)).expect("warns, not fails");
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
     }
 
-    /// Config-completeness T02 (S3): panel-produced mux flats emit the
-    /// stock sing-box 1.14.2 `multiplex` object on ss/trojan/vless/vmess.
-    /// Per-key shape: `mux:"on"` → `{"enabled": true}`; brutal keys are
-    /// consumed (never leak into the emission) while staying preserved in
-    /// stored JSON (generation works on a clone).
     #[test]
     fn t02_mux_emission_shape_on_four_protocols() {
         fn muxed(protocol: &str, params: serde_json::Value) -> ProxyConfig {
@@ -12994,8 +11249,6 @@ Active Connections\r
         }
     }
 
-    /// Config-completeness T02 (S3): default omits `multiplex`, explicit
-    /// off disables it, garbage fails typed naming the field.
     #[test]
     fn t02_mux_default_omits_off_disables_garbage_fails() {
         let plain = fixture("9", "Plain", "vless", vless_params(), "127.0.0.1", 10809);
@@ -13037,9 +11290,6 @@ Active Connections\r
         assert!(text.contains("mux"), "names the field, got {text}");
     }
 
-    /// Config-completeness T02 (S3): mux flats on non-mux protocols drop
-    /// so provider junk can never fail `check` (established
-    /// `drop_foreign_flats` semantics, extended to the new keys).
     #[test]
     fn t02_mux_flats_dropped_on_non_mux_protocol() {
         let mut params = json!({"type": "socks", "server": "198.51.100.9", "server_port": 1080});
@@ -13063,12 +11313,6 @@ Active Connections\r
         );
     }
 
-    /// Config-completeness review: flat-built Xray rows fail typed on keys
-    /// the bridge never copies (Ph2 XHTTP/xmux matrix) instead of looking
-    /// configured while the sidecar ignores them. Stored JSON still
-    /// preserves them (fold-level preserve); real link spellings
-    /// (`fingerprint`, `serviceName`) keep emitting; full-config
-    /// (`xray_shaped`) rows stay sidecar-judged.
     #[test]
     fn review_xray_flat_unknown_keys_reject_loud() {
         let mut ph2 = xray_params();
@@ -13083,7 +11327,7 @@ Active Connections\r
             text.contains("xPaddingBytes"),
             "names the field, got {text}"
         );
-        // Real link spellings emit through the flat branch.
+
         let mut aliases = xray_params();
         let obj = aliases.as_object_mut().expect("object");
         obj.remove("fp");
@@ -13118,12 +11362,6 @@ Active Connections\r
         );
     }
 
-    /// Config-completeness review: a custom `headers` map has no transport
-    /// mapping on vless/trojan/vmess (only `host` survives as the Host
-    /// header) — generate fails typed naming the field instead of dropping
-    /// it silently. Blank and empty shapes stay no-ops so untouched rows
-    /// keep working; the `http`-protocol arm never reaches this path (own
-    /// allowlist keeps path/headers).
     #[test]
     fn review_transport_headers_reject_loud() {
         let mut params = vless_params();
@@ -13153,9 +11391,6 @@ Active Connections\r
         generate(std::slice::from_ref(&empty_row)).expect("empty headers stay a no-op");
     }
 
-    /// Config-completeness T03: panel-produced vmess/trojan/shadowsocks rows
-    /// generate — per-key emission shapes the new pages rely on (cipher
-    /// grammars, `aid`/`uot` intake folds, legacy insecure, ss extras ride).
     #[test]
     fn t03_panel_rows_generate_shapes() {
         fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
@@ -13169,9 +11404,7 @@ Active Connections\r
                 .unwrap_or_else(|| panic!("{ty} egress present"))
                 .clone()
         }
-        // VMess new-style (the page writes `encryption` + string `alter_id`
-        // + `packet_encoding` + mux): cipher lands in `security`, aid
-        // coerces, packet_encoding rides, mux emits.
+
         let modern = fixture(
             "31",
             "VmessModern",
@@ -13188,8 +11421,7 @@ Active Connections\r
         assert_eq!(node["alter_id"], json!(3), "string aid coerces");
         assert_eq!(node["packet_encoding"], json!("xudp"), "rides to check");
         assert_eq!(node["multiplex"], json!({"enabled": true}));
-        // VMess legacy link shape (boolean `tls`, cipher in `security`):
-        // the tls object builds, the cipher stays, insecure honored (T03).
+
         let legacy = fixture(
             "32",
             "VmessLegacy",
@@ -13206,7 +11438,7 @@ Active Connections\r
         assert_eq!(node["tls"]["server_name"], json!("198.51.100.9"));
         assert_eq!(node["tls"]["insecure"], json!(true), "legacy insecure maps");
         assert!(node.get("encryption").is_none(), "no new-style key");
-        // Hand-written `aid` spelling folds to `alter_id` (t32 precedent).
+
         let aided = fixture(
             "33",
             "VmessAid",
@@ -13219,8 +11451,7 @@ Active Connections\r
         let node = node_of(&aided, "vmess");
         assert_eq!(node["alter_id"], json!(2), "`aid` folds");
         assert!(node.get("aid").is_none(), "alias never leaks");
-        // Trojan page shape (password + S1/S2/S3 keys) generates with tls,
-        // transport and mux emitted.
+
         let trojan = fixture(
             "34",
             "TrojanPage",
@@ -13236,9 +11467,7 @@ Active Connections\r
         assert_eq!(node["tls"]["server_name"], json!("198.51.100.9"));
         assert_eq!(node["transport"]["type"], json!("ws"));
         assert_eq!(node["multiplex"], json!({"enabled": true}));
-        // Shadowsocks page shape (method + password + uot spelling +
-        // plugin_opts + mux): cipher/secret land, `uot` folds to the
-        // sing-box bool, extras ride, mux emits.
+
         let mut ss = ss_params("pass1");
         ss.as_object_mut()
             .expect("object")
@@ -13264,12 +11493,6 @@ Active Connections\r
         assert_eq!(node["multiplex"], json!({"enabled": true}));
     }
 
-    /// Config-completeness T05: hysteria v1 + tuic page rows generate clean —
-    /// v1 maps `auth` to `auth_str` (a v2-layout `password` falls back when no
-    /// v1 auth is present; the alias never leaks), speeds ride as the native
-    /// `up`/`down` flats, v1 without speeds fails naming the field, and the
-    /// tuic seven tune the 1.14.2 shape (the `zero_rtt` alias folds to
-    /// `zero_rtt_handshake`).
     #[test]
     fn t05_hysteria_v1_and_tuic_page_shapes() {
         fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
@@ -13283,7 +11506,7 @@ Active Connections\r
                 .unwrap_or_else(|| panic!("{ty} egress present"))
                 .clone()
         }
-        // Hysteria v1 page shape (auth + string speeds + v1 tunables).
+
         let v1 = fixture(
             "51",
             "HyOne",
@@ -13304,8 +11527,7 @@ Active Connections\r
         assert_eq!(node["down"], json!("50 Mbps"));
         assert_eq!(node["server_ports"], json!("9000-9010"), "v1 tunables ride");
         assert_eq!(node["disable_mtu_discovery"], json!(true));
-        // A v2-layout `password` on a v1 row still starts (falls back to
-        // `auth_str` when no v1 `auth` is present) and never leaks.
+
         let toggled = fixture(
             "52",
             "HyToggled",
@@ -13318,7 +11540,7 @@ Active Connections\r
         let node = node_of(&toggled, "hysteria");
         assert_eq!(node["auth_str"], json!("v2secret"), "password falls back");
         assert!(node.get("password").is_none(), "alias never leaks");
-        // Canonical `auth` wins when both spellings disagree.
+
         let both = fixture(
             "53",
             "HyBoth",
@@ -13332,8 +11554,7 @@ Active Connections\r
         let node = node_of(&both, "hysteria");
         assert_eq!(node["auth_str"], json!("v1secret"), "canonical wins");
         assert!(node.get("password").is_none(), "alias never leaks");
-        // v1 without speeds fails at generate naming the field (the store
-        // gate refuses earlier at commit; this is the backstop).
+
         let nospeed = fixture(
             "54",
             "HyNoSpeed",
@@ -13348,7 +11569,7 @@ Active Connections\r
             error.to_string().contains("up") || error.to_string().contains("down"),
             "names the missing speed, got {error}"
         );
-        // TUIC page shape (all seven tuning fields + forced TLS).
+
         let tuic = fixture(
             "55",
             "TuicPage",
@@ -13375,10 +11596,6 @@ Active Connections\r
         assert_eq!(node["tls"]["server_name"], json!("192.0.2.12"));
     }
 
-    /// Config-completeness T06: naive/anytls/ssh page rows generate clean —
-    /// the naive tunables ride the strict gate (Throne spellings fold,
-    /// canonical wins, aliases never leak), anytls short names fold to the
-    /// session fields, and the ssh passphrase alias folds.
     #[test]
     fn t06_naive_anytls_ssh_page_shapes() {
         fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
@@ -13392,7 +11609,7 @@ Active Connections\r
                 .unwrap_or_else(|| panic!("{ty} egress present"))
                 .clone()
         }
-        // Naïve page shape (sing-box spellings): uot/quic bools + cc ride.
+
         let naive = fixture(
             "61",
             "NaivePage",
@@ -13409,7 +11626,7 @@ Active Connections\r
         assert_eq!(node["quic"], json!(true));
         assert_eq!(node["quic_congestion_control"], json!("bbr2"));
         assert_eq!(node["tls"]["server_name"], json!("192.0.2.22"));
-        // Throne spellings fold (canonical wins, aliases never leak).
+
         let throne = fixture(
             "62",
             "NaiveThrone",
@@ -13433,7 +11650,7 @@ Active Connections\r
             node.get("congestion_control").is_none(),
             "alias never leaks"
         );
-        // A bare `congestion_control` (no canonical) folds too.
+
         let bare_cc = fixture(
             "63",
             "NaiveBareCc",
@@ -13450,7 +11667,7 @@ Active Connections\r
             node.get("congestion_control").is_none(),
             "alias never leaks"
         );
-        // AnyTLS page shape (session tunables in sing-box spellings).
+
         let anytls = fixture(
             "64",
             "AnytlsPage",
@@ -13466,7 +11683,7 @@ Active Connections\r
         assert_eq!(node["idle_session_check_interval"], json!("30s"));
         assert_eq!(node["idle_session_timeout"], json!("60s"));
         assert_eq!(node["min_idle_session"], json!(5));
-        // Throne short names fold (canonical wins, aliases never leak).
+
         let short = fixture(
             "65",
             "AnytlsShort",
@@ -13484,7 +11701,7 @@ Active Connections\r
         for leaked in ["interval", "timeout", "min"] {
             assert!(node.get(leaked).is_none(), "alias never leaks: {leaked}");
         }
-        // SSH passphrase alias folds (canonical wins, alias never leaks).
+
         let ssh = fixture(
             "66",
             "SshPass",
@@ -13512,9 +11729,6 @@ Active Connections\r
         assert!(node.get("private_key_pass").is_none(), "alias never leaks");
     }
 
-    /// Config-completeness T06: socks/http page rows generate — version 5
-    /// (string or number) and blank networks ride, udp_over_tcp rides, http
-    /// path/headers ride, https rows serve TLS-on.
     #[test]
     fn t06_socks_http_page_shapes() {
         fn node_of(row: &ProxyConfig, ty: &str) -> serde_json::Value {
@@ -13558,7 +11772,7 @@ Active Connections\r
         assert_eq!(node["path"], json!("/p"));
         assert_eq!(node["headers"], json!("Host: h.example.com"));
         assert_eq!(node["tls"]["server_name"], json!("192.0.2.21"));
-        // An `https` row without TLS markers still serves TLS-on.
+
         let https = fixture(
             "70",
             "HttpsPlain",
@@ -13572,9 +11786,6 @@ Active Connections\r
         assert!(node.get("tls").is_some(), "https serves TLS-on: {node}");
     }
 
-    /// Config-completeness T06: version gates stay typed engine errors —
-    /// socks≠5 and any http `version` presence fail naming the field (never
-    /// a guessed emission, never an opaque `check` failure).
     #[test]
     fn t06_version_gates_keep_typed_errors() {
         let v4 = fixture(
@@ -13603,7 +11814,6 @@ Active Connections\r
         assert!(text.contains("version"), "names the field, got {text}");
     }
 
-    /// Two custom replacements binding one port conflict naming both.
     #[test]
     fn t41_custom_listens_conflict_names_both() {
         fn replacement(name: &str, core: &str, port: u16) -> ProxyConfig {
@@ -13638,7 +11848,7 @@ Active Connections\r
         assert!(text.contains("CustomA"), "names both: {text}");
         assert!(text.contains("CustomB"), "names both: {text}");
         assert!(text.contains("10991"), "names port: {text}");
-        // Distinct ports validate clean.
+
         let rows = vec![
             replacement("CustomA", "stock", 10991),
             replacement("CustomB", "fork", 10992),
@@ -13647,7 +11857,6 @@ Active Connections\r
         assert_eq!(plan.replacement_listens.len(), 2);
     }
 
-    /// Xray-shaped listens (`listen` + `port`) parse for the own-skip set.
     #[test]
     fn t41_xray_served_ports_parsed_for_own_skip() {
         let doc = serde_json::json!({
@@ -13664,7 +11873,6 @@ Active Connections\r
         assert!(served_listen_ports("not json").is_empty(), "fails open");
     }
 
-    /// Crash and stop clear the clash set (secrets never linger past use).
     #[test]
     fn t41_crash_and_stop_clear_clash() {
         let (mut controller, stock) = EngineController::fake();
@@ -13681,11 +11889,6 @@ Active Connections\r
         assert_eq!(controller.status(), &EngineStatus::Stopped);
     }
 
-    // -- Ticket 42: serve-everything -----------------------------------
-    // Every importable type serves natively where a 1.14.2 upstream schema
-    // exists; wild extras map or fail typed; 1.15.0-only fields never emit.
-
-    /// Find one row's outbound node by its serving tag.
     fn t42_outbound(generated: &GeneratedConfig, id: &str) -> serde_json::Value {
         let want = outbound_tag(id);
         generated.value()["outbounds"]
@@ -13697,7 +11900,6 @@ Active Connections\r
             .clone()
     }
 
-    /// Build one enabled row from a share link (import seam → engine seam).
     fn t42_row_from_link(id: &str, link: &str, bind: &str, port: u16) -> ProxyConfig {
         use crate::import::parse_link;
         let imported = parse_link(link).unwrap_or_else(|error| panic!("link parses: {error}"));
@@ -13716,9 +11918,6 @@ Active Connections\r
         }
     }
 
-    /// Ticket 42 (US-20): socks share links serve as native sing-box
-    /// `socks` outbounds (no `version` key: the schema default is 5, which
-    /// is what intake stores).
     #[test]
     fn t42_socks_link_serves_native() {
         let row = t42_row_from_link(
@@ -13739,8 +11938,6 @@ Active Connections\r
         assert!(node.get("version").is_none(), "no 1.15-risk version key");
     }
 
-    /// Ticket 42 (US-20): plain `http` serves without TLS; `https` serves
-    /// the same `http` outbound with TLS on.
     #[test]
     fn t42_http_and_https_serve_native() {
         let plain = t42_row_from_link(
@@ -13768,8 +11965,6 @@ Active Connections\r
         assert_eq!(node["tls"]["enabled"], json!(true));
     }
 
-    /// Ticket 42 (US-24): snell links serve as native `snell` outbounds
-    /// with a numeric version (1.14.0+ schema).
     #[test]
     fn t42_snell_link_serves_native() {
         let row = t42_row_from_link(
@@ -13788,8 +11983,6 @@ Active Connections\r
         assert_eq!(node["psk"], json!("psk-secret"));
     }
 
-    /// Ticket 42 (US-24): shadowtls links serve as native `shadowtls`
-    /// outbounds with mandatory TLS and a numeric version.
     #[test]
     fn t42_shadowtls_link_serves_native() {
         let row = t42_row_from_link(
@@ -13809,8 +12002,6 @@ Active Connections\r
         assert_eq!(node["tls"]["server_name"], json!("example.com"));
     }
 
-    /// Ticket 42: naive links serve as native `naive` outbounds (upstream
-    /// 1.14.2 table member) with TLS always on.
     #[test]
     fn t42_naive_link_serves_native() {
         let row = t42_row_from_link(
@@ -13828,8 +12019,6 @@ Active Connections\r
         assert_eq!(node["tls"]["enabled"], json!(true));
     }
 
-    /// Ticket 42 (US-21): hysteria2 without up/down omits both fields
-    /// (BBR congestion control per docs), never a zero default.
     #[test]
     fn t42_hy2_bbr_by_omission() {
         let row = t42_row_from_link(
@@ -13849,8 +12038,6 @@ Active Connections\r
         assert!(node.get("down_mbps").is_none(), "BBR: down omitted");
     }
 
-    /// Ticket 42 (US-21/US-26): explicit up/down spellings coerce to
-    /// numeric `up_mbps`/`down_mbps` (leading-number parse: "100 Mbps"→100).
     #[test]
     fn t42_hy2_updown_coerced_to_numbers() {
         let row = t42_row_from_link(
@@ -13867,8 +12054,6 @@ Active Connections\r
         assert_eq!(node["down_mbps"], json!(50));
     }
 
-    /// Ticket 42: JSON-number speeds pass through as numbers (never
-    /// silently dropped to BBR); non-numeric speeds fail typed.
     #[test]
     fn t42_hy2_numeric_and_bad_speeds() {
         let row = fixture(
@@ -13902,8 +12087,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42: socks `version` 5 (string or number) omits to the schema
-    /// default; anything else fails typed.
     #[test]
     fn t42_socks_version_shapes() {
         for (id, version) in [("sv1", json!("5")), ("sv2", json!(5))] {
@@ -13938,7 +12121,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42 (US-26): hy2 obfs flats fold into the native `obfs` block.
     #[test]
     fn t42_hy2_obfs_mapped() {
         let row = t42_row_from_link(
@@ -13955,8 +12137,6 @@ Active Connections\r
         assert_eq!(node["obfs"]["password"], json!("obfspw"));
     }
 
-    /// Ticket 42 (US-26): `allowInsecure` spellings map to `tls.insecure`
-    /// (never a top-level passthrough `check` rejects cryptically).
     #[test]
     fn t42_trojan_allowinsecure_maps_tls_insecure() {
         for (id, query) in [
@@ -13987,8 +12167,6 @@ Active Connections\r
         }
     }
 
-    /// Ticket 42 (US-23): quic transport emits `{"type":"quic"}` (V2Ray
-    /// transport shape, no extra fields).
     #[test]
     fn t42_quic_transport_emitted() {
         let row = t42_row_from_link(
@@ -14004,8 +12182,6 @@ Active Connections\r
         assert_eq!(node["transport"], json!({"type": "quic"}));
     }
 
-    /// Ticket 42 (US-23, kcp decision): kcp has no stock sing-box mapping —
-    /// it fails typed naming `network`, never a silently wrong connection.
     #[test]
     fn t42_kcp_decision_is_typed_bad_option() {
         let row = fixture(
@@ -14024,8 +12200,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42 (US-23): ECH flats fold into the native `tls.ech` block
-    /// (empty config → HTTPS-record DNS lookup per docs).
     #[test]
     fn t42_ech_mapped_to_tls() {
         let row = t42_row_from_link(
@@ -14045,8 +12219,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42 (US-26): wild hy2 extras fail typed naming the field
-    /// instead of dying inside `check`.
     #[test]
     fn t42_hy2_unknown_extra_is_typed_bad_option() {
         let row = t42_row_from_link(
@@ -14066,7 +12238,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42 (US-26): wild tuic extras fail typed naming the field.
     #[test]
     fn t42_tuic_unknown_extra_is_typed_bad_option() {
         let row = t42_row_from_link(
@@ -14086,8 +12257,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42 (prohibited side effect): no emitted config ever carries
-    /// 1.15.0-only fields; feeding them fails typed at generate time.
     #[test]
     fn t42_no_115_fields_ever_emitted() {
         let rows = vec![
@@ -14127,7 +12296,7 @@ Active Connections\r
                 assert!(node.get("version").is_none(), "no 1.15 http version");
             }
         }
-        // Feeding 1.15-only fields fails typed, never emits.
+
         let pinned = fixture(
             "p1",
             "Pinned",
@@ -14161,8 +12330,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42 (US-29): a preset rule with the `proxy` alias merges as a
-    /// `route` rule pointing at the row's outbound.
     #[test]
     fn t42_proxy_preset_action_serves_as_route() {
         use std::collections::HashMap;
@@ -14199,8 +12366,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 42 (US-29): a `warp` rule fails with a guidance error naming
-    /// the missing endpoint design (never a bare BadRule).
     #[test]
     fn t42_warp_preset_action_is_guidance_error() {
         use std::collections::HashMap;
@@ -14227,13 +12392,6 @@ Active Connections\r
         );
     }
 
-    // -- Ticket 48: lifecycle / port-race / reap proofs --------------------
-
-    /// Ticket 48 (US-63): an exhausted reservation range yields None
-    /// (the caller names the range instead of racing), and a freed range
-    /// reserves again. Proved on a small private range with real loopback
-    /// listeners — the shared clash range would race parallel controller
-    /// holds (ticket-39 class flake), and production delegates unchanged.
     #[test]
     fn t48_clash_reservation_none_when_exhausted() {
         const START: u16 = 12777;
@@ -14258,9 +12416,6 @@ Active Connections\r
         );
     }
 
-    /// Ticket 48 (US-63): the give-up arm returns instead of hanging when
-    /// a child never exits and ignores kills (pathological only on real
-    /// children — SIGKILL-equivalent reap is near-certain there).
     #[test]
     fn t48_wait_give_up_arm_returns() {
         struct NeverExits {
@@ -14288,13 +12443,6 @@ Active Connections\r
         assert!(stub.kills >= 1, "escalation kill attempted");
     }
 
-    /// Ticket 48 (US-61): sidecar lifecycle against stub executables —
-    /// a real exited child reaps via `poll_exit` (named cause, cleared
-    /// slot), a real sleeping child dies fast via `stop_child` (buffer
-    /// cleared, generation fenced), and `drain_log_lines` takes the
-    /// producer's buffered lines. No sing-box, loopback only.
-    /// Live-gated: spawns real OS processes (`cmd.exe`), so it runs only
-    /// with `MANYPROXY_LIVE_CHECK=1` like every other real-process proof.
     #[cfg(windows)]
     #[test]
     fn t48_stub_executable_lifecycle() {
@@ -14305,7 +12453,6 @@ Active Connections\r
 
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
 
-        // Exited stub: two stderr lines, then exit 3.
         let mut exiter = std::process::Command::new(&comspec)
             .args(["/c", "(echo line-one>&2 & echo line-two>&2 & exit 3)"])
             .stdin(std::process::Stdio::null())
@@ -14315,7 +12462,7 @@ Active Connections\r
             .expect("stub spawns");
         let pipe = exiter.stderr.take().expect("stderr piped");
         let reader = std::io::BufReader::new(pipe);
-        // `echo x>&2` trails a space on cmd — content asserted trimmed.
+
         let lines: Vec<String> = reader
             .lines()
             .map(|line| line.expect("stub stderr reads").trim_end().to_string())
@@ -14338,14 +12485,12 @@ Active Connections\r
         assert!(backend.poll_exit().is_none(), "reap is once");
         assert!(!backend.is_running());
 
-        // Buffered lines drain through the real producer path, then clear.
         let buffer = backend.log_buffer.clone();
         let gen = backend.reader_gen;
         push_pipe_line(&buffer, gen, "sidecar-hello".to_string());
         assert_eq!(backend.drain_log_lines(), vec!["sidecar-hello"]);
         assert!(backend.drain_log_lines().is_empty(), "drain takes");
 
-        // Sleeping stub: `stop_child` kills fast and fences the reader.
         let sleeper = std::process::Command::new(&comspec)
             .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
             .stdin(std::process::Stdio::null())

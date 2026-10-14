@@ -1,28 +1,14 @@
-//! Ticket 02: ProxyConfig library store.
-//!
-//! rusqlite-backed persistence for the config library. Every connection gets
-//! the sqlite-skill PRAGMAs (WAL, busy_timeout, FK, synchronous, temp_store),
-//! all queries are parameterized, and unit tests run on `:memory:` databases.
-//! The store owns all validation so UI dialogs pass raw strings straight
-//! through and render the returned field-level errors.
-
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-/// Default loopback bind for new configs (spec: loopback default, LAN only
-/// behind an explicit warning at activation time).
 pub const DEFAULT_BIND: &str = "127.0.0.1";
-/// Default group for new configs.
+
 pub const DEFAULT_GROUP: &str = "default";
-/// Default protocol when the add form leaves it blank.
+
 pub const DEFAULT_PROTOCOL: &str = "vless";
-/// Ticket 31: canonical stored protocol names (the
-/// [`canonical_protocol`] output form). Typo errors name this list so a
-/// mistyped protocol points at what exists; the import side has its own
-/// lists (JSON types vs link schemes differ, so one shared list would lie on
-/// some path).
+
 pub const VALID_PROTOCOLS: &[&str] = &[
     "vless",
     "vmess",
@@ -47,71 +33,35 @@ pub const VALID_PROTOCOLS: &[&str] = &[
     "custom-config",
     "extra-core",
     "chain",
-    // Config-completeness T08 (CAP-12): trivial `direct` rows (no fields —
-    // verified `edit_direct.ui` label-only) save and serve as a bare direct
-    // final. Appended last so the existing picker order never shifts.
     "direct",
-    // Ticket 07 (throne-adoption): parse-only intake protocols (disabled
-    // rows; serving them is a later ticket — the engine still names the gap
-    // at start time). Appended last, same order rule as `direct`.
     "mieru",
     "juicity",
     "trusttunnel",
 ];
-/// Inclusive auto-port range for configs created without an explicit port.
+
 pub const AUTO_PORT_START: u16 = 10801;
 pub const AUTO_PORT_END: u16 = 10999;
-/// Ticket 27: spillover auto-port range (spec: auto ports from the
-/// 10801/18081 ranges). Primary fills first; spillover serves overflow so
-/// 250 auto-port configs assign cleanly. Exhaustion is honest only past both
-/// ranges. Disjoint from the Xray bridge range (11801-11999) by construction.
+
 pub const AUTO_PORT_SPILL_START: u16 = 18081;
 pub const AUTO_PORT_SPILL_END: u16 = 18380;
 
-/// Ticket 27: total auto-port capacity across both ranges.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const AUTO_PORT_CAPACITY: usize = (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
     + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize;
 
-/// Ticket 27: auto-port candidates in assignment order (primary, then
-/// spillover). Every auto assignment in this file funnels through here so
-/// the two ranges never drift apart.
-/// Ticket A4: the pool is GLOBAL across binds (one port number serves one
-/// local endpoint; two binds never share an auto port). Auto-assign
-/// deliberately ignores `bind_ip` so `127.0.0.1:10801` and
-/// `0.0.0.0:10801` can never collide at activation. At rest two rows MAY
-/// share a bind:port (saves are never blocked — see the schema note); the
-/// conflict error naming both parties stays an activation-time concern.
-/// Restore is stricter (a duplicated bind:port in a backup fails loudly as
-/// corruption — see `restore_library_json`).
 pub fn auto_port_candidates() -> impl Iterator<Item = u16> {
     (AUTO_PORT_START..=AUTO_PORT_END).chain(AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END)
 }
 
-/// Ticket 27: true when a port was auto-assigned from either range
-/// (explicit user ports elsewhere stay legal at rest).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_auto_port(port: u16) -> bool {
     (AUTO_PORT_START..=AUTO_PORT_END).contains(&port)
         || (AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END).contains(&port)
 }
 
-/// Ticket 27: secrets-at-rest note. Row params are DPAPI-sealed at rest
-/// (user scope, `dpapi1:` marker, `src/dpapi.rs`, opened in [`map_row`]);
-/// the library DB file and every sidecar config additionally get user-only
-/// file permissions ([`harden_file_permissions`]). OS-keychain portability
-/// beyond DPAPI user scope stays an explicit BACKLOG non-goal: when it
-/// lands, this note and the export warning are its entry points.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const SECRETS_AT_REST_NOTE: &str = "secrets at rest: row params DPAPI-sealed (user scope) plus user-only file permissions (0600/ACL); OS-keychain portability beyond DPAPI user scope is backlog";
 
-/// Ticket 27: best-effort user-only permissions for a secrets-bearing file
-/// (library DB, sidecar configs). Unix sets 0600; Windows strips inherited
-/// ACLs and grants the current user SID only (best-effort: failures are
-/// ignored so hardening never breaks open/write — the file stays usable in
-/// its per-user dir). Never grants Administrators (user-only means
-/// user-only) and never trusts the spoofable `USERNAME` env (the SID comes
-/// from `whoami /user`). Never echoes file contents.
 pub fn harden_file_permissions(path: &Path) {
     #[cfg(unix)]
     {
@@ -120,12 +70,6 @@ pub fn harden_file_permissions(path: &Path) {
     }
     #[cfg(windows)]
     {
-        // Best-effort: `<user-sid>:(R,W)` only, no inherited entries. The
-        // temp dir and %APPDATA% are per-user by construction; this tightens
-        // the file itself when icacls is available. SIDs need the `*`
-        // prefix (otherwise icacls reads them as account names and grants
-        // nothing — which would lock even the owner out after the
-        // inheritance strip above).
         let principal = current_user_sid()
             .map(|sid| format!("*{sid}"))
             .unwrap_or_else(|| "OWNER RIGHTS".to_string());
@@ -145,8 +89,6 @@ pub fn harden_file_permissions(path: &Path) {
     }
 }
 
-/// Current process user SID via `whoami /user` (`None` when the lookup
-/// fails — the caller falls back to `OWNER RIGHTS`, never to `USERNAME`).
 #[cfg(windows)]
 fn current_user_sid() -> Option<String> {
     let output = std::process::Command::new("whoami")
@@ -165,7 +107,6 @@ fn current_user_sid() -> Option<String> {
         .map(str::to_string)
 }
 
-/// True for `S-1-...` SID shapes (digits and dashes after the prefix).
 #[cfg(windows)]
 fn is_sid_shape(token: &str) -> bool {
     token.len() > 4
@@ -173,21 +114,6 @@ fn is_sid_shape(token: &str) -> bool {
         && token[4..].chars().all(|c| c.is_ascii_digit() || c == '-')
 }
 
-/// Ticket 27: subscription-fetch policy for one URL (pure, no DNS, no fetch).
-/// Decision (documented rationale):
-/// - `https` to a public host: Allow (tokens ride TLS; the existing 8 MiB /
-///   20 s / UTF-8 caps still apply at fetch).
-/// - `http` (plaintext) to a public host: Warn — allowed for LAN-provider
-///   compat, but query tokens leak in plaintext, so the UI surfaces the
-///   reason (never the URL).
-/// - Any `http(s)` URL whose host is loopback/private/link-local/unspecified
-///   (`localhost`, `127.x`, `10/8`, `172.16/12`, `192.168/16`, `::1`, `::`,
-///   `fe80::/10`, `fc00::/7`): Block — a pasted subscription URL must never
-///   make the app probe local services (SSRF); local files enter via manual
-///   import instead. Non-IP hostnames (e.g. `example.com`) are never blocked
-///   here (no DNS at policy time).
-///
-/// Errors and reasons never echo the URL (tokens hide in queries).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionFetchPolicy {
     Allow,
@@ -195,8 +121,6 @@ pub enum SubscriptionFetchPolicy {
     Block { reason: &'static str },
 }
 
-/// Ticket 27: classify one subscription URL without fetching (see
-/// [`SubscriptionFetchPolicy`] for the warn/block/allow rationale).
 pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
     const HTTP_WARN: &str =
         "subscription uses plaintext http (tokens in the URL leak in plaintext; prefer https)";
@@ -216,8 +140,7 @@ pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
     };
     let authority = after.split('/').next().unwrap_or(after);
     let host_part = authority.rsplit('@').next().unwrap_or(authority);
-    // Bracketed IPv6 (`[::1]`, `[::1]:8080`) unwraps first — a naive `:`
-    // split would shred the literal (see ticket-27 RED run).
+
     let host = if let Some(rest) = host_part.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {
@@ -240,38 +163,12 @@ pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
     SubscriptionFetchPolicy::Allow
 }
 
-/// Ticket A5: enforced subscription-fetch caps. Single source of truth for
-/// the async fetch path (`fetch_subscription_body` enforces all three
-/// inline: size while streaming, timeout per request, redirect hops with a
-/// per-hop policy re-check) and for the byte ingest below
-/// ([`Store::refresh_with_bytes`], size + UTF-8 at ingest). Limits live in
-/// code on both sides — never comment-only.
 pub const SUBSCRIPTION_MAX_BYTES: usize = 8 * 1024 * 1024;
-/// Ticket A5: per-fetch network timeout, seconds (enforced by the fetch
-/// path; recorded here so the two sides cannot drift).
+
 pub const SUBSCRIPTION_TIMEOUT_SECS: u64 = 20;
-/// Ticket A5: redirect hops followed per fetch, each hop re-running
-/// [`subscription_fetch_policy`] (enforced by the fetch path).
+
 pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
 
-/// Ticket A5: DNS-rebind guard — the resolution-time half of
-/// [`subscription_fetch_policy`]. The pure policy blocks literal internal
-/// hosts without DNS; this runs AFTER resolution: a public hostname that
-/// resolves (or re-resolves, e.g. via a redirect target) to a
-/// loopback/private/link-local/unspecified address is Blocked, so a benign
-/// name can never smuggle the fetch onto a local service. An empty
-/// resolution fails closed (Block, never fetch blind). Reasons never echo
-/// the URL.
-///
-/// Honest wiring note: the live platform-client fetch path cannot observe
-/// resolved IPs (DNS is owned by the client), so it enforces the literal
-/// per-hop policy instead and this helper pins the contract for any
-/// fetch path with visible resolution (plus the tests below). A hostile
-/// subscription host could still rebind between hops invisible to the
-/// client — accepted residual risk: subscription URLs are user-supplied
-/// and user-trusted, refreshes keep last-good members on failure, and the
-/// loopback services reachable that way speak proxy protocols, not the
-/// plain-GET the fetch issues.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn subscription_fetch_policy_resolved(
     url: &str,
@@ -293,10 +190,7 @@ pub fn subscription_fetch_policy_resolved(
     }
     base
 }
-/// Ticket 27: true for loopback/private/link-local/unspecified hosts (IP
-/// literals only; hostnames are never internal without DNS). Mirrors the
-/// preset intake classifier — both copies block `localhost` subdomains and
-/// IPv4-mapped forms (decode-time and fetch-time stay in parity).
+
 fn is_internal_host(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
     let bare = lower.strip_suffix('.').unwrap_or(&lower);
@@ -316,9 +210,6 @@ fn is_internal_host(host: &str) -> bool {
                     || octets[0] == 127
             }
             IpAddr::V6(v6) => {
-                // Mapped-only: `::1` is not mapped (falls through to the
-                // plain v6 checks below); `to_ipv4` would also match
-                // IPv4-compatible `::a.b.c.d` and misroute `::1`.
                 if let Some(mapped) = v6.to_ipv4_mapped() {
                     let octets = mapped.octets();
                     return mapped.is_loopback()
@@ -329,10 +220,11 @@ fn is_internal_host(host: &str) -> bool {
                         || (octets[0] == 192 && octets[1] == 168)
                         || octets[0] == 127;
                 }
-                v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
-                // fe80::/10 link-local, fc00::/7 unique-local
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
             }
         }
     } else {
@@ -340,33 +232,25 @@ fn is_internal_host(host: &str) -> bool {
     }
 }
 
-/// A stored proxy configuration (ticket 02 owns identity, naming, grouping,
-/// enable flag, and local bind; protocol params are opaque until the
-/// import/custom-core tickets).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
-    /// Stable string id, never reused (AUTOINCREMENT rowid rendered as text).
     pub id: String,
     pub name: String,
     pub protocol: String,
-    /// Opaque protocol params; schema-checked by a later ticket.
+
     pub params: String,
     pub group: String,
     pub enabled: bool,
     pub bind_ip: String,
     pub port: u16,
-    /// Owning subscription id (ticket 04), if this row is subscription-managed.
+
     pub subscription_id: Option<String>,
-    /// Normalized subscription identity (ticket 04), if owned.
+
     pub identity_key: Option<String>,
-    /// Attached routing preset id (ticket 37), if any. `None` means no
-    /// preset: the engine serves the row's isolation rule alone (unattached
-    /// rows are byte-identical to before presets existed).
+
     pub preset_id: Option<String>,
 }
 
-/// Raw input for creating a config. All strings are unvalidated; empty
-/// protocol/group/bind fall back to defaults, empty port means auto-assign.
 #[derive(Debug, Clone)]
 pub struct NewConfig {
     pub name: String,
@@ -374,12 +258,10 @@ pub struct NewConfig {
     pub params: String,
     pub group: String,
     pub bind_ip: String,
-    /// Raw port text; `""` (or whitespace) means auto-assign.
+
     pub port: String,
 }
 
-/// Raw patch for editing a config. `None` means unchanged; `Some("")` port
-/// means auto-assign a fresh port.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigPatch {
     pub name: Option<String>,
@@ -390,7 +272,6 @@ pub struct ConfigPatch {
     pub port: Option<String>,
 }
 
-/// One field-level validation failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldError {
     pub field: &'static str,
@@ -406,26 +287,15 @@ impl FieldError {
     }
 }
 
-/// Store-level failures.
 #[derive(Debug)]
 pub enum StoreError {
-    /// One or more fields rejected; nothing was written.
     Invalid(Vec<FieldError>),
-    /// No config with this id.
+
     NotFound(String),
-    /// Ticket 14: filesystem failure (export writes — never the database).
-    /// Carries the destination path so the UI names it instead of
-    /// mislabeling the failure "database error".
-    Io {
-        path: PathBuf,
-        message: String,
-    },
-    /// Ticket A2: DPAPI seal/open failure (never a `Sql` mislabel). The
-    /// write aborts before commit, so nothing is stored — never silent
-    /// plaintext, never a partial row.
-    Crypto {
-        message: String,
-    },
+
+    Io { path: PathBuf, message: String },
+
+    Crypto { message: String },
     Sql(rusqlite::Error),
 }
 
@@ -457,18 +327,6 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-/// Ticket 25: full-fidelity payload behind [`Store::export_library_json`].
-/// `outbounds` holds each import-shaped row's params object verbatim (the
-/// import grammar reads only `outbounds`, so a re-import commits duplicates,
-/// never adds); `library` carries every row's full params,
-/// enabled flag, identity, sync baseline, adoptable flag, and row id;
-/// `subscriptions` carries each record's id plus refresh metadata
-/// (`last_refresh_at`/`last_error`/`failures`); `tombstones` rides along so
-/// user-deleted rows stay deleted after a restore. This is the store half
-/// of restorable export: the import/UI side reads these sections (ticket 26
-/// territory) or [`Store::restore_library_json`] rebuilds them directly.
-/// Ticket 28: the old slim `export_payload` wrapper is gone (zero callers;
-/// every consumer takes the full payload).
 pub fn export_payload_full(
     configs: &[ProxyConfig],
     subscriptions: &[Subscription],
@@ -540,24 +398,17 @@ pub fn export_payload_full(
     .to_string()
 }
 
-/// Ticket 12: durable latest-per-config health sample. The status view
-/// (`HealthStore`) stays in memory for the session, but the latest sample
-/// per row — latency plus the dead flag (an `error` present means dead) —
-/// survives restart via the `health_snapshots` table (one row per config).
-/// Logs stay session-only by ruling (never persisted here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthSnapshot {
     pub config_id: String,
     pub at: i64,
-    /// `"url-test"` or `"tcp-ping"` (see `health::HealthKind::as_str`).
+
     pub kind: String,
     pub latency_ms: Option<u64>,
-    /// `Some` names the dead cause; `None` means the last sample was live.
+
     pub error: Option<String>,
 }
 
-/// Map one health snapshot row to a HealthSnapshot.
-/// Ticket 25: negative stored latencies clamp to 0 (never wrap via `as u64`).
 fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot> {
     let latency_ms: Option<i64> = row.get(3)?;
     Ok(HealthSnapshot {
@@ -569,14 +420,6 @@ fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot>
     })
 }
 
-/// Parse raw port text from a form field. Empty means auto-assign (`None`).
-/// `Some(0)` never validates: it is rejected as out of range.
-/// Ticket 28: kept separate from the import grammar's `parse_port` — form
-/// input allows blank-means-auto and plain digits, while link/JSON ports
-/// enforce the strict grammar (no leading zeros/signs, multi-port
-/// first-wins); one parser would change rejections on one path.
-/// Ticket 43: the word `auto` (any case, padded or not) also means
-/// auto-assign, so an edited concrete port can return to auto by typing it.
 pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
@@ -591,10 +434,6 @@ pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
     }
 }
 
-/// Both proxy URL forms for a local endpoint (contract: copy action copies
-/// both the `socks5://` and `http://` forms).
-/// Ticket 32: IPv6 literals bracket (`socks5://[::1]:port`); IPv4 and
-/// hostnames pass through untouched.
 pub fn proxy_urls(bind_ip: &str, port: u16) -> (String, String) {
     let trimmed = bind_ip.trim();
     let host = if trimmed.contains(':') && !trimmed.starts_with('[') {
@@ -608,14 +447,10 @@ pub fn proxy_urls(bind_ip: &str, port: u16) -> (String, String) {
     )
 }
 
-/// Confirm-dialog description for removing a config. Names the config.
 pub fn delete_confirm_text(name: &str) -> String {
     format!("Remove \"{name}\"? The stored configuration is deleted. Nothing else changes.")
 }
 
-/// Ticket 43: confirm-dialog description for removing a RUNNING config. The
-/// endpoint stops first, and the copy says so — the stopped-row text above
-/// would lie here.
 pub fn delete_running_confirm_text(name: &str) -> String {
     format!(
         "Remove \"{name}\"? Its endpoint is running and will be stopped first, \
@@ -623,10 +458,6 @@ pub fn delete_running_confirm_text(name: &str) -> String {
     )
 }
 
-/// Ticket 10 (throne-adoption US-22): Traffic Stats periods. Only
-/// cumulative totals persist (per-period history is phase-2), so every
-/// period summarizes the same stored totals — the dialog labels them
-/// all-time honest (see [`Store::traffic_period_summary`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficPeriod {
     Day,
@@ -636,7 +467,6 @@ pub enum TrafficPeriod {
 }
 
 impl TrafficPeriod {
-    /// Every period, in selector order.
     pub const ALL: [TrafficPeriod; 4] = [
         TrafficPeriod::Day,
         TrafficPeriod::Week,
@@ -644,7 +474,6 @@ impl TrafficPeriod {
         TrafficPeriod::Quarter,
     ];
 
-    /// Selector label for the period.
     pub fn label(self) -> &'static str {
         match self {
             TrafficPeriod::Day => "24h",
@@ -655,14 +484,8 @@ impl TrafficPeriod {
     }
 }
 
-/// Ticket 09 (throne-adoption): preview cap for the Remove-duplicates
-/// confirm (names at most this many rows; the count still names all).
 pub const PRUNE_PREVIEW_LIMIT: usize = 20;
 
-/// Ticket 09 (throne-adoption): the four group prune kinds. There is
-/// deliberately no `Insecure` kind (spec Out of Scope: no `Remove
-/// insecure`); [`GroupPruneKind::ALL`] pins the surface so a fifth kind
-/// cannot slip in silently (see the `group_prune_kinds_pinned` test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupPruneKind {
     Duplicates,
@@ -672,7 +495,6 @@ pub enum GroupPruneKind {
 }
 
 impl GroupPruneKind {
-    /// Every prune kind, in menu order.
     pub const ALL: [GroupPruneKind; 4] = [
         GroupPruneKind::Duplicates,
         GroupPruneKind::Unavailable,
@@ -680,7 +502,6 @@ impl GroupPruneKind {
         GroupPruneKind::ClearTests,
     ];
 
-    /// Menu/confirm verb for the kind.
     pub fn label(self) -> &'static str {
         match self {
             GroupPruneKind::Duplicates => "Remove duplicates",
@@ -691,18 +512,11 @@ impl GroupPruneKind {
     }
 }
 
-/// Ticket 09 (throne-adoption): re-run commit validation over a stored
-/// protocol + params pair (the `IsValid` sweep predicate). A throwaway
-/// error vec keeps the signature boolean — callers needing field detail
-/// use the commit path, never this.
 pub fn is_valid_config(protocol: &str, params: &str) -> bool {
     let mut errors = Vec::new();
     validate_protocol_params(protocol, params, &mut errors).is_some() && errors.is_empty()
 }
 
-/// Ticket 09 (throne-adoption): confirm copy for Remove-duplicates. Names
-/// the group scope, the duplicate count, and previews at most
-/// [`PRUNE_PREVIEW_LIMIT`] names (`+N more` covers the rest).
 pub fn prune_duplicates_confirm_text(group: &str, total: usize, preview: &[String]) -> String {
     let mut text = format!(
         "Remove {total} duplicate(s) in group \"{group}\"? The first copy of each \
@@ -717,8 +531,6 @@ pub fn prune_duplicates_confirm_text(group: &str, total: usize, preview: &[Strin
     text
 }
 
-/// Ticket 09 (throne-adoption): confirm copy for Remove-unavailable.
-/// Names the group scope and the dead-sample count.
 pub fn prune_unavailable_confirm_text(group: &str, count: usize) -> String {
     format!(
         "Remove {count} unavailable row(s) in group \"{group}\"? Rows whose last test failed \
@@ -726,8 +538,6 @@ pub fn prune_unavailable_confirm_text(group: &str, count: usize) -> String {
     )
 }
 
-/// Ticket 09 (throne-adoption): confirm copy for Remove-invalid. Names the
-/// group scope and the validation-failure count.
 pub fn prune_invalid_confirm_text(group: &str, count: usize) -> String {
     format!(
         "Remove {count} invalid row(s) in group \"{group}\"? Rows failing validation are \
@@ -735,8 +545,6 @@ pub fn prune_invalid_confirm_text(group: &str, count: usize) -> String {
     )
 }
 
-/// Ticket 09 (throne-adoption): confirm copy for Clear-tests. Names the
-/// group scope and the cleared-sample count; rows are kept.
 pub fn clear_group_tests_confirm_text(group: &str, count: usize) -> String {
     format!(
         "Clear {count} test result(s) in group \"{group}\"? Rows are kept and read untested \
@@ -744,12 +552,6 @@ pub fn clear_group_tests_confirm_text(group: &str, count: usize) -> String {
     )
 }
 
-/// Ticket 09 (throne-adoption): one row's transport-security posture for
-/// the Show-Security column (`reality` > `tls` > `none`). Reads the
-/// explicit `security` key; protocols whose forms lock TLS always-on
-/// (AnyTLS/Naïve/TUIC/Hysteria/ShadowTLS captions) read `tls` without the
-/// key; everything else (shadowsocks, wireguard, plain, unreadable)
-/// reads `none` (fail-closed: never claim TLS that is not evidenced).
 pub fn row_security_label(protocol: &str, params_raw: &str) -> &'static str {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(params_raw.trim()) {
         if let Some(obj) = value.as_object() {
@@ -769,8 +571,6 @@ pub fn row_security_label(protocol: &str, params_raw: &str) -> &'static str {
     }
 }
 
-/// Ticket 09 (throne-adoption): rank behind the `Type|Security` sort
-/// (`reality` first — strongest posture — then `tls`, then `none`).
 pub fn security_rank(label: &str) -> u8 {
     match label {
         "reality" => 3,
@@ -780,10 +580,6 @@ pub fn security_rank(label: &str) -> u8 {
     }
 }
 
-/// Ticket 09 (throne-adoption): `Type|Security` row order — protocol
-/// name ascending, then security posture strongest-first, then row name
-/// (stable, total: names are unique per add). Pure seam; the list view
-/// applies it when the sort is armed.
 pub fn compare_type_security(a: &ProxyConfig, b: &ProxyConfig) -> std::cmp::Ordering {
     a.protocol
         .to_ascii_lowercase()
@@ -799,26 +595,14 @@ pub fn compare_type_security(a: &ProxyConfig, b: &ProxyConfig) -> std::cmp::Orde
         })
 }
 
-/// Ticket 09: explicit warning copy for any user-owned plaintext export.
-/// Ticket 11: the export confirm dialog shows this text verbatim (see
-/// [`export_confirm_description`]) so private keys/tokens/passwords never
-/// leave silently.
 pub fn export_warning_text() -> &'static str {
     "Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe."
 }
 
-/// Ticket 11: the export confirm dialog description. This indirection locks
-/// the verbatim binding: the dialog must show [`export_warning_text`]
-/// exactly (no paraphrase, no trimming).
 pub fn export_confirm_description() -> &'static str {
     export_warning_text()
 }
 
-/// Map one result row to a ProxyConfig. All columns are bound by position
-/// with explicit types (STRICT table guarantees the shapes).
-/// Ticket 25: out-of-range ports fail loudly (never silent truncation via
-/// `as u16`); a CHECK constraint guards new tables, this rejects drift in
-/// old ones.
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
     let id: i64 = row.get(0)?;
     let enabled: i64 = row.get(5)?;
@@ -837,8 +621,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
         id: id.to_string(),
         name: row.get(1)?,
         protocol: row.get(2)?,
-        // Ticket 35: the params column is sealed at rest; open it here —
-        // the single read funnel, so every consumer sees plaintext.
+
         params: {
             let stored: String = row.get(3)?;
             crate::dpapi::unseal_params(&stored).map_err(|message| {
@@ -862,38 +645,27 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProxyConfig> {
     })
 }
 
-/// A stored routing preset (ticket 37): a named, ordered list of sing-box
-/// route-rule objects applied per attached row. `rules_json` is the raw
-/// rules array (routing policy, not credentials — DPAPI sealing stays on
-/// `proxy_configs.params` only, ticket-35 behavior preserved).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutePreset {
-    /// Stable string id, never reused (AUTOINCREMENT rowid rendered as text).
     pub id: String,
     pub name: String,
-    /// Intake origin: `link` (`throne://route`), `url` (explicit fetch of a
-    /// preset URL / `throne://remoteroute`), `file` (preset JSON file), or
-    /// `manual` (hand-created in the manager).
+
     pub source: String,
-    /// Origin URL for `url` presets (fetch target, explicit refresh only —
-    /// never auto-fetched). `None` otherwise.
+
     pub source_url: Option<String>,
-    /// Raw JSON array of route-rule objects.
+
     pub rules_json: String,
-    /// Unix seconds of the last write (create / rule edit / refresh fill).
+
     pub updated_at: Option<i64>,
-    /// Ticket 40 (v5, additive): free-form manager note. `None` means unset.
+
     pub description: Option<String>,
-    /// Ticket 40 (v5, additive): true for shipped builtins (never deleted by
-    /// restore sweeps; manager still edits rules explicitly).
+
     pub is_builtin: bool,
-    /// Ticket 40 (v5, additive): unix seconds this preset was last attached.
+
     pub last_used_at: Option<i64>,
 }
 
 impl RoutePreset {
-    /// Decode the stored rules array. Corrupt rows fail with a static
-    /// message (never rule content).
     pub fn rules(&self) -> Result<Vec<serde_json::Value>, String> {
         match serde_json::from_str::<serde_json::Value>(&self.rules_json) {
             Ok(serde_json::Value::Array(rules)) => Ok(rules),
@@ -905,11 +677,9 @@ impl RoutePreset {
     }
 }
 
-/// Map one result row to a RoutePreset (STRICT table guarantees the shapes).
 fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
     let id: i64 = row.get(0)?;
-    // Ticket 40: v5 extension columns are trailing and optional for legacy
-    // SELECTs; missing reads as unset (never a whole-list failure).
+
     let description: Option<String> = row.get(6).ok().flatten();
     let is_builtin: Option<i64> = row.get(7).ok();
     let last_used_at: Option<i64> = row.get(8).ok().flatten();
@@ -926,27 +696,20 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
     })
 }
 
-/// Ticket 40 (v5): one quarantined library row. The store keeps good rows
-/// loadable while naming the ids that need attention (re-import or restore).
-/// `cause` names the column/reason only, never secret or param bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantinedRow {
     pub id: String,
     pub cause: String,
 }
 
-/// Ticket 40 (v5): one append-only health-history sample. `health_snapshots`
-/// keeps the latest-fast-path untouched; history serves per-row charts and
-/// range deletes via `idx_health_history_config_at`.
-/// Ticket 45: production type behind the detail sparkline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthHistoryEntry {
     pub config_id: String,
     pub at: i64,
-    /// `"url-test"` or `"tcp-ping"`.
+
     pub kind: String,
     pub latency_ms: Option<u64>,
-    /// `Some` names the dead cause; `None` means live.
+
     pub error: Option<String>,
 }
 
@@ -962,7 +725,6 @@ fn map_health_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthHis
     })
 }
 
-/// Fully validated + defaulted record content, ready for INSERT/UPDATE.
 struct ValidatedConfig {
     name: String,
     protocol: String,
@@ -973,14 +735,11 @@ struct ValidatedConfig {
 }
 
 impl ProxyConfig {
-    /// Integer rowid behind the string id; -1 when the id is foreign
-    /// (only used for UPDATE targets already loaded from this store).
     fn rowid(&self) -> i64 {
         self.id.parse().unwrap_or(-1)
     }
 }
 
-/// Non-empty after trimming, else push a `name` error and return None.
 fn validated_name(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -991,7 +750,6 @@ fn validated_name(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     }
 }
 
-/// Blank input falls back to `default`; otherwise the trimmed value.
 fn defaulted(raw: &str, default: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1001,18 +759,10 @@ fn defaulted(raw: &str, default: &str) -> String {
     }
 }
 
-/// Canonical group-label normalization: surrounding whitespace never
-/// distinguishes labels (stored labels are always trimmed — see
-/// [`defaulted`]). Every group entry point (rename/move/delete/count
-/// matching) funnels through here so `" g1 "` and `"g1"` are one group.
 fn normalized_group(raw: &str) -> String {
     raw.trim().to_string()
 }
 
-/// Blank means loopback default; otherwise the text must parse as an IP
-/// literal or `localhost` (spec: loopback default; LAN binds gated at
-/// activation time). Matches the engine save/start gate message
-/// (`BadBind`: "want an IP address or localhost").
 fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1033,14 +783,6 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     }
 }
 
-/// Ticket 16: canonical protocol for manual add/edit. Trims, lowercases, and
-/// folds well-known aliases to the stored form (mirrors the import grammar's
-/// `normalize_outbound_type` + Clash folds). Unknown names yield `None` so
-/// the caller can raise a `protocol` field error.
-/// Ticket 28: kept parallel to the grammar table on purpose — the grammar
-/// folds link-only aliases (`hy2`, `wg`, `naive+https`) and raises taxonomy
-/// errors, while this folds dialog input to stored form; sharing one table
-/// would newly accept (or reject) protocols on one path.
 fn canonical_protocol(raw: &str) -> Option<String> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
@@ -1054,16 +796,14 @@ fn canonical_protocol(raw: &str) -> Option<String> {
         "wireguard" | "wg" => Some("wireguard".to_string()),
         "amneziawg" | "awg" | "amnezia-wg" => Some("amneziawg".to_string()),
         "socks" | "socks5" => Some("socks".to_string()),
-        // Ticket 42: native 1.14.2 outbounds (serve-everything).
+
         "snell" => Some("snell".to_string()),
         "shadowtls" | "shadow-tls" | "shadow_tls" => Some("shadowtls".to_string()),
         "anytls" => Some("anytls".to_string()),
-        // Ticket 27: native SSH outbound (sing-box `ssh`) + standalone Noise
-        // (fork sidecar; AWG-vs-Noise mismatch rejected in the engine).
+
         "ssh" => Some("ssh".to_string()),
         "noise" => Some("noise".to_string()),
-        // Ticket 07 (throne-adoption): parse-only intake protocols (commit
-        // + library accept them; the engine still names the serving gap).
+
         "mieru" => Some("mieru".to_string()),
         "juicity" => Some("juicity".to_string()),
         "trusttunnel" => Some("trusttunnel".to_string()),
@@ -1080,35 +820,18 @@ fn canonical_protocol(raw: &str) -> Option<String> {
         | "custom-full-config" => Some("custom-config".to_string()),
         "extra" | "extra-core" | "extra_core" | "extracore" => Some("extra-core".to_string()),
         "chain" | "chained" | "chain-outbound" | "chain_outbound" => Some("chain".to_string()),
-        // Config-completeness T08 (CAP-12): trivial `direct` final.
+
         "direct" => Some("direct".to_string()),
         _ => None,
     }
 }
 
-/// Ticket 31: per-protocol starter params for the guided add dialog (never
-/// raw JSON first). Endpoint templates are JSON objects with the upstream
-/// `server`/`server_port` slots plus the protocol's credential slot(s) left
-/// blank — submitting one untouched fails in [`validate_protocol_params`]
-/// naming the missing field, never silently. Virtual types (`chain`,
-/// `custom-*`, `extra-core`, `direct`) start bare (`{"type":...}` with no
-/// server/port slots): their guided Server/Port inputs hide (Throne gating
-/// parity), and an import-shaped template with a blank server would fail the
-/// commit gate with nothing for the user to fill. Unknown input falls back
-/// to a bare server/port object (the commit then names the valid protocols).
 pub fn protocol_params_template(protocol: &str) -> String {
     fn blank(params: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
         params.insert(key.to_string(), serde_json::Value::String(String::new()));
     }
     let canonical = canonical_protocol(protocol).unwrap_or_else(|| protocol.trim().to_string());
-    // Config-completeness T08 (CAP-12) + review: virtual rows carry no
-    // endpoint address of their own (chain hops and custom/extra-core
-    // payloads name it in JSON), so the starter is the bare kind marker.
-    // `direct` led (T08); `chain`/`custom-*`/`extra-core` follow — the guided
-    // commit folds blank hidden inputs to a no-op, and the bare object is
-    // not import-shaped, so it clears the server gate the hidden inputs
-    // could never satisfy. Hand JSON with server keys still validates as
-    // before (import-shaped path unchanged).
+
     if matches!(
         canonical.as_str(),
         "direct" | "chain" | "custom-outbound" | "custom-config" | "extra-core"
@@ -1142,10 +865,7 @@ pub fn protocol_params_template(protocol: &str) -> String {
             blank(&mut params, "method");
             blank(&mut params, "password");
         }
-        // Ticket 42: snell needs its psk; shadowtls v1 rows may omit the
-        // password (v2/v3 carry it) so the template leaves it blank-only
-        // when the dialog targets a passworded shape — blank stays a
-        // template, never a committed row (commit names the field).
+
         "snell" => blank(&mut params, "psk"),
         "tuic" => {
             blank(&mut params, "uuid");
@@ -1159,8 +879,7 @@ pub fn protocol_params_template(protocol: &str) -> String {
             blank(&mut params, "username");
             blank(&mut params, "password");
         }
-        // Ticket 07 (throne-adoption): parse-only templates carry their
-        // credential slots (same key sets as the commit gate below).
+
         "mieru" | "trusttunnel" => {
             blank(&mut params, "username");
             blank(&mut params, "password");
@@ -1175,14 +894,6 @@ pub fn protocol_params_template(protocol: &str) -> String {
     serde_json::Value::Object(params).to_string()
 }
 
-/// Config-completeness T01: virtual row types carry no endpoint address of
-/// their own (`chain` hops and `custom-*`/`extra-core` payloads name it in
-/// JSON) — the guided Server/Server port inputs hide for these, matching
-/// Throne's address/port gating. In-memory flag table only (no migration,
-/// no `user_version` bump); aliases fold through [`canonical_protocol`] so
-/// dialog text can never dodge the gate.
-/// Config-completeness T08: `direct` joins (Throne `edit_direct.ui` is
-/// label-only — a trivial final has no address to show).
 pub fn is_virtual_protocol(protocol: &str) -> bool {
     matches!(
         canonical_protocol(protocol).as_deref(),
@@ -1190,19 +901,10 @@ pub fn is_virtual_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Config-completeness T01: true when a params box still holds the untouched
-/// starter for `protocol` — byte-identical to [`protocol_params_template`]
-/// output, never a semantic compare (whitespace or key order already means
-/// the user touched it, so the rewrite below stands off).
 pub fn is_pristine_template(params_raw: &str, protocol: &str) -> bool {
     params_raw == protocol_params_template(protocol)
 }
 
-/// Config-completeness T01: type-switch template rule (contract C1). A
-/// protocol switch rewrites the params box to the new type's starter ONLY
-/// when the box still holds the old type's pristine starter; user-typed or
-/// otherwise dirty JSON stands untouched and the new page prefills whatever
-/// keys overlap instead. Pure (no I/O) so headless tests pin it directly.
 pub fn pristine_template_rewrite(
     params_raw: &str,
     old_protocol: &str,
@@ -1215,10 +917,6 @@ pub fn pristine_template_rewrite(
     }
 }
 
-/// Config-completeness T02: shared Transport panel (S1) fold state — raw UI
-/// strings exactly as the panel controls hold them. `network` is the panel
-/// default (`tcp`) when the row carries none; every other blank means
-/// untouched (never wiped, R5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransportFold {
     pub network: String,
@@ -1228,8 +926,6 @@ pub struct TransportFold {
     pub service_name: String,
 }
 
-/// Config-completeness T02: shared TLS panel, optional variant (S2). `enable`
-/// mirrors the toggle; `pbk` non-blank means REALITY (Throne parity).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsOptionalFold {
     pub enable: bool,
@@ -1241,10 +937,6 @@ pub struct TlsOptionalFold {
     pub sid: String,
 }
 
-/// Config-completeness T03: the `security` enable/disable half of the
-/// optional TLS fold — enabling writes `tls` (or `reality` with a public
-/// key), disabling removes the key. Shared by the standard fold and the
-/// vmess legacy-aware variant below (one rule, two callers).
 fn fold_tls_security(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     fold: &TlsOptionalFold,
@@ -1270,10 +962,6 @@ fn fold_tls_security(
     }
 }
 
-/// Config-completeness T03: the credential half of the optional TLS fold
-/// (`sni`/`alpn`/`fp`/`insecure`/`pbk`/`sid`) — blank-safe, alias-aware,
-/// byte-identical on no-ops. Shared by the standard fold and the vmess
-/// legacy-aware variant below.
 fn fold_tls_details(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     fold: &TlsOptionalFold,
@@ -1298,8 +986,6 @@ fn fold_tls_details(
     changed
 }
 
-/// Config-completeness T02: shared Mux+Brutal panel (S3). `mode` is
-/// `""` (keep default) | `"on"` | `"off"`; speeds are raw UI text (Mbps).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MuxFold {
     pub mode: String,
@@ -1308,8 +994,6 @@ pub struct MuxFold {
     pub brutal_down_mbps: String,
 }
 
-/// Config-completeness T02: shared Advanced dial panel (S4, dial half — TLS
-/// extras are a later ticket with their own engine `tls{}` mapping).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DialFold {
     pub reuse_addr: bool,
@@ -1322,12 +1006,6 @@ pub struct DialFold {
     pub inet6_bind_address: String,
 }
 
-/// Config-completeness T02: write one select/control value into a params
-/// object — an unchanged value (including an echoed default) no-ops;
-/// `default_value` (and `""`) otherwise restore the default by REMOVING the
-/// key; any other value sets it. Returns true when the object changed
-/// (callers reserialize only then, so no-op folds stay byte-identical and
-/// never produce spurious edit patches).
 fn fold_select_key(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1352,10 +1030,6 @@ fn fold_select_key(
     true
 }
 
-/// Config-completeness T02: write one boolean into a params object across
-/// alias spellings — `false` removes every alias, `true` sets the canonical
-/// key (dropping stale aliases) only when the effective value changed.
-/// Untouched inputs compare equal through prefill, so they no-op.
 fn fold_bool_aliases(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     canonical: &str,
@@ -1375,9 +1049,6 @@ fn fold_bool_aliases(
     true
 }
 
-/// Config-completeness T02: truthy flat spelling (`1`/`true`/`yes`/`on`,
-/// JSON bools/numbers included) — mirrors the engine's `take_truthy` so
-/// prefill and fold agree on what a stored value means.
 fn truthy_flat(value: Option<&serde_json::Value>) -> bool {
     match value {
         Some(serde_json::Value::Bool(flag)) => *flag,
@@ -1392,9 +1063,6 @@ fn truthy_flat(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-/// Config-completeness T02: write one text value across read aliases —
-/// blank never touches the object (T05 blank semantics); non-blank writes
-/// the canonical key only when no alias already holds it.
 fn fold_text_aliases(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     canonical: &str,
@@ -1415,10 +1083,6 @@ fn fold_text_aliases(
     true
 }
 
-/// Config-completeness T02: write one numeric text value — blank no-ops,
-/// parseable integers land as numbers, anything else lands as a string so
-/// validation fails loudly naming the field instead of silently keeping the
-/// old value (T05 port semantics, generalized).
 fn fold_number_text(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1441,9 +1105,6 @@ fn fold_number_text(
     }
 }
 
-/// Config-completeness T02: value lookup matching
-/// [`lookup_case_insensitive`] but borrowing the JSON value (for
-/// bool-aware prefill — the stringifying lookup skips `false`).
 fn get_case_insensitive<'a>(
     obj: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1455,10 +1116,6 @@ fn get_case_insensitive<'a>(
     })
 }
 
-/// Config-completeness T02: prefill one panel toggle from a params JSON
-/// object (liberal truthy read across `keys`, mirroring [`truthy_flat`]).
-/// Blank for unparseable JSON or missing keys — the JSON stays the source
-/// of truth, the panel only echoes it.
 pub fn guided_prefill_bool(params_raw: &str, keys: &[&str]) -> bool {
     let obj = serde_json::from_str::<serde_json::Value>(params_raw)
         .ok()
@@ -1471,9 +1128,6 @@ pub fn guided_prefill_bool(params_raw: &str, keys: &[&str]) -> bool {
     }
 }
 
-/// Config-completeness T02: fold the shared Transport panel (S1) into a
-/// params JSON text. `network: "tcp"` restores the default (key removed);
-/// conditional blanks never wipe (R5). Byte-identical when nothing differs.
 pub fn fold_transport_into_params(params_raw: &str, fold: &TransportFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -1501,10 +1155,6 @@ pub fn fold_transport_into_params(params_raw: &str, fold: &TransportFold) -> Str
     }
 }
 
-/// Config-completeness T02: fold the shared TLS panel, optional variant
-/// (S2), into a params JSON text. Disabling removes `security` only (sni,
-/// pbk and friends stay preserved per R5); enabling writes `tls`, or
-/// `reality` when `pbk` is non-blank. Byte-identical when nothing differs.
 pub fn fold_tls_optional_into_params(params_raw: &str, fold: &TlsOptionalFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -1523,11 +1173,6 @@ pub fn fold_tls_optional_into_params(params_raw: &str, fold: &TlsOptionalFold) -
     }
 }
 
-/// Config-completeness T02: fold the shared Mux+Brutal panel (S3) into a
-/// params JSON text. `mode` `""` restores the default (key removed);
-/// `brutal_*` keys are panel state preserved in stored JSON — the engine
-/// consumes them without stock emission (no sing-box 1.14.2 mapping; the
-/// mux-force behavior still holds at emission). Byte-identical on no-ops.
 pub fn fold_mux_into_params(params_raw: &str, fold: &MuxFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -1538,8 +1183,7 @@ pub fn fold_mux_into_params(params_raw: &str, fold: &MuxFold) -> String {
         None => return params_raw.to_string(),
     };
     let mut changed = false;
-    // `""` (and the explicit `"default"`) restore the panel default; the
-    // shared select rule keeps echoed values byte-identical.
+
     changed |= fold_select_key(obj, "mux", &fold.mode, "default");
     changed |= fold_bool_aliases(obj, "brutal_enable", &["brutal_enable"], fold.brutal_enable);
     changed |= fold_number_text(obj, "brutal_up_mbps", &fold.brutal_up_mbps);
@@ -1551,9 +1195,6 @@ pub fn fold_mux_into_params(params_raw: &str, fold: &MuxFold) -> String {
     }
 }
 
-/// Config-completeness T02: fold the shared Advanced dial panel (S4, dial
-/// half) into a params JSON text. Toggles clear to absent (sing-box omits);
-/// timeout/bind texts are blank-safe. Byte-identical on no-ops.
 pub fn fold_dial_into_params(params_raw: &str, fold: &DialFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -1603,10 +1244,6 @@ pub fn fold_dial_into_params(params_raw: &str, fold: &DialFold) -> String {
     }
 }
 
-/// Config-completeness T02: fold the VLESS inner fields (uuid + flow +
-/// packet_encoding) into a params JSON text. `flow`/`packet_encoding` blank
-/// restores defaults (keys removed); uuid follows T05 identity semantics
-/// (aliases echoed, never wiped, never duplicated by untouched folds).
 pub fn fold_vless_inner_into_params(
     params_raw: &str,
     uuid: &str,
@@ -1632,17 +1269,8 @@ pub fn fold_vless_inner_into_params(
     }
 }
 
-/// Config-completeness T03: sing-box vmess packet ciphers (the `security`
-/// Select on the VMess page). One source for the picker, the prefill reader
-/// and the fold below — a value the UI cannot pick is a value the fold
-/// cannot write. `auto` leads: it is the sing-box default (the engine's
-/// new-style arm falls back to it), so it folds to absent on new-style rows.
 pub const VMESS_CIPHERS: [&str; 5] = ["auto", "zero", "none", "chacha20-poly1305", "aes-128-gcm"];
 
-/// Config-completeness T03: sing-box 1.14.2 shadowsocks ciphers (the
-/// `method` Select on the Shadowsocks page — all 18 incl. `2022-blake3-*`,
-/// `none`, `aes-*-gcm/ctr/cfb`, `chacha20-ietf*`, `xchacha20*`, `rc4-md5`).
-/// One source for the picker and the fold below.
 pub const SS_METHODS: [&str; 18] = [
     "2022-blake3-aes-128-gcm",
     "2022-blake3-aes-256-gcm",
@@ -1664,17 +1292,10 @@ pub const SS_METHODS: [&str; 18] = [
     "rc4-md5",
 ];
 
-/// Config-completeness T03: raw-object half of [`vmess_has_legacy_tls`]
-/// (the folds below already hold the parsed object — no re-parse).
 fn vmess_has_legacy_tls_raw(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
     obj.get("tls").is_some_and(|tls| tls.is_boolean())
 }
 
-/// Config-completeness T03: true when a vmess params text carries the legacy
-/// link grammar — a boolean `tls` key (import always writes it for
-/// `vmess://` links) with the packet cipher in `security`. New-style rows
-/// carry tls-ness in `security` and the cipher in `encryption` instead.
-/// The folds below branch on this so neither grammar clobbers the other.
 pub fn vmess_has_legacy_tls(params_raw: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(params_raw)
         .ok()
@@ -1682,12 +1303,6 @@ pub fn vmess_has_legacy_tls(params_raw: &str) -> bool {
         .is_some_and(|obj| vmess_has_legacy_tls_raw(&obj))
 }
 
-/// Config-completeness T03: read the vmess packet cipher for the `security`
-/// Select — `encryption` first (new-style), then `security` when it holds a
-/// cipher (legacy import shape, or an ambiguous hand-written row the fold
-/// pair heals toward new-style on save). A tls-ness `security`
-/// (`tls`/`reality`) reads blank so the picker falls back to `auto`, never
-/// to a cipher the row does not have.
 pub fn vmess_cipher_value(params_raw: &str) -> String {
     let encryption = guided_prefill_value(params_raw, &["encryption"]);
     if !encryption.trim().is_empty() {
@@ -1706,9 +1321,6 @@ pub fn vmess_cipher_value(params_raw: &str) -> String {
     String::new()
 }
 
-/// Config-completeness T03: read the vmess TLS toggle — the `security`
-/// on-values the engine maps, plus the legacy boolean `tls` import writes
-/// for `vmess://` links (the shared S2 prefill only reads `security`).
 pub fn vmess_tls_enabled(params_raw: &str) -> bool {
     let security = guided_prefill_value(params_raw, &["security"]);
     if matches!(
@@ -1720,16 +1332,6 @@ pub fn vmess_tls_enabled(params_raw: &str) -> bool {
     guided_prefill_bool(params_raw, &["tls"])
 }
 
-/// Config-completeness T03: fold the VMess inner fields — uuid, aid, cipher
-/// and packet_encoding — into a params JSON text. `uuid`/`aid` follow T05
-/// identity semantics as strings (the engine coerces `alter_id` to a number,
-/// so import string spellings echo byte-identical); `packet_encoding` blank
-/// restores the default. The cipher is grammar-aware: legacy rows (boolean
-/// `tls`) keep it in `security` (always written — `auto` is explicit there,
-/// never a removal); new-style rows write `encryption` (`auto` restores the
-/// sing-box default). A cipher must never land in a tls-ness `security` —
-/// `apply_tls` fails those with `unknown security`. Byte-identical when
-/// nothing differs.
 pub fn fold_vmess_inner_into_params(
     params_raw: &str,
     uuid: &str,
@@ -1761,10 +1363,6 @@ pub fn fold_vmess_inner_into_params(
     }
 }
 
-/// Config-completeness T03: fold the Trojan inner field (password) into a
-/// params JSON text. The trojan page's dedicated secret and the guided
-/// mini-form fold the same key (vless-uuid precedent: both no-op untouched,
-/// either one writes). Byte-identical when nothing differs.
 pub fn fold_trojan_inner_into_params(params_raw: &str, password: &str) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -1781,10 +1379,6 @@ pub fn fold_trojan_inner_into_params(params_raw: &str, password: &str) -> String
     }
 }
 
-/// Config-completeness T03: write one select value that has no valid
-/// default — blank never touches the object (no fabrication, no strip of
-/// values the picker cannot represent); non-blank writes when different.
-/// Returns true when the object changed (callers reserialize only then).
 fn fold_select_keep_blank(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1806,15 +1400,6 @@ fn fold_select_keep_blank(
     }
 }
 
-/// Config-completeness T03: fold the Shadowsocks inner fields into a params
-/// JSON text. `method`/`plugin` blank never touches the object: `method`
-/// has no valid default (a blank pick would fabricate a cipher — the commit
-/// gate names the missing method instead) and a stored `plugin` can carry
-/// SIP002 `;`-tails the picker cannot represent (stripping them would be
-/// data loss; the engine already fails non-empty plugins naming the field,
-/// so nothing hides). `plugin_opts` is blank-safe text; `uot` folds the
-/// `udp_over_tcp` bool (the sing-box name — the socks arm already consumes
-/// that flat) reading the `uot` spelling too. Byte-identical on no-ops.
 pub fn fold_shadowsocks_inner_into_params(
     params_raw: &str,
     method: &str,
@@ -1849,16 +1434,6 @@ pub fn fold_shadowsocks_inner_into_params(
     }
 }
 
-/// Config-completeness T03: fold the shared TLS panel (S2) on vmess rows —
-/// legacy-aware. Legacy rows (boolean `tls`) keep their cipher in
-/// `security`, so the toggle mirrors into the boolean instead (the standard
-/// fold would strip the cipher); every other field folds exactly as the
-/// standard panel. Typing a reality key (`pbk`) with TLS on migrates the row
-/// to the new-style grammar (boolean dropped, cipher moved to `encryption`,
-/// `security` becomes `reality`) — otherwise the engine's legacy arm would
-/// silently drop the key and run the row without REALITY. Untouched rows
-/// fold byte-identical either way; non-legacy rows fold exactly like
-/// [`fold_tls_optional_into_params`].
 pub fn fold_tls_vmess_into_params(params_raw: &str, fold: &TlsOptionalFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -1870,8 +1445,6 @@ pub fn fold_tls_vmess_into_params(params_raw: &str, fold: &TlsOptionalFold) -> S
     };
     let mut changed = false;
     if vmess_has_legacy_tls_raw(obj) && fold.enable && !fold.pbk.trim().is_empty() {
-        // Reality intent on a legacy row: migrate to new-style first (the
-        // legacy arm drops `pbk`/`sid`, so emitting them there would lie).
         obj.remove("tls");
         changed = true;
         if let Some(serde_json::Value::String(security)) = obj.get("security").cloned() {
@@ -1888,8 +1461,6 @@ pub fn fold_tls_vmess_into_params(params_raw: &str, fold: &TlsOptionalFold) -> S
         }
     }
     if vmess_has_legacy_tls_raw(obj) {
-        // Legacy grammar still owns the row: mirror the toggle into the
-        // boolean, never touch the cipher in `security`.
         let current = obj
             .get("tls")
             .and_then(|tls| tls.as_bool())
@@ -1910,26 +1481,8 @@ pub fn fold_tls_vmess_into_params(params_raw: &str, fold: &TlsOptionalFold) -> S
     }
 }
 
-/// Config-completeness T04: sing-box AmneziaWG versions (the `awg_version`
-/// Select on the AmneziaWG page). One source for the picker, the prefill
-/// reader and the fold below — a value the UI cannot pick is a value the
-/// fold cannot write. The blank "Select version…" row stands for "no
-/// selection" (the fold never fabricates nor strips — contract C2; the
-/// engine names a missing version at start).
 pub const AWG_VERSIONS: [&str; 2] = ["2.0", "3.x"];
 
-/// Config-completeness T04: WireGuard inner fold state — raw UI strings
-/// exactly as the page controls hold them. `local_addr` is the Throne name;
-/// it stores as `address` (the conf/URI/engine spelling —
-/// `reshape_wireguard_endpoint` coerces it to the endpoint list, while a
-/// verbatim `local_addr` would ride to the endpoint as an unknown field).
-/// `sys_ifc` stores as `system` (same reason). `dns` is form-preserved but
-/// never emitted (the engine strips it as a client setting — pre-existing).
-/// `udp_timeout` stays import-only: no UI writes it, no fold strips it.
-/// Every numeric-ish field folds as TEXT (aid precedent): import string
-/// spellings echo byte-identical and the engine coerces the ones it knows
-/// (`mtu`, `reserved`, keepalive); `workers` joins the engine coercion loop
-/// this ticket so its string spelling is check-safe too.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WireguardFold {
     pub private_key: String,
@@ -1944,13 +1497,6 @@ pub struct WireguardFold {
     pub sys_ifc: bool,
 }
 
-/// Config-completeness T04: fold the WireGuard inner fields into a params
-/// JSON text. `pre_shared_key` is the canonical stored spelling (the engine
-/// moves it to `peers[]`; the `preshared_key`/`presharedkey` spellings read
-/// as aliases but are never written — an unknown-cased key would ride to
-/// the endpoint verbatim and fail `check`). `address` likewise reads
-/// `local_address`/`local_addr` but writes the engine spelling. Byte-identical
-/// on no-ops.
 pub fn fold_wireguard_into_params(params_raw: &str, fold: &WireguardFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2003,14 +1549,6 @@ pub fn fold_wireguard_into_params(params_raw: &str, fold: &WireguardFold) -> Str
     }
 }
 
-/// Config-completeness T04: AmneziaWG matrix fold state — raw UI strings.
-/// `version` is the keep-blank Select value (`""` = no selection, never
-/// fabricated, never stripped). Junk-train numerics, S-lengths, H-ranges,
-/// I-chains and v3 texts all fold as text (engine coercion + fork `check`
-/// judge shapes; a failed parse stays verbatim for `check` to name loudly).
-/// `enable_amnezia` is a UI-state marker (Throne parity) — the engine
-/// consumes it without emission (brutal-speeds precedent). Trailers/cookies
-/// pass through for the fork `check` (R7 — hermetic shape proof in-ledger).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AmneziaFold {
     pub enable_amnezia: bool,
@@ -2042,11 +1580,6 @@ pub struct AmneziaFold {
     pub disable_cookies: bool,
 }
 
-/// Config-completeness T04: fold the AmneziaWG matrix into a params JSON
-/// text. Always folds every key regardless of the live `awg_version`
-/// selection — hiding the v3 section hides inputs but preserves stored
-/// values (R5); a v3 key on a 2.0 row fails generate naming the field
-/// (engine version gate, never a silent strip). Byte-identical on no-ops.
 pub fn fold_amneziawg_into_params(params_raw: &str, fold: &AmneziaFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2110,19 +1643,10 @@ pub fn fold_amneziawg_into_params(params_raw: &str, fold: &AmneziaFold) -> Strin
     }
 }
 
-/// Config-completeness T05: hysteria `auth_type` marker (the Throne
-/// `""|STRING|BASE64` spelling; `""` is the blank picker row) and the TUIC
-/// `congestion_control` / `udp_relay_mode` spellings (the engine allowlists).
-/// One source for picker, prefill and fold — a value the UI cannot pick is a
-/// value the fold cannot write.
 pub const HY_AUTH_TYPES: [&str; 2] = ["STRING", "BASE64"];
 pub const TUIC_CC_MODES: [&str; 3] = ["bbr", "cubic", "new_reno"];
 pub const TUIC_RELAY_MODES: [&str; 2] = ["native", "quic"];
 
-/// Config-completeness T05: shared TLS panel, forced variant (S2-forced).
-/// Same credential fields as [`TlsOptionalFold`] minus the enable toggle —
-/// security is locked `tls` (or `reality` with a public key). Raw UI strings
-/// exactly as the panel controls hold them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsForcedFold {
     pub sni: String,
@@ -2133,14 +1657,6 @@ pub struct TlsForcedFold {
     pub sid: String,
 }
 
-/// Config-completeness T05: fold the shared TLS panel, forced variant
-/// (S2-forced), into a params JSON text. Details fold blank-safe like the
-/// optional panel; `security` writes `reality` with a public key, `tls` when
-/// another detail was touched (locking the panel intent onto the row), and
-/// stands off untouched rows entirely (the engine defaults these protocols
-/// to TLS on, so an untouched page stays byte-identical). A stored
-/// `security=none` survives an untouched fold and fails at the engine naming
-/// the field — never silently repaired, never silently kept.
 pub fn fold_tls_forced_into_params(params_raw: &str, fold: &TlsForcedFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2201,18 +1717,6 @@ pub fn fold_tls_forced_into_params(params_raw: &str, fold: &TlsForcedFold) -> St
     }
 }
 
-/// Config-completeness T05: Hysteria inner fold state — raw UI strings
-/// exactly as the page controls hold them. Speeds fold as the engine
-/// `up`/`down` flats (v1 requires them, v2 `take_speed` coerces them to
-/// `up_mbps`/`down_mbps` — one input shape serves both wire grammars).
-/// `auth` is the v1 secret, `password` the v2 secret; the fold writes exactly
-/// one of them per `is_v2` (each credential folds only where its engine arm
-/// consumes it — a v2 `password` riding a v1 row would fail `check` as an
-/// unknown field). Every other key folds on both layouts (R5 hide-preserve —
-/// the layout toggle never wipes); v1-only tunables on a v2 row fail at the
-/// engine naming the field (AWG v2-negative precedent). Numerics fold as TEXT
-/// (aid precedent — the engine coerces); `auth_type` is keep-blank (no
-/// fabricated marker, contract C2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HysteriaFold {
     pub server_ports: String,
@@ -2228,9 +1732,6 @@ pub struct HysteriaFold {
     pub password: String,
 }
 
-/// Config-completeness T05: fold the Hysteria inner fields into a params JSON
-/// text. `is_v2` selects the credential (`password` on v2, `auth` on v1);
-/// blank inputs never touch the object. Byte-identical on no-ops.
 pub fn fold_hysteria_into_params(params_raw: &str, fold: &HysteriaFold, is_v2: bool) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2267,12 +1768,6 @@ pub fn fold_hysteria_into_params(params_raw: &str, fold: &HysteriaFold, is_v2: b
     }
 }
 
-/// Config-completeness T05: TUIC inner fold state — raw UI strings exactly as
-/// the page controls hold them. `congestion_control` / `udp_relay_mode` are
-/// keep-blank selects (no fabricated mode, contract C2); `zero_rtt_handshake`
-/// is the sing-box spelling (the Throne `zero_rtt` reads as an alias but is
-/// never written — a verbatim key would ride to the endpoint as an unknown
-/// field). `heartbeat` stays text (a duration like `10s`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuicFold {
     pub uuid: String,
@@ -2284,8 +1779,6 @@ pub struct TuicFold {
     pub heartbeat: String,
 }
 
-/// Config-completeness T05: fold the TUIC inner fields into a params JSON
-/// text. Blank inputs never touch the object. Byte-identical on no-ops.
 pub fn fold_tuic_into_params(params_raw: &str, fold: &TuicFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2320,19 +1813,9 @@ pub fn fold_tuic_into_params(params_raw: &str, fold: &TuicFold) -> String {
     }
 }
 
-/// Config-completeness T06: SOCKS versions (the `version` Select on the
-/// SOCKS page) and Naïve congestion modes (the `congestion_control` Select
-/// on the Naïve page, sing-box `quic_congestion_control` values per the
-/// 1.14.2 naive schema). One source for picker, prefill and fold — a value
-/// the UI cannot pick is a value the fold cannot write.
 pub const SOCKS_VERSIONS: [&str; 2] = ["5", "4"];
 pub const NAIVE_CC_MODES: [&str; 4] = ["bbr", "bbr2", "cubic", "reno"];
 
-/// Config-completeness T06: prefill one comma-list value (ssh `host_key` /
-/// `host_key_algorithms`) — string arrays join with ", " so a stored list
-/// echoes into its text input; anything else reads like
-/// [`guided_prefill_value`] (import query strings echo verbatim). Blank for
-/// unparseable JSON or missing keys.
 pub fn guided_prefill_list(params_raw: &str, keys: &[&str]) -> String {
     let obj = serde_json::from_str::<serde_json::Value>(params_raw)
         .ok()
@@ -2362,12 +1845,6 @@ pub fn guided_prefill_list(params_raw: &str, keys: &[&str]) -> String {
     guided_prefill_value(params_raw, keys)
 }
 
-/// Config-completeness T06: write one comma-list text value as a JSON string
-/// array (sing-box `host_key` / `host_key_algorithms` are lists — a bare
-/// string would fail `check`). Blank never touches the object; a value whose
-/// comma-split already matches the stored spelling (array or comma string)
-/// no-ops, so untouched echoes stay byte-identical. Anything else writes the
-/// canonical array. Returns true when the object changed.
 fn fold_comma_list(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     canonical: &str,
@@ -2419,13 +1896,6 @@ fn fold_comma_list(
     true
 }
 
-/// Config-completeness T06: write one keep-blank select value across read
-/// aliases — blank never touches the object (no fabrication, no strip);
-/// non-blank no-ops when any alias already holds it (import spellings echo
-/// byte-identical, the engine folds them at generate); otherwise writes the
-/// canonical key. Returns true when the object changed. (The single-key
-/// [`fold_select_keep_blank`] cannot do the alias half without changing its
-/// T03/T05 call sites.)
 fn fold_select_keep_blank_aliases(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     canonical: &str,
@@ -2446,13 +1916,6 @@ fn fold_select_keep_blank_aliases(
     true
 }
 
-/// Config-completeness T06: SOCKS inner fold state — raw UI strings exactly
-/// as the page controls hold them. `version` is keep-blank (blank leaves the
-/// stock default 5 — the engine omits it; "4" folds and fails generate naming
-/// the field, never a guessed emission). `network` follows the S1 rule
-/// ("tcp" restores the default by removing the key; the engine allows
-/// tcp|udp only). `udp_over_tcp` folds the sing-box bool reading the `uot`
-/// spelling too (ss-page precedent).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SocksFold {
     pub version: String,
@@ -2462,8 +1925,6 @@ pub struct SocksFold {
     pub udp_over_tcp: bool,
 }
 
-/// Config-completeness T06: fold the SOCKS inner fields into a params JSON
-/// text. Blank inputs never touch the object. Byte-identical on no-ops.
 pub fn fold_socks_into_params(params_raw: &str, fold: &SocksFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2491,10 +1952,6 @@ pub fn fold_socks_into_params(params_raw: &str, fold: &SocksFold) -> String {
     }
 }
 
-/// Config-completeness T06: HTTP/HTTPS inner fold state — raw UI strings.
-/// `path`/`headers` are parity+ (Throne `edit_http.ui` lacks them, both
-/// engines accept them): they fold as text and `check` judges the shape
-/// loudly. Blank inputs never touch the object.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpFold {
     pub username: String,
@@ -2503,8 +1960,6 @@ pub struct HttpFold {
     pub headers: String,
 }
 
-/// Config-completeness T06: fold the HTTP/HTTPS inner fields into a params
-/// JSON text. Byte-identical on no-ops.
 pub fn fold_http_into_params(params_raw: &str, fold: &HttpFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2526,12 +1981,6 @@ pub fn fold_http_into_params(params_raw: &str, fold: &HttpFold) -> String {
     }
 }
 
-/// Config-completeness T06: AnyTLS inner fold state — raw UI strings exactly
-/// as the page controls hold them. `interval`/`timeout` fold the sing-box
-/// duration texts (`idle_session_check_interval` / `idle_session_timeout`,
-/// e.g. "30s") reading the Throne short names too; `min` folds the count
-/// (`min_idle_session`) as a number (garbage stays a string for `check` to
-/// name loudly).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnytlsFold {
     pub password: String,
@@ -2540,8 +1989,6 @@ pub struct AnytlsFold {
     pub min: String,
 }
 
-/// Config-completeness T06: fold the AnyTLS inner fields into a params JSON
-/// text. Blank inputs never touch the object. Byte-identical on no-ops.
 pub fn fold_anytls_into_params(params_raw: &str, fold: &AnytlsFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2573,12 +2020,6 @@ pub fn fold_anytls_into_params(params_raw: &str, fold: &AnytlsFold) -> String {
     }
 }
 
-/// Config-completeness T06: Naïve inner fold state — raw UI strings exactly
-/// as the page controls hold them. `udp_over_tcp` folds the sing-box bool
-/// (docs: replaceable with a boolean) reading the Throne `uot` spelling too;
-/// `quic` folds the bool; `congestion_control` is keep-blank over the
-/// sing-box `quic_congestion_control` (blank leaves the chromium default
-/// cubic — contract C2, never fabricated).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NaiveFold {
     pub username: String,
@@ -2588,8 +2029,6 @@ pub struct NaiveFold {
     pub congestion_control: String,
 }
 
-/// Config-completeness T06: fold the Naïve inner fields into a params JSON
-/// text. Blank inputs never touch the object. Byte-identical on no-ops.
 pub fn fold_naive_into_params(params_raw: &str, fold: &NaiveFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2622,12 +2061,6 @@ pub fn fold_naive_into_params(params_raw: &str, fold: &NaiveFold) -> String {
     }
 }
 
-/// Config-completeness T06: SSH inner fold state — raw UI strings exactly as
-/// the page controls hold them. `user` is the sing-box spelling (the engine
-/// folds `username` at generate, canonical wins); `private_key_passphrase`
-/// is the sing-box spelling (reads the Throne `private_key_pass` too);
-/// `host_key` / `host_key_algorithms` fold comma-lists to arrays (a bare
-/// string would fail `check`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SshFold {
     pub user: String,
@@ -2640,8 +2073,6 @@ pub struct SshFold {
     pub client_version: String,
 }
 
-/// Config-completeness T06: fold the SSH inner fields into a params JSON
-/// text. Blank inputs never touch the object. Byte-identical on no-ops.
 pub fn fold_ssh_into_params(params_raw: &str, fold: &SshFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2692,39 +2123,16 @@ pub fn fold_ssh_into_params(params_raw: &str, fold: &SshFold) -> String {
     }
 }
 
-/// Config-completeness T07: Snell versions the engine maps (4|6 — absent
-/// means 4, anything else fails generate naming `version`). One source for
-/// the picker, the prefill reader and the fold below.
 pub const SNELL_VERSIONS: [&str; 2] = ["4", "6"];
 
-/// Config-completeness T07: ShadowTLS versions the engine maps (1|2|3 —
-/// absent takes the schema default 1; v1 rows omit the password). One source
-/// for the picker, the prefill reader and the fold below.
 pub const SHADOWTLS_VERSIONS: [&str; 3] = ["1", "2", "3"];
 
-/// Config-completeness T07: Xray stream networks (verified
-/// `xrayStreamSetting.h:5` via the audit — no tcp/quic on the Xray page).
-/// One source for the picker, the prefill reader and the fold below.
 pub const XRAY_NETWORKS: [&str; 5] = ["raw", "xhttp", "ws", "httpupgrade", "grpc"];
 
-/// Config-completeness T07: Xray VLESS flows (audit §3: the sing-box flow
-/// plus `xtls-rprx-vision-udp443`). One source for the picker and the fold.
 pub const XRAY_FLOWS: [&str; 2] = ["xtls-rprx-vision", "xtls-rprx-vision-udp443"];
 
-/// Config-completeness T07: Xray mux modes (audit §3 `xray_mux` — Keep
-/// Default is the blank row, never a stored value). One source for the
-/// picker, the prefill reader and the fold below.
 pub const XRAY_MUX_MODES: [&str; 2] = ["enabled", "disabled"];
 
-/// Config-completeness T07: Snell inner fold state — raw UI strings exactly
-/// as the page controls hold them. Engine-driven field list (Throne source
-/// has zero `snell` hits — no Throne editor to copy): `psk` text (required),
-/// `version` keep-blank over 4|6 (blank leaves the engine default 4 —
-/// contract C2, never fabricated), `obfs_mode`/`obfs_host`/`userkey` /
-/// `network`/`mode` as text (the engine passes them through for stock
-/// `check` to judge), `reuse` as a bool Switch. Blank inputs never touch the
-/// object (keep-blank — a stored value survives a blank pick for the engine
-/// gate to name, R5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnellFold {
     pub psk: String,
@@ -2737,9 +2145,6 @@ pub struct SnellFold {
     pub mode: String,
 }
 
-/// Config-completeness T07: fold the Snell inner fields into a params JSON
-/// text. Byte-identical on no-ops (including unparseable input, which
-/// returns unchanged so validation names that error).
 pub fn fold_snell_into_params(params_raw: &str, fold: &SnellFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2770,18 +2175,12 @@ pub fn fold_snell_into_params(params_raw: &str, fold: &SnellFold) -> String {
     }
 }
 
-/// Config-completeness T07: ShadowTLS inner fold state — `version`
-/// keep-blank over 1|2|3 (blank leaves the schema default 1; import omits it
-/// on passwordless v1 rows) plus the v2/v3 `password` text. The page adds
-/// the shared S2-forced + S4 panels around these two fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShadowTlsFold {
     pub version: String,
     pub password: String,
 }
 
-/// Config-completeness T07: fold the ShadowTLS inner fields into a params
-/// JSON text. Byte-identical on no-ops.
 pub fn fold_shadowtls_into_params(params_raw: &str, fold: &ShadowTlsFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2801,14 +2200,6 @@ pub fn fold_shadowtls_into_params(params_raw: &str, fold: &ShadowTlsFold) -> Str
     }
 }
 
-/// Config-completeness T07: Xray-VLESS Ph1 inner fold state — the common
-/// subset only (`uuid`/`encryption`/`flow` + `sni`/`fp`/`alpn` + REALITY
-/// `pbk`/`sid`/`spiderx` + `network`/`mode` + `xray_mux`). Selects are
-/// keep-blank over their closed sets (never fabricated, never stripped);
-/// every other key already in the object — Ph2-only `xray_*`, `path`/`host`,
-/// `security`, `packetEncoding` — is never touched (preserved byte-identical
-/// for the bridge to pass through or the sidecar to judge). No Ph2 matrix
-/// smuggling: XHTTP/xmux/session keys get no inputs here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct XrayFold {
     pub uuid: String,
@@ -2825,9 +2216,6 @@ pub struct XrayFold {
     pub mux: String,
 }
 
-/// Config-completeness T07: fold the Xray-VLESS Ph1 fields into a params
-/// JSON text. Byte-identical on no-ops; unknown keys (Ph2 matrix included)
-/// round-trip untouched.
 pub fn fold_xray_into_params(params_raw: &str, fold: &XrayFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2857,11 +2245,6 @@ pub fn fold_xray_into_params(params_raw: &str, fold: &XrayFold) -> String {
     }
 }
 
-/// Config-completeness T07: extra-core inner fold state — `exe` path text
-/// (reads the `binary` spelling too, writes `exe`), `args` text (stored with
-/// the row — the v1 spawn convention is `<exe> -c <file>`, so the footer
-/// says so honestly), `config` text (a JSON string or object — the sidecar
-/// file body). Blank inputs never touch the object.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtraFold {
     pub exe: String,
@@ -2869,11 +2252,6 @@ pub struct ExtraFold {
     pub config: String,
 }
 
-/// Config-completeness T07: fold one extra-core `config` text — blank never
-/// touches the object; text that parses as JSON compares against the stored
-/// value (object or string) so untouched echoes stay byte-identical;
-/// anything else lands as a string for the engine to name loudly (never a
-/// silently kept old value). Returns true when the object changed.
 fn fold_extra_config(obj: &mut serde_json::Map<String, serde_json::Value>, value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
@@ -2890,9 +2268,6 @@ fn fold_extra_config(obj: &mut serde_json::Map<String, serde_json::Value>, value
     }
 }
 
-/// Config-completeness T07: fold the extra-core inner fields into a params
-/// JSON text. Byte-identical on no-ops. Never writes `no_logs` (Throne
-/// non-persist bug — no such control exists anywhere).
 pub fn fold_extra_into_params(params_raw: &str, fold: &ExtraFold) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -2913,10 +2288,6 @@ pub fn fold_extra_into_params(params_raw: &str, fold: &ExtraFold) -> String {
     }
 }
 
-/// Config-completeness T07: echo one extra-core `config` value into its
-/// textarea — strings read verbatim, objects/arrays read as compact JSON
-/// (the fold re-parses them, so untouched echoes refold byte-identical).
-/// Blank for unparseable JSON or a missing key.
 pub fn extra_config_prefill(params_raw: &str) -> String {
     let obj = serde_json::from_str::<serde_json::Value>(params_raw)
         .ok()
@@ -2937,13 +2308,6 @@ pub fn extra_config_prefill(params_raw: &str) -> String {
     }
 }
 
-/// Config-completeness T07: dialog-Validate shape for extra-core rows —
-/// `exe` present plus a present, JSON-valid `config` (string or object).
-/// Field-naming errors for the Validate button (the commit path keeps the
-/// import contract untouched — import rows land disabled and fail at start
-/// naming the same fields through the engine gate, never newly rejected at
-/// intake). The executable NAME hygiene (`is_bad_extra_exe_name`) stays
-/// single-owned by the engine (no drifted duplicate here).
 pub fn validate_extra_params(params_raw: &str) -> Result<(), String> {
     let obj = serde_json::from_str::<serde_json::Value>(params_raw)
         .ok()
@@ -2977,10 +2341,6 @@ pub fn validate_extra_params(params_raw: &str) -> Result<(), String> {
     }
 }
 
-/// Config-completeness T07: chain hop kinds for the hop-list editor —
-/// `Other` covers standard rows, unknown ids and inline objects alike (the
-/// engine judges those at generate, loudly; the editor only gates what the
-/// ticket names: nested chains and misplaced extracore).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainHopSlot {
     Chain,
@@ -2989,14 +2349,6 @@ pub enum ChainHopSlot {
     Other,
 }
 
-/// Config-completeness T07: Throne hop rule for one add/replace — `existing`
-/// holds the current hops' kinds in order, `candidate` the picked row's
-/// kind, `index` the insert (add) or target (replace) position. Returns the
-/// rule-naming refusal, or `None` when the hop may land. Rules (Throne
-/// `edit_chain.ui` parity): v1 chains are flat (no chain/autoselector hops
-/// ever), at most one extracore hop and only at index 0. Engine egress-only
-/// placement (Extra/Custom/Xray last) is NOT gated here — generate names it
-/// at start.
 pub fn chain_hop_rejection(
     existing: &[ChainHopSlot],
     candidate: ChainHopSlot,
@@ -3037,10 +2389,6 @@ pub fn chain_hop_rejection(
     None
 }
 
-/// Config-completeness T07: read one chain row's `nodes` array — id
-/// references stay strings, inline outbound objects stay objects. Empty for
-/// unparseable JSON, a missing key, or a non-array value (the JSON stays the
-/// source of truth; the editor only echoes it).
 pub fn chain_nodes_of(params_raw: &str) -> Vec<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(params_raw)
         .ok()
@@ -3050,11 +2398,6 @@ pub fn chain_nodes_of(params_raw: &str) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// Config-completeness T07: fold the hop-list editor state into a params
-/// JSON text — writes the full `nodes` array when it differs (an explicit
-/// clear-all writes `[]`, which generate refuses naming `nodes`); untouched
-/// editors stay byte-identical (the empty editor over a nodeless template is
-/// a no-op, so fresh chain rows commit without a fabricated key).
 pub fn fold_chain_nodes_into_params(params_raw: &str, nodes: &[serde_json::Value]) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(params_raw) {
         Ok(value) => value,
@@ -3078,24 +2421,15 @@ pub fn fold_chain_nodes_into_params(params_raw: &str, nodes: &[serde_json::Value
     value.to_string()
 }
 
-/// Ticket 05 (signal-box): guided mini-form mapping for one protocol.
-/// `None` means unknown protocol (the commit names it through the normal
-/// validation path). `key = None` means a known protocol with no link
-/// secret — the Identity input hides while Server + Server port still fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuidedIdentity {
-    /// Params key the Identity input fills (`None` = no secret).
     pub key: Option<&'static str>,
-    /// Alias keys for prefill/compare (first entry is `key` when set).
+
     pub read_keys: &'static [&'static str],
-    /// Human credential list for the guided hint line.
+
     pub needs: &'static str,
 }
 
-/// Ticket 05: primary identity key + read aliases + needs-label per
-/// protocol. Key sets mirror [`validate_protocol_params`] exactly (same
-/// credential per protocol) so the mini-form can never disagree with the
-/// commit gate about what a row needs.
 pub fn guided_identity_fields(protocol: &str) -> Option<GuidedIdentity> {
     let canonical = canonical_protocol(protocol)?;
     let guided = match canonical.as_str() {
@@ -3144,8 +2478,7 @@ pub fn guided_identity_fields(protocol: &str) -> Option<GuidedIdentity> {
             read_keys: &["password"],
             needs: "username and password",
         },
-        // Ticket 07 (throne-adoption): parse-only protocols (key sets mirror
-        // [`validate_protocol_params`] exactly, same contract as above).
+
         "mieru" => GuidedIdentity {
             key: Some("password"),
             read_keys: &["password"],
@@ -3191,10 +2524,6 @@ pub fn guided_identity_fields(protocol: &str) -> Option<GuidedIdentity> {
     Some(guided)
 }
 
-/// Ticket 05: prefill one guided mini-form value from a params JSON object
-/// (case-insensitive across `keys`; numbers stringify). Blank for
-/// unparseable JSON or missing keys — the JSON stays the source of truth,
-/// the mini-form only echoes it.
 pub fn guided_prefill_value(params_raw: &str, keys: &[&str]) -> String {
     let obj = serde_json::from_str::<serde_json::Value>(params_raw)
         .ok()
@@ -3205,15 +2534,6 @@ pub fn guided_prefill_value(params_raw: &str, keys: &[&str]) -> String {
     }
 }
 
-/// Ticket 05: fold non-blank guided mini-form values into the params JSON
-/// text. Blank guided inputs leave the JSON byte-identical (the
-/// template/typed JSON stands, and untouched edit fields stay silent — no
-/// spurious patches from reserialization). Unparseable or non-object JSON
-/// returns unchanged so validation names that error. A non-blank server
-/// port outside 1-65535 (or unparseable) is written as a string so
-/// validation fails naming server_port instead of silently keeping the
-/// JSON's port. `identity` is `(key, read_aliases)`: the value compares
-/// across every alias but writes to `key` only.
 pub fn fold_guided_into_params(
     params_raw: &str,
     server: &str,
@@ -3243,8 +2563,7 @@ pub fn fold_guided_into_params(
         Some(obj) => obj,
         None => return params_raw.to_string(),
     };
-    // Reads borrow per call (never held across an insert — NLL ends each
-    // borrow before the mutation below).
+
     let mut changed = false;
     if !server.is_empty() && lookup_case_insensitive(obj, SERVER_KEYS).as_deref() != Some(server) {
         obj.insert(
@@ -3290,10 +2609,6 @@ pub fn fold_guided_into_params(
     }
 }
 
-/// Ticket 16: true when a params JSON object carries the import shape
-/// (`type`/`protocol` + `server`/`address` + `server_port`/`port`). Same
-/// predicate as [`export_payload`]: only these rows round-trip through the
-/// import grammar; opaque rows (e.g. `"{}"`) stay metadata-only.
 fn value_is_import_shaped(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
     let has_kind = obj.contains_key("type") || obj.contains_key("protocol");
     let has_host = obj.contains_key("server") || obj.contains_key("address");
@@ -3301,10 +2616,6 @@ fn value_is_import_shaped(obj: &serde_json::Map<String, serde_json::Value>) -> b
     has_kind && has_host && has_port
 }
 
-/// Ticket 16: true when `params` parses as a JSON object with the import
-/// shape. Used by the export toast (re-importable count) and by manual
-/// validation (only import-shaped rows get per-protocol credential checks,
-/// so legacy opaque rows like `"{}"` keep working).
 pub fn is_import_shaped_params(params: &str) -> bool {
     match serde_json::from_str::<serde_json::Value>(params) {
         Ok(serde_json::Value::Object(map)) => value_is_import_shaped(&map),
@@ -3312,7 +2623,6 @@ pub fn is_import_shaped_params(params: &str) -> bool {
     }
 }
 
-/// Ticket 16: number of rows whose params re-import through the grammar.
 pub fn count_importable(configs: &[ProxyConfig]) -> usize {
     configs
         .iter()
@@ -3320,10 +2630,6 @@ pub fn count_importable(configs: &[ProxyConfig]) -> usize {
         .count()
 }
 
-/// Ticket 28: kept case-insensitive on purpose — manual dialog params have
-/// no canonical key casing, while the import side (`json_string`) matches
-/// exact format keys; folding both to one lookup would newly accept or miss
-/// keys on one path.
 fn lookup_case_insensitive(
     obj: &serde_json::Map<String, serde_json::Value>,
     keys: &[&str],
@@ -3344,13 +2650,6 @@ fn lookup_case_insensitive(
     None
 }
 
-/// Ticket 16: validate a manual protocol + params pair like the import path
-/// does. Unknown protocols and non-JSON params are `protocol`/`params` field
-/// errors (row not created). Import-shaped params additionally require the
-/// per-protocol credential from research 05 (uuid/password/keys/…) plus a
-/// sane server/port; opaque params (e.g. `"{}"`) pass through so legacy
-/// hand rows and the `subscription_refresh_removes_only_owned` seed keep
-/// working. Reality without `pbk` is rejected like the link parsers.
 fn validate_protocol_params(
     protocol_raw: &str,
     params_raw: &str,
@@ -3442,17 +2741,12 @@ fn validate_protocol_params(
             }
             "anytls" => has(&["password"]),
             "naive" => has(&["username", "user"]) && has(&["password"]),
-            // Ticket 27: SSH needs a user plus one secret (password or
-            // private key); standalone Noise needs one noise secret
-            // (password or key) so rows never connect nowhere silently.
+
             "ssh" => has(&["username", "user"]) && has(&["password", "private_key", "privatekey"]),
             "noise" => has(&["password", "key"]),
-            // Ticket 42: snell needs its psk; shadowtls/socks/http serve
-            // without link credentials (v1 shadowtls omits the password).
+
             "snell" => has(&["psk"]),
-            // Ticket 07 (throne-adoption): parse-only credential gates
-            // mirroring the import side (never commit-ok/serve-fail on
-            // missing secrets).
+
             "mieru" => has(&["username", "user"]) && has(&["password"]),
             "juicity" => has(&["uuid", "id"]) && has(&["password"]),
             "trusttunnel" => has(&["username", "user"]) && has(&["password"]),
@@ -3472,7 +2766,7 @@ fn validate_protocol_params(
                 "ssh" => "username and a password or private_key",
                 "noise" => "password or key",
                 "snell" => "psk",
-                // Ticket 07 (throne-adoption): parse-only credential names.
+
                 "mieru" => "username and password",
                 "juicity" => "uuid and password",
                 "trusttunnel" => "username and password",
@@ -3481,22 +2775,14 @@ fn validate_protocol_params(
             errors.push(missing(what));
             return None;
         }
-        // Config-completeness T05: hysteria v1 rows cannot start without
-        // upload/download speeds (the engine hard-requires the `up`/`down`
-        // flats) — refuse at commit naming the page fields instead of
-        // producing a parse-ok/start-fail row. v2 leaves them optional
-        // (BBR-by-omission), so no gate there.
+
         if canonical == "hysteria"
             && !(has(&["up", "up_mbps", "upmbps"]) && has(&["down", "down_mbps", "downmbps"]))
         {
             errors.push(missing("up_mbps and down_mbps"));
             return None;
         }
-        // Config-completeness review: brutal speeds are panel state the
-        // engine preserves but never emits (no 1.14.2 mapping — follow-up),
-        // so garbage here would ride silently forever. Blank stays a
-        // no-op (untouched panels); JSON numbers pass; anything else must
-        // parse as Mbps, else the commit names the field.
+
         for key in [
             "brutal_up_mbps",
             "brutal_down_mbps",
@@ -3533,11 +2819,6 @@ fn validate_protocol_params(
     Some((canonical, params_text))
 }
 
-/// Ticket 09 (throne-adoption): the stored server hostname of a params
-/// blob, if it names a domain (not an IP literal). `None` means nothing
-/// to resolve — unparseable, no server key, blank, or already an IP.
-/// Pure seam: the UI resolves the returned hostname and saves
-/// [`rewrite_server_to_ip`]'s output.
 pub fn row_server_hostname(params_raw: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(params_raw.trim()).ok()?;
     let obj = value.as_object()?;
@@ -3556,11 +2837,6 @@ pub fn row_server_hostname(params_raw: &str) -> Option<String> {
     None
 }
 
-/// Ticket 09 (throne-adoption): rewrite a params blob's `server` (or
-/// `address`) hostname to a looked-up IP. Returns `None` when there is
-/// nothing to rewrite (see [`row_server_hostname`]); otherwise the
-/// re-serialized object with every other key byte-preserved through
-/// serde. Group-with-confirm and row-save both commit this string.
 pub fn rewrite_server_to_ip(params_raw: &str, ip: &str) -> Option<String> {
     row_server_hostname(params_raw)?;
     let mut value: serde_json::Value = serde_json::from_str(params_raw.trim()).ok()?;
@@ -3573,70 +2849,46 @@ pub fn rewrite_server_to_ip(params_raw: &str, ip: &str) -> Option<String> {
     }
     None
 }
-/// Ticket 04: a subscription refresh source. Refresh upserts ProxyConfigs in
-/// `group` keyed by normalized identity (never the remark); it never deletes
-/// hand-created configs and never enables or starts anything.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
-    /// Stable string id, never reused.
     pub id: String,
     pub label: String,
     pub url: String,
     pub group: String,
     pub auto_refresh: bool,
-    /// Unix seconds of the last successful refresh, if any.
+
     pub last_refresh_at: Option<i64>,
-    /// Last fetch/parse failure, cleared on the next success.
+
     pub last_error: Option<String>,
-    /// Ticket 17: latest per-item refresh failures (stored vec behind the
-    /// per-subscription failures view; cleared on a clean refresh, kept on a
-    /// fetch error which parsed nothing new).
+
     pub failures: Vec<crate::import::ImportFailure>,
-    /// Ticket 40 (v5): per-subscription auto-refresh interval in seconds.
-    /// Missing/legacy rows read as [`DEFAULT_AUTO_REFRESH_SECS`]; `<= 0`
-    /// means always due (matches [`due_for_refresh`] semantics).
+
     pub interval_secs: i64,
-    /// Ticket 08 (throne-adoption): quota snapshot from the
-    /// `Subscription-Userinfo` response header (`upload` + `download` land
-    /// in `quota_used`, `total` in `quota_total`, `expire` in
-    /// `quota_expire`). All `None` when the provider sends no header (or
-    /// the last success carried none) — the Manage Groups rows read these
-    /// for `Used / Remain / Expire`. Never secrets, plain integers.
+
     pub quota_used: Option<i64>,
     pub quota_total: Option<i64>,
     pub quota_expire: Option<i64>,
 }
 
-/// Ticket 04: outcome of one refresh merge. `error` is `Some` when the body
-/// failed to parse, in which case prior members were kept untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshOutcome {
     pub added: usize,
     pub updated: usize,
     pub removed: usize,
     pub duplicates: usize,
-    /// Desired rows skipped because the user deleted them (tombstoned).
+
     pub skipped: usize,
-    /// Ticket 25: owned rows where the user changed params/protocol AND
-    /// upstream changed them too (or rotated identity under a user edit).
-    /// The user's version is kept in place — never silently reverted — and
-    /// each such row counts here exactly once so the UI can surface it.
+
     pub conflicts: usize,
-    /// Ticket 08 (throne-adoption): owned rows that vanished upstream but
-    /// are currently serving — kept verbatim (never deleted, never
-    /// rewritten under a live endpoint) and reported as `[=] Still in
-    /// use`. They stay owned, so the next refresh revisits them.
+
     pub in_use: usize,
     pub failures: Vec<crate::import::ImportFailure>,
     pub error: Option<String>,
 }
 
-/// Default auto-refresh interval for subscriptions (ticket 04 scheduling
-/// hook): daily. The hook is [`due_for_refresh`]; the host decides when to
-/// evaluate it (v1: at startup for due subscriptions, plus manual refresh).
 pub const DEFAULT_AUTO_REFRESH_SECS: i64 = 86_400;
 
-/// Current Unix time in seconds (refresh bookkeeping).
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3644,9 +2896,6 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Auto-refresh scheduling hook: true when the subscription wants automatic
-/// refresh and has never succeeded or its last success is older than
-/// `interval_secs`.
 pub fn due_for_refresh(subscription: &Subscription, now: i64, interval_secs: i64) -> bool {
     if !subscription.auto_refresh {
         return false;
@@ -3657,22 +2906,10 @@ pub fn due_for_refresh(subscription: &Subscription, now: i64, interval_secs: i64
     }
 }
 
-/// Ticket 40 (v5): per-subscription due check honoring
-/// [`Subscription::interval_secs`] (missing/`<= 0` means always due once a
-/// prior success exists; never-refreshed auto subs are always due).
 pub fn due_for_refresh_for(subscription: &Subscription, now: i64) -> bool {
     due_for_refresh(subscription, now, subscription.interval_secs)
 }
 
-/// Ticket 08 (throne-adoption): quota snapshot parsed from one
-/// `Subscription-Userinfo` response header
-/// (`upload=…; download=…; total=…; expire=…`). Keys match
-/// case-insensitively; surrounding whitespace is ignored; unparseable
-/// values are skipped (never a whole-header failure). `used` is
-/// `upload + download` saturating (a present-but-garbled pair still yields
-/// `None`, never a guessed zero). `None` when the header carries no usable
-/// quota pair — the caller then clears the stored snapshot so a provider
-/// that stops reporting never shows stale numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SubscriptionQuota {
     pub used: Option<i64>,
@@ -3680,23 +2917,19 @@ pub struct SubscriptionQuota {
     pub expire: Option<i64>,
 }
 
-/// Parse one `Subscription-Userinfo` header value into a
-/// [`SubscriptionQuota`]. Returns `None` when nothing usable parses
-/// (empty header, no keys, or all values garbled).
 pub fn parse_subscription_userinfo(header: &str) -> Option<SubscriptionQuota> {
     fn parse_int(raw: &str) -> Option<i64> {
         let text = raw.trim();
         if text.is_empty() {
             return None;
         }
-        // Plain integers only — floats, units, and signs never appear in
-        // this header; anything else is garbled, not zero.
+
         if !text.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         let digits = text.trim_start_matches('0');
         let digits = if digits.is_empty() { "0" } else { digits };
-        // Saturate absurd magnitudes instead of wrapping.
+
         if digits.len() > 19 {
             return Some(i64::MAX);
         }
@@ -3740,26 +2973,20 @@ pub fn parse_subscription_userinfo(header: &str) -> Option<SubscriptionQuota> {
     })
 }
 
-/// Map one subscription row to a Subscription.
 fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
     let id: i64 = row.get(0)?;
     let auto_refresh: i64 = row.get(4)?;
     let failures_raw: Option<String> = row.get(7)?;
-    // Ticket 40: v5 `interval_secs` is column 8 when present; legacy rows
-    // (v0–v4 fixtures, hand-built SELECTs) fall back to the default.
+
     let interval_secs: Option<i64> = row.get(8).ok();
-    // Ticket 08 (throne-adoption): quota columns are 9–11 when present;
-    // legacy rows and hand-built SELECTs read as no-quota (never an error).
+
     let quota_used: Option<i64> = row.get(9).ok().flatten();
     let quota_total: Option<i64> = row.get(10).ok().flatten();
     let quota_expire: Option<i64> = row.get(11).ok().flatten();
     Ok(Subscription {
         id: id.to_string(),
         label: row.get(1)?,
-        // Ticket 35/48: subscription URLs carry tokens, so the column is
-        // sealed at rest like params. Sealed values open here — the single
-        // read funnel; pre-seal rows (legacy databases, hand-built
-        // fixtures) pass through since all writers seal.
+
         url: {
             let stored: String = row.get(2)?;
             if stored.trim_start().starts_with(crate::dpapi::MARKER) {
@@ -3789,10 +3016,6 @@ fn map_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscriptio
     })
 }
 
-/// Ticket 17: encode per-item refresh failures for the
-/// `subscriptions.failures` column (JSON array of
-/// `{index, label, reason, code}`; labels/reasons arrive redacted from the
-/// import path, so no secrets reach the database).
 fn encode_failures(failures: &[crate::import::ImportFailure]) -> String {
     let items: Vec<serde_json::Value> = failures
         .iter()
@@ -3808,9 +3031,6 @@ fn encode_failures(failures: &[crate::import::ImportFailure]) -> String {
     serde_json::Value::Array(items).to_string()
 }
 
-/// Ticket 17: decode the `subscriptions.failures` column. Any corruption
-/// (foreign rows, hand edits, older databases) yields no failures — never a
-/// crash, never an error.
 fn decode_failures(raw: Option<String>) -> Vec<crate::import::ImportFailure> {
     use crate::import::{ImportErrorKind, ImportFailure};
     let text = raw.unwrap_or_default();
@@ -3824,8 +3044,6 @@ fn decode_failures(raw: Option<String>) -> Vec<crate::import::ImportFailure> {
     let mut out = Vec::new();
     if let Some(items) = value.as_array() {
         for item in items {
-            // Ticket 25: saturating conversion (never truncate a hostile u64
-            // on 32-bit targets); import.rs owns its own half.
             let index = item
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
@@ -3857,17 +3075,6 @@ fn decode_failures(raw: Option<String>) -> Vec<crate::import::ImportFailure> {
     out
 }
 
-/// Ticket 25: widened subscription identity. The import grammar's
-/// [`crate::import::normalized_identity`] deliberately excludes
-/// transport/security/flow/fingerprint fields (same server with a flow-only
-/// change is one row for paste dedupe). Refresh merging needs the opposite:
-/// two upstream nodes that share the narrow identity but differ in
-/// transport/security/flow/fp/pbk/alpn/plugin are two different nodes and
-/// must not over-merge into one row. This key is the narrow key plus those
-/// fields (case-insensitive lookup, enum-like values lowercased, secrets
-/// verbatim like the narrow key). Non-JSON params fall back exactly like the
-/// narrow key. The cutover of `commit_batch` to this key needs an import.rs
-/// change (ticket 26 territory); refresh uses it today.
 pub fn widened_identity(protocol: &str, params: &str) -> String {
     fn get(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
         keys.iter().find_map(|wanted| {
@@ -3918,16 +3125,9 @@ pub fn widened_identity(protocol: &str, params: &str) -> String {
         .collect(),
         None => Vec::new(),
     };
-    // Ticket 32: AmneziaWG obfuscation keys join the identity — two rows
-    // sharing server+creds but a different `jc` (or s/h/i junk tune) are
-    // two nodes, never over-merged into one. Appended only for AWG-like
-    // rows (protocol alias or any AWG-layer key present), so every other
-    // protocol's key is byte-identical to before (no re-key churn for
-    // stored identities). Values stay verbatim like the narrow key.
+
     if let Some(map) = &parsed {
         if is_awg_like(protocol, map) {
-            // Declared version first (`awg_version`, else legacy `version`),
-            // then every obfuscation slot in matrix order.
             extras.push(
                 get(map, &["awg_version", "version"])
                     .map(|value| value.trim().to_string())
@@ -3945,9 +3145,6 @@ pub fn widened_identity(protocol: &str, params: &str) -> String {
     format!("{narrow}\0{}", extras.join("\0"))
 }
 
-/// Ticket 32: AWG obfuscation slots behind [`widened_identity`] — the v2
-/// junk/length/header/CPS matrix plus the 3.x additions (same key sets the
-/// engine's version matrix validates).
 const AWG_IDENTITY_KEYS: &[&str] = &[
     "jc",
     "jmin",
@@ -3976,9 +3173,6 @@ const AWG_IDENTITY_KEYS: &[&str] = &[
     "disablecookies",
 ];
 
-/// Ticket 32: true for AmneziaWG-like rows — the protocol alias, or any
-/// AWG-layer key carried in the params (case-insensitive; links and conf
-/// files spell them `Jc`, `S1`, …).
 fn is_awg_like(protocol: &str, params: &serde_json::Map<String, serde_json::Value>) -> bool {
     match protocol.trim().to_ascii_lowercase().as_str() {
         "amneziawg" | "awg" | "amnezia-wg" => return true,
@@ -3990,12 +3184,6 @@ fn is_awg_like(protocol: &str, params: &serde_json::Map<String, serde_json::Valu
     })
 }
 
-/// Ticket 25: rotation-link core for in-place identity rotation: normalized
-/// server + numeric port, WITHOUT protocol or credentials. When upstream
-/// rotates identity (flow/security/password/protocol change on the same
-/// server:port), the vanished owned row and the unmatched desired item share
-/// this core, so the merge updates in place (keeps id/port/enabled) instead
-/// of delete + re-add. `None` for non-JSON params (never rotation-matched).
 fn rotation_core(params: &str) -> Option<String> {
     let map = serde_json::from_str::<serde_json::Value>(params)
         .ok()?
@@ -4036,10 +3224,6 @@ fn rotation_core(params: &str) -> Option<String> {
     Some(format!("{server}\0{}", port.trim()))
 }
 
-/// Ticket 40: derive the rotation core (`server\0port`) from a stored
-/// widened identity key (`protocol\0server\0port\0…`). `None` when the key
-/// is not in the expected shape (legacy/foreign tombstones match exactly
-/// only, never by core).
 fn rotation_core_from_identity_key(key: &str) -> Option<String> {
     let mut parts = key.split('\0');
     let _protocol = parts.next()?;
@@ -4051,9 +3235,6 @@ fn rotation_core_from_identity_key(key: &str) -> Option<String> {
     Some(format!("{server}\0{}", port.trim()))
 }
 
-/// Ticket 25: outcome of [`Store::restore_library_json`].
-/// (Test-driven API for ticket 26; see the callee's note.)
-/// Ticket 40: `presets` counts rebuilt route presets (full-fidelity export).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreOutcome {
     pub configs: usize,
@@ -4062,10 +3243,6 @@ pub struct RestoreOutcome {
     pub presets: usize,
 }
 
-/// True when two paths name the same file: canonical comparison when both
-/// resolve, parent-canonical + file-name comparison otherwise (the export
-/// target usually does not exist yet, so canonicalization alone never
-/// suffices), absolutized-lexical fallback last.
 fn paths_equal(a: &Path, b: &Path) -> bool {
     if let (Ok(canonical_a), Ok(canonical_b)) = (a.canonicalize(), b.canonicalize()) {
         return canonical_a == canonical_b;
@@ -4080,8 +3257,6 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     {
         #[cfg(windows)]
         {
-            // Windows paths are case-insensitive; canonicalization already
-            // normalized separators.
             return joined_a.to_string_lossy().to_lowercase()
                 == joined_b.to_string_lossy().to_lowercase();
         }
@@ -4100,7 +3275,6 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     absolutize(a) == absolutize(b)
 }
 
-/// Ticket 25 (L4): same-directory tmp sibling for atomic export writes.
 fn tmp_export_path(path: &Path) -> PathBuf {
     let tmp_name = format!(
         ".{}.tmp-{}",
@@ -4115,18 +3289,12 @@ fn tmp_export_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Append a SQLite sidecar suffix (`-wal`/`-shm`/`-journal`) at the
-/// OS-string level so non-UTF8 paths survive (never `display()` concat,
-/// which breaks on non-UTF8 bytes).
 fn sibling_sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut os = path.as_os_str().to_owned();
     os.push(suffix);
     PathBuf::from(os)
 }
 
-/// Process-unique filename suffix: `<ts>-<pid>-<counter>` so two
-/// quarantines/backups/restores in the same second never collide (same
-/// process shares pid+timestamp; the counter disambiguates).
 static NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn unique_name_suffix(ts: i64) -> String {
@@ -4136,17 +3304,10 @@ fn unique_name_suffix(ts: i64) -> String {
 
 pub struct Store {
     conn: Connection,
-    /// Ticket 40: live file behind this handle (`None` for `:memory:` test
-    /// stores). Powers backup-before-restore + temp-DB atomic swaps without
-    /// touching the live user DB from tests (isolated `MANYPROXY_DB` only).
+
     db_path: Option<PathBuf>,
 }
 
-/// Swap a rebuilt temp DB over the live path. Plain rename first; on
-/// Windows the destination may be open (this process's own live handle or
-/// a lingering lock) and rename fails — then remove the destination +
-/// sidecars and retry once, with copy-over as a last resort. Off-Windows
-/// the rename error propagates unchanged.
 fn swap_tmp_over_live(tmp: &Path, db_path: &Path) -> std::io::Result<()> {
     if std::fs::rename(tmp, db_path).is_ok() {
         return Ok(());
@@ -4171,14 +3332,10 @@ fn swap_tmp_over_live(tmp: &Path, db_path: &Path) -> std::io::Result<()> {
 }
 
 impl Store {
-    /// Open a throwaway store for unit tests.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         Self::open_with_path(Connection::open_in_memory()?, None)
     }
 
-    /// Ticket 14 test seam: drop the main tables so reads fail with
-    /// `StoreError::Sql` (lets UI tests trigger the DB-error paths with a
-    /// failing store instead of a silent empty list).
     #[cfg(test)]
     pub fn break_schema_for_test(&self) -> Result<(), StoreError> {
         self.conn.execute_batch(
@@ -4187,21 +3344,12 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 14 test seam: read-only mode so writes fail with
-    /// `StoreError::Sql` while reads keep working (lets UI tests select a
-    /// row first, then fail the toggle write).
     #[cfg(test)]
     pub fn set_query_only_for_test(&self) -> Result<(), StoreError> {
         self.conn.execute_batch("PRAGMA query_only = ON;")?;
         Ok(())
     }
 
-    /// Open (creating parents as needed) a file-backed store.
-    /// Ticket 27: the DB file holds secrets at rest — user-only permissions
-    /// apply on open (best-effort, never fails the open).
-    /// Ticket 40: corrupt/foreign files are quarantined aside as
-    /// `library.db.corrupt-<ts>` with a loud integrity error (never silent
-    /// in-memory loss); the caller offers restore-from-export.
     pub fn open_file(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -4211,17 +3359,14 @@ impl Store {
                 })?;
             }
         }
-        // Fast reject: a non-empty file that is not SQLite at all (bad magic)
-        // quarantines before rusqlite ever touches it. Reads only the 16-byte
-        // header (never the whole file for a magic check).
+
         if path.exists() {
             if let Ok(meta) = std::fs::metadata(path) {
                 if meta.len() > 0 {
                     if let Ok(mut file) = std::fs::File::open(path) {
                         use std::io::Read as _;
                         let mut head = [0u8; 16];
-                        // `read_exact` fails on short files; short-but-nonempty
-                        // files fall through to rusqlite (loud + quarantine).
+
                         if file.read_exact(&mut head).is_ok() {
                             let magic = b"SQLite format 3\0";
                             if head != *magic {
@@ -4237,8 +3382,6 @@ impl Store {
             }
         }
         let conn = Connection::open(path).map_err(|e| {
-            // `Connection::open` itself failed (e.g. not a database): try to
-            // preserve the bad file aside before failing loudly.
             if path.exists() {
                 let _ = Self::quarantine_corrupt_file(path);
             }
@@ -4247,10 +3390,6 @@ impl Store {
         let store = match Self::open_with_path(conn, Some(path.to_path_buf())) {
             Ok(store) => store,
             Err(error) => {
-                // A schema/migration failure on a file-backed open that smells
-                // like corruption (not a clean validation error) preserves the
-                // bad file aside. Clean validation errors (newer version,
-                // DPAPI-down, drift) propagate untouched so retries work.
                 let text = error.to_string();
                 let looks_corrupt = text.contains("not a database")
                     || text.contains("file is not a database")
@@ -4268,8 +3407,7 @@ impl Store {
                 return Err(error);
             }
         };
-        // Post-migration integrity gate: a page-level fault quarantines on
-        // next open, never silent in-memory loss.
+
         if let Err(error) = store.check_quick() {
             let text = error.to_string();
             drop(store);
@@ -4282,8 +3420,7 @@ impl Store {
             return Err(error);
         }
         harden_file_permissions(path);
-        // WAL sidecars (`<db>-wal`, `<db>-shm`) hold the same secrets;
-        // tighten them too when present.
+
         for sibling in [sibling_sidecar(path, "-wal"), sibling_sidecar(path, "-shm")] {
             if sibling.exists() {
                 harden_file_permissions(&sibling);
@@ -4292,8 +3429,6 @@ impl Store {
         Ok(store)
     }
 
-    /// Default file location: `%APPDATA%/ManyProxy/library.db` on Windows,
-    /// `$HOME/.manyproxy/library.db` elsewhere. `MANYPROXY_DB` overrides.
     pub fn default_path() -> PathBuf {
         if let Ok(path) = std::env::var("MANYPROXY_DB") {
             if !path.trim().is_empty() {
@@ -4312,21 +3447,16 @@ impl Store {
         let mut store = Self { conn, db_path };
         store.apply_pragmas()?;
         store.create_schema()?;
-        // Ticket 40: time-based health-history retention at startup (90d,
-        // one tx, never VACUUM; best-effort so a prune failure never blocks
-        // open).
+
         let now = now_unix();
         let _ = store.gc_health_history(90, now);
         Ok(store)
     }
 
-    /// Ticket 40: live file behind this handle, if file-backed.
     pub fn db_path(&self) -> Option<PathBuf> {
         self.db_path.clone()
     }
 
-    /// Ticket 40: `PRAGMA quick_check` gate. `Ok(())` means `ok`; any error
-    /// row becomes a loud schema error (never silent in-memory loss).
     fn check_quick(&self) -> Result<(), StoreError> {
         let mut stmt = self.conn.prepare("PRAGMA quick_check")?;
         let rows = stmt
@@ -4342,10 +3472,6 @@ impl Store {
         }
     }
 
-    /// Ticket 40: preserve a corrupt/foreign DB file aside as
-    /// `library.db.corrupt-<ts>-<pid>-<counter>` (timestamp + pid + counter,
-    /// same directory so the live path stays on one filesystem). Returns the
-    /// quarantine path.
     fn quarantine_corrupt_file(path: &Path) -> Result<PathBuf, StoreError> {
         let ts = now_unix();
         let base = path
@@ -4361,18 +3487,13 @@ impl Store {
         std::fs::rename(path, &quarantined).map_err(|error| {
             StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?;
-        // Remove WAL sidecars of the bad file so a stale journal never
-        // shadows the quarantine.
+
         for suffix in ["-wal", "-shm", "-journal"] {
             let _ = std::fs::remove_file(sibling_sidecar(path, suffix));
         }
         Ok(quarantined)
     }
 
-    /// Ticket 40: timestamped backup before any wipe
-    /// (`library.db.bak-<ts>-<pid>-<counter>` in the same directory). The
-    /// backup is a plain file copy (same-filesystem, crash-safe source read);
-    /// restore uses temp-DB + rename, never in-place overwrite.
     pub fn backup_db_file(db_path: &Path, now: i64) -> Result<PathBuf, StoreError> {
         let base = db_path
             .file_name()
@@ -4391,18 +3512,11 @@ impl Store {
         Ok(backup)
     }
 
-    /// Ticket 40: atomic file restore. Validates the payload via a dry-run,
-    /// takes a timestamped backup, rebuilds into a temp sibling DB, runs
-    /// `quick_check`, then atomically renames over the live path. A kill
-    /// before the rename leaves the old library intact. Returns the outcome
-    /// plus the backup path (`None` when no live file existed, so no backup
-    /// was taken — never a phantom path to a file that was never written).
     pub fn restore_library_file(
         db_path: &Path,
         payload: &str,
         now: i64,
     ) -> Result<(RestoreOutcome, Option<PathBuf>), StoreError> {
-        // Validate first: a malformed backup never touches the live DB.
         {
             let mut dry = Store::open_in_memory()?;
             dry.restore_library_json(payload)?;
@@ -4413,8 +3527,7 @@ impl Store {
         } else {
             None
         };
-        // The live file's parents may not exist yet (fresh directory):
-        // create them before the temp DB lands.
+
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|error| StoreError::Io {
@@ -4423,8 +3536,7 @@ impl Store {
                 })?;
             }
         }
-        // Build into a temp sibling DB in the same directory (same filesystem
-        // → rename is atomic).
+
         let tmp = match db_path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.join(format!(
                 ".{}.restore-{}",
@@ -4436,7 +3548,7 @@ impl Store {
             )),
             _ => PathBuf::from(format!(".library.restore-{}", unique_name_suffix(now))),
         };
-        // Ensure a stale temp from a killed restore never shadows us.
+
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(sibling_sidecar(&tmp, "-wal"));
         let _ = std::fs::remove_file(sibling_sidecar(&tmp, "-shm"));
@@ -4447,7 +3559,7 @@ impl Store {
             )?;
             let outcome = tmp_store.restore_library_json(payload)?;
             tmp_store.check_quick()?;
-            // Close + fsync via checkpoint before the rename.
+
             let _ = tmp_store
                 .conn
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -4461,23 +3573,17 @@ impl Store {
                 message: error.to_string(),
             }
         })?;
-        // Drop stale WAL sidecars of the old live file; the renamed file
-        // carries its own journal state.
+
         for suffix in ["-wal", "-shm", "-journal"] {
-            // Only remove sidecars that predate the rename (best-effort).
             let _ = std::fs::remove_file(sibling_sidecar(db_path, suffix));
         }
         if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                // Best-effort dir fsync is platform-specific; rename itself is
-                // the atomicity guarantee (sqlite atomiccommit).
-            }
+            if !parent.as_os_str().is_empty() {}
         }
         harden_file_permissions(db_path);
         Ok((outcome, backup))
     }
 
-    /// sqlite-skill setup: must run on every connection.
     fn apply_pragmas(&self) -> Result<(), StoreError> {
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -4489,51 +3595,28 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 25: schema version behind `PRAGMA user_version`. Version 1 is
-    /// every table/column through ticket 17; version 2 adds the ticket-25
-    /// ownership columns (`adoptable`, `synced_params`); version 3 seals
-    /// params at rest (ticket 35, DPAPI); version 4 adds routing presets
-    /// (ticket 37: `route_presets` table + `proxy_configs.preset_id`); version
-    /// 5 stages per-sub intervals, health history, preset extensions, and
-    /// URL-keyed tombstones (ticket 40); version 6 seals subscription URLs
-    /// at rest (ticket 35/48: tokens ride in query strings). Fresh and legacy
-    /// (`user_version = 0`)
-    /// databases migrate forward idempotently; a database from a NEWER build
-    /// fails loudly (never a silent empty). The version bump lands LAST, so a
-    /// kill mid-migration retries on next open instead of trusting a
-    /// half-migrated file.
     const SCHEMA_VERSION: i64 = 6;
-    /// Minimum SQLite for this schema: STRICT tables need 3.37+.
+
     const MIN_SQLITE: (i64, i64, i64) = (3, 37, 0);
 
-    /// Ticket 35: seal params for storage. A DPAPI failure aborts the
-    /// write loudly (never silent plaintext). Ticket A2: typed as
-    /// `Crypto`, never `Sql` (a crypto outage is not a database error).
     fn seal_or_fail(plaintext: &str) -> Result<String, StoreError> {
         crate::dpapi::seal_params(plaintext).map_err(|message| StoreError::Crypto {
             message: format!("dpapi seal failed: {message}"),
         })
     }
 
-    /// Ticket 35: open stored params. Sealed values decrypt; legacy JSON
-    /// passes through; anything else fails loudly. Ticket A2: typed as
-    /// `Crypto`, never `Sql`.
     fn unseal_or_fail(stored: &str) -> Result<String, StoreError> {
         crate::dpapi::unseal_params(stored).map_err(|message| StoreError::Crypto {
             message: format!("dpapi open failed: {message}"),
         })
     }
 
-    /// Ticket 25: loud schema failure (newer-than-supported version, too-old
-    /// SQLite, post-migration drift). Reuses `StoreError::Sql` so the public
-    /// API stays additive; the message names the versions and the fix.
     fn schema_error(message: String) -> StoreError {
         StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
             std::io::Error::new(std::io::ErrorKind::InvalidData, message),
         )))
     }
 
-    /// Ticket 25: assert the runtime SQLite meets [`Store::MIN_SQLITE`].
     fn assert_sqlite_version(&self) -> Result<(), StoreError> {
         let text: String = self
             .conn
@@ -4556,7 +3639,6 @@ impl Store {
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool, StoreError> {
-        // Table names are hardcoded at the call sites (never user input).
         let mut stmt = self.conn.prepare(&format!(
             "SELECT name FROM pragma_table_info('{table}') WHERE name = ?1"
         ))?;
@@ -4582,14 +3664,7 @@ impl Store {
                 Self::SCHEMA_VERSION,
             )));
         }
-        // `grp` avoids the reserved word GROUP. Ports are intentionally NOT
-        // unique: two stored configs may share a port; the conflict error
-        // naming both parties is raised at activation time (ticket 03).
-        // Ticket 25: CHECK pins the valid range on new tables (old tables
-        // are covered by the read-time reject in `map_row`).
-        // Ticket 40 (v5): fresh DDL carries the full v5 shape so fresh and
-        // migrated DBs converge; migrated v4 DBs backfill via `ensure_column`
-        // below (all online ADD COLUMN / CREATE TABLE, no rebuild).
+
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS proxy_configs (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4658,41 +3733,27 @@ impl Store {
                value TEXT NOT NULL DEFAULT ''
              ) STRICT;",
         )?;
-        // Ticket 37: per-row preset attachment (null = none; validated on
-        // attach, so no FK — a dangling id fails loudly at merge time).
+
         self.ensure_column("proxy_configs", "preset_id", "TEXT")?;
-        // Migrate pre-ticket-04 databases that lack the new columns.
+
         for (column, ddl) in [("subscription_id", "TEXT"), ("identity_key", "TEXT")] {
             self.ensure_column("proxy_configs", column, ddl)?;
         }
-        // Ticket 17: migrate pre-ticket-17 databases that lack the per-item
-        // refresh failures column.
+
         self.ensure_column("subscriptions", "failures", "TEXT NOT NULL DEFAULT '[]'")?;
-        // Ticket 25 (version 2): ownership columns for the refresh merge —
-        // `adoptable` marks rows released by `remove_subscription` so a
-        // second subscription can adopt them; `synced_params` is the
-        // last-synced upstream baseline behind the user-vs-upstream compare.
+
         self.ensure_column("proxy_configs", "adoptable", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("proxy_configs", "synced_params", "TEXT")?;
-        // Ticket 36: cumulative data-plane byte counters (clash-API
-        // sourced; probe bytes never land here). Plain ADD COLUMN expand —
-        // no version bump (same precedent as the ticket-25 columns).
+
         self.ensure_column("proxy_configs", "traffic_rx", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("proxy_configs", "traffic_tx", "INTEGER NOT NULL DEFAULT 0")?;
-        // Ticket 08 (throne-adoption): library display order. Fresh rows
-        // and refresh inserts keep `sort_order` assigned (creation order by
-        // default, remote order for refreshed members); pre-ticket-08
-        // databases backfill to creation order exactly once (a later
-        // refresh legitimately assigns 0 to the first row, so the backfill
-        // must not re-run on reopen — hence the gate on column absence).
+
         if !self.column_exists("proxy_configs", "sort_order")? {
             self.ensure_column("proxy_configs", "sort_order", "INTEGER NOT NULL DEFAULT 0")?;
             self.conn
                 .execute("UPDATE proxy_configs SET sort_order = id", [])?;
         }
-        // Ticket 40 (v5): per-sub interval, preset extensions, tombstone URL
-        // + rotation core. All constraint-free ADD COLUMN (online, time
-        // independent of row count); idempotent via `ensure_column`.
+
         self.ensure_column(
             "subscriptions",
             "interval_secs",
@@ -4703,10 +3764,7 @@ impl Store {
         self.ensure_column("route_presets", "last_used_at", "INTEGER")?;
         self.ensure_column("subscription_tombstones", "subscription_url", "TEXT")?;
         self.ensure_column("subscription_tombstones", "rotation_core", "TEXT")?;
-        // Ticket 08 (throne-adoption): quota snapshot from the
-        // `Subscription-Userinfo` header. Nullable plain columns (no
-        // backfill: missing reads as no-quota, same as a provider that
-        // sends no header).
+
         for (column, ddl) in [
             ("quota_used", "INTEGER"),
             ("quota_total", "INTEGER"),
@@ -4714,8 +3772,7 @@ impl Store {
         ] {
             self.ensure_column("subscriptions", column, ddl)?;
         }
-        // Indexes (after all columns exist, so legacy DBs missing columns
-        // never fail index creation; IF NOT EXISTS keeps re-runs idempotent).
+
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_proxy_configs_enabled
                ON proxy_configs(enabled);
@@ -4732,9 +3789,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_tombstones_core
                ON subscription_tombstones(subscription_url, rotation_core);",
         )?;
-        // Backfill v5 tombstone URL + rotation core where the owning
-        // subscription still exists (orphan legacy tombstones keep NULL and
-        // still match by exact id-key; GC cleans them explicitly).
+
         {
             let rows: Vec<(String, String)> = {
                 let mut stmt = self.conn.prepare(
@@ -4768,13 +3823,7 @@ impl Store {
                 }
             }
         }
-        // Ticket 35 (version 3): seal params at rest. Every non-sealed value
-        // seals in one transaction — including legacy non-JSON garbage that
-        // does not start with `{` (leaving it would strand plaintext under a
-        // bumped version, violating the sealed-at-rest contract); already-
-        // sealed rows are untouched, so the migration is idempotent and
-        // reruns are no-ops. Unreadable-after-seal rows surface through the
-        // quarantine list, never as silent plaintext.
+
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -4802,11 +3851,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        // Ticket 35/48 (version 6): seal subscription URLs at rest.
-        // Subscription URLs carry tokens in the query string, so the
-        // `subscriptions.url` column seals exactly like params — sealed rows
-        // are skipped, every other row seals in one transaction before the
-        // version bump below (never stranded plaintext).
+
         if version < 6 {
             let tx = self.conn.transaction()?;
             let rows = {
@@ -4828,10 +3873,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        // Unknown drift fails loudly: every column the merge relies on must
-        // exist after migration, never a silent empty read.
-        // Ticket 40: drift loop extended to the v5 columns; fresh and
-        // migrated DBs converge to identical DDL per this check.
+
         for (table, column) in [
             ("proxy_configs", "subscription_id"),
             ("proxy_configs", "identity_key"),
@@ -4854,7 +3896,7 @@ impl Store {
                 )));
             }
         }
-        // health_history table must exist after migration.
+
         {
             let count: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='health_history'",
@@ -4868,19 +3910,12 @@ impl Store {
                 ));
             }
         }
-        // Ticket 40: bump LAST — the crash-safety property. A kill anywhere
-        // above leaves the old version number, so next open re-runs the
-        // migration instead of trusting a half-migrated file. DPAPI-down seal
-        // failures return before this line, so plaintext is never stranded as
-        // migrated.
+
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {};", Self::SCHEMA_VERSION))?;
         Ok(())
     }
 
-    /// Create a disabled config; invalid input is rejected with field errors.
-    /// Ticket 25: implemented on [`Store::add_batch`] (single-row batch —
-    /// one transaction, identical validation).
     pub fn add(&mut self, input: NewConfig) -> Result<ProxyConfig, StoreError> {
         let mut created = self.add_batch(vec![input])?;
         created
@@ -4888,12 +3923,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound("batch was empty".to_string()))
     }
 
-    /// Ticket 25: create many disabled configs in ONE transaction (the store
-    /// half of "batch inserts off the UI thread": one tx instead of ~1000
-    /// statements; rewiring `commit_batch` and the `spawn_blocking` move is
-    /// import.rs/main.rs territory, ticket 26). Validation runs fully before
-    /// any write, so one bad item rejects the whole batch and writes nothing.
-    /// Auto ports assign sequentially from a single taken-set snapshot.
     pub fn add_batch(&mut self, inputs: Vec<NewConfig>) -> Result<Vec<ProxyConfig>, StoreError> {
         struct Fields {
             name: String,
@@ -4945,8 +3974,6 @@ impl Store {
             let port = match item.port {
                 Some(port) => port,
                 None => {
-                    // Ticket 27: primary then spillover; honest exhaustion
-                    // only past both ranges (message unchanged).
                     let mut free = None;
                     for candidate in auto_port_candidates() {
                         if !taken.contains(&(candidate as i64)) {
@@ -4978,9 +4005,6 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut ids: Vec<i64> = Vec::with_capacity(assigned.len());
         for item in &assigned {
-            // Ticket 35: seal before the write; a DPAPI failure returns
-            // before commit, so the transaction rolls back with nothing
-            // written.
             let sealed = Self::seal_or_fail(&item.params)?;
             tx.execute(
                 "INSERT INTO proxy_configs
@@ -4997,8 +4021,7 @@ impl Store {
             )?;
             let rowid = tx.last_insert_rowid();
             ids.push(rowid);
-            // Ticket 08: new rows append in creation order (`sort_order`
-            // tracks the row id until a refresh reseats it).
+
             tx.execute(
                 "UPDATE proxy_configs SET sort_order = ?1 WHERE id = ?1",
                 params![rowid],
@@ -5015,9 +4038,6 @@ impl Store {
         Ok(out)
     }
 
-    /// All configs in library display order (`sort_order`, ties by id).
-    /// Fresh rows append in creation order; subscription refresh reseats
-    /// its members to remote order (see [`Store::refresh_with_body_running`]).
     pub fn list(&self) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
@@ -5030,7 +4050,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Fetch one config by id.
     pub fn get(&self, id: &str) -> Result<Option<ProxyConfig>, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -5048,16 +4067,9 @@ impl Store {
         }
     }
 
-    /// Ticket 40: tolerant list — good rows plus quarantined ids. One corrupt
-    /// params blob (bad DPAPI marker, out-of-range port) never poisons the
-    /// whole list; the UI renders goods with a banner naming the ids. Write
-    /// paths and single-row reads stay strict ([`Store::list`]/[`Store::get`]
-    /// still fail loudly).
     pub fn list_with_quarantine(
         &self,
     ) -> Result<(Vec<ProxyConfig>, Vec<QuarantinedRow>), StoreError> {
-        // Map each row individually so one fault partitions instead of
-        // failing the whole list.
         let ids: Vec<i64> = {
             let mut id_stmt = self
                 .conn
@@ -5088,29 +4100,22 @@ impl Store {
         Ok((good, quarantined))
     }
 
-    /// Ticket 40: tolerant export — skips quarantined rows, returns the
-    /// payload plus the skipped ids so the dialog can offer skip-or-flag.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn export_library_json_with_quarantine(&self) -> Result<(String, Vec<String>), StoreError> {
         let (rows, quarantined) = self.list_with_quarantine()?;
         let mut skipped: Vec<String> = quarantined.iter().map(|q| q.id.clone()).collect();
         let (rows, mut bad_synced) = self.without_unreadable_synced(rows);
         skipped.append(&mut bad_synced);
-        // Build the export from the good rows only (same shape as
-        // `export_library_json`, quarantined rows omitted, never failed).
+
         let subs = self.list_subscriptions()?;
         let tombstones = self.list_tombstones_raw()?;
         let payload = export_payload_full(&rows, &subs, &tombstones);
-        // Patch in the v5 full-fidelity sections for the good rows only.
+
         let enriched = self.enrich_export_payload(&payload, &rows)?;
         Ok((enriched, skipped))
     }
 
-    /// Raw tombstones for export (ordered, no filtering).
     fn list_tombstones_raw(&self) -> Result<Vec<(String, String)>, StoreError> {
-        // Ticket 40: export the URL-keyed shape when present; legacy readers
-        // ignore the extra keys. The base pair stays (subscription_id,
-        // identity_key) for backward compat.
         let mut stmt = self.conn.prepare(
             "SELECT subscription_id, identity_key FROM subscription_tombstones
              ORDER BY subscription_id, identity_key",
@@ -5125,16 +4130,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Edit a stopped-config record. Validation runs before any write, so
-    /// invalid input leaves the record unchanged.
-    /// Ticket 25: editing a subscription-owned row's protocol/params
-    /// refreshes its `identity_key` to the widened identity of the new
-    /// values (never a stale key that a later refresh would silently
-    /// revert), and any edit claims an adoptable (released) row so a later
-    /// subscription refresh cannot adopt it away. The last-synced upstream
-    /// baseline (`synced_params`) is deliberately left alone: the merge
-    /// compares current params against it to tell user-changed from
-    /// upstream-changed.
     pub fn update(&mut self, id: &str, patch: ConfigPatch) -> Result<ProxyConfig, StoreError> {
         let current = self
             .get(id)?
@@ -5153,7 +4148,6 @@ impl Store {
             params![
                 merged.name,
                 merged.protocol,
-                // Ticket 35: sealed at rest.
                 Self::seal_or_fail(&merged.params)?,
                 merged.group,
                 merged.bind_ip,
@@ -5166,23 +4160,13 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Remove a config. Returns false when the id does not exist.
-    /// Ticket 04: removing a subscription-owned row records a tombstone so
-    /// the next refresh does not resurrect a row the user deleted on purpose.
-    /// Ticket 12: the row's health snapshot goes with it (bounded table, no
-    /// stale resurrection after restart).
-    /// Ticket 25: the delete + tombstone + snapshot prune apply in a single
-    /// transaction (never a half-removed row).
-    /// Ticket 40: tombstones carry the subscription URL + rotation core so a
-    /// remove-subscribe + re-add of the same URL still honors the delete.
     pub fn remove(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Ok(false),
         };
         let current = self.get(id)?;
-        // Resolve the owning subscription URL before opening the tx (reads
-        // before the write tx keeps the tx short).
+
         let owner_url: Option<String> = match &current {
             Some(row) => match &row.subscription_id {
                 Some(sub_id) => self.get_subscription(sub_id)?.map(|s| s.url),
@@ -5212,8 +4196,7 @@ impl Store {
                 "DELETE FROM health_snapshots WHERE config_id = ?1",
                 params![id],
             )?;
-            // Ticket 40: history of a deleted row is pruned with it (bounded,
-            // no stale resurrection after restart).
+
             let _ = tx.execute(
                 "DELETE FROM health_history WHERE config_id = ?1",
                 params![id],
@@ -5223,9 +4206,6 @@ impl Store {
         Ok(removed > 0)
     }
 
-    /// Ticket 44: per-group row counts for the facet picker and the group
-    /// manager (ordered by group name). Groups are free-text labels, not a
-    /// table — this is the only group inventory.
     pub fn group_counts(&self) -> Result<Vec<(String, usize)>, StoreError> {
         let mut stmt = self
             .conn
@@ -5240,9 +4220,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Ticket 44: rename a group label across every row that carries it.
-    /// Returns the rows moved. An empty new name is rejected (nothing
-    /// written); renaming a missing group moves zero rows.
     pub fn rename_group(&mut self, old: &str, new: &str) -> Result<usize, StoreError> {
         let old = normalized_group(old);
         let new = normalized_group(new);
@@ -5256,17 +4233,12 @@ impl Store {
             "UPDATE proxy_configs SET grp = ?1 WHERE grp = ?2",
             params![new, old],
         )?;
-        // Ticket 08: subscriptions feeding the old label follow it — their
-        // members GroupFollow `subscription.group` on every refresh, so a
-        // rename that left them behind would yank members back on the next
-        // refresh. (Row counts and validation above are untouched.)
+
         self.conn.execute(
             "UPDATE subscriptions SET grp = ?1 WHERE grp = ?2",
             params![new, old],
         )?;
-        // Ticket 08: the skip-automatic-refresh flag follows the label, so
-        // a renamed group keeps its refresh policy (additive move — row
-        // counts and validation above are untouched).
+
         if old != new {
             let old_key = Self::group_skip_key(&old);
             if let Some(value) = self.get_meta(&old_key)? {
@@ -5278,9 +4250,6 @@ impl Store {
         Ok(changed)
     }
 
-    /// Ticket 44: move rows into a group by id. Unknown ids are skipped
-    /// (bulk semantics — already-removed rows are not failures); returns
-    /// the rows actually moved. An empty group name is rejected.
     pub fn move_to_group(&mut self, ids: &[String], group: &str) -> Result<usize, StoreError> {
         let group = normalized_group(group);
         if group.is_empty() {
@@ -5309,10 +4278,6 @@ impl Store {
         Ok(changed)
     }
 
-    /// Ticket 44: delete a group label. Refuses loudly while rows still
-    /// carry it (names the count so the manager can offer move-first);
-    /// deleting an already-empty group is a no-op success. The default
-    /// group label itself is never special-cased here — emptiness decides.
     pub fn delete_group(&mut self, name: &str) -> Result<(), StoreError> {
         let name = normalized_group(name);
         let remaining: i64 = self.conn.query_row(
@@ -5329,10 +4294,6 @@ impl Store {
         Ok(())
     }
 
-    // -- Ticket 09 (throne-adoption): group prunes ------------------------
-
-    /// Rows of one group in library display order (same order as
-    /// [`Store::list`], filtered to the normalized label).
     fn rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
         let group = normalized_group(group);
         Ok(self
@@ -5342,10 +4303,6 @@ impl Store {
             .collect())
     }
 
-    /// Later duplicates of one group: positional Uniq by
-    /// [`widened_identity`] (protocol + server + port + credentials +
-    /// extras) — the first row per key is kept, every later row is a
-    /// removal candidate, in display order.
     pub fn duplicate_rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut seen = HashSet::new();
         let mut dupes = Vec::new();
@@ -5358,8 +4315,6 @@ impl Store {
         Ok(dupes)
     }
 
-    /// Duplicate preview for the confirm: total count plus at most
-    /// [`PRUNE_PREVIEW_LIMIT`] names (first dupes in display order).
     pub fn duplicate_preview_in_group(
         &self,
         group: &str,
@@ -5374,10 +4329,6 @@ impl Store {
         Ok((total, names))
     }
 
-    /// Remove later duplicates of one group (keeps the first copy of each
-    /// identity). Removal rides [`Store::remove`] per row, so tombstones
-    /// and health snapshots follow each deleted row. Returns the removed
-    /// rows (display order) so the toast can name them.
     pub fn remove_duplicates_in_group(
         &mut self,
         group: &str,
@@ -5392,9 +4343,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// Rows of one group whose latest persisted sample is dead (an `error`
-    /// present — the Throne `latency<0` unavailable state; untested rows
-    /// carry no error and are never unavailable).
     pub fn unavailable_rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
         let dead: HashSet<String> = self
             .load_health_snapshots()?
@@ -5409,8 +4357,6 @@ impl Store {
             .collect())
     }
 
-    /// Remove dead-sample rows of one group (same per-row [`Store::remove`]
-    /// hygiene as duplicates). Returns the removed rows for toast naming.
     pub fn remove_unavailable_in_group(
         &mut self,
         group: &str,
@@ -5425,9 +4371,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// Rows of one group failing commit validation ([`is_valid_config`]) —
-    /// the `IsValid` sweep. Stored rows normally pass (writes validate),
-    /// but legacy/foreign-touched rows can drift; the sweep re-checks.
     pub fn invalid_rows_in_group(&self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
         Ok(self
             .rows_in_group(group)?
@@ -5436,8 +4379,6 @@ impl Store {
             .collect())
     }
 
-    /// Remove validation-failing rows of one group (same per-row
-    /// [`Store::remove`] hygiene). Returns the removed rows for naming.
     pub fn remove_invalid_in_group(&mut self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
         let bad = self.invalid_rows_in_group(group)?;
         let mut removed = Vec::with_capacity(bad.len());
@@ -5449,9 +4390,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// Drop persisted test samples (latest + history) for one group's rows
-    /// — the `Clear tests` prune. Rows are untouched; they read untested
-    /// until the next probe. Returns the cleared latest-sample count.
     pub fn clear_tests_in_group(&mut self, group: &str) -> Result<usize, StoreError> {
         let group = normalized_group(group);
         let cleared = self.conn.execute(
@@ -5467,7 +4405,6 @@ impl Store {
         Ok(cleared)
     }
 
-    /// Flip the enabled flag.
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<ProxyConfig, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -5484,14 +4421,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    // -- Ticket 37: routing presets --------------------------------------
-
-    /// Attach (`Some`) or detach (`None`) a routing preset on one row.
-    /// Attaching validates the preset exists (`NotFound` otherwise);
-    /// detaching always succeeds on a live row. `NotFound` for ghost rows.
-    /// Ticket 40: check + write run in one transaction (re-validated in-tx),
-    /// so a preset deleted between check and write still refuses loudly.
-    /// Successful attaches stamp `last_used_at`.
     pub fn set_config_preset(
         &mut self,
         config_id: &str,
@@ -5512,9 +4441,7 @@ impl Store {
             if rule_count == 0 {
                 return Err(StoreError::NotFound(preset.to_string()));
             }
-            // An empty-rules preset serves nothing (the merge would add no
-            // rule, silently serving preset-less) — refuse the attach loudly
-            // until the preset carries rules.
+
             let rules_json: String = tx.query_row(
                 "SELECT rules_json FROM route_presets WHERE id = ?1",
                 params![rowid_preset],
@@ -5550,9 +4477,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(config_id.to_string()))
     }
 
-    /// Ticket 40: rows whose `preset_id` points at a missing preset
-    /// (dangling references from cross-DB restores or races). The UI renders
-    /// these behind an orphan-sweep banner (never silent at serve).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn find_orphaned_preset_rows(&self) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -5563,22 +4487,14 @@ impl Store {
                AND preset_id NOT IN (SELECT id FROM route_presets)
              ORDER BY id",
         )?;
-        // `preset_id` here is the stored string id; the subselect compares as
-        // text-vs-integer — SQLite dynamic typing still matches numeric ids.
-        // Rows with non-numeric dangling ids also land here (never in the
-        // presets table).
+
         let rows = stmt
             .query_map([], map_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        // `map_row` unseals params strictly; a corrupt orphan still surfaces
-        // via `list_with_quarantine` — but the id-presence check above already
-        // ran in SQL. If strict mapping fails here, fall back to a tolerant
-        // scan so one bad row never hides the whole orphan set.
+
         Ok(rows)
     }
 
-    /// Ticket 40: detach every orphaned preset reference in one transaction.
-    /// Returns the detached count for the banner copy.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn detach_orphaned_presets(&mut self) -> Result<usize, StoreError> {
         let tx = self.conn.transaction()?;
@@ -5592,9 +4508,6 @@ impl Store {
         Ok(cleared)
     }
 
-    /// Preset rules for the engine merge: `preset_id` → ordered rule
-    /// objects. Corrupt stored rules fail loudly (never a silent empty
-    /// merge); rows without presets contribute nothing.
     pub fn preset_rules_map(&self) -> Result<HashMap<String, Vec<serde_json::Value>>, StoreError> {
         let mut map = HashMap::new();
         for preset in self.list_presets()? {
@@ -5608,8 +4521,6 @@ impl Store {
         Ok(map)
     }
 
-    /// Create a preset from validated rules. Names are non-empty and unique;
-    /// rules validate field-by-field (rejections name rule index + field).
     pub fn create_preset(
         &mut self,
         name: &str,
@@ -5643,15 +4554,11 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Import a `throne://route/...` link as a named preset (source
-    /// `link`). Replaces the v1 named error: route links now store.
     pub fn import_route_link(&mut self, line: &str) -> Result<RoutePreset, StoreError> {
         let parsed = crate::preset::decode_route_link(line).map_err(Self::preset_parse_error)?;
         self.create_preset(&parsed.name, "link", None, &parsed.rules)
     }
 
-    /// Import preset JSON (preset URL bodies after an explicit fetch, or
-    /// dropped/pasted JSON files) as a named preset.
     pub fn import_preset_json(
         &mut self,
         text: &str,
@@ -5663,9 +4570,6 @@ impl Store {
         self.create_preset(&parsed.name, source, source_url, &parsed.rules)
     }
 
-    /// Record a fetched remote preset URL as an empty-rules shell (source
-    /// `url`); the explicit fetch fills it via [`Store::set_preset_rules`].
-    /// Lets a `throne://remoteroute/...` paste land without any silent fetch.
     pub fn import_remote_preset_shell(
         &mut self,
         name: &str,
@@ -5674,8 +4578,6 @@ impl Store {
         self.create_preset(name, "url", Some(url), &[])
     }
 
-    /// Replace a preset's rules wholesale (the explicit-refresh write path).
-    /// Validates field-by-field like create.
     pub fn set_preset_rules(
         &mut self,
         id: &str,
@@ -5698,9 +4600,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Ticket 43: rename a preset (manager edit path). The new name validates
-    /// like create (blank fails); a taken name fails with the same
-    /// already-exists copy — never a silent overwrite. Rules are untouched.
     pub fn rename_preset(&mut self, id: &str, name: &str) -> Result<RoutePreset, StoreError> {
         let name = Self::validated_preset_name(name)?;
         let rowid: i64 = match id.parse() {
@@ -5727,11 +4626,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Append one rule object to a preset (manager add-rule). The rule
-    /// validates in place: the rejection names the (new) rule index + field.
-    /// Test-covered store seam for the manager add-rule scenario (the v1
-    /// manager UI covers list/create/delete/detach; rule edits go through
-    /// create-with-JSON there).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn add_preset_rule(
         &mut self,
@@ -5760,9 +4654,6 @@ impl Store {
         Ok(preset)
     }
 
-    /// Remove one rule by index (manager remove-rule). Out-of-range indices
-    /// fail typed; nothing is written. Test-covered store seam (see
-    /// [`Store::add_preset_rule`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_preset_rule(
         &mut self,
@@ -5790,7 +4681,6 @@ impl Store {
         self.set_preset_rules(id, &rules)
     }
 
-    /// All presets in stable id order.
     pub fn list_presets(&self) -> Result<Vec<RoutePreset>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, source, source_url, rules_json, updated_at,
@@ -5803,7 +4693,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Fetch one preset by id.
     pub fn get_preset(&self, id: &str) -> Result<Option<RoutePreset>, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -5821,8 +4710,6 @@ impl Store {
         }
     }
 
-    /// Ticket 40: fetch one preset by exact name (restore re-links by name,
-    /// never by cross-DB rowid).
     #[allow(dead_code)]
     pub fn get_preset_by_name(&self, name: &str) -> Result<Option<RoutePreset>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -5837,11 +4724,6 @@ impl Store {
         }
     }
 
-    /// Delete a preset. Refused (`Invalid`) while any row attaches it — the
-    /// refusal names the attached rows, so the UI can offer the explicit
-    /// detach-then-delete path ([`Store::delete_preset_detaching`]).
-    /// Existence check + attachment check + delete run in ONE transaction so
-    /// a concurrent attach between check and delete can never dangle.
     pub fn delete_preset(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -5883,8 +4765,6 @@ impl Store {
         Ok(removed > 0)
     }
 
-    /// Delete a preset, detaching every attached row first (the explicit
-    /// path: one transaction, never a half-detached delete).
     pub fn delete_preset_detaching(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -5903,7 +4783,6 @@ impl Store {
         Ok(removed > 0)
     }
 
-    /// Rows currently attaching a preset (stable id order).
     pub fn preset_attachments(&self, id: &str) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
@@ -5924,8 +4803,7 @@ impl Store {
                 "preset name must not be empty",
             )]));
         }
-        // Same bound as the preset intake (hash-suffixed on overflow, so
-        // two long names never truncate-collide into one preset).
+
         Ok(crate::preset::cap_name(trimmed.to_string()))
     }
 
@@ -5936,8 +4814,6 @@ impl Store {
         }
     }
 
-    /// Field-level rule validation behind create/set/add. Rejections name
-    /// rule index + field (never values).
     fn check_preset_rules(rules: &[serde_json::Value]) -> Result<(), StoreError> {
         if let Err(error) = crate::preset::validate_preset_rules(rules) {
             return Err(StoreError::Invalid(vec![FieldError::new(
@@ -5948,13 +4824,9 @@ impl Store {
         Ok(())
     }
 
-    /// Map a preset parse failure into [`StoreError::Invalid`] (field
-    /// `preset`; messages never echo payloads by construction of the parser).
     fn preset_parse_error(error: crate::preset::PresetError) -> StoreError {
         StoreError::Invalid(vec![FieldError::new("preset", error.to_string())])
     }
-
-    // -- Ticket 04: subscriptions -----------------------------------------
 
     fn validated_subscription_label(raw: &str) -> Result<String, StoreError> {
         let trimmed = raw.trim();
@@ -5968,10 +4840,6 @@ impl Store {
     }
 
     fn validated_subscription_url(raw: &str) -> Result<String, StoreError> {
-        // Error text never echoes the URL: subscription URLs often carry
-        // tokens in the query string (boundary: no secrets in logs).
-        // Ticket 25: byte-safe scheme prefix (never slice at a non-char
-        // boundary on non-ASCII input — the import-side half is ticket 24).
         let trimmed = raw.trim();
         let after_scheme = if trimmed
             .get(..7)
@@ -5996,16 +4864,11 @@ impl Store {
                 "subscription url must use http(s)",
             )]));
         }
-        // Ticket 27: internal hosts never fetch (SSRF guard). Plain http
-        // stays allowed here — the Warn surfaces at fetch/policy time, not
-        // as an add-time reject (LAN providers use http). Reasons never
-        // echo the URL.
+
         if matches!(
             subscription_fetch_policy(trimmed),
             SubscriptionFetchPolicy::Block { .. }
         ) {
-            // Distinguish scheme failures (above) from the internal-host
-            // block: only hosts that parsed as http(s) reach here.
             return Err(StoreError::Invalid(vec![FieldError::new(
                 "url",
                 "subscription url must not target internal hosts",
@@ -6014,10 +4877,6 @@ impl Store {
         Ok(trimmed.to_string())
     }
 
-    /// Add a subscription record. The URL must be `http(s)`; blank groups
-    /// fall back to the default. Members appear on the next refresh, never
-    /// enabled or started. The URL seals at rest (tokens ride in query
-    /// strings); reads unseal transparently.
     pub fn add_subscription(
         &mut self,
         label: &str,
@@ -6039,11 +4898,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Ticket 31: edit a subscription's label/url/group in place. Blank
-    /// groups fall back to the default (like add); the auto-refresh flag is
-    /// untouched. Invalid input fails typed with nothing written (the same
-    /// validators as add, so errors never echo the URL); unknown ids are
-    /// `NotFound`.
     pub fn update_subscription(
         &mut self,
         id: &str,
@@ -6070,10 +4924,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Ticket 31: find a subscription by exact (trimmed) URL — the friendly
-    /// `already subscribed` path. A missing row is `None`, never an error.
-    /// Compared in Rust over unsealed rows: sealed URLs are nondeterministic
-    /// ciphertext, so SQL equality could never match them.
     pub fn find_subscription_by_url(&self, url: &str) -> Result<Option<Subscription>, StoreError> {
         let trimmed = url.trim();
         for sub in self.list_subscriptions()? {
@@ -6084,7 +4934,6 @@ impl Store {
         Ok(None)
     }
 
-    /// All subscriptions in stable id order.
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, label, url, grp, auto_refresh, last_refresh_at, last_error, failures, interval_secs,
@@ -6097,7 +4946,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Fetch one subscription by id.
     pub fn get_subscription(&self, id: &str) -> Result<Option<Subscription>, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -6115,10 +4963,6 @@ impl Store {
         }
     }
 
-    /// Ticket 40 (v5): set a subscription's auto-refresh interval. Values
-    /// `<= 0` mean always-due (matches [`due_for_refresh`]); absurdly large
-    /// values saturate at `i64::MAX` via the column type (never wrap).
-    /// Ticket 45: production seam behind the per-sub interval picker.
     pub fn set_subscription_interval(
         &mut self,
         id: &str,
@@ -6139,7 +4983,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Flip a subscription's auto-refresh flag.
     pub fn set_subscription_auto_refresh(
         &mut self,
         id: &str,
@@ -6160,12 +5003,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Ticket 08 (throne-adoption): persist the quota snapshot parsed from
-    /// the `Subscription-Userinfo` header (see
-    /// [`parse_subscription_userinfo`]). `None` clears the snapshot — a
-    /// success that carries no header must not show stale numbers. Unknown
-    /// ids are `NotFound`; the merge itself never calls this (refresh keeps
-    /// last-good quota on failure by simply not calling it).
     pub fn set_subscription_quota(
         &mut self,
         id: &str,
@@ -6191,15 +5028,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Remove a subscription. Owned member rows are released (kept, unowned),
-    /// never deleted; tombstones for this subscription are KEPT (ticket 40:
-    /// URL-keyed, so a re-add of the same URL still honors deletes).
-    /// Ticket 25: the release + subscription delete apply in a single
-    /// transaction. Released rows keep their params but lose their identity,
-    /// baseline, and ownership — and are marked adoptable so a second
-    /// subscription carrying the same node adopts them in place instead of
-    /// double-counting a cross-subscription shadow. Use [`Store::gc_tombstones`]
-    /// to drop tombstones whose URL no longer has a subscription.
     pub fn remove_subscription(&mut self, id: &str) -> Result<bool, StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -6216,19 +5044,12 @@ impl Store {
              WHERE subscription_id = ?1",
             params![id],
         )?;
-        // Ticket 40: tombstones survive the unsubscribe (URL-keyed). The old
-        // `DELETE WHERE subscription_id = ?` is gone — it broke re-subscribe.
+
         let removed = tx.execute("DELETE FROM subscriptions WHERE id = ?1", params![rowid])?;
         tx.commit()?;
         Ok(removed > 0)
     }
 
-    /// Ticket 40: drop tombstones whose subscription URL no longer has a live
-    /// subscription AND whose subscription id is gone. Returns the pruned
-    /// count. Explicit (never on the remove path) so re-subscribe before GC
-    /// still honors deletes. Matched in Rust over unsealed URLs: sealed
-    /// `subscriptions.url` ciphertext never equals the plaintext tombstone
-    /// copy in SQL.
     #[allow(dead_code)]
     pub fn gc_tombstones(&mut self) -> Result<usize, StoreError> {
         let live_ids: HashSet<String> = {
@@ -6271,8 +5092,6 @@ impl Store {
         Ok(pruned)
     }
 
-    /// Record a fetch-level failure (e.g. network error from the intake
-    /// path): prior members are kept, only `last_error` changes.
     pub fn record_subscription_error(
         &mut self,
         id: &str,
@@ -6293,26 +5112,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    /// Refresh a subscription from an already-fetched body (the refresh-merge
-    /// seam: tests inject body strings, never real network). The body is
-    /// parsed with the ticket-03 parsers via
-    /// [`crate::import::import_subscription_body`]; the merge upserts owned
-    /// rows keyed by [`widened_identity`], preserves the hand-edit overlay
-    /// (name/enabled/bind/port), pins user-edited params/protocol against
-    /// silent upstream reverts (versioned against `synced_params`, conflicts
-    /// counted), rotates identity in place (id/port/enabled kept), adopts
-    /// released rows, tombstones user-deleted rows, removes only
-    /// subscription-owned vanished rows (pruning their health snapshots),
-    /// and applies atomically per group. Unparseable bodies keep the
-    /// last-good members and record `last_error`. Refresh never enables or
-    /// starts configs.
-    /// Ticket A5: byte-level ingest — enforces [`SUBSCRIPTION_MAX_BYTES`]
-    /// and UTF-8 before parsing, so oversize/non-text bodies keep the
-    /// last-good members and record `last_error` instead of growing us
-    /// without bound. Reasons never echo body bytes. (The live fetch
-    /// enforces the same two caps inline while streaming — the platform
-    /// client owns that socket — so this is the ingest-side half for
-    /// byte callers; both halves share the constants above.)
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn refresh_with_bytes(
         &mut self,
@@ -6341,9 +5140,7 @@ impl Store {
         };
         self.refresh_with_body(sub_id, text, now)
     }
-    /// Ticket 08 (throne-adoption): refresh with no endpoint serving —
-    /// nothing is ever sticky (see [`Store::refresh_with_body_running`]).
-    /// Every existing caller and test keeps this shape.
+
     pub fn refresh_with_body(
         &mut self,
         sub_id: &str,
@@ -6352,11 +5149,7 @@ impl Store {
     ) -> Result<RefreshOutcome, StoreError> {
         self.refresh_with_body_running(sub_id, body, now, &HashSet::new())
     }
-    /// Ticket 08 (throne-adoption): refresh while `running` (row ids with a
-    /// live endpoint) is sticky — owned rows that vanished upstream but are
-    /// in `running` are kept verbatim and counted as `in_use` (`[=] Still
-    /// in use`) instead of deleted. The UI passes its live-endpoint set;
-    /// tests inject ids directly, never real sidecars.
+
     pub fn refresh_with_body_running(
         &mut self,
         sub_id: &str,
@@ -6383,16 +5176,9 @@ impl Store {
                 ..Default::default()
             });
         }
-        // Desired set, FIRST-wins (ticket 25 L1: the code matches the
-        // comment); extras count as duplicates. A BTreeMap keeps the
-        // allocation order deterministic (ticket 25 L2). Keys are the
-        // widened identity (ticket 25: no transport/security/flow over-merge).
-        // Values carry the batch position so port-exhaustion failures report
-        // real per-item indices (ticket 25 L3).
+
         let mut desired: BTreeMap<String, (usize, ImportedConfig)> = BTreeMap::new();
-        // Ticket 08: first-occurrence order of the unique remote keys (the
-        // BTreeMap above is key-ordered, not remote-ordered) — the
-        // resequence below seats owned members in this order.
+
         let mut remote_keys: Vec<String> = Vec::new();
         let mut duplicates = 0usize;
         for (index, config) in batch.configs.into_iter().enumerate() {
@@ -6408,12 +5194,7 @@ impl Store {
             }
         }
         let rows = self.list()?;
-        // Ticket 40: URL-keyed tombstones with rotation-core matching. A
-        // delete stays honored across remove-subscribe + re-add of the same
-        // URL (new subscription id, same URL). Exact widened-identity hits
-        // skip; rotation-core hits (same server:port, rotated creds/flow)
-        // skip too. Legacy id-keyed tombstones still match by id for the
-        // same-subscription path.
+
         let mut tombstones: HashSet<String> = HashSet::new();
         let mut tomb_cores_by_url: HashSet<String> = HashSet::new();
         {
@@ -6427,19 +5208,14 @@ impl Store {
             for entry in entries {
                 let (key, core) = entry?;
                 tombstones.insert(key.clone());
-                // Rotation core for the tombstone: stored column first,
-                // derived from the identity key as fallback.
+
                 let core = core.or_else(|| rotation_core_from_identity_key(&key));
                 if let Some(core) = core {
                     tomb_cores_by_url.insert(core);
                 }
             }
         }
-        // Ticket 25: ownership side-channels live in side queries, never in
-        // `ProxyConfig` (its shape is frozen: main.rs builds it literally).
-        // `adoptable` marks rows released by `remove_subscription` so a
-        // second subscription adopts them; `synced_params` is the last-synced
-        // upstream baseline behind the user-vs-upstream compare.
+
         let mut adoptable: HashSet<String> = HashSet::new();
         {
             let mut stmt = self
@@ -6460,8 +5236,7 @@ impl Store {
             })?;
             for pair in pairs {
                 let (id, baseline) = pair?;
-                // Ticket 35: the baseline column is sealed at rest; open it
-                // once here so the versioned compare below stays plaintext.
+
                 let baseline = baseline
                     .map(|sealed| Self::unseal_or_fail(&sealed))
                     .transpose()?;
@@ -6483,8 +5258,7 @@ impl Store {
                 row,
             })
             .collect();
-        // Primary match key: the stored (last-synced or user-refreshed)
-        // identity, falling back to the fresh key for legacy rows.
+
         let mut owned_by_key: HashMap<String, &RowView<'_>> = HashMap::new();
         for view in &views {
             if view.owned {
@@ -6497,13 +5271,7 @@ impl Store {
         for view in &views {
             global_by_key.entry(view.fresh.clone()).or_insert(view);
         }
-        // Ticket 25: narrow fallback behind the widened shadow. Hand-made
-        // rows (dialog JSON, legacy seeds) omit the transport/security
-        // defaults the link parsers emit, so the same node serializes to
-        // different widened keys. A narrow hit on an UNOWNED row still
-        // dedupes exactly like before (adopt when released, duplicate when
-        // hand-made); owned rows never shadow (vanished/rotation resolves
-        // them) so widened precision survives where it matters.
+
         let mut narrow_by_key: HashMap<String, &RowView<'_>> = HashMap::new();
         for view in &views {
             narrow_by_key
@@ -6543,9 +5311,7 @@ impl Store {
             failures: batch.failures,
             ..Default::default()
         };
-        // Rotation cores of tombstoned desired items: a vanished owned row
-        // sharing one is user-owned now (the user edited identity away from
-        // the upstream key) and is pinned, never deleted, never reverted.
+
         let mut tomb_cores: HashSet<String> = HashSet::new();
         for (key, (_, config)) in &desired {
             if tombstones.contains(key) {
@@ -6561,9 +5327,7 @@ impl Store {
                 outcome.skipped += 1;
                 continue;
             }
-            // Ticket 40: rotation-core tombstone match — upstream rotated
-            // creds/flow on the same server:port the user deleted stays
-            // deleted (URL-keyed, cross-resubscribe safe).
+
             if let Some(core) = rotation_core(&config.params) {
                 if tomb_cores_by_url.contains(&core) {
                     outcome.skipped += 1;
@@ -6572,14 +5336,9 @@ impl Store {
             }
             if let Some(view) = owned_by_key.get(key) {
                 matched_owned.insert(view.row.id.clone());
-                // Ticket 25 versioned compare: the baseline is the
-                // last-synced upstream params. User-changed rows keep their
-                // params/protocol (pinned); upstream-only changes apply in
-                // place; both changing surfaces an explicit conflict.
+
                 match synced.get(&view.row.id).and_then(|base| base.clone()) {
                     None => {
-                        // Legacy row (pre-ticket-25, no baseline): upstream
-                        // wins, exactly the old behavior.
                         if view.row.protocol != config.protocol
                             || view.row.params != config.params
                             || view.row.group != subscription.group
@@ -6608,8 +5367,6 @@ impl Store {
                             });
                             outcome.updated += 1;
                         } else {
-                            // Pinned: user fix kept (params/protocol never
-                            // overwritten); only the group still follows.
                             if follow_group {
                                 ops.push(Op::GroupFollow {
                                     id: view.row.id.clone(),
@@ -6625,11 +5382,6 @@ impl Store {
                 continue;
             }
             if let Some(view) = global_by_key.get(key) {
-                // Ticket 25 cross-subscription fix: an unowned ADOPTABLE
-                // (released) row with the same node is adopted in place;
-                // hand-made collisions stay duplicates, never duplicated.
-                // Owned rows never shadow here (a stale-key twin falls
-                // through to candidate duty; vanished/rotation resolves it).
                 if view.owned {
                     candidates.push((key.clone(), *index, config.clone()));
                 } else if adoptable.contains(&view.row.id) {
@@ -6651,8 +5403,6 @@ impl Store {
                 if view.owned {
                     candidates.push((key.clone(), *index, config.clone()));
                 } else if adoptable.contains(&view.row.id) {
-                    // Released row, upstream tweaked an extra since release:
-                    // adopt in place onto the new key + params.
                     ops.push(Op::Adopt {
                         id: view.row.id.clone(),
                         key: key.clone(),
@@ -6666,7 +5416,7 @@ impl Store {
             }
             candidates.push((key.clone(), *index, config.clone()));
         }
-        // Vanished owned rows, paired deterministically by numeric id.
+
         let mut vanished: Vec<&RowView<'_>> = views
             .iter()
             .filter(|view| view.owned && !matched_owned.contains(&view.row.id))
@@ -6687,11 +5437,6 @@ impl Store {
                 }
             }
             if running.contains(view.row.id.as_str()) {
-                // Ticket 08 sticky: vanished upstream but currently
-                // serving — keep the row verbatim (never delete or rewrite
-                // a live endpoint's config under it) and count it `[=]`.
-                // It stays owned with its old key, so the next refresh
-                // revisits it once the endpoint stops.
                 outcome.in_use += 1;
                 continue;
             }
@@ -6704,12 +5449,8 @@ impl Store {
                     if rotation_core(&candidate.params).as_deref() == Some(core) {
                         consumed.insert(candidate_key.clone());
                         if user_changed {
-                            // Upstream rotated identity under a user edit:
-                            // keep the user's version, swallow the twin.
                             outcome.conflicts += 1;
                         } else {
-                            // Ticket 25 rotation in place: same id, same
-                            // port, same enabled — never delete + re-add.
                             ops.push(Op::UpstreamUpdate {
                                 id: view.row.id.clone(),
                                 protocol: candidate.protocol.clone(),
@@ -6724,19 +5465,6 @@ impl Store {
                 }
             }
             if !paired {
-                // Ticket 08 (throne-adoption): remark-stable fallback. The
-                // rotation pass above only pairs same-server cores; when
-                // upstream moves a node to a NEW host but keeps its remark,
-                // the vanished owned row and the unmatched candidate share
-                // the display name. Pair by exact name (first-wins in the
-                // deterministic vanished order above) so a host rotation
-                // updates in place — same id, same port, same enabled,
-                // same traffic — instead of delete + re-add. Hand-renamed
-                // rows never match (their name differs from every upstream
-                // remark), so rename preservation is unaffected. The
-                // user-edit rule mirrors rotation: a user-changed row keeps
-                // its version and swallows the twin (counted once as a
-                // conflict, never silently reverted).
                 for (candidate_key, _, candidate) in &candidates {
                     if consumed.contains(candidate_key) {
                         continue;
@@ -6767,8 +5495,7 @@ impl Store {
                 outcome.removed += 1;
             }
         }
-        // Ticket 25 L2: same-pass deletions free their ports first; BTreeMap
-        // order makes multi-insert allocation deterministic.
+
         let deleted_set: HashSet<&str> = deleted_ids.iter().map(String::as_str).collect();
         let mut taken: HashSet<i64> = rows
             .iter()
@@ -6812,7 +5539,6 @@ impl Store {
         for op in ops {
             match op {
                 Op::Insert { key, config, port } => {
-                    // Ticket 35: params and the sync baseline seal together.
                     let sealed = Self::seal_or_fail(&config.params)?;
                     tx.execute(
                         "INSERT INTO proxy_configs
@@ -6841,9 +5567,7 @@ impl Store {
                     let rowid: i64 = id.parse().map_err(|_| {
                         StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
                     })?;
-                    // Ticket 25: refreshes the identity key and the upstream
-                    // baseline together; id/port/enabled/name/bind survive.
-                    // Ticket 35: sealed at rest.
+
                     let sealed = Self::seal_or_fail(&params)?;
                     tx.execute(
                         "UPDATE proxy_configs
@@ -6866,10 +5590,7 @@ impl Store {
                     let rowid: i64 = id.parse().map_err(|_| {
                         StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
                     })?;
-                    // Ticket 25 adoption: a released row joins the
-                    // subscription in place (id/port/enabled/name kept); the
-                    // row was untouched since release, so upstream params win.
-                    // Ticket 35: sealed at rest.
+
                     let sealed = Self::seal_or_fail(&params)?;
                     tx.execute(
                         "UPDATE proxy_configs
@@ -6892,8 +5613,7 @@ impl Store {
                         StoreError::Invalid(vec![FieldError::new("id", "bad config id")])
                     })?;
                     tx.execute("DELETE FROM proxy_configs WHERE id = ?1", params![rowid])?;
-                    // Ticket 25: refresh-deletes prune like remove() does
-                    // (snapshot + history, never a stale resurrection).
+
                     tx.execute(
                         "DELETE FROM health_snapshots WHERE config_id = ?1",
                         params![id],
@@ -6905,14 +5625,7 @@ impl Store {
                 }
             }
         }
-        // Ticket 08 (throne-adoption): reorder owned members to remote
-        // order. `remote_keys` is the unique remote sequence; the post-merge
-        // read below resolves each key to its row (matched, adopted,
-        // rotated, name-paired, and freshly inserted alike — tombstoned and
-        // deleted keys resolve to nothing and are skipped). Every other row
-        // (hand-made, other subscriptions', sticky still-in-use rows) keeps
-        // its relative order; the member block anchors at the first owned
-        // slot, or the end when nothing owned is on screen yet.
+
         let remote_ids: Vec<String> = {
             let mut key_to_id: HashMap<String, String> = HashMap::new();
             {
@@ -6979,11 +5692,6 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Ticket 17: persist the latest per-item failures for one subscription
-    /// (the per-subscription failures view reads them back via
-    /// [`Store::get_subscription`]). A fetch-level failure parses nothing new,
-    /// so [`Store::record_subscription_error`] intentionally leaves this
-    /// column untouched.
     pub fn save_subscription_failures(
         &mut self,
         id: &str,
@@ -6999,11 +5707,6 @@ impl Store {
         Ok(())
     }
 
-    // -- Ticket 11: user-owned JSON export ----------------------------------
-
-    /// Default export destination: `MANYPROXY_EXPORT` overrides; otherwise a
-    /// `manyproxy-export.json` sibling of the library file. The dialog writes
-    /// here only after explicit confirm; cancel writes nothing.
     pub fn default_export_path() -> PathBuf {
         if let Ok(path) = std::env::var("MANYPROXY_EXPORT") {
             if !path.trim().is_empty() {
@@ -7019,10 +5722,6 @@ impl Store {
         PathBuf::from("manyproxy-export.json")
     }
 
-    /// Ticket 45: default visible-logs destination — `MANYPROXY_LOGS`
-    /// overrides; otherwise a `manyproxy-logs.txt` sibling of the library
-    /// file (same export-path pattern as [`Store::default_export_path`]:
-    /// explicit user action writes here, nothing automatic ever does).
     pub fn default_logs_path() -> PathBuf {
         if let Ok(path) = std::env::var("MANYPROXY_LOGS") {
             if !path.trim().is_empty() {
@@ -7038,41 +5737,11 @@ impl Store {
         PathBuf::from("manyproxy-logs.txt")
     }
 
-    /// Serialize the library (configs + subscriptions, no health samples)
-    /// for the user-owned export path. The payload round-trips through the
-    /// ticket-03 import grammar ([`crate::import::import_text`]): `outbounds`
-    /// carries each import-shaped row's params verbatim so an identical
-    /// re-import commits 0 added / N duplicates; `library`/`subscriptions`
-    /// metadata rides along for backup and is ignored by the import path.
-    /// Secrets stay plaintext by design (the confirm dialog shows
-    /// [`export_warning_text`] verbatim): redacting here would break
-    /// re-import, so redaction never applies to this payload.
-    /// Ticket 25: the `library`/`subscriptions`/`tombstones` sections are
-    /// full-fidelity (params, enabled, identity, sync baseline, adoptable
-    /// flag, refresh metadata) so [`Store::restore_library_json`] rebuilds
-    /// identical rows/groups/enabled with deletes staying deleted.
-    /// Ticket 40: full-fidelity — `route_presets` + per-row preset linkage
-    /// by NAME + traffic + meta survive, so export-then-restore elsewhere
-    /// rebuilds routing policy and counters. Tolerant of corrupt rows
-    /// (quarantined rows are skipped, never fail the whole export — the
-    /// caller uses `export_library_json_with_quarantine` for the skip list).
-    /// Rows whose sync baseline no longer unseals are skipped the same way
-    /// (logged + quarantined, never a whole-export abort):
-    /// `list_with_quarantine` cannot see that column (`map_row` never reads
-    /// it), so export filters it here.
-    /// Ticket A8: single pipeline — this delegates to
-    /// [`Store::export_library_json_with_quarantine`] and drops the skip
-    /// list, so the two exports can never drift apart (one funnel for the
-    /// good-rows shape, the quarantine list, and the v5 sections).
     pub fn export_library_json(&self) -> Result<String, StoreError> {
         let (payload, _) = self.export_library_json_with_quarantine()?;
         Ok(payload)
     }
 
-    /// Split `rows` into exportable rows plus skipped ids: any row whose
-    /// `synced_params` fails to unseal is logged and skipped (never a whole
-    /// export failure). A broken side-channel read degrades to no filtering
-    /// (loud `eprintln`, never silent data loss either way).
     fn without_unreadable_synced(&self, rows: Vec<ProxyConfig>) -> (Vec<ProxyConfig>, Vec<String>) {
         let mut bad: HashSet<String> = HashSet::new();
         match self
@@ -7120,25 +5789,17 @@ impl Store {
         (kept, skipped)
     }
 
-    /// Ticket 40: patch the v5 full-fidelity sections into a base export
-    /// payload for exactly `rows` (good rows only). Adds `adoptable` /
-    /// `synced_params` (ticket 25), `preset` (name, never id),
-    /// `traffic_rx` / `traffic_tx`, `route_presets`, and `meta`.
     fn enrich_export_payload(
         &self,
         base_payload: &str,
         rows: &[ProxyConfig],
     ) -> Result<String, StoreError> {
-        /// Per-row export side-channels: adoptable, synced baseline,
-        /// counters, preset name.
         type SideRow = (bool, Option<String>, i64, i64, Option<String>);
-        // Ownership side-channels + traffic + preset linkage, keyed by id.
+
         let mut side: HashMap<String, SideRow> = HashMap::new();
-        // Row ids whose sync baseline failed to unseal (quarantined below).
+
         let mut unreadable_synced: HashSet<String> = HashSet::new();
         {
-            // preset_id → preset name resolution happens below; here we read
-            // the raw linkage plus counters.
             let mut stmt = self.conn.prepare(
                 "SELECT id, adoptable, synced_params, traffic_rx, traffic_tx, preset_id
                  FROM proxy_configs",
@@ -7153,7 +5814,7 @@ impl Store {
                     row.get::<_, Option<String>>(5)?,
                 ))
             })?;
-            // Preset id → name map for linkage by name.
+
             let preset_names: HashMap<String, String> = self
                 .list_presets()?
                 .into_iter()
@@ -7161,8 +5822,7 @@ impl Store {
                 .collect();
             for entry in entries {
                 let (id, adoptable, synced, rx, tx, preset_id) = entry?;
-                // One unreadable sync baseline quarantines its row (logged +
-                // skipped), never the whole export.
+
                 let synced = match synced {
                     Some(sealed) => match Self::unseal_or_fail(&sealed) {
                         Ok(text) => Some(text),
@@ -7186,10 +5846,6 @@ impl Store {
         let mut value: serde_json::Value = serde_json::from_str(base_payload)
             .map_err(|error| Self::schema_error(format!("export serialization broke ({error})")))?;
         if let Some(entries) = value.get_mut("library").and_then(|v| v.as_array_mut()) {
-            // Drop any library entries for quarantined rows (base payload was
-            // built from good rows only, so this is a no-op — belt and
-            // suspenders for callers that pass a foreign base) plus rows
-            // whose sync baseline failed to unseal above.
             let good_ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
             entries.retain(|e| {
                 e.get("id")
@@ -7214,7 +5870,7 @@ impl Store {
                 }
             }
         }
-        // route_presets section (full rules, never secret-bearing).
+
         {
             let presets = self.list_presets()?;
             let items: Vec<serde_json::Value> = presets
@@ -7237,8 +5893,7 @@ impl Store {
                 obj.insert("route_presets".to_string(), serde_json::Value::Array(items));
             }
         }
-        // meta section (allow-listed keys only; future keys ride the same
-        // table without code changes, but only these restore).
+
         {
             let mut meta = serde_json::Map::new();
             for key in [
@@ -7250,8 +5905,7 @@ impl Store {
                     meta.insert(key.to_string(), serde_json::Value::String(v));
                 }
             }
-            // Ticket 08: per-group skip flags ride the same section
-            // (prefix-scoped; only `"1"` ever writes, so only it reads).
+
             for group in self.group_skip_flags()? {
                 meta.insert(
                     Self::group_skip_key(&group),
@@ -7262,7 +5916,7 @@ impl Store {
                 obj.insert("meta".to_string(), serde_json::Value::Object(meta));
             }
         }
-        // Tombstones with URL + rotation core for cross-DB fidelity.
+
         {
             let mut stmt = self.conn.prepare(
                 "SELECT subscription_id, identity_key, subscription_url, rotation_core
@@ -7285,15 +5939,6 @@ impl Store {
         Ok(value.to_string())
     }
 
-    /// Write the export file only when `confirmed` is true. Cancel (`false`)
-    /// performs no I/O and returns `Ok(None)`; confirm writes the payload
-    /// and returns the path. Errors never echo file contents (no secrets in
-    /// logs); only the destination path is named.
-    /// Ticket 25 (L4): the payload lands via tmp-file + rename in the same
-    /// directory, so a crash never leaves a half-written export behind.
-    /// Ticket 32: the payload holds secrets at rest, so both the tmp
-    /// sibling and the final file land user-only hardened
-    /// ([`harden_file_permissions`], like the library DB).
     pub fn commit_export(
         &self,
         path: &Path,
@@ -7302,8 +5947,7 @@ impl Store {
         if !confirmed {
             return Ok(None);
         }
-        // Never overwrite the live database with JSON export bytes: refuse
-        // when the destination resolves to the live DB file.
+
         if let Some(live) = self.db_path.as_deref() {
             if paths_equal(live, path) {
                 return Err(StoreError::Invalid(vec![FieldError::new(
@@ -7339,32 +5983,7 @@ impl Store {
         Ok(Some(path.to_path_buf()))
     }
 
-    /// Ticket 25: rebuild a [`Store::export_library_json`] payload verbatim —
-    /// same row ids, same groups, same enabled flags, same subscription
-    /// records with refresh metadata, same tombstones (deletes stay
-    /// deleted). Rows land exactly as exported (no re-validation, no port
-    /// reassignment); anything malformed fails loudly with an `export`
-    /// field error before anything is written (single transaction). The
-    /// import grammar keeps reading only `outbounds` (ticket 24 territory);
-    /// this is the store half that consumes the `library`/`subscriptions`/
-    /// `tombstones` sections ticket 25 exposes. No in-tree prod caller yet
-    /// (UI/import wiring is ticket 26); kept live by tests.
     #[allow(dead_code)]
-    /// Ticket 25: rebuild a [`Store::export_library_json`] payload verbatim —
-    /// same row ids, same groups, same enabled flags, same subscription
-    /// records with refresh metadata, same tombstones (deletes stay
-    /// deleted). Rows land exactly as exported (no re-validation, no port
-    /// reassignment); anything malformed fails loudly with an `export`
-    /// field error before anything is written (single transaction). The
-    /// import grammar keeps reading only `outbounds` (ticket 24 territory);
-    /// this is the store half that consumes the `library`/`subscriptions`/
-    /// `tombstones` sections ticket 25 exposes.
-    /// Ticket 40: full-fidelity — `route_presets` rebuild by id, per-row
-    /// linkage re-attached BY NAME (never dangling), traffic counters,
-    /// `interval_secs`, URL-keyed tombstones, and allow-listed `meta` all
-    /// survive. Old payloads missing the new sections still restore
-    /// (presets untouched, traffic zero, meta kept). The wipe + rebuild run
-    /// in ONE transaction: a mid-restore kill rolls back, old library intact.
     pub fn restore_library_json(&mut self, payload: &str) -> Result<RestoreOutcome, StoreError> {
         fn invalid(message: String) -> StoreError {
             StoreError::Invalid(vec![FieldError::new("export", message)])
@@ -7442,9 +6061,7 @@ impl Store {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0)
                 .max(0);
-            // Ticket A3: strict restore — missing/wrong-typed core fields fail
-            // loudly (same `invalid()` shape as id/port above), never silent
-            // defaults that would resurrect a corrupt export as good rows.
+
             let name = get_str(entry, "name")
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| invalid(format!("{what} needs a name")))?;
@@ -7470,8 +6087,7 @@ impl Store {
                     return Err(invalid(format!("{what} has a bad bind_ip")));
                 }
             }
-            // Ticket A3: reserved ranges never restore silently (the save
-            // gate would have refused them); name the range like the engine.
+
             if let Some(range) = crate::engine::reserved_range_of(port as u16) {
                 return Err(invalid(format!(
                     "{what} uses reserved port {port} ({range})"
@@ -7501,12 +6117,7 @@ impl Store {
                 traffic_tx,
             });
         }
-        // Ticket A3: duplicate bind:port on the restore path fails loudly
-        // (two rows can never claim one endpoint; activation would refuse
-        // it later — fail at restore instead). Keys fold through the same
-        // loopback-alias canonicalization as activation
-        // (`normalize_bind_key`), so `127.0.0.1`, `localhost`, and `::1`
-        // compare equal here exactly as they do at start time.
+
         {
             let mut seen: std::collections::HashSet<(String, i64)> =
                 std::collections::HashSet::new();
@@ -7548,7 +6159,7 @@ impl Store {
                 .get("failures")
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "[]".to_string());
-            // Loud on corrupt per-item metadata: never silently drop it.
+
             if serde_json::from_str::<serde_json::Value>(&failures).is_err() {
                 return Err(invalid(format!("{what} has corrupt failures")));
             }
@@ -7570,10 +6181,7 @@ impl Store {
                     .get("interval_secs")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or(DEFAULT_AUTO_REFRESH_SECS),
-                // Ticket 08: quota is tolerant (a missing key reads as
-                // no-quota, like a provider that sends no header); corrupt
-                // non-integer values fall back the same way, never failing
-                // the whole restore.
+
                 quota_used: entry.get("quota_used").and_then(serde_json::Value::as_i64),
                 quota_total: entry.get("quota_total").and_then(serde_json::Value::as_i64),
                 quota_expire: entry
@@ -7647,7 +6255,7 @@ impl Store {
                 Some(v) => v.to_string(),
                 None => "[]".to_string(),
             };
-            // Loud on corrupt rules: never silently drop routing policy.
+
             match serde_json::from_str::<serde_json::Value>(&rules_json) {
                 Ok(serde_json::Value::Array(_)) => {}
                 _ => return Err(invalid(format!("{what} has corrupt rules_json"))),
@@ -7669,7 +6277,7 @@ impl Store {
                     .and_then(serde_json::Value::as_i64),
             });
         }
-        // Validate meta values are strings (never secrets in errors).
+
         let mut meta_rows: Vec<(String, String)> = Vec::new();
         for key in [
             Self::META_RESTORE_RUNNING,
@@ -7677,25 +6285,20 @@ impl Store {
             Self::META_SUBS_AUTO_REFRESH,
         ] {
             if let Some(v) = meta_json.get(key).and_then(|v| v.as_str()) {
-                // running_ids must parse as an array of strings when present;
-                // corrupt snapshots fail loudly (never a guessed row).
                 if key == Self::META_RUNNING_IDS {
                     match serde_json::from_str::<serde_json::Value>(v) {
                         Ok(serde_json::Value::Array(_)) => {}
                         _ => return Err(invalid("meta.running_ids is corrupt".to_string())),
                     }
                 }
-                // Ticket 45: the kill-switch restores only as an explicit
-                // on/off bit; anything else fails loudly (never a guess).
+
                 if key == Self::META_SUBS_AUTO_REFRESH && v != "0" && v != "1" {
                     return Err(invalid("meta.subs_auto_refresh is corrupt".to_string()));
                 }
                 meta_rows.push((key.to_string(), v.to_string()));
             }
         }
-        // Ticket 08: per-group skip flags restore from the same section
-        // (prefix-scoped; only `"1"` restores — anything else is unset,
-        // never a guess).
+
         for (key, value) in &meta_json {
             if let (Some(group), Some(flag)) =
                 (key.strip_prefix("group.skip_refresh."), value.as_str())
@@ -7705,8 +6308,7 @@ impl Store {
                 }
             }
         }
-        // Seal plaintext params BEFORE opening the tx (DPAPI failures abort
-        // before any wipe, so the tx never starts half-sealed).
+
         let mut sealed_rows: Vec<(LibraryRow, String, Option<String>)> =
             Vec::with_capacity(rows.len());
         for row in rows {
@@ -7718,9 +6320,7 @@ impl Store {
                 .transpose()?;
             sealed_rows.push((row, sealed_params, sealed_synced));
         }
-        // Seal subscription URLs BEFORE opening the tx (same atomicity rule:
-        // export payloads carry plaintext URLs by design, and they seal on
-        // the way back in; already-sealed input stays as-is).
+
         let mut sealed_sub_urls: Vec<String> = Vec::with_capacity(sub_rows.len());
         for sub in &sub_rows {
             if sub.url.trim_start().starts_with(crate::dpapi::MARKER) {
@@ -7730,14 +6330,11 @@ impl Store {
             }
         }
         let tx = self.conn.transaction()?;
-        // Wipe + rebuild in ONE transaction (atomic: mid-kill rolls back).
+
         tx.execute("DELETE FROM proxy_configs", [])?;
         tx.execute("DELETE FROM subscriptions", [])?;
         tx.execute("DELETE FROM subscription_tombstones", [])?;
-        // Presets: only wipe when the payload carries an explicit presets
-        // array (missing or explicit `null` preserves live presets for
-        // re-attach, ticket-37 compat; only `[]` or a populated array —
-        // an explicit statement about the set — clears first).
+
         if obj
             .get("route_presets")
             .and_then(|v| v.as_array())
@@ -7764,8 +6361,7 @@ impl Store {
                 ],
             )?;
         }
-        // Preset name → id map for linkage (payload ids may differ across
-        // DBs; names are the stable key).
+
         let mut preset_by_name: HashMap<String, String> = HashMap::new();
         if !preset_rows.is_empty() {
             let mut stmt = tx.prepare("SELECT id, name FROM route_presets")?;
@@ -7776,8 +6372,6 @@ impl Store {
                 preset_by_name.insert(name, id.to_string());
             }
         } else {
-            // Old payload or empty presets: link against live presets (kept
-            // table) by name so same-DB restores still re-attach.
             let mut stmt = tx.prepare("SELECT id, name FROM route_presets")?;
             for entry in
                 stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -7808,13 +6402,8 @@ impl Store {
                 ],
             )?;
         }
-        // Ticket 08: display order rides the array position (export
-        // writes the library array in display order, so enumerate seats
-        // `sort_order` to reproduce it; payload ids never order rows).
+
         for (position, (row, sealed_params, sealed_synced)) in sealed_rows.iter().enumerate() {
-            // Ticket 40: linkage BY NAME (never dangling ids). Unknown names
-            // rebuild unattached (visible in the manager, never a serve-time
-            // failure).
             let preset_id: Option<String> = row
                 .preset_name
                 .as_deref()
@@ -7874,18 +6463,10 @@ impl Store {
         })
     }
 
-    // -- Ticket 36: data-plane traffic counters ----------------------------
-
-    /// Add data-plane byte deltas for one config. Totals persist (restart
-    /// resumes from these, never zeroed) and saturate at `i64::MAX`
-    /// (SQLite integers are 64-bit signed). Implemented on the batched path;
-    /// ticks use [`Store::add_traffic_batch`] directly (one tx per tick).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn add_traffic(&mut self, id: &str, rx: u64, tx: u64) -> Result<(), StoreError> {
         let updated = self.add_traffic_batch(&[(id.to_string(), rx, tx)])?;
         if updated == 0 {
-            // Preserve the single-row NotFound contract (batch skips unknown
-            // ids and counts; single-row callers expect a typed miss).
             if id.parse::<i64>().is_err() {
                 return Err(StoreError::Invalid(vec![FieldError::new(
                     "id",
@@ -7897,12 +6478,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 40: batched traffic writes — one transaction per tick with a
-    /// single prepared saturating UPDATE loop. Unknown ids are skipped (not
-    /// failed) so one removed row never drops a whole tick; the return count
-    /// names how many rows moved. Errors propagate loudly (callers log, never
-    /// swallow). Deltas are collected before the tx opens (never held across
-    /// network I/O).
     pub fn add_traffic_batch(
         &mut self,
         deltas: &[(String, u64, u64)],
@@ -7911,8 +6486,7 @@ impl Store {
             return Ok(0);
         }
         let tx = self.conn.transaction()?;
-        // Saturating single-statement UPDATEs: CASE caps at i64::MAX without
-        // overflowing the addition itself.
+
         let mut stmt = tx.prepare(
             "UPDATE proxy_configs SET
                traffic_rx = CASE WHEN traffic_rx > 9223372036854775807 - ?1
@@ -7927,12 +6501,12 @@ impl Store {
                 Ok(rowid) => rowid,
                 Err(_) => continue,
             };
-            // Clamp deltas to i64 range before binding (u64::MAX never wraps).
+
             let rx = (*rx).min(i64::MAX as u64) as i64;
             let txb = (*tx_bytes).min(i64::MAX as u64) as i64;
             match stmt.execute(params![rx, txb, rowid]) {
                 Ok(1..) => updated += 1,
-                Ok(_) => {} // unknown id: skip-and-count (quarantine philosophy)
+                Ok(_) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -7941,8 +6515,6 @@ impl Store {
         Ok(updated)
     }
 
-    /// All persisted data-plane totals keyed by config id (for display
-    /// hydration after restart).
     pub fn traffic_totals(&self) -> Result<HashMap<String, (u64, u64)>, StoreError> {
         let mut stmt = self
             .conn
@@ -7961,15 +6533,10 @@ impl Store {
         Ok(totals)
     }
 
-    /// Ticket 43: zero one row's data-plane totals (per-row reset, behind a
-    /// confirm in the UI). `NotFound` for ghost rows — never a silent no-op.
     pub fn reset_traffic(&mut self, id: &str) -> Result<(), StoreError> {
         self.reset_traffic_counters(id)
     }
 
-    /// Ticket 45: zero one row's persisted usage counters (the confirm gate
-    /// lives in the UI; this seam never zeros silently — unknown ids are
-    /// `NotFound`, never a silent no-op).
     pub fn reset_traffic_counters(&mut self, id: &str) -> Result<(), StoreError> {
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
@@ -7985,8 +6552,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 43: zero every row's data-plane totals (Settings "clear
-    /// traffic"). Returns the row count so the toast can name it.
     pub fn clear_all_traffic(&mut self) -> Result<usize, StoreError> {
         let changed = self.conn.execute(
             "UPDATE proxy_configs SET traffic_rx = 0, traffic_tx = 0",
@@ -7995,32 +6560,16 @@ impl Store {
         Ok(changed)
     }
 
-    /// Ticket 43: drop every persisted health snapshot (Settings "clear
-    /// health"). Returns the row count so the toast can name it.
     pub fn clear_health_snapshots(&mut self) -> Result<usize, StoreError> {
         let changed = self.conn.execute("DELETE FROM health_snapshots", [])?;
         Ok(changed)
     }
 
-    // -- Ticket 12: health snapshot persistence ------------------------------
-    /// Called after every recorded probe outcome; restart rehydrates from
-    /// [`Store::load_health_snapshots`]. Error text here is a probe cause
-    /// (already redacted at the health seam), never raw secrets.
-    /// Ticket 25: absurd latencies saturate at `i64::MAX` (never wrap);
-    /// implemented on [`Store::save_health_snapshots`].
-    /// Ticket 47: probe rounds persist batched ([`record_and_persist`] uses
-    /// [`Store::save_health_snapshots`]); kept for single-row callers.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn save_health_snapshot(&mut self, snapshot: &HealthSnapshot) -> Result<(), StoreError> {
         self.save_health_snapshots(std::slice::from_ref(snapshot))
     }
 
-    /// Ticket 25: persist a whole probe round in ONE transaction (the
-    /// store half of "health saves off the UI thread": one tx instead of N
-    /// statements; the `spawn_blocking` move is main.rs territory, ticket 26).
-    /// Ticket 40: the same tx also appends to `health_history` (one tx per
-    /// probe round covers latest + history; retention prunes separately via
-    /// `prune_health_history_before`, never VACUUM).
     pub fn save_health_snapshots(
         &mut self,
         snapshots: &[HealthSnapshot],
@@ -8066,9 +6615,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 40: validate one health sample. `kind` must be `url-test` or
-    /// `tcp-ping`; exactly one of `latency_ms` / `error` must be present
-    /// (null XOR non-null). Rejections are typed, never silent.
     fn check_health_sample(
         kind: &str,
         latency_ms: Option<u64>,
@@ -8083,8 +6629,6 @@ impl Store {
         }
     }
 
-    /// Ticket 40: append history samples without touching the latest
-    /// fast-path (retention prunes separately). One tx, validated strictly.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn append_health_history(
         &mut self,
@@ -8113,10 +6657,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 40: history for one config, oldest first, optionally since a
-    /// cutoff (`at >= since`). Serves the detail sparkline.
-    /// Ticket 45: production seam behind the detail sparkline (bounded by
-    /// the caller, never the latest-snapshot fast path).
     pub fn load_health_history(
         &self,
         config_id: &str,
@@ -8147,9 +6687,6 @@ impl Store {
         }
     }
 
-    /// Ticket 40: time-based retention — `DELETE WHERE at < ?` in one tx,
-    /// never VACUUM (WAL freelist reuse is fine). Returns the pruned count.
-    /// Called at startup + daily with a 30–90d cutoff.
     pub fn prune_health_history_before(&mut self, cutoff: i64) -> Result<usize, StoreError> {
         let tx = self.conn.transaction()?;
         let pruned = tx.execute("DELETE FROM health_history WHERE at < ?1", params![cutoff])?;
@@ -8157,16 +6694,12 @@ impl Store {
         Ok(pruned)
     }
 
-    /// Ticket 40: retention by age — keep the last `retain_days` of history
-    /// as of `now`. One tx, no VACUUM.
     pub fn gc_health_history(&mut self, retain_days: i64, now: i64) -> Result<usize, StoreError> {
         let days = retain_days.max(1);
         let cutoff = now.saturating_sub(days.saturating_mul(86_400));
         self.prune_health_history_before(cutoff)
     }
 
-    /// All persisted latest-per-config samples (callers filter to known ids
-    /// so snapshots of removed configs never resurrect rows).
     pub fn load_health_snapshots(&self) -> Result<Vec<HealthSnapshot>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT config_id, at, kind, latency_ms, error
@@ -8178,18 +6711,12 @@ impl Store {
         Ok(rows)
     }
 
-    // -- Ticket 38: opt-in autostart/restore state --------------------------
-
-    /// Meta key behind the session-restore opt-in (`"1"` = on).
     pub const META_RESTORE_RUNNING: &str = "restore_running";
-    /// Meta key behind the running-set snapshot (JSON array of config ids).
+
     pub const META_RUNNING_IDS: &str = "running_ids";
-    /// Ticket 43: meta key behind the global probe-URL override (unset means
-    /// the documented default). Per-row overrides live under
-    /// `test_url:<config_id>`.
+
     pub const META_TEST_URL: &str = "test_url";
 
-    /// Read one meta value (`None` when unset). Callers decide the default.
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
         let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
         let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
@@ -8199,7 +6726,6 @@ impl Store {
         }
     }
 
-    /// Write one meta value (upsert).
     pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -8209,60 +6735,38 @@ impl Store {
         Ok(())
     }
 
-    /// True only when the user opted into session restore. A broken read
-    /// fails closed (no restore), never open.
     pub fn restore_running(&self) -> bool {
         self.get_meta(Self::META_RESTORE_RUNNING)
             .map(|value| value.as_deref() == Some("1"))
             .unwrap_or(false)
     }
 
-    /// Persist the session-restore opt-in (explicit Settings checkbox only).
     pub fn set_restore_running(&mut self, on: bool) -> Result<(), StoreError> {
         self.set_meta(Self::META_RESTORE_RUNNING, if on { "1" } else { "0" })
     }
 
-    /// Ticket 45: meta key behind the global subscription auto-refresh
-    /// kill-switch (`"1"` = on). Unset means on (existing libraries keep
-    /// their behavior); explicit off gates the automatic due pass only —
-    /// manual Refresh-all-due is explicit consent and always runs.
     pub const META_SUBS_AUTO_REFRESH: &str = "subs_auto_refresh";
 
-    /// True unless the user explicitly killed subscription auto-refresh. A
-    /// broken read fails closed (no automatic network), never open.
     pub fn subs_auto_refresh_enabled(&self) -> bool {
         self.get_meta(Self::META_SUBS_AUTO_REFRESH)
             .map(|value| value.as_deref() != Some("0"))
             .unwrap_or(true)
     }
 
-    /// Persist the global auto-refresh kill-switch (explicit subs-dialog
-    /// toggle only — never flipped by ticks).
     pub fn set_subs_auto_refresh_enabled(&mut self, on: bool) -> Result<(), StoreError> {
         self.set_meta(Self::META_SUBS_AUTO_REFRESH, if on { "1" } else { "0" })
     }
 
-    /// Ticket 08 (throne-adoption): meta-key behind one group's
-    /// skip-automatic-refresh flag. The suffix is the trimmed group label
-    /// (labels are case-sensitive display strings; the flag follows the
-    /// label — renames migrate it, see [`Store::rename_group`]).
     fn group_skip_key(group: &str) -> String {
         format!("group.skip_refresh.{}", group.trim())
     }
 
-    /// True when the group is flagged to skip automatic refresh
-    /// (background ticks and Update-all). Unset means refresh normally.
-    /// Explicit per-row Update and Update-current always run — explicit
-    /// consent overrides the auto-skip.
     pub fn group_skip_refresh(&self, group: &str) -> bool {
         self.get_meta(&Self::group_skip_key(group))
             .map(|value| value.as_deref() == Some("1"))
             .unwrap_or(false)
     }
 
-    /// Every group currently flagged to skip automatic refresh, ordered.
-    /// (Export writes these into the `meta` section; restore reads them
-    /// back — same table, same prefix, values strictly `"1"`.)
     pub fn group_skip_flags(&self) -> Result<Vec<String>, StoreError> {
         let prefix = "group.skip_refresh.";
         let mut stmt = self.conn.prepare(
@@ -8280,10 +6784,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Set or clear the skip-automatic-refresh flag (Manage Groups Edit
-    /// only — ticks never flip it). Clearing deletes the key (unset means
-    /// refresh); unknown groups flag fine (the flag is inert until a
-    /// subscription feeds that label).
     pub fn set_group_skip_refresh(&mut self, group: &str, skip: bool) -> Result<(), StoreError> {
         let key = Self::group_skip_key(group);
         if skip {
@@ -8295,11 +6795,6 @@ impl Store {
         }
     }
 
-    /// Persist the currently running set for a later restore. Best-effort
-    /// bookkeeping (like health snapshots): callers ignore errors.
-    /// Ticket 40: filters to known config ids (ghost ids never persist) and
-    /// surfaces write errors (read-only disks fail loudly, never silent
-    /// loss — callers log instead of `let _ =`).
     pub fn save_running_snapshot(&mut self, ids: &[String]) -> Result<(), StoreError> {
         let known: HashSet<String> = {
             let mut stmt = self.conn.prepare("SELECT id FROM proxy_configs")?;
@@ -8319,8 +6814,6 @@ impl Store {
         self.set_meta(Self::META_RUNNING_IDS, &value)
     }
 
-    /// Ticket 43: clear the running snapshot (Settings "reset snapshot").
-    /// A later launch restores nothing; the live engine is untouched.
     pub fn clear_running_snapshot(&mut self) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM meta WHERE key = ?1",
@@ -8329,8 +6822,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 43: global probe-URL override (`None` means the documented
-    /// default). Blank reads as unset, never as a URL.
     pub fn test_url(&self) -> Option<String> {
         match self.get_meta(Self::META_TEST_URL) {
             Ok(Some(url)) if !url.trim().is_empty() => Some(url),
@@ -8338,13 +6829,10 @@ impl Store {
         }
     }
 
-    /// Ticket 43: persist the global probe-URL override (validated upstream;
-    /// stored trimmed).
     pub fn set_test_url(&mut self, url: &str) -> Result<(), StoreError> {
         self.set_meta(Self::META_TEST_URL, url.trim())
     }
 
-    /// Ticket 43: drop the global probe-URL override (back to the default).
     pub fn clear_test_url(&mut self) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM meta WHERE key = ?1",
@@ -8353,13 +6841,10 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 43: meta key for one row's probe-URL override.
     fn row_test_url_key(id: &str) -> String {
         format!("{}:{id}", Self::META_TEST_URL)
     }
 
-    /// Ticket 43: one row's probe-URL override (`None` falls back to the
-    /// global override, then the default). Blank reads as unset.
     pub fn row_test_url(&self, id: &str) -> Option<String> {
         match self.get_meta(&Self::row_test_url_key(id)) {
             Ok(Some(url)) if !url.trim().is_empty() => Some(url),
@@ -8367,12 +6852,10 @@ impl Store {
         }
     }
 
-    /// Ticket 43: persist one row's probe-URL override (validated upstream).
     pub fn set_row_test_url(&mut self, id: &str, url: &str) -> Result<(), StoreError> {
         self.set_meta(&Self::row_test_url_key(id), url.trim())
     }
 
-    /// Ticket 43: drop one row's probe-URL override (back to the global).
     pub fn clear_row_test_url(&mut self, id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM meta WHERE key = ?1",
@@ -8381,14 +6864,8 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 01: meta key behind the Appearance choice (`"dark"` default,
-    /// `"light"`, or `"system"` → Windows AppsUseLightTheme). A UI-only
-    /// preference: persisted here, never exported (like the probe-URL
-    /// override — machine-local, not cross-DB state).
     pub const META_APPEARANCE: &str = "appearance";
 
-    /// Ticket 01: persisted appearance (`"dark"` when unset or corrupt —
-    /// dark is the documented default, never a guessed OS read).
     pub fn appearance(&self) -> String {
         match self.get_meta(Self::META_APPEARANCE) {
             Ok(Some(value)) if value == "dark" || value == "light" || value == "system" => value,
@@ -8396,8 +6873,6 @@ impl Store {
         }
     }
 
-    /// Ticket 01: persist the Appearance choice. Anything outside the three
-    /// documented values fails loudly (never a guessed write).
     pub fn set_appearance(&mut self, value: &str) -> Result<(), StoreError> {
         if value != "dark" && value != "light" && value != "system" {
             return Err(StoreError::Invalid(vec![FieldError::new(
@@ -8408,32 +6883,18 @@ impl Store {
         self.set_meta(Self::META_APPEARANCE, value)
     }
 
-    /// Ticket 10 (throne-adoption US-30): meta key behind the
-    /// skip-delete-confirm toggle. `"1"` skips the single-row and bulk
-    /// remove confirms (the preset detach-delete confirm never skips —
-    /// detaching rows is not a plain delete). Unset/corrupt means ask
-    /// (fail-closed to the confirm, never to silent deletes).
     pub const META_SKIP_DELETE_CONFIRM: &str = "skip_delete_confirm";
 
-    /// True only after the explicit Settings opt-in. Broken reads fail
-    /// closed (confirm shown), never open.
     pub fn skip_delete_confirm(&self) -> bool {
         self.get_meta(Self::META_SKIP_DELETE_CONFIRM)
             .map(|value| value.as_deref() == Some("1"))
             .unwrap_or(false)
     }
 
-    /// Persist the skip-delete-confirm toggle (explicit Settings switch
-    /// only — delete paths never flip it).
     pub fn set_skip_delete_confirm(&mut self, skip: bool) -> Result<(), StoreError> {
         self.set_meta(Self::META_SKIP_DELETE_CONFIRM, if skip { "1" } else { "0" })
     }
 
-    /// Ticket 10 (US-26): Connections table columns in render order, with
-    /// their default widths in px. The UI applies these as cell widths,
-    /// persists resizes through [`Store::set_conn_column_width`], and
-    /// restores all five through [`Store::reset_conn_column_widths`]
-    /// (the Refresh Column Widths button).
     pub const CONN_COLUMNS: [(&str, u32); 5] = [
         ("destination", 220),
         ("exit", 180),
@@ -8442,13 +6903,8 @@ impl Store {
         ("session", 90),
     ];
 
-    /// Meta key behind the Connections column widths (JSON array of five
-    /// px widths, same order as [`Store::CONN_COLUMNS`]).
     pub const META_CONN_COL_WIDTHS: &str = "conn_col_widths";
 
-    /// Persisted Connections column widths in px. Corrupt/absent reads as
-    /// the defaults (never a zero-width table); each entry clamps to
-    /// 40..=600 so one bad value cannot collapse the rest.
     pub fn conn_column_widths(&self) -> [u32; 5] {
         let defaults = Self::default_conn_column_widths();
         let raw = match self.get_meta(Self::META_CONN_COL_WIDTHS) {
@@ -8472,7 +6928,6 @@ impl Store {
         out
     }
 
-    /// Default Connections column widths in px.
     pub fn default_conn_column_widths() -> [u32; 5] {
         [
             Self::CONN_COLUMNS[0].1,
@@ -8483,8 +6938,6 @@ impl Store {
         ]
     }
 
-    /// Persist one Connections column width (clamped 40..=600;
-    /// out-of-range columns fail loudly, never write a shifted table).
     pub fn set_conn_column_width(&mut self, index: usize, width_px: u32) -> Result<(), StoreError> {
         if index >= Self::CONN_COLUMNS.len() {
             return Err(StoreError::Invalid(vec![FieldError::new(
@@ -8507,9 +6960,6 @@ impl Store {
         self.set_meta(Self::META_CONN_COL_WIDTHS, &value)
     }
 
-    /// Restore the default Connections column widths (the Refresh Column
-    /// Widths button). Deletes the key so `conn_column_widths` reads
-    /// defaults (explicit reset, never a guessed write).
     pub fn reset_conn_column_widths(&mut self) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM meta WHERE key = ?1",
@@ -8518,11 +6968,6 @@ impl Store {
         Ok(())
     }
 
-    /// Ticket 10 (US-22): summarize stored totals for one Traffic Stats
-    /// period — `(exits_with_traffic, rx_bytes, tx_bytes)`. Periods share
-    /// the cumulative totals (no per-period history persists yet), so the
-    /// caller labels the summary all-time; the per-exit bars come from the
-    /// same map and always match this summary.
     pub fn traffic_period_summary(
         totals: &std::collections::HashMap<String, (u64, u64)>,
         _period: TrafficPeriod,
@@ -8540,10 +6985,6 @@ impl Store {
         (exits, rx, tx)
     }
 
-    /// Load the running-set snapshot. Missing or corrupt reads as empty
-    /// (never a crash, never a guessed row).
-    /// Ticket 40: filters to known config ids so a snapshot naming a removed
-    /// row never resurrects it (callers still intersect with live ids).
     pub fn load_running_snapshot(&self) -> Vec<String> {
         let raw = match self.get_meta(Self::META_RUNNING_IDS) {
             Ok(Some(raw)) => raw,
@@ -8556,8 +6997,7 @@ impl Store {
                 .collect(),
             _ => return Vec::new(),
         };
-        // Filter to live ids (best-effort: a broken read fails closed to the
-        // unfiltered list rather than empty — saves already filter).
+
         let known: HashSet<String> = match self.conn.prepare("SELECT id FROM proxy_configs") {
             Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, i64>(0)) {
                 Ok(mapped) => {
@@ -8587,12 +7027,6 @@ impl Store {
         ids.into_iter().filter(|id| known.contains(id)).collect()
     }
 
-    /// First free port in the auto range, given the set of taken ports.
-    /// Ticket 27: primary then spillover (see [`auto_port_candidates`]).
-    /// `exclude` frees one in-use port from the taken set (the edit-to-auto
-    /// path passes the row's own current port: it stays taken by nobody
-    /// else, so the row may keep it instead of burning a fresh port per
-    /// edit and starving the range).
     fn auto_port_excluding(&self, exclude: Option<u16>) -> Result<u16, StoreError> {
         let mut stmt = self.conn.prepare("SELECT port FROM proxy_configs")?;
         let mut taken: HashSet<i64> = stmt
@@ -8612,10 +7046,6 @@ impl Store {
         )]))
     }
 
-    /// Validate a patch against the current record; pure until the write.
-    /// Ticket 16: blank protocol/params/group/bind means "keep current"
-    /// (never silent defaults); blank name still errors; blank port still
-    /// means auto-assign (explicit in the dialog placeholder).
     fn validate_patch(
         &self,
         current: &ProxyConfig,
@@ -8649,9 +7079,6 @@ impl Store {
         };
         let port = match &patch.port {
             Some(raw) => match parse_port_field(raw) {
-                // Blank/`auto` re-resolves against every port but this row's
-                // own (it may keep its current port; otherwise the range
-                // drains one port per edit).
                 Ok(None) => match self.auto_port_excluding(Some(current.port)) {
                     Ok(port) => Some(port),
                     Err(StoreError::Invalid(mut auto_errors)) => {
@@ -8699,8 +7126,6 @@ mod tests {
         }
     }
 
-    /// Ticket 44: group rename moves every row carrying the old label;
-    /// empty names refuse with nothing written.
     #[test]
     fn t44_rename_group_moves_rows_and_rejects_empty() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8745,11 +7170,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08 (throne-adoption): the skip-automatic-refresh flag
-    /// round-trips per group; rename migrates the flag AND retargets
-    /// subscriptions feeding the old label (their members would otherwise
-    /// GroupFollow back on the next refresh); export/restore carries the
-    /// flags.
     #[test]
     fn t08_group_skip_flag_round_trips_and_follows_rename() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8769,7 +7189,7 @@ mod tests {
             .expect("flag clears");
         assert!(!store.group_skip_refresh("travel"), "clear deletes the key");
         assert!(store.group_skip_flags().expect("flags read").is_empty());
-        // Rename migrates the flag and retargets the subscription.
+
         store
             .set_group_skip_refresh("travel", true)
             .expect("flag sets");
@@ -8781,7 +7201,7 @@ mod tests {
             .expect("get works")
             .expect("sub kept");
         assert_eq!(moved.group, "team", "subscription follows rename");
-        // Export/restore carries the flag.
+
         let payload = store.export_library_json().expect("export works");
         let mut other = Store::open_in_memory().expect("in-memory store opens");
         other.restore_library_json(&payload).expect("restore works");
@@ -8791,8 +7211,6 @@ mod tests {
         );
     }
 
-    /// Ticket 44: bulk move lands the checked ids in the target group;
-    /// unknown ids skip silently; group counts inventory the labels.
     #[test]
     fn t44_move_to_group_and_counts() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8824,8 +7242,6 @@ mod tests {
         };
     }
 
-    /// Ticket 44: deleting a group with rows refuses loudly (names the
-    /// count); empty groups delete clean.
     #[test]
     fn t44_delete_group_refuses_while_rows_remain() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8848,8 +7264,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 1);
     }
 
-    /// Issue 02, scenario 1: empty library + add with loopback bind and auto
-    /// port yields a disabled record that persists (visible via list).
     #[test]
     fn add_config_with_defaults_persists_disabled() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8873,7 +7287,6 @@ mod tests {
         assert_eq!(rows, vec![created]);
     }
 
-    /// Invalid add input is rejected per field and writes nothing.
     #[test]
     fn add_invalid_reports_fields_and_writes_nothing() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8900,7 +7313,6 @@ mod tests {
         );
     }
 
-    /// Issue 02, scenario 2: editing with an invalid port keeps the record.
     #[test]
     fn edit_invalid_port_leaves_record_unchanged() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8927,7 +7339,6 @@ mod tests {
         assert_eq!(kept, created, "record unchanged after failed edit");
     }
 
-    /// Invalid name edit is rejected and the record is unchanged.
     #[test]
     fn edit_invalid_name_leaves_record_unchanged() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8950,7 +7361,6 @@ mod tests {
         assert_eq!(kept, created);
     }
 
-    /// Valid edits apply; unknown ids report NotFound.
     #[test]
     fn edit_valid_fields_applies() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8985,7 +7395,6 @@ mod tests {
         );
     }
 
-    /// Issue 02, scenario 3 (store half): remove deletes exactly one record.
     #[test]
     fn remove_deletes_only_target() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -8999,7 +7408,6 @@ mod tests {
         assert_eq!(rows, vec![second]);
     }
 
-    /// Enabled flag flips; unknown ids report NotFound.
     #[test]
     fn set_enabled_flips_flag() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9019,7 +7427,6 @@ mod tests {
         ));
     }
 
-    /// Ids are stable and never reused after removal.
     #[test]
     fn ids_are_stable_and_never_reused() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9039,7 +7446,6 @@ mod tests {
         assert_eq!(kept, second, "surviving record is untouched");
     }
 
-    /// Auto ports do not collide across adds.
     #[test]
     fn auto_ports_are_unique() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9052,12 +7458,6 @@ mod tests {
         }
     }
 
-    /// Stored configs may share a port; the conflict error naming both
-    /// parties is raised at activation time (ticket 03), not at rest.
-    /// Ticket A4: the auto pool is global across binds — even a LAN bind
-    /// consumes the shared pool, so it can never collide with a loopback
-    /// auto port at activation. Exhaustion is honest only past BOTH ranges
-    /// (see `AUTO_PORT_CAPACITY`); the error text is stable for the UI.
     #[test]
     fn a4_auto_pool_is_global_across_binds() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9105,7 +7505,6 @@ mod tests {
         assert_eq!(first.port, second.port);
     }
 
-    /// Port field parsing covers the issue's 99999 example plus blanks.
     #[test]
     fn port_field_parsing() {
         assert_eq!(parse_port_field("").expect("blank is auto"), None);
@@ -9125,7 +7524,6 @@ mod tests {
         }
     }
 
-    /// Bind validation: loopback default, any parseable IP allowed at rest.
     #[test]
     fn bind_validation() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9141,7 +7539,6 @@ mod tests {
         assert_eq!(lan.bind_ip, "0.0.0.0");
     }
 
-    /// Issue 02, scenario 4 (store half): URL pair formats.
     #[test]
     fn proxy_url_pair_format() {
         let (socks, http) = proxy_urls("127.0.0.1", 10801);
@@ -9149,7 +7546,6 @@ mod tests {
         assert_eq!(http, "http://127.0.0.1:10801");
     }
 
-    /// Delete confirm text names the config.
     #[test]
     fn delete_confirm_names_config() {
         let text = delete_confirm_text("Work VPN");
@@ -9159,8 +7555,6 @@ mod tests {
         );
     }
 
-    /// Ticket 09: the export warning names every secret class it protects
-    /// (keys, tokens, passwords) and states the plaintext consequence.
     #[test]
     fn export_warning_names_secret_classes() {
         let text = export_warning_text();
@@ -9169,7 +7563,6 @@ mod tests {
         }
     }
 
-    /// File-backed stores persist across reopen (restart scenario).
     #[test]
     fn file_store_persists_across_reopen() {
         let path =
@@ -9185,9 +7578,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// IpAddr import is used (keeps the dependency honest if refactored).
-    /// Ticket A1: `localhost` validates as a loopback bind (save gate agrees
-    /// with the engine start gate); garbage still fails naming localhost.
     #[test]
     fn localhost_parses_as_loopback() {
         let ip: IpAddr = DEFAULT_BIND.parse().expect("default bind parses");
@@ -9211,8 +7601,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 04: subscriptions + refresh (merge seam; injected bodies) --
-
     const SUB_UUID: &str = "11111111-2222-4333-8444-555555555555";
 
     fn sub_body_two() -> String {
@@ -9225,8 +7613,6 @@ mod tests {
             .expect("add subscription works")
     }
 
-    /// Subscription intake validates at the boundary: blank labels and
-    /// non-http(s) URLs are rejected per field, writing nothing.
     #[test]
     fn subscription_add_validates_label_and_url() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9268,8 +7654,6 @@ mod tests {
         assert_eq!(created.last_error, None);
     }
 
-    /// Issue 04, scenario 1: new subscription + fetch → group created,
-    /// members appear disabled, fetch recorded.
     #[test]
     fn subscription_refresh_creates_disabled_members() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9298,8 +7682,6 @@ mod tests {
         assert_eq!(kept.last_error, None);
     }
 
-    /// Issue 04, scenario 2: hand-renamed member + unchanged upstream body →
-    /// no duplicates, rename preserved (effective no-op).
     #[test]
     fn subscription_refresh_preserves_hand_rename_no_duplicates() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9329,8 +7711,6 @@ mod tests {
         assert_eq!(renamed.name, "My favourite", "hand edit wins");
     }
 
-    /// Changed upstream params with the same identity update in place (name
-    /// still preserved); a remark-only change is a no-op.
     #[test]
     fn subscription_refresh_updates_params_in_place() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9343,7 +7723,7 @@ mod tests {
             )
             .expect("refresh works");
         let before = store.list().expect("list works").remove(0);
-        // `flow` rides in params but is outside the identity key.
+
         let outcome = store
             .refresh_with_body(
                 &sub.id,
@@ -9357,7 +7737,7 @@ mod tests {
         assert_eq!(after.id, before.id, "updated in place, not re-added");
         assert_ne!(after.params, before.params);
         assert_eq!(after.name, before.name, "remark preserved");
-        // Remark-only change: identical params, identical key → no-op.
+
         let noop = store
             .refresh_with_body(
                 &sub.id,
@@ -9372,10 +7752,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 1);
     }
 
-    /// Ticket 08 (throne-adoption) scenario 1: upstream moves one member to
-    /// a new host but keeps its remark → the same row id is updated in
-    /// place (`[~]Updated 1`, no add, no delete); port, enabled state, and
-    /// accumulated traffic survive the move.
     #[test]
     fn subscription_refresh_host_change_updates_in_place_keeps_port_traffic() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9394,7 +7770,7 @@ mod tests {
         store
             .add_traffic(&moved_id, 1_000_000, 500_000)
             .expect("traffic seeds");
-        // Same remark `#one`, new host `c.example.com`.
+
         let outcome = store
             .refresh_with_body(
                 &sub.id,
@@ -9418,10 +7794,6 @@ mod tests {
         assert_eq!(kept.1, 500_000, "tx preserved");
     }
 
-    /// Ticket 08 (throne-adoption): a serving row that vanishes upstream is
-    /// sticky — kept verbatim and counted `[=] Still in use`, never
-    /// deleted; once it stops serving, the delete lands on the next
-    /// refresh.
     #[test]
     fn subscription_refresh_running_row_stays_in_use_until_stopped() {
         use std::collections::HashSet;
@@ -9439,7 +7811,7 @@ mod tests {
             .id
             .clone();
         let running: HashSet<String> = [live_id.clone()].into_iter().collect();
-        // Upstream drops `one`, keeps `two`.
+
         let one_body = "trojan://pw@b.example.com:443#two".to_string();
         let outcome = store
             .refresh_with_body_running(&sub.id, &one_body, 200, &running)
@@ -9449,7 +7821,7 @@ mod tests {
         let kept = store.get(&live_id).expect("get works").expect("kept");
         assert_eq!(kept.name, "one", "kept verbatim");
         assert_eq!(store.list().expect("list works").len(), 2);
-        // Stopped: the same body now deletes it.
+
         let outcome = store
             .refresh_with_body(&sub.id, &one_body, 300)
             .expect("refresh works");
@@ -9458,9 +7830,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 1);
     }
 
-    /// Ticket 08 (throne-adoption): refresh reseats owned members to remote
-    /// order; hand-made rows keep their relative slots around the member
-    /// block (anchored at the first owned slot).
     #[test]
     fn subscription_refresh_reorders_members_to_remote_order() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9468,7 +7837,7 @@ mod tests {
         store
             .refresh_with_body(&sub.id, &sub_body_two(), 100)
             .expect("refresh works");
-        // A hand-made row sorts first (creation order = id order).
+
         let hand = store
             .add(NewConfig {
                 name: "Hand made".to_string(),
@@ -9479,7 +7848,7 @@ mod tests {
                 port: String::new(),
             })
             .expect("hand add works");
-        // Remote order flips to [two, one]; the hand row stays put.
+
         let outcome = store
             .refresh_with_body(
                 &sub.id,
@@ -9503,7 +7872,7 @@ mod tests {
             vec!["two".to_string(), "one".to_string(), hand.name.clone()],
             "members follow remote order, hand row keeps its slot: {names:?}"
         );
-        // Flipping back restores [one, two] with the hand row still last.
+
         store
             .refresh_with_body(&sub.id, &sub_body_two(), 300)
             .expect("refresh works");
@@ -9520,8 +7889,6 @@ mod tests {
         );
     }
 
-    /// Issue 04, scenario 3: upstream removes a member → only the
-    /// subscription-owned row is removed; hand-created configs are untouched.
     #[test]
     fn subscription_refresh_removes_only_owned() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9557,8 +7924,6 @@ mod tests {
         assert_eq!(kept.subscription_id, None);
     }
 
-    /// An upstream that empties cleanly (`[]`) removes owned members; that is
-    /// a valid refresh, not a failure.
     #[test]
     fn subscription_refresh_empty_array_clears_owned() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9574,8 +7939,6 @@ mod tests {
         assert!(store.list().expect("list works").is_empty());
     }
 
-    /// Issue 04, scenario 4: fetch/parse failure → prior members kept, error
-    /// recorded on the subscription.
     #[test]
     fn subscription_refresh_failure_keeps_last_good() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9598,7 +7961,7 @@ mod tests {
             .expect("sub present");
         assert_eq!(kept.last_refresh_at, Some(100), "success stamp untouched");
         assert!(kept.last_error.is_some(), "error recorded");
-        // Next success clears the error.
+
         store
             .refresh_with_body(&sub.id, &sub_body_two(), 300)
             .expect("refresh works");
@@ -9610,9 +7973,6 @@ mod tests {
         assert_eq!(cleared.last_refresh_at, Some(300));
     }
 
-    /// Ticket 08 (throne-adoption): `Subscription-Userinfo` header parsing —
-    /// the standard `upload / download / total / expire` shape, tolerant of
-    /// case, whitespace, unknown keys, and garbled values.
     #[test]
     fn subscription_userinfo_parses_standard_shape() {
         let quota = parse_subscription_userinfo(
@@ -9622,18 +7982,18 @@ mod tests {
         assert_eq!(quota.used, Some(3_072));
         assert_eq!(quota.total, Some(1_073_741_824));
         assert_eq!(quota.expire, Some(1_735_689_600));
-        // Case + whitespace tolerant; unknown keys ignored.
+
         let mixed = parse_subscription_userinfo(" Upload = 7 ;DOWNLOAD=8;foo=bar ")
             .expect("tolerant parse works");
         assert_eq!(mixed.used, Some(15));
         assert_eq!(mixed.total, None);
         assert_eq!(mixed.expire, None);
-        // Garbage never becomes a quota (and never a zero).
+
         assert_eq!(parse_subscription_userinfo(""), None);
         assert_eq!(parse_subscription_userinfo("upload=abc; total=xyz"), None);
         assert_eq!(parse_subscription_userinfo("nothing-here"), None);
         assert_eq!(parse_subscription_userinfo("upload=12.5; total=1GB"), None);
-        // One usable key suffices; saturating on absurd magnitudes.
+
         let partial = parse_subscription_userinfo("total=99999999999999999999999")
             .expect("huge total saturates");
         assert_eq!(partial.total, Some(i64::MAX));
@@ -9643,10 +8003,6 @@ mod tests {
         assert_eq!(expire_only.expire, Some(1_735_689_600));
     }
 
-    /// Ticket 08 (throne-adoption): quota setter round-trips; `None` clears
-    /// so a success without a header never shows stale numbers; the refresh
-    /// merge itself never touches quota (last-good preserved on failure by
-    /// simply not calling the setter).
     #[test]
     fn subscription_quota_round_trips_and_refresh_keeps_it() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9673,7 +8029,7 @@ mod tests {
         assert_eq!(kept.quota_used, Some(3_072));
         assert_eq!(kept.quota_total, Some(1_073_741_824));
         assert_eq!(kept.quota_expire, Some(1_735_689_600));
-        // A refresh (success or failure) never rewrites quota itself.
+
         store
             .refresh_with_body(&sub.id, &sub_body_two(), 100)
             .expect("refresh works");
@@ -9690,7 +8046,7 @@ mod tests {
             .expect("get works")
             .expect("sub present");
         assert_eq!(after_failure.quota_used, Some(3_072), "failure keeps quota");
-        // Explicit clear (success without a header at the call site).
+
         store
             .set_subscription_quota(&sub.id, None)
             .expect("quota clears");
@@ -9701,7 +8057,7 @@ mod tests {
         assert_eq!(cleared.quota_used, None);
         assert_eq!(cleared.quota_total, None);
         assert_eq!(cleared.quota_expire, None);
-        // Unknown ids fail loudly.
+
         assert!(
             store
                 .set_subscription_quota("9999", Some(SubscriptionQuota::default()))
@@ -9710,8 +8066,6 @@ mod tests {
         );
     }
 
-    /// Prohibited side effect: refresh never enables/starts configs and never
-    /// overwrites hand-edited overlay fields (name/enabled/bind/port).
     #[test]
     fn subscription_refresh_never_enables_or_clobbers_overlay() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9733,8 +8087,7 @@ mod tests {
                 },
             )
             .expect("user edits bind");
-        // Upstream adds a third member; the refresh must not touch the
-        // user-enabled row's overlay and the newcomer stays disabled.
+
         let grown = format!("{}\ntrojan://pw@c.example.com:443#three", sub_body_two());
         let outcome = store
             .refresh_with_body(&sub.id, &grown, 200)
@@ -9756,7 +8109,6 @@ mod tests {
         assert!(!newcomer.enabled, "new rows land disabled");
     }
 
-    /// User-deleted owned rows are tombstoned: refresh does not resurrect.
     #[test]
     fn subscription_tombstone_prevents_resurrect() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9781,8 +8133,6 @@ mod tests {
         assert!(rows.iter().all(|row| row.name != "two"));
     }
 
-    /// Upstream rows colliding with hand-created (or foreign) identity count
-    /// as duplicates instead of duplicating.
     #[test]
     fn subscription_refresh_counts_foreign_identity_as_duplicate() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9807,7 +8157,6 @@ mod tests {
         assert_eq!(rows.len(), 1, "no duplicate created, got {rows:?}");
     }
 
-    /// Per-item failures skip + count while valid siblings still merge.
     #[test]
     fn subscription_refresh_per_item_failures_skip_and_count() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9825,10 +8174,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 1);
     }
 
-    /// Ticket 17: per-item failures persist on the subscription (the stored
-    /// vec behind the per-subscription failures view): partial refreshes
-    /// store their failures, a clean refresh clears them, and a total
-    /// failure stores its failures alongside `last_error`.
     #[test]
     fn subscription_failures_persist_and_clear() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9864,7 +8209,6 @@ mod tests {
             "label kept without secrets"
         );
 
-        // A clean refresh clears the stored vec.
         store
             .refresh_with_body(
                 &sub.id,
@@ -9878,7 +8222,6 @@ mod tests {
             .expect("sub present");
         assert!(clean.failures.is_empty(), "clean refresh clears failures");
 
-        // A total failure stores its failures with the error.
         let outcome = store
             .refresh_with_body(&sub.id, "bogus://x\nbogus://y", 300)
             .expect("failure is an outcome");
@@ -9891,8 +8234,6 @@ mod tests {
         assert!(failed.last_error.is_some(), "error still recorded");
     }
 
-    /// Ticket 17: corrupted failures JSON decodes to no failures (never a
-    /// crash, never an error).
     #[test]
     fn subscription_failures_decode_is_forgiving() {
         assert!(decode_failures(None).is_empty());
@@ -9901,10 +8242,6 @@ mod tests {
         assert!(decode_failures(Some("[{\"index\": 2}]".to_string())).len() == 1);
     }
 
-    /// Ticket A8: a corrupt `failures` CELL in a live row (hand edit, older
-    /// build) reads back as no failures — never a crash, never an error —
-    /// and an empty library round-trips export → restore → export
-    /// byte-identically through the single pipeline.
     #[test]
     fn a8_corrupt_failures_cell_and_empty_round_trip() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9925,7 +8262,6 @@ mod tests {
             "corrupt cell decodes to no failures"
         );
 
-        // Empty library round-trip through the single export pipeline.
         let empty = Store::open_in_memory().expect("fresh store opens");
         let payload = empty.export_library_json().expect("empty export works");
         let (quarantined_payload, skipped) = empty
@@ -9956,8 +8292,6 @@ mod tests {
         );
     }
 
-    /// Removing a subscription releases (never deletes) its rows and drops
-    /// its tombstones; unknown ids report NotFound/false.
     #[test]
     fn remove_subscription_releases_rows() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -9984,12 +8318,10 @@ mod tests {
         ));
     }
 
-    /// Ticket 14, scenario 5: export I/O failures name the destination path
-    /// and never mislabel as a database error.
     #[test]
     fn export_io_error_names_path_never_database() {
         let store = Store::open_in_memory().expect("in-memory store opens");
-        // A regular file where a directory is needed: dir creation must fail.
+
         let blocker =
             std::env::temp_dir().join(format!("manyproxy-t14-blocker-{}.tmp", std::process::id()));
         std::fs::write(&blocker, b"blocker").expect("blocker writes");
@@ -10013,9 +8345,6 @@ mod tests {
         );
     }
 
-    /// Ticket 14, scenario 6 (store seam): a broken database reports `Err`,
-    /// never `Ok(false)`, so the UI can tell "already removed" from a real
-    /// failure.
     #[test]
     fn remove_subscription_db_error_is_err_never_already_removed() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10029,8 +8358,6 @@ mod tests {
         );
     }
 
-    /// Ticket 14, scenario 2 (store seam): reads on a broken database report
-    /// `Err` so the UI notifies instead of rendering a silent empty list.
     #[test]
     fn list_db_error_is_err_after_schema_break() {
         let store = Store::open_in_memory().expect("in-memory store opens");
@@ -10046,8 +8373,6 @@ mod tests {
         ));
     }
 
-    /// Auto-refresh scheduling hook: manual gate is `auto_refresh`; timing
-    /// compares `last_refresh_at` against the interval.
     #[test]
     fn due_for_refresh_hook() {
         let scheduled = Subscription {
@@ -10092,8 +8417,6 @@ mod tests {
         assert!(!toggled.auto_refresh);
     }
 
-    // -- Ticket 11: user-owned JSON export -----------------------------------
-
     const EXPORT_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
     fn export_seed_body() -> String {
@@ -10111,16 +8434,11 @@ mod tests {
             .expect("seed subscription works");
     }
 
-    /// The confirm dialog description is the warning text verbatim (no
-    /// paraphrase, no trimming): secrets never leave silently.
     #[test]
     fn export_confirm_description_is_warning_verbatim() {
         assert_eq!(export_confirm_description(), export_warning_text());
     }
 
-    /// Scenario 1: library with 3 configs → export with confirm → file
-    /// parses as JSON, re-import yields 0 added / 3 duplicates, warning
-    /// shown verbatim before write.
     #[test]
     fn export_round_trips_through_import_grammar_as_duplicates() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10145,8 +8463,7 @@ mod tests {
             Some(1),
             "subscriptions ride along"
         );
-        // Plaintext by design (redacting here would break re-import): the
-        // credential survives the round trip; the warning covers the risk.
+
         assert!(
             payload.contains("pw"),
             "export keeps fields valid for re-import"
@@ -10165,8 +8482,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 3);
     }
 
-    /// Hand-made rows whose params are not import-shaped stay metadata-only:
-    /// they never poison the import path with per-item failures.
     #[test]
     fn export_keeps_non_import_rows_metadata_only() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10209,7 +8524,6 @@ mod tests {
         );
     }
 
-    /// Scenario: export with confirm → the file is written and parses.
     #[test]
     fn export_confirmed_writes_parseable_file() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10237,7 +8551,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Scenario: export cancelled → no file is created.
     #[test]
     fn export_cancelled_writes_no_file() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10256,9 +8569,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // -- Ticket 09 (throne-adoption): group prunes ---------------------------
-
-    /// The prune surface stays four kinds (no `Remove insecure`).
     #[test]
     fn t09_group_prune_kinds_pinned() {
         assert_eq!(GroupPruneKind::ALL.len(), 4, "four prune kinds");
@@ -10295,8 +8605,6 @@ mod tests {
         }
     }
 
-    /// Scenario: group with 2 dupes + 1 dead → Remove duplicates confirms
-    /// with count + preview and keeps one copy of each.
     #[test]
     fn t09_remove_duplicates_keeps_first_with_preview() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10309,8 +8617,7 @@ mod tests {
                 r#"{"server":"example.com","server_port":443,"uuid":"11111111-2222-4333-8444-555555555555"}"#,
             ))
             .expect("add works");
-        // The dead row is untouched by the duplicates sweep (availability
-        // is a different prune).
+
         store
             .save_health_snapshot(&dead_snapshot(&b.id))
             .expect("save works");
@@ -10347,7 +8654,6 @@ mod tests {
         );
     }
 
-    /// Previews name at most 20 rows while the count names all.
     #[test]
     fn t09_duplicate_preview_caps_at_twenty() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10366,7 +8672,6 @@ mod tests {
         assert!(confirm.contains("+4 more"), "overflow named: {confirm}");
     }
 
-    /// Remove-unavailable drops dead-sample rows only (live + untested stay).
     #[test]
     fn t09_remove_unavailable_drops_dead_only() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10402,8 +8707,6 @@ mod tests {
         assert!(!kept.contains(&"Dead".to_string()));
     }
 
-    /// Insert one validation-failing row past the commit gate (raw SQL —
-    /// the commit path would refuse it), for the sweep test.
     fn t09_insert_invalid_row(store: &mut Store, name: &str, group: &str) -> String {
         let sealed =
             Store::seal_or_fail(r#"{"type":"vless","server":"example.com","server_port":443}"#)
@@ -10420,7 +8723,6 @@ mod tests {
         store.conn.last_insert_rowid().to_string()
     }
 
-    /// Remove-invalid sweeps validation failures, keeps the rest.
     #[test]
     fn t09_remove_invalid_sweeps_failures_only() {
         assert!(is_valid_config("vless", ""), "opaque legacy passes");
@@ -10458,8 +8760,6 @@ mod tests {
         );
     }
 
-    /// Clear-tests drops one group's samples + history, keeps rows and the
-    /// other group's samples.
     #[test]
     fn t09_clear_tests_in_group_scoped() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10489,7 +8789,6 @@ mod tests {
         );
     }
 
-    /// Resolve-Domain rewrite: hostnames rewrite, IPs and keyless blobs do not.
     #[test]
     fn t09_resolve_domain_rewrite_helpers() {
         assert_eq!(
@@ -10515,7 +8814,6 @@ mod tests {
         assert_eq!(rewrite_server_to_ip("{}", "1.2.3.4"), None);
     }
 
-    /// Show-Security labels + Type|Security order.
     #[test]
     fn t09_security_label_and_sort() {
         assert_eq!(row_security_label("vless", r#"{"security":"tls"}"#), "tls");
@@ -10551,8 +8849,6 @@ mod tests {
         assert_eq!(names, ["a", "b", "c"], "type asc, reality before tls");
     }
 
-    // -- Ticket 12: health snapshot persistence ------------------------------
-
     fn live_snapshot(id: &str, latency_ms: u64) -> HealthSnapshot {
         HealthSnapshot {
             config_id: id.to_string(),
@@ -10573,8 +8869,6 @@ mod tests {
         }
     }
 
-    /// Latest-per-config samples upsert by config id (live latency + dead
-    /// flag survive as stored).
     #[test]
     fn health_snapshots_save_load_round_trip() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10588,7 +8882,7 @@ mod tests {
         store
             .save_health_snapshot(&dead_snapshot("2"))
             .expect("save works");
-        // A newer sample for the same row replaces, never appends.
+
         store
             .save_health_snapshot(&live_snapshot("1", 44))
             .expect("resave works");
@@ -10614,8 +8908,6 @@ mod tests {
             .contains("dial refused"));
     }
 
-    /// Removing a config prunes its snapshot (bounded table, no stale
-    /// resurrection after restart).
     #[test]
     fn health_snapshot_pruned_with_config() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10631,8 +8923,6 @@ mod tests {
             .is_empty());
     }
 
-    /// File-backed stores keep snapshots across reopen (restart scenario at
-    /// the persistence seam).
     #[test]
     fn health_snapshots_persist_across_reopen() {
         let path =
@@ -10653,8 +8943,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // -- Ticket 16: validation coherence + dedupe/group consistency ---------
-
     fn invalid_fields(error: &StoreError) -> Vec<String> {
         match error {
             StoreError::Invalid(fields) => fields.iter().map(|e| e.field.to_string()).collect(),
@@ -10662,8 +8950,6 @@ mod tests {
         }
     }
 
-    /// Scenario 1: unknown protocol or non-JSON params → field error, nothing
-    /// written.
     #[test]
     fn manual_add_unknown_protocol_or_non_json_rejected() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10701,8 +8987,6 @@ mod tests {
         );
     }
 
-    /// Scenario 1 (credential half): import-shaped vless without uuid lands
-    /// no row — the same rule the link grammar enforces.
     #[test]
     fn manual_add_import_shaped_without_credential_rejected() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10730,7 +9014,7 @@ mod tests {
             store.list().expect("list works").is_empty(),
             "failed add writes nothing"
         );
-        // Opaque legacy rows stay valid (metadata-only, never poison import).
+
         let ok = store
             .add(NewConfig {
                 name: "Opaque".to_string(),
@@ -10745,8 +9029,6 @@ mod tests {
         assert!(!is_import_shaped_params(&ok.params));
     }
 
-    /// Scenario 1 (edit half): bad protocol/params on edit fail pure (record
-    /// unchanged).
     #[test]
     fn manual_edit_bad_protocol_or_params_leaves_record_unchanged() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10775,8 +9057,6 @@ mod tests {
         assert_eq!(kept, created, "record unchanged after failed edits");
     }
 
-    /// Scenario 2: cleared protocol/params/group/bind keep current values;
-    /// blank port still means auto (explicit in the dialog placeholder).
     #[test]
     fn edit_blank_preserves_current_values() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10807,7 +9087,7 @@ mod tests {
         assert_eq!(kept.group, "travel", "group preserved");
         assert_eq!(kept.bind_ip, "127.0.0.2", "bind preserved");
         assert_eq!(kept.port, 10821, "untouched port preserved");
-        // Blank port is the documented auto exception.
+
         let reauto = store
             .update(
                 &created.id,
@@ -10826,8 +9106,6 @@ mod tests {
         assert_eq!(reauto.group, "travel");
     }
 
-    /// Scenario 7 (store half): import-shaped vs total counts for the honest
-    /// export toast.
     #[test]
     fn import_shaped_predicate_and_count() {
         assert!(is_import_shaped_params(
@@ -10866,8 +9144,6 @@ mod tests {
         assert_eq!(count_importable(&rows), 1);
     }
 
-    // -- Ticket 25: store races, transactions, identity, off-thread halves --
-
     fn vless_params_with(server: &str, extra: &[(&str, &str)]) -> String {
         let mut map = serde_json::Map::new();
         map.insert(
@@ -10895,8 +9171,6 @@ mod tests {
         serde_json::Value::Object(map).to_string()
     }
 
-    /// update() on an owned row refreshes identity_key to the widened
-    /// identity of the new values (never stale for the next refresh).
     #[test]
     fn t25_update_refreshes_identity_key() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10926,8 +9200,6 @@ mod tests {
         assert_ne!(before, after, "flow is part of the widened identity");
     }
 
-    /// Required scenario: a user param fix on an owned row survives refresh
-    /// (kept, never silently reverted).
     #[test]
     fn t25_user_param_fix_survives_refresh() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10963,8 +9235,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 2);
     }
 
-    /// A non-identity user fix (extra params outside the key) pins the row:
-    /// refresh keeps it with zero churn.
     #[test]
     fn t25_user_nonidentity_fix_pinned_no_churn() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -10978,8 +9248,7 @@ mod tests {
             .into_iter()
             .find(|row| row.name == "one")
             .expect("member one");
-        // A true non-identity fix: the row's own params plus an extra the
-        // identity ignores (every key field byte-identical).
+
         let mut value: serde_json::Value = serde_json::from_str(&row.params).expect("params parse");
         value["mux"] = serde_json::Value::String("on".to_string());
         let fixed = value.to_string();
@@ -11003,8 +9272,6 @@ mod tests {
         assert_eq!(kept.params, fixed);
     }
 
-    /// Upstream identity rotation (password change, same server) updates in
-    /// place: same id, same port, same enabled — never delete + re-add.
     #[test]
     fn t25_upstream_rotation_updates_in_place() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11029,7 +9296,6 @@ mod tests {
         assert_ne!(after.params, before.params, "new credentials applied");
     }
 
-    /// In-body duplicates are first-wins (the code matches the comment).
     #[test]
     fn t25_first_wins_in_body_dupes() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11047,8 +9313,6 @@ mod tests {
         assert_eq!(rows[0].name, "one", "first wins");
     }
 
-    /// Same-pass deletions free their ports, and multi-insert allocation is
-    /// deterministic (key-sorted).
     #[test]
     fn t25_ports_reused_and_deterministic() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11079,7 +9343,7 @@ mod tests {
         assert_eq!(three.port, freed, "freed port is reused");
         assert_ne!(four.port, kept_port);
         assert_ne!(three.port, four.port);
-        // Deterministic: the lower-sorted key takes the lower free port.
+
         let key_three = widened_identity(&three.protocol, &three.params);
         let key_four = widened_identity(&four.protocol, &four.params);
         assert_eq!(
@@ -11089,9 +9353,6 @@ mod tests {
         );
     }
 
-    /// Port exhaustion reports real per-item indices (never a blanket 0).
-    /// Ticket 27: the range under test is the widened capacity (primary +
-    /// spillover); exhaustion is honest only past both.
     #[test]
     fn t25_exhaustion_reports_real_indices() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11123,8 +9384,6 @@ mod tests {
         assert_eq!(indices, vec![0, 1], "real batch positions, got {indices:?}");
     }
 
-    /// Released rows are adoptable: a second subscription adopts them in
-    /// place (same id/port) instead of shadowing them as duplicates.
     #[test]
     fn t25_released_rows_adopted_by_second_subscription() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11153,8 +9412,6 @@ mod tests {
         assert_eq!(before_ids, after_ids, "adopted in place, same ids");
     }
 
-    /// Editing a released row claims it: a later subscription cannot adopt
-    /// it away (the collision stays a duplicate).
     #[test]
     fn t25_update_claims_released_row_against_adoption() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11186,7 +9443,6 @@ mod tests {
         assert_eq!(kept.name, "Mine now");
     }
 
-    /// Refresh-deletes prune health snapshots (no stale resurrection).
     #[test]
     fn t25_refresh_delete_prunes_snapshot() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11194,8 +9450,7 @@ mod tests {
         store
             .refresh_with_body(&sub.id, &sub_body_two(), 100)
             .expect("refresh works");
-        // Ticket 08: members seat in remote order (no longer BTreeMap key
-        // order), so pick the doomed member by name, not position.
+
         let row = store
             .list()
             .expect("list works")
@@ -11226,8 +9481,6 @@ mod tests {
             .is_empty());
     }
 
-    /// Required scenario: export → wipe → restore is identical (rows, groups,
-    /// enabled, subscriptions, tombstones); deletes stay deleted.
     #[test]
     fn t25_export_restore_round_trip() {
         let mut first = Store::open_in_memory().expect("in-memory store opens");
@@ -11279,7 +9532,7 @@ mod tests {
             Some(100),
             "refresh metadata survives"
         );
-        // No resurrection: the tombstoned member stays skipped.
+
         let refresh = second
             .refresh_with_body(&sub.id, &sub_body_two(), 200)
             .expect("refresh works");
@@ -11288,7 +9541,6 @@ mod tests {
         assert_eq!(second.list().expect("list works").len(), 1);
     }
 
-    /// Restore fails loudly on garbage (never a silent empty library).
     #[test]
     fn t25_restore_rejects_garbage_loudly() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11306,7 +9558,7 @@ mod tests {
             );
             assert!(store.list().expect("list works").is_empty());
         }
-        // An honest empty export restores to an honest empty library.
+
         let outcome = store
             .restore_library_json("{\"library\": [], \"subscriptions\": []}")
             .expect("empty restore works");
@@ -11321,9 +9573,6 @@ mod tests {
         );
     }
 
-    /// Ticket A3: strict restore — corrupt library rows fail loudly (missing
-    /// / wrong-typed name/protocol/params/bind_ip, reserved ports, duplicate
-    /// bind:port), with nothing written.
     #[test]
     fn a3_restore_rejects_corrupt_rows_loudly() {
         fn valid_entry() -> serde_json::Value {
@@ -11394,7 +9643,7 @@ mod tests {
                 "{label}: nothing written"
             );
         }
-        // Duplicate bind:port fails loudly with nothing written.
+
         {
             let mut second = valid_entry();
             second["id"] = serde_json::Value::String("2".to_string());
@@ -11411,8 +9660,7 @@ mod tests {
             assert!(error.to_string().contains("duplicates"), "got {error}");
             assert!(store.list().expect("list works").is_empty());
         }
-        // Loopback aliases compare equal (review: `127.0.0.1`, `localhost`,
-        // `::1` claim one endpoint at activation, so restore refuses them).
+
         for alias in ["localhost", "::1", "LOCALHOST", " 127.0.0.1 "] {
             let mut second = valid_entry();
             second["id"] = serde_json::Value::String("2".to_string());
@@ -11426,7 +9674,7 @@ mod tests {
             assert!(error.to_string().contains("duplicates"), "got {error}");
             assert!(store.list().expect("list works").is_empty());
         }
-        // localhost bind restores fine (A1 parity: loopback by name).
+
         {
             let mut entry = valid_entry();
             entry["bind_ip"] = serde_json::Value::String("localhost".to_string());
@@ -11437,7 +9685,7 @@ mod tests {
             assert_eq!(outcome.configs, 1);
         }
     }
-    /// Atomic export: tmp + rename leaves a parseable file and no tmp litter.
+
     #[test]
     fn t25_export_is_atomic_no_tmp_litter() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11448,10 +9696,7 @@ mod tests {
         store.commit_export(&path, true).expect("export works");
         let on_disk = std::fs::read_to_string(&path).expect("file written");
         serde_json::from_str::<serde_json::Value>(&on_disk).expect("parses");
-        // Ticket 39: scan only this export's own tmp sibling
-        // (`.{filename}.tmp-{pid}`, see `tmp_export_path`) — never the
-        // whole shared temp dir, where a concurrent test's in-flight
-        // export tmp is legitimate work, not our litter.
+
         let own_tmp_prefix = format!(
             ".{}.tmp-",
             path.file_name()
@@ -11467,7 +9712,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Batch insert: 500 rows in one transaction; one bad item writes nothing.
     #[test]
     fn t25_add_batch_is_atomic() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11478,8 +9722,7 @@ mod tests {
                 params: vless_params_with(&format!("h{index}.example.com"), &[]),
                 group: "bulk".to_string(),
                 bind_ip: String::new(),
-                // Explicit unique ports: duplicates stay legal at rest, so
-                // pin distinct ones outside the auto ranges.
+
                 port: (20_000 + index).to_string(),
             })
             .collect();
@@ -11517,8 +9760,6 @@ mod tests {
         );
     }
 
-    /// Health batch: one call persists a whole probe round; absurd latencies
-    /// saturate instead of wrapping.
     #[test]
     fn t25_health_batch_saves_round() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11548,8 +9789,6 @@ mod tests {
         );
     }
 
-    /// Legacy databases (user_version 0, no ticket-25 columns) migrate
-    /// forward on open: ownership columns reappear and refresh works.
     #[test]
     fn t25_legacy_database_migrates_forward() {
         let path =
@@ -11572,7 +9811,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version reads");
         assert_eq!(version, Store::SCHEMA_VERSION);
-        // Ownership merge works on the migrated file (release + adopt).
+
         let sub = add_sub(&mut store, "travel");
         store
             .refresh_with_body(&sub.id, "trojan://pw@b.example.com:443#two", 100)
@@ -11589,7 +9828,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A database from a NEWER build fails loudly on open (never silent).
     #[test]
     fn t25_newer_schema_fails_loudly() {
         let path =
@@ -11615,7 +9853,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Non-ASCII subscription URLs never panic (valid ones still accepted).
     #[test]
     fn t25_non_ascii_subscription_urls_never_panic() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11639,8 +9876,6 @@ mod tests {
         }
     }
 
-    /// The widened identity splits transport/security variants that the
-    /// narrow identity merges (no over-merge); remark never matters.
     #[test]
     fn t25_widened_identity_splits_variants() {
         let base = vless_params_with("a.example.com", &[]);
@@ -11663,10 +9898,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 32: store correctness (IPv6 URLs, AWG identity, hardened
-    // export) ------------------------------------------------------------
-
-    /// Ticket 32: IPv6 binds bracket in copied URLs (`[::1]:port`).
     #[test]
     fn t32_proxy_urls_bracket_ipv6() {
         let (socks, http) = proxy_urls("::1", 10801);
@@ -11679,8 +9910,6 @@ mod tests {
         assert_eq!(socks, "socks5://[2001:db8::1]:10802");
     }
 
-    /// Ticket 32: two AWG rows sharing server+creds but a different `jc`
-    /// are two rows (identity includes AWG keys); identical rows dedupe.
     #[test]
     fn t32_awg_identity_includes_obfuscation_keys() {
         fn awg_params_with(jc: &str) -> String {
@@ -11708,7 +9937,7 @@ mod tests {
             widened_identity("amneziawg", &first.clone()),
             "identical rows share identity"
         );
-        // End to end: refresh/import keeps both rows.
+
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let batch = crate::import::BatchResult {
             configs: vec![
@@ -11735,8 +9964,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 2);
     }
 
-    /// Ticket 32: the export file lands 0600/ACL-hardened like the DB (user
-    /// only; the payload holds secrets at rest).
     #[test]
     fn t32_export_file_hardened_like_db() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11767,10 +9994,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // -- Ticket 27: caps lift + secrets hardening + fetch policy -----------
-
-    /// 250 auto-port configs all assign (primary then spillover); exhaustion
-    /// stays honest only past the widened capacity.
     #[test]
     fn ticket27_auto_ports_assign_250_with_spillover_and_honest_exhaustion() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -11798,7 +10021,7 @@ mod tests {
             ports.iter().any(|port| *port >= AUTO_PORT_SPILL_START),
             "spillover serves overflow past the 199-port primary"
         );
-        // Fill to capacity, then prove honest exhaustion (message unchanged).
+
         let mut fill: Vec<NewConfig> = Vec::new();
         for port in auto_port_candidates() {
             if ports.contains(&port) {
@@ -11832,8 +10055,6 @@ mod tests {
         );
     }
 
-    /// Fresh file DBs carry user-only permissions; the backlog note records
-    /// keychain/DPAPI as a non-goal (never shipped silently).
     #[test]
     fn ticket27_db_file_has_user_only_permissions_and_backlog_note() {
         let path =
@@ -11860,7 +10081,7 @@ mod tests {
             SECRETS_AT_REST_NOTE.contains("keychain") && SECRETS_AT_REST_NOTE.contains("DPAPI"),
             "backlog recorded, got {SECRETS_AT_REST_NOTE}"
         );
-        // Spot permissions are best-effort on hardened files.
+
         let probe =
             std::env::temp_dir().join(format!("manyproxy-t27-harden-{}.tmp", std::process::id()));
         std::fs::write(&probe, "secrets").expect("probe writes");
@@ -11869,8 +10090,6 @@ mod tests {
         let _ = std::fs::remove_file(&probe);
     }
 
-    /// Subscription-fetch policy: https/public allows, http warns, internal
-    /// blocks (reasons never echo the URL); add rejects internal only.
     #[test]
     fn ticket27_subscription_fetch_policy_warn_block_allow() {
         use SubscriptionFetchPolicy::{Allow, Block, Warn};
@@ -11897,7 +10116,7 @@ mod tests {
                 "blocked: {url}"
             );
         }
-        // Reasons never echo hosts/tokens.
+
         let blocked = subscription_fetch_policy("http://127.0.0.1/sub?token=hunter2");
         let reason = match blocked {
             Block { reason } => reason,
@@ -11914,20 +10133,16 @@ mod tests {
             error.to_string().contains("internal"),
             "names block, got {error}"
         );
-        // Plain http stays addable (Warn at fetch, LAN-provider compat).
+
         store
             .add_subscription("Plain", "http://example.com/sub.txt", "g", true)
             .expect("http add allowed");
     }
 
-    /// Ticket A5: redirect + DNS-rebind coverage — every hop re-runs the
-    /// policy, so a benign host redirecting (or resolving) to loopback is
-    /// Blocked; caps are enforced code; Warn reasons never carry tokens.
     #[test]
     fn a5_redirect_rebind_caps_hold() {
         use SubscriptionFetchPolicy::{Allow, Block, Warn};
-        // A redirect target is just another URL through the same policy: a
-        // hop to 127.0.0.1 is Blocked before any byte is fetched from it.
+
         for target in [
             "http://127.0.0.1/evil?token=hunter2",
             "https://127.0.0.1:8080/evil",
@@ -11939,7 +10154,7 @@ mod tests {
                 "redirect target blocked: {target}"
             );
         }
-        // DNS-rebind: public name, internal resolution → Block.
+
         let loopback: std::net::IpAddr = "127.0.0.1".parse().expect("ip parses");
         let private: std::net::IpAddr = "10.9.9.9".parse().expect("ip parses");
         let public: std::net::IpAddr = "93.184.216.34".parse().expect("ip parses");
@@ -11981,8 +10196,7 @@ mod tests {
             ),
             "empty resolution fails closed"
         );
-        // Literal-internal URLs stay Block even with a public resolution
-        // claim (no DNS laundering past the literal guard).
+
         assert!(
             matches!(
                 subscription_fetch_policy_resolved("http://127.0.0.1/sub", &[public]),
@@ -11990,18 +10204,18 @@ mod tests {
             ),
             "literal internal never laundered"
         );
-        // Warn reasons never echo the URL/token.
+
         let reason = match subscription_fetch_policy("http://example.com/sub?token=hunter2") {
             Warn { reason } => reason,
             other => panic!("expected Warn, got {other:?}"),
         };
         assert!(!reason.contains("hunter2"), "no token echo: {reason}");
         assert!(!reason.contains("example.com"), "no URL echo: {reason}");
-        // Caps live in code and match the fetch path (8 MiB / 20 s / 5).
+
         assert_eq!(SUBSCRIPTION_MAX_BYTES, 8 * 1024 * 1024);
         assert_eq!(SUBSCRIPTION_TIMEOUT_SECS, 20);
         assert_eq!(SUBSCRIPTION_MAX_REDIRECTS, 5);
-        // Byte entry enforces size + UTF-8, keeping last-good members.
+
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let sub = add_sub(&mut store, "travel");
         store
@@ -12028,15 +10242,13 @@ mod tests {
             2,
             "capped bodies keep last-good members"
         );
-        // Small valid bodies still flow through the byte entry.
+
         let outcome = store
             .refresh_with_bytes(&sub.id, sub_body_two().as_bytes(), 400)
             .expect("valid bytes refresh");
         assert!(outcome.error.is_none(), "clean, got {outcome:?}");
     }
 
-    /// Manual ssh/noise rows validate like the import path (credentials
-    /// required; opaque rows still pass through).
     #[test]
     fn ticket27_manual_ssh_noise_rows_validate() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -12087,9 +10299,6 @@ mod tests {
         }
     }
 
-    /// Ticket 07 (throne-adoption): parse-only rows commit like the import
-    /// path (credentials required, named without values; opaque rows still
-    /// pass through untouched).
     #[test]
     fn t07_parse_only_rows_validate() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -12150,10 +10359,6 @@ mod tests {
         }
     }
 
-    // -- Ticket 35: DPAPI secrets at rest ------------------------------
-
-    /// Ticket 35: DPAPI round trip — sealed bytes carry no plaintext and
-    /// open back to the exact input.
     #[test]
     fn ticket35_dpapi_round_trip() {
         let plain = br#"{"private_key":"SECRET-PRIVATE-KEY-MATERIAL"}"#;
@@ -12166,7 +10371,6 @@ mod tests {
         assert_eq!(opened, plain, "round trip is exact");
     }
 
-    /// Ticket 35: tampered ciphertext fails loudly (never silent plaintext).
     #[test]
     fn ticket35_dpapi_tamper_fails_loud() {
         let mut sealed = crate::dpapi::protect(b"hello").expect("protects");
@@ -12176,8 +10380,6 @@ mod tests {
         assert!(!error.contains("hello"), "no secret echo: {error}");
     }
 
-    /// Ticket 35: a stored row's params column carries no credential
-    /// plaintext at rest, and reads back identically.
     #[test]
     fn ticket35_stored_params_have_no_plaintext() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -12211,8 +10413,6 @@ mod tests {
         );
     }
 
-    /// Ticket 35/48: a stored subscription URL carries no token plaintext
-    /// at rest, reads back identically, and still matches by URL.
     #[test]
     fn ticket35_stored_sub_urls_have_no_plaintext() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -12261,8 +10461,6 @@ mod tests {
         );
     }
 
-    /// Ticket 35: a v2 plaintext database migrates to sealed params on open
-    /// with zero data loss (file-backed migration fixture).
     #[test]
     fn ticket35_v2_plaintext_migrates_to_sealed() {
         let dir = std::env::temp_dir().join(format!(
@@ -12287,7 +10485,7 @@ mod tests {
                     port: String::new(),
                 })
                 .expect("add works");
-            // Rewind to a v2 plaintext shape: raw params + user_version 2.
+
             store
                 .conn
                 .execute(
@@ -12326,9 +10524,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // -- Ticket 36: data-plane traffic counters ------------------------
-
-    /// Ticket 36: traffic deltas accumulate per row and read back as a map.
     #[test]
     fn ticket36_traffic_accumulates_per_row() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -12350,10 +10545,6 @@ mod tests {
         assert_eq!(totals.get(&created.id), Some(&(1_048_882, 98)));
     }
 
-    // -- Ticket 31: dialogs + import + subscriptions ---------------------
-
-    /// Ticket 31: a typo protocol error names the valid protocol list (never
-    /// just "unknown").
     #[test]
     fn ticket31_unknown_protocol_names_valid_protocols() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -12378,9 +10569,6 @@ mod tests {
         );
     }
 
-    /// Ticket 31: per-protocol templates carry the credential slot; a
-    /// template with the server filled but the credential blank fails naming
-    /// the credential (guided add, never raw JSON first).
     #[test]
     fn ticket31_protocol_templates_guide_and_reject_blank_credentials() {
         for (protocol, credential) in [
@@ -12407,7 +10595,7 @@ mod tests {
                 "{protocol} template names {credential}: {template}"
             );
         }
-        // Server filled, credential blank → the named credential error.
+
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let params = protocol_params_template("vless")
             .replace("\"server\":\"\"", "\"server\":\"a.example.com\"");
@@ -12423,7 +10611,7 @@ mod tests {
             .expect_err("blank credential must fail");
         let text = error.to_string();
         assert!(text.contains("uuid"), "names the credential, got {text}");
-        // Unknown protocol falls back to a bare server/port object.
+
         let fallback = protocol_params_template("bogus");
         assert!(
             fallback.contains("server"),
@@ -12431,9 +10619,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness review: virtual starters are bare (no server/port
-    /// slots — the guided inputs hide for these) and commit clean; brutal
-    /// garbage fails naming the field instead of riding silently.
     #[test]
     fn review_virtual_templates_commit_and_brutal_gate() {
         for virtual_proto in [
@@ -12468,8 +10653,7 @@ mod tests {
                 })
                 .unwrap_or_else(|error| panic!("bare {virtual_proto} starter commits: {error}"));
         }
-        // Brutal garbage fails at commit naming the field; numerics pass the
-        // gate (emission stays preserved-not-emitted per follow-up).
+
         let bad = "{\"type\":\"vless\",\"server\":\"s.example.com\",\"server_port\":443,\
             \"uuid\":\"11111111-2222-4333-8444-555555555555\",\
             \"brutal_down_mbps\":\"fast\"}";
@@ -12500,12 +10684,6 @@ mod tests {
             .expect("numeric brutal speed commits");
     }
 
-    /// Config-completeness T01: the picker lists exactly the 27 canonical
-    /// stored types (contract: no free-text typos); the virtual set is the
-    /// four address-less types plus trivial `direct` (T08, Throne label-only
-    /// parity); pristine detection is byte-identical; the switch rewrite
-    /// fires on pristine JSON only.
-    /// Ticket 07 (throne-adoption): 24 + mieru/juicity/trusttunnel.
     #[test]
     fn t01_picker_virtual_and_pristine_rules() {
         assert_eq!(
@@ -12540,19 +10718,18 @@ mod tests {
             );
         }
         assert!(!is_virtual_protocol("bogus"), "unknown is not virtual");
-        // Pristine: byte-identical starter only (any edit dirties it).
+
         let vless_starter = protocol_params_template("vless");
         assert!(is_pristine_template(&vless_starter, "vless"));
         assert!(!is_pristine_template(&format!("{vless_starter} "), "vless"));
         assert!(!is_pristine_template(&vless_starter, "chain"));
-        // Switch on pristine JSON rewrites to the new starter.
+
         assert_eq!(
             pristine_template_rewrite(&vless_starter, "vless", "chain"),
             protocol_params_template("chain"),
             "pristine switch rewrites"
         );
-        // Switch on dirty JSON stands (server filled, hand-typed object,
-        // garbage text all survive the switch).
+
         let dirty = vless_starter.replace("\"server\":\"\"", "\"server\":\"a.example.com\"");
         assert_eq!(
             pristine_template_rewrite(&dirty, "vless", "chain"),
@@ -12572,10 +10749,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T08 (CAP-12): trivial `direct` rows — the starter
-    /// is the bare kind marker (no fields to fill), the guided identity is
-    /// secret-free, and the untouched starter saves (opaque passthrough, no
-    /// credential gate).
     #[test]
     fn t08_direct_template_saves_with_no_fields() {
         assert_eq!(
@@ -12601,14 +10774,8 @@ mod tests {
         assert_eq!(created.protocol, "direct");
     }
 
-    /// Config-completeness T02: shared-panel folds are byte-identical
-    /// no-ops on untouched values and write minimal diffs on changes —
-    /// never a spurious patch, never a wipe of hidden keys.
     #[test]
     fn t02_panel_folds_noop_untouched_and_write_minimal() {
-        // Transport: untouched import row (network=tcp echoed) folds back
-        // byte-identical; ws sets network+path+host; back to tcp removes
-        // the network key instead of writing a default.
         let shaped = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"network\":\"tcp\"}";
         let echoed = TransportFold {
@@ -12643,8 +10810,7 @@ mod tests {
         assert!(back_value.get("network").is_none(), "tcp restores default");
         assert_eq!(back_value["path"], "/w", "conditional values preserved");
         assert_eq!(back_value["server"], "a.example.com", "row untouched");
-        // TLS optional: enabling writes tls, pbk flips to reality,
-        // disabling removes security only (sni stays per R5).
+
         let bare = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443}";
         let on = fold_tls_optional_into_params(
             bare,
@@ -12687,8 +10853,7 @@ mod tests {
         );
         assert_eq!(off_value["sni"], "s.example.com", "sni preserved");
         assert_eq!(off_value["pbk"], "pubkey", "pbk preserved");
-        // insecure across alias spellings: untouched alias no-ops, toggle
-        // writes canonical and clears the alias.
+
         let aliased = "{\"security\":\"tls\",\"allowInsecure\":true}";
         let kept = fold_tls_optional_into_params(
             aliased,
@@ -12711,9 +10876,7 @@ mod tests {
             serde_json::from_str(&cleared).expect("insecure off folds");
         assert!(cleared_value.get("allowInsecure").is_none());
         assert!(cleared_value.get("insecure").is_none());
-        // Mux: modes round-trip, brutal speeds land as numbers, garbage
-        // speeds land as strings at fold time and fail at the commit gate
-        // naming the field (never silent at either level).
+
         let mux_on = fold_mux_into_params(
             bare,
             &MuxFold {
@@ -12744,8 +10907,7 @@ mod tests {
             "default removes the key"
         );
         assert_eq!(default_value["brutal_enable"], true, "brutal preserved");
-        // Dial: toggles clear to absent, texts are blank-safe, untouched
-        // echoes stay byte-identical.
+
         let dialed = fold_dial_into_params(
             bare,
             &DialFold {
@@ -12773,7 +10935,7 @@ mod tests {
         let dial_off_value: serde_json::Value =
             serde_json::from_str(&dial_off).expect("dial off folds");
         assert!(dial_off_value.get("reuse_addr").is_none(), "false clears");
-        // VLESS inner: uuid/flow/packet_encoding with default-restore.
+
         let inner = fold_vless_inner_into_params(
             bare,
             "11111111-2222-4333-8444-555555555555",
@@ -12800,7 +10962,7 @@ mod tests {
             "blank flow restores default"
         );
         assert!(plain_value.get("packet_encoding").is_none());
-        // Garbage JSON stands untouched through every fold.
+
         for fold_it in [
             fold_transport_into_params("{{{", &TransportFold::default()),
             fold_mux_into_params("{{{", &MuxFold::default()),
@@ -12810,15 +10972,10 @@ mod tests {
         }
     }
 
-    /// Config-completeness T03: vmess inner fold is grammar-aware — legacy
-    /// rows (boolean `tls`) keep the cipher in `security`, new-style rows
-    /// write `encryption`; untouched rows echo byte-identical; `aid` stays a
-    /// string (the engine coerces); `packet_encoding` restores on blank.
     #[test]
     fn t03_vmess_inner_fold_keeps_grammar() {
         let uuid = "11111111-2222-4333-8444-555555555555";
-        // Legacy import shape: boolean `tls` owns the row, cipher in
-        // `security` (exactly what `parse_vmess` writes).
+
         let legacy = format!(
             "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"uuid\":\"{uuid}\",\"alter_id\":\"0\",\"security\":\"auto\",\"tls\":true}}"
@@ -12832,8 +10989,7 @@ mod tests {
             legacy,
             "untouched legacy echoes byte-identical"
         );
-        // Cipher switch on a legacy row rewrites `security`, never
-        // `encryption`; the boolean stands.
+
         let switched = fold_vmess_inner_into_params(&legacy, uuid, "0", "chacha20-poly1305", "");
         let switched_value: serde_json::Value =
             serde_json::from_str(&switched).expect("switched folds");
@@ -12844,7 +11000,7 @@ mod tests {
         );
         assert_eq!(switched_value["tls"], true, "boolean untouched");
         assert_eq!(switched_value["alter_id"], "0", "aid stays a string");
-        // New-style reality row: cipher goes to `encryption`, tls-ness stays.
+
         let modern = format!(
             "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"uuid\":\"{uuid}\",\"alter_id\":\"2\",\"security\":\"reality\",\
@@ -12858,16 +11014,13 @@ mod tests {
             modern,
             "untouched new-style echoes byte-identical"
         );
-        // A tls-ness `security` never reads as a cipher (the picker falls
-        // back to `auto`, never to a cipher the row does not have).
+
         assert_eq!(vmess_cipher_value("{\"security\":\"tls\"}"), "");
         assert_eq!(vmess_cipher_value("{\"security\":\"reality\"}"), "");
         assert!(vmess_tls_enabled("{\"security\":\"tls\"}"));
         assert!(!vmess_tls_enabled("{\"security\":\"auto\"}"));
         assert!(!vmess_tls_enabled("{}"));
-        // Ambiguous hand-written row (cipher in `security`, no boolean):
-        // the reader shows the cipher; the inner fold stages `encryption`
-        // and the S2 fold drops the ambiguous `security` — healed together.
+
         let ambiguous = format!(
             "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"uuid\":\"{uuid}\",\"security\":\"auto\"}}"
@@ -12893,7 +11046,7 @@ mod tests {
             "default cipher stays absent"
         );
         assert_eq!(healed_value["packet_encoding"], "xudp");
-        // Garbage JSON stands untouched through every new fold.
+
         for fold_it in [
             fold_vmess_inner_into_params("{{{", uuid, "0", "auto", ""),
             fold_trojan_inner_into_params("{{{", "secret"),
@@ -12904,9 +11057,6 @@ mod tests {
         }
     }
 
-    /// Config-completeness T03: the vmess TLS fold mirrors the toggle into
-    /// the legacy boolean (cipher never stripped), migrates to new-style on
-    /// reality intent, and matches the standard fold off legacy rows.
     #[test]
     fn t03_tls_vmess_fold_mirrors_bool_and_migrates_reality() {
         let uuid = "11111111-2222-4333-8444-555555555555";
@@ -12914,7 +11064,7 @@ mod tests {
             "{{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"uuid\":\"{uuid}\",\"alter_id\":\"0\",\"security\":\"auto\",\"tls\":true}}"
         );
-        // Untouched legacy echoes byte-identical (cipher never stripped).
+
         let echo = fold_tls_vmess_into_params(
             &legacy,
             &TlsOptionalFold {
@@ -12923,7 +11073,7 @@ mod tests {
             },
         );
         assert_eq!(echo, legacy, "untouched legacy echoes byte-identical");
-        // Toggle off flips the boolean, keeps the cipher and every key.
+
         let off = fold_tls_vmess_into_params(
             &legacy,
             &TlsOptionalFold {
@@ -12934,8 +11084,7 @@ mod tests {
         let off_value: serde_json::Value = serde_json::from_str(&off).expect("off folds");
         assert_eq!(off_value["tls"], false, "boolean mirrors the toggle");
         assert_eq!(off_value["security"], "auto", "cipher preserved");
-        // Reality intent migrates: boolean dropped, cipher moved to
-        // `encryption`, `security` becomes `reality`.
+
         let migrated = fold_tls_vmess_into_params(
             &legacy,
             &TlsOptionalFold {
@@ -12956,7 +11105,7 @@ mod tests {
         assert_eq!(migrated_value["security"], "reality");
         assert_eq!(migrated_value["sni"], "a.example.com");
         assert_eq!(migrated_value["pbk"], "pubkey");
-        // Migrating twice is stable (second fold is a no-op echo).
+
         let twice = fold_tls_vmess_into_params(
             &migrated,
             &TlsOptionalFold {
@@ -12968,8 +11117,7 @@ mod tests {
             },
         );
         assert_eq!(twice, migrated, "migration is idempotent");
-        // Off legacy rows: every standard detail still folds (sni lands,
-        // cipher stands, boolean flips only when the toggle differs).
+
         let modern = "{\"type\":\"vmess\",\"server\":\"a.example.com\",\"server_port\":443}";
         for fold in [
             TlsOptionalFold {
@@ -12996,12 +11144,8 @@ mod tests {
         }
     }
 
-    /// Config-completeness T03: trojan/shadowsocks inner folds — secrets
-    /// echo, blank method/plugin never fabricate or strip, `uot` folds the
-    /// `udp_over_tcp` bool across both spellings.
     #[test]
     fn t03_ss_and_trojan_inner_folds() {
-        // Trojan: password echoes, writes, blanks never wipe.
         let trojan = "{\"type\":\"trojan\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"password\":\"secret\"}";
         assert_eq!(
@@ -13023,16 +11167,14 @@ mod tests {
             trojan,
             "whitespace never wipes"
         );
-        // Shadowsocks pristine template: blank method/plugin stand — no
-        // fabricated cipher, no stripped key (the commit gate names the
-        // missing method instead).
+
         let template = protocol_params_template("shadowsocks");
         assert_eq!(
             fold_shadowsocks_inner_into_params(&template, "", "", "", "", false),
             template,
             "pristine template stands"
         );
-        // Populated row echoes byte-identical.
+
         let ss = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\"server_port\":8388,\
             \"method\":\"aes-128-gcm\",\"password\":\"pw\",\"udp_over_tcp\":true}";
         assert_eq!(
@@ -13040,10 +11182,7 @@ mod tests {
             ss,
             "untouched ss echoes byte-identical"
         );
-        // Method switch writes; plugin pick writes; plugin_opts lands;
-        // `uot:true` echoes (the engine folds that spelling — same rule as
-        // every aliased toggle), while a false→true flip retires the alias
-        // to the canonical bool.
+
         let uot_legacy = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
             \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\"uot\":true}";
         assert_eq!(
@@ -13071,7 +11210,7 @@ mod tests {
             normalized_value.get("uot").is_none(),
             "alias retired on write"
         );
-        // Stored SIP002 `;`-tails survive a blank pick (never stripped).
+
         let tailed = "{\"type\":\"shadowsocks\",\"server\":\"a.example.com\",\
             \"server_port\":8388,\"method\":\"aes-128-gcm\",\"password\":\"pw\",\
             \"plugin\":\"obfs-local;obfs=http\"}";
@@ -13080,7 +11219,7 @@ mod tests {
             tailed,
             "unrepresentable plugin preserved"
         );
-        // `uot` off clears the canonical bool.
+
         let cleared = fold_shadowsocks_inner_into_params(ss, "aes-128-gcm", "pw", "", "", false);
         let cleared_value: serde_json::Value =
             serde_json::from_str(&cleared).expect("cleared folds");
@@ -13088,10 +11227,6 @@ mod tests {
         assert_eq!(cleared_value["method"], "aes-128-gcm", "method kept");
     }
 
-    /// Config-completeness T04: wireguard inner fold — canonical engine
-    /// spellings win (`pre_shared_key`, `address`), Throne spellings read
-    /// as aliases but are never written; numerics stay text (aid precedent —
-    /// the engine coerces); `udp_timeout` (import-only) is never stripped.
     #[test]
     fn t04_wireguard_inner_fold() {
         let full = WireguardFold {
@@ -13138,7 +11273,7 @@ mod tests {
             folded_value.get("sys_ifc").is_none(),
             "Throne spelling never written"
         );
-        // Echoed fold is byte-identical (no spurious patch).
+
         let echo = WireguardFold {
             private_key: "LOCAL".to_string(),
             public_key: "REMOTE".to_string(),
@@ -13156,7 +11291,7 @@ mod tests {
             folded,
             "untouched wg echoes byte-identical"
         );
-        // Throne/legacy spellings echo without duplicating the canonical key.
+
         let throne = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
             \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"preshared_key\":\"PSK\",\
             \"local_addr\":\"10.0.0.2/32\",\"sys_ifc\":true}";
@@ -13173,15 +11308,14 @@ mod tests {
             throne,
             "matching aliases echo (engine-adjacent spellings retire only on write)"
         );
-        // Pristine template stands through a blank fold.
+
         let template = protocol_params_template("wireguard");
         assert_eq!(
             fold_wireguard_into_params(&template, &WireguardFold::default()),
             template,
             "pristine template stands"
         );
-        // Import-only extras ride through untouched (preserved, never
-        // stripped, no UI): `udp_timeout`, verbatim conf keys, AllowedIPs.
+
         let imported = "{\"type\":\"wireguard\",\"server\":\"192.0.2.44\",\"server_port\":51820,\
             \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"udp_timeout\":\"30\",\
             \"allowed_ips\":\"10.0.0.0/8\",\"fwmark\":\"100\",\"keepalive\":\"25\"}";
@@ -13196,7 +11330,7 @@ mod tests {
         assert_eq!(kept, imported, "import-only keys preserved");
         let kept_value: serde_json::Value = serde_json::from_str(&kept).expect("kept parses");
         assert_eq!(kept_value["udp_timeout"], "30");
-        // `system` off clears the canonical bool (and the Throne alias).
+
         let sys_off = fold_wireguard_into_params(
             &folded,
             &WireguardFold {
@@ -13204,7 +11338,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Blank texts never wipe — only the toggle flips.
+
         let sys_off_value: serde_json::Value =
             serde_json::from_str(&sys_off).expect("sys off folds");
         assert!(sys_off_value.get("system").is_none(), "false clears");
@@ -13215,10 +11349,6 @@ mod tests {
         assert_eq!(fold_wireguard_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T04: amneziawg matrix fold — version keep-blank
-    /// (never fabricated, never stripped), full J/S/H/I + v3 texts,
-    /// trailers/cookies bools, enable marker; hidden-version folds still
-    /// preserve (R5 — the fold never branches on version).
     #[test]
     fn t04_amneziawg_matrix_fold() {
         assert_eq!(AWG_VERSIONS, ["2.0", "3.x"]);
@@ -13265,9 +11395,7 @@ mod tests {
             folded,
             "untouched matrix echoes byte-identical"
         );
-        // Blank version never fabricates (contract C2) and a blank-text
-        // echo never strips stored values (R5 hide-preserve); toggles echo
-        // explicitly (off counts as blank and clears — same rule as S4).
+
         let noversion = fold_amneziawg_into_params(bare, &AmneziaFold::default());
         let noversion_value: serde_json::Value =
             serde_json::from_str(&noversion).expect("no-version folds");
@@ -13287,8 +11415,7 @@ mod tests {
             folded,
             "echoed toggles+version keep, blank texts never strip"
         );
-        // The fold never branches on version: v3 keys fold onto a 2.0 row
-        // untouched (R5 hide-preserve — the engine gate names them loudly).
+
         let v2row = "{\"type\":\"amneziawg\",\"server\":\"192.0.2.90\",\"server_port\":51820,\
             \"private_key\":\"LOCAL\",\"public_key\":\"REMOTE\",\"awg_version\":\"2.0\",\
             \"headerprotectionkey\":\"HPK\"}";
@@ -13297,7 +11424,7 @@ mod tests {
             v2row,
             "hidden-version values preserved, never wiped"
         );
-        // Toggles off clear; unparseable JSON stands.
+
         let off = fold_amneziawg_into_params(
             &folded,
             &AmneziaFold {
@@ -13313,11 +11440,6 @@ mod tests {
         assert_eq!(fold_amneziawg_into_params("{{{", &matrix), "{{{");
     }
 
-    /// Config-completeness T05: hysteria fold — common fields on both
-    /// layouts, engine spellings only (`up`/`down`, never `up_mbps`; recv
-    /// windows as numbers), keep-blank `auth_type`, exclusive credentials
-    /// per `is_v2` (auth on v1, password on v2); pristine templates stand
-    /// through blank folds.
     #[test]
     fn t05_hysteria_fold_common_and_version_halves() {
         assert_eq!(HY_AUTH_TYPES, ["STRING", "BASE64"]);
@@ -13359,7 +11481,7 @@ mod tests {
             value.get("password").is_none(),
             "v1 never folds the v2 credential"
         );
-        // Echoed fold is byte-identical (numbers echo as their text).
+
         let echo = HysteriaFold {
             server_ports: "9000-9010".to_string(),
             hop_interval: "30s".to_string(),
@@ -13378,7 +11500,7 @@ mod tests {
             folded,
             "untouched v1 echoes byte-identical"
         );
-        // v2 folds the password and never the v1 auth.
+
         let v2 = HysteriaFold {
             up: "100".to_string(),
             down: "100".to_string(),
@@ -13393,7 +11515,7 @@ mod tests {
         assert_eq!(value2["password"], "v2secret");
         assert_eq!(value2["up"], "100");
         assert!(value2.get("auth").is_none(), "v2 never folds the v1 auth");
-        // Throne `up_mbps` spellings echo through the up/down readers.
+
         let throne = "{\"type\":\"hysteria\",\"server\":\"192.0.2.14\",\"server_port\":443,\
             \"auth\":\"s\",\"up_mbps\":100,\"down_mbps\":50}";
         let throne_echo = HysteriaFold {
@@ -13407,7 +11529,7 @@ mod tests {
             throne,
             "matching aliases echo"
         );
-        // Pristine templates stand through blank folds on both layouts.
+
         for proto in ["hysteria", "hysteria2"] {
             let template = protocol_params_template(proto);
             assert_eq!(
@@ -13423,9 +11545,6 @@ mod tests {
         assert_eq!(fold_hysteria_into_params("{{{", &v1, false), "{{{");
     }
 
-    /// Config-completeness T05: v1 commits refuse blank up/down naming the
-    /// page fields; v1 with speeds lands; v2 without speeds lands
-    /// (BBR-by-omission).
     #[test]
     fn t05_hysteria_v1_up_down_gate_names_fields() {
         fn add(
@@ -13468,9 +11587,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T05: tuic fold — all seven tuning fields land in
-    /// engine spellings (`zero_rtt_handshake`, never `zero_rtt`; keep-blank
-    /// selects never fabricate); pristine template stands through a blank.
     #[test]
     fn t05_tuic_fold_seven_fields_engine_spellings() {
         assert_eq!(TUIC_CC_MODES, ["bbr", "cubic", "new_reno"]);
@@ -13507,7 +11623,7 @@ mod tests {
             folded,
             "untouched tuic echoes byte-identical"
         );
-        // The Throne `zero_rtt` spelling echoes into the handshake switch.
+
         let throne = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
             \"uuid\":\"u\",\"password\":\"p\",\"zero_rtt\":true}";
         let throne_echo = TuicFold {
@@ -13521,7 +11637,7 @@ mod tests {
             throne,
             "matching alias echoes"
         );
-        // Blank selects never fabricate; pristine template stands.
+
         let template = protocol_params_template("tuic");
         assert_eq!(
             fold_tuic_into_params(&template, &TuicFold::default()),
@@ -13531,10 +11647,6 @@ mod tests {
         assert_eq!(fold_tuic_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T05: forced-TLS fold — untouched rows stay
-    /// byte-identical (no fabricated `security`); details fold blank-safe;
-    /// a public key locks `reality`; any other touched detail locks `tls`;
-    /// a stored `security=none` survives untouched (the engine names it).
     #[test]
     fn t05_tls_forced_fold_locks_only_when_touched() {
         let bare = "{\"type\":\"tuic\",\"server\":\"192.0.2.12\",\"server_port\":443,\
@@ -13561,7 +11673,7 @@ mod tests {
             serde_json::from_str(&fold_tls_forced_into_params(bare, &pbk)).expect("pbk folds");
         assert_eq!(pbk_value["security"], "reality", "public key locks reality");
         assert_eq!(pbk_value["pbk"], "PUBKEY");
-        // An existing tls marker is kept, never rewritten.
+
         let tls_row =
             "{\"type\":\"tuic\",\"server\":\"s\",\"server_port\":443,\"security\":\"tls\"}";
         let kept = fold_tls_forced_into_params(
@@ -13573,7 +11685,7 @@ mod tests {
         );
         let kept_value: serde_json::Value = serde_json::from_str(&kept).expect("kept parses");
         assert_eq!(kept_value["security"], "tls");
-        // A stored `security=none` survives an untouched fold (engine names it).
+
         let none_row =
             "{\"type\":\"tuic\",\"server\":\"s\",\"server_port\":443,\"security\":\"none\"}";
         assert_eq!(
@@ -13584,10 +11696,6 @@ mod tests {
         assert_eq!(fold_tls_forced_into_params("{{{", &sni), "{{{");
     }
 
-    /// Config-completeness T06: SOCKS fold — version keep-blank (blank
-    /// leaves the stock 5; "4" folds for the engine to reject naming the
-    /// field), S1-rule network ("tcp" removes), uot bool; pristine template
-    /// stands through a blank.
     #[test]
     fn t06_socks_fold_version_network_uot() {
         assert_eq!(SOCKS_VERSIONS, ["5", "4"]);
@@ -13611,8 +11719,7 @@ mod tests {
             folded,
             "untouched socks echoes byte-identical"
         );
-        // A stored v4 survives the fold (the engine rejects it naming
-        // `version` — never a guessed emission).
+
         let v4 = "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080,\"version\":\"4\"}";
         let v4_echo = SocksFold {
             version: "4".to_string(),
@@ -13623,7 +11730,7 @@ mod tests {
             v4,
             "v4 echoes for the engine gate"
         );
-        // The Throne `uot` spelling echoes into the sing-box bool.
+
         let throne = "{\"type\":\"socks\",\"server\":\"s\",\"server_port\":1080,\"uot\":true}";
         let throne_echo = SocksFold {
             udp_over_tcp: true,
@@ -13635,7 +11742,7 @@ mod tests {
             throne,
             "matching alias echoes (tcp removes nothing absent)"
         );
-        // Pristine template stands through a blank fold.
+
         let template = protocol_params_template("socks");
         assert_eq!(
             fold_socks_into_params(&template, &SocksFold::default()),
@@ -13645,8 +11752,6 @@ mod tests {
         assert_eq!(fold_socks_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T06: HTTP/HTTPS fold — username/password/path/
-    /// headers parity+ as blank-safe text; pristine templates stand.
     #[test]
     fn t06_http_fold_parity_plus() {
         let full = HttpFold {
@@ -13678,10 +11783,6 @@ mod tests {
         assert_eq!(fold_http_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T06: AnyTLS fold — password plus the session
-    /// tunables in sing-box spellings (interval/timeout texts, min as a
-    /// number); Throne short names echo without duplication; pristine
-    /// template stands.
     #[test]
     fn t06_anytls_fold_interval_timeout_min() {
         let full = AnytlsFold {
@@ -13707,7 +11808,7 @@ mod tests {
             folded,
             "untouched anytls echoes byte-identical"
         );
-        // Throne short names echo into the long inputs without duplicating.
+
         let throne = "{\"type\":\"anytls\",\"server\":\"s\",\"server_port\":8443,\
             \"password\":\"p\",\"interval\":\"30s\",\"timeout\":\"60s\"}";
         let throne_echo = AnytlsFold {
@@ -13730,10 +11831,6 @@ mod tests {
         assert_eq!(fold_anytls_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T06: Naïve fold — username/password plus uot/quic
-    /// bools and the keep-blank cc (never fabricated); the Throne
-    /// `congestion_control` spelling echoes without duplicating; pristine
-    /// template stands.
     #[test]
     fn t06_naive_fold_uot_quic_cc() {
         assert_eq!(NAIVE_CC_MODES, ["bbr", "bbr2", "cubic", "reno"]);
@@ -13765,8 +11862,7 @@ mod tests {
             folded,
             "untouched naive echoes byte-identical"
         );
-        // The Throne spellings echo without duplicating (the engine folds
-        // them at generate, canonical wins).
+
         let throne = "{\"type\":\"naive\",\"server\":\"s\",\"server_port\":443,\
             \"username\":\"u\",\"password\":\"p\",\"uot\":true,\"congestion_control\":\"cubic\"}";
         let throne_echo = NaiveFold {
@@ -13781,7 +11877,7 @@ mod tests {
             throne,
             "matching aliases echo"
         );
-        // Blank cc never fabricates; pristine template stands.
+
         let template = protocol_params_template("naive");
         assert_eq!(
             fold_naive_into_params(&template, &NaiveFold::default()),
@@ -13791,10 +11887,6 @@ mod tests {
         assert_eq!(fold_naive_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T06: SSH fold — user/password/key blob/path/pass
-    /// plus host-key lists (comma text in, string arrays out) and
-    /// client_version; engine spellings written, Throne spellings read;
-    /// pristine template stands.
     #[test]
     fn t06_ssh_fold_user_key_hostlists() {
         let full = SshFold {
@@ -13831,9 +11923,7 @@ mod tests {
             value.get("username").is_some_and(|name| name == ""),
             "template username slot untouched (engine drops it when user wins)"
         );
-        // Untouched echoes stay byte-identical — arrays echo through the
-        // list reader, the Throne `username`/`privatekey` spellings echo
-        // through the text readers.
+
         let echo = SshFold {
             user: "root".to_string(),
             password: "secret".to_string(),
@@ -13854,7 +11944,7 @@ mod tests {
             "ecdsa-sha2-nistp256 AAAA, ssh-ed25519 BBBB",
             "stored arrays echo as comma text"
         );
-        // Throne spellings echo without duplicating.
+
         let throne = "{\"type\":\"ssh\",\"server\":\"s\",\"server_port\":22,\
             \"username\":\"root\",\"privatekey\":\"K\",\"private_key_pass\":\"pp\"}";
         let throne_echo = SshFold {
@@ -13877,10 +11967,6 @@ mod tests {
         assert_eq!(fold_ssh_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T07: Snell fold — engine-driven fields (the engine
-    /// maps exactly psk/version/userkey/reuse/network/obfs_mode/obfs_host/
-    /// mode; version keep-blank leaves the engine default 4). Blank folds
-    /// never touch the object; the Throne `obfs` spelling echoes.
     #[test]
     fn t07_snell_fold_engine_driven_fields() {
         assert_eq!(SNELL_VERSIONS, ["4", "6"]);
@@ -13910,8 +11996,7 @@ mod tests {
             folded,
             "untouched snell echoes byte-identical"
         );
-        // A stored version survives a blank pick (the engine default applies
-        // only when the key is absent — the fold never strips).
+
         let v6 = "{\"type\":\"snell\",\"server\":\"s\",\"server_port\":8080,\
             \"psk\":\"secret\",\"version\":\"6\"}";
         assert_eq!(
@@ -13919,7 +12004,7 @@ mod tests {
             v6,
             "stored version survives blank picks"
         );
-        // The Throne `obfs` spelling echoes without duplicating.
+
         let throne = "{\"type\":\"snell\",\"server\":\"s\",\"server_port\":8080,\"obfs\":\"http\"}";
         let throne_echo = SnellFold {
             obfs_mode: "http".to_string(),
@@ -13939,9 +12024,6 @@ mod tests {
         assert_eq!(fold_snell_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T07: ShadowTLS fold — version keep-blank over
-    /// 1|2|3 (blank leaves the schema default 1; v1 rows omit the password)
-    /// plus the v2/v3 password text. Blank folds never touch the object.
     #[test]
     fn t07_shadowtls_fold_version_password() {
         assert_eq!(SHADOWTLS_VERSIONS, ["1", "2", "3"]);
@@ -13959,7 +12041,7 @@ mod tests {
             folded,
             "untouched shadowtls echoes byte-identical"
         );
-        // A passwordless v1 row stands through a blank fold.
+
         let v1 = "{\"type\":\"shadowtls\",\"server\":\"s\",\"server_port\":443}";
         assert_eq!(
             fold_shadowtls_into_params(v1, &ShadowTlsFold::default()),
@@ -13975,11 +12057,6 @@ mod tests {
         assert_eq!(fold_shadowtls_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T07: Xray-VLESS Ph1 fold — the common subset lands
-    /// in bridge spellings while Ph2-only keys (`xPaddingBytes`,
-    /// `maxConcurrency`, `downloadSettings`, …) and unknown `xray_*` keys are
-    /// preserved byte-identical, never stripped. No Ph2 matrix smuggling: the
-    /// fold writes no XHTTP/xmux/session keys.
     #[test]
     fn t07_xray_fold_ph1_preserves_ph2() {
         assert_eq!(XRAY_NETWORKS, ["raw", "xhttp", "ws", "httpupgrade", "grpc"]);
@@ -14019,7 +12096,7 @@ mod tests {
             folded,
             "untouched xray echoes byte-identical"
         );
-        // Hand-added Ph2-only keys survive a matching Ph1 fold untouched.
+
         let ph2 = "{\"type\":\"xray\",\"server\":\"s\",\"server_port\":443,\
             \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
             \"flow\":\"xtls-rprx-vision\",\"sni\":\"example.com\",\"fp\":\"chrome\",\
@@ -14033,7 +12110,7 @@ mod tests {
             ph2,
             "Ph2-only and unknown xray_* keys round-trip untouched (preserve-not-strip)"
         );
-        // The `fingerprint` spelling echoes without duplicating.
+
         let throne = "{\"type\":\"xray\",\"server\":\"s\",\"server_port\":443,\
             \"fingerprint\":\"chrome\"}";
         let throne_echo = XrayFold {
@@ -14052,18 +12129,13 @@ mod tests {
         assert_eq!(fold_xray_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T07: chain hop rules — Throne rejections verbatim
-    /// (flat v1 chains: no chain/autoselector hops ever; at most one
-    /// extracore hop, only at index 0). Every refusal names the rule; legal
-    /// hops land with `None`. The nodes reader/fold round-trips the editor
-    /// state byte-identically.
     #[test]
     fn t07_chain_hop_rules_name_throne_rejections() {
         use ChainHopSlot::{Autoselector, Chain, Extra, Other};
         let none: &[ChainHopSlot] = &[];
         let one_other: &[ChainHopSlot] = &[Other];
         let extra_first: &[ChainHopSlot] = &[Extra, Other];
-        // Nested chains and autoselectors never land, at any index.
+
         for candidate in [Chain, Autoselector] {
             let rule = chain_hop_rejection(none, candidate, 0, false).expect("rejected");
             assert!(
@@ -14072,7 +12144,7 @@ mod tests {
             );
             assert!(chain_hop_rejection(one_other, candidate, 1, false).is_some());
         }
-        // Extracore hops sit at index 0 only.
+
         let off_index = chain_hop_rejection(one_other, Extra, 1, false).expect("rejected");
         assert!(
             off_index.contains("index 0"),
@@ -14080,8 +12152,7 @@ mod tests {
         );
         assert!(chain_hop_rejection(none, Extra, 0, false).is_none());
         assert!(chain_hop_rejection(one_other, Extra, 0, false).is_none());
-        // At most one extracore hop per chain (replacing the index-0
-        // extracore with another extracore is the one legal overlap).
+
         let second = chain_hop_rejection(extra_first, Extra, 0, false).expect("rejected");
         assert!(
             second.contains("at most one"),
@@ -14089,17 +12160,16 @@ mod tests {
         );
         assert!(chain_hop_rejection(extra_first, Extra, 0, true).is_none());
         assert!(chain_hop_rejection(extra_first, Other, 1, true).is_none());
-        // Out-of-range replaces name the index rule.
+
         let oob = chain_hop_rejection(one_other, Other, 1, true).expect("rejected");
         assert!(
             oob.contains("out of range"),
             "out-of-range replace names the rule: {oob}"
         );
-        // Ordinary hops land anywhere, including beside an extracore first hop.
+
         assert!(chain_hop_rejection(none, Other, 0, false).is_none());
         assert!(chain_hop_rejection(extra_first, Other, 2, false).is_none());
-        // The nodes reader echoes the editor state; the fold is a no-op when
-        // nothing differs and writes explicit clear-alls.
+
         let params = "{\"type\":\"chain\",\"nodes\":[\"a\",\"b\"]}";
         assert_eq!(
             chain_nodes_of(params),
@@ -14134,10 +12204,6 @@ mod tests {
         assert_eq!(fold_chain_nodes_into_params("{{{", &[]), "{{{");
     }
 
-    /// Config-completeness T07: extra-core fold + Validate — exe/args/config
-    /// land in engine spellings, untouched echoes stay byte-identical, and
-    /// the shape gate names exe/config fields. `no_logs` is never written
-    /// (Throne non-persist bug — no such control exists anywhere).
     #[test]
     fn t07_extra_fold_validate_never_no_logs() {
         let full = ExtraFold {
@@ -14160,8 +12226,7 @@ mod tests {
             folded,
             "untouched extra echoes byte-identical"
         );
-        // Stored objects echo as JSON text through the reader and refold
-        // byte-identically; strings read verbatim.
+
         assert_eq!(
             extra_config_prefill(&folded),
             "{\"inbounds\":[]}",
@@ -14171,7 +12236,7 @@ mod tests {
         assert_eq!(extra_config_prefill(with_string), "{\"a\":1}");
         assert_eq!(extra_config_prefill("{\"type\":\"extra-core\"}"), "");
         assert_eq!(extra_config_prefill("{{{"), "");
-        // The `binary` spelling echoes into `exe` without duplicating.
+
         let alias = "{\"type\":\"extra-core\",\"binary\":\"core.exe\"}";
         let alias_echo = ExtraFold {
             exe: "core.exe".to_string(),
@@ -14182,7 +12247,7 @@ mod tests {
             alias,
             "matching alias echoes"
         );
-        // Validate names the missing shape before commit.
+
         assert!(validate_extra_params(&folded).is_ok());
         let no_exe = validate_extra_params("{\"config\":\"{}\"}").expect_err("exe required");
         assert!(no_exe.contains("exe"), "missing exe names exe: {no_exe}");
@@ -14208,8 +12273,6 @@ mod tests {
         assert_eq!(fold_extra_into_params("{{{", &full), "{{{");
     }
 
-    /// Config-completeness T02: toggle prefill reads truthy spellings
-    /// (bools, numbers, liberal strings) and stays false on garbage.
     #[test]
     fn t02_prefill_bool_reads_truthy_spellings() {
         assert!(guided_prefill_bool(
@@ -14228,9 +12291,6 @@ mod tests {
         assert!(!guided_prefill_bool("", &["reuse_addr"]));
     }
 
-    /// Ticket 05: guided identity mapping mirrors the commit gate (same
-    /// credential per protocol); aliases canonicalize; secret-free and
-    /// custom protocols hide Identity; unknown stays unknown.
     #[test]
     fn t05_guided_identity_fields_mirror_validation() {
         let vless = guided_identity_fields("vless").expect("vless maps");
@@ -14238,7 +12298,7 @@ mod tests {
         assert_eq!(vless.needs, "uuid");
         let trojan = guided_identity_fields("trojan").expect("trojan maps");
         assert_eq!(trojan.key, Some("password"));
-        // Aliases canonicalize through the same gate as validation.
+
         assert_eq!(
             guided_identity_fields("ss").expect("ss maps").key,
             Some("password"),
@@ -14259,8 +12319,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05: guided prefill echoes the JSON (aliases, numbers) and
-    /// stays blank on garbage — the JSON is the source of truth.
     #[test]
     fn t05_guided_prefill_echoes_json_blank_on_garbage() {
         let params = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
@@ -14282,18 +12340,15 @@ mod tests {
         assert_eq!(guided_prefill_value("", &["server"]), "");
     }
 
-    /// Ticket 05: blank guided inputs leave the JSON byte-identical;
-    /// non-blank values fold in; garbage ports fail loudly at validation
-    /// (written as strings, never silently kept).
     #[test]
     fn t05_fold_guided_leaves_blank_untouched_and_merges_touched() {
         let template = protocol_params_template("vless");
-        // All blank → byte-identical (untouched template still names uuid).
+
         assert_eq!(
             fold_guided_into_params(&template, "", "", Some(("uuid", &["uuid", "id"])), ""),
             template
         );
-        // Guided identity + server fold into the blank template.
+
         let merged = fold_guided_into_params(
             &template,
             "a.example.com",
@@ -14305,7 +12360,7 @@ mod tests {
         assert_eq!(value["server"], "a.example.com");
         assert_eq!(value["uuid"], "11111111-2222-4333-8444-555555555555");
         assert_eq!(value["server_port"], 443, "template port stands");
-        // Untouched values never reserialize (no spurious edit patches).
+
         let shaped = "{\"type\":\"vless\",\"server\":\"a.example.com\",\"server_port\":443,\
             \"uuid\":\"11111111-2222-4333-8444-555555555555\"}";
         assert_eq!(
@@ -14318,21 +12373,19 @@ mod tests {
             ),
             shaped
         );
-        // Garbage port is written as a string — validation names it.
+
         let bad_port = fold_guided_into_params(shaped, "", "abc", None, "");
         assert!(
             bad_port.contains("\"server_port\":\"abc\""),
             "loud for validation, got {bad_port}"
         );
-        // Unparseable JSON returns unchanged (validation names that error).
+
         assert_eq!(
             fold_guided_into_params("{{{", "a.example.com", "", None, ""),
             "{{{"
         );
     }
 
-    /// Ticket 31: edit a subscription's label/url/group — persists in place,
-    /// no double row, auto flag untouched.
     #[test]
     fn ticket31_update_subscription_persists_label_url_group() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14353,8 +12406,6 @@ mod tests {
         assert_eq!(rows[0].group, "g2");
     }
 
-    /// Ticket 31: bad subscription edits fail typed with the record
-    /// unchanged; unknown ids are NotFound. Errors never echo the URL.
     #[test]
     fn ticket31_update_subscription_rejects_bad_input_and_ghosts() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14395,8 +12446,6 @@ mod tests {
         );
     }
 
-    /// Ticket 31: duplicate-URL lookup finds the existing row (the friendly
-    /// `already subscribed` path); other URLs find nothing.
     #[test]
     fn ticket31_find_subscription_by_url_matches_trimmed() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14418,9 +12467,6 @@ mod tests {
         );
     }
 
-    /// Ticket 31: no silent dedup on bind/port — two rows may share an
-    /// endpoint at rest (the conflict error naming both parties stays an
-    /// activation-time concern); saves are never blocked here.
     #[test]
     fn ticket31_shared_bind_port_saves_without_silent_dedup() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14448,8 +12494,6 @@ mod tests {
         assert_eq!(store.list().expect("list works").len(), 2);
     }
 
-    // -- Ticket 37: routing presets --------------------------------------
-
     fn t37_seed_row(store: &mut Store, name: &str) -> ProxyConfig {
         store
             .add(NewConfig {
@@ -14470,8 +12514,6 @@ mod tests {
         .expect("fixture rules parse")
     }
 
-    /// Ticket 37: `throne://route` link imports a named preset with its rules
-    /// (replaces the v1 named error).
     #[test]
     fn ticket37_route_link_imports_named_preset() {
         use base64::Engine as _;
@@ -14489,8 +12531,6 @@ mod tests {
         assert_eq!(listed[0].name, "ads");
     }
 
-    /// Ticket 42 (US-28): route links store in all three encodings
-    /// (standard-b64, urlsafe-b64, raw JSON).
     #[test]
     fn t42_route_link_all_encodings_store() {
         use base64::Engine as _;
@@ -14512,8 +12552,6 @@ mod tests {
         }
     }
 
-    /// Ticket 37: preset URL/JSON bodies import; malformed rules are rejected
-    /// naming the rule index and the field (never values).
     #[test]
     fn ticket37_preset_json_import_and_malformed_rule_error() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14544,8 +12582,6 @@ mod tests {
         assert_eq!(store.list_presets().expect("list works").len(), 1);
     }
 
-    /// Ticket 37: preset manager — create / add rule / remove rule / detach
-    /// persist and validate; delete of an attached preset is refused.
     #[test]
     fn ticket37_preset_manager_crud_and_refused_delete() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14573,8 +12609,7 @@ mod tests {
             .expect("get works")
             .expect("preset kept");
         assert_eq!(back.rules().expect("rules decode").len(), 0);
-        // Attaching an empty-rules preset is refused (it would serve
-        // preset-less without a word).
+
         assert!(
             store.set_config_preset(&row.id, Some(&preset.id)).is_err(),
             "empty attach refused"
@@ -14582,7 +12617,7 @@ mod tests {
         store
             .add_preset_rule(&preset.id, serde_json::json!({"action": "direct"}))
             .expect("re-add rule works");
-        // Attach, then delete must refuse.
+
         store
             .set_config_preset(&row.id, Some(&preset.id))
             .expect("attach works");
@@ -14599,7 +12634,7 @@ mod tests {
             store.get_preset(&preset.id).expect("get works").is_some(),
             "refused delete keeps the preset"
         );
-        // Explicit detach, then delete succeeds.
+
         store
             .set_config_preset(&row.id, None)
             .expect("detach works");
@@ -14612,7 +12647,6 @@ mod tests {
         );
     }
 
-    /// Ticket 37: explicit delete-detaches-then-deletes in one call.
     #[test]
     fn ticket37_delete_detaching_clears_attachments() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14634,8 +12668,6 @@ mod tests {
         );
     }
 
-    /// Ticket 37: attaching a ghost preset is NotFound; attaching to a ghost
-    /// row is NotFound; removing a ghost rule index fails typed.
     #[test]
     fn ticket37_preset_ghost_references_fail_typed() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14663,8 +12695,6 @@ mod tests {
         );
     }
 
-    /// Ticket 37: fresh rows carry no preset and survive a restart-shaped
-    /// reopen with their attachment intact (isolated temp DB, synthetic row).
     #[test]
     fn ticket37_preset_attachment_survives_reopen() {
         let dir = std::env::temp_dir().join(format!(
@@ -14701,11 +12731,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Ticket 37: restore rebuilds rows unattached while the presets table
-    /// itself survives (backups cover endpoints, not routing policy). The
-    /// preset stays listed for re-attach — never a dangling reference.
-    /// Ticket 40: full-fidelity export now carries presets + linkage by name,
-    /// so restores re-attach (old unattached expectation superseded).
     #[test]
     fn ticket37_restore_rebuilds_rows_unattached_presets_survive() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14717,8 +12742,7 @@ mod tests {
             .set_config_preset(&row.id, Some(&preset.id))
             .expect("attach works");
         let payload = store.export_library_json().expect("export works");
-        // Restore runs against a wiped library in the same database (the
-        // production path wipes rows + subscriptions, never route_presets).
+
         for row in store.list().expect("list works") {
             store.remove(&row.id).expect("wipe works");
         }
@@ -14736,11 +12760,7 @@ mod tests {
             .expect("preset survives restore");
         assert_eq!(kept.rules().expect("rules decode").len(), 3);
     }
-    // -- Ticket 48: DPAPI failure injection + preset integration --------
 
-    /// Ticket 48 (US-60): DPAPI-down writes abort loudly with nothing
-    /// written — a single add and a sealing subscription refresh both
-    /// roll back (version and rows untouched, next open retries).
     #[test]
     fn t48_dpapi_down_aborts_writes_without_side_effects() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14765,8 +12785,6 @@ mod tests {
             add_result.expect_err("DPAPI-down add aborts"),
             refresh_result.expect_err("DPAPI-down refresh aborts"),
         ] {
-            // Ticket A2: crypto failures are `Crypto`, never `Sql`, with an
-            // honest message (no "database error" mislabel).
             assert!(
                 matches!(error, StoreError::Crypto { .. }),
                 "distinct crypto variant, got {error:?}"
@@ -14800,9 +12818,6 @@ mod tests {
         );
     }
 
-    /// Ticket 48 (US-60): a foreign DPAPI blob (sealed under another
-    /// profile) fails strict reads loudly, quarantines on tolerant reads
-    /// instead of poisoning the list, and is skipped (named) by export.
     #[test]
     fn t48_foreign_blob_reads_quarantine() {
         use base64::Engine as _;
@@ -14846,8 +12861,6 @@ mod tests {
         assert_eq!(skipped, vec![bad_id], "export names the skip");
     }
 
-    /// Ticket 48 (US-65): a corrupt sync baseline fails the refresh loudly
-    /// (never a silent revert, never a guessed compare); rows stay intact.
     #[test]
     fn t48_refresh_corrupt_baseline_fails_loud() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14894,10 +12907,6 @@ mod tests {
             .expect("seed row saves")
     }
 
-    /// Ticket 48 (US-65): preset attach → generate (rules merge ahead of
-    /// the isolation rule) → delete paths → deleted id refused at
-    /// attach-time → cross-DB-style dangling reference swept by the
-    /// orphan banner path, generation honest again afterwards.
     #[test]
     fn t48_preset_attach_generate_deleted_id_integration() {
         use crate::engine::{generate_with_presets, inbound_tag, outbound_tag};
@@ -14950,8 +12959,7 @@ mod tests {
             ),
             "deleted id refused at attach-time"
         );
-        // Cross-DB-style dangling reference (restore races): the orphan
-        // scan names it, the sweep clears it, generation is honest again.
+
         store
             .conn
             .execute(
@@ -14971,8 +12979,6 @@ mod tests {
         generate_with_presets(&rows, &map).expect("swept set generates");
     }
 
-    /// Ticket 01: appearance defaults dark, round-trips all three values,
-    /// and rejects junk (unset/corrupt reads dark, bad writes fail loudly).
     #[test]
     fn appearance_defaults_dark_and_round_trips() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -14991,8 +12997,6 @@ mod tests {
         assert_eq!(store.appearance(), "dark", "corrupt reads dark");
     }
 
-    /// Ticket 38: restore opt-in defaults off and round-trips (explicit
-    /// checkbox only — nothing enables it silently).
     #[test]
     fn restore_running_defaults_off_and_round_trips() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -15003,9 +13007,6 @@ mod tests {
         assert!(!store.restore_running(), "opt-out reads back");
     }
 
-    /// Ticket 10 (US-30): skip-delete-confirm defaults to asking and
-    /// round-trips (explicit Settings switch only — delete paths never
-    /// flip it; corrupt reads ask).
     #[test]
     fn t10_skip_delete_confirm_defaults_off_and_round_trips() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -15020,8 +13021,6 @@ mod tests {
         assert!(!store.skip_delete_confirm(), "corrupt reads ask");
     }
 
-    /// Ticket 10 (US-26): column widths default, persist per column,
-    /// clamp strays, reject bad indexes, and reset to defaults.
     #[test]
     fn t10_conn_column_widths_persist_clamp_and_reset() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -15067,9 +13066,6 @@ mod tests {
         );
     }
 
-    /// Ticket 10 (US-22): every period summarizes the same stored totals
-    /// (cumulative — per-period history is phase-2); per-exit bars from
-    /// the same map always match the summary.
     #[test]
     fn t10_traffic_period_summary_matches_stored_totals() {
         let mut totals = std::collections::HashMap::new();
@@ -15087,9 +13083,6 @@ mod tests {
         );
     }
 
-    /// Ticket 38: running-set snapshot round-trips; missing reads empty;
-    /// corrupt JSON reads empty (never a crash, never a guessed row).
-    /// Ticket 40: saves filter to known ids (ghosts never persist).
     #[test]
     fn running_snapshot_round_trips_and_fails_empty() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -15097,7 +13090,7 @@ mod tests {
             store.load_running_snapshot().is_empty(),
             "missing reads empty"
         );
-        // Ghost ids filter to empty (never persist unknown rows).
+
         store
             .save_running_snapshot(&["3".to_string(), "7".to_string()])
             .expect("snapshot writes");
@@ -15105,7 +13098,7 @@ mod tests {
             store.load_running_snapshot().is_empty(),
             "unknown ids filter to empty"
         );
-        // Known ids round-trip.
+
         let row = store
             .add(NewConfig {
                 name: "R".to_string(),
@@ -15133,7 +13126,6 @@ mod tests {
         );
     }
 
-    /// Ticket 38: meta upserts (same key twice keeps the latest).
     #[test]
     fn meta_upserts() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -15146,10 +13138,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 40: Store v5 foundation + integrity hardening (RED) --------
-
-    /// v4 fixture migrates idempotently to v5 with zero loss; fresh and
-    /// migrated converge per drift check.
     #[test]
     fn t40_v4_to_v5_migrates_idempotently() {
         let dir = std::env::temp_dir().join(format!(
@@ -15163,7 +13151,6 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir works");
         let v4_path = dir.join("v4.db");
         {
-            // Build a v4-shaped DB by hand (no v5 columns, version 4).
             let conn = rusqlite::Connection::open(&v4_path).expect("v4 file opens");
             conn.execute_batch(
                 "CREATE TABLE proxy_configs (
@@ -15199,7 +13186,7 @@ mod tests {
                  PRAGMA user_version = 4;",
             )
             .expect("v4 ddl works");
-            // Seed one row/sub/preset/traffic with DPAPI-sealed params (v4 already seals).
+
             let sealed = crate::dpapi::seal_params(
                 r#"{"server":"198.51.100.9","server_port":8388,"method":"aes-128-gcm","password":"p"}"#,
             )
@@ -15232,11 +13219,11 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version reads");
         assert_eq!(version, Store::SCHEMA_VERSION, "migrated fully");
-        // interval_secs defaults 86400.
+
         let subs = store.list_subscriptions().expect("subs list");
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].interval_secs, 86_400, "default interval");
-        // The v4 plaintext subscription URL sealed at rest, reads back plain.
+
         let raw_url: String = store
             .conn
             .query_row("SELECT url FROM subscriptions", [], |r| r.get(0))
@@ -15249,11 +13236,11 @@ mod tests {
             subs[0].url, "https://example.com/a.txt",
             "reads decrypt transparently"
         );
-        // Zero data loss.
+
         let rows = store.list().expect("rows list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "V4Row");
-        // Reopen is idempotent.
+
         drop(store);
         let store2 = Store::open_file(&v4_path).expect("reopen works");
         let version2: i64 = store2
@@ -15261,7 +13248,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version reads");
         assert_eq!(version2, Store::SCHEMA_VERSION);
-        // Fresh and migrated converge: same v5 columns present.
+
         let fresh = Store::open_in_memory().expect("fresh opens");
         for (table, column) in [
             ("subscriptions", "interval_secs"),
@@ -15279,7 +13266,7 @@ mod tests {
                 "migrated has {table}.{column}"
             );
         }
-        // health_history table + index exist on both.
+
         for s in [&fresh, &store2] {
             let tbl: i64 = s
                 .conn
@@ -15294,8 +13281,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// One corrupt params blob quarantines; good rows load with banner ids;
-    /// export skips-or-flags; strict writes still reject.
     #[test]
     fn t40_corrupt_row_quarantines() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15309,7 +13294,7 @@ mod tests {
                 port: String::new(),
             })
             .expect("good seeds");
-        // Corrupt the second row's params directly (foreign blob, bad base64).
+
         let bad_id: i64 = {
             store
                 .conn
@@ -15322,26 +13307,25 @@ mod tests {
             store.conn.last_insert_rowid()
         };
         let bad_id_str = bad_id.to_string();
-        // Strict list fails loudly.
+
         assert!(store.list().is_err(), "strict list fails on corrupt row");
-        // Tolerant list loads good + names quarantined.
+
         let (rows, quarantined) = store.list_with_quarantine().expect("tolerant lists");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, good.id);
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].id, bad_id_str);
-        // Tolerant export skips bad and flags ids.
+
         let (payload, skipped) = store
             .export_library_json_with_quarantine()
             .expect("tolerant export works");
         assert_eq!(skipped, vec![bad_id_str.clone()]);
         assert!(payload.contains("Good"), "good row exported");
         assert!(!payload.contains("\"Bad\""), "bad row skipped");
-        // Single-row strict read still rejects.
+
         assert!(store.get(&bad_id_str).is_err(), "strict get rejects");
     }
 
-    /// Batched traffic: one tx per tick, saturating, unknown ids skipped.
     #[test]
     fn t40_traffic_batch_is_atomic_and_saturating() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15375,7 +13359,7 @@ mod tests {
         assert_eq!(updated, 2, "unknown ids skipped, 2 updated");
         let totals = store.traffic_totals().expect("totals read");
         assert_eq!(totals.get(&a.id), Some(&(100, 50)));
-        // Saturating at i64::MAX.
+
         store
             .conn
             .execute(
@@ -15394,7 +13378,6 @@ mod tests {
         );
     }
 
-    /// URL-keyed tombstones: delete survives remove + re-add same URL.
     #[test]
     fn t40_tombstone_url_keyed_survives_resubscribe() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15416,9 +13399,9 @@ mod tests {
             .expect("victim")
             .clone();
         assert!(store.remove(&victim.id).expect("delete works"));
-        // Remove the subscription entirely (old code dropped tombstones).
+
         assert!(store.remove_subscription(&sub.id).expect("unsub works"));
-        // Re-add the SAME URL (new id) and refresh with both members again.
+
         let sub2 = store
             .add_subscription("S2", "https://example.com/feed.txt", "g", true)
             .expect("re-add works");
@@ -15434,7 +13417,6 @@ mod tests {
         assert_eq!(rows[0].name, "Two");
     }
 
-    /// Dangling preset attach refuses loudly in-tx; orphan sweep finds it.
     #[test]
     fn t40_preset_attach_revalidated_and_orphan_sweep() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15448,7 +13430,7 @@ mod tests {
                 port: String::new(),
             })
             .expect("row seeds");
-        // Ghost preset refuses.
+
         assert!(
             matches!(
                 store.set_config_preset(&row.id, Some("9999")),
@@ -15456,7 +13438,7 @@ mod tests {
             ),
             "dangling attach refuses"
         );
-        // Plant a dangling reference behind the API (simulates cross-DB restore).
+
         store
             .conn
             .execute(
@@ -15473,7 +13455,6 @@ mod tests {
         assert_eq!(back.preset_id, None);
     }
 
-    /// Snapshot saves filter to known ids; read-only surfaces errors.
     #[test]
     fn t40_snapshot_filters_unknown_ids() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15491,7 +13472,7 @@ mod tests {
             .save_running_snapshot(&[row.id.clone(), "9999".to_string()])
             .expect("snapshot writes");
         assert_eq!(store.load_running_snapshot(), vec![row.id.clone()]);
-        // Read-only disk surfaces errors instead of silent loss.
+
         store.set_query_only_for_test().expect("readonly sets");
         assert!(
             store
@@ -15501,7 +13482,6 @@ mod tests {
         );
     }
 
-    /// Health history appends per round with retention; bad kinds rejected.
     #[test]
     fn t40_health_history_appends_and_prunes() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15533,9 +13513,7 @@ mod tests {
                 },
             ])
             .expect("append works");
-        // latest-fast-path untouched: snapshots still round-trip separately.
-        // Note: save_health_snapshots also appends to history (one tx per
-        // probe round), so history holds 2 appended + 1 snapshot = 3.
+
         store
             .save_health_snapshot(&HealthSnapshot {
                 config_id: row.id.clone(),
@@ -15549,7 +13527,7 @@ mod tests {
             .load_health_history(&row.id, None)
             .expect("history loads");
         assert_eq!(hist.len(), 3);
-        // Retention: prune everything before 1500 in one tx.
+
         let pruned = store
             .prune_health_history_before(1_500)
             .expect("prune works");
@@ -15559,7 +13537,7 @@ mod tests {
             .expect("history loads");
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0].at, 2_000);
-        // Validation: latency XOR error, kind allow-list.
+
         assert!(
             store
                 .append_health_history(&[HealthHistoryEntry {
@@ -15574,8 +13552,6 @@ mod tests {
         );
     }
 
-    /// Ticket 45: per-sub interval is honored by `due_for_refresh_for` and
-    /// rows expose `last_refresh_at` for display.
     #[test]
     fn t45_sub_interval_honored_by_due() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15585,7 +13561,7 @@ mod tests {
         assert_eq!(sub.interval_secs, DEFAULT_AUTO_REFRESH_SECS);
         assert_eq!(sub.last_refresh_at, None);
         let now = 1_700_000_000;
-        // A 1h interval set on the row is honored: fresh stamp → not due.
+
         let hourly = store
             .set_subscription_interval(&sub.id, 3_600)
             .expect("interval sets");
@@ -15603,15 +13579,13 @@ mod tests {
             ..hourly
         };
         assert!(due_for_refresh_for(&stale, now), "stale hourly sub due");
-        // Unknown ids never silently succeed.
+
         assert!(
             store.set_subscription_interval("9999", 60).is_err(),
             "unknown id fails loudly"
         );
     }
 
-    /// Ticket 45: the global auto-refresh kill-switch defaults on (unset
-    /// means on) and persists off across reads.
     #[test]
     fn t45_global_kill_switch_defaults_on_and_persists() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15635,8 +13609,6 @@ mod tests {
         );
     }
 
-    /// Ticket 45: usage reset zeroes both counters; unknown ids are
-    /// `NotFound`, never a silent no-op.
     #[test]
     fn t45_reset_traffic_zeroes_counters() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15662,9 +13634,6 @@ mod tests {
         );
     }
 
-    /// Ticket 45: the 30d retention window keeps recent history and prunes
-    /// old samples in one tx; the latest-snapshot fast path is a separate
-    /// table and never pays the history scan.
     #[test]
     fn t45_history_retention_window_keeps_recent() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15700,8 +13669,7 @@ mod tests {
             .expect("history loads");
         assert_eq!(kept.len(), 2, "10d + now samples kept");
         assert!(kept.iter().all(|entry| entry.at >= now - 30 * day));
-        // Latest-fast-path reads only `health_snapshots` (no history scan):
-        // a snapshot round-trips while history holds rows.
+
         store
             .save_health_snapshot(&HealthSnapshot {
                 config_id: row.id.clone(),
@@ -15716,8 +13684,6 @@ mod tests {
         assert_eq!(snaps[0].config_id, row.id);
     }
 
-    /// Ticket 45: logs leave through the export-path pattern — a stable file
-    /// name beside the library.
     #[test]
     fn t45_logs_path_pattern() {
         let path = Store::default_logs_path();
@@ -15728,7 +13694,6 @@ mod tests {
         );
     }
 
-    /// Export is full-fidelity: presets + linkage by name + traffic + meta.
     #[test]
     fn t40_export_full_fidelity_round_trip() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15761,7 +13726,7 @@ mod tests {
         let payload = store.export_library_json().expect("export works");
         assert!(payload.contains("\"route_presets\""), "presets exported");
         assert!(payload.contains("\"traffic_rx\""), "traffic exported");
-        // Restore elsewhere rebuilds linkage by NAME (ids differ across DBs).
+
         let mut other = Store::open_in_memory().expect("other opens");
         let outcome = other.restore_library_json(&payload).expect("restore works");
         assert_eq!(outcome.configs, 1);
@@ -15781,7 +13746,6 @@ mod tests {
         assert_eq!(other.load_running_snapshot(), vec![rows[0].id.clone()]);
     }
 
-    /// Per-sub interval persists; due check honors it.
     #[test]
     fn t40_per_sub_interval_honored() {
         let mut store = Store::open_in_memory().expect("in-memory opens");
@@ -15804,7 +13768,7 @@ mod tests {
             .get_subscription(&sub.id)
             .expect("get works")
             .expect("kept");
-        // Refresh with empty body errors (keeps last-good); stamp manually instead.
+
         let _ = back;
         let due_sub = Subscription {
             interval_secs: 3_600,
@@ -15822,7 +13786,6 @@ mod tests {
         );
     }
 
-    /// Corrupt file is quarantined aside, never silent in-memory loss.
     #[test]
     fn t40_corrupt_file_quarantined() {
         let dir = std::env::temp_dir().join(format!(
@@ -15845,7 +13808,7 @@ mod tests {
             text.contains("corrupt") || text.contains("integrity"),
             "loud guidance, got {text}"
         );
-        // Bad file preserved aside.
+
         let kept: Vec<_> = std::fs::read_dir(&dir)
             .expect("dir reads")
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
@@ -15855,7 +13818,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Restore takes a timestamped backup before any wipe (file path).
     #[test]
     fn t40_restore_takes_backup_before_wipe() {
         let dir = std::env::temp_dir().join(format!(
@@ -15884,7 +13846,7 @@ mod tests {
         };
         let backup = Store::backup_db_file(&path, now_unix()).expect("backup works");
         assert!(backup.exists(), "timestamped backup exists");
-        // Restoring an empty payload over the live file keeps a backup.
+
         let empty = r#"{"outbounds":[],"library":[],"subscriptions":[],"tombstones":[],"route_presets":[],"meta":{}}"#;
         let (_outcome, bak) =
             Store::restore_library_file(&path, empty, now_unix()).expect("file restore works");
@@ -15895,13 +13857,11 @@ mod tests {
             store.list().expect("list works").is_empty(),
             "restored empty"
         );
-        // The pre-restore backup still holds the exported row.
+
         let _ = (payload, backup);
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Export refuses the live database path (JSON bytes must never
-    /// overwrite the library file).
     #[test]
     fn export_refuses_live_db_path() {
         let dir = std::env::temp_dir().join(format!(
@@ -15927,8 +13887,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Edit-to-auto reuses the row's own port (never burns a fresh port
-    /// per edit toward exhaustion).
     #[test]
     fn edit_to_auto_keeps_own_port() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -15950,8 +13908,6 @@ mod tests {
         );
     }
 
-    /// `route_presets: null` preserves live presets like a missing section
-    /// (only an explicit array — even empty — wipes first).
     #[test]
     fn restore_null_presets_preserves_live() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -15977,8 +13933,6 @@ mod tests {
         );
     }
 
-    /// Restoring with no live file succeeds with no backup (never a phantom
-    /// path to a file that was never written).
     #[test]
     fn restore_without_live_file_returns_no_backup() {
         let dir = std::env::temp_dir().join(format!(
@@ -16002,8 +13956,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Export skips a row whose sync baseline no longer unseals (logged +
-    /// quarantined) instead of aborting the whole export.
     #[test]
     fn export_skips_row_with_bad_synced_params() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16036,7 +13988,6 @@ mod tests {
         let _ = quarantine_payload;
     }
 
-    /// Group rename/move/delete trim consistently (`" g1 "` is `"g1"`).
     #[test]
     fn group_ops_trim_consistently() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16056,7 +14007,6 @@ mod tests {
         );
     }
 
-    /// DPAPI-down migration fails loudly, version stays, retry succeeds.
     #[test]
     fn t40_dpapi_down_migration_fails_loud_version_stays() {
         let dir = std::env::temp_dir().join(format!(
@@ -16123,7 +14073,7 @@ mod tests {
             version < Store::SCHEMA_VERSION,
             "version stays, next open retries (got {version})"
         );
-        // Retry with DPAPI up migrates fully.
+
         let store = Store::open_file(&path).expect("retry works");
         let version: i64 = store
             .conn
@@ -16132,7 +14082,7 @@ mod tests {
         assert_eq!(version, Store::SCHEMA_VERSION);
         std::fs::remove_dir_all(&dir).ok();
     }
-    /// Ticket 43: the word `auto` (any case) means auto-assign, like blank.
+
     #[test]
     fn port_field_auto_word_means_auto_assign() {
         assert_eq!(super::parse_port_field("").expect("blank ok"), None);
@@ -16148,7 +14098,6 @@ mod tests {
         );
     }
 
-    /// Ticket 43: global test-URL override round-trips; empty reads as unset.
     #[test]
     fn test_url_global_round_trips() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16164,7 +14113,6 @@ mod tests {
         assert_eq!(store.test_url(), None, "clear returns to default");
     }
 
-    /// Ticket 43: per-row test-URL override round-trips independently.
     #[test]
     fn test_url_row_override_round_trips() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16181,7 +14129,6 @@ mod tests {
         assert_eq!(store.row_test_url(&row.id), None, "clear returns to global");
     }
 
-    /// Ticket 43: per-row traffic reset zeroes one row; clear-all zeroes all.
     #[test]
     fn traffic_reset_and_clear_all() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16203,7 +14150,6 @@ mod tests {
         assert_eq!(totals.get(&beta.id), Some(&(0, 0)), "beta zeroed");
     }
 
-    /// Ticket 43: preset rename validates + keeps rules; duplicates fail.
     #[test]
     fn preset_rename_validates_and_keeps_rules() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16231,7 +14177,6 @@ mod tests {
         );
     }
 
-    /// Ticket 43: the running-remove confirm promises stop-first.
     #[test]
     fn delete_running_confirm_promises_stop_first() {
         let stopped = super::delete_confirm_text("Work");
@@ -16247,7 +14192,6 @@ mod tests {
         );
     }
 
-    /// Ticket 43: clearing health snapshots empties the table.
     #[test]
     fn clear_health_snapshots_empties() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16278,7 +14222,6 @@ mod tests {
         );
     }
 
-    /// Port field trims padding and reports the literal 1-65535 range.
     #[test]
     fn port_field_trims_and_reports_literal_range() {
         assert_eq!(

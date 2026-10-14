@@ -1,32 +1,11 @@
-//! Ticket 38: tray presence + opt-in autostart + session restore.
-//!
-//! The tray icon comes from `assets/icon.ico` (no new art): `build.rs`
-//! decodes the preferred PNG entry to RGBA and emits
-//! `OUT_DIR/tray_icon_rgba.rs`, included below for `tray-icon`'s
-//! `Icon::from_rgba` (its only icon constructor).
-//!
-//! Window hide/restore goes through the native `HWND` (`ShowWindow`
-//! `SW_HIDE`/`SW_SHOW`) because GPUI exposes only minimize/activate —
-//! minimizing leaves a taskbar button, which is not a hide. The `HWND`
-//! comes from the GPUI `Window` via `raw-window-handle` on the main
-//! thread, so the engine (and its endpoints) is never touched: hiding is
-//! purely windowing, closing never kills proxies.
-//!
-//! Autostart writes `HKCU\...\Run` ONLY from the explicit Settings
-//! checkbox ([`set_autostart_enabled`]); every helper takes an explicit
-//! key path so tests use a temp key, never the real Run key.
-
 include!(concat!(env!("OUT_DIR"), "/tray_icon_rgba.rs"));
 
 use crate::store::ProxyConfig;
 
-/// Tray tooltip: the app name plus the live running count.
 pub fn tray_tooltip(running: usize) -> String {
     format!("ManyProxy · {running} running")
 }
 
-/// Menu item ids for the tray menu (Show / Select exit / Select preset /
-/// Start all / Stop all / Open config folder / Quit).
 pub mod menu_id {
     pub const SHOW: &str = "tray-show";
     pub const SELECT_EXIT: &str = "tray-select-exit";
@@ -37,24 +16,20 @@ pub mod menu_id {
     pub const QUIT: &str = "tray-quit";
 }
 
-/// Actions behind the tray menu (and the left-click toggle, which is Show).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     Show,
-    /// Ticket 10 (US-30): show the window and open the preset picker for
-    /// the selected row (the ROUTING chooser twin — tray mirrors the shell).
+
     SelectExit,
-    /// Ticket 10 (US-30): show the window and open the presets manager.
+
     SelectPreset,
     StartAll,
     StopAll,
-    /// Ticket 10 (US-30): show the window and copy the config folder path
-    /// (copy, never a shell-out — the shell never launches an explorer).
+
     OpenConfig,
     Quit,
 }
 
-/// Map a menu item id to its action (`None` for foreign ids).
 pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
     match id {
         menu_id::SHOW => Some(TrayAction::Show),
@@ -68,7 +43,6 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
     }
 }
 
-/// The menu item id for an action (inverse of [`action_for_menu_id`]).
 pub fn menu_id_for_action(action: TrayAction) -> &'static str {
     match action {
         TrayAction::Show => menu_id::SHOW,
@@ -81,10 +55,6 @@ pub fn menu_id_for_action(action: TrayAction) -> &'static str {
     }
 }
 
-/// Ticket 10 (US-30): the config folder behind the tray OpenConfig action
-/// and the manager share rows — the data folder's parent (the database
-/// path minus its file name; `MANYPROXY_DB` overrides honored through
-/// [`crate::store::Store::default_path`]).
 pub fn config_folder() -> String {
     let path = crate::store::Store::default_path();
     path.parent()
@@ -93,43 +63,28 @@ pub fn config_folder() -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Value name of the autostart entry.
 pub const AUTOSTART_VALUE_NAME: &str = "ManyProxy";
 
-/// Real Run key path (never used by tests).
 pub const AUTOSTART_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-/// Flag appended to the autostart command so a login launch starts hidden
-/// in the tray instead of popping a window (honored in `main` via
-/// [`launched_minimized`]).
 pub const AUTOSTART_MINIMIZED_FLAG: &str = "--tray";
 
-/// Quoted current-exe command for the Run value (`None` when the exe path
-/// is unknown — the checkbox then reports the failure instead of writing
-/// a broken value). Carries [`AUTOSTART_MINIMIZED_FLAG`] so login launches
-/// start hidden.
 pub fn autostart_command() -> Option<String> {
     std::env::current_exe()
         .ok()
         .map(|path| format!("\"{}\" {AUTOSTART_MINIMIZED_FLAG}", path.display()))
 }
 
-/// Bare quoted current-exe command (pre-flag form). Only used to recognize
-/// a legacy autostart value as on — new writes always carry the flag.
 fn autostart_command_legacy() -> Option<String> {
     std::env::current_exe()
         .ok()
         .map(|path| format!("\"{}\"", path.display()))
 }
 
-/// True when this process was launched from the autostart entry (start
-/// hidden in the tray instead of showing a window).
 pub fn launched_minimized() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_MINIMIZED_FLAG)
 }
 
-/// Read the autostart command stored under `key_path` (`None` when absent
-/// or unreadable — absent and broken both read as off).
 #[cfg(windows)]
 pub fn read_autostart_at(key_path: &str) -> Option<String> {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -146,7 +101,6 @@ pub fn read_autostart_at(_key_path: &str) -> Option<String> {
     None
 }
 
-/// Write the autostart command under `key_path`.
 #[cfg(windows)]
 pub fn set_autostart_at(key_path: &str, command: &str) -> Result<(), String> {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -163,30 +117,24 @@ pub fn set_autostart_at(_key_path: &str, _command: &str) -> Result<(), String> {
     Err("autostart is Windows-only".to_string())
 }
 
-/// Remove the autostart value under `key_path` (absent counts as removed).
 #[cfg(windows)]
 pub fn clear_autostart_at(key_path: &str) -> Result<(), String> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
     let root = RegKey::predef(HKEY_CURRENT_USER);
-    // Read + write access: the existence check reads, the delete writes.
-    // A plain `open_subkey` (read-only) denies the delete (os error 5).
+
     let key = match root.open_subkey_with_flags(key_path, KEY_READ | KEY_WRITE) {
         Ok(key) => key,
-        // No key means no value — already off.
+
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("cannot open autostart key ({error})")),
     };
     match key.get_value::<String, _>(AUTOSTART_VALUE_NAME) {
-        // No value means already off (checked first so a missing value is
-        // never an error, whatever the OS reports on delete).
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => key
             .delete_value(AUTOSTART_VALUE_NAME)
             .map_err(|error| format!("cannot clear autostart value ({error})")),
-        // Corrupt value type (non-string data under our value name) or any
-        // other read failure: the value is ours, so delete it anyway —
-        // removal must never get stuck on unreadable data.
+
         Err(_) => key
             .delete_value(AUTOSTART_VALUE_NAME)
             .map_err(|error| format!("cannot clear autostart value ({error})")),
@@ -198,10 +146,6 @@ pub fn clear_autostart_at(_key_path: &str) -> Result<(), String> {
     Err("autostart is Windows-only".to_string())
 }
 
-/// True when the real Run value equals this exe's command (a stale value
-/// from a moved exe reads as off, never as on). A legacy pre-flag value
-/// for this same exe also reads as on (re-enable rewrites it with the
-/// flag); anything else is off.
 pub fn autostart_enabled() -> bool {
     autostart_value_is_on(read_autostart_at(AUTOSTART_RUN_KEY).as_deref())
 }
@@ -215,9 +159,6 @@ fn autostart_value_is_on(stored: Option<&str>) -> bool {
     }
 }
 
-/// The stored command's target exe path (`None` when the value is absent
-/// or unparseable). The value is ours (`AUTOSTART_VALUE_NAME`); the path
-/// is the quoted first token with any launch flag stripped.
 fn autostart_target_exe(command: &str) -> Option<String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -235,11 +176,6 @@ fn autostart_target_exe(command: &str) -> Option<String> {
     }
 }
 
-/// Remove the autostart value under `key_path` when its target exe no
-/// longer exists (moved/uninstalled copy — a dead entry that would
-/// otherwise linger in Run forever). Unparseable values are removed too
-/// (the value is ours and names nothing runnable — fail-closed to off).
-/// Returns true when a dead entry was removed.
 #[cfg(windows)]
 pub fn clear_dead_autostart_target_at(key_path: &str) -> bool {
     let Some(stored) = read_autostart_at(key_path) else {
@@ -257,21 +193,16 @@ pub fn clear_dead_autostart_target_at(_key_path: &str) -> bool {
     false
 }
 
-/// Startup cleanup of a dead autostart entry under the real Run key
-/// (best-effort, never loud — see [`clear_dead_autostart_target_at`]).
 pub fn clear_dead_autostart_target() -> bool {
     clear_dead_autostart_target_at(AUTOSTART_RUN_KEY)
 }
 
-/// The explicit opt-in behind the Settings checkbox: `true` writes the
-/// real Run value, `false` removes it. The ONLY writer of the real key.
 pub fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
         let command = autostart_command()
             .ok_or_else(|| "cannot determine the app path for autostart".to_string())?;
         set_autostart_at(AUTOSTART_RUN_KEY, &command)?;
-        // Read back: a write that does not stick is a loud failure, never
-        // a checkbox that lies.
+
         if read_autostart_at(AUTOSTART_RUN_KEY).as_deref() == Some(command.as_str()) {
             Ok(())
         } else {
@@ -282,9 +213,6 @@ pub fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
     }
 }
 
-/// Split a restore snapshot into rows that start immediately (loopback
-/// binds) and rows that stay behind the LAN confirm gate. Unknown ids
-/// (deleted rows) are dropped. Library order is preserved in both arms.
 pub fn partition_restore(
     rows: &[ProxyConfig],
     snapshot: &[String],
@@ -305,36 +233,28 @@ pub fn partition_restore(
     (now, gated)
 }
 
-/// Native window hide/show through the `HWND` (see module docs).
-/// `false` when the handle is null, stale, or the end state did not land.
 #[cfg(windows)]
 pub fn hide_window_handle(hwnd: isize) -> bool {
     if hwnd == 0 {
         return false;
     }
-    // SAFETY: `IsWindow`/`ShowWindow`/`IsWindowVisible` on an `HWND` are
-    // synchronous and never dereference our memory; a stale handle fails
-    // inside the OS without touching us. Called on the main thread only.
+
     unsafe {
-        // `ShowWindow` alone no-ops on a stale handle while reading as
-        // applied — gate on `IsWindow` first.
         if native::IsWindow(hwnd) == 0 {
             return false;
         }
-        // `ShowWindow` reports the previous visibility (nonzero = was
-        // visible); the end-state check confirms the hide landed.
+
         let was_visible = native::ShowWindow(hwnd, native::SW_HIDE);
         was_visible != 0 || native::IsWindowVisible(hwnd) == 0
     }
 }
 
-/// Restore a hidden window through the `HWND` (see module docs).
 #[cfg(windows)]
 pub fn show_window_handle(hwnd: isize) -> bool {
     if hwnd == 0 {
         return false;
     }
-    // SAFETY: same contract as [`hide_window_handle`].
+
     unsafe {
         if native::IsWindow(hwnd) == 0 {
             return false;
@@ -344,8 +264,6 @@ pub fn show_window_handle(hwnd: isize) -> bool {
     }
 }
 
-/// Hand-rolled `user32` hide/show (two constants, three calls — the same
-/// minimal-FFI shape as `dpapi.rs`, no `windows`-crate weight).
 #[cfg(windows)]
 mod native {
     pub const SW_HIDE: i32 = 0;
@@ -369,14 +287,10 @@ pub fn show_window_handle(_hwnd: isize) -> bool {
     false
 }
 
-/// Extract the Win32 `HWND` behind a GPUI window (`None` off-Windows or
-/// when the handle is not a Win32 one). Main thread only, like every
-/// GPUI window call.
 #[cfg(windows)]
 pub fn hwnd_from_window(window: &gpui_kit::Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    // Fully qualified: `Window` also has an inherent `window_handle`
-    // returning GPUI's `AnyWindowHandle`; the trait gives the OS handle.
+
     match HasWindowHandle::window_handle(window) {
         Ok(handle) => match handle.as_raw() {
             RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
@@ -391,18 +305,11 @@ pub fn hwnd_from_window(_window: &gpui_kit::Window) -> Option<isize> {
     None
 }
 
-/// Live tray presence. Owns the `TrayIcon` (dropping it removes the icon
-/// via `NIM_DELETE`) and the menu behind it. Created and polled on the
-/// GPUI main thread only.
 pub struct TrayHandle {
     icon: tray_icon::TrayIcon,
 }
 
 impl TrayHandle {
-    /// Build the icon + Show/Start all/Stop all/Quit menu on the calling
-    /// (main) thread. Fails loudly when the shell refuses the icon — the
-    /// caller then keeps the pre-tray close-confirm instead of a dishonest
-    /// tray-less hide.
     pub fn build() -> Result<Self, String> {
         use tray_icon::{
             menu::{Menu, MenuItem},
@@ -438,8 +345,6 @@ impl TrayHandle {
         Ok(Self { icon })
     }
 
-    /// Refresh the `ManyProxy · N running` tooltip (best-effort: a tooltip
-    /// that does not stick never breaks serving).
     pub fn set_running(&self, running: usize) {
         let _ = self.icon.set_tooltip(Some(tray_tooltip(running)));
     }
@@ -465,27 +370,21 @@ mod tests {
         }
     }
 
-    /// Ticket 38: the build-decode icon is the 32x32 entry with a full
-    /// RGBA buffer (same asset as the exe icon, no new art).
     #[test]
     fn tray_icon_rgba_is_32x32() {
         assert_eq!((TRAY_ICON_WIDTH, TRAY_ICON_HEIGHT), (32, 32));
         assert_eq!(TRAY_ICON_RGBA.len(), 32 * 32 * 4);
-        // Non-trivial pixels: not all zeros, not all opaque white.
+
         assert!(TRAY_ICON_RGBA.iter().any(|byte| *byte != 0));
         assert!(TRAY_ICON_RGBA.iter().any(|byte| *byte != 255));
     }
 
-    /// Ticket 38: the tooltip names the app plus the live count.
     #[test]
     fn tooltip_carries_running_count() {
         assert_eq!(tray_tooltip(0), "ManyProxy · 0 running");
         assert_eq!(tray_tooltip(3), "ManyProxy · 3 running");
     }
 
-    /// Ticket 38: every menu id maps to exactly one action and back.
-    /// Ticket 10 (US-30): Select exit / Select preset / Open config folder
-    /// ride the same round-trip (tray mirrors the shell).
     #[test]
     fn menu_ids_round_trip() {
         for (id, action) in [
@@ -503,8 +402,6 @@ mod tests {
         assert_eq!(action_for_menu_id("foreign"), None);
     }
 
-    /// Ticket 10 (US-30): the config folder is the data folder's parent
-    /// (never empty — falls back to the full path).
     #[test]
     fn config_folder_is_parent_of_db_path() {
         let folder = config_folder();
@@ -516,8 +413,6 @@ mod tests {
         );
     }
 
-    /// Ticket 38: autostart round-trips on a temp key (never the real Run
-    /// key); absent reads as off; clearing an absent value still succeeds.
     #[test]
     fn autostart_round_trips_on_temp_key() {
         let key = format!(r"Software\ManyProxyTrayTest\{}", std::process::id());
@@ -530,7 +425,7 @@ mod tests {
         );
         clear_autostart_at(&key).expect("temp key clears");
         assert_eq!(read_autostart_at(&key), None);
-        // Best-effort cleanup of the temp key itself.
+
         #[cfg(windows)]
         {
             use winreg::enums::HKEY_CURRENT_USER;
@@ -539,8 +434,6 @@ mod tests {
         }
     }
 
-    /// Ticket 38: restore partition keeps loopback immediate, gates LAN,
-    /// drops deleted rows, and preserves library order.
     #[test]
     fn restore_partition_gates_lan() {
         let rows = vec![
@@ -560,16 +453,12 @@ mod tests {
         );
     }
 
-    /// Ticket 38: null handles never crash (headless-safe); there is no
-    /// window behind them so both report not-applied.
     #[test]
     fn null_handles_report_not_applied() {
         assert!(!hide_window_handle(0));
         assert!(!show_window_handle(0));
     }
 
-    /// Autostart command is the quoted current-exe path plus the hidden-start
-    /// flag (the exact value the Settings checkbox writes to the Run key).
     #[test]
     fn autostart_command_is_quoted_exe_path() {
         let command = autostart_command().expect("current exe is known");
@@ -578,13 +467,10 @@ mod tests {
             command,
             format!("\"{}\" {AUTOSTART_MINIMIZED_FLAG}", exe.display())
         );
-        // A normal launch never carries the flag.
+
         assert!(!launched_minimized(), "test harness did not pass --tray");
     }
 
-    /// A stale Run value (moved exe) never reads as on: it differs from
-    /// this exe's command, so the equality behind `autostart_enabled`
-    /// reports off.
     #[cfg(windows)]
     #[test]
     fn autostart_stale_value_reads_as_off() {
@@ -608,9 +494,6 @@ mod tests {
         }
     }
 
-    /// Null HWND plus tray build is headless-safe: null never applies,
-    /// build either yields an icon whose tooltip refresh never panics or
-    /// fails loudly with a tray cause.
     #[test]
     fn tray_build_and_null_hwnd_are_headless_safe() {
         assert!(!hide_window_handle(0));
@@ -631,8 +514,6 @@ mod tests {
         }
     }
 
-    /// The on/off predicate accepts the current flagged command and the
-    /// legacy bare-exe value; anything else (foreign path, absent) is off.
     #[test]
     fn autostart_on_predicate_accepts_current_and_legacy() {
         let command = autostart_command().expect("exe known");
@@ -645,8 +526,6 @@ mod tests {
         assert!(!autostart_value_is_on(None));
     }
 
-    /// Dead autostart targets clean up: a value pointing at a missing exe
-    /// is removed; a live target is kept; absent stays absent.
     #[cfg(windows)]
     #[test]
     fn dead_autostart_target_cleans_up() {
@@ -664,8 +543,6 @@ mod tests {
         let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&key);
     }
 
-    /// A corrupt (non-string) value under our name still clears instead of
-    /// failing on the read.
     #[cfg(windows)]
     #[test]
     fn corrupt_autostart_type_still_clears() {

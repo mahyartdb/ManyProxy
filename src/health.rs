@@ -1,32 +1,9 @@
-//! Ticket 06: per-config health, traffic stats, and sidecar logs.
-//!
-//! One [`HealthStore`] per window holds append-only [`HealthSample`]s (latest
-//! wins per row), accumulated [`TrafficStats`], and a [`LogStore`] of
-//! redacted [`LogRecord`]s tagged by config where possible.
-//!
-//! The measure seam is [`HealthProber`]: the real driver dials each config's
-//! own local endpoint (so a URL test can only ever exit via that config's
-//! egress), the fake driver scripts latencies/failures for tests. No test
-//! touches a real remote server. Ticket 08 flips Xray/custom/extra-core/
-//! chained rows on: they are probeable through their own endpoints exactly
-//! like stock rows (extra-core slot: active-profile tests only — the runner
-//! only ever probes running endpoints, never group bulk sets; there is no
-//! group-test path in v1). Ticket 07 flips AmneziaWG variants on: AWG rows
-//! are probeable through their own endpoints exactly like stock rows.
-//!
-//! Hard prohibitions: health checks never route through another config's
-//! egress (each probe dials its own `bind:port`); secrets never reach stored
-//! or displayed log lines ([`redact_secrets`] runs on every ingest).
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-/// Ticket 26: the fake prober crosses threads (health probes run on the
-/// background executor via `spawn_probe`), so its shared script state is
-/// `Arc<Mutex<…>>` instead of `Rc<RefCell<…>>`. The scripting API
-/// (`shared`, latencies, failures, deny-list, call log) is unchanged.
+
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -34,32 +11,24 @@ use std::time::{Duration, Instant};
 use crate::engine::{inbound_tag, outbound_tag};
 use crate::store::{now_unix, HealthSnapshot, ProxyConfig};
 
-/// Default URL-test target: plain `http` (the local mixed inbound serves an
-/// HTTP-proxy GET directly; `https` would need a CONNECT+TLS stack v1 does
-/// not carry) returning 204.
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
-/// Ticket 09 (throne-adoption): adopted batch-test values — at most 100
-/// rows per probe chunk, 200ms between chunks (progress cadence), 10-way
-/// overlap, 3000ms URL-test ceiling, 5000ms speedtest ceiling.
+
 pub const GROUP_TEST_BATCH_SIZE: usize = 100;
 pub const GROUP_TEST_POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub const GROUP_TEST_CONCURRENCY: usize = 10;
 pub const URL_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SPEED_TEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Ticket 36: host of the health-test URL — clash flows to this host are
-/// probes, never data-plane bytes (single source of truth derived from
-/// [`DEFAULT_TEST_URL`], never a second literal to drift).
+
 pub fn probe_host() -> String {
     split_http_url(DEFAULT_TEST_URL)
         .map(|(_, host)| host.to_string())
         .unwrap_or_default()
 }
-/// In-memory bounds (durable persistence defers to a later ticket).
+
 const MAX_SAMPLES: usize = 10_000;
 #[cfg_attr(not(test), allow(dead_code))]
 const MAX_LOG_RECORDS: usize = 5_000;
 
-/// What kind of measurement a sample holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthKind {
     UrlTest,
@@ -75,8 +44,6 @@ impl HealthKind {
     }
 }
 
-/// One measurement for one config (data-model `HealthSample`). Success has
-/// `latency_ms` set and `error` clear; failure is the reverse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthSample {
     pub config_id: String,
@@ -86,7 +53,6 @@ pub struct HealthSample {
     pub error: Option<String>,
 }
 
-/// Bytes moved by successful probes (accumulated per config).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProbeSuccess {
     pub latency_ms: u64,
@@ -94,33 +60,18 @@ pub struct ProbeSuccess {
     pub bytes_tx: u64,
 }
 
-/// One probe result: the append-only sample plus the success payload (if
-/// any) that feeds traffic counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestOutcome {
     pub sample: HealthSample,
     pub success: Option<ProbeSuccess>,
 }
 
-/// Mock-friendly measure seam. Every method receives the config's own local
-/// endpoint (`bind`/`port`); implementations must dial exactly that address
-/// so results are per-egress. Object-safe so the UI holds a boxed driver.
 pub trait HealthProber {
-    /// False for rows this driver cannot measure (extra-core/custom until
-    /// ticket 08). The runner records a named skip without calling the
-    /// probe methods.
-    /// Ticket 28: the permissive default stays — both in-tree drivers
-    /// override it, and it keeps future test doubles total.
     fn supports(&self, config: &ProxyConfig) -> bool {
         let _ = config;
         true
     }
-    /// GET `url` through the HTTP-proxy face of `bind:port`.
-    /// Ticket 47: `&self` (was `&mut self`) — probes run concurrently on
-    /// scoped threads behind [`test_all`]/[`ping_all`], so drivers share
-    /// through the reference (`RealHealthProber` is stateless; the fake
-    /// already synchronizes through `Arc<Mutex<…>>`). Outcomes (order,
-    /// content, per-egress routing) are unchanged.
+
     fn url_test(
         &self,
         config: &ProxyConfig,
@@ -128,14 +79,10 @@ pub trait HealthProber {
         port: u16,
         url: &str,
     ) -> Result<ProbeSuccess, String>;
-    /// Time one TCP dial to `bind:port` (endpoint liveness).
-    /// Ticket 47: `&self` like [`HealthProber::url_test`] (shared across
-    /// probe threads; semantics unchanged).
+
     fn tcp_ping(&self, config: &ProxyConfig, bind: &str, port: u16)
         -> Result<ProbeSuccess, String>;
-    /// Ticket 09 (throne-adoption): timed transfer through the endpoint
-    /// (`mode` + `timeout`). The default driver has no transfer stack, so
-    /// it reports unsupported (named per row, never silent).
+
     fn speed_test(
         &self,
         config: &ProxyConfig,
@@ -151,8 +98,7 @@ pub trait HealthProber {
             redact_secrets(&config.name)
         ))
     }
-    /// Ticket 09 (throne-adoption): fetch the egress IP through the
-    /// endpoint. Default: unsupported (named per row, never silent).
+
     fn out_ip(
         &self,
         config: &ProxyConfig,
@@ -168,14 +114,6 @@ pub trait HealthProber {
     }
 }
 
-/// Protocols measurable in this slice. Mirrors the ticket-05 standard set
-/// plus ticket-07 AmneziaWG variants plus ticket-08 Xray/custom/extra-core/
-/// chained rows plus ticket-27 SSH/AnyTLS/Noise natives (each probe still
-/// dials the row's own endpoint, so every row is measured through its own
-/// egress). Anything else (socks, naive, …) is a named skip until its owning
-/// ticket.
-/// Ticket 28: kept parallel to the engine/store/import tables — probeability
-/// is a measurement capability list, not a parse or routing taxonomy.
 pub fn is_probeable_protocol(protocol: &str) -> bool {
     matches!(
         protocol.trim().to_ascii_lowercase().as_str(),
@@ -221,9 +159,6 @@ pub fn is_probeable_protocol(protocol: &str) -> bool {
     )
 }
 
-/// Production driver: blocking TCP dials with a per-test timeout. Ticket 26:
-/// the blocking calls run on the background executor via
-/// `AppView::spawn_probe` — never on the UI thread.
 pub struct RealHealthProber {
     timeout: Duration,
 }
@@ -240,17 +175,6 @@ impl Default for RealHealthProber {
     }
 }
 
-/// Resolve a local endpoint for dialing. Wildcard binds (`0.0.0.0`/`::`)
-/// are served on loopback, so dial loopback instead of the unspecified
-/// address (which can never connect). Hostname binds resolve with a
-/// deadline (see [`resolve_endpoint_host`]).
-///
-/// Probes dial the row's own LOCAL endpoint only: a non-loopback result (a
-/// hostile bind or a rebinding hostname) is refused instead of dialed, so
-/// a health check can never steer traffic at a remote host. The egress
-/// under test is exercised through the proxy; the dial itself stays on
-/// loopback. Refusals name loopback so [`classify_health_cause`] reads
-/// them as local, never egress.
 fn endpoint_addr(bind: &str, port: u16, timeout: Duration) -> Result<SocketAddr, String> {
     let trimmed = bind.trim();
     let addr = if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
@@ -263,7 +187,7 @@ fn endpoint_addr(bind: &str, port: u16, timeout: Duration) -> Result<SocketAddr,
         } else {
             trimmed.to_string()
         };
-        // IPv6 literals need brackets in `ip:port` form.
+
         let socket = if host.contains(':') {
             format!("[{host}]:{port}")
         } else {
@@ -284,10 +208,6 @@ fn endpoint_addr(bind: &str, port: u16, timeout: Duration) -> Result<SocketAddr,
     Ok(addr)
 }
 
-/// Resolve `host:port` with a deadline. `to_socket_addrs` blocks on DNS
-/// with no deadline of its own, so the lookup runs on a detached thread
-/// and a late answer is dropped, never awaited — a hung resolver must
-/// never hang a probe round.
 fn resolve_endpoint_host(host: &str, port: u16, timeout: Duration) -> Option<SocketAddr> {
     let text = format!("{host}:{port}");
     let (tx, rx) = std::sync::mpsc::channel();
@@ -301,8 +221,6 @@ fn resolve_endpoint_host(host: &str, port: u16, timeout: Duration) -> Option<Soc
     rx.recv_timeout(timeout).ok().flatten()
 }
 
-/// Split `scheme://host/rest`. Errors never echo the URL (queries carry
-/// tokens).
 fn split_http_url(url: &str) -> Result<(&str, &str), String> {
     let (scheme, rest) = url
         .split_once("://")
@@ -349,9 +267,6 @@ impl HealthProber for RealHealthProber {
         let mut chunk = [0u8; 8192];
         let read_started = Instant::now();
         loop {
-            // Overall read deadline: per-read timeouts alone never bound a
-            // slow drip (one byte per timeout keeps the loop alive until
-            // the 64KB cap — hours, not seconds).
             let elapsed = read_started.elapsed();
             if elapsed >= self.timeout {
                 return Err(format!(
@@ -385,8 +300,7 @@ impl HealthProber for RealHealthProber {
             .nth(1)
             .and_then(|code| code.parse::<u16>().ok())
             .ok_or_else(|| format!("url test via {endpoint}: bad proxy response"))?;
-        // Only 2xx is success: a 3xx (captive portal, redirector) or any
-        // other status is not a working egress.
+
         if (200..300).contains(&code) {
             Ok(ProbeSuccess {
                 latency_ms: started.elapsed().as_millis() as u64,
@@ -464,10 +378,6 @@ impl HealthProber for RealHealthProber {
                 }
             }
             SpeedtestMode::Upload => {
-                // Fixed 256KB payload POSTed at the test URL; the rate
-                // counts bytes pushed through the egress. A target that
-                // refuses POST names itself in the outcome (honest dead,
-                // never a fabricated zero).
                 let payload = vec![b'M'; 256 * 1024];
                 let request = format!(
                     "POST {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: ManyProxy-health\r\nContent-Length: {}\r\n\r\n",
@@ -516,8 +426,7 @@ impl HealthProber for RealHealthProber {
         );
         let (_, body) = exchange(endpoint, &request, self.timeout, 4096).map_err(named)?;
         let text = String::from_utf8_lossy(&body);
-        // The body past the headers is the echo payload; a status line or
-        // HTML error page is never an IP.
+
         let candidate = text
             .split("\r\n\r\n")
             .nth(1)
@@ -530,8 +439,6 @@ impl HealthProber for RealHealthProber {
     }
 }
 
-/// Ticket 09: name a speedtest failure with its row (redacted like every
-/// other probe cause).
 fn named_speed_error(config: &ProxyConfig, cause: impl Into<String>) -> String {
     format!(
         "speed test failed for \"{}\": {}",
@@ -540,10 +447,6 @@ fn named_speed_error(config: &ProxyConfig, cause: impl Into<String>) -> String {
     )
 }
 
-/// Ticket 09: one HTTP exchange through `endpoint` — write `request`, read
-/// to close/deadline/`cap`. Returns the status code + full raw bytes.
-/// Overall-deadline bound like [`RealHealthProber::url_test`]: per-read
-/// timeouts alone never bound a slow drip.
 fn exchange(
     endpoint: SocketAddr,
     request: &str,
@@ -594,8 +497,6 @@ fn exchange(
     Ok((code, buf))
 }
 
-/// Ticket 09: write headers + payload, read the status line only (upload
-/// rate counts bytes sent, not the reply body).
 fn post_exchange(
     endpoint: SocketAddr,
     headers: &str,
@@ -653,20 +554,10 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
         .map(|pos| pos + 4)
 }
 
-/// Ticket 28: shared runner behind [`test_all`] and [`ping_all`] (one
-/// skip/probe/failure shape; only the kind, verb, and probe call differ).
-/// Ticket 47: shared through `&` (probes run concurrently).
 type ProbeFn = fn(&dyn HealthProber, &ProxyConfig, &str, u16, &str) -> Result<ProbeSuccess, String>;
 
-/// Ticket 47: max probe threads per round. Test-all on N rows overlaps at
-/// most this many blocking dials; outcomes still land in input order, so
-/// probe semantics (per-egress routing, skip/failure shapes) are unchanged.
-/// Ticket 09 (throne-adoption): adopted Throne value 10 (was 8) — kept as
-/// the alias of [`GROUP_TEST_CONCURRENCY`] so the bound cannot drift.
 pub const MAX_PROBE_CONCURRENCY: usize = GROUP_TEST_CONCURRENCY;
 
-/// Ticket 47: one probe of one config (the per-row body shared by the
-/// sequential and concurrent runners — one skip/probe/failure shape).
 fn run_one(
     config: &ProxyConfig,
     prober: &dyn HealthProber,
@@ -692,7 +583,7 @@ fn run_one(
             success: None,
         };
     }
-    // A panicking driver must fail its own row, never poison the round.
+
     let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         probe(prober, config, &config.bind_ip, config.port, url)
     }));
@@ -751,15 +642,6 @@ fn run_all(
         .collect()
 }
 
-/// Ticket 47: bounded concurrent runner — at most [`MAX_PROBE_CONCURRENCY`]
-/// workers pull row indices off an atomic counter (scoped threads, joined
-/// before return; no tasks leak past the round). Outcomes are re-sorted
-/// into input order, so callers observe exactly the sequential contract.
-/// `prober` is shared (`&(dyn HealthProber + Sync)`); drivers must be
-/// `Sync` (the real driver is stateless, the fake is `Arc<Mutex>`).
-/// Ticket 09 (throne-adoption): `stop` aborts the run — workers stop
-/// pulling new rows once set (in-flight rows still record, so every
-/// returned outcome carries latency or a named failure, never a blank).
 fn run_all_concurrent(
     configs: &[ProxyConfig],
     prober: &(dyn HealthProber + Sync),
@@ -788,7 +670,6 @@ fn run_all_concurrent_stoppable(
         return Vec::new();
     }
     if configs.len() == 1 {
-        // Single-row fast path: no thread overhead for one blocking dial.
         return run_all(configs, prober, kind, verb, probe, url);
     }
     let next = AtomicUsize::new(0);
@@ -805,9 +686,7 @@ fn run_all_concurrent_stoppable(
                     break;
                 };
                 let outcome = run_one(config, prober, kind, verb, probe, url);
-                // Poison-tolerant push: a panicking sibling already
-                // recovered above, but never let a poisoned slot abort the
-                // whole round — recover the guard and keep its results.
+
                 done.lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .push((index, outcome));
@@ -841,10 +720,6 @@ fn ping_probe(
     prober.tcp_ping(config, bind, port)
 }
 
-/// Run one URL test per config through each config's own endpoint. Order of
-/// the returned outcomes matches `configs`.
-/// Ticket 47: probes overlap (bounded [`MAX_PROBE_CONCURRENCY`]-way via
-/// [`test_all_concurrent`]) instead of serializing one 5s bound per row.
 pub fn test_all(
     configs: &[ProxyConfig],
     url: &str,
@@ -853,7 +728,6 @@ pub fn test_all(
     test_all_concurrent(configs, url, prober)
 }
 
-/// Ticket 47: the concurrent URL-test runner (also the `test_all` engine).
 pub fn test_all_concurrent(
     configs: &[ProxyConfig],
     url: &str,
@@ -869,13 +743,10 @@ pub fn test_all_concurrent(
     )
 }
 
-/// Time one TCP dial per config to its own endpoint.
-/// Ticket 47: bounded-concurrent like [`test_all`].
 pub fn ping_all(configs: &[ProxyConfig], prober: &(dyn HealthProber + Sync)) -> Vec<TestOutcome> {
     ping_all_concurrent(configs, prober)
 }
 
-/// Ticket 47: the concurrent TCP-ping runner (also the `ping_all` engine).
 pub fn ping_all_concurrent(
     configs: &[ProxyConfig],
     prober: &(dyn HealthProber + Sync),
@@ -890,9 +761,6 @@ pub fn ping_all_concurrent(
     )
 }
 
-/// Ticket 09 (throne-adoption): stoppable URL-test runner — the group-test
-/// engine. `stop` (see `Stop Testing`) halts new pulls; in-flight rows
-/// still record latency or a named failure.
 pub fn test_all_stoppable(
     configs: &[ProxyConfig],
     url: &str,
@@ -910,8 +778,6 @@ pub fn test_all_stoppable(
     )
 }
 
-/// Ticket 09 (throne-adoption): stoppable TCP-ping runner (group-ping engine).
-/// Test-only seam until a ping-group action ships.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn ping_all_stoppable(
     configs: &[ProxyConfig],
@@ -929,12 +795,6 @@ pub fn ping_all_stoppable(
     )
 }
 
-/// Ticket 09 (throne-adoption): one group's URL tests in
-/// [`GROUP_TEST_BATCH_SIZE`] chunks — `on_progress(done, total)` fires per
-/// chunk (including the last), [`GROUP_TEST_POLL_INTERVAL`] parks between
-/// chunks, and `stop` aborts before the next chunk (workers also stop
-/// pulling mid-chunk). Returned outcomes stay in input order; a stopped
-/// run returns the completed prefix only.
 pub fn test_group(
     configs: &[ProxyConfig],
     url: &str,
@@ -947,9 +807,6 @@ pub fn test_group(
     })
 }
 
-/// Ticket 09 (throne-adoption): one group's TCP pings, chunked like
-/// [`test_group`]. Test-only seam until a ping-group action ships (see
-/// `t09_ping_group_chunks_and_stops`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn ping_group(
     configs: &[ProxyConfig],
@@ -984,11 +841,6 @@ fn run_group(
     out
 }
 
-/// Ticket 09 (throne-adoption): one group's speedtests — SEQUENTIAL with
-/// stop checks between rows. Concurrent transfers would share the pipe
-/// and distort every rate, so the 10-way overlap stays on url/ping only.
-/// `on_progress(done, total)` fires per row. Unsupported rows record a
-/// named skip; a panicking driver fails its own row, never the run.
 pub fn speed_group(
     configs: &[ProxyConfig],
     url: &str,
@@ -1047,8 +899,6 @@ pub fn speed_group(
     out
 }
 
-/// Ticket 09 (throne-adoption): speedtest direction. Download reads a full
-/// response body through the endpoint; upload POSTs a fixed payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SpeedtestMode {
     #[default]
@@ -1064,9 +914,6 @@ impl SpeedtestMode {
         }
     }
 
-    /// Parse a mode label (`None` = the unknown position, never a silent
-    /// default — the UI only offers known labels anyway). Test-pinned seam
-    /// for the mode picker vocabulary.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_label(label: &str) -> Option<SpeedtestMode> {
         match label.trim().to_ascii_lowercase().as_str() {
@@ -1076,7 +923,6 @@ impl SpeedtestMode {
         }
     }
 
-    /// Cycle for the mode menu item (download → upload → download).
     pub fn next(self) -> SpeedtestMode {
         match self {
             SpeedtestMode::Download => SpeedtestMode::Upload,
@@ -1085,8 +931,6 @@ impl SpeedtestMode {
     }
 }
 
-/// Ticket 09 (throne-adoption): speedtest parameters — a mode plus a
-/// timeout (pinned default [`SPEED_TEST_TIMEOUT`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeedtestConfig {
     pub mode: SpeedtestMode,
@@ -1102,9 +946,6 @@ impl Default for SpeedtestConfig {
     }
 }
 
-/// Ticket 09 (throne-adoption): one speedtest result. `mbps` is set on
-/// measured success only; failures name the cause. Recorded via
-/// [`HealthStore::record_speed_sample`] — samples only, never traffic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeedtestOutcome {
     pub config_id: String,
@@ -1114,14 +955,10 @@ pub struct SpeedtestOutcome {
     pub error: Option<String>,
 }
 
-/// Ticket 09 (throne-adoption): megabits per second over `bytes` moved in
-/// `elapsed` (zero elapsed reads 0, never infinite).
 pub fn mbps_of(bytes: u64, elapsed: Duration) -> f64 {
     (bytes as f64 * 8.0) / elapsed.as_secs_f64().max(1e-9) / 1e6
 }
 
-/// Ticket 09 (throne-adoption): Throne speed result string — `12.4 Mbps`
-/// on measured success, the named failure otherwise.
 pub fn format_speed_result(outcome: &SpeedtestOutcome) -> String {
     match (outcome.mbps, outcome.error.as_deref()) {
         (Some(mbps), _) => format!("{} {mbps:.1} Mbps", outcome.mode.as_str()),
@@ -1130,26 +967,14 @@ pub fn format_speed_result(outcome: &SpeedtestOutcome) -> String {
     }
 }
 
-/// Ticket 09 (throne-adoption): default out-IP echo target (plain `http`
-/// like [`DEFAULT_TEST_URL`] — the local mixed inbound serves
-/// HTTP-proxy GET directly). User-initiated only, never background.
 pub const RESOLVE_IP_URL: &str = "http://api.ipify.org";
 
-/// Ticket 09 (throne-adoption): ceiling for one out-IP fetch and one
-/// domain resolution (user-initiated; detached-thread lookups never hang
-/// a probe round past this).
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Ticket 09 (throne-adoption): resolve a bare hostname to its first IP
-/// with a deadline (detached thread + drop, like
-/// [`resolve_endpoint_host`] — a hung resolver never hangs the caller).
-/// `None` on failure or timeout. Pure network, no loopback restriction:
-/// server hostnames are remote by definition.
 pub fn resolve_hostname(host: &str, timeout: Duration) -> Option<std::net::IpAddr> {
     resolve_endpoint_host(host.trim(), 80, timeout).map(|addr| addr.ip())
 }
 
-/// Liveness derived from the latest sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowState {
     Unknown,
@@ -1157,10 +982,6 @@ pub enum RowState {
     Dead,
 }
 
-/// Latest-sample view for one row (dead carries the named cause).
-/// Ticket 41: dead rows also carry the classified kind (DNS vs local vs
-/// egress) so health tells resolution failure apart from reachability
-/// failure without changing the displayed cause copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowHealth {
     pub state: RowState,
@@ -1169,7 +990,6 @@ pub struct RowHealth {
     pub cause_kind: Option<HealthCause>,
 }
 
-/// Accumulated traffic for one config.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrafficStats {
     pub rx_bytes: u64,
@@ -1177,7 +997,6 @@ pub struct TrafficStats {
     pub probes: u64,
 }
 
-/// Short human byte count (`0B`, `512B`, `1.2KB`, `3.0MB`).
 pub fn format_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
     let mut value = n as f64;
@@ -1193,7 +1012,6 @@ pub fn format_bytes(n: u64) -> String {
     }
 }
 
-/// Truncate display text to `limit` chars (dead causes can be long).
 pub fn truncate(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
@@ -1203,10 +1021,6 @@ pub fn truncate(text: &str, limit: usize) -> String {
     kept
 }
 
-/// Ticket 45: sparkline series from oldest-first `(at, latency)` history —
-/// the newest `limit` successful samples, oldest-first for the chart.
-/// Error samples never plot as zero (they are dropped); empty in means
-/// empty out (the detail pane shows a text fallback instead).
 pub fn sparkline_latencies(samples: &[(i64, Option<u64>)], limit: usize) -> Vec<u64> {
     let mut latencies: Vec<u64> = samples.iter().filter_map(|(_, latency)| *latency).collect();
     if latencies.len() > limit.max(1) {
@@ -1215,10 +1029,6 @@ pub fn sparkline_latencies(samples: &[(i64, Option<u64>)], limit: usize) -> Vec<
     latencies
 }
 
-/// Ticket 36: parse a clash-API `/connections` body into
-/// `(download_total, upload_total)`. Live shape (stock sing-box 1.14.2):
-/// `{"connections":[],"downloadTotal":1048782,"memory":4497408,
-/// "uploadTotal":88}`. Missing/non-integer totals fail named (never zero).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_clash_totals(body: &str) -> Result<(u64, u64), String> {
     let value: serde_json::Value =
@@ -1232,21 +1042,16 @@ pub fn parse_clash_totals(body: &str) -> Result<(u64, u64), String> {
     Ok((total("downloadTotal")?, total("uploadTotal")?))
 }
 
-/// Ticket 36: one live clash connection with cumulative bytes and its
-/// owning row (`metadata.type` is `<inbound-type>/<inbound-tag>`; our
-/// tags are `in-<rowid>`, so the suffix is the row id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClashConn {
     pub id: String,
     pub row_id: Option<String>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
-    /// Destination host/IP for probe exclusion.
+
     pub dest: String,
 }
 
-/// Ticket 36: parse the `connections` array. Malformed entries are
-/// skipped (never a whole-poll failure); a non-JSON body fails named.
 pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|_| "clash connections are not JSON".to_string())?;
@@ -1298,23 +1103,11 @@ pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
     Ok(out)
 }
 
-/// Ticket 36: true when a clash entry destination is the health-test
-/// host (probe flows must never pollute data-plane counters). Shared by
-/// [`attribute_entries`] and the traffic tick so the exclusion can never
-/// drift between the two.
-/// Ticket 41: both sides normalize (lowercase, no port, no trailing dot —
-/// see [`normalize_probe_host`]) and resolved probe IPs match too (see
-/// [`is_probe_destination_with_ips`]).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_probe_destination(dest: &str, probe_host: &str) -> bool {
     is_probe_destination_with_ips(dest, probe_host, &[])
 }
 
-/// Ticket 41: normalize one clash-entry destination / probe host for
-/// attribution: lowercase, strip scheme + path/query, strip one `:port`
-/// suffix (single-colon hosts only — bare IPv6 keeps its colons), strip
-/// brackets, strip one trailing dot. `www.` folding stays in the caller
-/// (probe hosts are single-sourced from [`DEFAULT_TEST_URL`]).
 pub fn normalize_probe_host(raw: &str) -> String {
     let mut host = raw.trim().to_ascii_lowercase();
     if let Some(rest) = host
@@ -1326,19 +1119,18 @@ pub fn normalize_probe_host(raw: &str) -> String {
     if let Some(end) = host.find(['/', '?', '#']) {
         host.truncate(end);
     }
-    // Bracketed IPv6 (`[::1]` or `[::1]:port`).
+
     if let Some(inner) = host.strip_prefix('[') {
         if let Some(end) = inner.find(']') {
             return inner[..end].trim_end_matches('.').to_string();
         }
         return inner.trim_end_matches('.').to_string();
     }
-    // Bare IPv6 (two or more colons) never carries a port suffix here.
+
     if host.chars().filter(|c| *c == ':').count() >= 2 {
         return host.trim_end_matches('.').to_string();
     }
-    // One optional `:port` suffix (numeric tail only — a junk suffix is
-    // part of the name, never a port).
+
     if let Some((head, tail)) = host.rsplit_once(':') {
         if !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()) {
             host = head.to_string();
@@ -1347,10 +1139,6 @@ pub fn normalize_probe_host(raw: &str) -> String {
     host.trim_end_matches('.').to_string()
 }
 
-/// Ticket 41: probe-destination match over normalized forms, plus resolved
-/// probe IPs: a clash entry whose destination is the probe host's resolved
-/// IP (the common case — clash reports `destinationIP` while health dials
-/// the name) is still a probe flow, in every casing/port/dot variant.
 pub fn is_probe_destination_with_ips(
     dest: &str,
     probe_host: &str,
@@ -1370,13 +1158,12 @@ pub fn is_probe_destination_with_ips(
     {
         return true;
     }
-    // Resolved-IP leg: compare as addresses (string forms can spell one IP
-    // several ways — `::ffff:1.2.3.4` vs `1.2.3.4`).
+
     if let Ok(dest_ip) = dest.parse::<std::net::IpAddr>() {
         if probe_ips.contains(&dest_ip) {
             return true;
         }
-        // IPv4-mapped IPv6 normalization for mixed reporters.
+
         if let std::net::IpAddr::V6(v6) = dest_ip {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 let mapped = std::net::IpAddr::V4(mapped);
@@ -1389,10 +1176,6 @@ pub fn is_probe_destination_with_ips(
     false
 }
 
-/// Ticket 41: best-effort resolution of the probe host to its IPs (numeric
-/// fast path, real DNS otherwise). Empty on failure (fail-open: the
-/// hostname leg above still applies — resolution must never turn a probe
-/// into data-plane bytes, nor data-plane bytes into a probe).
 pub fn resolve_probe_ips(host: &str) -> Vec<std::net::IpAddr> {
     let normalized = normalize_probe_host(host);
     if normalized.is_empty() {
@@ -1415,11 +1198,6 @@ pub fn resolve_probe_ips(host: &str) -> Vec<std::net::IpAddr> {
     ips
 }
 
-/// Ticket 41: health-cause classifier — DNS failures (the name never
-/// resolved) vs local failures (bind/permission/reserved/port) vs egress
-/// failures (the far end unreachable/refused/timed out). The validation
-/// gate fails fast with [`crate::engine::EngineError::DnsFailure`]; this
-/// is the probe-time twin so health rows read DNS-vs-egress honestly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthCause {
     Dns,
@@ -1427,9 +1205,6 @@ pub enum HealthCause {
     Egress,
 }
 
-/// Ticket 41: classify one health/probe cause string. Matching is
-/// case-insensitive substring over the cause text (causes are already
-/// redacted upstream — no secrets reach this match).
 pub fn classify_health_cause(cause: &str) -> HealthCause {
     let lowered = cause.to_ascii_lowercase();
     const DNS_MARKERS: &[&str] = &[
@@ -1466,11 +1241,6 @@ pub fn classify_health_cause(cause: &str) -> HealthCause {
     HealthCause::Egress
 }
 
-/// Ticket 36: sum entry bytes per row, excluding flows to the health-test
-/// host (probes must never pollute data-plane counters) and entries no
-/// row claims. Returns `row_id -> (rx, tx)`.
-/// Ticket 41: hostname-leg only; use [`attribute_entries_with_ips`] when
-/// the probe host's resolved IPs are known.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn attribute_entries(
     entries: &[ClashConn],
@@ -1479,9 +1249,6 @@ pub fn attribute_entries(
     attribute_entries_with_ips(entries, probe_host, &[])
 }
 
-/// Ticket 41: [`attribute_entries`] plus the resolved-IP leg — probe flows
-/// addressed by resolved IP (case/port/dot variants included) are excluded
-/// from usage counters in all variants.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn attribute_entries_with_ips(
     entries: &[ClashConn],
@@ -1503,7 +1270,6 @@ pub fn attribute_entries_with_ips(
     totals
 }
 
-/// Ticket 36: raw `/connections` body off one clash controller.
 fn fetch_clash_body(
     port: u16,
     secret: &str,
@@ -1524,8 +1290,7 @@ fn fetch_clash_body(
     stream
         .write_all(request.as_bytes())
         .map_err(|error| format!("clash poll {endpoint}: write failed ({error})"))?;
-    // Bodies stay small (single-core sidecars hold few connections); the
-    // cap keeps a pathological peer from growing us without bound.
+
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -1562,9 +1327,6 @@ fn fetch_clash_body(
     Ok(String::from_utf8_lossy(&buf[end..]).into_owned())
 }
 
-/// Ticket 36: poll one clash controller's `/connections` totals over
-/// loopback. Any failure is a named `Err` (the tick skips that row,
-/// keeping its last totals — never zeroing on a missed poll).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn poll_clash_totals(
     port: u16,
@@ -1574,8 +1336,6 @@ pub fn poll_clash_totals(
     parse_clash_totals(&fetch_clash_body(port, secret, timeout)?)
 }
 
-/// Ticket 36: poll one clash controller's live connection entries (for
-/// per-row attribution by inbound tag).
 pub fn poll_clash_entries(
     port: u16,
     secret: &str,
@@ -1584,24 +1344,12 @@ pub fn poll_clash_entries(
     parse_clash_entries(&fetch_clash_body(port, secret, timeout)?)
 }
 
-/// Ticket 47: per-core clash poll ceiling (1–2s — one slow controller never
-/// stalls the traffic tick past this).
 pub const CLASH_PER_CORE_TIMEOUT_SECS: u64 = 2;
-/// Ticket 47: cap for the traffic last-seen map (`core/conn-id` entries).
-/// Churny short connections never grow it past this.
+
 pub const MAX_TRAFFIC_SEEN_ENTRIES: usize = 20_000;
-/// Ticket 47: time-to-live for last-seen entries of dead/removed cores.
-/// Entries of live targets with failed polls never expire (dropping them
-/// would double-count on recovery); entries whose core is gone entirely
-/// expire so crash churn never grows the map.
+
 pub const TRAFFIC_SEEN_TTL_SECS: i64 = 600;
 
-/// Ticket 47: bounded last-seen clash connection bytes (`core/conn-id` →
-/// cumulative rx/tx + last-refresh stamp). The traffic tick diffs live
-/// readings against this map to persist per-row deltas; the sweep drops
-/// closed connections on healthy cores and TTLs dead-core entries while
-/// keeping failed-live-core ids (a failed poll must never look like a mass
-/// close — that would double-count on recovery).
 #[derive(Debug, Clone)]
 pub struct TrafficSeenMap {
     inner: HashMap<String, (u64, u64, i64)>,
@@ -1610,14 +1358,12 @@ pub struct TrafficSeenMap {
 }
 
 impl Default for TrafficSeenMap {
-    /// Production bound ([`MAX_TRAFFIC_SEEN_ENTRIES`] + [`TRAFFIC_SEEN_TTL_SECS`]).
     fn default() -> Self {
         Self::bounded()
     }
 }
 
 impl TrafficSeenMap {
-    /// Production bound ([`MAX_TRAFFIC_SEEN_ENTRIES`] + [`TRAFFIC_SEEN_TTL_SECS`]).
     pub fn bounded() -> Self {
         Self {
             inner: HashMap::new(),
@@ -1626,32 +1372,23 @@ impl TrafficSeenMap {
         }
     }
 
-    /// Last reading for one connection, if tracked.
     pub fn get(&self, key: &str) -> Option<(u64, u64)> {
         self.inner.get(key).map(|(rx, tx, _)| (*rx, *tx))
     }
 
-    /// Record one live reading. Cap enforcement happens in [`sweep`] (with
-    /// failed-live protection), never here, so an insert burst mid-tick
-    /// cannot evict the high-water marks the sweep still needs.
     pub fn insert(&mut self, key: String, rx: u64, tx: u64, now: i64) {
         self.inner.insert(key, (rx, tx, now));
     }
 
-    /// Drop everything (clear-traffic paths reset the epoch deliberately).
     pub fn clear(&mut self) {
         self.inner.clear();
     }
 
-    /// Tracked connection count (bounded by [`sweep`]).
-    /// Ticket 47: test seam (production bounds via [`sweep`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// True when nothing is tracked.
-    /// Ticket 47: test seam (production bounds via [`sweep`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
@@ -1661,10 +1398,6 @@ impl TrafficSeenMap {
         id.split('/').next().unwrap_or("")
     }
 
-    /// One tick-end sweep: drop closed connections on healthy cores, TTL
-    /// dead-core entries, keep failed-live-core ids and everything `seen`
-    /// this round, then enforce the cap (oldest first, never evicting
-    /// failed-live holds except when the whole map is holds).
     pub fn sweep(
         &mut self,
         now: i64,
@@ -1678,13 +1411,9 @@ impl TrafficSeenMap {
             }
             let core = Self::core_of(id);
             if live_cores.contains(core) {
-                // Live target: a failed poll keeps ids (never a mass
-                // close); a healthy poll drops unseen ids (closed).
                 return !ok_cores.contains(core);
             }
-            // Dead/removed core: TTL'd so crash churn stays bounded. A
-            // restarted core resets its counters, so treating its next
-            // reading as a fresh epoch is correct, never a double count.
+
             now.saturating_sub(*at) <= self.ttl_secs
         });
         let protected: HashSet<String> = self
@@ -1716,23 +1445,13 @@ impl TrafficSeenMap {
         }
     }
 }
-/// Ticket 47: per-core timeout as a [`Duration`] (single source; the tick
-/// passes this, never a second literal).
+
 pub const CLASH_PER_CORE_TIMEOUT: Duration = Duration::from_secs(CLASH_PER_CORE_TIMEOUT_SECS);
-/// Ticket 47: total deadline for one traffic-tick poll round across all
-/// cores (bounds the tick even when every controller is slow).
+
 pub const CLASH_TOTAL_DEADLINE_SECS: u64 = 8;
-/// Ticket 47: total deadline as a [`Duration`].
+
 pub const CLASH_TOTAL_DEADLINE: Duration = Duration::from_secs(CLASH_TOTAL_DEADLINE_SECS);
 
-/// Ticket 47: poll every clash target concurrently (one thread per live
-/// core — bounded by the live-core count, which is bounded by the running
-/// sidecar count), each poll capped by `per_core`. Results landing after
-/// `total` are reported as deadline errors instead of stalling the tick;
-/// late threads are detached and exit on their own within `per_core`
-/// (bounded, never leaked past one timeout). Secrets travel only into the
-/// polling threads (never into error strings or logs — error text names
-/// core/port only). Result order matches `targets` order.
 pub fn poll_clash_targets(
     targets: &[crate::engine::ClashTarget],
     per_core: Duration,
@@ -1777,33 +1496,20 @@ pub fn poll_clash_targets(
         .collect()
 }
 
-/// Append-only samples + per-config traffic accumulation.
 #[derive(Debug, Default)]
 pub struct HealthStore {
     samples: VecDeque<HealthSample>,
-    /// Ticket 47: O(1) latest-sample index — the last-pushed sample of any
-    /// kind per config, plus the last-pushed sample per (config, kind).
-    /// Maintained on every push, ring-cap eviction, and stale prune, so
-    /// [`HealthStore::latest`]/[`latest_of`] never scan the ring. Clones are
-    /// bounded (one per config per slot), never per sample.
+
     latest_any: HashMap<String, HealthSample>,
     latest_kind: HashMap<String, [Option<HealthSample>; 2]>,
     traffic: HashMap<String, TrafficStats>,
-    /// Ticket 36: data-plane totals per config, mirrored from the store
-    /// (persisted) after every clash poll. Present means the row is
-    /// clash-tracked; absent rows keep the probe-byte display.
+
     data_traffic: HashMap<String, (u64, u64)>,
-    /// Ticket 41: per-row stale-totals markers — set when a crash drops the
-    /// row's core (dead sockets are skipped, last totals kept but flagged),
-    /// cleared on the next successful poll of the row.
+
     stale: HashSet<String>,
 }
 
 impl HealthStore {
-    /// Ticket 28: one bounded push for [`record_outcome`] and [`hydrate`]
-    /// (the ring cap is not per-caller policy).
-    /// Ticket 47: the ring is a [`VecDeque`] (O(1) front eviction) and every
-    /// push refreshes the O(1) latest-sample index.
     fn push_sample(&mut self, sample: HealthSample) {
         if self.samples.len() >= MAX_SAMPLES {
             if let Some(evicted) = self.samples.pop_front() {
@@ -1817,7 +1523,6 @@ impl HealthStore {
         self.latest_kind.entry(id).or_insert([None, None])[slot] = Some(sample);
     }
 
-    /// Ticket 47: index slot for one probe kind.
     fn kind_slot(kind: HealthKind) -> usize {
         match kind {
             HealthKind::UrlTest => 0,
@@ -1825,7 +1530,6 @@ impl HealthStore {
         }
     }
 
-    /// Latest sample of one kind for one config.
     pub fn latest_of(&self, config_id: &str, kind: HealthKind) -> Option<&HealthSample> {
         self.latest_filtered(config_id, Some(kind))
     }
@@ -1840,9 +1544,6 @@ impl HealthStore {
         }
     }
 
-    /// Ticket 47: repair the index after a ring-cap eviction. Only the
-    /// evicted config is ever rescanned (and only when the evicted sample
-    /// was its indexed latest); every other config stays O(1).
     fn reindex_evicted(&mut self, evicted: &HealthSample) {
         let id = &evicted.config_id;
         if self.latest_any.get(id) == Some(evicted) {
@@ -1894,8 +1595,6 @@ impl HealthStore {
         }
     }
 
-    /// Ticket 47: rebuild the whole index front-to-back (later pushes win —
-    /// the same answer a reverse scan gives). Only the prune path pays O(n).
     fn rebuild_latest_index(&mut self) {
         self.latest_any.clear();
         self.latest_kind.clear();
@@ -1908,7 +1607,6 @@ impl HealthStore {
         }
     }
 
-    /// Append one outcome: sample always, traffic only on success.
     pub fn record_outcome(&mut self, outcome: &TestOutcome) {
         self.push_sample(outcome.sample.clone());
         if let Some(success) = &outcome.success {
@@ -1922,12 +1620,6 @@ impl HealthStore {
         }
     }
 
-    /// Ticket 12: restore persisted latest-per-config samples after restart.
-    /// Samples only — traffic counters stay session-only (a fresh session
-    /// has moved no bytes yet). Unknown kinds default to URL tests; callers
-    /// pass only snapshots of known rows so removed configs never resurrect.
-    /// Restored errors re-run [`redact_secrets`]: snapshots predate the fix
-    /// or were written by older builds, so hydrate never trusts them blind.
     pub fn hydrate(&mut self, snapshots: &[HealthSnapshot]) {
         for snapshot in snapshots {
             let kind = if snapshot.kind == HealthKind::TcpPing.as_str() {
@@ -1945,23 +1637,11 @@ impl HealthStore {
         }
     }
 
-    /// Latest sample of any kind for one config.
-    /// Ticket 28: shares the reverse scan with [`latest_of`].
-    /// Ticket 32: no longer behind [`HealthStore::status`] (worst-kind-wins
-    /// reads per-kind); kept as the public latest-sample accessor.
-    /// Ticket 47: served O(1) from the latest-sample index (see
-    /// [`HealthStore::push_sample`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn latest(&self, config_id: &str) -> Option<&HealthSample> {
         self.latest_filtered(config_id, None)
     }
 
-    /// Liveness across kinds (ticket 32: worst-kind-wins): the latest sample
-    /// of EACH kind is considered — any dead kind means dead, so a later
-    /// ping success never masks a live URL failure (and vice versa). The
-    /// URL leg names the cause when it is dead (end-to-end signal beats
-    /// dial timing); latency prefers the URL leg. Nothing recorded of any
-    /// kind is unknown.
     pub fn status(&self, config_id: &str) -> RowHealth {
         let url = self.latest_of(config_id, HealthKind::UrlTest);
         let ping = self.latest_of(config_id, HealthKind::TcpPing);
@@ -1994,10 +1674,6 @@ impl HealthStore {
         }
     }
 
-    /// Ticket 32: drop samples older than `max_age_secs` relative to `now`
-    /// (stale samples expire instead of haunting a row forever).
-    /// Future-dated samples (clock skew) are kept, never pruned.
-    /// Ticket 47: the latest-sample index rebuilds from the survivors.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn prune_stale(&mut self, now: i64, max_age_secs: i64) {
         self.samples
@@ -2005,25 +1681,19 @@ impl HealthStore {
         self.rebuild_latest_index();
     }
 
-    /// Accumulated traffic (zeroed when nothing succeeded yet).
     pub fn traffic(&self, config_id: &str) -> TrafficStats {
         self.traffic.get(config_id).copied().unwrap_or_default()
     }
 
-    /// Ticket 36: mirror persisted data-plane totals for display.
     pub fn set_data_traffic(&mut self, config_id: &str, rx_bytes: u64, tx_bytes: u64) {
         self.data_traffic
             .insert(config_id.to_string(), (rx_bytes, tx_bytes));
     }
 
-    /// Ticket 36: pass-through for the poll tick (untracked rows stay None).
     pub fn data_traffic(&self, config_id: &str) -> Option<(u64, u64)> {
         self.data_traffic.get(config_id).copied()
     }
 
-    /// Ticket 09 (throne-adoption): drop every sample, traffic counter,
-    /// and stale marker of the given configs (the Clear-tests session
-    /// half — persisted snapshots go through the store).
     pub fn prune_configs(&mut self, ids: &HashSet<String>) {
         self.samples
             .retain(|sample| !ids.contains(&sample.config_id));
@@ -2033,40 +1703,24 @@ impl HealthStore {
         self.rebuild_latest_index();
     }
 
-    /// Ticket 41: mark one row's totals stale (its core crashed and ticks
-    /// skip it — last totals are kept but flagged, never trusted fresh).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn mark_stale(&mut self, config_id: &str) {
         self.stale.insert(config_id.to_string());
     }
 
-    /// Ticket 41: mark several rows stale at once (one crash drops a whole
-    /// core's rows).
     pub fn mark_stale_all(&mut self, config_ids: &[String]) {
         self.stale.extend(config_ids.iter().cloned());
     }
 
-    /// Ticket 41: clear one row's stale marker (its next successful poll
-    /// landed after recovery).
     pub fn clear_stale(&mut self, config_id: &str) {
         self.stale.remove(config_id);
     }
 
-    /// Ticket 41: true when the row's totals are stale (crashed, skipped by
-    /// ticks until recovery).
     pub fn is_stale(&self, config_id: &str) -> bool {
         self.stale.contains(config_id)
     }
 
-    /// Ticket 33: probe-byte counts are labeled `probe:` — they measure
-    /// health-probe request/response bytes through the row's own endpoint,
-    /// never data-plane traffic (there is no data-plane meter in v1).
-    /// Ticket 36: clash-tracked rows report data-plane totals instead; the
-    /// probe count rides along as context. Untracked rows keep the v1
-    /// probe display.
     fn traffic_text(&self, config_id: &str) -> String {
-        // Ticket 41: stale totals read as stale (crashed core, ticks
-        // skipping) — never as fresh.
         let stale = if self.is_stale(config_id) {
             " (stale)"
         } else {
@@ -2096,8 +1750,6 @@ impl HealthStore {
         }
     }
 
-    /// One-line row summary for the library list: `87ms`, `dead`, or empty
-    /// when untested (the row then shows no health child).
     pub fn row_summary(&self, config_id: &str) -> String {
         match self.status(config_id) {
             RowHealth {
@@ -2121,8 +1773,6 @@ impl HealthStore {
         }
     }
 
-    /// Detail-bar line: url latency + tcp-ping latency + traffic, the
-    /// named dead cause, or the never-tested line with its next step.
     pub fn detail_line(&self, config_id: &str) -> String {
         let url_ms = self
             .latest_of(config_id, HealthKind::UrlTest)
@@ -2160,10 +1810,6 @@ impl HealthStore {
                 state: RowState::Dead,
                 cause: Some(cause),
                 ..
-            // BUG-3: failure evidence renders full text inside the `Endpoint
-            // failed` alert (this branch only ever feeds that Alert — see
-            // `render_detail_health`). The 140-char `truncate` cap stays for
-            // one-line summaries elsewhere, never for the error box.
             } => format!("health: {cause} · {traffic}"),
             RowHealth {
                 state: RowState::Dead,
@@ -2173,7 +1819,6 @@ impl HealthStore {
         }
     }
 
-    /// `(live, dead)` over the given ids (untested ids count as neither).
     pub fn counts(&self, ids: &[String]) -> (usize, usize) {
         let mut live = 0;
         let mut dead = 0;
@@ -2193,10 +1838,6 @@ impl HealthStore {
         (live, dead)
     }
 
-    /// Ticket 09 (throne-adoption): record a speedtest sample — latency
-    /// and dead flag only, NEVER traffic. Speed runs measure the pipe;
-    /// crediting probe bytes to usage would bill the measurement as data
-    /// plane (see the `speed_runs_never_credit_probe_bytes` test).
     pub fn record_speed_sample(&mut self, outcome: &SpeedtestOutcome, at: i64) {
         self.push_sample(HealthSample {
             config_id: outcome.config_id.clone(),
@@ -2208,11 +1849,6 @@ impl HealthStore {
     }
 }
 
-/// Ticket 09 (throne-adoption): Throne latency colors — one tone per
-/// sample. Untested rows are `Unknown` (never green); under 500ms is
-/// `Fast`, under 1500ms is `Slow`, anything slower is `Poor`. The UI maps
-/// tones to theme tokens (code never names a color). Test-pinned mapping
-/// seam; the card/inspector paint mapping is the render follow-up.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatencyTone {
@@ -2232,10 +1868,6 @@ pub fn latency_tone(latency_ms: Option<u64>) -> LatencyTone {
     }
 }
 
-/// Ticket 09 (throne-adoption): Throne result string for one outcome —
-/// `33ms` on success, the named failure otherwise (`untested` when the
-/// sample carries neither, which a runner never emits). Test-pinned seam
-/// for the per-row result vocabulary.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn test_result_string(outcome: &TestOutcome) -> String {
     match (outcome.sample.latency_ms, outcome.sample.error.as_deref()) {
@@ -2245,8 +1877,6 @@ pub fn test_result_string(outcome: &TestOutcome) -> String {
     }
 }
 
-/// Sidecar log severity.
-/// Ticket 45: production type behind the logs level filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -2265,9 +1895,6 @@ impl LogLevel {
         }
     }
 
-    /// Ticket 45: parse a level-filter label (`None` = the `all` position,
-    /// unknown labels also read as `all` so a corrupt pick never hides
-    /// everything silently — the UI only offers known labels anyway).
     pub fn from_label(label: &str) -> Option<LogLevel> {
         match label.trim().to_ascii_lowercase().as_str() {
             "debug" => Some(LogLevel::Debug),
@@ -2279,9 +1906,6 @@ impl LogLevel {
     }
 }
 
-/// True when `word` appears as a whole word (lowercase alphanumeric run)
-/// in `lower` — never a raw substring, so `terror` is not an `error` and
-/// `panicky` is not a `panic`.
 fn has_word(lower: &str, word: &str) -> bool {
     lower
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -2306,12 +1930,6 @@ fn parse_level(line: &str) -> LogLevel {
     }
 }
 
-/// One redacted sidecar line (data-model `LogRecord`). `config_id` is `None`
-/// for engine-global lines no tag claimed.
-/// Ticket 47: `message` is ANSI-stripped at ingest (render paths never strip
-/// again) and `search` is the cached lowercase `"[level] message"` blob the
-/// Logs dialog filters on (zero per-render allocs, zero per-keystroke case
-/// folding).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRecord {
     pub at: i64,
@@ -2321,19 +1939,12 @@ pub struct LogRecord {
     pub search: String,
 }
 
-/// Ticket 47: precomputed log-tag index — the `in-{id}`/`out-{id}` tag
-/// strings built ONCE per ingest batch (not once per config per line), in
-/// config order so first-config-wins matches the per-line scan exactly.
-/// (A real multi-pattern automaton like aho-corasick would only pay off
-/// past hundreds of patterns; at ≤2×rows needles the precomputed strings
-/// remove the per-line allocs that dominated. No new dep.)
 #[derive(Debug, Clone, Default)]
 pub struct LogTagIndex {
     tags: Vec<(String, String)>,
 }
 
 impl LogTagIndex {
-    /// Build the index for one ingest batch (one build per batch, not per line).
     pub fn build(active: &[ProxyConfig]) -> Self {
         let mut tags = Vec::with_capacity(active.len() * 2);
         for config in active {
@@ -2343,10 +1954,6 @@ impl LogTagIndex {
         Self { tags }
     }
 
-    /// Claim a line for the first config whose tag it names as a bounded
-    /// token. Tags are `in-{id}`/`out-{id}`; a raw substring match would
-    /// misattribute `out-12` to `out-1`, so the tag must sit on word
-    /// boundaries (no alphanumeric/`-`/`_` glued on either side).
     pub fn tag_for(&self, line: &str) -> Option<String> {
         for (tag, id) in &self.tags {
             if tag_matches_bounded(line, tag) {
@@ -2357,16 +1964,10 @@ impl LogTagIndex {
     }
 }
 
-/// Chars that extend a log tag (`out-1` glued to `2` is `out-12`, not a
-/// mention of `out-1`).
 fn is_tag_cont_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
-/// True when `tag` occurs in `line` with boundary chars on both sides.
-/// All occurrences are tried (an early overlap rejection never hides a
-/// later exact mention). Byte-index safe: tags are ASCII, so every
-/// advance lands on a char boundary.
 fn tag_matches_bounded(line: &str, tag: &str) -> bool {
     if tag.is_empty() || tag.len() > line.len() {
         return false;
@@ -2394,18 +1995,12 @@ fn tag_matches_bounded(line: &str, tag: &str) -> bool {
     false
 }
 
-/// Redacted, tagged sidecar lines with a per-config filter.
-/// Ticket 47: the ring is a [`VecDeque`] (O(1) front eviction) with
-/// crash-cause lines pinned past normal-line eviction.
 #[derive(Debug, Default)]
 pub struct LogStore {
     records: VecDeque<LogRecord>,
 }
 
 impl LogStore {
-    /// Ingest one raw sidecar line: strip ANSI, tag by config via the
-    /// precomputed index, redact secrets, classify severity, cache the
-    /// search blob.
     pub fn push_raw(&mut self, line: &str, tags: &LogTagIndex) {
         let stripped = crate::engine::strip_ansi_codes(line);
         let message = redact_secrets(&stripped);
@@ -2422,10 +2017,6 @@ impl LogStore {
 
     fn push(&mut self, record: LogRecord) {
         if self.records.len() >= MAX_LOG_RECORDS {
-            // Pin crash-cause lines: evict the oldest NORMAL line so a
-            // sustained spam burst never flushes the evidence; when every
-            // line is pinned, evict the oldest anyway (the ring stays
-            // bounded no matter what).
             if let Some(position) = self
                 .records
                 .iter()
@@ -2439,7 +2030,6 @@ impl LogStore {
         self.records.push_back(record);
     }
 
-    /// Only lines tagged to this config (per-config filter).
     pub fn for_config(&self, config_id: &str) -> Vec<&LogRecord> {
         self.records
             .iter()
@@ -2447,16 +2037,11 @@ impl LogStore {
             .collect()
     }
 
-    /// All stored lines, oldest first.
     pub fn all(&self) -> &VecDeque<LogRecord> {
         &self.records
     }
 }
 
-/// Ticket 47: crash-cause lines survive ring eviction. Whole-word match
-/// (`panic`/`fatal`/`crash`/`crashed` — sing-box fatal errors, Go panics,
-/// and our own crash vocabulary): a raw substring would pin spam that
-/// merely contains the letters and flush the real evidence.
 fn is_crash_cause_line(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     has_any_word(
@@ -2465,10 +2050,6 @@ fn is_crash_cause_line(message: &str) -> bool {
     )
 }
 
-/// Claim a sidecar line for a config when it names that config's endpoint.
-/// Ticket 47: one-shot build + tag (same first-config-wins answer as
-/// [`LogTagIndex::tag_for`]); batch ingest builds the index once via
-/// [`LogTagIndex::build`] instead. Kept as the parity oracle for the index.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn tag_for_line(line: &str, active: &[ProxyConfig]) -> Option<String> {
     LogTagIndex::build(active).tag_for(line)
@@ -2529,7 +2110,6 @@ fn is_secret_key(token: &str) -> bool {
     .any(|suffix| clean.ends_with(suffix))
 }
 
-/// UUID-shaped (`8-4-4-4-12` hex) or bare 32-hex, with or without a key.
 fn is_uuid_like(token: &str) -> bool {
     let bytes = token.as_bytes();
     if bytes.len() == 36
@@ -2546,9 +2126,6 @@ fn is_uuid_like(token: &str) -> bool {
     bytes.len() == 32 && bytes.iter().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// A key-less token that still reads as a secret: UUID-shaped, or a long
-/// opaque run with an entropy signal (a digit or `-`/`_`). Length-gated so
-/// plain words, tags (`out-1`), and host labels pass through untouched.
 fn is_bare_secret(token: &str) -> bool {
     if is_uuid_like(token) {
         return true;
@@ -2588,28 +2165,15 @@ fn is_value_end(c: char) -> bool {
     )
 }
 
-/// Ends a masked secret value: like [`is_value_end`] but spaces/tabs are
-/// VALUE bytes, not terminators — a secret's tail must never leak because
-/// it contains a space (`Authorization: Bearer <token>`).
 fn is_secret_value_end(c: char) -> bool {
     c != ' ' && c != '\t' && is_value_end(c)
 }
 
-/// Redact credential values in `key=value`, `key: value`, `"key": "value"`,
-/// `Bearer <token>`, `scheme://userinfo@host`, and `?key=value` forms.
-/// Non-secret text (hosts, tags, config names) passes through untouched.
 pub fn redact_secrets(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < chars.len() {
-        // URL userinfo: scheme://credentials@ → scheme://***@. Any scheme
-        // qualifies (`vless://uuid@…` exactly like `https://user@…`); only
-        // a path/query/fragment delimiter BEFORE the `@` disqualifies it
-        // (a `/` after the `@` is a path, never a reason to keep the
-        // credentials — the old code leaked userinfo on any pathed URL).
-        // Scanning resumes after the `@` so `?token=` values in the same
-        // link still pass key=value redaction below.
         if i + 2 < chars.len() && chars[i] == ':' && chars[i + 1] == '/' && chars[i + 2] == '/' {
             out.push_str("://");
             let j = i + 3;
@@ -2636,8 +2200,7 @@ pub fn redact_secrets(line: &str) -> String {
                 i = at + 1;
                 continue;
             }
-            // No userinfo: emit just the scheme separator and fall through
-            // so the host/query still pass key=value redaction.
+
             i += 3;
             continue;
         }
@@ -2662,10 +2225,6 @@ pub fn redact_secrets(line: &str) -> String {
                     "bearer" | "basic"
                 );
                 if k < chars.len() && (chars[k] == '=' || chars[k] == ':') {
-                    // Replay key + separator verbatim, then mask the ENTIRE
-                    // value — including inner spaces — so `Authorization:
-                    // Bearer <token>` never leaks its tail. Only structural
-                    // ends (`"`, `,`, `&`, …) terminate the mask.
                     while j <= k {
                         out.push(chars[j]);
                         j += 1;
@@ -2680,7 +2239,7 @@ pub fn redact_secrets(line: &str) -> String {
                     while j < chars.len() && !is_secret_value_end(chars[j]) {
                         j += 1;
                     }
-                    // Replay a closing quote when we consumed an opening one.
+
                     if j < chars.len() && (chars[j] == '"' || chars[j] == '\'') {
                         out.push(chars[j]);
                         j += 1;
@@ -2701,9 +2260,7 @@ pub fn redact_secrets(line: &str) -> String {
                     continue;
                 }
             }
-            // Key-less secrets: UUIDs and long opaque runs mask bare (no
-            // `key=` needed). Hosts, tags, and plain words are too short
-            // or lack the entropy signal, so they pass through.
+
             if is_bare_secret(&token) {
                 out.push_str("***");
                 i = j;
@@ -2730,8 +2287,6 @@ struct FakeProbeState {
     out_ips: HashMap<String, String>,
 }
 
-/// One recorded probe call (asserts per-egress routing: each call carries
-/// the tested config's own endpoint).
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCall {
@@ -2742,8 +2297,6 @@ pub struct ProbeCall {
     pub url: String,
 }
 
-/// Read/write handle to a [`FakeHealthProber`]'s script (latencies,
-/// failures, and the ticket-08 deny-list hook).
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct FakeHealthHandle {
@@ -2768,8 +2321,6 @@ impl FakeHealthHandle {
             .insert(config_id.to_string(), cause.to_string());
     }
 
-    /// Deny a protocol (test hook: simulates an unprobeable row without
-    /// touching the runner; the runner records a named skip).
     pub fn deny_protocol(&self, protocol: &str) {
         self.state
             .lock()
@@ -2789,7 +2340,6 @@ impl FakeHealthHandle {
             .collect()
     }
 
-    /// Script a speedtest rate for one row (default 10.0 Mbps unscripted).
     pub fn script_speed(&self, config_id: &str, mbps: f64) {
         self.state
             .lock()
@@ -2798,7 +2348,6 @@ impl FakeHealthHandle {
             .insert(config_id.to_string(), mbps);
     }
 
-    /// Script an out-IP answer for one row (default `203.0.113.7`).
     pub fn script_out_ip(&self, config_id: &str, ip: &str) {
         self.state
             .lock()
@@ -2808,11 +2357,6 @@ impl FakeHealthHandle {
     }
 }
 
-/// In-memory mock driver: records calls, never dials, never resolves.
-/// All health tests run against this.
-/// Ticket 28: kept mirrored with the engine fake on purpose — this one is
-/// `Arc<Mutex>` (shared across probe threads), the engine fake is
-/// `Rc<RefCell>` (single-threaded UI harness).
 #[cfg(test)]
 pub struct FakeHealthProber {
     state: Arc<Mutex<FakeProbeState>>,
@@ -2961,8 +2505,6 @@ mod tests {
         }
     }
 
-    /// Prohibited side effect: each URL test dials its own config's endpoint,
-    /// never another row's egress.
     #[test]
     fn url_tests_use_each_configs_own_endpoint() {
         let configs = vec![
@@ -2982,7 +2524,6 @@ mod tests {
         }
     }
 
-    /// Scenario 1: 5 running rows each show a latency or a named failure.
     #[test]
     fn five_actives_each_show_latency_or_named_failure() {
         let configs: Vec<ProxyConfig> = (0..5)
@@ -3026,9 +2567,6 @@ mod tests {
         assert_eq!(store.row_summary("missing"), "");
     }
 
-    // -- Ticket 09 (throne-adoption): prunes + test semantics -------------
-
-    /// Adopted Throne batch values stay pinned.
     #[test]
     fn t09_group_values_pinned() {
         assert_eq!(GROUP_TEST_BATCH_SIZE, 100, "batch pinned");
@@ -3043,8 +2581,6 @@ mod tests {
         assert_eq!(SPEED_TEST_TIMEOUT, std::time::Duration::from_secs(5));
     }
 
-    /// Scenario: group test chunks at 100 with per-chunk progress; every
-    /// row shows latency or a named failure.
     #[test]
     fn t09_test_group_chunks_with_progress() {
         let configs: Vec<ProxyConfig> = (0..205)
@@ -3080,7 +2616,7 @@ mod tests {
                 assert_eq!(text, "42ms", "latency string: {text}");
             }
         }
-        // Tones: untested never reads good; boundaries pinned.
+
         assert_eq!(latency_tone(None), LatencyTone::Unknown);
         assert_eq!(latency_tone(Some(33)), LatencyTone::Fast);
         assert_eq!(latency_tone(Some(499)), LatencyTone::Fast);
@@ -3089,9 +2625,6 @@ mod tests {
         assert_eq!(latency_tone(Some(1500)), LatencyTone::Poor);
     }
 
-    /// Scenario: stop aborts the run — a pre-set flag probes nothing, and
-    /// a flag raised on the first probe still records only completed rows
-    /// (every returned row carries latency or a named failure).
     #[test]
     fn t09_test_group_stop_aborts() {
         use std::sync::atomic::Ordering;
@@ -3108,7 +2641,7 @@ mod tests {
                 )
             })
             .collect();
-        // Pre-set stop: no outcomes, no probe calls.
+
         let stopped = std::sync::atomic::AtomicBool::new(true);
         let (prober, handle) = FakeHealthProber::shared();
         let mut progress = Vec::new();
@@ -3129,8 +2662,7 @@ mod tests {
                 "no pulls after stop"
             );
         }
-        // Mid-run stop: the prober raises the flag on its first call; the
-        // run still records only completed rows (at most one worker wave).
+
         struct StopOnFirst {
             stop: Arc<std::sync::atomic::AtomicBool>,
         }
@@ -3173,7 +2705,6 @@ mod tests {
         }
     }
 
-    /// Speed runs record samples but never credit probe bytes to usage.
     #[test]
     fn t09_speed_runs_never_credit_probe_bytes() {
         let config = fixture("1", "Alpha", "vless", "127.0.0.1", 10801);
@@ -3199,7 +2730,7 @@ mod tests {
             "no usage credit"
         );
         assert_eq!(store.status("1").latency_ms, Some(42), "sample recorded");
-        // Modes round-trip through labels; failures name their cause.
+
         assert_eq!(
             SpeedtestMode::from_label("upload"),
             Some(SpeedtestMode::Upload)
@@ -3214,7 +2745,7 @@ mod tests {
             error: Some("dial refused".to_string()),
         };
         assert_eq!(format_speed_result(&failed), "dial refused");
-        // ...while a real URL probe DOES credit its bytes (contrast guard).
+
         let probe = prober
             .url_test(&config, "127.0.0.1", 10801, DEFAULT_TEST_URL)
             .expect("fake probes");
@@ -3233,12 +2764,11 @@ mod tests {
             TrafficStats::default(),
             "url probes credit"
         );
-        // Pure Mbps math pinned (zero elapsed never infinite).
+
         assert!((mbps_of(1_250_000, std::time::Duration::from_secs(1)) - 10.0).abs() < 1e-9);
         assert_eq!(mbps_of(100, std::time::Duration::ZERO), 800.0 / 1e6 * 1e9);
     }
 
-    /// Group speedtests measure every row (sequential) and stop aborts.
     #[test]
     fn t09_speed_group_measures_and_stops() {
         let configs = vec![
@@ -3276,8 +2806,6 @@ mod tests {
         assert!(outcomes.is_empty(), "stopped speed run records nothing");
     }
 
-    /// Ping groups chunk like test groups and stop aborts (seam coverage
-    /// for the unshipped ping-group action).
     #[test]
     fn t09_ping_group_chunks_and_stops() {
         let configs: Vec<ProxyConfig> = (0..105)
@@ -3304,8 +2832,6 @@ mod tests {
         assert!(outcomes.is_empty(), "stopped ping run records nothing");
     }
 
-    /// Clear-tests session half: pruning drops samples + traffic of the
-    /// cleared ids while the other group's rows stay intact.
     #[test]
     fn t09_prune_configs_drops_session_state() {
         let configs = vec![
@@ -3329,7 +2855,6 @@ mod tests {
         assert!(store.latest("2").is_some(), "other rows kept");
     }
 
-    /// Fake out-IP answers script per row; failures name the row.
     #[test]
     fn t09_out_ip_scripts_per_row() {
         let config = fixture("1", "Alpha", "vless", "127.0.0.1", 10801);
@@ -3351,8 +2876,6 @@ mod tests {
         );
     }
 
-    /// Scenario 3: a killed upstream flags only its own row; the others keep
-    /// their values.
     #[test]
     fn retest_flags_only_killed_row() {
         let configs = vec![
@@ -3385,10 +2908,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 32: truthful status (worst-kind-wins, stale expiry) --------
-
-    /// Ticket 32: a URL failure after a ping success is dead — and a later
-    /// ping success never masks a live URL failure (worst-kind-wins).
     #[test]
     fn t32_url_failure_after_ping_success_is_dead() {
         fn outcome(
@@ -3412,7 +2931,7 @@ mod tests {
                 }),
             }
         }
-        // Ping success, then URL failure: dead.
+
         let mut store = HealthStore::default();
         store.record_outcome(&outcome("1", HealthKind::TcpPing, Some(7), None));
         store.record_outcome(&outcome(
@@ -3426,7 +2945,7 @@ mod tests {
             matches!(status.state, RowState::Dead),
             "url failure is dead: {status:?}"
         );
-        // URL failure, then ping success: still dead (no ping masking).
+
         let mut masked = HealthStore::default();
         masked.record_outcome(&outcome(
             "1",
@@ -3441,7 +2960,7 @@ mod tests {
             "ping must not mask url failure: {status:?}"
         );
         assert!(masked.row_summary("1") == "dead", "list shows dead");
-        // Both kinds live: live with a latency.
+
         let mut live = HealthStore::default();
         live.record_outcome(&outcome("1", HealthKind::TcpPing, Some(7), None));
         live.record_outcome(&outcome("1", HealthKind::UrlTest, Some(42), None));
@@ -3450,9 +2969,6 @@ mod tests {
         assert_eq!(status.latency_ms, Some(42));
     }
 
-    /// Ticket 32: stale samples expire — pruning drops samples older than
-    /// the TTL so dead history cannot haunt a row forever (and fresh
-    /// samples survive).
     #[test]
     fn t32_stale_samples_expire() {
         let now = now_unix();
@@ -3493,8 +3009,6 @@ mod tests {
         assert_eq!(store.row_summary("fresh"), "42ms");
     }
 
-    /// Ticket 12: hydrated snapshots restore latencies and dead flags;
-    /// traffic stays zeroed (session-only) and unknown kinds default.
     #[test]
     fn hydrate_restores_latency_and_dead_flags_without_traffic() {
         use crate::store::HealthSnapshot;
@@ -3537,7 +3051,7 @@ mod tests {
             dead.cause
         );
         assert_eq!(store.row_summary("2"), "dead");
-        // Unknown kinds default to URL tests, never panic.
+
         assert_eq!(
             store.latest("3").map(|sample| sample.kind),
             Some(HealthKind::UrlTest)
@@ -3548,12 +3062,11 @@ mod tests {
                 .map(|s| &s.config_id),
             Some(&"2".to_string())
         );
-        // Traffic is session-only: hydration moves no bytes.
+
         assert_eq!(store.traffic("1"), TrafficStats::default());
         assert_eq!(store.status("missing").state, RowState::Unknown);
     }
 
-    /// TCP pings record dial timing under their own kind.
     #[test]
     fn tcp_ping_records_timing_per_endpoint() {
         assert_eq!(HealthKind::UrlTest.as_str(), "url-test");
@@ -3568,10 +3081,6 @@ mod tests {
         assert_eq!(handle.calls_for("1")[0].port, 10801);
     }
 
-    /// Denied protocols get a named skip without probing; standard rows
-    /// still run. The deny hook simulates unprobeable rows in tests.
-    /// Ticket 27: AnyTLS/SSH/Noise are probeable now — the residual skip
-    /// case is a genuinely unprobeable protocol (`naive`).
     #[test]
     fn unsupported_protocol_skipped_without_probing() {
         let configs = vec![
@@ -3599,9 +3108,6 @@ mod tests {
         assert!(!is_probeable_protocol("naive"));
     }
 
-    /// Ticket 07: AWG rows are probeable through their own endpoints (deny
-    /// list flipped); rows with no probe stay denied.
-    /// Ticket 27: the still-denied example is `naive` (AnyTLS probes now).
     #[test]
     fn amneziawg_rows_are_probeable_through_own_endpoints() {
         for protocol in ["amneziawg", "awg", "amnezia-wg"] {
@@ -3630,9 +3136,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08: Xray/custom/extra-core/chained rows are probeable through
-    /// their own endpoints (deny-list hook flipped); each probe dials its
-    /// own endpoint so results stay per-egress.
     #[test]
     fn ticket08_rows_are_probeable_through_own_endpoints() {
         for protocol in [
@@ -3674,10 +3177,6 @@ mod tests {
         }
     }
 
-    /// Ticket 27: SSH/AnyTLS/Noise rows are probeable through their own
-    /// endpoints (native engine support landed); each probe dials its own
-    /// endpoint so results stay per-egress. Traffic counters stay
-    /// probe-bytes per the spec note (data-plane deferred).
     #[test]
     fn ticket27_ssh_anytls_noise_probeable_through_own_endpoints() {
         for protocol in ["ssh", "anytls", "noise"] {
@@ -3710,7 +3209,7 @@ mod tests {
             assert_eq!(calls[0].port, config.port, "own endpoint, not a sibling's");
             store.record_outcome(outcome);
         }
-        // Probe-bytes only: no data-plane traffic is invented here.
+
         for config in &configs {
             let stats = store.traffic(&config.id);
             assert_eq!(stats.probes, 1);
@@ -3722,7 +3221,6 @@ mod tests {
         }
     }
 
-    /// Traffic counters accumulate per config across probes.
     #[test]
     fn traffic_stats_accumulate_per_config() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
@@ -3746,8 +3244,6 @@ mod tests {
         );
     }
 
-    /// Ticket 33: probe-byte counters are labeled `probe:` (never bare
-    /// `traffic` — v1 has no data-plane meter).
     #[test]
     fn traffic_text_is_labeled_probe() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
@@ -3765,8 +3261,6 @@ mod tests {
         assert!(line.contains("1 probe(s)"), "probe count shown, got {line}");
     }
 
-    /// Ticket 36: the clash `/connections` totals parse (live shape from
-    /// stock sing-box 1.14.2); missing fields and garbage fail named.
     #[test]
     fn ticket36_parse_clash_totals() {
         let (rx, tx) = crate::health::parse_clash_totals(
@@ -3784,8 +3278,6 @@ mod tests {
         );
     }
 
-    /// Ticket 36: once data-plane totals exist, the traffic line reports
-    /// them (not probe bytes); untracked rows keep the probe label.
     #[test]
     fn ticket36_traffic_text_prefers_data_plane() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
@@ -3805,8 +3297,6 @@ mod tests {
         assert_eq!(untracked, "health: never tested — press Test to check");
     }
 
-    /// Ticket 36: the clash poller reads totals off a live controller
-    /// (stub TCP server speaking the live shape) and rejects bad auth.
     #[test]
     fn ticket36_poll_clash_totals() {
         use std::io::Write as _;
@@ -3852,9 +3342,6 @@ mod tests {
         );
     }
 
-    /// Ticket 36: connection entries parse with per-connection bytes and
-    /// the owning row (from `metadata.type: "mixed/in-<rowid>"`); probe
-    /// destinations filter out so health checks never pollute counters.
     #[test]
     fn ticket36_parse_clash_entries() {
         let body = r#"{"connections":[{"chains":["direct"],"download":2877275,"id":"a99cac52","metadata":{"destinationIP":"127.0.0.1","destinationPort":"19097","host":"","network":"tcp","sourceIP":"127.0.0.1","sourcePort":"51241","type":"mixed/in-7"},"rule":"final","upload":89},{"chains":["direct"],"download":500,"id":"probe-1","metadata":{"destinationIP":"93.184.216.34","destinationPort":"80","host":"www.gstatic.com","network":"tcp","sourceIP":"127.0.0.1","sourcePort":"51242","type":"mixed/in-7"},"rule":"final","upload":60}],"downloadTotal":2877775,"uploadTotal":149}"#;
@@ -3870,8 +3357,6 @@ mod tests {
         );
     }
 
-    /// Scenario 2: per-config log filter shows only its lines, secrets
-    /// redacted; engine-global lines stay out.
     #[test]
     fn logs_filter_to_config_and_redact_secrets() {
         let active = vec![
@@ -3912,8 +3397,6 @@ mod tests {
         );
     }
 
-    /// Ticket 45: sparkline latencies take the newest successful samples
-    /// (oldest-first for the chart), capped — errors never plot as zero.
     #[test]
     fn t45_sparkline_latencies_newest_capped() {
         let samples: Vec<(i64, Option<u64>)> = vec![
@@ -3931,7 +3414,6 @@ mod tests {
         assert!(sparkline_latencies(&errors, 10).is_empty());
     }
 
-    /// Ticket 45: log levels round-trip through labels for the level filter.
     #[test]
     fn t45_log_level_labels() {
         assert_eq!(LogLevel::Debug.as_str(), "debug");
@@ -3943,7 +3425,6 @@ mod tests {
         assert_eq!(LogLevel::from_label("bogus"), None);
     }
 
-    /// Redaction covers key forms, bearer tokens, userinfo, and queries.
     #[test]
     fn redact_secrets_covers_credential_forms() {
         for (raw, leaked) in [
@@ -3972,7 +3453,6 @@ mod tests {
         );
     }
 
-    /// Byte formatting and truncation stay readable in rows.
     #[test]
     fn format_bytes_and_truncate() {
         assert_eq!(format_bytes(0), "0B");
@@ -3982,9 +3462,6 @@ mod tests {
         assert!(truncate(&"x".repeat(200), 140).ends_with('…'));
     }
 
-    /// Endpoint normalization: wildcards dial loopback; bad binds name the
-    /// endpoint without secrets. Non-loopback targets are refused (probes
-    /// dial the local endpoint only); hostname resolution is deadline-bound.
     #[test]
     fn endpoint_addr_normalizes_wildcards() {
         use std::time::Duration;
@@ -4022,9 +3499,6 @@ mod tests {
         assert!(split_http_url(DEFAULT_TEST_URL).is_ok());
     }
 
-    /// Redaction: Authorization values mask in full (never just the first
-    /// word), pathed URLs still mask userinfo, link queries still mask,
-    /// and bare UUIDs/keys mask with no key name.
     #[test]
     fn redact_secrets_covers_auth_pathed_bare_forms() {
         for (raw, leaked) in [
@@ -4058,19 +3532,13 @@ mod tests {
                 "leaked {leaked} in {redacted} (from {raw})"
             );
         }
-        // Fragments and tags survive when no secret precedes them.
+
         assert_eq!(
             redact_secrets("vless://host:443#my-row"),
             "vless://host:443#my-row"
         );
     }
 
-    /// Ticket A7: one redaction contract across both owners — the same
-    /// uuid/password/token corpus is clean through `redact_secrets`
-    /// (log/sidecar paths) AND `import::redact_link` (label paths), and the
-    /// pinned order is redact-FIRST, truncate-LAST (a long secret link is
-    /// still clean after the 96-char display cut — truncation never slices
-    /// a secret into an unredacted tail).
     #[test]
     fn a7_redaction_contract_holds_in_both_owners() {
         const UUID: &str = "11111111-2222-4333-8444-555555555555";
@@ -4102,9 +3570,7 @@ mod tests {
                 "host kept for diagnostics: {via_import}"
             );
         }
-        // Order pin: a 200-char secret query redacts fully even though the
-        // display truncates at 96 chars (redact-first means the cut only
-        // ever slices mask characters, never plaintext).
+
         let long_secret = format!("https://host.example.com/sub?token={}", "s".repeat(200));
         let redacted = crate::import::redact_link(&long_secret);
         assert!(redacted.chars().count() <= 97, "truncated: {redacted}");
@@ -4114,8 +3580,6 @@ mod tests {
         );
     }
 
-    /// Only 2xx is a working egress: 302/500 from the local stub fail the
-    /// URL test instead of counting as success.
     #[test]
     fn real_url_test_only_2xx_is_success() {
         use std::io::{Read as _, Write as _};
@@ -4156,8 +3620,6 @@ mod tests {
         assert!(error.contains("500"), "names the status: {error}");
     }
 
-    /// A slow drip (bytes inside every read window, forever) cannot hold
-    /// the URL test past its overall read deadline.
     #[test]
     fn real_url_test_slow_drip_hits_overall_deadline() {
         use std::io::{Read as _, Write as _};
@@ -4168,9 +3630,7 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accept works");
             let mut head = [0u8; 4096];
             let _ = stream.read(&mut head);
-            // Drips land well inside every per-read window, so only the
-            // overall deadline can stop this (per-read timeouts alone
-            // would run to the 64KB cap — over ten minutes here).
+
             for _ in 0..10_000 {
                 if stream.write_all(b"x").is_err() {
                     break;
@@ -4192,10 +3652,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 41: probe attribution normalization + cause classifier ------
-
-    /// Normalization strips casing, ports, schemes, paths, brackets, and
-    /// one trailing dot; bare IPv6 keeps its colons.
     #[test]
     fn t41_normalize_probe_host_variants() {
         assert_eq!(normalize_probe_host("www.gstatic.com"), "www.gstatic.com");
@@ -4215,8 +3671,6 @@ mod tests {
         assert_eq!(normalize_probe_host(""), "");
     }
 
-    /// Probe matching holds across case/port/dot variants and resolved IPs;
-    /// strangers and empty probes never match.
     #[test]
     fn t41_probe_match_variants_and_resolved_ips() {
         let probe = "www.gstatic.com";
@@ -4231,7 +3685,7 @@ mod tests {
         assert!(!is_probe_destination("example.com", probe));
         assert!(!is_probe_destination("www.gstatic.com", ""));
         assert!(!is_probe_destination("", probe));
-        // Resolved-IP leg: clash reports the IP while health dials the name.
+
         let ips = vec!["93.184.216.34".parse().expect("ip parses")];
         assert!(is_probe_destination_with_ips("93.184.216.34", probe, &ips));
         assert!(is_probe_destination_with_ips(
@@ -4241,12 +3695,11 @@ mod tests {
         ));
         assert!(!is_probe_destination_with_ips("93.184.216.34", probe, &[]));
         assert!(!is_probe_destination_with_ips("203.0.113.7", probe, &ips));
-        // Numeric probe hosts resolve without DNS.
+
         assert_eq!(resolve_probe_ips("93.184.216.34"), ips, "numeric fast path");
         assert!(resolve_probe_ips("").is_empty());
     }
 
-    /// Attribution excludes probe flows in every variant; legit flows count.
     #[test]
     fn t41_attribute_excludes_all_probe_variants() {
         fn entry(id: &str, row: &str, dest: &str, rx: u64, tx: u64) -> ClashConn {
@@ -4271,12 +3724,11 @@ mod tests {
         let attributed = attribute_entries_with_ips(&entries, probe, &ips);
         assert_eq!(attributed.get("7"), Some(&(1000, 100)), "{attributed:?}");
         assert_eq!(attributed.get("8"), Some(&(2000, 200)), "{attributed:?}");
-        // Hostname-leg compat entry point still excludes exact probes.
+
         let hostname_only = attribute_entries(&entries[4..], probe);
         assert_eq!(hostname_only.get("7"), Some(&(1000, 100)));
     }
 
-    /// The cause classifier tells DNS failure from local and egress failure.
     #[test]
     fn t41_classify_health_cause() {
         for cause in [
@@ -4305,8 +3757,6 @@ mod tests {
         }
     }
 
-    /// Dead rows carry the classified kind on the status seam; live and
-    /// unknown rows carry none.
     #[test]
     fn t41_status_carries_cause_kind() {
         fn outcome(id: &str, error: Option<&str>) -> TestOutcome {
@@ -4343,7 +3793,6 @@ mod tests {
         assert_eq!(store.status("missing").cause_kind, None);
     }
 
-    /// Stale markers flag crashed rows' totals and clear on fresh polls.
     #[test]
     fn t41_stale_markers_flag_and_clear() {
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
@@ -4367,9 +3816,6 @@ mod tests {
         assert!(!store.detail_line("1").contains("stale"));
     }
 
-    /// Ticket 47 (RED): bounded concurrent probes — 16 slow probes finish in
-    /// ~2 waves (10-way) with at most 10 in flight, outcomes in input order.
-    /// Ticket 09 (throne-adoption): Throne value 10 (was 8).
     #[test]
     fn t47_concurrent_probes_bounded_and_ordered() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4455,9 +3901,6 @@ mod tests {
         );
     }
 
-    /// Ticket 47 (RED): concurrent clash polls — fast cores return entries
-    /// while a slow core fails closed on the per-core timeout, and the whole
-    /// round lands well under the serial sum (parallel, not sequential).
     #[test]
     fn t47_clash_polls_concurrent_with_per_core_timeout() {
         use std::io::{Read as _, Write as _};
@@ -4561,8 +4004,6 @@ mod tests {
         srv_slow.join().expect("slow stub drains");
     }
 
-    /// Ticket 47 (RED): the total deadline cuts a round of all-slow cores —
-    /// every result is a deadline error and the round returns promptly.
     #[test]
     fn t47_clash_polls_total_deadline_caps_all_slow() {
         use std::io::Read as _;
@@ -4608,14 +4049,11 @@ mod tests {
         let _ = server;
     }
 
-    /// Ticket A8: clash-poll errors never carry the bearer secret — every
-    /// failure arm (dial, write, read, status, deadline) names core/port
-    /// only. Pinned with a refused port plus a wrong-secret stub.
     #[test]
     fn a8_clash_poll_errors_never_carry_secret() {
         use std::time::Duration;
         const SECRET: &str = "s3cret-hunter2-11111111-2222-4333-8444-555555555555";
-        // Refused port: dial fails before any byte moves.
+
         let refused = vec![crate::engine::ClashTarget {
             core: "down".to_string(),
             port: 1,
@@ -4629,7 +4067,7 @@ mod tests {
             assert!(!error.contains("hunter2"), "secret part in error: {error}");
             assert!(error.contains("127.0.0.1"), "endpoint named: {error}");
         }
-        // Wrong secret against a live stub: 401 names the endpoint only.
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
         let port = listener.local_addr().expect("addr works").port();
         let server = std::thread::spawn(move || {
@@ -4657,8 +4095,6 @@ mod tests {
         server.join().expect("stub drains");
     }
 
-    /// Ticket 47 (RED): ingest strips ANSI once and caches the lowercase
-    /// search blob — stored records carry no escapes.
     #[test]
     fn t47_log_ingest_strips_ansi_and_caches_search() {
         let tags = LogTagIndex::build(&[]);
@@ -4681,8 +4117,6 @@ mod tests {
         );
     }
 
-    /// Ticket 47 (RED): the precomputed tag index answers exactly like the
-    /// per-line scan — including overlapping numeric ids (first-config-wins).
     #[test]
     fn t47_log_tag_index_matches_scan() {
         let active = vec![
@@ -4707,17 +4141,14 @@ mod tests {
             );
         }
         assert_eq!(index.tag_for("warn in-1: x").as_deref(), Some("1"));
-        // Bounded-token match: "out-12" is 12's tag, never a mention of
-        // "out-1" (a raw substring match would misattribute it to "1").
+
         assert_eq!(index.tag_for("error out-12: y").as_deref(), Some("12"));
         assert_eq!(index.tag_for("info engine started"), None);
-        // Without the overlapping id, 12 wins its own tag.
+
         let index12 = LogTagIndex::build(&active[1..]);
         assert_eq!(index12.tag_for("error out-12: y").as_deref(), Some("12"));
     }
 
-    /// Ticket 47 (RED): the log ring stays capped and crash-cause lines
-    /// survive churn (pinned past normal-line eviction).
     #[test]
     fn t47_log_ring_pins_crash_lines() {
         let tags = LogTagIndex::build(&[]);
@@ -4742,9 +4173,6 @@ mod tests {
         );
     }
 
-    /// Ticket 47 (RED): the latest-health index answers O(1) and always
-    /// agrees with a reverse scan — across interleaved kinds, ring-cap
-    /// eviction, and stale pruning.
     #[test]
     fn t47_latest_health_index_matches_scan() {
         let mut store = HealthStore::default();
@@ -4782,7 +4210,7 @@ mod tests {
             }
         }
         assert!(store.samples.len() <= MAX_SAMPLES, "ring capped");
-        // Eviction under pressure: newest index entries survive a full churn.
+
         for i in 0..(MAX_SAMPLES + 50) {
             let sample = HealthSample {
                 config_id: "churn".to_string(),
@@ -4803,7 +4231,7 @@ mod tests {
         );
         let expect = model.iter().rev().find(|s| s.config_id == "churn");
         assert_eq!(store.latest("churn"), expect, "newest survives eviction");
-        // Prune rebuilds the index identically.
+
         let now = 1_800_000_000 + MAX_SAMPLES as i64 + 100;
         store.prune_stale(now, 90);
         model.retain(|s| now.saturating_sub(s.at) <= 90);
@@ -4824,9 +4252,6 @@ mod tests {
         }
     }
 
-    /// Ticket 47 (RED): the traffic last-seen map stays bounded (cap + TTL)
-    /// while never dropping failed-live-core ids (no double-count on
-    /// recovery) and dropping closed connections on healthy cores.
     #[test]
     fn t47_traffic_seen_map_bounds_and_sweep() {
         use std::collections::HashSet;
@@ -4836,13 +4261,12 @@ mod tests {
         map.insert("core-a/c1".to_string(), 100, 10, now);
         assert!(!map.is_empty(), "insert tracks");
         assert_eq!(map.get("core-a/c1"), Some((100, 10)));
-        // Closed on a healthy core: dropped by the sweep.
+
         let ok: HashSet<String> = ["core-a".to_string()].into_iter().collect();
         let live = ok.clone();
         map.sweep(now + 1, &ok, &HashSet::new(), &live);
         assert_eq!(map.get("core-a/c1"), None, "closed conn dropped");
-        // Failed poll on a live core: kept across sweeps (never a mass
-        // close, never TTL'd while live).
+
         map.insert("core-a/c2".to_string(), 50, 5, now);
         let ok_empty: HashSet<String> = HashSet::new();
         map.sweep(now + 1, &ok_empty, &HashSet::new(), &live);
@@ -4858,8 +4282,7 @@ mod tests {
             Some((50, 5)),
             "live entries ignore TTL"
         );
-        // Dead core (crashed/removed): TTL'd out so the map never grows
-        // without bound across restarts.
+
         map.insert("dead/c9".to_string(), 7, 7, now);
         let live_only_a = live.clone();
         map.sweep(
@@ -4869,7 +4292,7 @@ mod tests {
             &live_only_a,
         );
         assert_eq!(map.get("dead/c9"), None, "dead-core entry TTL'd");
-        // Cap: overflow evicts oldest evictable, never failed-live ids.
+
         let mut big = TrafficSeenMap::default();
         big.insert("core-a/keep".to_string(), 1, 1, now);
         for i in 0..(MAX_TRAFFIC_SEEN_ENTRIES + 100) {
@@ -4888,8 +4311,6 @@ mod tests {
         );
     }
 
-    /// Ticket 47: concurrent runner matches the sequential runner
-    /// outcome-for-outcome (ignoring `at` stamps) for both kinds.
     #[test]
     fn t47_concurrent_matches_sequential() {
         let configs = vec![
@@ -4937,10 +4358,6 @@ mod tests {
         }
     }
 
-    // -- Ticket 48: clash error-arm table + probe edges ---------------------
-
-    /// One canned HTTP reply per accepted connection (raw bytes, exactly
-    /// what a hostile or broken controller could send).
     fn stub_clash_raw(replies: Vec<Vec<u8>>) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
@@ -4950,8 +4367,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().expect("accept works");
                 let mut head = [0u8; 4096];
                 let _ = stream.read(&mut head);
-                // Best-effort: the oversize arm stops reading at its cap
-                // and goes away mid-write (RST), which must not fail the stub.
+
                 let _ = stream.write_all(&reply);
             }
         });
@@ -4968,10 +4384,6 @@ mod tests {
         out
     }
 
-    /// Ticket 48 (US-64): every clash error shape maps to its typed
-    /// outcome — oversize, 401, non-200, malformed headers, garbage
-    /// status, non-JSON 200 body — on the TcpListener harness. The tick
-    /// skips these rows keeping last totals, never zeroing.
     #[test]
     fn t48_clash_error_arm_table() {
         use std::time::Duration;
@@ -5006,19 +4418,14 @@ mod tests {
         server.join().expect("stub drains");
     }
 
-    /// Ticket 48 (US-64): probe-destination edges — www folding in both
-    /// directions, IPv4-mapped IPv6, junk (non-numeric) port suffixes,
-    /// and empty sides never matching.
     #[test]
     fn t48_probe_destination_edges() {
         let probe = "example.com";
-        // www folding is dest-driven: a www clash entry folds against
-        // the probe, but a bare entry never folds up to a www probe
-        // (apex traffic stays counted, never hidden as probes).
+
         assert!(is_probe_destination("www.example.com", probe));
         assert!(!is_probe_destination("example.com", "www.example.com"));
         assert!(is_probe_destination("WWW.EXAMPLE.COM.:443", probe));
-        // IPv4-mapped IPv6 reporters match the v4 probe IP.
+
         let ips = vec!["93.184.216.34".parse().expect("ip parses")];
         assert!(is_probe_destination_with_ips(
             "::ffff:93.184.216.34",
@@ -5030,19 +4437,17 @@ mod tests {
             probe,
             &ips
         ));
-        // Only numeric tails are ports: junk suffixes are names, never a
-        // match for the bare probe host.
+
         assert!(!is_probe_destination("example.com:abc", probe));
         assert!(!is_probe_destination("example.com:", probe));
-        // Empty sides never match, whatever the other side holds.
+
         assert!(!is_probe_destination("", probe));
         assert!(!is_probe_destination("example.com", ""));
         assert!(!is_probe_destination("", ""));
-        // Case and trailing-dot variants of an exact probe still match.
+
         assert!(is_probe_destination("EXAMPLE.COM.", probe));
     }
 
-    /// `counts` reports (live, dead) with untested ids as neither.
     #[test]
     fn health_store_counts_live_dead_and_untested() {
         fn outcome(id: &str, error: Option<&str>) -> TestOutcome {
@@ -5071,7 +4476,6 @@ mod tests {
         assert_eq!(store.counts(&["missing".to_string()]), (0, 0));
     }
 
-    /// An unresolvable probe host resolves to no IPs (fail-open).
     #[test]
     fn resolve_probe_ips_unresolvable_is_empty() {
         assert!(resolve_probe_ips("no-such-host.invalid").is_empty());

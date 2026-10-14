@@ -1,18 +1,10 @@
-//! Ticket 21: embed the Windows exe icon (`assets/icon.ico`, wired through
-//! `manyproxy.rc`). Windows-only; other targets skip it (the `compile` call
-//! itself is a no-op there).
-
 fn main() {
     println!("cargo:rerun-if-changed=manyproxy.rc");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     build_tray_icon_rgba();
-    // Ticket 33: stamp the git hash for About (`option_env!` in main.rs).
-    // Best-effort only: no git binary / no repo / any failure falls back to
-    // "unknown" and never fails the build.
+
     println!("cargo:rerun-if-changed=.git/HEAD");
-    // Ticket 34: `.git/HEAD` only names the ref (its bytes never change on
-    // commit), so follow it to the ref file — otherwise the About hash goes
-    // stale after the first build. Best-effort; never fails the build.
+
     if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
         if let Some(target) = head.trim().strip_prefix("ref: ") {
             println!("cargo:rerun-if-changed=.git/{target}");
@@ -34,14 +26,6 @@ fn main() {
     }
 }
 
-/// Ticket 38: decode the tray icon from `assets/icon.ico` (no new art) into
-/// an RGBA byte array for `tray-icon`'s `Icon::from_rgba` (its only icon
-/// constructor). The ICO holds PNG-compressed entries, so this parses the
-/// ICO directory and PNG-decodes the preferred entry (32x32, else 48, 16,
-/// 256, else the largest). Emits `OUT_DIR/tray_icon_rgba.rs` with
-/// `TRAY_ICON_WIDTH/HEIGHT/RGBA`. Loud failure (panic) on unreadable or
-/// undecodable assets: a missing tray icon must break the build, never ship
-/// a tray without an icon.
 fn build_tray_icon_rgba() {
     let data =
         std::fs::read("assets/icon.ico").expect("ticket 38: assets/icon.ico must be readable");
@@ -83,7 +67,6 @@ struct IcoEntry {
 }
 
 fn ico_dimensions(raw_width: u8, raw_height: u8) -> (u32, u32) {
-    // A zero byte means 256 per the ICO format.
     let width = if raw_width == 0 {
         256
     } else {
@@ -97,8 +80,6 @@ fn ico_dimensions(raw_width: u8, raw_height: u8) -> (u32, u32) {
     (width, height)
 }
 
-/// Parse the ICO directory; returns the preferred entry's location.
-/// Preference is tray-sized entries first (32, 48, 16, 256), else largest.
 fn pick_ico_entry(data: &[u8]) -> Option<IcoEntry> {
     if data.len() < 6 || data[0..4] != [0, 0, 1, 0] {
         return None;
@@ -126,10 +107,7 @@ fn pick_ico_entry(data: &[u8]) -> Option<IcoEntry> {
         if len == 0 || offset.checked_add(len)? > data.len() {
             continue;
         }
-        // PNG-compressed entries start with the PNG magic; BMP/DIB entries
-        // need a rasterizer this build script deliberately avoids. The magic
-        // check stays inside the entry bounds (never past `len` into a
-        // neighboring entry).
+
         if len >= 8
             && data[offset..offset + len]
                 .starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
@@ -158,9 +136,6 @@ fn pick_ico_entry(data: &[u8]) -> Option<IcoEntry> {
     entries.into_iter().max_by_key(|entry| entry.width)
 }
 
-/// PNG-decode one entry to straight RGBA8. Rejects anything that is not
-/// 8-bit RGBA so a mode change in the asset fails loudly instead of
-/// shipping a mis-decoded icon.
 fn decode_png_rgba8(png_bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     use png::ColorType;
     let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));

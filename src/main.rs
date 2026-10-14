@@ -100,12 +100,6 @@ use store::{
     DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
-// Ticket 26: application keyboard actions. Bound to [`APP_KEY_CONTEXT`] by
-// [`bind_app_keys`]; the shell div handles them via `.on_action(...)`.
-// Every handler is a no-op while any overlay is open (see
-// [`overlay_open`]), so shortcut keys never steal sheet/dialog input
-// (the overlay keeps its own Confirm/Cancel keys).
-// Ticket 44: `ClearChecked` lets Escape empty the multi-select set.
 actions!(
     manyproxy,
     [
@@ -131,23 +125,8 @@ actions!(
     ]
 );
 
-/// Ticket 26: key context owning the app shortcuts (was the bare
-/// `"manyproxy-library"` literal with no bindings — a dead context).
 pub const APP_KEY_CONTEXT: &str = "manyproxy-library";
 
-/// Ticket 26: register the app shortcuts under [`APP_KEY_CONTEXT`].
-/// Modifier-only chords (never printable characters) so list search typing
-/// is unaffected; dialogs are guarded at the handler, not the binding.
-/// Ticket 44: Escape clears the multi-select set (same guard).
-/// Lane B (B9): Delete edits nothing — it opens the naming confirm;
-/// Ctrl-F lands in search; Ctrl-E edits; Ctrl-1..6 switch inspector panes.
-/// Delete/Ctrl-E/Ctrl-F are inert while typing in a field (the focused
-/// input consumes the keystroke before the shell sees it) and while any
-/// dialog is open.
-/// Config-completeness T08 (CAP-11): Ctrl-V pastes clipboard text into the
-/// Import dialog (same handler as the palette `ImportClipboard` op and the
-/// Library-menu item). Like every other shortcut it is inert while typing
-/// (the focused input keeps native paste) and while any dialog is open.
 pub fn bind_app_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-n", AddConfig, Some(APP_KEY_CONTEXT)),
@@ -168,54 +147,30 @@ pub fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("ctrl-6", InspectorTraffic, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-k", OpenPalette, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-u", CopyUrls, Some(APP_KEY_CONTEXT)),
-        // Ticket 08 (throne-adoption): Update-current refreshes the
-        // subscriptions feeding the focused group (Ctrl-U stays on Copy
-        // URLs — its shortcut is pinned by config-completeness T08).
         KeyBinding::new("ctrl-r", UpdateCurrentGroup, Some(APP_KEY_CONTEXT)),
     ]);
 }
 
-/// Ticket 12: background tick intervals. Each tick is bounded (engine poll
-/// is O(1); the subscription pass only starts already-due subs; the
-/// re-probe only covers running rows with the existing 5s per-test bound)
-/// and stoppable (see [`AppView::stop_background_ticks`]; the loop also
-/// exits when the view is released).
 pub const ENGINE_POLL_TICK_SECS: u64 = 5;
 pub const DUE_SUBSCRIPTION_TICK_SECS: u64 = 300;
 pub const REPROBE_TICK_SECS: u64 = 60;
-/// Ticket 36: data-plane traffic cadence. Each pass polls every serving
-/// core's loopback clash controller (fast refuse-or-reply, 2s bound per
-/// core like the probe bound above) and persists per-row deltas.
+
 pub const TRAFFIC_TICK_SECS: u64 = 5;
-/// Ticket 05 (throne-adoption): visible-pane traffic cadence — the traffic
-/// loop runs at 1Hz and [`AppView::spawn_traffic_poll`] throttles to the 5s
-/// base cadence while the Connections/Traffic pane is hidden (see
-/// [`traffic_poll_due`]). Incremental mirror updates keep each pass O(delta).
+
 pub const TRAFFIC_FAST_TICK_SECS: u64 = 1;
-/// Ticket 47: tray event-pump cadence (menu actions + left-click toggle).
-/// 500ms stays responsive to clicks without the old 150ms idle wakeups.
+
 pub const TRAY_PUMP_MILLIS: u64 = 500;
-/// Ticket 47: seconds after window open before due subscriptions refresh —
-/// first paint always precedes refresh work.
+
 pub const STARTUP_REFRESH_DEFER_SECS: u64 = 3;
 
-/// Ticket 21: single branding seam — the OS window title and the TitleBar
-/// caption both read this name (the exe icon is `assets/icon.ico`, wired
-/// through `manyproxy.rc` + `build.rs`).
 pub const APP_TITLE: &str = "ManyProxy";
 
-/// Ticket 21: window options with the branded OS title. The base is
-/// [`TitleBar::window_options`]; `WindowOptions` itself has no title field —
-/// the initial title lives in `TitlebarOptions::title`, which the base
-/// leaves as `None`.
-/// Ticket 09: fresh launch opens at 1000x700 with an 880x620 minimum (no
-/// persisted geometry — the OS default is a huge window).
 fn app_window_options() -> WindowOptions {
     let mut options = TitleBar::window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some(APP_TITLE.into());
     }
-    // Ticket 09: initial content size 1000x700, resizable down to 880x620.
+
     options.window_bounds = Some(WindowBounds::Windowed(Bounds::new(
         point(px(0.), px(0.)),
         size(px(1000.), px(700.)),
@@ -224,21 +179,13 @@ fn app_window_options() -> WindowOptions {
     options
 }
 
-/// Ticket 33: crate version stamped into About (from `Cargo.toml`).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Ticket 33: git hash stamped by `build.rs` (`MANYPROXY_GIT_HASH`); plain
-/// dev builds without git metadata show the fallback, never a build failure.
 pub const GIT_HASH: &str = match option_env!("MANYPROXY_GIT_HASH") {
     Some(hash) => hash,
     None => "unknown (dev build)",
 };
 
-/// Ticket 33: the five app shortcuts in one place — the About dialog and the
-/// toolbar hint labels both read this, so the visible hints can never drift
-/// from the [`bind_app_keys`] bindings.
-/// Lane B (B9): plus row-edit, row-delete, search-focus, inspector tabs,
-/// and the Escape checked-clear — every binding documented, no hidden keys.
 pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Add configuration", "Ctrl-N"),
     ("Import configurations", "Ctrl-O"),
@@ -257,37 +204,25 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Command palette", "Ctrl-K"),
 ];
 
-/// Lane B (B7): confirm copy for the Settings traffic wipe — names the
-/// library scope so the click can never be a blind clear.
 fn settings_clear_traffic_text(total: usize) -> String {
     format!("Clear traffic counters for all {total} configuration(s)? This cannot be undone.")
 }
 
-/// Lane B (B7): confirm copy for the Settings health-snapshot wipe.
 fn settings_clear_health_text() -> String {
     "Clear every persisted health snapshot? Rows read untested until the next probe. \
      This cannot be undone."
         .to_string()
 }
 
-/// Lane B (B7): confirm copy for the Settings running-snapshot reset.
 fn settings_clear_snapshot_text() -> String {
     "Forget the running snapshot? The next launch starts with nothing running. The live \
      engine is untouched. This cannot be undone."
         .to_string()
 }
 
-/// Ticket 01: the three Appearance choices in radio order. The store is the
-/// only persistence (`Store::appearance` / `set_appearance`); anything else
-/// reads as dark (the documented default).
 pub const APPEARANCE_CHOICES: &[(&str, &str)] =
     &[("dark", "Dark"), ("light", "Light"), ("system", "System")];
 
-/// Ticket 01: read-only probe of the Windows app-theme flag
-/// (`HKCU\...\Personalize\AppsUseLightTheme`: nonzero = light). Read-only —
-/// never a write, so the local-only contract is untouched. `None` when the
-/// value is missing/unreadable (or off Windows); callers fall back to dark,
-/// never a guessed write.
 fn windows_apps_light_theme() -> Option<bool> {
     #[cfg(windows)]
     {
@@ -306,10 +241,6 @@ fn windows_apps_light_theme() -> Option<bool> {
     }
 }
 
-/// Ticket 01: pure Appearance → kit mode mapping. `system_light` is the OS
-/// flag (see [`windows_apps_light_theme`]); unknown values read dark (the
-/// documented default, matching [`Store::appearance`]). Pure so tests pin
-/// the mapping without touching the registry.
 fn appearance_theme_mode(appearance: &str, system_light: bool) -> ThemeMode {
     match appearance {
         "light" => ThemeMode::Light,
@@ -320,23 +251,14 @@ fn appearance_theme_mode(appearance: &str, system_light: bool) -> ThemeMode {
     }
 }
 
-/// Ticket 01: resolve a persisted Appearance choice to the live kit mode
-/// (System consults the Windows flag; missing flag reads dark).
 fn resolve_appearance_mode(appearance: &str) -> ThemeMode {
     appearance_theme_mode(appearance, windows_apps_light_theme().unwrap_or(false))
 }
 
-/// Ticket 01: apply a persisted Appearance choice to the kit theme (tokens
-/// only — app code carries zero hardcoded colors, so every surface follows).
-/// `window` refreshes the frame when one is handy (dialog switches); `None`
-/// at startup before the first frame.
 fn apply_appearance(appearance: &str, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(resolve_appearance_mode(appearance), window, cx);
 }
 
-/// Ticket 01: one-line routing inventory for the Settings Routing section —
-/// preset count plus attached-row count (`None` on either broken read, so
-/// the line never prints a lying zero).
 fn routing_summary_text(presets: Option<usize>, attached: Option<usize>) -> String {
     match (presets, attached) {
         (Some(presets), Some(attached)) => {
@@ -346,8 +268,6 @@ fn routing_summary_text(presets: Option<usize>, attached: Option<usize>) -> Stri
     }
 }
 
-/// Ticket 01: one-line preset inventory for the Settings Preset section
-/// (`None` on a broken read — never a lying zero).
 fn preset_summary_text(presets: Option<usize>) -> String {
     match presets {
         Some(presets) => format!("{presets} routing preset(s) stored"),
@@ -355,9 +275,6 @@ fn preset_summary_text(presets: Option<usize>) -> String {
     }
 }
 
-/// Lane B (B8): overwrite-gate copy for the logs Save — names the exact
-/// destination (the `MANYPROXY_LOGS` override when set, else the
-/// `manyproxy-logs.txt` library sibling) so the second click is informed.
 fn logs_overwrite_text(path: &std::path::Path) -> String {
     format!(
         "Overwrite {} with the visible log lines? Secrets stay redacted.",
@@ -365,9 +282,6 @@ fn logs_overwrite_text(path: &std::path::Path) -> String {
     )
 }
 
-/// T07 (gpui-18-sweep CAP-8): save-destination disclosure — names the exact
-/// path Save writes (the `MANYPROXY_LOGS` override when set, else the
-/// `manyproxy-logs.txt` library sibling) so the click is never a surprise.
 fn logs_save_path_text() -> String {
     format!(
         "Save writes to {} (set MANYPROXY_LOGS to override the location)",
@@ -375,9 +289,6 @@ fn logs_save_path_text() -> String {
     )
 }
 
-/// Lane B (B7): confirm copy for a group delete — names the group and its
-/// row count. Empty-only deletes still refuse loudly at commit; the copy
-/// says so up front instead of surprising.
 fn group_delete_confirm_text(name: &str, count: usize) -> String {
     if count == 0 {
         format!("Delete empty group \"{name}\"? No rows move (none use it). This cannot be undone.")
@@ -389,9 +300,6 @@ fn group_delete_confirm_text(name: &str, count: usize) -> String {
     }
 }
 
-/// Ticket 33: close-confirm text for a window close with running endpoints.
-/// `None` when nothing runs (close proceeds silently — nothing to kill).
-/// `Some` names every running row so the confirm can never be a blind kill.
 fn close_confirm_description(running_names: &[String]) -> Option<String> {
     if running_names.is_empty() {
         return None;
@@ -407,9 +315,6 @@ fn close_confirm_description(running_names: &[String]) -> Option<String> {
     ))
 }
 
-/// Ticket 33: one sidecar-presence line for About: the expected file name
-/// plus whether it resolved in the app directory (never a download — a
-/// missing binary stays a missing binary).
 fn sidecar_presence_line(file_name: &str, found: bool) -> String {
     if found {
         format!("{file_name}: found (app dir)")
@@ -418,8 +323,6 @@ fn sidecar_presence_line(file_name: &str, found: bool) -> String {
     }
 }
 
-/// Ticket 33: About dialog body — version + git hash + sidecar presence +
-/// data paths + shortcuts list. Pure so tests pin the complete content.
 fn about_body(
     version: &str,
     git_hash: &str,
@@ -442,14 +345,6 @@ fn about_body(
     out
 }
 
-/// Delegate for the configuration library list.
-///
-/// Ticket 02: renders stored rows with stable domain ids
-/// (`library-row-{config.id}`), no entity per row. Selection is mirrored here
-/// so the detail bar can follow it; search filters the visible rows.
-/// Ticket 47: `search_index` + `upstream_cache` are built once per
-/// `set_rows` (row data changes are rare; keystrokes and frames are
-/// frequent) so filter + render never parse per-row JSON.
 struct LibraryDelegate {
     rows: Vec<ProxyConfig>,
     search_index: Vec<RowSearchIndex>,
@@ -457,64 +352,35 @@ struct LibraryDelegate {
     visible: Vec<usize>,
     query: String,
     selected: Option<IndexPath>,
-    /// Ticket 06: per-row health summary (`config_id` → `87ms` / `dead`);
-    /// empty or missing means untested (no health child rendered).
+
     health: HashMap<String, String>,
-    /// Ticket 30: serving truth per row (`config_id` set while running).
-    /// The badge renders from this — never from the enabled flag.
+
     running: HashSet<String>,
-    /// Lane B (B6): crashed-shard truth per row (subset of `running` from
-    /// [`crate::engine::EngineController::ids_on_crashed_shards`], set on
-    /// every reload). Feeds the shared [`serving_tone`] rule so the row lamp
-    /// agrees with the detail Badge about sidecar crashes.
+
     crashed: HashSet<String>,
-    /// Ticket 43: persisted traffic totals (`config_id` → `(rx, tx)`), set on
-    /// every reload so the list shows per-row usage.
+
     traffic: HashMap<String, (u64, u64)>,
-    /// Ticket 43: subscription labels + preset names by id, set on reload so
-    /// the extended search never reads the store per keystroke.
+
     sub_labels: HashMap<String, String>,
     preset_names: HashMap<String, String>,
-    /// Ticket 44: id-keyed multi-select (config ids, never indices — a
-    /// reload or filter never re-targets the set). Pruned by [`set_rows`];
-    /// bulk actions run over exactly this set.
+
     checked: HashSet<String>,
-    /// Ticket 44: group/protocol/status facets ANDed with the text query in
-    /// [`apply_filter`]. `None` means no constraint on that facet.
+
     facet_group: Option<String>,
     facet_protocol: Option<String>,
     facet_status: Option<FacetStatus>,
-    /// Ticket 09 (throne-adoption): Show-Security column state — when on,
-    /// the meta line carries the row's `Type · security` posture (see
-    /// [`apply_show_security`]); off keeps the pinned three-fact meta.
+
     show_security: bool,
-    /// Ticket 09 (throne-adoption): `Type|Security` display sort — orders
-    /// `visible` by [`compare_type_security`] (display-only; store order
-    /// and refresh reseat are untouched).
+
     type_security_sort: bool,
-    /// T04 (gpui-18-sweep CAP-5): back-link to the owning view, set once
-    /// from [`AppView::render`] (guarded — one update, then quiet). Lets the
-    /// truly-empty `Empty` host working Add/Import buttons in content, so no
-    /// CTA strands in a separate strip below the list. `None` only before
-    /// the first frame (bare-delegate unit tests never render).
+
     app_view: Option<Entity<AppView>>,
-    /// R3 inline loopback-endpoint editing: cached per-row serve bind + port
-    /// [`InputState`]s, keyed by config id (never indices — a reload or
-    /// filter never re-targets a draft). Created lazily on first render;
-    /// pruned by [`set_rows`] like `checked`.
+
     endpoint_inputs: HashMap<String, RowEndpointInputs>,
-    /// R3: row ids whose endpoint inputs fired Enter since the last render.
-    /// The subscription records the id only (no window at event time); the
-    /// write itself runs deferred, outside the render borrow.
+
     pending_endpoint_commits: Vec<String>,
 }
 
-/// R3 inline loopback-endpoint editing: one row's cached editors. The two
-/// [`InputState`]s render in the row card; `_subs` keeps the Enter
-/// subscriptions alive (dropping them unsubscribes); `clean_*` is the last
-/// committed-or-synced text, so uncommitted drafts survive scrolling while
-/// external writes (Edit dialog, subscriptions) still repaint untouched
-/// fields.
 struct RowEndpointInputs {
     bind: Entity<InputState>,
     port: Entity<InputState>,
@@ -523,9 +389,6 @@ struct RowEndpointInputs {
     clean_port: String,
 }
 
-/// Ticket 44: status facet over row state + serving set + health summaries —
-/// exact predicates (never substring), so `Live` cannot match a stray
-/// "delivered" and `Stopped` cannot match a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FacetStatus {
     Enabled,
@@ -564,8 +427,6 @@ impl FacetStatus {
         Self::ALL.into_iter().find(|status| status.label() == label)
     }
 
-    /// Mirror of the `_full` health words: a present non-`dead` summary is
-    /// live; missing/blank is untested.
     fn matches(
         self,
         row: &ProxyConfig,
@@ -593,16 +454,6 @@ impl FacetStatus {
     }
 }
 
-/// Ticket 47: precomputed per-row search fields (lowercased once in
-/// `set_rows`, never per keystroke). `host_server`/`host_address` stay
-/// SEPARATE so the index answers exactly like [`library_row_matches`]
-/// (server-then-address, never a cross-field span).
-/// Ticket 43-extended (47 merge): the context words (subscription label,
-/// preset name, enabled/disabled, running/stopped, health text) ride the
-/// same index so the extended matcher
-/// ([`library_row_matches_full`]) holds without per-keystroke maps.
-/// Refreshed by [`LibraryDelegate::refresh_search_words`] whenever rows or
-/// context change; empty maps reproduce the base matcher exactly.
 struct RowSearchIndex {
     name: String,
     protocol: String,
@@ -641,9 +492,6 @@ impl RowSearchIndex {
         }
     }
 
-    /// Fill the context words for one row (id-keyed maps owned by the
-    /// delegate). Mirrors [`library_row_matches_full`] field for field —
-    /// any drift breaks `t47_search_index_matches_full_with_context`.
     fn enrich(
         &mut self,
         row: &ProxyConfig,
@@ -675,10 +523,6 @@ impl RowSearchIndex {
             .unwrap_or_default();
     }
 
-    /// Mirror of [`library_row_matches_full`] over a pre-lowered query (the
-    /// delegate lowercases once per filter, not once per row per keystroke).
-    /// Base half mirrors [`library_row_matches`]; context half mirrors the
-    /// `_full` extension (sub label, preset name, state, serving, health).
     fn matches_lowered(&self, lowered: &str) -> bool {
         if lowered.is_empty() {
             return true;
@@ -712,9 +556,6 @@ impl RowSearchIndex {
     }
 }
 
-/// Ticket 47: the `server`/`address` string hosts for the search index —
-/// the same keys and the same string-only rule as [`library_row_matches`]
-/// (parsed once per `set_rows`, never per keystroke).
 fn search_hosts(params: &str) -> (String, String) {
     let mut server = String::new();
     let mut address = String::new();
@@ -756,11 +597,6 @@ impl LibraryDelegate {
         }
     }
 
-    /// Replace all rows, preserving the selection by config id when possible.
-    /// Ticket 47: rebuilds the search index + upstream cache (the only
-    /// per-row JSON parses — never at filter/render time).
-    /// Ticket 44: prunes checked ids that vanished (bulk never acts on
-    /// ghosts), then re-filters (facets may now match differently).
     fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.search_index = rows.iter().map(RowSearchIndex::of).collect();
@@ -774,12 +610,10 @@ impl LibraryDelegate {
             })
             .collect();
         self.rows = rows;
-        // Ticket 44: drop checked ids with no row left (deleted elsewhere —
-        // the bulk bar label recomputes from this set, never stale).
+
         let live: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
         self.checked.retain(|id| live.contains(id.as_str()));
-        // R3: drop cached editors + pending commits for vanished rows
-        // (dropping a subscription unsubscribes — no ghost Enter commits).
+
         self.endpoint_inputs
             .retain(|id, _| live.contains(id.as_str()));
         self.pending_endpoint_commits
@@ -794,16 +628,10 @@ impl LibraryDelegate {
         });
     }
 
-    /// Cached upstream display for one row (no JSON parse on the render
-    /// path). `None` for rows missing from the cache (never a wrong
-    /// "no upstream" — callers fall back to a live parse).
     fn upstream_for(&self, id: &str) -> Option<&str> {
         self.upstream_cache.get(id).map(String::as_str)
     }
 
-    /// R3: lazily create (once per row id) the serve bind + port editors and
-    /// their Enter subscriptions. Render-safe: creation never touches the
-    /// store or the owning view.
     fn ensure_row_inputs(
         &mut self,
         row_id: &str,
@@ -825,8 +653,7 @@ impl LibraryDelegate {
                 .placeholder("auto")
                 .default_value(port_default.to_string())
         });
-        // Enter records the id only — the write runs deferred with a window
-        // (see the render drain). One subscription per editor, owned here.
+
         let mut subs = Vec::with_capacity(2);
         for state in [&bind, &port] {
             let id = row_id.to_string();
@@ -858,9 +685,6 @@ impl LibraryDelegate {
         );
     }
 
-    /// R3: repaint editors whose stored row moved underneath them (Edit
-    /// dialog, subscription refresh) while leaving focused fields and
-    /// uncommitted drafts exactly alone.
     fn sync_row_inputs(
         &mut self,
         row_id: &str,
@@ -894,9 +718,6 @@ impl LibraryDelegate {
         }
     }
 
-    /// R3: true while either of one row's editors holds keyboard focus.
-    /// The row Esc handler only reverts the focused row, so a propagated
-    /// Escape never touches drafts in rows the user is not editing.
     fn row_inputs_focused(&self, row_id: &str, window: &Window, cx: &App) -> bool {
         let Some(inputs) = self.endpoint_inputs.get(row_id) else {
             return false;
@@ -905,7 +726,6 @@ impl LibraryDelegate {
             || inputs.port.focus_handle(cx).is_focused(window)
     }
 
-    /// R3: current draft texts for one row (`None` before first render).
     fn endpoint_draft_texts(&self, row_id: &str, cx: &App) -> Option<(String, String)> {
         let inputs = self.endpoint_inputs.get(row_id)?;
         Some((
@@ -914,9 +734,6 @@ impl LibraryDelegate {
         ))
     }
 
-    /// R3: snap one row's editors back to stored truth (Esc path). Returns
-    /// true when anything was dirty — callers stop a global-Escape action
-    /// only then, so a clean Esc still clears the checked set.
     fn revert_row_inputs(&mut self, row_id: &str, window: &mut Window, cx: &mut App) -> bool {
         let Some(row) = self.rows.iter().find(|row| row.id == row_id).cloned() else {
             return false;
@@ -942,13 +759,6 @@ impl LibraryDelegate {
     }
 
     fn apply_filter(&mut self) {
-        // Ticket 26: re-derive the selection by config id (the `set_rows`
-        // pattern), never by stale index. A narrowed filter clears a
-        // filtered-out selection instead of landing actions on the wrong row.
-        // Ticket 47: one contains per row over the precomputed index — zero
-        // parses, zero per-row allocs per keystroke.
-        // Ticket 44: facets AND with the text query (group/protocol/status
-        // read straight off the row + maps — no JSON parses either).
         let selected_id = self.selected_row().map(|row| row.id.clone());
         let lowered = self.query.trim().to_lowercase();
         let mut visible = Vec::new();
@@ -961,8 +771,7 @@ impl LibraryDelegate {
             }
             visible.push(index);
         }
-        // Ticket 09 (throne-adoption): `Type|Security` display sort —
-        // orders the visible indices only (store order untouched).
+
         if self.type_security_sort {
             visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
         }
@@ -975,10 +784,6 @@ impl LibraryDelegate {
         });
     }
 
-    /// Ticket 44: one row against the three facets (`None` = unconstrained).
-    /// Protocol compares lowercased (stored values vary in case); group is
-    /// an exact label match (no free-text typos — pickers only offer real
-    /// labels).
     fn row_matches_facets(&self, index: usize) -> bool {
         let Some(row) = self.rows.get(index) else {
             return false;
@@ -1001,16 +806,10 @@ impl LibraryDelegate {
         true
     }
 
-    /// Ticket 44: true while any facet constrains the list (drives the
-    /// bulk label's visible count + the Clear-facets CTA).
     fn facets_active(&self) -> bool {
         self.facet_group.is_some() || self.facet_protocol.is_some() || self.facet_status.is_some()
     }
 
-    /// Lane B (B9): names the active filters for the no-hits empty state
-    /// (only the set parts — `group: X · protocol: y · status: Z ·
-    /// search: "q"`), so a filtered-to-zero list explains itself instead of
-    /// masquerading as an empty library.
     fn active_filter_text(&self) -> String {
         let mut parts = Vec::new();
         if let Some(group) = &self.facet_group {
@@ -1029,12 +828,6 @@ impl LibraryDelegate {
         parts.join(" · ")
     }
 
-    /// Ticket 44: honest bulk-bar label. The bulk set is the primitive
-    /// (actions run over the full set, never just the visible slice).
-    /// Ticket 01: the bar always reads `N checked (of M visible)` — both
-    /// counts even unfiltered, so the checked acting set (rim + chip) can
-    /// never be confused with the selected row (wash). Empty when nothing
-    /// is checked (the bar hides with it).
     fn bulk_label(&self) -> String {
         if self.checked.is_empty() {
             return String::new();
@@ -1046,8 +839,6 @@ impl LibraryDelegate {
         )
     }
 
-    /// Ticket 44: the checked rows in library order (bulk actions iterate
-    /// this; filter-hiding never shrinks it).
     fn checked_rows(&self) -> Vec<ProxyConfig> {
         self.rows
             .iter()
@@ -1056,9 +847,6 @@ impl LibraryDelegate {
             .collect()
     }
 
-    /// Ticket 44: distinct group labels with row counts for the facet picker
-    /// and group manager (ordered by label; counts cover ALL rows, not just
-    /// the visible slice).
     fn group_options(&self) -> Vec<(String, usize)> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for row in &self.rows {
@@ -1072,9 +860,6 @@ impl LibraryDelegate {
         options
     }
 
-    /// Ticket 03: distinct lowercased protocols with row counts for the
-    /// facet picker (ordered by label; counts cover ALL rows, not just the
-    /// visible slice — same contract as [`group_options`]).
     fn protocol_options(&self) -> Vec<(String, usize)> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for row in &self.rows {
@@ -1085,10 +870,6 @@ impl LibraryDelegate {
         options
     }
 
-    /// Ticket 03: status facet options with result counts (ALL rows, like
-    /// groups/protocols) so the picker trigger names the active choice plus
-    /// its count. Counts read the same serving/health truth as the filter
-    /// itself ([`FacetStatus::matches`]).
     fn status_options(&self) -> Vec<(FacetStatus, usize)> {
         FacetStatus::ALL
             .iter()
@@ -1103,8 +884,6 @@ impl LibraryDelegate {
             .collect()
     }
 
-    /// Ticket 44: facet setters (each re-filters; the picker calls these).
-    /// Clearing one facet never touches the others or the text query.
     fn set_facet_group(&mut self, group: Option<String>) {
         self.facet_group = group;
         self.apply_filter();
@@ -1120,14 +899,10 @@ impl LibraryDelegate {
         self.apply_filter();
     }
 
-    /// Ticket 09 (throne-adoption): Show-Security toggle (render-only —
-    /// no re-filter; the list repaints with the posture column).
     fn set_show_security(&mut self, show: bool) {
         self.show_security = show;
     }
 
-    /// Ticket 09 (throne-adoption): `Type|Security` sort toggle (re-orders
-    /// `visible` via [`apply_filter`]; store order untouched).
     fn set_type_security_sort(&mut self, sort: bool) {
         self.type_security_sort = sort;
         self.apply_filter();
@@ -1140,8 +915,6 @@ impl LibraryDelegate {
         self.apply_filter();
     }
 
-    /// Ticket 44: toggle one id in the multi-select set (checkbox taps +
-    /// keyboard call this). Unknown ids are ignored (never a ghost check).
     fn toggle_checked(&mut self, id: &str) {
         if self.checked.contains(id) {
             self.checked.remove(id);
@@ -1152,9 +925,6 @@ impl LibraryDelegate {
         }
     }
 
-    /// Check every known id in one pass (post-import lands here — the new
-    /// rows arrive checked so the bulk bar offers its actions, and unknown
-    /// ids are ignored like [`LibraryDelegate::toggle_checked`]).
     fn check_ids(&mut self, ids: &[String]) {
         for id in ids {
             if self.rows.iter().any(|row| &row.id == id) {
@@ -1163,15 +933,10 @@ impl LibraryDelegate {
         }
     }
 
-    /// Ticket 44: empty the multi-select set (bulk Clear + Esc with no
-    /// dialog open call this).
     fn clear_checked(&mut self) {
         self.checked.clear();
     }
 
-    /// Ticket 01: 1-based position of one id in the checked set (library
-    /// order). Drives the checked-row count chip — a text numeral, so the
-    /// checked set reads without color.
     fn checked_position(&self, id: &str) -> Option<usize> {
         self.rows
             .iter()
@@ -1180,8 +945,6 @@ impl LibraryDelegate {
             .map(|position| position + 1)
     }
 
-    /// Ticket 44: visible rows in library order (select-visible + bulk
-    /// honesty read this, never the full row set).
     fn visible_rows(&self) -> Vec<ProxyConfig> {
         self.visible
             .iter()
@@ -1204,41 +967,26 @@ impl LibraryDelegate {
         self.selected = None;
     }
 
-    /// Ticket 06: replace the per-row health summaries (keyed by config id
-    /// so row replacement never misattributes a latency).
-    /// Ticket 44: re-filters too (status facets read health).
     fn set_health(&mut self, health: HashMap<String, String>) {
         self.health = health;
         self.refresh_search_words();
         self.apply_filter();
     }
 
-    /// Ticket 30: replace the serving set (`config_id`s currently running).
-    /// Badges render from this — never from the enabled flag.
-    /// Ticket 44: re-filters too (status facets read the serving set).
     fn set_running(&mut self, ids: Vec<String>) {
         self.running = ids.into_iter().collect();
         self.refresh_search_words();
         self.apply_filter();
     }
 
-    /// Lane B (B6): replace the crashed-shard set (ids on crashed sidecar
-    /// shards — always a subset of the running set). No re-filter: facets
-    /// read health/serving, never crash state.
     fn set_crashed(&mut self, ids: Vec<String>) {
         self.crashed = ids.into_iter().collect();
     }
 
-    /// Ticket 43: replace the per-row traffic totals (persisted store
-    /// counters, keyed by config id).
     fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
         self.traffic = traffic;
     }
 
-    /// Ticket 43: replace the search context maps (subscription labels and
-    /// preset names by id). Set on reload; filters never touch the store.
-    /// Ticket 44: re-filters too (context words feed the text index, so a
-    /// label change can match differently under the live query).
     fn set_search_context(
         &mut self,
         sub_labels: HashMap<String, String>,
@@ -1250,10 +998,6 @@ impl LibraryDelegate {
         self.apply_filter();
     }
 
-    /// Rebuild the index context words from the current rows + maps (rows,
-    /// health, serving set, labels). Called after every context mutation so
-    /// the precomputed index never goes stale; per-keystroke filtering stays
-    /// allocation-free. Traffic is not searched, so `set_traffic` skips this.
     fn refresh_search_words(&mut self) {
         for (row, entry) in self.rows.iter().zip(self.search_index.iter_mut()) {
             entry.enrich(
@@ -1266,7 +1010,6 @@ impl LibraryDelegate {
         }
     }
 
-    /// (total rows, enabled rows) for the status bar.
     fn counts(&self) -> (usize, usize) {
         (
             self.rows.len(),
@@ -1274,30 +1017,16 @@ impl LibraryDelegate {
         )
     }
 
-    /// Ticket 30: (visible rows, total rows) for the `N of M` search count.
-    /// Test-only seam (production reads `delegate_counts_for_search`).
     #[cfg(test)]
     fn visible_counts(&self) -> (usize, usize) {
         (self.visible.len(), self.rows.len())
     }
 
-    /// Ticket 30: (visible, total, query) for the search-count row.
     fn delegate_counts_for_search(&self) -> (usize, usize, String) {
         (self.visible.len(), self.rows.len(), self.query.clone())
     }
 }
 
-// Ticket 07 spike removed: the card list is the only library view — the
-// unreachable flag, its delegate, and its render arm are gone.
-
-/// T07 (gpui-18-sweep CAP-8): the virtualized log-lines delegate — one
-/// `ListItem` per visible line (`log-line-<ix>`), fed from the
-/// [`AppView::visible_log_lines`] snapshot at dialog open. The kit `List`
-/// (built on `v_virtual_list`) mounts only the viewport rows, so the
-/// 200-line tail never becomes a 200-child `flex_col` no matter how many
-/// records the ring holds. Rows truncate with full-text tooltips (uniform
-/// single-line height keeps the virtualizer honest); selection is left
-/// unowned (log lines are evidence, never a target).
 struct LogLinesDelegate {
     lines: Vec<String>,
 }
@@ -1377,31 +1106,20 @@ impl ListDelegate for LibraryDelegate {
             .selected
             .map(|current| current.section == index.section && current.row == index.row)
             .unwrap_or(false);
-        // Ticket 19: complete row content (name, protocol, upstream
-        // host:port, bind endpoint, enabled state, serving badge) via the
-        // tested [`library_row_lines`] seam — one child per line, stable
-        // domain id, no entity per row.
-        // Ticket 30: the badge reads the serving set, never the enabled flag.
-        // Ticket 47: the upstream string comes from the set_rows cache —
-        // zero JSON parses on the render path.
+
         let health = self
             .health
             .get(&row.id)
             .filter(|summary| !summary.is_empty())
             .cloned();
         let is_running = self.running.contains(&row.id);
-        // Ticket 43: per-row persisted traffic totals ride into the row.
+
         let traffic = self.traffic.get(&row.id).copied();
         let upstream = self
             .upstream_for(&row.id)
             .unwrap_or("no upstream")
             .to_string();
-        // Ticket 44: id-keyed multi-select checkbox. Stable domain id
-        // (`check-<id>`, never an index), controlled from `checked`.
-        // The toggle runs through the list entity so the delegate stays the
-        // single owner of the set. The box rides in the header row beside the
-        // name (horizontal, not a new vertical line) so row height stays
-        // paint-compatible with the ticket-19 three-row frame.
+
         let row_id = row.id.clone();
         let list_view = cx.entity();
         let is_checked = self.checked.contains(&row_id);
@@ -1409,8 +1127,6 @@ impl ListDelegate for LibraryDelegate {
         let checkbox = Checkbox::new(format!("check-{row_id}"))
             .small()
             .checked(is_checked)
-            // Ticket 01: the checkbox names the bulk set, never selection —
-            // screen readers hear checked-vs-selected as text, not hue.
             .accessibility_label(if is_checked {
                 format!("Checked {} (bulk action target)", row.name)
             } else {
@@ -1423,13 +1139,11 @@ impl ListDelegate for LibraryDelegate {
                     cx.notify();
                 });
             });
-        // R3 inline loopback editing: editors live per row id; drafts sync
-        // from stored truth unless focused or dirty.
+
         let port_stored = row.port.to_string();
         self.ensure_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
         self.sync_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
-        // R3 Enter drain: the subscription recorded the id (no window at
-        // event time); the write runs deferred, outside this render borrow.
+
         if self.pending_endpoint_commits.contains(&row_id) {
             self.pending_endpoint_commits.retain(|id| id != &row_id);
             if let Some(app_view) = self.app_view.clone() {
@@ -1446,19 +1160,11 @@ impl ListDelegate for LibraryDelegate {
             .get(&row_id)
             .map(|inputs| (inputs.bind.clone(), inputs.port.clone()))
             .expect("R3: row editors ensured above");
-        // T01: the row keeps only a narrow gutter (px_1) — the card owns the
-        // text padding (px_2) so the pre-card text inset (12px) is unchanged.
+
         let item = ListItem::new(format!("library-row-{}", row.id))
             .selected(selected)
             .px_1();
-        // T01: themed row card — surface, hairline, radius, hover and the
-        // selected highlight ride on the card (theme tokens only). The states
-        // mirror the ListItem's own selection formula so the row rim and the
-        // card read as one highlight.
-        // Ticket 01: one selection grammar — the blue wash marks the
-        // selected row and nothing else; a checked row carries an accent
-        // rim (2px, so shape differs without color) plus a numeral count
-        // chip. A row both checked and selected shows both.
+
         let selected_bg = if cx.theme().list.active_highlight {
             cx.theme().list_active
         } else {
@@ -1490,19 +1196,12 @@ impl ListDelegate for LibraryDelegate {
             is_running,
             traffic,
         );
-        // Ticket 09 (throne-adoption): Show-Security splices the posture
-        // into the meta line (render-only; the pinned line builder above
-        // is untouched).
+
         if self.show_security {
             apply_show_security(&mut rendered, &row);
         }
         let mut lines = rendered.into_iter();
-        // Operate polish: name at base weight via Label, meta + badge at
-        // small size. Meta rides muted; the badge rides the serving color
-        // (danger on dead-while-serving, success while running, muted when
-        // stopped). Pinned strings unchanged — only the wrappers carry style.
-        // Lane B (B6): lamp and badge share [`serving_tone`] — one evidence
-        // rule, so the two can never disagree about a row.
+
         let tone = serving_tone(
             is_running,
             health.as_deref(),
@@ -1514,17 +1213,6 @@ impl ListDelegate for LibraryDelegate {
             ServingTone::Stopped => cx.theme().muted_foreground,
         };
         if let Some(first) = lines.next() {
-            // Signal-box timetable: every header opens with the occupancy
-            // lamp in the same leading cell — lit green/red while serving,
-            // dark when stopped — so all rows share one exact geometry.
-            // Flat fill only, never glow or shadow.
-            // Ticket 01: a checked row carries its count-chip numeral here
-            // (1-based position in the checked set — text, not hue).
-            // Lane B (B6): the lamp reads the same [`serving_tone`] as the
-            // badge above — one evidence rule for both.
-            // Ticket 01 (ui-polish): 12px-minimum lamp target so the serving
-            // signal stays hittable at 50-row density (theme radius keeps
-            // the pill shape; flat fill only, never glow or shadow).
             let lamp_color = match tone {
                 ServingTone::Failed => cx.theme().danger,
                 ServingTone::Serving => cx.theme().success,
@@ -1564,11 +1252,11 @@ impl ListDelegate for LibraryDelegate {
                         })
                         .child(Label::new(first)),
                 )
-                // R3 inline loopback editing: the serve endpoint edits where
-                // it lives — fixed bind + port fields plus per-row
-                // Start/Stop + Edit in the header line. Commits ride Enter
-                // (deferred write), Esc reverts; serve/edit flush a dirty
-                // draft first, then act on it. Field ids stay stable per row.
+
+
+
+
+
                 .child(
                     div()
                         .flex()
@@ -1586,10 +1274,10 @@ impl ListDelegate for LibraryDelegate {
                                 if event.keystroke.key != "escape" {
                                     return;
                                 }
-                                // Polish: only the focused row reverts, so one
-                                // Escape can never touch drafts in rows the
-                                // user is not editing. A clean Esc falls
-                                // through to the global clear-checked action.
+
+
+
+
                                 let reverted = {
                                     let delegate = list.delegate_mut();
                                     delegate.row_inputs_focused(&revert_id, window, cx)
@@ -1714,13 +1402,7 @@ impl ListDelegate for LibraryDelegate {
         } else {
             card = card.child(checkbox);
         }
-        // Dense body: meta line then badge-plus-traffic line. The serving
-        // badge is dense line 3 (index 2) — the pinned badge string itself
-        // never changes, only its row position. Meta reads muted, the badge
-        // reads the serving color, both at small size under the base name.
-        // Ticket 01 (ui-polish): the meta tooltip carries the full 5-fact
-        // route ([`library_row_full_route`]) — group + enabled stay one
-        // hover away while the visible meta stays at most 3 facts.
+
         for (index, line) in lines.enumerate() {
             if index == 0 {
                 let tip = library_row_full_route(&row, &upstream);
@@ -1737,10 +1419,7 @@ impl ListDelegate for LibraryDelegate {
                 card = card.child(div().text_sm().text_color(badge_color).child(line));
             }
         }
-        // R3 live endpoint warnings: the collision + LAN guards read the
-        // current draft (not just stored truth), so a bad edit warns before
-        // Enter is ever pressed. Saving stays allowed — a shared endpoint is
-        // an activation-time concern (see `bind_port_collision_warning`).
+
         if let Some((bind_text, port_text)) = self.endpoint_draft_texts(&row_id, cx) {
             if let Some(warning) =
                 bind_port_collision_warning(&self.rows, Some(&row_id), &bind_text, &port_text)
@@ -1765,11 +1444,7 @@ impl ListDelegate for LibraryDelegate {
                 );
             }
         }
-        // Throne-adoption 03: single-click still selects (the outer List
-        // row owns that — untouched). Double-click opens Edit for THAT row
-        // and right-click opens the row-targeted menu — both close over
-        // this row's id, never the selection. Signal Box geometry, ids,
-        // and styling are unchanged.
+
         let rendered = match self.app_view.clone() {
             Some(app_view) => {
                 let edit_view = app_view.clone();
@@ -1800,17 +1475,6 @@ impl ListDelegate for LibraryDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
-        // Ticket 30: a query with no hits is not an empty library. No-hits
-        // shows `No matches — Clear search` + `N of M`; a truly empty
-        // library shows the Add/Import CTAs.
-        // T04: both arms render through the kit `Empty` (header/content
-        // slots); ids and pinned strings are unchanged.
-        // T07: the no-hits hint is a working Button (same delegate seam the
-        // checkbox uses) — it clears the query in place.
-        // Lane B (B9): facet-only filters land here too (any filter hiding
-        // every row reads as no-hits, never as an empty library). The
-        // description names the active filters; Clear all resets query +
-        // facets while Clear search keeps its BUG-1 seam untouched.
         let list_view = cx.entity();
         if !self.rows.is_empty() && self.visible.is_empty() {
             let (visible, total) = (self.visible.len(), self.rows.len());
@@ -1838,24 +1502,24 @@ impl ListDelegate for LibraryDelegate {
                                 .gap_2()
                                 .child(
                                     Button::new("clear-search-hint")
-                                        // T04: `.small()` like every empty-state button.
+
                                         .small()
                                         .label("Clear search")
                                         .tooltip("Clear the search query (keeps facet filters and checked)")
                                         .on_click(move |_, window, cx| {
                                             hint_view.update(cx, |state, list_cx| {
-                                                // BUG-1: push the cleared query back into
-                                                // the kit List widget (`query_input` +
-                                                // `last_query`) via `set_query` — mutating
-                                                // `delegate.query` alone leaves stale text
-                                                // that blocks row selection.
+
+
+
+
+
                                                 state.set_query("", window, list_cx);
                                             });
                                         }),
                                 )
                                 .child(
                                     Button::new("clear-search-facets")
-                                        // T04: `.small()` like every empty-state button.
+
                                         .small()
                                         .label("Clear all")
                                         .tooltip("Clear search and every filter")
@@ -1871,15 +1535,7 @@ impl ListDelegate for LibraryDelegate {
                     ),
             );
         }
-        // T04 (gpui-18-sweep CAP-5): the truly-empty library teaches inside
-        // the `Empty` — title + description + working Add/Import buttons in
-        // content. The old `render_empty_ctas` strip below the list stranded
-        // the CTAs outside the empty, so assistive tech heard them apart
-        // from it. The `empty-library-ctas` wrapper rides inside the content
-        // (same id, same handlers — the CTA-click tests keep their anchor);
-        // buttons ride `.small()` like every other action row. Without the
-        // back-link (pre-first-frame only) the copy still teaches, minus the
-        // buttons — never dead buttons.
+
         let add_view = self.app_view.clone();
         let import_view = self.app_view.clone();
         let mut ctas = div()
@@ -1932,11 +1588,6 @@ impl ListDelegate for LibraryDelegate {
     }
 }
 
-/// T08: the `Kbd` chip for a `Name (Key)` shortcut button. `keystroke` is
-/// the [`Keystroke::parse`] form (`"ctrl-n"`); on parse failure the
-/// parenthesized fallback preserves today's look exactly instead of
-/// dropping the hint. Callers keep the exact pinned `Name (Key)` string on
-/// `accessibility_label` — the chip only changes the visual.
 fn shortcut_kbd(keystroke: &str, fallback: &str) -> AnyElement {
     match Keystroke::parse(keystroke) {
         Ok(stroke) => Kbd::new(stroke).into_any_element(),
@@ -1944,56 +1595,16 @@ fn shortcut_kbd(keystroke: &str, fallback: &str) -> AnyElement {
     }
 }
 
-/// One labeled text field inside the add/edit dialog. A kit [`Field`]
-/// (label-over-input) carrying the pinned wrapper id on an inner div, so the
-/// headless field anchors (`field-name`, …) keep painting while the dialog
-/// bodies compose on `v_form`. Takes the state entity by value so the built
-/// element is `'static` (the element clones the entity internally).
-/// Ticket T03: the label rides kit `field()` + `ParentElement::child` (never
-/// an invented `Field::child` method — verified absent in 0.6.6 `field.rs`).
 fn dialog_field(id: &'static str, label: &str, state: Entity<InputState>) -> Field {
     field()
         .label(label.to_string())
         .child(div().id(id).test_support().child(Input::new(&state)))
 }
 
-/// Ticket 18: shared commit signature for plain-dialog footers — the same
-/// closure runs on the Confirm key path (`button_props.on_ok`) and the
-/// footer OK click. Returns true when the dialog should close (false keeps
-/// it open, e.g. total import failure).
 type DialogCommit = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
-/// Ticket T03 (gpui-18-sweep CAP-3): repaint callback shared by the kit
-/// `RadioGroup` pickers — the group writes its cell, then notifies the
-/// owning view through this so the new mark paints on the same frame.
 type DialogRepaint = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// Ticket 18: explicit mouse commit path for plain dialogs. A plain `Dialog`
-/// renders footer buttons ONLY via `.footer(...)` (`button_props.on_ok` fires
-/// on the Confirm key action alone), so every `open_dialog` dialog gets one
-/// of these footers. `commit` is the same `Rc`-shared closure the key path
-/// runs through `button_props.on_ok`: OK clicks commit identically (including
-/// stay-open-on-error — no close when it returns false) and Cancel closes
-/// with no side effects. The click never dispatches Confirm/Cancel, so one
-/// user action can never fire both paths (no double-commit). Button ids are
-/// stable per dialog; observability comes from the base button itself
-/// (`Button::new(id)` wraps a `div().id(id).test_support()`).
-/// Ticket 26 (L7 ruling): no idempotency token is added on top. The framework
-/// routes one user gesture to exactly one path (a click never dispatches the
-/// Confirm key action and vice versa — verified against the `Dialog` render
-/// in ticket 18), and both paths share the single `Rc` closure, so there is
-/// no second execution to dedupe. Dialogs with real re-entrancy risk (import
-/// parse, refresh fetch) carry their own in-flight guards instead.
-/// Ticket 05: honest footers — `ok_label` names the commit verb (never a bare
-/// `OK`; closing without saving reads `Close`), Cancel always discards with
-/// no side effects, and destructive work stays on alert confirms carrying
-/// `ButtonVariant::Danger` (never on this plain path). Both buttons ride
-/// `.small()` so footers stay inside the minimum-frame paint budget.
-/// Ticket 03 (US-3): pure-close dialogs render Close-only — when the commit
-/// label reads `Close` there is no commit to offer, so the footer is the
-/// single close button (kept on `ok_id`, which the pins click) and no
-/// `Cancel` sibling. `Esc` still closes through the dialog's Cancel key
-/// path, which never depended on the sibling button existing.
 fn dialog_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
@@ -2033,31 +1644,10 @@ fn dialog_footer(
         )
 }
 
-/// T08 (gpui-18-sweep CAP-9): true while any overlay owns the screen — a
-/// `Dialog` or a `Sheet` (`WindowExt::open_sheet`). Sheets occlude the shell
-/// exactly like dialogs (the kit overlay covers the viewport and stops mouse
-/// input), so every key-action guard uses this: shortcuts must never punch
-/// through a reference sheet into the library behind it (F5 starting an
-/// endpoint while the subscriptions URL field holds focus, Delete clearing
-/// the checked set on sheet Escape, drops stacking an import dialog over a
-/// sheet). Verified 0.6.6: `Root::open_sheet_at` captures the previously
-/// focused handle and `Root::close_sheet` restores it, so Escape (kit
-/// `Cancel` → `request_close`) closes the topmost layer with focus returning
-/// to its trigger — the guards only keep shell keys out of the way.
 fn overlay_open(window: &mut Window, cx: &mut App) -> bool {
     window.has_active_dialog(cx) || window.has_active_sheet(cx)
 }
 
-/// T08 (gpui-18-sweep CAP-9): sheet footer — the same honest verbs, stable
-/// ids, and shared-`Rc`-commit shape as [`dialog_footer`], but wired for
-/// `WindowExt::open_sheet` chrome. Differences are kit-forced (verified
-/// `sheet.rs`: `Sheet` offers `title/footer/size/on_close` only — no
-/// `button_props.on_ok` Confirm-key path, and `on_close` takes
-/// `Fn(&ClickEvent, &mut Window, &mut App)`): Cancel closes only the sheet
-/// (`close_sheet` never touches a dialog stacked above it), and the commit
-/// button is the single commit path (keyboard users reach it by tabbing —
-/// kit buttons activate on Enter when focused — instead of a global
-/// Confirm key). Both buttons ride `.small()` like dialog footers.
 fn sheet_footer(
     ok_id: &'static str,
     cancel_id: &'static str,
@@ -2088,22 +1678,6 @@ fn sheet_footer(
         )
 }
 
-/// Ticket 05: honest footer commit labels — one source so a label lie fails
-/// `honest_footer_labels_name_their_effect` instead of hiding inline.
-/// Closing without saving reads `Close` (settings, groups, and the preset
-/// picker, whose per-row `Attach` buttons do the real attaching while the
-/// footer itself just closes); commits name their verb (`Add`, `Save`,
-/// `Import`, `Export`, `Move`, `Rename`, `Copy link`); the Logs filter commit reads
-/// `Apply filter` so committing the typed filter is distinct from discarding
-/// it via `Cancel` (a second `Save` would collide with the file-writing
-/// `logs-save` button in the same dialog). Never a bare `OK` (see DESIGN.md
-/// dialogs section). Rulings: settings/groups `Done` overstated a no-op
-/// close (CAP-5.1 → `Close`); preset-attach `Attach` implied a footer attach
-/// that never runs (→ `Close`, per-row buttons keep the honest `Attach`
-/// verb); logs `Close` understated a filter save (CAP-5.3 → `Apply filter`);
-/// presets/subscriptions `Done` understated the manager create (CAP-5.2 →
-/// `Add`; an empty form closes with nothing to add, the documented manager
-/// pattern, rather than implying no verb at all).
 fn footer_commit_label(dialog: &str) -> &'static str {
     match dialog {
         "settings" | "groups" | "preset-attach" => "Close",
@@ -2119,14 +1693,8 @@ fn footer_commit_label(dialog: &str) -> &'static str {
     }
 }
 
-/// Ticket 10 (US-28): share-dialog credential warning (the export-dialog
-/// plaintext pattern — a share link rebuilds the endpoint elsewhere).
 const SHARE_WARNING: &str = "This link carries the endpoint's credentials — anyone holding it can use it. Prefer Copy URLs for credential-free sharing.";
 
-/// Ticket 06 (throne-adoption): the `Advanced Settings` button behind the
-/// Common box — opens the second small dialog (Dial Fields + TLS extras)
-/// over the same form entities. One stable id; hidden when the protocol
-/// carries nothing advanced (see [`has_advanced_dialog`]).
 fn advanced_settings_button(view: &Entity<AppView>, form: &ConfigForm) -> impl IntoElement {
     let adv_view = view.clone();
     let adv_form = form.clone();
@@ -2142,11 +1710,6 @@ fn advanced_settings_button(view: &Entity<AppView>, form: &ConfigForm) -> impl I
         })
 }
 
-/// Ticket 06: one masked-password row with the Throne presence caption —
-/// the secret input plus a `Not Set`/`Already Set` state line underneath
-/// (presence only, the value never renders). `id` pins the input
-/// wrapper; `{id}-state` pins the caption. Callers pass the full label
-/// (with ` *` exactly when blank fails validation).
 fn password_row(label: &str, id: &'static str, secret: &Entity<InputState>, cx: &App) -> Field {
     let presence = secret_state_caption(secret.read(cx).value().as_ref()).to_string();
     field().label(label.to_string()).child(
@@ -2170,12 +1733,6 @@ fn password_row(label: &str, id: &'static str, secret: &Entity<InputState>, cx: 
     )
 }
 
-/// Ticket 05: the Advanced disclosure toggle — one behavior, two
-/// placements (the collapsed hint row and the expanded Params header row;
-/// only one renders per frame, so the stable
-/// `params-advanced-toggle` id never collides). The swap itself lives in
-/// [`ConfigForm::expand_merge`] / [`ConfigForm::collapse_echo`] (called
-/// here and by tests).
 fn advanced_toggle_button(
     label: &'static str,
     view: &Entity<AppView>,
@@ -2201,10 +1758,6 @@ fn advanced_toggle_button(
         })
 }
 
-/// Config-completeness T02: one shared-panel disclosure toggle — the same
-/// behavior as [`advanced_toggle_button`] (the cell flips, the owning view
-/// notifies, the next frame rebuilds) with a per-panel stable id so
-/// headless tests can expand each section. Labels name the open action.
 fn panel_toggle_button(
     id: &'static str,
     label: &'static str,
@@ -2225,50 +1778,29 @@ fn panel_toggle_button(
         })
 }
 
-/// Handles to the add/edit dialog inputs. Entities are created once in the
-/// button handler (never in render) and cloned into the dialog builder.
 #[derive(Clone)]
 struct ConfigForm {
     name: Entity<InputState>,
-    /// Config-completeness T01: protocol picker state (Add only — Edit
-    /// renders [`ConfigForm::protocol_locked`] text instead, Throne §7.7
-    /// parity). Created once in [`ConfigForm::blank`]/[`ConfigForm::prefilled`]
-    /// (never in render); the selection drives the guided hint, the
-    /// virtual-type gate, and the pristine-only template sync below.
+
     protocol_select: Entity<SelectState<ProtocolChoiceList>>,
-    /// Config-completeness T01: last protocol the template sync applied.
-    /// Compared against the live selection in the dialog builder (the only
-    /// window-holding frame scope) so a switch rewrites pristine JSON once
-    /// and dirty JSON never.
+
     last_protocol: Rc<RefCell<String>>,
-    /// Config-completeness T01: true on Edit — the type control renders as
-    /// read-only text (`protocol-lock`) and commits keep the baseline type.
+
     protocol_locked: bool,
-    /// Config-completeness T01: baseline protocol text shown (and committed)
-    /// while locked.
+
     locked_protocol: String,
-    /// Config-completeness T02: VLESS inner fields — masked uuid secret,
-    /// flow + packet_encoding pickers. Prefilled from params on Edit;
-    /// rendered (and folded) only while the live protocol is `vless`.
+
     vless_uuid: Entity<InputState>,
     vless_flow: Entity<SelectState<PanelChoiceList>>,
     vless_packet_encoding: Entity<SelectState<PanelChoiceList>>,
-    /// Config-completeness T02: shared Transport panel (S1) — network
-    /// picker (the Network box) plus conditional disguise inputs (the
-    /// Camouflage box: ws path/host, http host/path/method, grpc service
-    /// name). Entities persist while hidden (R5: hiding never wipes), so
-    /// ws→tcp keeps path/host for reopen.
+
     s1_network: Entity<SelectState<PanelChoiceList>>,
     s1_path: Entity<InputState>,
     s1_host: Entity<InputState>,
     s1_method: Entity<InputState>,
     s1_service_name: Entity<InputState>,
     s1_open: Rc<RefCell<bool>>,
-    /// Config-completeness T02: shared TLS panel, optional variant (S2) —
-    /// enable toggle (TLS box) plus SNI/ALPN/fingerprint (TLS Security box).
-    /// Disabling folds `security` away while every other key stays preserved
-    /// (R5). Ticket 06: insecure + REALITY keys ride the Advanced dialog's
-    /// TLS extras.
+
     s2_enable: Rc<RefCell<bool>>,
     s2_sni: Entity<InputState>,
     s2_alpn: Entity<InputState>,
@@ -2277,19 +1809,13 @@ struct ConfigForm {
     s2_pbk: Entity<InputState>,
     s2_sid: Entity<InputState>,
     s2_open: Rc<RefCell<bool>>,
-    /// Config-completeness T02: shared Mux+Brutal panel (S3) — mode cell
-    /// (`""`|`on`|`off`, RadioGroup-driven) plus brutal state. `flow=vision`
-    /// unmounts the section with reason text (values preserved, fold
-    /// skipped); brutal forces the effective mode On.
+
     s3_mode: Rc<RefCell<String>>,
     s3_brutal: Rc<RefCell<bool>>,
     s3_up: Entity<InputState>,
     s3_down: Entity<InputState>,
     s3_open: Rc<RefCell<bool>>,
-    /// Config-completeness T02: shared Advanced dial panel (S4, dial half) —
-    /// four toggles plus timeout/bind text inputs. Ticket 06: rendered in
-    /// the Advanced dialog (see [`AppView::open_advanced_dialog`]), never
-    /// in the main form.
+
     s4_reuse: Rc<RefCell<bool>>,
     s4_fastopen: Rc<RefCell<bool>>,
     s4_fragment: Rc<RefCell<bool>>,
@@ -2298,46 +1824,28 @@ struct ConfigForm {
     s4_bind: Entity<InputState>,
     s4_inet4: Entity<InputState>,
     s4_inet6: Entity<InputState>,
-    /// Config-completeness T02: outer VLESS disclosure (see
-    /// [`ConfigForm::vless_block`]) — collapsed by default per the t11
-    /// minimum-frame contract.
+
     vless_open: Rc<RefCell<bool>>,
-    /// Config-completeness T03: VMess inner fields — masked uuid secret +
-    /// generate, aid text, cipher + packet_encoding pickers. Prefilled from
-    /// params on Edit (cipher via the grammar-aware reader); rendered (and
-    /// folded) only while the live protocol is `vmess`.
+
     vmess_uuid: Entity<InputState>,
     vmess_aid: Entity<InputState>,
     vmess_security: Entity<SelectState<PanelChoiceList>>,
     vmess_packet_encoding: Entity<SelectState<PanelChoiceList>>,
-    /// Config-completeness T03: outer VMess disclosure (see
-    /// [`ConfigForm::vmess_block`]) — collapsed by default like VLESS.
+
     vmess_open: Rc<RefCell<bool>>,
-    /// Config-completeness T03: Trojan inner field — masked password secret
-    /// (no generator: passwords are not uuids). Rendered (and folded) only
-    /// while the live protocol is `trojan`.
+
     trojan_password: Entity<InputState>,
-    /// Config-completeness T03: outer Trojan disclosure (see
-    /// [`ConfigForm::trojan_block`]) — collapsed by default like VLESS.
+
     trojan_open: Rc<RefCell<bool>>,
-    /// Config-completeness T03: Shadowsocks inner fields — method + plugin
-    /// pickers, masked password secret, plugin_opts text, uot cell.
-    /// Rendered (and folded) only while the live protocol is `shadowsocks`;
-    /// the page carries S3 + Advanced-dialog S4 only (no S1/S2 — Throne
-    /// HasMux parity).
+
     ss_method: Entity<SelectState<PanelChoiceList>>,
     ss_password: Entity<InputState>,
     ss_plugin: Entity<SelectState<PanelChoiceList>>,
     ss_plugin_opts: Entity<InputState>,
     ss_uot: Rc<RefCell<bool>>,
-    /// Config-completeness T03: outer Shadowsocks disclosure (see
-    /// [`ConfigForm::shadowsocks_block`]) — collapsed by default like VLESS.
+
     ss_open: Rc<RefCell<bool>>,
-    /// Config-completeness T04: WireGuard inner fields — masked private-key
-    /// secret + keygen, peer public/preshared keys, reserved/keepalive/
-    /// local-addr/dns/mtu/workers texts, sys_ifc cell. Rendered (and folded)
-    /// only while the live protocol is `wireguard`; the page carries
-    /// Advanced-dialog S4 only (no Transport/TLS/Mux — endpoint parity).
+
     wg_private: Entity<InputState>,
     wg_public: Entity<InputState>,
     wg_preshared: Entity<InputState>,
@@ -2348,16 +1856,9 @@ struct ConfigForm {
     wg_mtu: Entity<InputState>,
     wg_workers: Entity<InputState>,
     wg_sys_ifc: Rc<RefCell<bool>>,
-    /// Config-completeness T04: outer WireGuard disclosure (see
-    /// [`ConfigForm::wireguard_block`]) — collapsed by default like VLESS.
+
     wg_open: Rc<RefCell<bool>>,
-    /// Config-completeness T04: AmneziaWG inner fields — the full WG set
-    /// above (separate entities so unmerged typing never crosses pages —
-    /// T03 protocol-scoping) plus the AWG matrix: enable marker, version
-    /// picker, junk-train Jc/Jmin/Jmax, S-lengths, H-ranges, I-chains, v3
-    /// fields, trailers/cookies cells. Rendered (and folded) only while the
-    /// live protocol is `amneziawg`; the page carries Advanced-dialog S4
-    /// only.
+
     awg_private: Entity<InputState>,
     awg_public: Entity<InputState>,
     awg_preshared: Entity<InputState>,
@@ -2395,15 +1896,9 @@ struct ConfigForm {
     awg_max_handshake: Entity<InputState>,
     awg_trailers: Rc<RefCell<bool>>,
     awg_cookies: Rc<RefCell<bool>>,
-    /// Config-completeness T04: outer AmneziaWG disclosure (see
-    /// [`ConfigForm::amneziawg_block`]) — collapsed by default like VLESS.
+
     awg_open: Rc<RefCell<bool>>,
-    /// Config-completeness T05: Hysteria inner fields — common texts
-    /// (server_ports/hop_interval/up/down/obfs), v1-only auth_type picker +
-    /// auth secret + recv_window(_conn) + mtu-disvery cell, v2-only password
-    /// secret. One page serves both `hysteria` and `hysteria2` (the version
-    /// RadioGroup switches the protocol on Add, locked on Edit); hidden
-    /// halves persist in their entities (R5 hide-preserve).
+
     hy_server_ports: Entity<InputState>,
     hy_hop_interval: Entity<InputState>,
     hy_up: Entity<InputState>,
@@ -2415,14 +1910,9 @@ struct ConfigForm {
     hy_recv: Entity<InputState>,
     hy_mtu: Rc<RefCell<bool>>,
     hy_password: Entity<InputState>,
-    /// Config-completeness T05: outer Hysteria disclosure (see
-    /// [`ConfigForm::hysteria_block`]) — collapsed by default like VLESS.
+
     hy_open: Rc<RefCell<bool>>,
-    /// Config-completeness T05: TUIC inner fields — uuid secret (+uuidgen
-    /// button, uuid-row precedent) + password secret, congestion_control +
-    /// udp_relay_mode keep-blank pickers, udp_over_stream + zero_rtt cells,
-    /// heartbeat text. Rendered (and folded) only while the live protocol is
-    /// `tuic`; the page carries S2-forced + Advanced-dialog S4.
+
     tuic_uuid: Entity<InputState>,
     tuic_password: Entity<InputState>,
     tuic_cc: Entity<SelectState<PanelChoiceList>>,
@@ -2430,61 +1920,39 @@ struct ConfigForm {
     tuic_uot: Rc<RefCell<bool>>,
     tuic_zero_rtt: Rc<RefCell<bool>>,
     tuic_heartbeat: Entity<InputState>,
-    /// Config-completeness T05: outer TUIC disclosure (see
-    /// [`ConfigForm::tuic_block`]) — collapsed by default like VLESS.
+
     tuic_open: Rc<RefCell<bool>>,
-    /// Config-completeness T06: SOCKS inner fields — version + network
-    /// pickers, username/password texts, udp_over_tcp cell. Rendered (and
-    /// folded) only while the live protocol is `socks`; the page carries
-    /// Advanced-dialog S4 only (no Transport/TLS/Mux — inner parity).
+
     socks_version: Entity<SelectState<PanelChoiceList>>,
     socks_username: Entity<InputState>,
     socks_password: Entity<InputState>,
     socks_network: Entity<SelectState<PanelChoiceList>>,
     socks_uot: Rc<RefCell<bool>>,
-    /// Config-completeness T06: outer SOCKS disclosure (see
-    /// [`ConfigForm::socks_block`]) — collapsed by default like VLESS.
+
     socks_open: Rc<RefCell<bool>>,
-    /// Config-completeness T06: HTTP/HTTPS inner fields — username/password/
-    /// path/headers texts (path/headers are parity+). One entity set serves
-    /// both `http` and `https` (hysteria v1/v2 precedent); rendered (and
-    /// folded) only while the live protocol is either; the page carries
-    /// S2-optional + Advanced-dialog S4.
+
     http_username: Entity<InputState>,
     http_password: Entity<InputState>,
     http_path: Entity<InputState>,
     http_headers: Entity<InputState>,
-    /// Config-completeness T06: outer HTTP disclosure (see
-    /// [`ConfigForm::http_block`]) — collapsed by default like VLESS.
+
     http_open: Rc<RefCell<bool>>,
-    /// Config-completeness T06: AnyTLS inner fields — masked password secret
-    /// plus the idle-session tunables (interval/timeout durations, min
-    /// count). Rendered (and folded) only while the live protocol is
-    /// `anytls`; the page carries S2-forced + Advanced-dialog S4.
+
     anytls_password: Entity<InputState>,
     anytls_interval: Entity<InputState>,
     anytls_timeout: Entity<InputState>,
     anytls_min: Entity<InputState>,
-    /// Config-completeness T06: outer AnyTLS disclosure (see
-    /// [`ConfigForm::anytls_block`]) — collapsed by default like VLESS.
+
     anytls_open: Rc<RefCell<bool>>,
-    /// Config-completeness T06: Naïve inner fields — username + masked
-    /// password secrets, uot/quic cells, congestion_control picker.
-    /// Rendered (and folded) only while the live protocol is `naive`; the
-    /// page carries S2-forced + Advanced-dialog S4.
+
     naive_username: Entity<InputState>,
     naive_password: Entity<InputState>,
     naive_uot: Rc<RefCell<bool>>,
     naive_quic: Rc<RefCell<bool>>,
     naive_cc: Entity<SelectState<PanelChoiceList>>,
-    /// Config-completeness T06: outer Naïve disclosure (see
-    /// [`ConfigForm::naive_block`]) — collapsed by default like VLESS.
+
     naive_open: Rc<RefCell<bool>>,
-    /// Config-completeness T06: SSH inner fields — user text, masked password
-    /// secret, private-key blob area + path input + Browse picker + masked
-    /// passphrase, host-key + algs comma lists, client version. Rendered (and
-    /// folded) only while the live protocol is `ssh`; the page carries
-    /// Advanced-dialog S4 only (no TLS — inner parity).
+
     ssh_user: Entity<InputState>,
     ssh_password: Entity<InputState>,
     ssh_private_key: Entity<TextareaState>,
@@ -2493,14 +1961,9 @@ struct ConfigForm {
     ssh_host_key: Entity<InputState>,
     ssh_host_key_algs: Entity<InputState>,
     ssh_client_version: Entity<InputState>,
-    /// Config-completeness T06: outer SSH disclosure (see
-    /// [`ConfigForm::ssh_block`]) — collapsed by default like VLESS.
+
     ssh_open: Rc<RefCell<bool>>,
-    /// Config-completeness T07: Snell inner fields — masked psk secret,
-    /// version picker (4|6), obfs_mode/host + userkey + network + mode texts,
-    /// reuse cell. Engine-driven list (no Throne editor exists); rendered
-    /// (and folded) only while the live protocol is `snell`; the page carries
-    /// Advanced-dialog S4 only (no Transport/TLS/Mux — inner parity).
+
     snell_psk: Entity<InputState>,
     snell_version: Entity<SelectState<PanelChoiceList>>,
     snell_obfs_mode: Entity<InputState>,
@@ -2509,24 +1972,14 @@ struct ConfigForm {
     snell_reuse: Rc<RefCell<bool>>,
     snell_network: Entity<InputState>,
     snell_mode: Entity<InputState>,
-    /// Config-completeness T07: outer Snell disclosure (see
-    /// [`ConfigForm::snell_block`]) — collapsed by default like VLESS.
+
     snell_open: Rc<RefCell<bool>>,
-    /// Config-completeness T07: ShadowTLS inner fields — version picker
-    /// (1|2|3) + password text (v2/v3-only; v1 rows omit it). Rendered (and
-    /// folded) only while the live protocol is `shadowtls`; the page carries
-    /// S2-forced + Advanced-dialog S4.
+
     shadowtls_version: Entity<SelectState<PanelChoiceList>>,
     shadowtls_password: Entity<InputState>,
-    /// Config-completeness T07: outer ShadowTLS disclosure (see
-    /// [`ConfigForm::shadowtls_block`]) — collapsed by default like VLESS.
+
     shadowtls_open: Rc<RefCell<bool>>,
-    /// Config-completeness T07: Xray-VLESS Ph1 inner fields (uuid with
-    /// uuidgen, encryption, flow picker, sni/fp/alpn, REALITY pbk/sid/spiderx,
-    /// Xray-network picker, mode text, xray-mux picker). Ph2-only keys stay
-    /// JSON-only (preserved, never stripped); rendered (and folded) only
-    /// while the live protocol is `xray`; no shared panels (the bridge serves
-    /// the Ph1 subset, so S4 dial keys would be dead there).
+
     xray_uuid: Entity<InputState>,
     xray_enc: Entity<InputState>,
     xray_flow: Entity<SelectState<PanelChoiceList>>,
@@ -2539,68 +1992,38 @@ struct ConfigForm {
     xray_network: Entity<SelectState<PanelChoiceList>>,
     xray_mode: Entity<InputState>,
     xray_mux: Entity<SelectState<PanelChoiceList>>,
-    /// Config-completeness T07: outer Xray disclosure (see
-    /// [`ConfigForm::xray_block`]) — collapsed by default like VLESS.
+
     xray_open: Rc<RefCell<bool>>,
-    /// Config-completeness T07: chain hop-list editor state — ordered `nodes`
-    /// (id-reference strings or inline outbound objects, exactly the stored
-    /// shape). The cell is NEVER reset by `clear_panels` (kept, so the
-    /// expand→commit path refolds idempotently) and `echo_panels` always
-    /// re-syncs it from the box on collapse (hand-edited box JSON wins over
-    /// stale picks — expanding always merges first, so no unmerged typing
-    /// can be clobbered). Rendered (and folded) only while the live protocol
-    /// is `chain`.
+
     chain_hops: Rc<RefCell<Vec<serde_json::Value>>>,
-    /// Config-completeness T07: the library picker behind the hop editor —
-    /// choices rebuilt with the row list at dialog open (tests keep the
-    /// blank placeholder; the selection is transient UI, never folded).
+
     chain_pick: Entity<SelectState<PanelChoiceList>>,
-    /// Config-completeness T07: library snapshot (id, name, protocol) behind
-    /// the hop picker + hop labels + add/replace rejection. Set at dialog
-    /// open alongside `chain_pick`; empty for direct test forms.
+
     chain_library: Rc<RefCell<Vec<ChainLibraryEntry>>>,
-    /// Config-completeness T07: outer chain disclosure (see
-    /// [`ConfigForm::chain_block`]) — collapsed by default like VLESS.
+
     chain_open: Rc<RefCell<bool>>,
-    /// Config-completeness T07: extra-core inner fields — exe path text +
-    /// Browse picker, args text, config textarea. Rendered (and folded) only
-    /// while the live protocol is `extra-core`. Deliberately no `no_logs`
-    /// control anywhere (Throne non-persist bug — never copied).
+
     extra_exe: Entity<InputState>,
     extra_args: Entity<InputState>,
     extra_config: Entity<TextareaState>,
-    /// Config-completeness T07: outer extra-core disclosure (see
-    /// [`ConfigForm::extra_block`]) — collapsed by default like VLESS.
+
     extra_open: Rc<RefCell<bool>>,
-    /// Ticket 43: multiline params editor (was single-line `Input` — JSON
-    /// needs room). Reads/writes go through the same `value()` seam.
+
     params: Entity<TextareaState>,
     group: Entity<InputState>,
     bind: Entity<InputState>,
     port: Entity<InputState>,
-    /// Ticket 43: per-row probe-URL override (edit only — blank means the
-    /// global override, then the default). Persisted in store meta, never in
-    /// the row itself, so no schema change.
+
     test_url: Entity<InputState>,
-    /// Ticket 05 (signal-box): guided protocol-first mini-form — Server,
-    /// Server port, Identity. Prefilled from the params JSON at open;
-    /// non-blank values fold into the params at commit (see
-    /// [`ConfigForm::effective_params`]); blank values leave the JSON
-    /// untouched. The raw JSON lives under the Advanced disclosure.
+
     guided_server: Entity<InputState>,
     guided_port: Entity<InputState>,
     guided_identity: Entity<InputState>,
-    /// Ticket 05: Advanced disclosure state (raw JSON visible). Add starts
-    /// collapsed (guided-first); edit starts expanded (existing JSON rows
-    /// keep their current view). Shared cell so a params validation error
-    /// can auto-expand the box it points at.
+
     advanced: Rc<RefCell<bool>>,
 }
 
 impl ConfigForm {
-    /// Ticket 28: one input builder behind `blank` and `prefilled` (same
-    /// placeholder + default wiring per field; `None` skips `default_value`
-    /// exactly like the old blank fields did).
     fn field(
         window: &mut Window,
         cx: &mut Context<AppView>,
@@ -2616,10 +2039,6 @@ impl ConfigForm {
         })
     }
 
-    /// Lane B (B8): one masked builder for the guided identity secret
-    /// (uuid/password/token) — masked at rest with a reveal toggle at the
-    /// render site, so shoulder-surfing the Add/Edit dialog never lifts a
-    /// credential. Values still read/write normally (fold + prefill).
     fn secret_field(
         window: &mut Window,
         cx: &mut Context<AppView>,
@@ -2637,10 +2056,6 @@ impl ConfigForm {
         })
     }
 
-    /// Config-completeness T02: one picker builder behind the panel
-    /// dropdowns — `choices` from the option tables above, `current`
-    /// preselected (fallback: first row). States are created once in
-    /// [`ConfigForm::blank`]/[`ConfigForm::prefilled`], never in render.
     fn panel_select(
         window: &mut Window,
         cx: &mut Context<AppView>,
@@ -2654,8 +2069,6 @@ impl ConfigForm {
         cx.new(|cx| SelectState::new(PanelChoiceList(choices), selected, window, cx))
     }
 
-    /// Ticket 43: one multiline builder for the params box (same
-    /// placeholder + default wiring as [`ConfigForm::field`]).
     fn area(
         window: &mut Window,
         cx: &mut Context<AppView>,
@@ -2671,10 +2084,6 @@ impl ConfigForm {
         })
     }
 
-    /// Config-completeness T01: live protocol text — the picker selection on
-    /// Add, the baseline on Edit (locked). Falls back to the last-seen
-    /// protocol when the Select holds no selection (unknown legacy type on a
-    /// locked row), so reads never invent a type.
     fn protocol_text(&self, cx: &App) -> String {
         if self.protocol_locked {
             return self.locked_protocol.clone();
@@ -2686,14 +2095,6 @@ impl ConfigForm {
             .unwrap_or_else(|| self.last_protocol.borrow().clone())
     }
 
-    /// Config-completeness T01: pristine-only template sync (contract C1).
-    /// Runs at the top of the Add/Edit dialog builders — the only frame scope
-    /// holding a `Window` outside kit internals (kit `SelectState::set_value`
-    /// needs one, and the Confirm subscription has none). When the picker
-    /// selection moved since the last sync, the params box rewrites to the
-    /// new starter only via [`pristine_template_rewrite`] (dirty JSON stands);
-    /// the tracker advances either way so the rewrite fires exactly once per
-    /// switch. No-op on locked (Edit) rows.
     fn sync_protocol_template(&self, window: &mut Window, cx: &mut App) {
         if self.protocol_locked {
             return;
@@ -2721,11 +2122,6 @@ impl ConfigForm {
     }
 
     fn blank(window: &mut Window, cx: &mut Context<AppView>) -> Self {
-        // Ticket 31: the params box opens with the per-protocol field
-        // template (guided add, not raw JSON first). Submitting it untouched
-        // fails naming the missing field — never silently.
-        // Ticket 05: the guided mini-form opens blank (fold no-ops, so the
-        // template stands) under a collapsed Advanced disclosure.
         let template = protocol_params_template(DEFAULT_PROTOCOL);
         let selected = protocol_choices()
             .iter()
@@ -2752,9 +2148,7 @@ impl ConfigForm {
             guided_server: Self::field(window, cx, "Server (e.g. example.com)", None),
             guided_port: Self::field(window, cx, "Port (e.g. 443)", None),
             guided_identity: Self::secret_field(window, cx, "Identity secret", None),
-            // Config-completeness T02: panels open blank (every fold
-            // no-ops, so the template stands) under collapsed disclosures
-            // (the 880x620 minimum fits the guided core; t11 pins it).
+
             vless_uuid: Self::secret_field(window, cx, "UUID", None),
             vless_flow: Self::panel_select(window, cx, flow_choices(), ""),
             vless_packet_encoding: Self::panel_select(window, cx, packet_encoding_choices(), ""),
@@ -2786,8 +2180,7 @@ impl ConfigForm {
             s4_inet4: Self::field(window, cx, "IPv4 bind address", None),
             s4_inet6: Self::field(window, cx, "IPv6 bind address", None),
             vless_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T03: panels open blank (every fold
-            // no-ops, so the template stands) under collapsed disclosures.
+
             vmess_uuid: Self::secret_field(window, cx, "UUID", None),
             vmess_aid: Self::field(window, cx, "Alter ID (aid)", None),
             vmess_security: Self::panel_select(window, cx, vmess_security_choices(), "auto"),
@@ -2801,8 +2194,7 @@ impl ConfigForm {
             ss_plugin_opts: Self::field(window, cx, "Plugin options", None),
             ss_uot: Rc::new(RefCell::new(false)),
             ss_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T04: WG/AWG pages open blank (every fold
-            // no-ops, so the template stands) under collapsed disclosures.
+
             wg_private: Self::secret_field(window, cx, "Private key", None),
             wg_public: Self::field(window, cx, "Peer public key", None),
             wg_preshared: Self::secret_field(window, cx, "Preshared key", None),
@@ -2852,9 +2244,7 @@ impl ConfigForm {
             awg_trailers: Rc::new(RefCell::new(false)),
             awg_cookies: Rc::new(RefCell::new(false)),
             awg_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T05: Hysteria/TUIC pages open blank (every
-            // fold no-ops, so the template stands) under collapsed
-            // disclosures.
+
             hy_server_ports: Self::field(window, cx, "Server ports (e.g. 9000-9010)", None),
             hy_hop_interval: Self::field(window, cx, "Hop interval (e.g. 30s)", None),
             hy_up: Self::field(window, cx, "Up Mbps", None),
@@ -2875,9 +2265,7 @@ impl ConfigForm {
             tuic_zero_rtt: Rc::new(RefCell::new(false)),
             tuic_heartbeat: Self::field(window, cx, "Heartbeat (e.g. 10s)", None),
             tuic_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T06: SOCKS/HTTP(S)/AnyTLS/Naïve/SSH pages
-            // open blank (every fold no-ops, so the template stands) under
-            // collapsed disclosures.
+
             socks_version: Self::panel_select(window, cx, socks_version_choices(), ""),
             socks_username: Self::field(window, cx, "Username", None),
             socks_password: Self::secret_field(window, cx, "Password", None),
@@ -2952,9 +2340,6 @@ impl ConfigForm {
         config: &ProxyConfig,
         test_url: Option<&str>,
     ) -> Self {
-        // Ticket 05: the guided mini-form echoes the row's params JSON
-        // (untouched values fold back byte-identical — no spurious patch);
-        // the Advanced disclosure opens expanded on edit.
         let read_keys: &[&str] = guided_identity_fields(&config.protocol)
             .map(|guided| guided.read_keys)
             .unwrap_or(&[]);
@@ -2962,8 +2347,7 @@ impl ConfigForm {
             .iter()
             .position(|choice| choice.value == config.protocol)
             .map(IndexPath::new);
-        // Config-completeness T02: panels echo the row's params JSON
-        // (untouched values fold back byte-identical — no spurious patch).
+
         let params = config.params.as_str();
         let network_value = guided_prefill_value(params, &["network"]);
         let network = if network_value.is_empty() {
@@ -2972,9 +2356,7 @@ impl ConfigForm {
             network_value
         };
         let security = guided_prefill_value(params, &["security"]);
-        // Config-completeness T03: vmess rows may carry the legacy boolean
-        // `tls` import writes for `vmess://` links (the cipher sits in
-        // `security` there) — the grammar-aware reader owns that protocol.
+
         let tls_on = if config.protocol == "vmess" {
             vmess_tls_enabled(params)
         } else {
@@ -3177,11 +2559,7 @@ impl ConfigForm {
                 Some(&guided_prefill_value(params, &["inet6_bind_address"])),
             ),
             vless_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T03: inner pages echo the row's params
-            // JSON (untouched values fold back byte-identical — no spurious
-            // patch). The vmess cipher reads grammar-aware (legacy `security`
-            // vs new-style `encryption`); the ss method/plugin blanks stand
-            // for "no selection" (never fabricated, never stripped).
+
             vmess_uuid: Self::secret_field(
                 window,
                 cx,
@@ -3246,12 +2624,7 @@ impl ConfigForm {
                 &["udp_over_tcp", "uot"],
             ))),
             ss_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T04: WG/AWG inner pages echo the row's
-            // params JSON (untouched values fold back byte-identical — no
-            // spurious patch). The version picker reads `awg_version` else
-            // the legacy `version`; anything outside 2.0|3.x echoes as no
-            // selection and round-trips byte-identical (the engine accepts
-            // `2`/`3`/`3.0`/`3.1` too).
+
             wg_private: Self::secret_field(
                 window,
                 cx,
@@ -3550,12 +2923,7 @@ impl ConfigForm {
                 &["disablecookies", "disable_cookies"],
             ))),
             awg_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T05: Hysteria/TUIC pages echo the row's
-            // params JSON (untouched values fold back byte-identical — no
-            // spurious patch). Speeds read the engine `up`/`down` flats else
-            // the Throne `up_mbps` spellings; the v1 auth reads `auth` only
-            // (a `password` on a v1 row stays preserved for the v2 layout,
-            // never duplicated into `auth`).
+
             hy_server_ports: Self::field(
                 window,
                 cx,
@@ -3663,11 +3031,7 @@ impl ConfigForm {
                 Some(&guided_prefill_value(params, &["heartbeat"])),
             ),
             tuic_open: Rc::new(RefCell::new(false)),
-            // Config-completeness T06: small-matrix pages echo the row's
-            // params JSON (untouched values fold back byte-identical — no
-            // spurious patch). The socks version/network, naive cc and ssh
-            // host-key lists read alias-aware like the T03–T05 pickers; the
-            // http block serves both `http` and `https` on one entity set.
+
             socks_version: Self::panel_select(
                 window,
                 cx,
@@ -3989,32 +3353,6 @@ impl ConfigForm {
         }
     }
 
-    /// Consumes a clone; every built element owns its state entity.
-    /// Ticket 17: appends the inline LAN-confirm hint when the current bind
-    /// is non-loopback (rebuilt on every render, so it tracks typing).
-    /// Ticket 31: `collision` is the precomputed bind/port warning for the
-    /// live field values (computed per render by the caller, which owns the
-    /// rows snapshot); `form_error` is the shared first-error slot shown
-    /// inline under the fields. All owned strings — the built element keeps
-    /// no borrows.
-    /// Ticket 43: the params box is multiline with Format (pretty-print in
-    /// place) and Template (fill the per-protocol starter for the current
-    /// protocol field) buttons on both add and edit. Validation failures
-    /// name the JSON error inline via the shared `form_error` path at commit.
-    /// `show_test_url` renders the per-row probe-URL override (edit only —
-    /// the add dialog never implies a row exists yet).
-    /// Ticket 05 (signal-box): protocol-first mini-form — Server, Server
-    /// port, Identity sit under Protocol with a per-protocol hint; the raw
-    /// JSON box lives under the Advanced disclosure (collapsed on add,
-    /// expanded on edit; the toggle flips the shared cell and notifies, so
-    /// the next frame rebuilds). Guided and JSON swap, never stack; the
-    /// toggle rides the hint row when collapsed and the Params header row
-    /// when expanded. The Identity input hides for secret-free protocols
-    /// (its fold would write nowhere).
-    /// Auto-port budget readout — the ranges auto-assign fills from, and how
-    /// many stored rows already hold a port inside them. Manual out-of-range
-    /// ports never consume budget, so the count only climbs when exhaustion
-    /// can actually bite.
     fn port_budget_text(rows: &[ProxyConfig]) -> String {
         use crate::store::{
             AUTO_PORT_END, AUTO_PORT_SPILL_END, AUTO_PORT_SPILL_START, AUTO_PORT_START,
@@ -4028,14 +3366,6 @@ impl ConfigForm {
         format!("Auto ports: {used} of {total} in use (10801–10999, spill 18081–18380)")
     }
 
-    /// Config-completeness T03: one masked-secret-plus-generate row (the
-    /// VLESS and VMess uuid fields) — `id_prefix` pins `<prefix>-uuid` /
-    /// `<prefix>-uuid-generate`. Same kit pieces as the T02 inline row
-    /// (`Input` + `mask_toggle`, `.small()` `Button` + tooltip, honest
-    /// toast naming the protocol-neutral outcome).
-    /// Ticket 06: the label carries `*` (blank fails validation) and a
-    /// `Not Set`/`Already Set` presence caption rides under the row
-    /// (`<prefix>-uuid-state`; presence only, the value never renders).
     fn uuid_row(
         &self,
         view: &Entity<AppView>,
@@ -4094,13 +3424,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: one kit-maximal dropdown row — label-over
-    /// field with the hover copy on an outer wrapper (kit `Select` has no
-    /// tooltip slot — facet-bar precedent) and the T01 ENTER-guard on the
-    /// wrapper (kit `BaseSelect` propagates Confirm even with its popup
-    /// open; without the stop the picker's Enter pick would also commit a
-    /// half-filled row). Kit: `Select::new(&state)` +
-    /// `.id().small().accessibility_label()`.
     fn panel_select_row(
         label: &str,
         tip_id: &'static str,
@@ -4127,11 +3450,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: one outer collapsed disclosure per guided
-    /// page (a single header row at the 880x620 minimum — t11 pins the core
-    /// form in-frame; the full page is one click away). Closed content
-    /// unmounts, entities persist (R5). Kit: `Collapsible` (controlled
-    /// `open`) + `Button` toggle + `Label` caption.
     fn page_disclosure(
         caption: &str,
         caption_id: &'static str,
@@ -4166,13 +3484,7 @@ impl ConfigForm {
             .content(div().id(section_id).test_support().child(block))
     }
 
-    /// Ticket 06 (throne-adoption): shared Network box (S1, picker half) —
-    /// the stream transport network picker. The per-network disguise inputs
-    /// (ws path/host, httpupgrade/http host/path/method, grpc service name)
-    /// live in [`ConfigForm::s1_camouflage_section`] (the right-column
-    /// `Camouflage` box), so rare knobs stop crowding the transport row.
     fn s1_network_section(&self, view: &Entity<AppView>, _cx: &App) -> impl IntoElement {
-        // S1: Transport picker only — conditionals ride the Camouflage box.
         let network_select = self.s1_network.clone();
         let picker = field().label("Network".to_string()).child(
             div()
@@ -4223,13 +3535,6 @@ impl ConfigForm {
         )
     }
 
-    /// Ticket 06: shared Camouflage box (S1, disguise half) — the
-    /// per-network conditional inputs, always expanded (they are two rows
-    /// at most and only render for disguise-capable transports). `None`
-    /// for plain transports (tcp and friends carry no disguise keys), so
-    /// the right column stays honest about what applies. Same input ids
-    /// (`s1-path`/`s1-host`/`s1-method`/`s1-service-name`) as before the
-    /// split — only the box moved.
     fn s1_camouflage_section(&self, cx: &App) -> Option<AnyElement> {
         let network = Self::panel_value(&self.s1_network, cx, "tcp");
         let conditional = |id: &'static str, label: &str, state: &Entity<InputState>| {
@@ -4288,17 +3593,6 @@ impl ConfigForm {
         )
     }
 
-    /// Ticket 06: retired in favor of the split halves — pages render
-    /// [`ConfigForm::s1_network_section`] in the main form and the dialog
-    /// shell renders [`ConfigForm::s1_camouflage_section`] in the right
-    /// column.
-    /// Ticket 06 (throne-adoption): shared TLS box (S2, switch half) — the
-    /// enable toggle (optional variant) or the always-on note (forced
-    /// variant, the fold locks `security` instead). Credentials ride the
-    /// right-column `TLS Security` box ([`ConfigForm::s2_security_section`])
-    /// and the Advanced dialog's `TLS extras`
-    /// ([`ConfigForm::s2_extras_section`]), so rare knobs stop crowding the
-    /// TLS row. Same caption/toggle/content ids as before the split.
     fn s2_tls_section(
         &self,
         view: &Entity<AppView>,
@@ -4372,11 +3666,6 @@ impl ConfigForm {
         )
     }
 
-    /// Ticket 06: right-column `TLS Security` box — SNI, ALPN and the uTLS
-    /// fingerprint over the shared entities, always expanded (three rows;
-    /// the enable toggle stays on the left TLS box). Same input ids
-    /// (`s2-sni`/`s2-alpn`/`s2-fp`) as before the split — only the box
-    /// moved. Secret-free (hostnames and fingerprints, never keys).
     fn s2_security_section(&self, cx: &App) -> impl IntoElement {
         let _ = cx;
         let fp_select = self.s2_fp.clone();
@@ -4436,12 +3725,6 @@ impl ConfigForm {
         )
     }
 
-    /// Ticket 06: Advanced-dialog `TLS extras` — the testing-only insecure
-    /// switch plus the REALITY public key / short id over the shared
-    /// entities, always expanded. Same ids (`s2-insecure`/`s2-pbk`/
-    /// `s2-sid`) as before the split; rendered only in the Advanced dialog
-    /// ([`AppView::open_advanced_dialog`]), so rare knobs stay out of the
-    /// main form. Secret-free labels (presence only, never values).
     fn s2_extras_section(&self, repaint: &DialogRepaint) -> impl IntoElement {
         let s2_insecure = self.s2_insecure.clone();
         let s2_repaint_insecure = repaint.clone();
@@ -4497,24 +3780,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: shared TLS panel, optional variant (S2) —
-    /// the exact T02 section (enable toggle plus credential inputs;
-    /// disabling folds `security` away while every other key stays
-    /// preserved), shared by the vless/vmess/trojan pages.
-    /// Config-completeness T05: `forced` renders the MustTLS variant (same
-    /// credential inputs over the shared entities, no enable toggle — the
-    /// forced fold locks `security` to tls/reality instead); the caption
-    /// names the lock honestly.
-    /// Ticket 06: retired in favor of the split halves — pages render
-    /// [`ConfigForm::s2_tls_section`] in the main form,
-    /// [`ConfigForm::s2_security_section`] in the right column, and
-    /// [`ConfigForm::s2_extras_section`] in the Advanced dialog.
-    /// Config-completeness T03: shared Mux+Brutal panel (S3) — the exact
-    /// T02 section (`flow=vision` unmounts the section with reason text,
-    /// stored keys preserved, fold skipped; brutal forces On). `vision`
-    /// comes from the page's flow picker (true only on VLESS with
-    /// `xtls-rprx-vision`); every other page passes false. Kit:
-    /// `RadioGroup` (`selected_index` + `on_change`) + `Switch` + `Input`.
     fn s3_section(
         &self,
         view: &Entity<AppView>,
@@ -4522,8 +3787,6 @@ impl ConfigForm {
         cx: &App,
         vision: bool,
     ) -> AnyElement {
-        // S3: Mux+Brutal — `flow=vision` unmounts the section with reason
-        // text (stored keys preserved, fold skipped); brutal forces On.
         let _ = cx;
         if vision {
             return field().label_indent(false).child(
@@ -4646,20 +3909,12 @@ impl ConfigForm {
             .into_any_element()
     }
 
-    /// Config-completeness T03: shared dial-fields section (S4) — four
-    /// toggles plus timeout/bind inputs. Ticket 06 renders it in the
-    /// Advanced dialog only (see [`AppView::open_advanced_dialog`]): the
-    /// small sheet shows the whole section, no inner disclosure, so its
-    /// fields never wait on a repaint round-trip. Kit: `Switch` (`checked`
-    /// + `on_change` over shared cells) + `Input`.
     fn s4_section(
         &self,
         _view: &Entity<AppView>,
         repaint: &DialogRepaint,
         cx: &App,
     ) -> impl IntoElement {
-        // S4: Advanced dial — toggles plus timeout/bind inputs (TLS extras
-        // are a later ticket with their own engine `tls{}` mapping).
         let _ = cx;
         let dial_switch = |id: &'static str,
                            switch_id: &'static str,
@@ -4747,9 +4002,7 @@ impl ConfigForm {
                         .child(Input::new(&self.s4_inet6)),
                 ),
             );
-        // Ticket 06: the Advanced dialog shows the whole section (small
-        // dialog, everything visible) — no inner disclosure, so the dialog
-        // never depends on a repaint round-trip to reveal its fields.
+
         field().label_indent(false).child(
             div()
                 .flex()
@@ -4766,17 +4019,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: VMess guided page — uuid (+uuidgen button),
-    /// aid, cipher and packet_encoding inner plus the shared Network/TLS/Mux
-    /// panels (same section fns as VLESS — one rule, four pages; dial rides
-    /// the Advanced dialog). Rendered only
-    /// while the live protocol is `vmess`; every other protocol keeps its
-    /// form. The whole page rides ONE outer collapsed disclosure (a single
-    /// header row at the 880x620 minimum — t11 pins the core form in-frame).
-    /// Kit constructors/builders: `Select::new(&state)` +
-    /// `.id().small().accessibility_label()`, masked `Input` +
-    /// `mask_toggle`, `.small()` `Button` generator, `Field` + `v_form`
-    /// layout, outer-wrapper `Tooltip`s, `Label` captions.
     fn vmess_block(
         &self,
         view: &Entity<AppView>,
@@ -4812,8 +4054,7 @@ impl ConfigForm {
         block = block.child(self.s1_network_section(view, cx));
         block = block.child(self.s2_tls_section(view, repaint, cx, false));
         block = block.child(self.s3_section(view, repaint, cx, false));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         Self::page_disclosure(
             "VMess settings",
             "vmess-section-caption",
@@ -4825,11 +4066,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: Trojan guided page — masked password inner
-    /// plus the full shared Network/TLS/Mux panels (same section fns as
-    /// VLESS; dial rides the Advanced dialog).
-    /// Rendered only while the live protocol is `trojan`. Same kit set and
-    /// outer-disclosure contract as [`ConfigForm::vmess_block`].
     fn trojan_block(
         &self,
         view: &Entity<AppView>,
@@ -4846,8 +4082,7 @@ impl ConfigForm {
         block = block.child(self.s1_network_section(view, cx));
         block = block.child(self.s2_tls_section(view, repaint, cx, false));
         block = block.child(self.s3_section(view, repaint, cx, false));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         Self::page_disclosure(
             "Trojan settings",
             "trojan-section-caption",
@@ -4859,15 +4094,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: Shadowsocks guided page — method, password,
-    /// plugin, plugin_opts and uot inner with Mux-only Settings (no
-    /// Transport/Security panels — Throne HasMux parity) plus the shared
-    /// Advanced-dialog S4 dial (dial fields only — no TLS section, HasTLS
-    /// gating).
-    /// Same kit set and outer-disclosure contract as
-    /// [`ConfigForm::vmess_block`]. The plugin footer is honest: any
-    /// non-empty plugin fails generate naming the field until its
-    /// executable sits beside the engine.
     fn shadowsocks_block(
         &self,
         view: &Entity<AppView>,
@@ -4931,8 +4157,7 @@ impl ConfigForm {
             ));
         }
         block = block.child(self.s3_section(view, repaint, cx, false));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         Self::page_disclosure(
             "Shadowsocks settings",
             "ss-section-caption",
@@ -4944,13 +4169,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T04: the nine shared WireGuard peer/net rows
-    /// (private key + keygen, peer public/preshared keys, reserved,
-    /// keepalive, local address, DNS, MTU, workers, sys_ifc) — one helper
-    /// behind the WG and AWG pages (separate entities per page, one render
-    /// rule). Kit constructors/builders: masked `Input` + `mask_toggle`,
-    /// `.small()` `Button` generator (uuid-row precedent), `Switch`
-    /// (`checked` + `on_change` over the shared cell), `Field` layout.
     fn wg_peer_block(
         &self,
         view: &Entity<AppView>,
@@ -5084,10 +4302,6 @@ impl ConfigForm {
             )
     }
 
-    /// Config-completeness T04: WireGuard guided page — the shared peer/net
-    /// rows plus the Advanced-dialog S4 dial (no Transport/TLS/Mux — endpoint
-    /// parity). Rendered only while the live protocol is `wireguard`. Same
-    /// outer-disclosure contract as [`ConfigForm::vmess_block`].
     fn wireguard_block(
         &self,
         view: &Entity<AppView>,
@@ -5113,8 +4327,7 @@ impl ConfigForm {
                 sys_ifc: &self.wg_sys_ifc,
             },
         ));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("wg-notes").test_support().child(
                 "WireGuard rows become endpoints[] at generate. Blank AllowedIPs defaults to \
@@ -5132,14 +4345,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T04: AmneziaWG guided page (headline) — all WG
-    /// peer/net rows + enable marker + `awg_version` 2.0|3.x picker + the
-    /// full J/S/H/I matrix + v3 fields + trailers/cookies switches, plus
-    /// the Advanced-dialog S4 dial. The v3 section hides unless 3.x is picked
-    /// (entities persist, the fold always folds — R5 hide-preserve, never a
-    /// wipe). Rendered only while the live protocol is `amneziawg`. Same
-    /// kit set and outer-disclosure contract as
-    /// [`ConfigForm::wireguard_block`].
     fn amneziawg_block(
         &self,
         view: &Entity<AppView>,
@@ -5241,8 +4446,7 @@ impl ConfigForm {
             .child(row("awg-i3", "I3", &self.awg_i3))
             .child(row("awg-i4", "I4", &self.awg_i4))
             .child(row("awg-i5", "I5", &self.awg_i5));
-        // Version-gated v3 section: hidden inputs persist (entities stand,
-        // the fold always folds) — hiding never wipes per R5.
+
         if Self::panel_value(&self.awg_version, cx, "") == "3.x" {
             block = block.child(caption("awg-v3-caption", "v3-only fields"));
             block = block
@@ -5299,8 +4503,7 @@ impl ConfigForm {
                 ),
             );
         }
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("awg-notes").test_support().child(
                 "AmneziaWG rows run in the fork sidecar (sing-box-awg). v3-only keys on a 2.0 row \
@@ -5318,23 +4521,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T05: Hysteria guided page — one page for both
-    /// `hysteria` (v1) and `hysteria2` (v2). The version RadioGroup switches
-    /// the protocol on Add (pristine-template machinery does the rewrite);
-    /// on Edit the type is locked so the version renders as read-only text
-    /// (Throne §7.7 parity). Common rows (server_ports/hop_interval/
-    /// up/down/obfs) persist across the toggle; v1-only (auth_type/auth/
-    /// recv_window(_conn)/disable_mtu_discovery) vs v2-only (password)
-    /// layouts swap as kit primitives with hidden halves preserved in their
-    /// entities (R5 — the fold always folds both halves, credentials excepted:
-    /// each folds only where its engine arm consumes it). Plus the shared
-    /// S2-forced panels (S4 dial rides the Advanced dialog). Same kit set and
-    /// outer-disclosure contract as
-    /// [`ConfigForm::wireguard_block`]: `RadioGroup` (`selected_index` +
-    /// `on_change`), `Select::new(&state)` +
-    /// `.id().small().accessibility_label()`, masked `Input` +
-    /// `mask_toggle`, `Switch` (`checked` + `on_change`), `Field` layout,
-    /// outer-wrapper `Tooltip`s, `Label` captions, honest footer.
     fn hysteria_block(
         &self,
         view: &Entity<AppView>,
@@ -5470,8 +4656,7 @@ impl ConfigForm {
             ));
         }
         block = block.child(self.s2_tls_section(view, repaint, cx, true));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("hy-notes").test_support().child(
                 "Hysteria v1 rows require up/down (blank refuses naming up_mbps/down_mbps); \
@@ -5489,13 +4674,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T05: TUIC guided page — uuid (+uuidgen button) +
-    /// password secrets, congestion_control + udp_relay_mode keep-blank
-    /// pickers, udp_over_stream + zero_rtt switches, heartbeat text, plus the
-    /// shared S2-forced panels (S4 dial rides the Advanced dialog). Rendered
-    /// only while the live protocol is
-    /// `tuic`. Same kit set and outer-disclosure contract as
-    /// [`ConfigForm::hysteria_block`].
     fn tuic_block(
         &self,
         view: &Entity<AppView>,
@@ -5576,8 +4754,7 @@ impl ConfigForm {
             ),
         );
         block = block.child(self.s2_tls_section(view, repaint, cx, true));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("tuic-notes").test_support().child(
                 "TUIC runs TLS always-on (security locked tls). Blank congestion/relay stay unset.",
@@ -5594,16 +4771,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T06: SOCKS guided page — version + network
-    /// keep-blank/S1-rule pickers, username/password texts, udp_over_tcp
-    /// switch, plus the Advanced-dialog S4 dial (no Transport/TLS/Mux — inner
-    /// parity). Rendered only while the live protocol is `socks`. The footer
-    /// is honest: blank version leaves the stock 5, and 4 fails generate
-    /// naming the field. Same kit set and outer-disclosure contract as
-    /// [`ConfigForm::tuic_block`]: `Select::new(&state)` +
-    /// `.id().small().accessibility_label()`, masked `Input` +
-    /// `mask_toggle`, `Switch` (`checked` + `on_change`), `Field` layout,
-    /// outer-wrapper `Tooltip`s, `Label` captions.
     fn socks_block(
         &self,
         view: &Entity<AppView>,
@@ -5659,8 +4826,7 @@ impl ConfigForm {
                 ),
             ),
         );
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("socks-notes").test_support().child(
                 "SOCKS serves version 5 stock (blank leaves the default); 4 fails generate \
@@ -5678,14 +4844,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T06: HTTP/HTTPS guided page — username/password/
-    /// path/headers texts (path/headers are parity+: Throne `edit_http.ui`
-    /// lacks them, both engines accept them) plus the shared S2-optional
-    /// (S4 dial rides the Advanced dialog). One block serves both `http` and
-    /// `https` (hysteria v1/v2 precedent — one entity set, two protocols).
-    /// The footer is honest: `https` rows serve TLS-on even with the panel
-    /// off, and `check` judges the headers shape. Same kit set and outer-disclosure contract as
-    /// [`ConfigForm::socks_block`].
     fn http_block(
         &self,
         view: &Entity<AppView>,
@@ -5725,8 +4883,7 @@ impl ConfigForm {
                 ),
             );
         block = block.child(self.s2_tls_section(view, repaint, cx, false));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("http-notes").test_support().child(
                 "HTTPS rows serve TLS-on (security=tls) even with the panel off. \
@@ -5744,13 +4901,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T06: AnyTLS guided page — masked password secret
-    /// plus the idle-session tunables (interval/timeout durations, min
-    /// count), plus the shared S2-forced panels (S4 dial rides the Advanced
-    /// dialog). Rendered only while the
-    /// live protocol is `anytls`. The footer is honest about the duration
-    /// shapes. Same kit set and outer-disclosure contract as
-    /// [`ConfigForm::socks_block`].
     fn anytls_block(
         &self,
         view: &Entity<AppView>,
@@ -5790,8 +4940,7 @@ impl ConfigForm {
                 ),
             );
         block = block.child(self.s2_tls_section(view, repaint, cx, true));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("anytls-notes").test_support().child(
                 "AnyTLS runs TLS always-on (security locked tls). Interval/timeout are \
@@ -5809,13 +4958,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T06: Naïve guided page — username + masked
-    /// password secrets, uot/quic switches, congestion_control keep-blank
-    /// picker, plus the shared S2-forced panels (S4 dial rides the Advanced
-    /// dialog). Rendered only while the
-    /// live protocol is `naive`. The footer is honest about the 1.14.2
-    /// shapes. Same kit set and outer-disclosure contract as
-    /// [`ConfigForm::socks_block`].
     fn naive_block(
         &self,
         view: &Entity<AppView>,
@@ -5888,8 +5030,7 @@ impl ConfigForm {
             &self.naive_cc,
         ));
         block = block.child(self.s2_tls_section(view, repaint, cx, true));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("naive-notes").test_support().child(
                 "Naïve runs TLS always-on (security locked tls). Blank congestion control \
@@ -5907,15 +5048,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T06: SSH guided page — user text, masked password
-    /// secret, private-key blob area + path input + Browse picker + masked
-    /// passphrase, host-key + algs comma lists, client version, plus the
-    /// Advanced-dialog S4 dial (no TLS — inner parity). Rendered only while the
-    /// live protocol is `ssh`. The key area is a kit `Textarea` (Throne
-    /// text-area parity; `Input::mask_toggle` exists only on `Input` in kit
-    /// 0.6.6, so the blob stays visible while both secrets stay masked). The
-    /// footer is honest about the JSON-only remainder. Same kit set and
-    /// outer-disclosure contract as [`ConfigForm::socks_block`].
     fn ssh_block(
         &self,
         view: &Entity<AppView>,
@@ -6018,8 +5150,7 @@ impl ConfigForm {
                         .child(Input::new(&self.ssh_client_version)),
                 ),
             );
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("ssh-notes").test_support().child(
                 "Browse fills the path and loads the key file (no hand-paste). Host key \
@@ -6037,12 +5168,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T07: Snell guided page — masked psk secret +
-    /// version picker + obfs_mode/host + userkey + reuse Switch + network +
-    /// mode texts, plus the Advanced-dialog S4. Engine-driven list (the Throne
-    /// source snapshot has zero `snell` hits, so there is no Throne editor to
-    /// copy — fields come from `engine.rs` + `import.rs`). Same kit set and
-    /// outer-disclosure contract as [`ConfigForm::socks_block`].
     fn snell_block(
         &self,
         view: &Entity<AppView>,
@@ -6118,8 +5243,7 @@ impl ConfigForm {
                 ),
             ),
         );
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("snell-notes").test_support().child(
                 "Snell serves version 4 when blank; 6 needs a v6 peer. \
@@ -6137,11 +5261,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T07: ShadowTLS guided page (version picker 1|2|3
-    /// with password text, plus the shared S2-forced (S4 dial rides the
-    /// Advanced dialog). Rendered
-    /// only while the live protocol is `shadowtls`. Same kit set and
-    /// outer-disclosure contract as [`ConfigForm::socks_block`].
     fn shadowtls_block(
         &self,
         view: &Entity<AppView>,
@@ -6165,8 +5284,7 @@ impl ConfigForm {
                 cx,
             ));
         block = block.child(self.s2_tls_section(view, repaint, cx, true));
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
+
         block = block.child(field().label_indent(false).child(
             div().id("shadowtls-notes").test_support().child(
                 "ShadowTLS runs TLS always-on (security locked tls). Version blank takes \
@@ -6184,13 +5302,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T07: Xray-VLESS Ph1 guided page (uuid with uuidgen,
-    /// encryption, flow picker, sni/fp/alpn, REALITY pbk/sid/spiderx,
-    /// Xray-network picker, mode text, xray-mux picker). No shared panels
-    /// (the bridge serves the Ph1 subset, so S4 dial keys would be dead there;
-    /// the footer says what stays JSON-only). Ph2-only keys already in the
-    /// box are preserved untouched (never stripped). Same kit set and
-    /// outer-disclosure contract as [`ConfigForm::socks_block`].
     fn xray_block(
         &self,
         view: &Entity<AppView>,
@@ -6306,12 +5417,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T07: chain hop-list editor — ordered hop rows
-    /// (name + protocol labels, per-hop Replace/Remove) plus the library
-    /// picker + Add, with Throne rejection rules (no chain hops, at most one
-    /// extracore hop at index 0 — refusals toast naming the rule). Empty hops
-    /// render a kit `Empty`, never a hand-rolled placeholder. Same kit set
-    /// and outer-disclosure contract as [`ConfigForm::socks_block`].
     fn chain_block(
         &self,
         view: &Entity<AppView>,
@@ -6462,11 +5567,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T07: extra-core picker page — exe path text +
-    /// Browse (fills the path, never reads the binary) + args text + config
-    /// textarea. Deliberately no `no_logs` control anywhere (Throne
-    /// non-persist bug — never copied). Same kit set and outer-disclosure
-    /// contract as [`ConfigForm::socks_block`].
     fn extra_block(
         &self,
         view: &Entity<AppView>,
@@ -6548,21 +5648,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T02: VLESS guided page — inner fields plus the
-    /// shared Network/TLS/Mux panels as kit-maximal `Collapsible` sections
-    /// (controlled
-    /// `open`, no motion id — closed content unmounts, entities persist, so
-    /// hiding never wipes per R5). Rendered only while the live protocol is
-    /// `vless`; every other protocol keeps the T01 form byte-for-byte.
-    /// The whole page rides ONE outer collapsed disclosure (a single header
-    /// row at the 880x620 minimum — t11 pins the core form in-frame; seven
-    /// open rows would push it out).
-    /// Kit constructors/builders: `Select::new(&state)` +
-    /// `.id().small().accessibility_label()`, `Input` (+ masked `uuid` with
-    /// `mask_toggle`), `Button` (+ `.small()` generators), `RadioGroup`
-    /// (`selected_index` + `on_change`, interval-picker precedent),
-    /// `Switch` (`checked` + `on_change` over shared cells), `Field` +
-    /// `v_form` layout, outer-wrapper `Tooltip`s, `Label` captions.
     fn vless_block(
         &self,
         view: &Entity<AppView>,
@@ -6570,7 +5655,7 @@ impl ConfigForm {
         cx: &App,
     ) -> impl IntoElement {
         let mut block = div().flex().flex_col().gap_2();
-        // Inner: uuid (masked + generate) + flow + packet_encoding.
+
         block = block.child(self.uuid_row(view, &self.vless_uuid, "vless", cx));
         let flow_select = self.vless_flow.clone();
         let packet_select = self.vless_packet_encoding.clone();
@@ -6614,18 +5699,14 @@ impl ConfigForm {
                     ),
             ),
         );
-        // S1: Transport picker (shared section — see `s1_network_section`).
+
         block = block.child(self.s1_network_section(view, cx));
-        // S2: TLS, optional variant (shared section — see `s2_section`).
+
         block = block.child(self.s2_tls_section(view, repaint, cx, false));
-        // S3: Mux+Brutal (shared section — see `s3_section`).
+
         let flow = Self::panel_value(&self.vless_flow, cx, "");
         block = block.child(self.s3_section(view, repaint, cx, flow == "xtls-rprx-vision"));
-        // S4: Advanced dial (shared section — see `s4_section`).
-        // Ticket 06: dial fields ride the Advanced dialog (see
-        // `open_advanced_dialog`), never the main form.
-        // One outer collapsed disclosure: a single header row at the minimum
-        // frame (t11), the full page one click away.
+
         Self::page_disclosure(
             "VLESS settings",
             "vless-section-caption",
@@ -6649,9 +5730,7 @@ impl ConfigForm {
         let bind = self.bind.read(cx).value().to_string();
         let protocol_text = self.protocol_text(cx);
         let guided = guided_identity_fields(&protocol_text);
-        // Config-completeness T01: virtual rows (chain/custom-*/extra-core)
-        // carry no endpoint address — the guided Server/Server port inputs
-        // hide for these (Throne gating parity).
+
         let virtual_row = is_virtual_protocol(&protocol_text);
         let format_view = view.clone();
         let format_params = self.params.clone();
@@ -6662,14 +5741,9 @@ impl ConfigForm {
         let validate_params = self.params.clone();
         let validate_form = self.clone();
         let expanded = *self.advanced.borrow();
-        // Pre-clone for the toggle buttons (both placements borrow this,
-        // never `self` — the assembly below moves `self`'s fields).
+
         let toggle_form = self.clone();
-        // Config-completeness T02/T03: the guided page builds here, before
-        // the assembly below moves `self`'s fields (each `*_block` borrows
-        // `&self`; the built element owns entity/Rc clones, so the borrow
-        // ends before the first move). One page per protocol — every other
-        // protocol keeps the T01 form byte-for-byte.
+
         let guided_panels = if expanded {
             None
         } else {
@@ -6691,15 +5765,13 @@ impl ConfigForm {
                     Some(self.hysteria_block(&view, &repaint, cx).into_any_element())
                 }
                 "tuic" => Some(self.tuic_block(&view, &repaint, cx).into_any_element()),
-                // Config-completeness T06: small matrices — one page per
-                // protocol (http/https share one block, hysteria precedent).
+
                 "socks" => Some(self.socks_block(&view, &repaint, cx).into_any_element()),
                 "http" | "https" => Some(self.http_block(&view, &repaint, cx).into_any_element()),
                 "anytls" => Some(self.anytls_block(&view, &repaint, cx).into_any_element()),
                 "naive" => Some(self.naive_block(&view, &repaint, cx).into_any_element()),
                 "ssh" => Some(self.ssh_block(&view, &repaint, cx).into_any_element()),
-                // Config-completeness T07: edge pages (Snell/ShadowTLS engine
-                // shapes, Xray Ph1 subset, chain hops, extra-core picker).
+
                 "snell" => Some(self.snell_block(&view, &repaint, cx).into_any_element()),
                 "shadowtls" => Some(self.shadowtls_block(&view, &repaint, cx).into_any_element()),
                 "xray" => Some(self.xray_block(&view, &repaint, cx).into_any_element()),
@@ -6708,20 +5780,13 @@ impl ConfigForm {
                 _ => None,
             }
         };
-        // Ticket 05: guided and JSON swap (never stack) — each mode stays
-        // near the old form's height, so no mode pushes content below the
-        // fold. Server + Server port share one row; the toggle rides the
-        // hint row when collapsed and the params buttons row when expanded.
+
         let params_row = div()
             .id("field-params")
             .test_support()
             .flex()
             .flex_col()
             .gap_1()
-            // Ticket 05: the toggle rides the Params header row (section
-            // title plus collapse action) — the buttons row below keeps its
-            // exact three-button width, so expanded mode fits the minimum
-            // frame like the old form did.
             .child(
                 div()
                     .flex()
@@ -6735,8 +5800,6 @@ impl ConfigForm {
                         &toggle_form,
                     )),
             )
-            // Ticket 11: 96px instead of 120 — the Add form (6 fields +
-            // footer) must paint inside the 880x620 minimum frame.
             .child(Textarea::new(&self.params).h(px(96.)))
             .child(
                 div()
@@ -6779,25 +5842,9 @@ impl ConfigForm {
                         },
                     )),
             );
-        // Ticket 11: small density on the form grid — the Add form (6 fields +
-        // footer) must paint inside the 880x620 minimum frame.
-        // Ticket T03 (gpui-18-sweep CAP-3): the body composes on kit `v_form`
-        // + `field()` — each field keeps its pinned wrapper id on an inner
-        // div (kit `Field` re-keys its own node by column index, so the
-        // anchor rides one level down). Guided and JSON swap, never stack:
-        // the raw JSON box rides a kit `Collapsible` Advanced section
-        // (controlled `open`, no motion id — closed content unmounts).
-        // Server + Server port share one side-by-side row of nested kit
-        // fields, as do bind + port (stacked rows would push the port readout
-        // below the minimum-frame fold — verified by
-        // `t11_add_dialog_paints_inside_minimum_frame`); the toggle rides the
-        // hint row when collapsed and the params buttons row when expanded.
+
         let mut form = v_form().small();
-        // Ticket 06: the Common box head (Type/Name/Server/Server port/
-        // Identity + Advanced Settings button) — caption plus the second
-        // dialog opener; the rows join below (protocol row next, endpoint
-        // rows in the guided branch). `*` marks required fill-ins; hover
-        // copy stays secret-free by construction (static strings only).
+
         let mut common_head = div().flex().flex_row().items_center().gap_2().child(
             div()
                 .flex_1()
@@ -6829,12 +5876,7 @@ impl ConfigForm {
                     ),
             ),
         );
-        // Config-completeness T01: protocol is a kit `Select` over the 23
-        // canonical types on Add (no free-text typos possible) and read-only
-        // `protocol-lock` text on Edit (type locked once created, Throne §7.7
-        // parity). Kit constructors/builders: `Select::new(&state)` +
-        // `.id().small().accessibility_label()`; the hover copy rides an outer
-        // wrapper (kit `Select` has no tooltip slot — facet-bar precedent).
+
         if self.protocol_locked {
             let locked = self.locked_protocol.clone();
             common = common.child(
@@ -6860,15 +5902,6 @@ impl ConfigForm {
                             cx.new(|_| Tooltip::new("Protocol (locked after creation)".to_string()))
                                 .into()
                         })
-                        // T01 ENTER-guard: kit `BaseSelect` propagates Confirm even
-                        // with its popup open (verified gpui-base 0.6.6
-                        // `select.rs`: the Confirm handler calls `cx.propagate()`
-                        // before the open check, while Cancel stops) and the dialog
-                        // host commits on any bubbled Confirm — without this stop
-                        // the picker's Enter pick would also commit a half-filled
-                        // row (audit §10.9 incident). The inner kit handlers (list
-                        // pick, popup close, trigger refocus) already ran, so only
-                        // the dialog commit is suppressed here.
                         .on_action(|_: &Confirm, _: &mut Window, cx: &mut App| {
                             cx.stop_propagation();
                         })
@@ -6881,12 +5914,7 @@ impl ConfigForm {
                 ),
             );
         }
-        // Ticket 06: two-column Throne regroup — the Common box and the
-        // `<Type>` box ride the left column, `TLS Security` + `Camouflage`
-        // ride the right column where applicable. The guided/JSON swap keeps
-        // its contract (expanded shows the raw box only — rare knobs live
-        // in the Advanced dialog either way). Folds, validation and the
-        // params toggle flow below never read layout.
+
         let has_page = guided_panels.is_some();
         let camouflage = if has_page && has_network_panel(&protocol_text) {
             self.s1_camouflage_section(cx)
@@ -6907,14 +5935,6 @@ impl ConfigForm {
                     .child(Collapsible::new().open(expanded).content(params_row)),
             );
         } else {
-            // The endpoint rows join the Common box (side-by-side Server /
-            // Server port, the optional masked Identity, then the hint +
-            // raw-JSON toggle row).
-            // Config-completeness T01: virtual rows hide the endpoint inputs
-            // (see `virtual_row` above); Identity already hides for these via
-            // the `guided.key` gate below, and the params JSON keeps its slots
-            // for explicit edits. Hidden values are never wiped (fold no-ops
-            // on blank inputs).
             if !virtual_row {
                 common = common.child(
                     div()
@@ -6968,11 +5988,7 @@ impl ConfigForm {
                         ),
                 );
             }
-            // Ticket 06: the generic Identity row hides where the `<Type>`
-            // box owns the same secret (see [`block_owns_identity`]) — one
-            // password input, never two stacked duplicates. The label names
-            // the live params key with a `*`; the presence caption reads
-            // `Not Set`/`Already Set` (the value never renders).
+
             if guided.is_some_and(|guided| guided.key.is_some())
                 && !block_owns_identity(&protocol_text)
             {
@@ -7075,7 +6091,7 @@ impl ConfigForm {
                 ),
             );
         }
-        // Ticket 43: per-row probe override lives on edit only.
+
         if show_test_url {
             form = form.child(dialog_field(
                 "field-test-url",
@@ -7113,11 +6129,6 @@ impl ConfigForm {
         form
     }
 
-    /// Ticket 31: move keyboard focus to the named field's input
-    /// (`name`/`protocol`/`params`/`group`/`bind_ip`/`port`). Unknown names
-    /// focus nothing (never a wrong field).
-    /// Config-completeness T01: `protocol` is a kit `Select`, not a text
-    /// input — focus its trigger on Add; a locked Edit row focuses nothing.
     fn focus_field(&self, field: &str, window: &mut Window, cx: &mut App) {
         if field == "protocol" {
             if !self.protocol_locked {
@@ -7127,8 +6138,7 @@ impl ConfigForm {
             }
             return;
         }
-        // Ticket 43: `params` is a textarea state — every arm converts to
-        // the shared [`AnyInputState`] (the match cannot mix entity types).
+
         let target: Option<AnyInputState> = match field {
             "name" => Some(AnyInputState::from(self.name.clone())),
             "params" => Some(AnyInputState::from(self.params.clone())),
@@ -7154,24 +6164,6 @@ impl ConfigForm {
         }
     }
 
-    /// Ticket 05: params at commit — the raw JSON box text with non-blank
-    /// guided mini-form values folded in (server, server port, the
-    /// protocol's identity key). Blank guided inputs change nothing, so an
-    /// untouched template and an untouched edit row commit byte-identical
-    /// params (validation still names every missing field inline).
-    /// Config-completeness T02/T03: on guided pages the inner fields plus
-    /// the attached shared panels fold in the same byte-identical way —
-    /// vless/vmess/trojan take S1/S2/S4 (S3 unless vision-disabled on
-    /// vless), shadowsocks takes S3+S4 only (Mux-only Settings, Throne
-    /// HasMux parity); any other protocol skips the panels outright so a
-    /// type switch can never smear guided keys onto foreign rows.
-    /// Config-completeness T06: socks/ssh take S4 alone, http/https take
-    /// S2-optional + S4, anytls/naive take S2-forced + S4 (see
-    /// [`ConfigForm::effective_params`]).
-    /// Config-completeness T07: snell takes S4 alone, shadowtls takes
-    /// S2-forced + S4, xray/chain/extra-core take no shared panels (the xray
-    /// bridge serves the Ph1 subset — S4 dial keys would be dead there; the
-    /// chain/extra rows carry no endpoint tuning).
     fn effective_params(&self, cx: &App) -> String {
         let params = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -7252,10 +6244,7 @@ impl ConfigForm {
                 let params = fold_tls_forced_into_params(&params, &self.tls_forced_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
             }
-            // Config-completeness T06: small matrices — each page folds
-            // exactly what it renders (never smears keys onto foreign rows).
-            // SOCKS/SSH take S4 alone; HTTP(S) takes S2-optional; AnyTLS and
-            // Naïve take S2-forced.
+
             "socks" => {
                 let params = fold_socks_into_params(&params, &self.socks_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
@@ -7279,9 +6268,7 @@ impl ConfigForm {
                 let params = fold_ssh_into_params(&params, &self.ssh_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
             }
-            // Config-completeness T07: edge pages fold exactly what they
-            // render (same scoping rule as T06 — never smear keys onto
-            // foreign rows).
+
             "snell" => {
                 let params = fold_snell_into_params(&params, &self.snell_fold(cx));
                 fold_dial_into_params(&params, &self.dial_fold(cx))
@@ -7298,8 +6285,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02: read one panel dropdown (default when the
-    /// Select holds no selection, so reads never invent a type).
     fn panel_value(
         select: &Entity<SelectState<PanelChoiceList>>,
         cx: &App,
@@ -7312,8 +6297,6 @@ impl ConfigForm {
             .unwrap_or_else(|| default.to_string())
     }
 
-    /// Config-completeness T02: VLESS inner texts in fold order
-    /// (uuid, flow, packet_encoding).
     fn vless_inner_values(&self, cx: &App) -> (String, String, String) {
         (
             self.vless_uuid.read(cx).value().to_string(),
@@ -7322,9 +6305,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: VMess inner texts in fold order (uuid, aid,
-    /// cipher, packet_encoding). The cipher picker falls back to `auto`
-    /// (the sing-box default) when the row carries none.
     fn vmess_inner_values(&self, cx: &App) -> (String, String, String, String) {
         (
             self.vmess_uuid.read(cx).value().to_string(),
@@ -7334,10 +6314,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T03: Shadowsocks inner texts in fold order
-    /// (method, password, plugin, plugin_opts, uot). The method/plugin
-    /// pickers fall back to blank ("no selection" — the fold never
-    /// fabricates nor strips).
     fn ss_inner_values(&self, cx: &App) -> (String, String, String, String, bool) {
         (
             Self::panel_value(&self.ss_method, cx, ""),
@@ -7348,10 +6324,6 @@ impl ConfigForm {
         )
     }
 
-    /// Config-completeness T04: WireGuard inner texts in fold order — read
-    /// from the WG page (`page == "wireguard"`) or the AWG page (same slots,
-    /// separate entities). The version/matrix half reads through
-    /// [`ConfigForm::amnezia_fold`].
     fn wireguard_fold(&self, cx: &App, page: &str) -> WireguardFold {
         let awg = page == "amneziawg";
         WireguardFold {
@@ -7408,9 +6380,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T04: AmneziaWG matrix UI state as a store fold.
-    /// Always reads every field regardless of the live version selection —
-    /// the fold never branches on version (R5 hide-preserve).
     fn amnezia_fold(&self, cx: &App) -> AmneziaFold {
         AmneziaFold {
             enable_amnezia: *self.awg_enable.borrow(),
@@ -7443,9 +6412,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T05: Hysteria inner UI state as a store fold.
-    /// Reads every field regardless of the live layout — the store fold
-    /// branches only on the credential (R5 hide-preserve).
     fn hysteria_fold(&self, cx: &App) -> HysteriaFold {
         HysteriaFold {
             server_ports: self.hy_server_ports.read(cx).value().to_string(),
@@ -7462,7 +6428,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T05: TUIC inner UI state as a store fold.
     fn tuic_fold(&self, cx: &App) -> TuicFold {
         TuicFold {
             uuid: self.tuic_uuid.read(cx).value().to_string(),
@@ -7475,9 +6440,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T06: SOCKS inner UI state as a store fold. The
-    /// version/network pickers fall back to blank/"tcp" (the fold never
-    /// fabricates a version; "tcp" restores the S1-rule default).
     fn socks_fold(&self, cx: &App) -> SocksFold {
         SocksFold {
             version: Self::panel_value(&self.socks_version, cx, ""),
@@ -7488,8 +6450,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T06: HTTP/HTTPS inner UI state as a store fold
-    /// (one entity set, both protocols — hysteria v1/v2 precedent).
     fn http_fold(&self, cx: &App) -> HttpFold {
         HttpFold {
             username: self.http_username.read(cx).value().to_string(),
@@ -7499,7 +6459,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T06: AnyTLS inner UI state as a store fold.
     fn anytls_fold(&self, cx: &App) -> AnytlsFold {
         AnytlsFold {
             password: self.anytls_password.read(cx).value().to_string(),
@@ -7509,8 +6468,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T06: Naïve inner UI state as a store fold. The cc
-    /// picker falls back to blank (never fabricated — contract C2).
     fn naive_fold(&self, cx: &App) -> NaiveFold {
         NaiveFold {
             username: self.naive_username.read(cx).value().to_string(),
@@ -7521,7 +6478,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T06: SSH inner UI state as a store fold.
     fn ssh_fold(&self, cx: &App) -> SshFold {
         SshFold {
             user: self.ssh_user.read(cx).value().to_string(),
@@ -7535,9 +6491,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T07: Snell inner UI state as a store fold. The
-    /// version picker falls back to blank (engine default 4 — never
-    /// fabricated, contract C2).
     fn snell_fold(&self, cx: &App) -> SnellFold {
         SnellFold {
             psk: self.snell_psk.read(cx).value().to_string(),
@@ -7551,8 +6504,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T07: ShadowTLS inner UI state as a store fold
-    /// (version keep-blank, password text — the page adds S2-forced + S4).
     fn shadowtls_fold(&self, cx: &App) -> ShadowTlsFold {
         ShadowTlsFold {
             version: Self::panel_value(&self.shadowtls_version, cx, ""),
@@ -7560,8 +6511,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T07: Xray-VLESS Ph1 UI state as a store fold. All
-    /// three pickers fall back to blank (never fabricated — contract C2).
     fn xray_fold(&self, cx: &App) -> XrayFold {
         XrayFold {
             uuid: self.xray_uuid.read(cx).value().to_string(),
@@ -7579,7 +6528,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T07: extra-core inner UI state as a store fold.
     fn extra_fold(&self, cx: &App) -> ExtraFold {
         ExtraFold {
             exe: self.extra_exe.read(cx).value().to_string(),
@@ -7588,9 +6536,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T05: S2-forced UI state as a store fold — the
-    /// shared S2 entities (the enable cell never renders on forced pages, so
-    /// it never folds there either).
     fn tls_forced_fold(&self, cx: &App) -> TlsForcedFold {
         TlsForcedFold {
             sni: self.s2_sni.read(cx).value().to_string(),
@@ -7602,7 +6547,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02: S1 UI state as a store fold.
     fn transport_fold(&self, cx: &App) -> TransportFold {
         TransportFold {
             network: Self::panel_value(&self.s1_network, cx, "tcp"),
@@ -7613,7 +6557,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02: S2 UI state as a store fold.
     fn tls_optional_fold(&self, cx: &App) -> TlsOptionalFold {
         TlsOptionalFold {
             enable: *self.s2_enable.borrow(),
@@ -7626,9 +6569,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02: effective S3 mode — brutal forces On
-    /// (Throne parity); the stored cell is untouched so unsetting brutal
-    /// restores the picked mode.
     fn s3_effective_mode(&self) -> String {
         if *self.s3_brutal.borrow() {
             "on".to_string()
@@ -7637,8 +6577,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02: S3 UI state as a store fold (effective
-    /// mode — brutal-forced On folds as `on`).
     fn mux_fold(&self, cx: &App) -> MuxFold {
         MuxFold {
             mode: self.s3_effective_mode(),
@@ -7648,7 +6586,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02: S4 UI state as a store fold.
     fn dial_fold(&self, cx: &App) -> DialFold {
         DialFold {
             reuse_addr: *self.s4_reuse.borrow(),
@@ -7662,13 +6599,6 @@ impl ConfigForm {
         }
     }
 
-    /// Ticket 05: expand direction of the Advanced swap — merge non-blank
-    /// guided values into the JSON box, then clear the guided inputs when
-    /// the box parses as an object. A garbage box keeps the inputs, so
-    /// nothing is ever lost (the commit fold reports that error instead).
-    /// Config-completeness T02/T03: on guided pages the panels merge and
-    /// clear the same way (one truth after expand); other protocols keep
-    /// the guided-only behavior byte-for-byte.
     fn expand_merge(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -7681,8 +6611,7 @@ impl ConfigForm {
             identity,
             self.guided_identity.read(cx).value().as_ref(),
         );
-        // Each page folds exactly what it renders (never smears keys onto
-        // foreign rows); the clear below resets exactly what was merged.
+
         let page = matches!(
             protocol.as_str(),
             "vless"
@@ -7778,8 +6707,7 @@ impl ConfigForm {
                     merged = fold_tls_forced_into_params(&merged, &self.tls_forced_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
                 }
-                // Config-completeness T06: small matrices merge exactly what
-                // their pages render (same scoping as `effective_params`).
+
                 "socks" => {
                     merged = fold_socks_into_params(&merged, &self.socks_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
@@ -7803,8 +6731,7 @@ impl ConfigForm {
                     merged = fold_ssh_into_params(&merged, &self.ssh_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
                 }
-                // Config-completeness T07: edge pages merge exactly what
-                // their pages render (same scoping as `effective_params`).
+
                 "snell" => {
                     merged = fold_snell_into_params(&merged, &self.snell_fold(cx));
                     merged = fold_dial_into_params(&merged, &self.dial_fold(cx));
@@ -7852,17 +6779,7 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02/T03: collapse counterpart of
-    /// [`ConfigForm::expand_merge`] for the panels — reset text inputs,
-    /// dropdowns (to their defaults), toggles and the mux mode cell.
-    /// Resets exactly what the page merged: the current page's inner plus
-    /// the shared panels it folds (shadowsocks folds S3+S4 only, so S1/S2
-    /// inputs — possibly holding another page's unmerged typing — stand).
     fn clear_panels(&self, window: &mut Window, cx: &mut Context<AppView>, protocol: &str) {
-        // S4 (dial) merges on every guided page; S3 (mux) only on the
-        // vless/vmess/trojan/shadowsocks pages (T03 scoping: a page resets
-        // exactly what it merged, so another page's unmerged typing stands —
-        // wireguard/amneziawg never touch S3).
         let mut texts: Vec<&Entity<InputState>> = vec![
             &self.s4_timeout,
             &self.s4_bind,
@@ -7882,15 +6799,6 @@ impl ConfigForm {
             cells.push(&self.s3_brutal);
         }
         if protocol != "shadowsocks" {
-            // Config-completeness T05: forced-TLS pages (hysteria/tuic)
-            // merge the S2 credential inputs only — S1/S3 and the enable
-            // toggle ride other pages, so their unmerged typing stands.
-            // Config-completeness T06: anytls/naive join the forced set;
-            // http/https merge the optional-S2 panel but never S1; socks/ssh
-            // merge no shared panel (S4 alone).
-            // Config-completeness T07: shadowtls joins the forced set; snell /
-            // xray / chain / extra-core merge no shared panel (S4 alone for
-            // snell, none for the rest).
             let forced_tls = matches!(
                 protocol,
                 "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls"
@@ -7959,9 +6867,7 @@ impl ConfigForm {
                 selects.extend([(&self.tuic_cc, ""), (&self.tuic_relay, "")]);
                 cells.extend([&self.tuic_uot, &self.tuic_zero_rtt]);
             }
-            // Config-completeness T06: small matrices reset exactly what
-            // their pages merged (shared-panel scope above mirrors the same
-            // rule). The ssh key area clears like any text input.
+
             "socks" => {
                 texts.extend([&self.socks_username, &self.socks_password]);
                 selects.extend([(&self.socks_version, ""), (&self.socks_network, "tcp")]);
@@ -7998,18 +6904,12 @@ impl ConfigForm {
                     &self.ssh_host_key_algs,
                     &self.ssh_client_version,
                 ]);
-                // The key blob area is a `TextareaState`, not an `InputState`
-                // (it cannot ride the `texts` vec) — cleared the same way.
+
                 self.ssh_private_key.update(cx, |state, cx| {
                     state.set_value(String::new(), window, cx);
                 });
             }
-            // Config-completeness T07: edge pages reset exactly what their
-            // pages merged (shared-panel scope above mirrors the same rule).
-            // The chain hop cell is deliberately NOT reset here: the fold is
-            // idempotent, so keeping it makes the expand→commit path refold
-            // byte-identical instead of wiping merged hops (the collapse echo
-            // below re-syncs it from the box instead).
+
             "snell" => {
                 texts.extend([
                     &self.snell_psk,
@@ -8047,8 +6947,7 @@ impl ConfigForm {
             "chain" => {}
             "extra-core" => {
                 texts.extend([&self.extra_exe, &self.extra_args]);
-                // The config area is a `TextareaState` — cleared like the ssh
-                // key blob above.
+
                 self.extra_config.update(cx, |state, cx| {
                     state.set_value(String::new(), window, cx);
                 });
@@ -8131,12 +7030,6 @@ impl ConfigForm {
         }
     }
 
-    /// Ticket 05: collapse direction of the Advanced swap — echo the JSON
-    /// box into blank guided inputs only (never clobbers values kept
-    /// across a garbage box).
-    /// Config-completeness T02/T03: on guided pages the panels echo the
-    /// same way (defaults count as blank for dropdowns, off counts as
-    /// blank for toggles).
     fn collapse_echo(&self, window: &mut Window, cx: &mut Context<AppView>) {
         let box_text = self.params.read(cx).value().to_string();
         let protocol = self.protocol_text(cx);
@@ -8192,11 +7085,6 @@ impl ConfigForm {
         }
     }
 
-    /// Config-completeness T02/T03: collapse counterpart of
-    /// [`ConfigForm::clear_panels`] — echo the JSON box into blank/default
-    /// panel inputs only (never clobbers values kept across a garbage box).
-    /// Shared panels echo on every guided page; inner fields echo per page
-    /// (the vmess cipher reads grammar-aware, like prefill).
     fn echo_panels(
         &self,
         window: &mut Window,
@@ -8204,9 +7092,6 @@ impl ConfigForm {
         box_text: &str,
         protocol: &str,
     ) {
-        // Shared panels echo only what the page merged (clear-scoping
-        // mirror): S4 dial on every guided page; S1/S2/S3 only on the pages
-        // that fold them (wireguard/amneziawg take S4 alone).
         let full_panels = matches!(protocol, "vless" | "vmess" | "trojan");
         let mux_page = matches!(protocol, "vless" | "vmess" | "trojan" | "shadowsocks");
         let mut shared_texts: Vec<(&Entity<InputState>, &[&str])> = vec![
@@ -8215,12 +7100,7 @@ impl ConfigForm {
             (&self.s4_inet4, &["inet4_bind_address"][..]),
             (&self.s4_inet6, &["inet6_bind_address"][..]),
         ];
-        // Config-completeness T05: forced-TLS pages echo the S2 credential
-        // inputs (never the enable toggle or S1 — those ride other pages).
-        // Config-completeness T06: anytls/naive join the forced set;
-        // http/https echo the full optional-S2 panel (enable included).
-        // Config-completeness T07: shadowtls joins the forced set (S2
-        // credentials echo; the enable toggle rides other pages).
+
         let forced_tls = matches!(
             protocol,
             "hysteria" | "hysteria2" | "tuic" | "anytls" | "naive" | "shadowtls"
@@ -8257,7 +7137,7 @@ impl ConfigForm {
                 });
             }
         }
-        // Inner texts per page (blank inputs only, same rule).
+
         let inner_texts: &[(&Entity<InputState>, &[&str])] = match protocol {
             "vless" => &[(&self.vless_uuid, &["uuid", "id"][..])],
             "vmess" => &[
@@ -8272,10 +7152,7 @@ impl ConfigForm {
                     &["plugin_opts", "plugin-opts", "pluginOpts"][..],
                 ),
             ],
-            // Config-completeness T05: Hysteria inner texts echo on both
-            // layouts (one page, two protocols — the v1 auth reads `auth`
-            // only so a v2 `password` never duplicates into it); TUIC inner
-            // texts echo the seven tuning fields.
+
             "hysteria" | "hysteria2" => &[
                 (&self.hy_server_ports, &["server_ports"][..]),
                 (&self.hy_hop_interval, &["hop_interval"][..]),
@@ -8292,10 +7169,7 @@ impl ConfigForm {
                 (&self.tuic_password, &["password"][..]),
                 (&self.tuic_heartbeat, &["heartbeat"][..]),
             ],
-            // Config-completeness T06: small-matrix inner texts echo on
-            // blank inputs only (same rule). The ssh host-key lists read
-            // through the list reader (stored arrays echo as comma text);
-            // the key blob area echoes like any text input.
+
             "socks" => &[
                 (&self.socks_username, &["username"][..]),
                 (&self.socks_password, &["password"][..]),
@@ -8332,10 +7206,7 @@ impl ConfigForm {
                 ),
                 (&self.ssh_client_version, &["client_version"][..]),
             ],
-            // Config-completeness T07: edge inner texts echo on blank inputs
-            // only (same rule). The extra config area echoes through its own
-            // reader below (stored objects read as JSON text); chain hops
-            // re-sync from the box unconditionally (see below).
+
             "snell" => &[
                 (&self.snell_psk, &["psk"][..]),
                 (&self.snell_obfs_mode, &["obfs_mode", "obfs"][..]),
@@ -8359,8 +7230,7 @@ impl ConfigForm {
                 (&self.extra_exe, &["exe", "binary"][..]),
                 (&self.extra_args, &["args"][..]),
             ],
-            // Config-completeness T04: WG peer/net rows echo on both pages
-            // (separate entities per page — T03 scoping).
+
             "wireguard" => &[
                 (&self.wg_private, &["private_key", "privatekey"][..]),
                 (&self.wg_public, &["public_key", "publickey"][..]),
@@ -8435,9 +7305,7 @@ impl ConfigForm {
                 });
             }
         }
-        // Config-completeness T06: the ssh host-key lists echo through the
-        // list reader (stored arrays read as comma text) and the key blob
-        // echoes into its area — blank inputs only, same rule.
+
         if protocol == "ssh" {
             for (entity, keys) in [
                 (&self.ssh_host_key, &["host_key"][..]),
@@ -8465,8 +7333,7 @@ impl ConfigForm {
                 });
             }
         }
-        // Config-completeness T07: the extra config area echoes through its
-        // reader (stored objects read as JSON text) — blank inputs only.
+
         if protocol == "extra-core" {
             let config_value = extra_config_prefill(box_text);
             let config_blank = self
@@ -8482,15 +7349,11 @@ impl ConfigForm {
                 });
             }
         }
-        // Config-completeness T07: the hop cell always re-syncs from the box
-        // on collapse (hand-edited box JSON wins — expanding always merges
-        // first, so no unmerged editor typing can be clobbered; and the cell
-        // is never cleared, so the expand→commit path refolds idempotently).
+
         if protocol == "chain" {
             *self.chain_hops.borrow_mut() = chain_nodes_of(box_text);
         }
-        // Config-completeness T06: the socks network echoes S1-rule (the
-        // default counts as blank, like the transport pages).
+
         if protocol == "socks" {
             let value = guided_prefill_value(box_text, &["network"]);
             let current = self
@@ -8505,8 +7368,7 @@ impl ConfigForm {
                 });
             }
         }
-        // S1 echoes on the transport pages; the S2 fingerprint echoes on the
-        // optional and forced TLS pages alike (shared entities, one rule).
+
         let panel_selects: &[EchoSelect] = if full_panels {
             &[
                 (&self.s1_network, &["network"][..], "tcp"),
@@ -8530,7 +7392,7 @@ impl ConfigForm {
                 });
             }
         }
-        // Inner dropdowns per page (a default counts as blank, same rule).
+
         let inner_selects: &[EchoSelect] = match protocol {
             "vless" => &[
                 (&self.vless_flow, &["flow"][..], ""),
@@ -8549,15 +7411,9 @@ impl ConfigForm {
                 (&self.ss_method, &["method"][..], ""),
                 (&self.ss_plugin, &["plugin"][..], ""),
             ],
-            // Config-completeness T04: the AWG version reads `awg_version`
-            // else the legacy `version` (a non-2.0|3.x spelling echoes as no
-            // selection and round-trips byte-identical).
+
             "amneziawg" => &[(&self.awg_version, &["awg_version", "version"][..], "")],
-            // Config-completeness T05: the v1 auth marker and the TUIC
-            // modes echo the same way (a non-pickable spelling echoes as no
-            // selection and round-trips byte-identical).
-            // Config-completeness T06: the socks version and naive cc echo
-            // the same way (the socks network echoes S1-rule below).
+
             "hysteria" | "hysteria2" => &[(&self.hy_auth_type, &["auth_type"][..], "")],
             "tuic" => &[
                 (&self.tuic_cc, &["congestion_control"][..], ""),
@@ -8569,9 +7425,7 @@ impl ConfigForm {
                 &["quic_congestion_control", "congestion_control"][..],
                 "",
             )],
-            // Config-completeness T07: edge dropdowns echo the same way (a
-            // non-pickable spelling echoes as no selection and round-trips
-            // byte-identical — the folds never strip).
+
             "snell" => &[(&self.snell_version, &["version"][..], "")],
             "shadowtls" => &[(&self.shadowtls_version, &["version"][..], "")],
             "xray" => &[
@@ -8595,8 +7449,7 @@ impl ConfigForm {
                 });
             }
         }
-        // The vmess cipher reads grammar-aware (legacy `security` vs
-        // new-style `encryption`) — the same reader prefill uses.
+
         if protocol == "vmess" {
             let value = vmess_cipher_value(box_text);
             let current = self
@@ -8617,8 +7470,7 @@ impl ConfigForm {
             (&self.s4_fragment, &["udp_fragment"][..]),
             (&self.s4_multipath, &["tcp_multi_path"][..]),
         ];
-        // The S2 insecure toggle echoes on the optional and forced TLS
-        // pages alike (the forced page has no enable toggle to echo).
+
         if full_panels || forced_tls || optional_tls {
             shared_cells.push((
                 &self.s2_insecure,
@@ -8638,10 +7490,7 @@ impl ConfigForm {
                 *cell.borrow_mut() = true;
             }
         }
-        // `security: "tls"` is not a truthy spelling — the enable toggle
-        // echoes the on-values the engine maps (same rule as prefill;
-        // vmess rows read grammar-aware for the legacy boolean). HTTP(S)
-        // rows echo it too (optional-TLS pages, same rule).
+
         if (full_panels || optional_tls) && !*self.s2_enable.borrow() {
             let on = if protocol == "vmess" {
                 vmess_tls_enabled(box_text)
@@ -8662,8 +7511,7 @@ impl ConfigForm {
         {
             *self.ss_uot.borrow_mut() = true;
         }
-        // Config-completeness T06: SOCKS/Naïve toggles echo the same way
-        // (off counts as blank).
+
         if protocol == "socks"
             && !*self.socks_uot.borrow()
             && guided_prefill_bool(box_text, &["udp_over_tcp", "uot"])
@@ -8680,8 +7528,7 @@ impl ConfigForm {
                 }
             }
         }
-        // Config-completeness T05: Hysteria/TUIC toggles echo the same way
-        // (off counts as blank).
+
         if matches!(protocol, "hysteria" | "hysteria2")
             && !*self.hy_mtu.borrow()
             && guided_prefill_bool(box_text, &["disable_mtu_discovery"])
@@ -8698,8 +7545,7 @@ impl ConfigForm {
                 }
             }
         }
-        // Config-completeness T04: WG/AWG toggles echo the same way (off
-        // counts as blank).
+
         if protocol == "wireguard"
             && !*self.wg_sys_ifc.borrow()
             && guided_prefill_bool(box_text, &["system", "sys_ifc"])
@@ -8732,14 +7578,6 @@ impl ConfigForm {
         }
     }
 
-    /// Ticket 26: patch relative to the dialog-open snapshot. Fields the user
-    /// did not touch stay `None` (unchanged), so a concurrent refresh that
-    /// landed after the dialog opened survives the commit on every untouched
-    /// field. Only genuinely edited fields are written. Blank-vs-snapshot
-    /// keeps the store's blank-equals-keep semantics (`Some("")` on genuinely
-    /// edited fields behaves exactly like the old full patch).
-    /// Ticket 28: reads the six fields once via [`ConfigForm::as_new`] (one
-    /// read path for add and edit); only the baseline compare is edit-only.
     fn as_patch_vs(&self, cx: &App, baseline: &ProxyConfig) -> ConfigPatch {
         fn changed(current: String, baseline: &str) -> Option<String> {
             if current == baseline {
@@ -8760,12 +7598,6 @@ impl ConfigForm {
     }
 }
 
-/// Handles to the import dialog inputs: a multi-line paste box plus the
-/// target group. `file_hint` carries the dropped file name (if exactly one)
-/// so `.conf` content keeps its stem for peer names; `original_text` is the
-/// prefill at open time (stale-hint guard: edited text parses as its own
-/// type); `multi_files` carries every dropped file for multi-drop so per-file
-/// stems/keys survive (merged text alone cannot recover file boundaries).
 #[derive(Clone)]
 struct ImportForm {
     text: Entity<TextareaState>,
@@ -8776,8 +7608,6 @@ struct ImportForm {
 }
 
 impl ImportForm {
-    /// Ticket 28: one constructor (the old `new`/`new_multi` pair shared the
-    /// whole body; `multi` is `Some` only for an unedited multi-file drop).
     fn new(
         window: &mut Window,
         cx: &mut Context<AppView>,
@@ -8803,20 +7633,9 @@ impl ImportForm {
         }
     }
 
-    /// Consumes a clone; every built element owns its state entity.
-    /// Ticket 17: shows the live `X valid · Y invalid` preview (rebuilt on
-    /// every render from the current box contents, so it tracks typing and
-    /// pasting) plus the dropped file names when present. The preview is
-    /// inline text, never a toast.
-    /// Ticket 43: the first failure reason shows inline pre-commit (fixable
-    /// before OK), plus a Browse button that picks files from disk (the
-    /// current box text is carried over, never dropped).
-    /// Ticket 07: the preview runs the same resolve + parse as the commit
-    /// (unedited multi-file drops parse per file), so files-picked counts
-    /// never diverge from what Import would do.
     fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
         let text = self.text.read(cx).value().to_string();
-        // Ticket 07: same resolve + parse as the commit (multi-aware).
+
         let preview = preview_batch_for_form(
             &text,
             self.file_hint.clone(),
@@ -8832,16 +7651,13 @@ impl ImportForm {
                 failure.reason
             )
         });
-        // Ticket T03 (gpui-18-sweep CAP-3): the import body composes on kit
-        // `v_form` + `field()` — every row keeps its pinned id on an inner
-        // div. Preview counts, first-failure reason, and file names ride
-        // labelless fields under the inputs.
+
         let mut form = v_form()
             .small()
-            // Signal-refined P2: the blank box was a leap of faith — one
-            // compact reassurance + shape line rides above the box
-            // (read-only text, never a toast). Single block so the live
-            // preview and first-failure lines stay above the fold.
+
+
+
+
             .child(
                 field().label_indent(false).child(
                     div()
@@ -8867,8 +7683,7 @@ impl ImportForm {
                 "Group",
                 self.group.clone(),
             ));
-        // Ticket 43: Browse — the platform file picker; picked bytes merge
-        // with (never replace) the current box text.
+
         {
             let browse_view = view.clone();
             let browse_text = self.text.clone();
@@ -8900,8 +7715,7 @@ impl ImportForm {
                     .child(import_preview_message(valid, invalid)),
             ),
         );
-        // Ticket 43: first-failure reason pre-commit (inline, never toast-only).
-        // Ticket 07: multi-aware (same batch as the preview counts above).
+
         if let Some(reason) = first_failure {
             form = form.child(
                 field().label_indent(false).child(
@@ -8925,23 +7739,13 @@ impl ImportForm {
     }
 }
 
-/// Ticket 04: redacted subscription URL for display (query and fragment are
-/// dropped so tokens never reach the screen or logs).
-/// Ticket 14: userinfo is stripped too — same rule as
-/// [`subscription_label_from_url`]: a pasted URL can embed `user:password`,
-/// which must never appear in a row, notification, or log.
-/// Ticket 28: kept separate from the import `redact_link` and health
-/// `redact_secrets` on purpose — this drops query/fragment for http(s)
-/// endpoint URLs, `redact_link` masks opaque link payloads but keeps
-/// fragments (remarks are display names), and `redact_secrets` scrubs
-/// token forms inside free text; one scrubber would leak on some path.
 fn redact_subscription_url(url: &str) -> String {
     let without_fragment = url.split('#').next().unwrap_or(url);
     let without_query = without_fragment
         .split('?')
         .next()
         .unwrap_or(without_fragment);
-    // Strip `userinfo@` from the authority, keeping scheme + host + path.
+
     let stripped = match without_query.split_once("://") {
         Some((scheme, rest)) => {
             let path_at = rest.find('/').unwrap_or(rest.len());
@@ -8956,14 +7760,10 @@ fn redact_subscription_url(url: &str) -> String {
             format!("{host}{path}")
         }
     };
-    // Ticket 28: length cap is health::truncate (same 96-char rule as the
-    // link scrubber; one truncator for every display path).
+
     truncate(&stripped, 96)
 }
 
-/// Ticket 04: default subscription label derived from the URL host (never
-/// the userinfo, never the query — both may carry a token).
-/// Ticket 09: userinfo stripped too (a pasted URL can embed credentials).
 fn subscription_label_from_url(url: &str) -> String {
     let after = url.split("://").nth(1).unwrap_or(url);
     let host = after.split('/').next().unwrap_or(after);
@@ -8975,18 +7775,10 @@ fn subscription_label_from_url(url: &str) -> String {
     }
 }
 
-/// Ticket 14: single-line `throne://addsub/...` failure text. Surfaces the
-/// intake's own reason (`bad-base64`, `bad-host`, …) — the parse errors never
-/// echo the URL (see `addsub_rejects_non_http_and_unknown_command`), so this
-/// is safe for notifications.
 fn addsub_error_message(error: &ImportError) -> String {
     format!("Invalid subscription link: {error}")
 }
 
-/// Ticket 16: dialog group wins for single-addsub intake. A blank dialog
-/// falls back to the payload group; an untouched `default` dialog keeps a
-/// custom payload group; any edited (non-default) dialog group lands the
-/// subscription in the edited group, not the payload group.
 fn effective_addsub_group(dialog_group: &str, payload_group: &str) -> String {
     let dialog = dialog_group.trim();
     if dialog.is_empty() {
@@ -8998,11 +7790,6 @@ fn effective_addsub_group(dialog_group: &str, payload_group: &str) -> String {
     dialog.to_string()
 }
 
-/// Ticket 16: honest export toast. The payload only re-imports import-shaped
-/// rows, so when hand-made metadata-only rows exist the toast states both
-/// numbers instead of claiming every row re-imports.
-/// Ticket 28: the count fragment is shared with
-/// [`export_preview_description`] (one branch, two sentence frames).
 fn export_count_fragment(total: usize, importable: usize) -> String {
     if importable == total {
         format!("{total} config(s)")
@@ -9018,19 +7805,10 @@ fn export_count_message(total: usize, importable: usize, path: &str) -> String {
     )
 }
 
-/// Ticket 17: success toast copy naming the affected row (add/edit/remove
-/// each name their row; no toast fires on keystrokes or dialog opens).
-/// Ticket 28: one verb slot instead of three parallel one-line wrappers.
 fn row_action_message(verb: &str, name: &str) -> String {
     format!("{verb} \"{name}\"")
 }
 
-/// Ticket 17: live import preview counts, reusing the parser read-only (no
-/// store writes, no toasts — the dialog renders these as inline text).
-/// BUG-4: an empty box is neutral `(0, 0)` — the parser reports empty input
-/// as one `Empty` failure, which must never surface as `0 valid · 1 invalid`.
-/// Ticket 07: the live dialog now previews via [`preview_batch_for_form`]
-/// (multi-aware); this single-text helper stays as the pure headless seam.
 #[cfg_attr(not(test), allow(dead_code))]
 fn import_preview_counts(text: &str, file_hint: Option<&str>) -> (usize, usize) {
     if text.trim().is_empty() {
@@ -9043,15 +7821,10 @@ fn import_preview_counts(text: &str, file_hint: Option<&str>) -> (usize, usize) 
     (batch.configs.len(), batch.failures.len())
 }
 
-/// Ticket 17: the inline preview line (`X valid · Y invalid`).
 fn import_preview_message(valid: usize, invalid: usize) -> String {
     format!("{valid} valid · {invalid} invalid")
 }
 
-/// Ticket 26: parse-ready import inputs, shared by the synchronous commit
-/// (tests, headless) and the background dialog commit. `original` is the
-/// dialog prefill: edited text drops the stale drop hint and multi-file
-/// bytes and sniffs as its own type.
 struct ResolvedImport {
     text: String,
     group: String,
@@ -9084,11 +7857,7 @@ fn resolve_import_inputs(
     }
 }
 
-/// Ticket 26: pure CPU parse of resolved inputs (runs on the background
-/// executor on the dialog path). Unedited multi-file drops parse per file
-/// (stems/keys survive); everything else sniffs single-text.
 fn parse_import_inputs(resolved: &ResolvedImport) -> crate::import::BatchResult {
-    // Unedited multi-file drop: per-file parse keeps stems/keys.
     if let Some(files) = &resolved.multi {
         if resolved.file_hint.is_none() {
             let refs: Vec<(&str, &str)> = files
@@ -9104,11 +7873,6 @@ fn parse_import_inputs(resolved: &ResolvedImport) -> crate::import::BatchResult 
     }
 }
 
-/// Ticket 07: live preview batch for the import dialog — the same
-/// resolve + parse the commit uses, so files-picked (multi) and edited-text
-/// previews never diverge from what Import would do. Empty stays neutral
-/// (empty batch, never `0 valid · 1 invalid`); callers derive counts and the
-/// first failure from the returned batch.
 fn preview_batch_for_form(
     text: &str,
     file_hint: Option<String>,
@@ -9123,9 +7887,6 @@ fn preview_batch_for_form(
     parse_import_inputs(&resolved)
 }
 
-/// Ticket 07: honest partial-success toast — `Imported N · M duplicates
-/// skipped · K failed`, plus every failure when present. Pure so headless
-/// tests pin the counts without reading framework-private notifications.
 fn import_success_summary(
     imported: usize,
     duplicates: usize,
@@ -9141,17 +7902,10 @@ fn import_success_summary(
     summary
 }
 
-/// Ticket 17: basename of a dropped path (dialogs show file names, never
-/// full paths — paths can carry OS usernames).
 fn file_basename(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
-/// Ticket 17: file-names line for the import dialog after a drop (`None`
-/// when nothing was dropped).
-/// Ticket 28: one basename-join for the single- and multi-file arms (the
-/// `File:`/`Files:` prefixes stay distinct; an empty multi-drop still shows
-/// nothing even when a stale hint lingers).
 fn import_files_label(
     file_hint: Option<&str>,
     multi_files: Option<&[(String, String)]>,
@@ -9170,10 +7924,6 @@ fn import_files_label(
     }
 }
 
-/// Ticket 17: export dialog preview — row counts plus the destination path,
-/// with an overwrite warning when the file already exists. The plaintext
-/// warning itself stays verbatim ([`export_confirm_description`]); this line
-/// is appended after it.
 fn export_preview_description(total: usize, importable: usize, path: &str, exists: bool) -> String {
     let mut out = format!("{} → {path}", export_count_fragment(total, importable));
     if exists {
@@ -9182,8 +7932,6 @@ fn export_preview_description(total: usize, importable: usize, path: &str, exist
     out
 }
 
-/// Ticket 17: per-subscription item failures line (renders the stored
-/// failures vec, not just a count). Empty when there is nothing to show.
 fn subscription_failures_text(failures: &[crate::import::ImportFailure]) -> String {
     if failures.is_empty() {
         String::new()
@@ -9199,12 +7947,6 @@ fn subscription_failures_text(failures: &[crate::import::ImportFailure]) -> Stri
     }
 }
 
-/// Ticket 17: one coalesced background-tick summary for N refreshes.
-/// `None` when there is nothing to report (never an empty toast).
-/// The bool is the warning flag (any failed member — or any preserved user
-/// edit — warns).
-/// Ticket 08 (throne-adoption): bracket diff counts plus `[=] Still in
-/// use` for kept serving rows (see [`refresh_summary_text`]).
 #[allow(clippy::too_many_arguments)]
 fn coalesced_refresh_message(
     subs: usize,
@@ -9235,7 +7977,6 @@ fn coalesced_refresh_message(
     }
 }
 
-/// Ticket 17: honest start-all copy — never "Started 0".
 fn start_all_message(count: usize) -> String {
     if count == 0 {
         "Nothing to start — the library is empty".to_string()
@@ -9244,8 +7985,6 @@ fn start_all_message(count: usize) -> String {
     }
 }
 
-/// Ticket 17: honest stop-all copy — never a success claim over silence.
-/// Ticket 43: the success names the count, never a bare claim.
 fn stop_all_message(running: usize) -> String {
     if running == 0 {
         "Nothing to stop — no endpoints are running".to_string()
@@ -9254,9 +7993,6 @@ fn stop_all_message(running: usize) -> String {
     }
 }
 
-/// Ticket 43: stop-all confirm text — names the count plus every running row
-/// so the confirm can never be a blind kill. Empty input still names the
-/// zero (callers only show it when something runs).
 fn stop_all_confirm_description(names: &[String]) -> String {
     let named = names
         .iter()
@@ -9269,14 +8005,10 @@ fn stop_all_confirm_description(names: &[String]) -> String {
     )
 }
 
-/// Ticket 43: edit-while-running copy — names the row and says the serving
-/// config is unchanged until a restart (no stale-serves-as-live).
 fn restart_to_apply_message(name: &str) -> String {
     format!("Updated \"{name}\" — restart it to apply (still serving the previous config)")
 }
 
-/// Ticket 43: remove copy — a running row's endpoint stops first, and the
-/// toast says so; an idle row says nothing about stopping.
 fn removed_message(name: &str, was_running: bool) -> String {
     if was_running {
         format!("Removed \"{name}\" (endpoint stopped first)")
@@ -9285,13 +8017,6 @@ fn removed_message(name: &str, was_running: bool) -> String {
     }
 }
 
-/// Ticket 10: bulk-delete confirm copy — names the count, lists the affected
-/// rows (quoted, first three plus an honest `+N more` tail), and promises
-/// stop-first so a running endpoint is never a surprise kill. The empty-set
-/// branch keeps the sentence shape (callers guard on empty; the pure fn stays
-/// total). Ledger ruling: row names ride the description (the title keeps the
-/// count) because the description is the only confirm surface with room for
-/// both without clipping at the 880px minimum.
 fn bulk_delete_confirm_description(count: usize, names: &[String]) -> String {
     const SHOWN: usize = 3;
     if names.is_empty() {
@@ -9315,14 +8040,6 @@ fn bulk_delete_confirm_description(count: usize, names: &[String]) -> String {
     )
 }
 
-/// Ticket 10: bulk-delete outcome toast — per-item outcomes, never a bare
-/// count. Full success names every removed row (capped like the confirm);
-/// any failure names the failed rows beside both counts so a partial delete
-/// can never read as clean. Ledger ruling: failures carry names (they need
-/// repair), successes carry names on the clean path (confirmation); the caps
-/// keep a 50-row toast readable. Levels live at the call site: clean →
-/// success, partial → warning, total failure → error — honest-toast kept, the
-/// action stays enabled and the toast tells the truth.
 fn bulk_delete_result_message(removed: &[String], failed: &[String]) -> String {
     const SHOWN: usize = 3;
     fn listed(names: &[String]) -> String {
@@ -9363,8 +8080,6 @@ fn bulk_delete_result_message(removed: &[String], failed: &[String]) -> String {
     )
 }
 
-/// Ticket 43: duplicate display name — `{base} copy`, suffixed while taken.
-/// Pure so tests pin uniqueness without touching the store.
 fn duplicate_name(base: &str, taken: &[String]) -> String {
     let first = format!("{base} copy");
     if !taken.iter().any(|name| name == &first) {
@@ -9380,9 +8095,6 @@ fn duplicate_name(base: &str, taken: &[String]) -> String {
     }
 }
 
-/// Ticket 43: one probe outcome rendered as a toast — names the row plus the
-/// latency on success or the redacted cause on failure (the cause is already
-/// redacted at the health seam).
 fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) -> String {
     let verb = if ping { "Ping" } else { "Test" };
     match (outcome.sample.latency_ms, outcome.sample.error.as_deref()) {
@@ -9392,15 +8104,10 @@ fn probe_result_toast(name: &str, outcome: &TestOutcome, ping: bool) -> String {
     }
 }
 
-/// Ticket 43: multi-probe summary toast — names all three counts so it never
-/// claims a clean sweep over failures.
 fn probe_summary_toast(count: usize, live: usize, dead: usize) -> String {
     format!("Tested {count} endpoint(s): {live} live · {dead} dead")
 }
 
-/// Ticket 09 (throne-adoption): splice the row's transport-security
-/// posture into the rendered meta line (index 1 of the dense lines) when
-/// Show-Security is on. Pure seam; the pinned line builder is untouched.
 fn apply_show_security(lines: &mut [String], row: &ProxyConfig) {
     if let Some(meta) = lines.get_mut(1) {
         *meta = format!(
@@ -9411,9 +8118,6 @@ fn apply_show_security(lines: &mut [String], row: &ProxyConfig) {
     }
 }
 
-/// Ticket 09 (throne-adoption): group-test summary toast — names the group
-/// scope, the run size, and the outcome counts (plus the early-stop mark
-/// when `Stop Testing` cut the run short).
 fn group_test_summary_toast(
     group: &str,
     count: usize,
@@ -9430,8 +8134,6 @@ fn group_test_summary_toast(
     }
 }
 
-/// Ticket 09 (throne-adoption): speedtest summary toast — names the scope,
-/// the mode, and measured vs failed counts.
 fn speed_test_summary_toast(
     scope: &str,
     mode: SpeedtestMode,
@@ -9444,8 +8146,6 @@ fn speed_test_summary_toast(
     )
 }
 
-/// Ticket 09 (throne-adoption): one speedtest outcome rendered as a toast —
-/// names the row plus the measured rate or the named failure.
 fn speed_result_toast(name: &str, outcome: &SpeedtestOutcome) -> String {
     match (outcome.mbps, outcome.error.as_deref()) {
         (Some(_), _) => format!("Speedtest \"{name}\": {}", format_speed_result(outcome)),
@@ -9454,8 +8154,6 @@ fn speed_result_toast(name: &str, outcome: &SpeedtestOutcome) -> String {
     }
 }
 
-/// Ticket 09 (throne-adoption): out-IP summary toast — names the scope,
-/// the resolved addresses (deduped, at most 3 shown), and failures.
 fn out_ip_summary_toast(scope: &str, ips: &[String], failed: &[String]) -> String {
     let mut unique: Vec<&String> = Vec::new();
     for ip in ips {
@@ -9482,8 +8180,6 @@ fn out_ip_summary_toast(scope: &str, ips: &[String], failed: &[String]) -> Strin
     text
 }
 
-/// Ticket 09 (throne-adoption): group Resolve-Domain confirm — names the
-/// group scope and the rows whose server is a domain.
 fn resolve_domain_confirm_text(group: &str, names: &[String]) -> String {
     let mut text = format!(
         "Rewrite {} domain server(s) in group \"{group}\" to their resolved IPs? \
@@ -9500,8 +8196,6 @@ fn resolve_domain_confirm_text(group: &str, names: &[String]) -> String {
     text
 }
 
-/// Ticket 09 (throne-adoption): Resolve-Domain result toast — names
-/// rewrites (`old → new`) plus failures; nothing-resolved reads honestly.
 fn resolve_domain_result_message(
     rewritten: &[(String, String, String)],
     failed: &[String],
@@ -9531,15 +8225,10 @@ fn resolve_domain_result_message(
     text
 }
 
-/// Ticket 17: honest stop-on-stopped copy naming the row.
 fn already_stopped_message(name: &str) -> String {
     format!("\"{name}\" is already stopped")
 }
 
-/// Ticket 30: serving badge for one row — running rows show
-/// `● Running :port` plus ` · health` when a summary exists; stopped rows
-/// show `○ Stopped`. The enabled flag never appears here (it stays secondary
-/// in the row's third line). Port + health are display-safe (no secrets).
 fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
     if !is_running {
         return "○ Stopped".to_string();
@@ -9550,11 +8239,6 @@ fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
     }
 }
 
-/// Lane B (B6): one serving-evidence rule for the row lamp, the row badge,
-/// and the detail Badge — red means dead-while-serving (a `dead` health
-/// summary or a crashed sidecar shard on a running row), green means serving,
-/// everything else is stopped-gray. Single rule, three paint sites, so lamp
-/// and badge can never disagree about a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServingTone {
     Failed,
@@ -9573,11 +8257,6 @@ fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool) -> Servin
     }
 }
 
-/// T01 (gpui-18-sweep): text equivalent of the occupancy lamp so serving
-/// state never rides on hue alone. Ruling: kit `Marker` is a container row
-/// (not a dot) and `Badge` carries no id/tooltip/a11y in 0.6.6, so the 12px
-/// flat-fill lamp geometry stays a div — only the accessible name + tooltip
-/// are added, pinned `row-dot-<id>` unchanged.
 fn lamp_access_label(tone: ServingTone, name: &str) -> String {
     match tone {
         ServingTone::Failed => format!("Failed — {name} (dead while serving)"),
@@ -9586,24 +8265,14 @@ fn lamp_access_label(tone: ServingTone, name: &str) -> String {
     }
 }
 
-/// T01 (gpui-18-sweep): text equivalent of the numeral check chip — position
-/// is 1-based in the checked set, total is the set length.
 fn check_chip_tip(position: usize, total: usize) -> String {
     format!("Checked {position} of {total} — bulk action target")
 }
 
-/// Ticket 01: detail-header acting-row line — names the F5/detail-Start
-/// target so the selected row can never be confused with the checked set.
 fn acting_on_label(config: &ProxyConfig) -> String {
     format!("Acting on: {}", config.name)
 }
 
-/// Signal-box 06: which bind endpoint a per-row copy button carries.
-/// Lane B (B7): plus the display-only upstream `host:port` (still bind-side
-/// metadata via [`upstream_host_port`] — never params or secrets), so the
-/// row no longer has a copy gap beside a display-only line. Every form comes
-/// from secret-free sources, so the clipboard can never carry params or
-/// secrets through this path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointUrl {
     Socks,
@@ -9611,15 +8280,6 @@ enum EndpointUrl {
     Upstream,
 }
 
-/// W1: row lifecycle state machine — stopped → starting → running, with
-/// failed for serving rows whose sidecar died or whose health reads dead.
-/// Derived per render from (serving truth, start-in-flight, failed evidence)
-/// and never stored, so it cannot go stale. Precedence is Starting > Failed >
-/// Running > Stopped: a second Start while one is in flight is ignored (see
-/// [`start_busy_message`]) so Starting dominates, and a dead endpoint never
-/// paints as healthy-running. Failed keeps the existing dead-suffixed running
-/// badge copy ([`serving_badge`] with a `dead` summary) — the phase names the
-/// lifecycle, the badge keeps its pinned strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowPhase {
     Stopped,
@@ -9641,9 +8301,6 @@ impl RowPhase {
         }
     }
 
-    /// Detail Start-button copy for this phase. Only Starting differs — every
-    /// other phase offers the same `Start` (a failed row restarts like a
-    /// stopped one, through the same re-apply path).
     fn start_label(self) -> &'static str {
         match self {
             Self::Starting => "Starting…",
@@ -9652,29 +8309,18 @@ impl RowPhase {
     }
 }
 
-/// Ticket 30: honest start-on-running copy — a restart, never a bare
-/// `Started`.
 fn already_running_message(name: &str) -> String {
     format!("\"{name}\" already running (restarted)")
 }
 
-/// Ticket 30: no-selection copy for Start/Stop/Test/Ping with nothing
-/// selected (F5 path included).
 fn no_selection_message() -> String {
     "Select a configuration first".to_string()
 }
 
-/// Ticket 30: busy-guard copy — a second Start while one is in flight is
-/// ignored, never double-applied.
 fn start_busy_message() -> String {
     "Starting… already in progress".to_string()
 }
 
-/// Ticket 02 (throne-adoption): global Start/Stop presentation — the glyph
-/// plus the accessible name for a `(running, busy)` state. Idle (nothing
-/// running) offers Start-all, Running offers Stop-all, and a start in
-/// flight offers only the `Connecting…` busy state (never clickable into
-/// a second apply — see [`AppView::toggle_global_engines`]).
 fn global_toggle_present(running: usize, busy: bool) -> (&'static str, &'static str) {
     if busy {
         ("…", "Connecting…")
@@ -9685,12 +8331,6 @@ fn global_toggle_present(running: usize, busy: bool) -> (&'static str, &'static 
     }
 }
 
-/// Ticket 02 (throne-adoption): one top-bar menu row — a labelled `div`
-/// with a stable id on a custom element because `PopupMenuItem` carries no
-/// id of its own. Custom rows are silent (no a11y label), so role + name
-/// are exposed for assistive tech; `shortcut` is
-/// `(parse-key, chip-fallback, aria-key)` for bound actions (the visible
-/// `Kbd` chip plus the shortcut property) and `None` for unbound rows.
 fn topbar_menu_row(
     id: &'static str,
     label: &'static str,
@@ -9698,10 +8338,6 @@ fn topbar_menu_row(
     tip: &'static str,
     shortcut: Option<(&'static str, &'static str, &'static str)>,
 ) -> AnyElement {
-    // Method order mirrors the previously inline rows (role + name first,
-    // shortcut property beside the visible chip): `aria_keyshortcuts`
-    // retypes the chain, so each arm builds its own chain and erases to
-    // `AnyElement` instead of sharing one builder.
     match shortcut {
         Some((parse, chip, aria)) => div()
             .id(id)
@@ -9732,8 +8368,6 @@ fn topbar_menu_row(
     }
 }
 
-/// Ticket 30: partial start-all copy — names the failed rows plus both
-/// counts so the toast never claims a clean sweep over failures.
 fn start_all_partial_message(started: usize, failed_names: &[String]) -> String {
     let failed = failed_names.len();
     if failed == 0 {
@@ -9745,29 +8379,16 @@ fn start_all_partial_message(started: usize, failed_names: &[String]) -> String 
     )
 }
 
-/// Ticket 03: library search placeholder — pinned at this seam so headless
-/// tests pin the visible text field without reaching into kit internals.
 const SEARCH_PLACEHOLDER: &str = "Search configurations";
 
-/// Ticket 30: search count `N of M` (visible of total).
 fn search_count_text(visible: usize, total: usize) -> String {
     format!("{visible} of {total}")
 }
 
-/// T06 (CAP-7): facet hover copy — the dimension, the active choice (with
-/// its result count, same text as the trigger), and the live `N of M`
-/// visible count, e.g. `Filter by group: Group: travel (2) · 1 of 2 shown`.
-/// Painted on the outer wrapper div: kit `Select` has no tooltip slot
-/// (verified 0.6.6 `select.rs`), so the tooltip never rides the picker.
 fn facet_tip_text(dimension: &str, active_display: &str, visible: usize, total: usize) -> String {
     format!("Filter by {dimension}: {active_display} · {visible} of {total} shown")
 }
 
-/// Lane B (B9): serving-ports segment copy — bare `:port` tokens capped at
-/// three with an honest `+N` remainder (`None` while nothing serves, so the
-/// segment stays absent instead of naming a lying zero). No `serving`
-/// prefix: the segment rides beside `engine-status`, which already names
-/// the running state — the prefix would only push the 880px strip over.
 fn serving_ports_text(ports: &[u16]) -> Option<String> {
     if ports.is_empty() {
         return None;
@@ -9786,39 +8407,22 @@ fn serving_ports_text(ports: &[u16]) -> Option<String> {
     }
 }
 
-/// Ticket 30: no-hits copy for a query that matches nothing (total > 0).
 fn no_matches_text() -> String {
     "No matches — Clear search".to_string()
 }
 
-/// Ticket 30: empty-library copy with Add/Import affordances.
 fn empty_library_text() -> String {
     "No proxy configurations yet — Add or Import to start".to_string()
 }
 
-/// Ticket 30: sidecar-crash notification copy — names the joined per-shard
-/// detail (`shard: cause[; …]`) and points at the log viewer. `detail` comes
-/// from [`engine::EngineController::crash_detail`] (already redacted).
 fn crash_notification_text(detail: &str) -> String {
     format!("Engine crashed ({detail}) — View logs")
 }
 
-/// Ticket 30: true for start-all failures that isolate to one broken row
-/// (bad params, unsupported protocol, wrong-layer/custom/chain schema
-/// failures — each names its row). Union-level failures (port conflicts,
-/// missing binaries, check/spawn failures, bridge skew, LAN gate) stay
-/// atomic: nothing starts, exactly like before.
-/// Ticket 41: delegates to the engine seam (extended with the ticket-41
-/// row-local variants: bad bind/port, reserved ports, DNS failures) so the
-/// split can never drift between the two.
 fn is_row_local_start_error(error: &EngineError) -> bool {
     crate::engine::is_row_local_error(error)
 }
 
-/// Ticket 41: save gate — reserved ranges + garbage binds fail typed before
-/// any write (the engine seam names the range). Blank ports (auto) and
-/// unparseable ports flow through: store validation + auto-assign own those
-/// errors, and this gate must never double-report them.
 fn save_listen_gate(name: &str, bind_raw: &str, port_raw: &str) -> Result<(), String> {
     let port: u16 = match port_raw.trim() {
         "" => return Ok(()),
@@ -9830,10 +8434,6 @@ fn save_listen_gate(name: &str, bind_raw: &str, port_raw: &str) -> Result<(), St
     crate::engine::validate_listen_for_save(name, bind_raw, port).map_err(|error| error.to_string())
 }
 
-/// Ticket 26: the enabled flag is NOT the engine. The switch and the Enable
-/// button write the stored flag only — they never start or stop an endpoint
-/// (see [`AppView::commit_enabled_flag`]). This copy says so on every
-/// successful toggle so the two states can never be confused.
 fn enabled_flag_message(name: &str, enabled: bool) -> String {
     if enabled {
         format!("\"{name}\" enabled (flag only — Start to serve)")
@@ -9842,16 +8442,10 @@ fn enabled_flag_message(name: &str, enabled: bool) -> String {
     }
 }
 
-/// Ticket 26: store-list failure copy. Names the database error instead of
-/// rendering (or toasting about) an empty library that is not really empty.
 fn db_list_error_message(error: &StoreError) -> String {
     format!("Cannot load library: {error}")
 }
 
-/// Ticket 26: one refresh completion rendered as text. Returns the warning
-/// flag (any failure OR any preserved user edit warns) plus the line.
-/// Conflicts are user edits the merge refused to revert — they are named,
-/// never folded into silence.
 #[allow(clippy::too_many_arguments)]
 fn refresh_summary_text(
     label: &str,
@@ -9884,9 +8478,6 @@ fn refresh_summary_text(
     (failures > 0 || conflicts > 0, summary)
 }
 
-/// Ticket 26 (ticket-25 consumer): restore completion copy. Counts come from
-/// [`RestoreOutcome`]; failures are loud errors at the call site, never
-/// folded into this line.
 fn restore_done_message(outcome: &RestoreOutcome) -> String {
     format!(
         "Restored {} config(s), {} subscription(s)",
@@ -9894,25 +8485,16 @@ fn restore_done_message(outcome: &RestoreOutcome) -> String {
     )
 }
 
-/// Ticket 26: dropped-but-unreadable files are named (basenames only — full
-/// paths can carry OS usernames), never swallowed.
 fn unreadable_drop_message(names: &[String]) -> String {
     format!("Skipped unreadable file(s): {}", names.join(", "))
 }
 
-/// Ticket 07 (throne-adoption): one dropped/picked file after the intake
-/// guards (50MB cap, image/binary/non-UTF8 reject). `Refused` carries the
-/// static reason (never file bytes); `Unreadable` is a bare read error.
 enum ImportFileRead {
     Text(String),
     Unreadable,
     Refused(&'static str),
 }
 
-/// Ticket 07 (throne-adoption): read one dropped/picked file with the intake
-/// guards. Oversize files are rejected before buffering the whole read into
-/// the dialog; image, NUL-carrying, and non-UTF8 bytes are refused with a
-/// static reason (loud per-file problems, never silent skips).
 fn read_import_file(path: &std::path::Path) -> ImportFileRead {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -9930,11 +8512,6 @@ fn read_import_file(path: &std::path::Path) -> ImportFileRead {
     }
 }
 
-/// Ticket 19: upstream `host:port` for a library row, read from the params
-/// JSON only (`server`/`address` + `server_port`/`port` — the same keys the
-/// store validation and import grammar use). Credential keys are never read,
-/// so the display string cannot leak secrets by construction. `None` for
-/// metadata-only rows with no upstream host.
 fn upstream_host_port(row: &ProxyConfig) -> Option<String> {
     let map = serde_json::from_str::<serde_json::Value>(&row.params)
         .ok()?
@@ -9968,20 +8545,6 @@ fn upstream_host_port(row: &ProxyConfig) -> Option<String> {
     })
 }
 
-/// Ticket 19: every text line of a library row — name, protocol + upstream
-/// host:port, group + bind endpoint + enabled state, plus the serving badge.
-/// Ticket 30: the badge (`● Running :port · health` / `○ Stopped`) is always
-/// present from the serving truth; the enabled flag stays secondary in the
-/// third line. Health folds into the badge when running (no separate health
-/// child). Pure so tests pin the complete content;
-/// [`LibraryDelegate::render_item`] maps each line to a child.
-/// Ticket 43: `traffic` appends a fifth `↓rx ↑tx` line, but only when bytes
-/// have actually flowed (idle rows keep the four-line shape).
-/// Ticket 43: `traffic` appends a fifth `↓rx ↑tx` line, but only when bytes
-/// have actually flowed (idle rows keep the four-line shape).
-/// Ticket 47 merge: production renders through
-/// `library_row_lines_with_upstream`; this parsing form stays pinned by
-/// tests.
 #[cfg_attr(not(test), allow(dead_code))]
 fn library_row_lines(
     row: &ProxyConfig,
@@ -10007,10 +8570,7 @@ fn library_row_lines(
     }
     lines
 }
-/// Ticket 47: row lines over a precomputed upstream string (the delegate
-/// cache) — zero JSON parses on the render path. [`library_row_lines`]
-/// stays as the parsing wrapper (tests + single-row callers); rendered
-/// strings are identical either way.
+
 #[allow(dead_code)]
 fn library_row_lines_with_upstream(
     row: &ProxyConfig,
@@ -10036,13 +8596,7 @@ fn library_row_lines_with_upstream(
     }
     lines
 }
-/// Ticket 01 (throne-density): dense row lines over the same inputs as
-/// [`library_row_lines_with_upstream`] — three lines max: name, merged
-/// meta (`proto · upstream · bind:port`, at most 3 facts), badge plus
-/// optional traffic (`badge · ↓rx ↑tx`). Same strings, fewer children, so
-/// the 1000x700 frame paints more rows with no new secrets surface.
-/// Group + enabled ride the full-route tooltip ([`library_row_full_route`])
-/// and the detail pane, never the meta line.
+
 fn library_row_dense_lines_with_upstream(
     row: &ProxyConfig,
     upstream: &str,
@@ -10050,8 +8604,6 @@ fn library_row_dense_lines_with_upstream(
     is_running: bool,
     traffic: Option<(u64, u64)>,
 ) -> Vec<String> {
-    // Ticket 01 (ui-polish): meta carries the route only — protocol,
-    // upstream, bind endpoint. Group + enabled stay one hover away.
     let meta = format!(
         "{} · {upstream} · bind {}:{}",
         row.protocol, row.bind_ip, row.port
@@ -10065,10 +8617,6 @@ fn library_row_dense_lines_with_upstream(
     vec![row.name.clone(), meta, badge]
 }
 
-/// Ticket 01 (ui-polish): the full 5-fact route for one row — protocol,
-/// upstream, group, bind endpoint, enabled state. Rides the meta-line
-/// tooltip and the detail pane while the meta line itself stays at most 3
-/// facts. Secret-free by construction (same sources as the meta line).
 fn library_row_full_route(row: &ProxyConfig, upstream: &str) -> String {
     let state = if row.enabled { "enabled" } else { "disabled" };
     format!(
@@ -10077,23 +8625,11 @@ fn library_row_full_route(row: &ProxyConfig, upstream: &str) -> String {
     )
 }
 
-/// Ticket 17: a library row matches the search query by name, protocol,
-/// group, bind address, port, or upstream host (the `server`/`address` inside
-/// params — never credential fields).
-/// Ticket 43: kept as the pinned base-matcher seam (the delegate filters
-/// through [`library_row_matches_full`); tests pin both.
-/// Ticket 47: kept as the semantic oracle for the delegate search index
-/// ([`RowSearchIndex::matches_lowered`] must agree on every input — see
-/// `t47_search_index_matches_scan_parity`); production filtering runs on
-/// the index, never here.
 #[cfg_attr(not(test), allow(dead_code))]
 fn library_row_matches(row: &ProxyConfig, query: &str) -> bool {
     library_row_matches_full(row, query, &MatchContext::empty())
 }
 
-/// Ticket 43: search context for the extended matcher — subscription labels
-/// and preset names by id (set on reload, never per keystroke), the serving
-/// set, and the per-row health summaries.
 #[derive(Debug, Default)]
 struct MatchContext {
     sub_labels: HashMap<String, String>,
@@ -10109,10 +8645,6 @@ impl MatchContext {
     }
 }
 
-/// Ticket 43: extended library matcher — everything [`library_row_matches`]
-/// covers plus subscription label, preset name, enabled/disabled, running/
-/// stopped, and health words (live/dead/untested plus the summary text).
-/// Credential fields are never read.
 fn library_row_matches_full(row: &ProxyConfig, query: &str, ctx: &MatchContext) -> bool {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -10162,8 +8694,6 @@ fn library_row_matches_full(row: &ProxyConfig, query: &str, ctx: &MatchContext) 
     health_word.contains(&q)
 }
 
-/// Ticket 43: the pre-extension matcher (name/protocol/group/bind/port/
-/// upstream host), split out so the extended matcher reuses it.
 fn library_row_matches_base(row: &ProxyConfig, q: &str) -> bool {
     if row.name.to_lowercase().contains(q)
         || row.protocol.to_lowercase().contains(q)
@@ -10187,8 +8717,6 @@ fn library_row_matches_base(row: &ProxyConfig, q: &str) -> bool {
     false
 }
 
-/// Ticket 43: validate a probe-URL override — http(s) with a host, nothing
-/// else. Returns the trimmed URL or the reason it cannot be used.
 fn normalize_test_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -10205,8 +8733,6 @@ fn normalize_test_url(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Ticket 43: probe-URL precedence — per-row override, then the global
-/// override, then the documented default.
 fn effective_probe_url(row_override: Option<&str>, global: Option<&str>) -> String {
     row_override
         .filter(|url| !url.trim().is_empty())
@@ -10215,7 +8741,6 @@ fn effective_probe_url(row_override: Option<&str>, global: Option<&str>) -> Stri
         .unwrap_or_else(|| DEFAULT_TEST_URL.to_string())
 }
 
-/// Ticket 43: byte counts for traffic display (`88 B`, `2.0 KB`, `1.0 MB`).
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -10231,8 +8756,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Ticket 43: per-row traffic line (`↓1.0 MB ↑88 B`). `None` when both
-/// counters are zero, so idle rows stay quiet.
 fn traffic_summary_text(rx: u64, tx: u64) -> Option<String> {
     if rx == 0 && tx == 0 {
         return None;
@@ -10240,17 +8763,11 @@ fn traffic_summary_text(rx: u64, tx: u64) -> Option<String> {
     Some(format!("↓{} ↑{}", format_bytes(rx), format_bytes(tx)))
 }
 
-/// Ticket 43: summed traffic for the status bar. `None` when nothing has
-/// flowed, so the bar stays quiet on a fresh library.
-/// (Superseded in the bar by [`summed_traffic_text`]; kept + pinned by
-/// `ticket43_traffic_text` as the formatting oracle.)
 #[cfg_attr(not(test), allow(dead_code))]
 fn traffic_status_text(total_rx: u64, total_tx: u64) -> Option<String> {
     traffic_summary_text(total_rx, total_tx).map(|summary| format!("traffic {summary}"))
 }
 
-/// Ticket 43: pretty-print params JSON for the Format button. Returns the
-/// pretty text or the reason it cannot format (the box keeps the original).
 fn format_params_json(text: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| format!("params are not valid JSON: {error}"))?;
@@ -10258,8 +8775,6 @@ fn format_params_json(text: &str) -> Result<String, String> {
         .map_err(|error| format!("params cannot be formatted: {error}"))
 }
 
-/// Ticket 43: params validation for the Validate button — blank means the
-/// store default, anything else must parse as JSON.
 fn validate_params_json(text: &str) -> Result<(), String> {
     if text.trim().is_empty() {
         return Ok(());
@@ -10269,11 +8784,6 @@ fn validate_params_json(text: &str) -> Result<(), String> {
         .map_err(|error| format!("params are not valid JSON: {error}"))
 }
 
-/// Ticket 43: first import failure rendered pre-commit (`item N (label):
-/// reason`), reusing the read-only preview parse. `None` when everything
-/// parses (or the box is empty) — the dialog then shows no reason line.
-/// Ticket 07: the live dialog now renders from [`preview_batch_for_form`]
-/// (multi-aware); this single-text helper stays as the pure headless seam.
 #[cfg_attr(not(test), allow(dead_code))]
 fn first_import_failure_reason(text: &str, file_hint: Option<&str>) -> Option<String> {
     if text.trim().is_empty() {
@@ -10293,13 +8803,8 @@ fn first_import_failure_reason(text: &str, file_hint: Option<&str>) -> Option<St
     })
 }
 
-/// Ticket 43: picked-file merge outcome — merged box text, the single-file
-/// hint (stems/keys survive), and the unedited multi-file pairs.
 type BrowsedImport = (String, Option<String>, Option<Vec<(String, String)>>);
 
-/// Ticket 43: fold picked files into the import dialog inputs — the current
-/// box text is kept, file bytes are appended; a single file keeps its name
-/// (stem/keys survive), several keep every pair (unedited multi path).
 fn merge_browse_results(existing: &str, files: &[(String, String)]) -> BrowsedImport {
     let mut merged = existing.to_string();
     for (_, content) in files {
@@ -10318,22 +8823,15 @@ fn merge_browse_results(existing: &str, files: &[(String, String)]) -> BrowsedIm
     }
 }
 
-/// Ticket 43: browse-read toast — names the count plus every file (basenames
-/// only; full paths can carry OS usernames).
 fn browse_read_message(names: &[String]) -> String {
     let short: Vec<String> = names.iter().map(|name| file_basename(name)).collect();
     format!("Read {} file(s): {}", short.len(), short.join(", "))
 }
 
-/// Ticket 43: second-gate overwrite confirm — names the exact path that will
-/// be clobbered. The write only runs on confirm.
 fn export_overwrite_confirm_description(path: &str) -> String {
     format!("\"{path}\" already exists. Overwrite it with the new export?")
 }
 
-/// Ticket 43: log severity filter — `None` shows everything, `Some` keeps
-/// exactly that level.
-/// Ticket 47 merge: render paths filter inline; kept pinned by tests.
 #[cfg_attr(not(test), allow(dead_code))]
 fn log_level_matches(level: LogLevel, filter: Option<LogLevel>) -> bool {
     match filter {
@@ -10342,8 +8840,6 @@ fn log_level_matches(level: LogLevel, filter: Option<LogLevel>) -> bool {
     }
 }
 
-/// Ticket 43: member names of one subscription, in library order. Empty when
-/// the sub owns nothing (never a missing-members lie).
 fn subscription_member_names(rows: &[ProxyConfig], sub_id: &str) -> Vec<String> {
     rows.iter()
         .filter(|row| row.subscription_id.as_deref() == Some(sub_id))
@@ -10351,8 +8847,6 @@ fn subscription_member_names(rows: &[ProxyConfig], sub_id: &str) -> Vec<String> 
         .collect()
 }
 
-/// Ticket 43: Settings tick-interval line, read from the real constants so
-/// the copy can never drift from the timers.
 fn tick_interval_summary() -> String {
     format!(
         "engine poll {ENGINE_POLL_TICK_SECS}s · subscriptions {DUE_SUBSCRIPTION_TICK_SECS}s · \
@@ -10360,11 +8854,6 @@ fn tick_interval_summary() -> String {
     )
 }
 
-/// Ticket 17: inline LAN-confirm hint for add/edit dialogs. `Some` when
-/// starting this bind will stop at the LAN confirm gate; `None` for
-/// loopback and for blank (blank means the loopback default).
-/// Ticket 05 (signal-box): plain-words Bind guard — leaving loopback
-/// exposes the machine (the hint says so verbatim, not just "confirm").
 fn lan_hint_for_bind(bind: &str) -> Option<String> {
     if bind.trim().is_empty() || !requires_lan_confirm(bind) {
         return None;
@@ -10375,9 +8864,6 @@ fn lan_hint_for_bind(bind: &str) -> Option<String> {
     ))
 }
 
-/// Ticket 05 (signal-box): Identity input label for the live protocol
-/// text (`Identity (uuid)`); generic while the protocol is unknown or
-/// secret-free (the input then hides — see [`ConfigForm::element`]).
 fn guided_identity_label(protocol_raw: &str) -> String {
     match guided_identity_fields(protocol_raw).and_then(|guided| guided.key) {
         Some(key) => format!("Identity ({key})"),
@@ -10385,11 +8871,6 @@ fn guided_identity_label(protocol_raw: &str) -> String {
     }
 }
 
-/// Ticket 05: guided hint line under the mini-form (`None` for unknown
-/// protocols — the commit names those through validation, never the hint).
-/// Kept to one short clause (the dialog sizes to its content — a long line
-/// would force it past the 880px minimum; the adjacent Advanced toggle
-/// already points at the JSON).
 fn guided_hint_line(protocol_raw: &str) -> Option<String> {
     let name = protocol_raw.trim();
     let guided = guided_identity_fields(protocol_raw)?;
@@ -10403,13 +8884,6 @@ fn guided_hint_line(protocol_raw: &str) -> Option<String> {
     }
 }
 
-/// Ticket 06 (throne-adoption): guided-page ownership of the identity
-/// secret — these protocols render their own credential input inside the
-/// `<Type>` box for the same params key the generic Identity row would
-/// fill, so the generic row hides and AnyTLS-style stacking disappears
-/// (one password input, never two). Protocols without a guided page
-/// (mieru/juicity/parse-only, socks/http trust-on-first-use, virtual
-/// rows) keep the generic row. Secret-free (protocol names only).
 fn block_owns_identity(protocol_raw: &str) -> bool {
     matches!(
         protocol_raw.trim(),
@@ -10430,12 +8904,6 @@ fn block_owns_identity(protocol_raw: &str) -> bool {
     )
 }
 
-/// Ticket 06: TLS panel plan per protocol — `None` means the protocol
-/// carries no TLS UI at all; `Some(false)` renders the optional TLS box
-/// (enable toggle); `Some(true)` renders the always-on variant (the fold
-/// locks `security`, so there is no toggle). Mirrors exactly which
-/// `*_block` fns call `s2_section` today, so layout can never disagree
-/// with the commit fold about what a row carries.
 fn tls_panel_plan(protocol_raw: &str) -> Option<bool> {
     match protocol_raw.trim() {
         "vless" | "vmess" | "trojan" | "http" | "https" => Some(false),
@@ -10444,15 +8912,10 @@ fn tls_panel_plan(protocol_raw: &str) -> Option<bool> {
     }
 }
 
-/// Ticket 06: protocols carrying the shared Network box (the Transport
-/// panel). Mirrors the `s1_network_section` call sites.
 fn has_network_panel(protocol_raw: &str) -> bool {
     matches!(protocol_raw.trim(), "vless" | "vmess" | "trojan")
 }
 
-/// Ticket 06: protocols carrying Dial Fields in the Advanced dialog.
-/// Mirrors the `s4_section` call sites (xray/chain/extra-core rows carry
-/// no endpoint tuning, so they get no Advanced dialog half).
 fn has_dial_panel(protocol_raw: &str) -> bool {
     matches!(
         protocol_raw.trim(),
@@ -10476,16 +8939,10 @@ fn has_dial_panel(protocol_raw: &str) -> bool {
     )
 }
 
-/// Ticket 06: the `Advanced Settings` button shows exactly when the
-/// second dialog would carry something (Dial Fields and/or TLS extras).
 fn has_advanced_dialog(protocol_raw: &str) -> bool {
     has_dial_panel(protocol_raw) || tls_panel_plan(protocol_raw).is_some()
 }
 
-/// Ticket 06: Throne `Not Set`/`Already Set` cert-label parity — a
-/// secret's presence reads as a caption beside the masked input (the
-/// value itself never renders). Secret-free by construction (one
-/// presence bit, never the value).
 fn secret_state_caption(value: &str) -> &'static str {
     if value.trim().is_empty() {
         "Not Set"
@@ -10494,10 +8951,6 @@ fn secret_state_caption(value: &str) -> &'static str {
     }
 }
 
-/// Ticket 31: owning dialog field for a save error — the first invalid
-/// field's name plus its message, so the dialog can show it inline and move
-/// focus to it. `None` for non-field errors (`NotFound`/database). Carries
-/// field names only, never values (no secrets by construction).
 fn field_error_target(error: &StoreError) -> Option<(&'static str, String)> {
     match error {
         StoreError::Invalid(errors) => errors
@@ -10507,13 +8960,6 @@ fn field_error_target(error: &StoreError) -> Option<(&'static str, String)> {
     }
 }
 
-/// Ticket 31: non-blocking bind/port collision warning naming the colliding
-/// row. `None` when the pair is free, when it is the edited row itself
-/// (`exclude_id`), when the port is blank (auto-assign never collides), or
-/// when the port is unparseable (validation owns that error — the warning
-/// must never double-report it). Saving is always still allowed: at rest two
-/// rows may share an endpoint; the conflict error naming both parties stays
-/// an activation-time concern.
 fn bind_port_collision_warning(
     rows: &[ProxyConfig],
     exclude_id: Option<&str>,
@@ -10537,9 +8983,6 @@ fn bind_port_collision_warning(
         })
 }
 
-/// Ticket 31: visible plaintext-fetch warning for subscription URLs (the
-/// Warn policy surfaced, never the URL). `None` for https and for anything
-/// the validators reject (those are errors, not warnings).
 fn http_subscription_warning(url: &str) -> Option<String> {
     match store::subscription_fetch_policy(url) {
         store::SubscriptionFetchPolicy::Warn { reason } => Some(reason.to_string()),
@@ -10547,33 +8990,10 @@ fn http_subscription_warning(url: &str) -> Option<String> {
     }
 }
 
-/// Ticket 31: friendly duplicate-subscription copy — names the existing
-/// label (never the URL: tokens hide in queries).
 fn already_subscribed_message(label: &str) -> String {
     format!("Already subscribed as \"{label}\" — no duplicate added")
 }
 
-/// Ticket 04: fetch a subscription body over the platform HTTP client.
-/// Errors are generic on purpose (never echo the URL: tokens hide in
-/// queries). Bodies are capped at 8 MiB and must be UTF-8; anything else is
-/// a refresh failure that keeps the last-good members.
-/// Ticket 27: the fetch enforces [`store::subscription_fetch_policy`] first —
-/// internal hosts Block without touching the network (SSRF guard); plaintext
-/// http Warns (proceeds: LAN-provider compat, tokens leak in plaintext).
-/// Ticket 48: redirects never auto-follow — the client is pinned to
-/// NoFollow and each hop re-runs the fetch policy (fetch-time SSRF
-/// re-check), so a benign host redirecting to loopback/private/link-local
-/// is blocked before any byte is fetched from it. Same-policy hops are
-/// followed (CDN compat) up to a small bound; anything else fails loudly.
-/// Residual risk (honest): DNS is owned by the platform client, so a
-/// hostile host rebinding between hops is invisible here — accepted
-/// because subscription URLs are user-supplied and user-trusted (see the
-/// wiring note on `subscription_fetch_policy_resolved`).
-/// Ticket 08 (throne-adoption): one fetched subscription — the body plus
-/// the quota snapshot parsed from the final response's
-/// `Subscription-Userinfo` header (`None` when the provider sends none;
-/// see [`store::parse_subscription_userinfo`]). The header is read from
-/// the final response only, never from redirect hops.
 #[derive(Debug, Clone)]
 pub struct FetchedSubscription {
     pub body: String,
@@ -10620,8 +9040,7 @@ async fn fetch_subscription_body(
                 response.status().as_u16()
             ));
         }
-        // Ticket 08: quota header off the final response (before the body
-        // is consumed — headers borrow the response).
+
         let userinfo = response
             .headers()
             .get("subscription-userinfo")
@@ -10650,17 +9069,10 @@ async fn fetch_subscription_body(
     Err("subscription fetch failed (too many redirects)".to_string())
 }
 
-/// Ticket 48: redirect statuses the fetch follows by hand (each hop
-/// re-checked — never client-auto-followed past the SSRF guard).
 fn is_fetch_redirect(status: http_client::http::StatusCode) -> bool {
     matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
-/// Ticket 48: resolve a `Location` value against the fetched URL.
-/// Absolute http(s) URLs pass through (the caller re-checks the policy);
-/// origin-absolute paths resolve against the current origin. Anything
-/// else (relative segments, other schemes, empties) is refused — the
-/// fetch fails instead of guessing where to go.
 fn resolve_fetch_redirect(current_url: &str, location: &str) -> Option<String> {
     let location = location.trim();
     if location.is_empty() {
@@ -10688,10 +9100,6 @@ fn resolve_fetch_redirect(current_url: &str, location: &str) -> Option<String> {
     None
 }
 
-/// Ticket 48: read the redirect target off response headers (first
-/// `Location` only — never a joined list), resolved against the URL just
-/// fetched. `None` means the hop is unusable (missing, non-ASCII, or
-/// unresolvable) and the fetch fails loudly.
 fn fetch_redirect_location(
     headers: &http_client::http::HeaderMap,
     current_url: &str,
@@ -10703,12 +9111,8 @@ fn fetch_redirect_location(
     resolve_fetch_redirect(current_url, location)
 }
 
-/// Ticket 45: per-subscription interval presets (seconds) behind the
-/// interval picker. `0` means always-due (matches
-/// [`store::due_for_refresh`]); the default stays daily.
 pub const INTERVAL_PRESETS: &[i64] = &[0, 3_600, 21_600, 43_200, 86_400, 604_800];
 
-/// Ticket 45: display copy for an interval value (`0`/`<= 0` = always).
 pub fn format_interval_secs(secs: i64) -> String {
     if secs <= 0 {
         return "always".to_string();
@@ -10725,8 +9129,6 @@ pub fn format_interval_secs(secs: i64) -> String {
     format!("{}d", secs / 86_400)
 }
 
-/// Ticket 45: display copy for a subscription's last successful refresh
-/// (`None` = never — rendered honestly, never blank).
 pub fn format_last_refresh(last_refresh_at: Option<i64>, now: i64) -> String {
     match last_refresh_at {
         None => "never refreshed".to_string(),
@@ -10745,9 +9147,6 @@ pub fn format_last_refresh(last_refresh_at: Option<i64>, now: i64) -> String {
     }
 }
 
-/// Ticket 45: summed data-plane totals across all rows for the status bar
-/// (`None` when the store is unreadable — the bar then shows no totals
-/// rather than a lying zero).
 pub fn summed_traffic_text(store: &Store) -> Option<String> {
     let totals = store.traffic_totals().ok()?;
     let (mut rx, mut tx) = (0u64, 0u64);
@@ -10758,22 +9157,6 @@ pub fn summed_traffic_text(store: &Store) -> Option<String> {
     Some(format!("↓ {} · ↑ {}", format_bytes(rx), format_bytes(tx)))
 }
 
-/// Ticket 45: one interval-picker group — preset choices writing the shared
-/// `interval_secs` cell (the dialog commit reads it, like the auto-refresh
-/// switch).
-/// Ticket T03 (gpui-18-sweep CAP-3): exactly one grouped exclusive choice —
-/// kit `RadioGroup` with `selected_index` + `on_change` over the six presets,
-/// so the current preset reads as selected instead of bracketed text, with
-/// arrow-key navigation the standalone row lacked. The group re-keys its
-/// children by index (verified 0.6.6 `radio.rs` render: `radio.id = ix.into()`)
-/// and the group node itself does not self-register for headless observation
-/// (verified 0.6.6 `radio_group.rs` — only `Radio` calls `.test_support()`),
-/// so per-option string ids cannot survive: the stable anchors are the static
-/// caption (`{prefix}-caption`) and the observed wrapper (`{prefix}-group`);
-/// headless clicks scope within the wrapper by index. `repaint` notifies the
-/// owning view so the new mark paints at once.
-/// Ticket 08: one static group caption, never a repeating summary of the
-/// current value.
 fn interval_picker_row(
     id_prefix: &str,
     interval_secs: Rc<RefCell<i64>>,
@@ -10817,25 +9200,17 @@ fn interval_picker_row(
         )
 }
 
-/// Handles to the subscription add form inside the subscriptions dialog.
-/// Ticket 17: `auto_refresh` is the add-form checkbox state (default on —
-/// no more create-then-toggle). A shared cell (not an entity): the dialog
-/// builder reads it on every render and the toggle writes it on click; the
-/// OK handler commits whatever it holds.
 #[derive(Clone)]
 struct SubForm {
     label: Entity<InputState>,
     url: Entity<InputState>,
     group: Entity<InputState>,
     auto_refresh: Rc<RefCell<bool>>,
-    /// Ticket 45: per-subscription interval picker state (default daily).
+
     interval_secs: Rc<RefCell<i64>>,
 }
 
 impl SubForm {
-    /// Ticket 26: the only add-form constructor. Fresh opens pass empty
-    /// strings; refresh-driven reopens pass the stashed in-progress text so
-    /// a background completion never wipes what the user already typed.
     fn restored(
         window: &mut Window,
         cx: &mut Context<AppView>,
@@ -10866,13 +9241,6 @@ impl SubForm {
         }
     }
 
-    /// Consumes a clone; every built element owns its state entity.
-    /// Ticket 31: appends the inline plaintext-fetch warning when the live
-    /// URL input is http (rebuilt on every render, so it tracks typing —
-    /// same pattern as the LAN hint on [`ConfigForm::element`]).
-    /// Ticket T03 (gpui-18-sweep CAP-3): the add form composes on kit
-    /// `v_form` + `field()`; the interval choice is the shared
-    /// [`interval_picker_row`] `RadioGroup`.
     fn element(self, view: Entity<AppView>, cx: &App) -> impl IntoElement {
         let auto = self.auto_refresh.clone();
         let checked = *auto.borrow();
@@ -10885,8 +9253,7 @@ impl SubForm {
             .small()
             .child(dialog_field("field-sub-label", "Label", self.label))
             .child(dialog_field("field-sub-url", "Subscription URL", self.url));
-        // Ticket 08: the plaintext-fetch warning sits beside the URL field
-        // it describes (not at the form foot).
+
         if let Some(warning) = http_subscription_warning(&url) {
             form = form.child(
                 field().label_indent(false).child(
@@ -10904,7 +9271,7 @@ impl SubForm {
                     Switch::new("sub-auto-add")
                         .checked(checked)
                         .label("Auto-refresh")
-                        // Ticket 08: the switch states what it governs.
+
                         .tooltip(
                             "Automatic refresh of this subscription. Manual Refresh always works.",
                         )
@@ -10916,8 +9283,8 @@ impl SubForm {
                         }),
                 ),
             ))
-            // Ticket 45: per-subscription interval picker (preset buttons
-            // write the shared cell; OK commits it).
+
+
             .child(field().label_indent(false).child(
                 div()
                     .id("field-sub-interval")
@@ -10932,19 +9299,6 @@ impl SubForm {
     }
 }
 
-/// Ticket 04: one subscription row for the manager dialog (label, redacted
-/// URL, group, member count, auto flag, last error) with Refresh / Auto /
-/// Remove actions. Refresh re-reads the record so a stale snapshot cannot
-/// fetch a removed subscription.
-/// Ticket 31: plus an Edit action opening the label/url/group editor.
-/// Ticket 37: one subscription row — label + redacted URL + group + auto +
-/// member count, plus Refresh / Auto / Edit / Remove.
-/// Ticket 43: expandable — an expanded row lists member names, a copy-URL
-/// button (redacted, never the token-bearing original), and the same Refresh
-/// retry. `expanded` + `members` come from the manager dialog's snapshot.
-/// Ticket 45: plus the visible last-refresh time and per-sub interval
-/// (the controllable-subscriptions surface: picker in the add/edit forms,
-// kill-switch + Refresh-all-due in the dialog header).
 fn subscription_row(
     view: Entity<AppView>,
     sub: ProxySubscription,
@@ -10956,11 +9310,6 @@ fn subscription_row(
     let mut row = div()
         .flex()
         .flex_row()
-        // T08 (gpui-18-sweep CAP-9): wrapped, never clipped — the manager
-        // now lives in a 520px sheet (narrower than the old dialog), and a
-        // nowrap row would push the Refresh/Auto/Remove actions past the
-        // sheet body's clip. Same No-Sideways-Scroll rule as every crowded
-        // action set; ids, labels, and handlers unchanged.
         .flex_wrap()
         .items_center()
         .gap_2()
@@ -10971,8 +9320,6 @@ fn subscription_row(
             sub.group,
             if sub.auto_refresh { "on" } else { "off" }
         ))
-        // Ticket 45: last-refresh + interval are always visible (never a
-        // hidden auto-update).
         .child(
             div()
                 .id(format!("sub-meta-{}", sub.id))
@@ -10986,8 +9333,7 @@ fn subscription_row(
     if let Some(error) = sub.last_error.as_deref() {
         row = row.child(format!("last error: {error}"));
     }
-    // Ticket 17: item failures viewable per subscription (the stored vec,
-    // not just the aggregated count).
+
     let failures = subscription_failures_text(&sub.failures);
     if !failures.is_empty() {
         row = row.child(
@@ -10997,7 +9343,7 @@ fn subscription_row(
                 .child(failures),
         );
     }
-    // Ticket 43: expand affordance + expanded member detail.
+
     let expand_view = view.clone();
     let expand_id = sub.id.clone();
     row = row.child(
@@ -11038,9 +9384,7 @@ fn subscription_row(
                     });
                 }),
         );
-        // Lane B (B8): the token-bearing original behind an explicit
-        // plaintext warning — display and Copy URL stay redacted; the full
-        // secret only leaves on a second, informed click.
+
         let full_view = view.clone();
         let full_url = sub.url.clone();
         let full_label = sub.label.clone();
@@ -11058,10 +9402,7 @@ fn subscription_row(
     }
     let refresh_view = view.clone();
     let refresh_id = sub.id.clone();
-    // T08 (gpui-18-sweep CAP-10): in-flight refresh reads label + spinner
-    // (`Button.loading`, like Start/Test/Ping) and ignores double-activation
-    // through the existing [`AppView::note_refresh_started`] guard — a second
-    // press while the fetch runs starts nothing.
+
     let mut refresh_button = Button::new(format!("sub-refresh-{}", sub.id))
         .label("Refresh")
         .loading(refreshing)
@@ -11080,10 +9421,7 @@ fn subscription_row(
         );
     }
     row = row.child(refresh_button);
-    // T08 (gpui-18-sweep CAP-10): streaming rows (fetch in flight, outcome +
-    // duration unknown) compose `Skeleton` + `ShimmerText` — no invented
-    // `Skeleton::shimmer`, theme tokens only. The row rebuilds on start
-    // (reopen) and on completion, so the shimmer tracks the real fetch.
+
     if refreshing {
         row = row.child(
             div()
@@ -11106,8 +9444,6 @@ fn subscription_row(
     row = row.child(
         Button::new(format!("sub-auto-{}", sub.id))
             .label(if auto_now { "Auto on" } else { "Auto off" })
-            // Ticket 08: the toggle states what it governs (this sub only;
-            // explicit Refresh stays available either way).
             .tooltip(format!(
                 "Automatic refresh of \"{auto_label}\" only. Manual Refresh always works."
             ))
@@ -11117,8 +9453,6 @@ fn subscription_row(
             .on_click(move |_, window, cx| {
                 let sub_id = auto_id.clone();
                 auto_view.update(cx, |view, cx| {
-                    // Ticket 26: only the id travels — the current flag is
-                    // re-read at commit (the rendered label may be stale).
                     view.commit_subscription_auto(&sub_id, window, cx);
                 });
             }),
@@ -11148,9 +9482,6 @@ fn subscription_row(
     )
 }
 
-/// Ticket 08 (throne-adoption): quota expiry copy. Missing data is omitted
-/// by the caller (no provider data reads as no claim, never a guessed
-/// date); the past reads `expired`, never a negative countdown.
 fn format_expire(expire_at: i64, now: i64) -> String {
     let delta = expire_at.saturating_sub(now);
     if delta <= 0 {
@@ -11164,8 +9495,6 @@ fn format_expire(expire_at: i64, now: i64) -> String {
     }
 }
 
-/// Ticket 08: one Manage-Groups row snapshot — pure data over row counts +
-/// feeding subscriptions, so the sheet body and the tests share it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupRowView {
     name: String,
@@ -11176,13 +9505,6 @@ struct GroupRowView {
     sub_ids: Vec<String>,
 }
 
-/// Ticket 08: build Manage-Groups rows from live group counts plus every
-/// subscription. Groups with rows but no subscription read `Basic`;
-/// groups fed by N subscriptions read `Subscription (N)` with a
-/// `Last update | Used / Remain / Expire` line from the
-/// `Subscription-Userinfo` snapshots (plus an auto-skip marker when
-/// flagged). Subscription-fed groups with zero rows still list (a fresh
-/// or fully-pruned feed is still a group). Ordered by name.
 fn group_row_views(
     counts: &[(String, usize)],
     subs: &[ProxySubscription],
@@ -11236,10 +9558,6 @@ fn group_row_views(
         .collect()
 }
 
-/// Ticket 08: the second Manage-Groups line for subscription-fed groups.
-/// `None` for basic groups. Used/Remain/Expire segments appear only when
-/// the feed reports them (sums across feeds, earliest expiry); last
-/// update is the latest success across feeds.
 fn group_quota_line(subs: &[&ProxySubscription], now: i64) -> Option<String> {
     if subs.is_empty() {
         return None;
@@ -11281,9 +9599,6 @@ fn group_quota_line(subs: &[&ProxySubscription], now: i64) -> Option<String> {
     Some(segments.join(" | "))
 }
 
-/// Ticket 08: subscriptions feeding one group, in stable numeric id order —
-/// the Update-current / per-row Update selection seam (pure; starting the
-/// fetches stays on the caller, which owns the network).
 fn update_target_subs(subs: &[ProxySubscription], group: &str) -> Vec<ProxySubscription> {
     let mut out: Vec<ProxySubscription> = subs
         .iter()
@@ -11294,9 +9609,6 @@ fn update_target_subs(subs: &[ProxySubscription], group: &str) -> Vec<ProxySubsc
     out
 }
 
-/// Ticket 08: Update-all selection — every subscription outside
-/// skip-flagged groups runs; flagged ones are reported, never fetched.
-/// Returns (included, skipped). Pure; the caller owns the confirm + fetch.
 fn update_all_targets(
     subs: Vec<ProxySubscription>,
     flagged: &HashSet<String>,
@@ -11313,8 +9625,6 @@ fn update_all_targets(
     (included, skipped)
 }
 
-/// Ticket 08: Update-all confirm copy — names the run set size plus the
-/// skip-flagged remainder, never a blind fetch.
 fn update_all_confirm_text(included: usize, skipped: usize) -> String {
     if skipped == 0 {
         format!("Update all {included} subscription(s)?")
@@ -11325,22 +9635,14 @@ fn update_all_confirm_text(included: usize, skipped: usize) -> String {
     }
 }
 
-/// Ticket 37: single-line `throne://route/...` / `throne://remoteroute/...`
-/// failure text. Surfaces the intake's own reason — parse errors never echo
-/// payloads or URLs, so this is safe for notifications.
 fn preset_error_message(error: &crate::preset::PresetError) -> String {
     format!("Invalid routing preset: {error}")
 }
 
-/// Ticket 37: success toast copy for a stored preset (name + rule count —
-/// never rule content).
 fn preset_imported_message(name: &str, count: usize) -> String {
     format!("Routing preset \"{name}\" imported ({count} rule(s))")
 }
 
-/// Ticket 37: one-line summary for a preset manager row (name, source, rule
-/// count, attachments). Rule content never appears; corrupt stored rules
-/// report `invalid rules` instead of a count.
 fn preset_row_summary(preset: &store::RoutePreset, attached: &[String]) -> String {
     let rules = match preset.rules() {
         Ok(rules) => format!("{} rule(s)", rules.len()),
@@ -11354,8 +9656,6 @@ fn preset_row_summary(preset: &store::RoutePreset, attached: &[String]) -> Strin
     format!("{} · {} · {rules} · {attached}", preset.name, preset.source)
 }
 
-/// Ticket 37: detach-delete confirm text naming the preset and every
-/// attached row (explicit path after a refused plain delete).
 fn preset_delete_confirm_description(name: &str, attached: &[String]) -> String {
     format!(
         "Delete routing preset \"{name}\"? It is still attached to {} row(s): {}. \
@@ -11365,10 +9665,6 @@ fn preset_delete_confirm_description(name: &str, attached: &[String]) -> String 
     )
 }
 
-/// Ticket 37: create-form for the presets manager dialog (name plus an
-/// optional rules body — a preset object or a bare rules array; empty means
-/// an empty preset rules are added to later). Entities are created once in
-/// the button handler and cloned into the dialog builder.
 #[derive(Clone)]
 struct PresetForm {
     name: Entity<InputState>,
@@ -11391,7 +9687,6 @@ impl PresetForm {
         }
     }
 
-    /// Consumes a clone; every built element owns its state entity.
     fn element(self, _cx: &App) -> impl IntoElement {
         div()
             .flex()
@@ -11411,10 +9706,6 @@ impl PresetForm {
     }
 }
 
-/// Ticket 37: one preset row for the manager dialog (summary + explicit
-/// Refresh for URL presets + Remove). Refresh re-reads the record so a stale
-/// snapshot cannot fetch a removed preset; Remove refuses while attached
-/// (the confirm path detaches explicitly).
 fn preset_row(
     view: Entity<AppView>,
     preset: store::RoutePreset,
@@ -11492,9 +9783,6 @@ fn preset_row(
     )
 }
 
-/// Ticket 10 (US-29): one Advanced rules-box rewrite — cycle one rule's
-/// action (`direct → proxy → block → direct`), remove one rule, or append
-/// a fresh `direct` rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PresetRulesOp {
     CycleAction(usize),
@@ -11502,12 +9790,6 @@ enum PresetRulesOp {
     Add,
 }
 
-/// Ticket 10 (US-29): the Advanced section of the preset edit dialog — one
-/// line per stored rule (`Rule i — action · tab · tab`) with an Action
-/// cycle and a Delete button, plus an Add-rule button. Ops rewrite the
-/// dialog's rules box in place (see
-/// [`AppView::rewrite_preset_rules_box`]); corrupt stored rules render
-/// their loud message instead of a list.
 fn preset_advanced_section(
     view: Entity<AppView>,
     preset: &store::RoutePreset,
@@ -11601,13 +9883,6 @@ fn preset_advanced_section(
     )
 }
 
-/// Ticket 12: run one background tick loop: sleep `secs`, run one bounded
-/// pass, then exit when ticks are stopped or the view is released (fail
-/// closed: a released view ends its loops instead of updating dead state).
-/// Ticket 47: ONE timer per interval — the sleep is a single background
-/// timer, never 1s slices — so idle wakeups match the longest interval.
-/// Stopping ticks ends each loop after its current sleep; process exit
-/// drops the loops outright, so nothing lingers past quit.
 fn spawn_tick(
     cx: &mut Context<AppView>,
     secs: u64,
@@ -11639,12 +9914,6 @@ fn spawn_tick(
     .detach();
 }
 
-/// Root view of the ManyProxy window: title bar, toolbar, virtualized
-/// configuration list, detail bar, status bar, plus overlay layers.
-/// T03: one facet menu (group / protocol / status) rendered as a kit
-/// `Select` with an inline dropdown (a deferred popover — the old dialogs
-/// never open). Options derive live from the delegate each frame, so the
-/// menu always lists real labels with counts, exactly like the dialog did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FacetMenu {
     Group,
@@ -11652,11 +9921,6 @@ enum FacetMenu {
     Status,
 }
 
-/// T03: one row of a facet menu. `title` is the dropdown row (with counts,
-/// like the old dialog buttons); `display` is the trigger text (the exact
-/// `Group: X` labels the old buttons showed); `value` is the committed
-/// facet (`None` = All). `id` is the stable element id
-/// (`facet-group-travel`, …, `facet-group-all`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FacetChoice {
     id: String,
@@ -11681,9 +9945,6 @@ impl SearchableListItem for FacetChoice {
     }
 }
 
-/// T03: the item data behind one facet `Select`. A dedicated delegate (not
-/// `SearchableVec`) so option rows render with stable observed ids that
-/// headless tests can click.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FacetChoiceList(Vec<FacetChoice>);
 
@@ -11727,10 +9988,6 @@ impl SearchableListDelegate for FacetChoiceList {
     }
 }
 
-/// Ticket 44: group labels are free text (slashes, spaces, dots) but element
-/// ids must stay id-safe. Display/title/labels keep the verbatim label —
-/// only the `id` is slugged. Identity for plain names (`travel` stays
-/// `travel`) so existing facet/manager ids never shift.
 fn slugify_group_id(group: &str) -> String {
     let mut slug = String::with_capacity(group.len());
     for ch in group.chars() {
@@ -11753,7 +10010,6 @@ fn slugify_group_id(group: &str) -> String {
 impl FacetMenu {
     const ALL: [FacetMenu; 3] = [FacetMenu::Group, FacetMenu::Protocol, FacetMenu::Status];
 
-    /// Live options plus the currently committed value for this menu.
     fn choices(&self, delegate: &LibraryDelegate) -> (Vec<FacetChoice>, Option<String>) {
         match self {
             FacetMenu::Group => (
@@ -11768,9 +10024,6 @@ impl FacetMenu {
                         .group_options()
                         .into_iter()
                         .map(|(group, count)| FacetChoice {
-                            // Ticket 44: the id slugs the label (slashes
-                            // never reach an element id); title/display stay
-                            // verbatim with counts.
                             id: format!("facet-group-{}", slugify_group_id(&group)),
                             title: format!("{group} ({count})"),
                             display: format!("Group: {group} ({count})"),
@@ -11792,8 +10045,6 @@ impl FacetMenu {
                         .protocol_options()
                         .into_iter()
                         .map(|(protocol, count)| FacetChoice {
-                            // Ticket 03: trigger + dropdown row name the choice
-                            // and its result count (ids stay bare and stable).
                             id: format!("facet-protocol-{protocol}"),
                             title: format!("{protocol} ({count})"),
                             display: format!("Protocol: {protocol} ({count})"),
@@ -11817,8 +10068,6 @@ impl FacetMenu {
                         .map(|(status, count)| {
                             let label = status.label().to_string();
                             FacetChoice {
-                                // Ticket 03: trigger + dropdown row name the
-                                // choice and its result count (ids stay stable).
                                 id: format!("facet-status-{label}"),
                                 title: format!("{label} ({count})"),
                                 display: format!("Status: {label} ({count})"),
@@ -11834,9 +10083,6 @@ impl FacetMenu {
         }
     }
 
-    /// T06 (CAP-7): the active choice's trigger text (`Group: travel (2)` /
-    /// `Group: All`) for the outer hover tooltip — the same choice+count
-    /// the trigger shows, so hover and trigger can never disagree.
     fn current_display(&self, delegate: &LibraryDelegate) -> String {
         let (choices, current) = self.choices(delegate);
         choices
@@ -11846,8 +10092,6 @@ impl FacetMenu {
             .unwrap_or_else(|| "All".to_string())
     }
 
-    /// Commit a picked value through the existing delegate seams (the same
-    /// setters the dialog buttons called, with the same notifications).
     fn apply(&self, view: &mut AppView, value: Option<String>, cx: &mut Context<AppView>) {
         view.libraries.update(cx, |state, list_cx| {
             let delegate = state.delegate_mut();
@@ -11865,8 +10109,6 @@ impl FacetMenu {
     }
 }
 
-/// T03: one facet `Select` — its state entity (created once, never in
-/// render), the last-synced options, and the retained confirm subscription.
 struct FacetPicker {
     state: Entity<SelectState<FacetChoiceList>>,
     synced: Vec<FacetChoice>,
@@ -11904,11 +10146,6 @@ impl FacetPicker {
     }
 }
 
-/// Config-completeness T01: one row of the Add-dialog protocol picker. `title`
-/// is the dropdown row, `display` is the trigger text (`Protocol: vless`),
-/// `value` is the canonical stored type, `id` is the stable headless anchor
-/// (`protocol-option-vless`, …). Mirrors the facet `Select` composition (same
-/// delegate shape, same stable-id rows) so the picker needs no new kit API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProtocolChoice {
     id: String,
@@ -11933,9 +10170,6 @@ impl SearchableListItem for ProtocolChoice {
     }
 }
 
-/// Config-completeness T01: the item data behind the protocol `Select` — a
-/// dedicated delegate (not `SearchableVec`) so option rows render with stable
-/// observed ids (`protocol-option-<type>`) that headless tests can find.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProtocolChoiceList(Vec<ProtocolChoice>);
 
@@ -11979,10 +10213,6 @@ impl SearchableListDelegate for ProtocolChoiceList {
     }
 }
 
-/// Config-completeness T01: the 24 canonical stored types as picker rows, in
-/// [`VALID_PROTOCOLS`] order (the store owns the list — the dialog never
-/// forks it, so a typo'd protocol is unrepresentable).
-/// Config-completeness T08: `direct` rides last (trivial final, CAP-12).
 fn protocol_choices() -> Vec<ProtocolChoice> {
     VALID_PROTOCOLS
         .iter()
@@ -11995,10 +10225,6 @@ fn protocol_choices() -> Vec<ProtocolChoice> {
         .collect()
 }
 
-/// Config-completeness T02: the item data behind one panel `Select`
-/// (flow, packet_encoding, network, fp). Same delegate shape as the
-/// protocol picker (stable `SelectedListItem` rows); one shared type for
-/// all panel dropdowns so each new select needs no new delegate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PanelChoice {
     id: String,
@@ -12023,9 +10249,6 @@ impl SearchableListItem for PanelChoice {
     }
 }
 
-/// Config-completeness T02: the item data behind panel `Select`s — a
-/// dedicated delegate (not `SearchableVec`) so option rows render with
-/// stable observed ids (`<prefix>-<value>`) that headless tests can find.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PanelChoiceList(Vec<PanelChoice>);
 
@@ -12069,9 +10292,6 @@ impl SearchableListDelegate for PanelChoiceList {
     }
 }
 
-/// Config-completeness T02: picker rows for one panel dropdown — `items`
-/// are `(value, title)` pairs; ids read `<prefix>-<slug>` where blank
-/// values slug to `default`.
 fn panel_choices(prefix: &str, items: &[(&str, &str)]) -> Vec<PanelChoice> {
     items
         .iter()
@@ -12091,9 +10311,6 @@ fn panel_choices(prefix: &str, items: &[(&str, &str)]) -> Vec<PanelChoice> {
         .collect()
 }
 
-/// Config-completeness T02: option tables for the panel dropdowns (one
-/// source — render, prefill and fold all read these, so a value the UI
-/// cannot pick is a value the fold cannot write).
 fn flow_choices() -> Vec<PanelChoice> {
     panel_choices(
         "vless-flow-option",
@@ -12104,8 +10321,6 @@ fn flow_choices() -> Vec<PanelChoice> {
     )
 }
 
-/// Config-completeness T02: sing-box 1.14.2 vless `packet_encoding`
-/// spellings (the engine passes them through; `check` judges).
 fn packet_encoding_choices() -> Vec<PanelChoice> {
     panel_choices(
         "vless-packet-encoding-option",
@@ -12117,9 +10332,6 @@ fn packet_encoding_choices() -> Vec<PanelChoice> {
     )
 }
 
-/// Config-completeness T02: sing-box stream networks the engine maps
-/// (`apply_transport`); `raw`/`none`/`gun` intake spellings keep working
-/// through JSON, they just get no picker row.
 fn network_choices() -> Vec<PanelChoice> {
     panel_choices(
         "s1-network-option",
@@ -12134,8 +10346,6 @@ fn network_choices() -> Vec<PanelChoice> {
     )
 }
 
-/// Config-completeness T02: uTLS fingerprints the engine forwards
-/// (`tls.utls.fingerprint`; `check` judges).
 fn fp_choices() -> Vec<PanelChoice> {
     panel_choices(
         "s2-fp-option",
@@ -12155,10 +10365,6 @@ fn fp_choices() -> Vec<PanelChoice> {
     )
 }
 
-/// Config-completeness T03: vmess packet ciphers (exactly the 5
-/// [`crate::store::VMESS_CIPHERS`] values — one source for picker, prefill
-/// and fold, so a value the UI cannot pick is a value the fold cannot
-/// write). `auto` leads as the sing-box default.
 fn vmess_security_choices() -> Vec<PanelChoice> {
     use crate::store::VMESS_CIPHERS;
     let mut items: Vec<(&str, &str)> = Vec::with_capacity(VMESS_CIPHERS.len());
@@ -12173,11 +10379,6 @@ fn vmess_security_choices() -> Vec<PanelChoice> {
     panel_choices("vmess-security-option", &items)
 }
 
-/// Config-completeness T03: all 18 sing-box shadowsocks ciphers (exactly
-/// [`crate::store::SS_METHODS`]) behind one blank "Select method…" row.
-/// Method has no valid default — the blank row stands for "no selection"
-/// (the fold never fabricates nor strips; the commit gate names a missing
-/// method instead).
 fn ss_method_choices() -> Vec<PanelChoice> {
     use crate::store::SS_METHODS;
     let mut items: Vec<(&str, &str)> = vec![("", "Select method…")];
@@ -12187,9 +10388,6 @@ fn ss_method_choices() -> Vec<PanelChoice> {
     panel_choices("ss-method-option", &items)
 }
 
-/// Config-completeness T03: shadowsocks plugin names (`""` = none; any
-/// non-empty pick fails generate naming `plugin` until its executable sits
-/// beside the engine — the page footer says so, Throne parity).
 fn ss_plugin_choices() -> Vec<PanelChoice> {
     panel_choices(
         "ss-plugin-option",
@@ -12201,11 +10399,6 @@ fn ss_plugin_choices() -> Vec<PanelChoice> {
     )
 }
 
-/// Config-completeness T04: AmneziaWG versions (exactly
-/// [`crate::store::AWG_VERSIONS`]) behind one blank "Select version…" row.
-/// Version has no valid default — the blank row stands for "no selection"
-/// (the fold never fabricates nor strips — contract C2; the engine names a
-/// missing version at start instead).
 fn awg_version_choices() -> Vec<PanelChoice> {
     use crate::store::AWG_VERSIONS;
     let mut items: Vec<(&str, &str)> = vec![("", "Select version…")];
@@ -12215,10 +10408,6 @@ fn awg_version_choices() -> Vec<PanelChoice> {
     panel_choices("awg-version-option", &items)
 }
 
-/// Config-completeness T05: hysteria v1 `auth_type` marker (exactly
-/// [`crate::store::HY_AUTH_TYPES`]) behind one blank "Default" row. The
-/// marker has no valid default — blank stands for "no selection" (the fold
-/// never fabricates nor strips — contract C2).
 fn hy_auth_type_choices() -> Vec<PanelChoice> {
     use crate::store::HY_AUTH_TYPES;
     let mut items: Vec<(&str, &str)> = vec![("", "Default")];
@@ -12228,9 +10417,6 @@ fn hy_auth_type_choices() -> Vec<PanelChoice> {
     panel_choices("hy-auth-type-option", &items)
 }
 
-/// Config-completeness T05: TUIC `congestion_control` modes (exactly
-/// [`crate::store::TUIC_CC_MODES`]) behind one blank "Select…" row
-/// (keep-blank — contract C2).
 fn tuic_cc_choices() -> Vec<PanelChoice> {
     use crate::store::TUIC_CC_MODES;
     let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
@@ -12240,9 +10426,6 @@ fn tuic_cc_choices() -> Vec<PanelChoice> {
     panel_choices("tuic-cc-option", &items)
 }
 
-/// Config-completeness T05: TUIC `udp_relay_mode` modes (exactly
-/// [`crate::store::TUIC_RELAY_MODES`]) behind one blank "Select…" row
-/// (keep-blank — contract C2).
 fn tuic_relay_choices() -> Vec<PanelChoice> {
     use crate::store::TUIC_RELAY_MODES;
     let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
@@ -12252,10 +10435,6 @@ fn tuic_relay_choices() -> Vec<PanelChoice> {
     panel_choices("tuic-relay-option", &items)
 }
 
-/// Config-completeness T06: SOCKS versions (exactly
-/// [`crate::store::SOCKS_VERSIONS`]) behind one blank "Select version…" row.
-/// Version has no valid default — blank leaves the stock default 5 (the
-/// engine omits it); "4" folds for generate to reject naming the field.
 fn socks_version_choices() -> Vec<PanelChoice> {
     use crate::store::SOCKS_VERSIONS;
     let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 5)")];
@@ -12265,16 +10444,10 @@ fn socks_version_choices() -> Vec<PanelChoice> {
     panel_choices("socks-version-option", &items)
 }
 
-/// Config-completeness T06: SOCKS networks the engine maps (tcp|udp only —
-/// anything else fails generate naming `network`). `tcp` leads as the
-/// sing-box default (the fold removes it, S1-rule).
 fn socks_network_choices() -> Vec<PanelChoice> {
     panel_choices("socks-network-option", &[("tcp", "tcp"), ("udp", "udp")])
 }
 
-/// Config-completeness T06: Naïve `quic_congestion_control` modes (exactly
-/// [`crate::store::NAIVE_CC_MODES`]) behind one blank "Select…" row
-/// (keep-blank — blank leaves the chromium default cubic, contract C2).
 fn naive_cc_choices() -> Vec<PanelChoice> {
     use crate::store::NAIVE_CC_MODES;
     let mut items: Vec<(&str, &str)> = vec![("", "Select…")];
@@ -12284,16 +10457,10 @@ fn naive_cc_choices() -> Vec<PanelChoice> {
     panel_choices("naive-cc-option", &items)
 }
 
-/// Config-completeness T06: SSH Browse failure text — names the full picked
-/// path (a wrong path must say which path: never a basename, never silent).
-/// Pure so headless tests pin it without a file picker.
 fn ssh_key_pick_error(path: &str) -> String {
     format!("SSH key file unreadable: {path} (check the path and pick again)")
 }
 
-/// Config-completeness T07: Snell versions the engine maps (exactly
-/// [`crate::store::SNELL_VERSIONS`]) behind one blank row (keep-blank —
-/// blank leaves the engine default 4, contract C2).
 fn snell_version_choices() -> Vec<PanelChoice> {
     use crate::store::SNELL_VERSIONS;
     let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 4)")];
@@ -12303,9 +10470,6 @@ fn snell_version_choices() -> Vec<PanelChoice> {
     panel_choices("snell-version-option", &items)
 }
 
-/// Config-completeness T07: ShadowTLS versions the engine maps (exactly
-/// [`crate::store::SHADOWTLS_VERSIONS`]) behind one blank row (keep-blank —
-/// blank leaves the schema default 1; import omits it on v1 rows).
 fn shadowtls_version_choices() -> Vec<PanelChoice> {
     use crate::store::SHADOWTLS_VERSIONS;
     let mut items: Vec<(&str, &str)> = vec![("", "Select version… (blank = 1)")];
@@ -12315,9 +10479,6 @@ fn shadowtls_version_choices() -> Vec<PanelChoice> {
     panel_choices("shadowtls-version-option", &items)
 }
 
-/// Config-completeness T07: Xray stream networks (exactly
-/// [`crate::store::XRAY_NETWORKS`]) behind one blank row (keep-blank — no
-/// fabricated default; the sidecar judges).
 fn xray_network_choices() -> Vec<PanelChoice> {
     use crate::store::XRAY_NETWORKS;
     let mut items: Vec<(&str, &str)> = vec![("", "Select network…")];
@@ -12327,9 +10488,6 @@ fn xray_network_choices() -> Vec<PanelChoice> {
     panel_choices("xray-network-option", &items)
 }
 
-/// Config-completeness T07: Xray VLESS flows (exactly
-/// [`crate::store::XRAY_FLOWS`]) behind one blank row (keep-blank — blank
-/// leaves the default, like the sing-box flow picker).
 fn xray_flow_choices() -> Vec<PanelChoice> {
     use crate::store::XRAY_FLOWS;
     let mut items: Vec<(&str, &str)> = vec![("", "Default (no flow)")];
@@ -12339,9 +10497,6 @@ fn xray_flow_choices() -> Vec<PanelChoice> {
     panel_choices("xray-flow-option", &items)
 }
 
-/// Config-completeness T07: Xray mux modes (exactly
-/// [`crate::store::XRAY_MUX_MODES`]) behind one blank Keep-Default row (the
-/// blank stands for default — the fold never fabricates nor strips).
 fn xray_mux_choices() -> Vec<PanelChoice> {
     use crate::store::XRAY_MUX_MODES;
     let mut items: Vec<(&str, &str)> = vec![("", "Keep default")];
@@ -12351,8 +10506,6 @@ fn xray_mux_choices() -> Vec<PanelChoice> {
     panel_choices("xray-mux-option", &items)
 }
 
-/// Config-completeness T07: one chain-library row for the hop picker —
-/// values are row ids (stable, never reused); titles read `name (protocol)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChainLibraryEntry {
     id: String,
@@ -12360,10 +10513,6 @@ struct ChainLibraryEntry {
     protocol: String,
 }
 
-/// Config-completeness T07: hop-picker rows for the chain library — one blank
-/// "Select a row…" head plus one row per library entry (id values, human
-/// titles). Rebuilt with the row list at dialog open; the blank form keeps
-/// the head only.
 fn chain_pick_choices(library: &[ChainLibraryEntry]) -> Vec<PanelChoice> {
     let mut owned: Vec<(String, String)> = Vec::with_capacity(library.len() + 1);
     owned.push((String::new(), "Select a row…".to_string()));
@@ -12380,10 +10529,6 @@ fn chain_pick_choices(library: &[ChainLibraryEntry]) -> Vec<PanelChoice> {
     panel_choices("chain-pick-option", &items)
 }
 
-/// Config-completeness T07: chain→rule mapping for one hop candidate —
-/// canonical protocol to the [`ChainHopSlot`] the rejection rule matches on
-/// (`autoselector` has no row type here — matched literally so the Throne
-/// rule holds verbatim even for hand JSON).
 fn chain_slot_kind(protocol: &str) -> ChainHopSlot {
     use crate::engine::{is_chain_protocol, is_extra_core_protocol};
     if protocol.trim().eq_ignore_ascii_case("autoselector") {
@@ -12398,10 +10543,6 @@ fn chain_slot_kind(protocol: &str) -> ChainHopSlot {
     }
 }
 
-/// Config-completeness T07: kinds of the current editor hops in order —
-/// id references resolve through the library (unknown ids read `Other` —
-/// the engine names them at generate), inline objects classify by their
-/// `type`/`protocol` marker. Pure so headless tests pin it without a dialog.
 fn chain_existing_kinds(
     hops: &[serde_json::Value],
     library: &[ChainLibraryEntry],
@@ -12426,10 +10567,6 @@ fn chain_existing_kinds(
         .collect()
 }
 
-/// Config-completeness T07: one hop row label — id references show the
-/// library `name (protocol)` (bare id when unknown — never params contents);
-/// inline objects show their marker + `(inline)`. Pure so headless tests pin
-/// it without a dialog.
 fn chain_hop_label(
     node: &serde_json::Value,
     index: usize,
@@ -12457,10 +10594,6 @@ fn chain_hop_label(
     }
 }
 
-/// Config-completeness T04: borrowed entity set for the nine shared
-/// WireGuard peer/net rows — the WG and AWG pages hold separate entities
-/// (T03 protocol-scoping: unmerged typing never crosses pages) but render
-/// the same rows through [`ConfigForm::wg_peer_block`].
 struct WgPeerRefs<'a> {
     prefix: &'static str,
     private_key: &'a Entity<InputState>,
@@ -12475,18 +10608,12 @@ struct WgPeerRefs<'a> {
     sys_ifc: &'a Rc<RefCell<bool>>,
 }
 
-/// Config-completeness T03: one echoed dropdown for the collapse path —
-/// panel state, read keys, and the default that counts as blank.
 type EchoSelect<'a> = (
     &'a Entity<SelectState<PanelChoiceList>>,
     &'a [&'a str],
     &'a str,
 );
 
-/// Config-completeness T02: UUIDv4 for the VLESS generate button — OS
-/// CSPRNG via the existing `getrandom` dep (no new crates); the clash-secret
-/// hash fallback (pid + wall clock + atomic nonce) so generation never
-/// panics, never logs. Version/variant bits set per RFC 4122.
 fn generate_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
@@ -12522,14 +10649,6 @@ fn generate_uuid_v4() -> String {
     out
 }
 
-/// Config-completeness T04: WireGuard private key for the WG/AWG keygen
-/// button — 32 OS-random bytes, base64 (exactly what `wg genkey` emits; no
-/// new crates: `getrandom` + `base64` are already deps). The hash fallback
-/// mirrors [`generate_uuid_v4`] (pid + wall clock + atomic nonce across two
-/// hashers for 32 bytes) so generation never panics, never logs. Local-only
-/// by construction: this fills local key material only — there is no WARP
-/// account registration (that needs network; Throne's `warp_autogen`
-/// endpoint-filling stays out per local-only).
 fn generate_wireguard_key() -> String {
     use base64::Engine as _;
     let mut bytes = [0u8; 32];
@@ -12553,10 +10672,6 @@ fn generate_wireguard_key() -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Command palette (Ctrl-K): one searchable surface over the whole
-/// action set — every key-bound action plus every menu-only destination.
-/// Sections below are the dispatch table: keep the group/item order and
-/// [`AppView::palette_op_at`] in agreement (a test pins both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteOp {
     Add,
@@ -12587,13 +10702,6 @@ enum PaletteOp {
     ExportLibrary,
 }
 
-/// Ticket 05 (throne-adoption): one connections-table row — honest stored
-/// fields only. The clash entry carries `id`, `row_id`, cumulative
-/// `rx`/`tx`, and `dest`; `delta_rx`/`delta_tx` is this poll's session
-/// delta from the same diff that persists traffic. No per-connection
-/// protocol/outbound/rate exists here by construction — the row protocol
-/// resolves from the joined library row at render time, and unclaimed
-/// connections (no row claims them) render as unclaimed, never guessed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConnRow {
     core: String,
@@ -12612,11 +10720,6 @@ impl ConnRow {
     }
 }
 
-/// Ticket 05: filter a connections snapshot to the selected row (when the
-/// toggle is on and a row is selected — with no selection, or toggled off,
-/// every live connection shows) and sort by cumulative traffic, descending
-/// by default. Probes are excluded at commit time (see
-/// [`AppView::apply_traffic_results`]), so this stays a pure display seam.
 fn build_conn_rows(
     snapshot: &[(String, crate::health::ClashConn)],
     deltas: &HashMap<String, (u64, u64)>,
@@ -12658,11 +10761,6 @@ fn build_conn_rows(
     rows
 }
 
-/// Ticket 05: one per-exit traffic aggregate for the Traffic pane — the
-/// library row plus its persisted totals (which already fold in clash-poll
-/// deltas). Idle rows stay quiet (no lying zero bars); there is deliberately
-/// no Direct line (presets emit no per-rule decisions yet, so a Direct
-/// aggregate would be fabricated).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExitTraffic {
     row_id: String,
@@ -12678,10 +10776,6 @@ impl ExitTraffic {
     }
 }
 
-/// Ticket 05: exit join for one connection row — `(name, bind:port,
-/// protocol)` from the library row the entry's `row_id` claims. Unclaimed
-/// entries (or rows removed since the poll) render as unclaimed placeholders
-/// — never a guessed protocol or endpoint. Pure seam for tests.
 fn conn_exit_of(rows: &[ProxyConfig], row_id: Option<&str>) -> (String, String, String) {
     match row_id.and_then(|id| rows.iter().find(|row| row.id == id)) {
         Some(row) => (
@@ -12693,7 +10787,6 @@ fn conn_exit_of(rows: &[ProxyConfig], row_id: Option<&str>) -> (String, String, 
     }
 }
 
-/// Ticket 05: per-exit aggregates over stored rows, heaviest exit first.
 fn aggregate_exit_traffic(
     rows: &[ProxyConfig],
     totals: &HashMap<String, (u64, u64)>,
@@ -12718,8 +10811,6 @@ fn aggregate_exit_traffic(
     exits
 }
 
-/// Ticket 10 (US-23): uptime line for Runtime Stats (`3d 4h`, `5h 12m`,
-/// `45s` — largest two units, never empty).
 fn format_uptime(total_secs: u64) -> String {
     let days = total_secs / 86_400;
     let hours = (total_secs % 86_400) / 3_600;
@@ -12736,9 +10827,6 @@ fn format_uptime(total_secs: u64) -> String {
     }
 }
 
-/// Ticket 10 (US-22): one stacked Traffic Stats bar (12 cells: `█` rx,
-/// `▓` tx, `░` empty), split proportionally over the heaviest exit.
-/// Pure seam so bars always match the stored totals.
 fn traffic_stacked_bar(rx: u64, tx: u64, max_total: u64) -> String {
     const CELLS: usize = 12;
     let max = max_total.max(1);
@@ -12754,9 +10842,6 @@ fn traffic_stacked_bar(rx: u64, tx: u64, max_total: u64) -> String {
     )
 }
 
-/// Ticket 10 (US-22): Traffic Stats summary line — period label plus the
-/// all-time caveat (only cumulative totals persist), exit count, and
-/// byte totals. Never names one profile (the bars do that per exit).
 fn traffic_stats_summary_text(
     period: store::TrafficPeriod,
     exits: usize,
@@ -12771,10 +10856,6 @@ fn traffic_stats_summary_text(
     )
 }
 
-/// Ticket 05: traffic-poll cadence — 1Hz while the Connections or Traffic
-/// pane is visible, else the 5s base cadence. Pure seam over the throttle
-/// stamp (see [`AppView::spawn_traffic_poll`]); the headless tick stays
-/// unthrottled.
 fn traffic_poll_due(tab: InspectorTab, now: i64, last_poll_at: i64) -> bool {
     if matches!(tab, InspectorTab::Connections | InspectorTab::Traffic) {
         return true;
@@ -12782,13 +10863,6 @@ fn traffic_poll_due(tab: InspectorTab, now: i64, last_poll_at: i64) -> bool {
     now.saturating_sub(last_poll_at) >= TRAFFIC_TICK_SECS as i64
 }
 
-/// Ticket 05: bottom-inspector tab over the existing detail builders.
-/// `Details` is the default overview; `Health` surfaces health + history
-/// with the row ops; `Presets` carries the attached routing preset.
-/// Ticket 05 (throne-adoption): `Logs` replays the redacted visible lines
-/// with the include/exclude/regex legs + level row; `Connections` is the
-/// honest stored-fields-only live table; `Traffic` aggregates per-exit
-/// totals (never a fabricated Direct line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum InspectorTab {
     #[default]
@@ -12823,10 +10897,6 @@ impl InspectorTab {
         }
     }
 
-    /// T06 (CAP-7): accessible tab name carrying its bound key (`Name (Key)`
-    /// per DESIGN.md) — the visible `Kbd` suffix chip on each tab mirrors
-    /// this string. Pure seam so headless tests pin the hint contract
-    /// (`Kbd` itself has no element id to assert).
     fn a11y_label(self) -> &'static str {
         match self {
             InspectorTab::Details => "Inspector Details tab (Ctrl-1)",
@@ -12842,77 +10912,35 @@ impl InspectorTab {
 struct AppView {
     focus: FocusHandle,
     libraries: Entity<ListState<LibraryDelegate>>,
-    /// Tracked scroll state for the inspector pane body
-    /// (`config-detail-body`). GPUI applies a scroller's offset at PAINT time
-    /// (`window.with_element_offset`), so a child's layout bounds never move
-    /// when the pane scrolls — layout bounds cannot prove the wheel works.
-    /// Tracking the handle exposes `offset()`/`max_offset()`: `max_offset().y
-    /// > 0` states that a tab's sections really do exceed the 240px panel
-    /// (there is something below the fold to reach), and a wheel event moving
-    /// `offset().y` states that the user can reach it.
+
     detail_scroll: ScrollHandle,
     store: Store,
-    /// Ticket 05: supervised sidecar owner (one combined config for the
-    /// active set). Production uses the real `sing-box` driver; tests swap
-    /// in the fake via direct field assignment.
+
     engine: EngineController,
-    /// Ticket 06: health samples + traffic counters, redacted sidecar logs
-    /// with a per-config UI filter, and the boxed measure driver
-    /// (production dials each config's own endpoint; tests swap in the
-    /// fake via direct field assignment like the engine).
-    /// Ticket 12: `ticks_enabled` gates the four background ticks
-    /// ([`AppView::stop_background_ticks`]); the latest sample per row is
-    /// also persisted so restart restores latencies + dead flags.
+
     health_store: HealthStore,
     logs: LogStore,
     log_filter: String,
-    /// Ticket 43: logs-dialog severity filter (`None` shows every level) and
-    /// the live-tail switch (on = reopen on new lines unless paused).
-    /// `logs_open` tracks the dialog so background reloads only touch it.
-    /// Ticket 45: logs level filter (`None` = all) + tail toggle (true =
-    /// follow the newest, false = paused at the head).
+
     log_level: Option<LogLevel>,
     log_tail: bool,
     logs_open: bool,
-    /// Ticket 45: true while the logs dialog owns the screen (cleared by
-    /// every dismiss path via `.on_close`, so level/tail toggles never
-    /// touch a foreign dialog — the ticket-26 subs-form precedent).
-    /// Ticket 43: stored-record count at the last logs-dialog open — the
-    /// live-tail watermark (a reload with more records reopens when tailing).
+
     logs_seen: usize,
-    /// T07 (gpui-18-sweep CAP-8): the virtualized log-lines viewport state
-    /// for the open logs dialog (`None` while closed).
+
     log_list: Option<Entity<ListState<LogLinesDelegate>>>,
-    /// Ticket 43: expanded subscription rows in the manager dialog (sub ids).
+
     expanded_subs: HashSet<String>,
-    /// Ticket 36: last-seen clash connection bytes (`core/conn-id` → (rx,
-    /// tx)) for the traffic tick. Keyed per connection (not per row) so a
-    /// connection that closes between polls cannot double-count the bytes
-    /// of the connections still open. In-memory only (rebuilt per poll;
-    /// the persisted totals in the store are the source of truth).
-    /// Ticket 47: bounded ([`TrafficSeenMap`]: cap + TTL + sweep) so churny
-    /// short connections never grow the map without bound.
+
     traffic_last_seen: TrafficSeenMap,
-    /// Ticket 47: a traffic poll is running off-thread ([`spawn_traffic_poll`]).
-    /// A second tick while set is SKIPPED (returns 0), never queued.
+
     traffic_tick_in_flight: bool,
-    /// Ticket 47: the display mirror hydrated from persisted totals yet
-    /// ([`ensure_traffic_mirror`] runs once, on the first traffic tick —
-    /// startup never scans).
+
     traffic_mirror_hydrated: bool,
-    /// Ticket 26: `Send` so blocking probes can move to the background
-    /// executor ([`AppView::spawn_probe`]); the fake stays API-identical.
+
     prober: Box<dyn HealthProber + Send + Sync>,
     ticks_enabled: bool,
-    /// Ticket 17: background-refresh toast coalescing. `refresh_batch_members`
-    /// holds the in-flight background member ids; completions for members
-    /// accumulate counts instead of notifying, and the last member flushes at
-    /// most one toast. Manual refreshes notify immediately as before.
-    /// Ticket 26: `refresh_generation` is the batch epoch (bumped only when a
-    /// batch opens from empty — a tick never resets an open batch, it unions
-    /// into it); `inflight_refreshes` dedupes manual-vs-tick double fetches
-    /// by sub id; `refresh_batch_conflicts` accumulates preserved user edits
-    /// for the coalesced copy.
+
     refresh_batch_total: usize,
     refresh_batch_members: HashSet<String>,
     refresh_batch_added: usize,
@@ -12923,108 +10951,60 @@ struct AppView {
     refresh_batch_in_use: usize,
     refresh_generation: u64,
     inflight_refreshes: HashSet<String>,
-    /// Ticket 26: a health probe (URL test or ping) is running off-thread.
-    /// A second probe request toasts instead of stacking (the placeholder
-    /// prober swap in [`AppView::spawn_probe`] is never observable).
-    /// Ticket 47: per-kind flags (URL-test vs TCP-ping) — the 60s re-probe
-    /// tick holds only the URL-test flag, so a manual ping is never blocked
-    /// by the tick (manual work has priority: the tick skips when its kind
-    /// is busy and retries next round).
+
     probe_url_in_flight: bool,
     probe_ping_in_flight: bool,
-    /// Ticket 09 (throne-adoption): stop flag for group test/speed/resolve
-    /// runs (see `Stop Testing`). Set on start, raised by the stop action;
-    /// runners stop pulling new rows once raised (in-flight rows complete).
+
     probe_stop: Arc<AtomicBool>,
-    /// Ticket 09 (throne-adoption): a group test/speed/resolve run is
-    /// off-thread. A second group run toasts instead of stacking; single
-    /// probes keep their per-kind flags above.
+
     group_test_in_flight: bool,
-    /// Ticket 09 (throne-adoption): speedtest mode for the next run
-    /// (the mode menu item cycles it; the timeout stays pinned to
-    /// [`SPEED_TEST_TIMEOUT`]).
+
     speedtest_mode: SpeedtestMode,
-    /// Ticket 26: the live subscriptions-dialog add form, stashed on open so
-    /// a genuine reopen (background refresh completion) can carry
-    /// in-progress text across instead of rebuilding a blank form. `None`
-    /// means no subs dialog was opened (foreign dialogs are never touched).
+
     subs_form: Option<SubForm>,
-    /// Ticket 37: the live presets-dialog create form, stashed on open so a
-    /// list-mutation reopen (remove / refresh completion) carries
-    /// in-progress text across instead of rebuilding a blank form. `None`
-    /// means no presets dialog was opened.
+
     preset_form: Option<PresetForm>,
-    /// Ticket 26: an import-dialog parse is running on the background
-    /// executor. A second OK while it runs is ignored (the first completion
-    /// closes or keeps the dialog exactly once — no double commit).
+
     import_parse_in_flight: bool,
-    /// Ticket 33: set once the user confirms the close-with-running-endpoints
-    /// dialog, so the confirmed second close is never vetoed again.
+
     close_confirmed: bool,
-    /// Ticket 38: live tray presence (`None` when the shell refused the
-    /// icon — the close-confirm then stays instead of a dishonest hide).
-    /// Main thread only, like everything in this view.
+
     tray: Option<crate::tray::TrayHandle>,
-    /// Ticket 38: last running set written to the store snapshot (change
-    /// guard so the background poll does not rewrite the DB every 5s).
+
     last_snapshot: Vec<String>,
-    /// Ticket 30: an engine start (single or start-all) is in flight. A
-    /// second Start while set is ignored with an info toast (no second
-    /// apply); the detail Start button reads `Starting…` while set.
+
     start_in_flight: bool,
-    /// Background tick loops started once (idempotent guard so a second
-    /// `start_background_ticks` call never doubles the four loops).
+
     ticks_started: bool,
-    /// Ticket 47: sidecar presence lines (About dialog), resolved ONCE at
-    /// startup — every About open reuses the cache instead of re-probing
-    /// the filesystem. (The DB/export paths shown beside them are pure
-    /// path computations, never filesystem reads.)
+
     sidecar_presence: Vec<String>,
-    /// Retained list subscription: dropping it would stop detail-bar
-    /// refreshes on selection/search events.
+
     _libraries_subscription: Subscription,
-    /// T03: facet pickers as inline `Select` popovers (replacing the
-    /// `open_facet_*_dialog` triad). Entities live here, never in render.
+
     facet_group: FacetPicker,
     facet_protocol: FacetPicker,
     facet_status: FacetPicker,
-    /// Ticket 05: active bottom-inspector tab (default Details). Plain
-    /// `Copy` field — the `TabBar` is `RenderOnce`, so it is rebuilt from
-    /// this every frame; no entity is created in render.
+
     inspector_tab: InspectorTab,
-    /// Ticket 05 (throne-adoption): last live-connections snapshot —
-    /// `(serving core, entry)` pairs with probes already excluded (see
-    /// [`AppView::apply_traffic_results`]). Honest stored fields only
-    /// (`ClashConn` carries `id`, `row_id`, cumulative `rx`/`tx`, `dest` —
-    /// never a fabricated protocol/outbound/rate).
+
     conn_snapshot: Vec<(String, crate::health::ClashConn)>,
-    /// Ticket 05: this poll's per-connection session delta (`core/conn-id`
-    /// → `(delta_rx, delta_tx)`), keyed like [`TrafficSeenMap`]. Pruned to
-    /// the snapshot on every commit; missing keys read as zero delta.
+
     conn_delta: HashMap<String, (u64, u64)>,
-    /// Ticket 05: connections pane shows only the selected row's flows
-    /// (default on, like the logs pane); with no selection it shows all.
+
     conn_selected_only: bool,
-    /// Ticket 05: connections sort direction (default descending — the
-    /// heaviest flow first).
+
     conn_sort_desc: bool,
-    /// Ticket 05: last traffic-poll start (`now_unix` epoch). The 1Hz loop
-    /// skips while the Connections/Traffic pane is hidden until the 5s base
-    /// cadence elapses (see [`traffic_poll_due`]).
+
     last_traffic_poll_at: i64,
-    /// Ticket 05 (throne-adoption): logs-pane exclude keyword (lines
-    /// containing it are dropped) alongside the `log_filter` include.
+
     log_exclude: String,
-    /// Ticket 05: logs-pane regex pattern over the redacted display line.
-    /// Empty means inactive; an invalid pattern fails open (ignored).
+
     log_regex: String,
-    /// Command-palette state, created on open (never in render) and held
-    /// so the dialog builder owns stable interaction state.
+
     palette: Option<Entity<CommandState>>,
-    /// Ticket 10 (US-22): Traffic Stats dialog period selector (default
-    /// 24h). Plain `Copy` field — the dialog rebuilds from this on open.
+
     traffic_period: store::TrafficPeriod,
-    /// Ticket 10 (US-23): process start for the Runtime Stats uptime line.
+
     started_at: std::time::Instant,
 }
 
@@ -13053,9 +11033,7 @@ impl AppView {
                 .searchable(true)
                 .selectable(true)
         });
-        // T03: facet pickers — entities created once here (never in render).
-        // Rows load below, so these start with the All-only options and sync
-        // on the first frame via `sync_facet_pickers`.
+
         let empty_delegate = LibraryDelegate::new();
         let (group_choices, group_current) = FacetMenu::Group.choices(&empty_delegate);
         let facet_group =
@@ -13076,21 +11054,11 @@ impl AppView {
             window,
             cx,
         );
-        // Ticket 01: apply the persisted Appearance before the first frame
-        // (dark when unset — `gpui_kit::init` leaves Light behind, so an
-        // explicit change is what makes dark the real default). System
-        // consults the Windows app-theme flag; a later OS flip applies on
-        // the next launch or Settings open (no silent watcher).
+
         apply_appearance(&store.appearance(), Some(window), cx);
-        // Ticket 38: seed the snapshot guard from the stored set so the
-        // first reload does not rewrite an unchanged snapshot.
+
         let last_snapshot = store.load_running_snapshot();
-        // Ticket 41: crash-safe startup — a hard kill orphans sidecars
-        // holding our ports and leaves secret temp files behind. The reaper
-        // kills only matching sidecar binaries holding our ports (never
-        // anything else) and sweeps our stale temp files, so relaunch
-        // serves again with no manual port cleanup. Best-effort: failures
-        // never block or toast the launch.
+
         {
             let our_ports: Vec<u16> = store
                 .list()
@@ -13098,8 +11066,7 @@ impl AppView {
                 .unwrap_or_default();
             crate::engine::production_startup_reap(&our_ports);
         }
-        // Ticket 47: resolve sidecar presence once (three cheap stats beside
-        // the exe) — the About dialog reuses this cache on every open.
+
         let sidecar_presence = [
             (engine_binary_file_name(), resolve_engine_binary().is_ok()),
             (fork_binary_file_name(), resolve_fork_binary().is_ok()),
@@ -13123,9 +11090,7 @@ impl AppView {
             log_tail: true,
             logs_open: false,
             logs_seen: 0,
-            // T07 (gpui-18-sweep CAP-8): the virtualized log-lines viewport,
-            // synced from the visible snapshot on every logs-dialog open (the
-            // dialog builder is `Fn`, so the handle rides in per open).
+
             log_list: None,
             expanded_subs: HashSet::new(),
             traffic_last_seen: TrafficSeenMap::default(),
@@ -13179,18 +11144,13 @@ impl AppView {
         let mut view = view;
         let rows = match view.store.list() {
             Ok(rows) => rows,
-            // Ticket 14: a broken database must not render as a silent empty
-            // library.
+
             Err(error) => {
                 window.push_notification(Notification::error(db_list_error_message(&error)), cx);
                 Vec::new()
             }
         };
-        // Ticket 12: restore last latencies + dead flags across restart.
-        // Only snapshots of still-known rows hydrate (removed configs never
-        // resurrect); traffic stays session-only; logs are never persisted.
-        // Ticket 26: the known set reuses the rows listed above (a second
-        // list that fails would silently hydrate nothing on a broken DB).
+
         if let Ok(snapshots) = view.store.load_health_snapshots() {
             let known: HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
             let kept: Vec<HealthSnapshot> = snapshots
@@ -13198,26 +11158,18 @@ impl AppView {
                 .filter(|snapshot| known.contains(&snapshot.config_id))
                 .collect();
             view.health_store.hydrate(&kept);
-            // Ticket 47: data-plane counters hydrate LAZILY on the first
-            // traffic tick ([`AppView::ensure_traffic_mirror`]) — startup
-            // never scans the traffic table, so first paint is never gated
-            // on totals. Restart still resumes counters (never zeroed).
         }
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
-            // Ticket 19: the rows cache refreshes inside `ListState::render`
-            // (the `List` element embeds the state entity as a child view),
-            // which only runs when the list entity itself is notified — the
-            // parent notify below never reaches it.
+
             list_cx.notify();
         });
-        // T03: rows are in — the pickers inventory them on this first sync.
+
         view.sync_facet_pickers(window, cx);
         cx.notify();
         view
     }
 
-    /// Number of stored configurations (also asserted by UI tests).
     #[cfg_attr(not(test), allow(dead_code))]
     fn config_count(&self, cx: &App) -> usize {
         self.libraries.read(cx).delegate().counts().0
@@ -13227,9 +11179,6 @@ impl AppView {
         self.libraries.read(cx).delegate().selected_row()
     }
 
-    /// Ticket 47: cached upstream display for one row (no JSON parse on the
-    /// render path); falls back to a live parse for rows missing from the
-    /// cache (never a wrong "no upstream").
     fn cached_upstream(&self, cx: &App, config: &ProxyConfig) -> String {
         self.libraries
             .read(cx)
@@ -13241,25 +11190,12 @@ impl AppView {
             })
     }
 
-    /// Reload rows from the store, keeping the selection by id. A list
-    /// failure notifies (never a silent empty list); callers without a
-    /// window (background ticks, headless refresh) use [`AppView::reload_quiet`].
-    /// Ticket 28: the three reload variants stay — the notify/ignore split
-    /// is load-bearing (ticket-14 ruling: headless paths stay silent by
-    /// necessity, every user action notifies).
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Ticket 30: a pending sidecar crash notifies here (windowed) with
-        // shard/cause + View-logs — never status-bar-only. The inner reload
-        // skips its own poll so the one-shot poll is consumed exactly once.
         self.notify_engine_crash(window, cx);
         if let Err(error) = self.reload_inner_no_poll(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
-        // Ticket 43: live-tail — the logs sheet follows new sidecar lines
-        // unless paused. Only our own sheet reopens (the `logs_open` proof);
-        // a paused sheet or a foreign screen is never touched. T08: the
-        // sheet closes alone (`close_sheet` never drops a dialog stacked
-        // above it).
+
         if self.logs_open
             && self.log_tail
             && self.logs.all().len() != self.logs_seen
@@ -13273,16 +11209,11 @@ impl AppView {
         cx.notify();
     }
 
-    /// Window-less reload for background ticks and headless paths: keeps the
-    /// last-good rows when the store fails (no window exists to notify).
     fn reload_quiet(&mut self, cx: &mut Context<Self>) {
         let _ = self.reload_inner(cx);
         cx.notify();
     }
 
-    /// Reload without consuming the engine poll (the caller already polled
-    /// once and reuses that result — a second one-shot poll would come back
-    /// empty and lose the crash).
     fn reload_quiet_no_poll(&mut self, cx: &mut Context<Self>) {
         let _ = self.reload_inner_no_poll(cx);
         cx.notify();
@@ -13297,28 +11228,20 @@ impl AppView {
     }
 
     fn reload_inner_impl(&mut self, cx: &mut Context<Self>, poll: bool) -> Result<(), StoreError> {
-        // Ticket 47: one store list per reload — log ingest reuses these
-        // rows (never a second list). A broken database returns early with
-        // the last-good rows and old log lines kept (never a lying empty
-        // set — ticket-14 precedent).
         let rows = self.store.list()?;
         self.drain_engine_logs(&rows);
-        // Poll exactly once per reload path: callers that already consumed
-        // the one-shot poll pass `poll: false` and reuse their result.
+
         if poll {
             self.poll_engine();
         }
         let health = self.health_map();
         let running = self.engine.running_ids();
-        // Ticket 38: persist the running set on change (session-restore
-        // source) and refresh the tray tooltip with the live count.
+
         self.snapshot_running_set(&running);
         if let Some(tray) = &self.tray {
             tray.set_running(running.len());
         }
-        // Ticket 43: traffic totals + search context ride into the delegate
-        // on every reload (a broken totals read shows no traffic, never a
-        // lying zero — the delegate keeps its last-good map).
+
         let traffic = self.store.traffic_totals().unwrap_or_default();
         let mut sub_labels = HashMap::new();
         if let Ok(subs) = self.store.list_subscriptions() {
@@ -13335,10 +11258,9 @@ impl AppView {
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
             state.delegate_mut().set_health(health);
-            // Ticket 30: serving truth follows the engine on every reload.
+
             state.delegate_mut().set_running(running);
-            // Lane B (B6): crash truth follows the engine too, so the row
-            // lamp shares the detail Badge's failed evidence.
+
             state
                 .delegate_mut()
                 .set_crashed(self.engine.ids_on_crashed_shards());
@@ -13346,7 +11268,7 @@ impl AppView {
             state
                 .delegate_mut()
                 .set_search_context(sub_labels, preset_names);
-            // Ticket 19: notify the list entity itself (see `with_store`).
+
             list_cx.notify();
         });
         Ok(())
@@ -13356,10 +11278,6 @@ impl AppView {
         window.push_notification(Notification::error(format!("Cannot save: {error}")), cx);
     }
 
-    /// Ticket 26: list the library or notify once with the database error.
-    /// `None` means the rows are unknown — callers must return early instead
-    /// of acting on a lying empty list (never "the library is empty" over a
-    /// corrupt database).
     fn list_or_notify(&self, window: &mut Window, cx: &mut App) -> Option<Vec<ProxyConfig>> {
         match self.store.list() {
             Ok(rows) => Some(rows),
@@ -13370,9 +11288,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 26: running rows for a probe, or notify once on a database
-    /// error (never "no running endpoints" over a corrupt database).
-    /// Ticket 28: filters over [`list_or_notify`] (one list/notify seam).
     fn running_rows_or_notify(
         &self,
         window: &mut Window,
@@ -13386,14 +11301,6 @@ impl AppView {
         })
     }
 
-    /// Ticket 17: success names the row (informational toast, never a
-    /// blocking modal; nothing fires on keystrokes).
-    /// Ticket 26 (L6 ruling): the search filter is user state and survives
-    /// the add — a new row hidden by the active filter is confirmed by the
-    /// toast plus the status count, and appears when the filter clears.
-    /// Clearing the user's query behind their back would be worse.
-    /// Ticket 31: dialogs commit through [`AppView::commit_add_with_focus`];
-    /// this stays as the headless/test seam.
     #[cfg_attr(not(test), allow(dead_code))]
     fn commit_add(
         &mut self,
@@ -13401,7 +11308,6 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Ticket 41: reserved ranges + garbage binds fail before any write.
         if let Err(reason) = save_listen_gate(&input.name, &input.bind_ip, &input.port) {
             window.push_notification(Notification::error(reason), cx);
             return false;
@@ -13420,11 +11326,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 31: dialog commit behind [`AppView::commit_add`]. Reads the
-    /// input from the form, and on failure records the first field error in
-    /// the shared inline slot (rendered under the fields on the next frame)
-    /// and moves keyboard focus to the owning field. The dialog stays open
-    /// (false); the toast still fires so headless callers see the error too.
     fn commit_add_with_focus(
         &mut self,
         form: &ConfigForm,
@@ -13432,8 +11333,6 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Ticket 41: save gate first (inline slot + focus, like every other
-        // field error — the dialog stays open, retryable).
         let input = form.as_new(cx);
         if let Err(reason) = save_listen_gate(&input.name, &input.bind_ip, &input.port) {
             *form_error.borrow_mut() = Some(("port".to_string(), reason.clone()));
@@ -13442,10 +11341,7 @@ impl AppView {
             cx.notify();
             return false;
         }
-        // Config-completeness T07: extra-core rows gate on exe + config shape
-        // at dialog commit (the Validate button surfaces the same errors
-        // pre-commit; the store/import path stays untouched so imported rows
-        // keep landing disabled and failing at start through the engine gate).
+
         if input.protocol == "extra-core" {
             if let Err(reason) = validate_extra_params(&input.params) {
                 *form_error.borrow_mut() = Some(("params".to_string(), reason.clone()));
@@ -13467,9 +11363,7 @@ impl AppView {
             Err(error) => {
                 if let Some((field, message)) = field_error_target(&error) {
                     *form_error.borrow_mut() = Some((field.to_string(), message));
-                    // Ticket 05: a params error auto-expands Advanced so the
-                    // box the error points at is visible (the dialog stays
-                    // open either way).
+
                     if field == "params" {
                         *form.advanced.borrow_mut() = true;
                     }
@@ -13482,10 +11376,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: Format-JSON button behind the add/edit params box —
-    /// pretty-prints the box in place (undoable). Bad JSON toasts the
-    /// reason and keeps the original text; blank boxes stay blank (the
-    /// store default), never a guessed object.
     fn format_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
@@ -13512,16 +11402,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: Template button behind the add/edit params box — fills the
-    /// per-protocol starter for the current protocol field (overwrites the
-    /// box; Format/undo restores typing). The toast names the protocol so a
-    /// stale-field fill is never mysterious.
-    /// Config-completeness T01: the protocol comes from the picker's live
-    /// selection (Add) or the locked baseline (Edit). This button stays an
-    /// EXPLICIT overwrite (the click is consent); the pristine-only rule
-    /// covers the AUTOMATIC type-switch rewrite instead (see
-    /// [`ConfigForm::sync_protocol_template`]) — refusing an explicit reset
-    /// would defeat the button's purpose.
     fn template_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
@@ -13544,9 +11424,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 43: Validate button behind the add/edit params box — blank
-    /// means the protocol default (valid), anything else must parse as JSON.
-    /// Both outcomes toast (success names nothing secret — just validity).
     fn validate_dialog_params(
         &mut self,
         params: &Entity<TextareaState>,
@@ -13562,9 +11439,7 @@ impl AppView {
                 return false;
             }
         }
-        // Config-completeness T07: extra-core rows gate on exe + config shape
-        // (the engine names the same fields at start; the button surfaces
-        // them pre-commit instead). Other protocols keep the JSON-only check.
+
         if protocol == "extra-core" {
             if let Err(reason) = validate_extra_params(&current) {
                 window.push_notification(Notification::error(reason), cx);
@@ -13582,14 +11457,6 @@ impl AppView {
         true
     }
 
-    /// Ticket 26: re-read the row at commit. A row deleted while the dialog
-    /// was open warns "Already removed" and closes (nothing left to edit);
-    /// a store failure keeps the dialog open with the error (retryable).
-    /// Staleness inside the row is handled by the caller, which builds the
-    /// patch relative to the dialog-open snapshot (only user-touched fields
-    /// are `Some` — see [`ConfigForm::as_patch_vs`]).
-    /// Ticket 31: dialogs commit through [`AppView::commit_edit_with_focus`];
-    /// this stays as the headless/test seam.
     #[cfg_attr(not(test), allow(dead_code))]
     fn commit_edit(
         &mut self,
@@ -13608,9 +11475,6 @@ impl AppView {
                 false
             }
             Ok(Some(existing)) => {
-                // Ticket 41: save gate on the effective row (patch over the
-                // stored row) - reserved ranges + garbage binds fail before
-                // any write.
                 let name = patch.name.as_deref().unwrap_or(&existing.name);
                 let bind = patch.bind_ip.as_deref().unwrap_or(&existing.bind_ip);
                 let port_gate = match patch.port.as_deref() {
@@ -13626,9 +11490,6 @@ impl AppView {
                 }
                 match self.store.update(id, patch) {
                     Ok(updated) => {
-                        // Ticket 43: a running row keeps serving its previous
-                        // config until a restart - the toast names the row and
-                        // says so instead of implying the edit is live.
                         let message = if self.engine.is_running(id) {
                             restart_to_apply_message(&updated.name)
                         } else {
@@ -13647,13 +11508,6 @@ impl AppView {
         }
     }
 
-    /// R3 inline endpoint editing: commit one row's loopback bind/port draft
-    /// (Enter path, deferred out of render; serve/edit buttons flush through
-    /// here too). Same gates + toasts as the dialog path ([`commit_edit`]);
-    /// a draft matching stored truth closes silently (Enter with no edits).
-    /// Editors canonicalize to freshly stored truth on success; a failed
-    /// draft stays visible for correction. Returns whether the row may
-    /// proceed (true also covers no-change and ghost rows, which warn).
     fn commit_row_endpoint(
         &mut self,
         id: &str,
@@ -13694,7 +11548,6 @@ impl AppView {
         };
         let ok = self.commit_edit(id, patch, window, cx);
         if ok {
-            // Canonicalize editors to freshly stored truth (reload ran).
             if let Ok(Some(fresh)) = self.store.get(id) {
                 let bind_fresh = fresh.bind_ip.clone();
                 let port_fresh = fresh.port.to_string();
@@ -13719,9 +11572,6 @@ impl AppView {
         ok
     }
 
-    /// Ticket 31: dialog commit behind [`AppView::commit_edit`]. Same
-    /// ghost/store-failure arms, plus the inline first-error slot and focus
-    /// move on validation failure (the dialog stays open, retryable).
     fn commit_edit_with_focus(
         &mut self,
         id: &str,
@@ -13742,9 +11592,6 @@ impl AppView {
                 false
             }
             Ok(Some(existing)) => {
-                // Ticket 41: save gate on the effective row (inline slot +
-                // focus, like every other field error - the dialog stays
-                // open, retryable).
                 let name = patch.name.as_deref().unwrap_or(&existing.name);
                 let bind = patch.bind_ip.as_deref().unwrap_or(&existing.bind_ip);
                 let port_gate = match patch.port.as_deref() {
@@ -13761,10 +11608,7 @@ impl AppView {
                     cx.notify();
                     return false;
                 }
-                // Config-completeness T07: extra-core rows gate on exe +
-                // config shape when the dialog actually rewrote params
-                // (untouched legacy rows pass through; the store/import path
-                // stays untouched — see `commit_add_with_focus`).
+
                 if patch.params.is_some() && existing.protocol == "extra-core" {
                     let params = patch.params.as_deref().unwrap_or(&existing.params);
                     if let Err(reason) = validate_extra_params(params) {
@@ -13779,8 +11623,7 @@ impl AppView {
                 match self.store.update(id, patch) {
                     Ok(updated) => {
                         *form_error.borrow_mut() = None;
-                        // Ticket 43: restart-to-apply prompt on the dialog path
-                        // too (see [`AppView::commit_edit`]).
+
                         let message = if self.engine.is_running(id) {
                             restart_to_apply_message(&updated.name)
                         } else {
@@ -13793,8 +11636,7 @@ impl AppView {
                     Err(error) => {
                         if let Some((field, message)) = field_error_target(&error) {
                             *form_error.borrow_mut() = Some((field.to_string(), message));
-                            // Ticket 05: a params error auto-expands Advanced
-                            // (see `commit_add_with_focus`).
+
                             if field == "params" {
                                 *form.advanced.borrow_mut() = true;
                             }
@@ -13809,11 +11651,7 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: deleting a running row stops its endpoint FIRST, then the
-    /// row disappears — no orphan keeps serving. The toast names the row and
-    /// says the endpoint stopped first; an idle row keeps the plain copy.
     fn commit_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // Ticket 17: the toast names the row (looked up before the delete).
         let name = self
             .store
             .get(id)
@@ -13824,20 +11662,15 @@ impl AppView {
         let was_running = self.engine.stop_one(id);
         match self.store.remove(id) {
             Ok(true) => {
-                // Ticket 19: only drop the selection when the removed row was
-                // selected — any other row keeps the selection, which
-                // `set_rows` then preserves by id across the reload.
                 if self.selected_config(cx).map(|row| row.id).as_deref() == Some(id) {
                     self.libraries.update(cx, |state, list_cx| {
                         state.delegate_mut().clear_selection();
-                        // Ticket 19: notify the list entity itself (see
-                        // `with_store`); the reload below refreshes rows too.
+
                         list_cx.notify();
                     });
                 }
                 self.reload(window, cx);
-                // Focus returns to the shell so keyboard control survives a
-                // destructive commit (the selection it acted on is gone).
+
                 window.focus(&self.focus, cx);
                 window.push_notification(
                     Notification::success(removed_message(&name, was_running)),
@@ -13854,10 +11687,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: duplicate one row — the copy lands disabled with a fresh
-    /// auto-assign port (blank port text), a unique `… copy` name, and the
-    /// same protocol/params/group/bind. Ghost rows warn; the toast names both
-    /// rows.
     fn commit_duplicate(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let source = match self.store.get(id) {
             Ok(Some(row)) => row,
@@ -13901,16 +11730,10 @@ impl AppView {
         }
     }
 
-    /// Throne-adoption 03: fresh row lookup for row-targeted actions (card
-    /// double-click + right-click menu). `None` on ghost rows and store
-    /// failures alike — callers warn `Already removed` like
-    /// [`AppView::commit_duplicate`], never a stale delegate snapshot.
     fn row_config(&self, id: &str) -> Option<ProxyConfig> {
         self.store.get(id).ok().flatten()
     }
 
-    /// Throne-adoption 03: open Edit for THAT row (double-click + menu),
-    /// never the selection. Ghost rows warn; the selection is untouched.
     fn open_edit_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -13919,8 +11742,6 @@ impl AppView {
         self.open_edit_dialog(config, window, cx);
     }
 
-    /// Throne-adoption 03: delete confirm for THAT row (menu), never the
-    /// selection. Ghost rows warn.
     fn open_remove_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -13929,8 +11750,6 @@ impl AppView {
         self.open_remove_confirm(config, window, cx);
     }
 
-    /// Throne-adoption 03: traffic-reset confirm for THAT row (menu).
-    /// Ghost rows warn.
     fn open_traffic_reset_for_row(
         &mut self,
         id: &str,
@@ -13944,8 +11763,6 @@ impl AppView {
         self.open_traffic_reset_confirm(config, window, cx);
     }
 
-    /// Throne-adoption 03: usage-reset confirm for THAT row (menu).
-    /// Ghost rows warn.
     fn open_usage_reset_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -13954,9 +11771,6 @@ impl AppView {
         self.open_usage_reset_confirm(config, window, cx);
     }
 
-    /// Ticket 43: reset one row's traffic totals (post-confirm). Store and
-    /// session mirror zero together, then the rows repaint; the toast names
-    /// the row. Ghost rows warn loudly.
     fn commit_reset_traffic(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .store
@@ -13986,8 +11800,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: confirm-reset wrapper for one row's traffic — names the row
-    /// and its current totals so the reset is never blind.
     fn open_traffic_reset_confirm(
         &mut self,
         config: ProxyConfig,
@@ -14030,9 +11842,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 43: Settings commit — validate and store the global test-URL
-    /// override. Blank clears back to the documented default. The toast names
-    /// the effective URL so the setting visibly takes effect.
     fn commit_test_url(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -14077,10 +11886,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: edit-dialog commit for one row's probe-URL override.
-    /// Unchanged values stay silent (no toast on a no-op save); blank clears
-    /// back to the global; anything else validates before it persists. The
-    /// toast names the row plus the effective URL.
     fn commit_row_test_url(
         &mut self,
         id: &str,
@@ -14144,9 +11949,6 @@ impl AppView {
         }
     }
 
-    /// Lane B (B7): Settings traffic wipe behind an explicit naming
-    /// confirm (same gate as [`AppView::open_usage_reset_confirm`]) — one
-    /// click never zeroes silently.
     fn open_clear_traffic_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description =
@@ -14171,8 +11973,6 @@ impl AppView {
         });
     }
 
-    /// Lane B (B7): Settings health-snapshot wipe behind an explicit
-    /// confirm — one click never drops probe evidence silently.
     fn open_clear_health_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_health_text();
@@ -14196,8 +11996,6 @@ impl AppView {
         });
     }
 
-    /// Lane B (B7): Settings running-snapshot reset behind an explicit
-    /// confirm — one click never forgets the restore set silently.
     fn open_clear_snapshot_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description = settings_clear_snapshot_text();
@@ -14220,9 +12018,7 @@ impl AppView {
                 })
         });
     }
-    /// Ticket 43: Settings commit — clear every row's traffic totals. The
-    /// toast names the cleared row count; the session mirrors rehydrate on
-    /// the next tick.
+
     fn commit_clear_traffic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.clear_all_traffic() {
             Ok(count) => {
@@ -14242,9 +12038,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: Settings commit — drop every persisted health snapshot.
-    /// The toast names the cleared count; the live session store is untouched
-    /// (restart rehydrates from empty, honestly untested).
     fn commit_clear_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.clear_health_snapshots() {
             Ok(count) => {
@@ -14263,8 +12056,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: Settings commit — drop the running snapshot so a later
-    /// launch restores nothing. The live engine is untouched.
     fn commit_clear_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.clear_running_snapshot() {
             Ok(()) => {
@@ -14283,11 +12074,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 26: the single enabled-flag commit behind the detail switch and
-    /// the Enable/Disable button. The flag is re-read fresh (never a stale
-    /// snapshot write) and the engine is deliberately untouched — the toast
-    /// says so ([`enabled_flag_message`]): enable ≠ start, disable ≠ stop.
-    /// One semantic, documented at the only place it can be confused.
     fn commit_enabled_flag(
         &mut self,
         id: &str,
@@ -14302,7 +12088,7 @@ impl AppView {
             .flatten()
             .map(|row| row.name)
             .unwrap_or_else(|| id.to_string());
-        // Ticket 14: a failed write notifies (never a dead switch).
+
         match self.store.set_enabled(id, enabled) {
             Ok(_) => {
                 self.reload(window, cx);
@@ -14318,9 +12104,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 30: the removed duplicate Enable/Disable button's commit path.
-    /// Test-only seam — production uses the `Enabled` Switch.
-    /// Ticket 43: no selection explains itself — never a dead click.
     #[cfg(test)]
     fn toggle_selected_enabled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
@@ -14332,10 +12115,6 @@ impl AppView {
         self.commit_enabled_flag(&id, enabled, window, cx);
     }
 
-    /// Signal-box 06: per-row copy — one bind endpoint URL on the
-    /// clipboard (the same secret-free [`proxy_urls`] forms the
-    /// all-or-nothing `copy-urls` carries). No selection explains itself,
-    /// exactly like the bulk copy above.
     fn copy_single_endpoint_url(
         &mut self,
         which: EndpointUrl,
@@ -14347,9 +12126,7 @@ impl AppView {
             let (url, name) = match which {
                 EndpointUrl::Socks => (Some(socks), "SOCKS"),
                 EndpointUrl::Http => (Some(http), "HTTP"),
-                // Lane B (B7): the display-only upstream line copies its
-                // host:port (never params or secrets); rows without one say
-                // so instead of copying nothing.
+
                 EndpointUrl::Upstream => (upstream_host_port(&config), "upstream"),
             };
             match url {
@@ -14370,7 +12147,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: no selection explains itself — never a dead click.
     fn copy_selected_urls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -14379,9 +12155,6 @@ impl AppView {
         self.copy_row_urls(&config.id, window, cx);
     }
 
-    /// Throne-adoption 03: copy THAT row's bind endpoints (menu), never the
-    /// selection and never secrets — `bind:port` only, like the selected
-    /// path above. Ghost rows warn.
     fn copy_row_urls(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -14392,10 +12165,6 @@ impl AppView {
         window.push_notification(Notification::success("Copied proxy URLs"), cx);
     }
 
-    /// Ticket 10 (US-28): share-out dialog for THAT row (menu) — the
-    /// `ExportToLink || ExportJsonLink` copy, never an empty string.
-    /// Unlike Copy URLs this link carries credentials, so the dialog says
-    /// so up front (the export-dialog plaintext pattern). Ghost rows warn.
     fn open_share_for_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -14450,42 +12219,22 @@ impl AppView {
         });
     }
 
-    /// Ticket 05: surface a detected sidecar crash on every reload so the
-    /// status bar reflects it without a background timer.
-    /// Ticket 12: returns the named cause once (the engine-crash tick uses
-    /// it; reload ignores it).
-    /// Ticket 30: the joined per-shard detail (`shard: cause[; …]`) is
-    /// available via [`AppView::poll_engine_detail`] for notifications —
-    /// a crash is never status-bar-only.
     fn poll_engine(&mut self) -> Option<String> {
         self.engine.poll()
     }
 
-    /// Ticket 30: poll for crashes with the joined per-shard detail (always
-    /// `shard: cause` per shard, via `EngineController::crash_detail`).
-    /// Single-shard crashes keep their shard prefix here (unlike `poll()`'s
-    /// bare cause) so the notification can name the shard.
     fn poll_engine_detail(&mut self) -> Option<String> {
         let crashes = self.engine.poll_shards();
         if crashes.is_empty() {
             return None;
         }
-        // Matches `poll()`'s active-empty silence: with nothing served there
-        // is no serving truth to report (the one-shot poll is consumed).
+
         if self.engine.running_count() == 0 {
             return None;
         }
         Some(EngineController::crash_detail(&crashes))
     }
 
-    /// Ticket 30: notify one crash as an error naming shard/cause with the
-    /// View-logs path. No-op when there is no crash. Returns the detail when
-    /// notified (tests pin delivery by count + the pure copy).
-    /// Ticket 41: opt-in auto-restart runs first — when the policy is
-    /// enabled, a retry is left, and the backoff fence has passed, one
-    /// bounded restart attempt replaces the crash notice (recovery toasts
-    /// instead; exhaustion falls through to the crash notice). Disabled by
-    /// default: the notice path is byte-identical when never opted in.
     fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut App) -> Option<String> {
         let detail = self.poll_engine_detail()?;
         if self.engine.auto_restart_due(std::time::Instant::now()) {
@@ -14514,12 +12263,6 @@ impl AppView {
         Some(detail)
     }
 
-    /// Ticket 41: manual Restart — re-applies the active set so every
-    /// crashed shard restarts beside its healthy siblings. Starting a
-    /// crashed row (or start-all) restarts it the same way through
-    /// re-apply; this is the explicit entry point. A quiet info toast when
-    /// nothing crashed (never a fake "Restarted"); failures toast loud.
-    /// Test-called until the crash-notice action lands (follow-up slice).
     #[cfg_attr(not(test), allow(dead_code))]
     fn restart_crashed_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let crashed = self.engine.crashed_shards();
@@ -14548,22 +12291,13 @@ impl AppView {
         }
     }
 
-    /// Ticket 05: warn once per non-loopback bind going live (LAN exposure
-    /// needs an explicit user action — the Start click — plus this warning).
     fn warn_for_lan_binds(&self, window: &mut Window, cx: &mut App) {
         for warning in self.engine.lan_warnings() {
             window.push_notification(Notification::warning(warning), cx);
         }
     }
 
-    /// Ticket 05: start the selected config. The engine regenerates one
-    /// combined config, runs the engine `check`, then restarts the sidecar;
-    /// a port conflict names both configs and changes nothing.
-    /// Ticket 09: non-loopback binds stop at an explicit confirm dialog
-    /// first (LAN-exposure gate) — nothing starts until the user confirms.
     fn start_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Ticket 30: no selection + Start (F5 included) explains itself —
-        // never a dead click.
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
@@ -14571,16 +12305,12 @@ impl AppView {
         self.start_row(&config.id, window, cx);
     }
 
-    /// Throne-adoption 03: start THAT row (card menu), never the selection.
-    /// Same gates as the selected path above (busy guard, LAN confirm,
-    /// test-synchronous commit). Ghost rows warn.
     fn start_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
             return;
         };
-        // Ticket 30: a second Start while one is in flight is ignored (no
-        // second apply).
+
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
@@ -14589,9 +12319,7 @@ impl AppView {
             self.open_lan_confirm_single(config, window, cx);
             return;
         }
-        // Off-UI in production (the click returns before the bounded
-        // apply); synchronous in tests so headless assertions stay
-        // deterministic.
+
         if cfg!(test) {
             self.commit_start_selected(&config.id, window, cx);
         } else {
@@ -14599,9 +12327,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 09: LAN confirm gate for one config. The dialog names the
-    /// config + bind only (see [`lan_confirm_text`]); confirming starts it,
-    /// dismissing changes nothing.
     fn open_lan_confirm_single(
         &mut self,
         config: ProxyConfig,
@@ -14631,13 +12356,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 09: the actual single start (post-gate). Looks the config up
-    /// fresh so a confirmed dialog never starts a stale row.
-    /// Ticket 23: post-gate starts use the confirmed variant (the controller
-    /// enforces LAN confirms itself); check output is redacted for display.
-    /// Ticket 30: re-entrant starts are ignored (busy guard); starting an
-    /// already-running row reports `already running (restarted)`, never a
-    /// bare `Started`.
     fn commit_start_selected(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
@@ -14648,8 +12366,7 @@ impl AppView {
             self.start_in_flight = false;
             return;
         };
-        // Ticket 37: attached preset rules merge at serve time — sync them
-        // first; a corrupt store aborts the start loudly, never preset-less.
+
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
             window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
@@ -14660,32 +12377,27 @@ impl AppView {
             window.push_notification(Notification::warning(warning), cx);
         }
         match self.engine.start_one_confirmed(&config) {
-            Ok(()) => {
-                // Ticket 26: a flag write that fails after a successful start
-                // is loud (never a silent `let _`): the endpoint runs while
-                // the flag lies, so the toast says exactly that.
-                match self.store.set_enabled(id, true) {
-                    Ok(_) => {
-                        self.reload(window, cx);
-                        let message = if was_running {
-                            already_running_message(&config.name)
-                        } else {
-                            format!("Started \"{}\"", config.name)
-                        };
-                        window.push_notification(Notification::success(message), cx);
-                    }
-                    Err(error) => {
-                        self.reload(window, cx);
-                        window.push_notification(
-                            Notification::error(format!(
-                                "Started \"{}\" but could not save its flag: {error}",
-                                config.name
-                            )),
-                            cx,
-                        );
-                    }
+            Ok(()) => match self.store.set_enabled(id, true) {
+                Ok(_) => {
+                    self.reload(window, cx);
+                    let message = if was_running {
+                        already_running_message(&config.name)
+                    } else {
+                        format!("Started \"{}\"", config.name)
+                    };
+                    window.push_notification(Notification::success(message), cx);
                 }
-            }
+                Err(error) => {
+                    self.reload(window, cx);
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Started \"{}\" but could not save its flag: {error}",
+                            config.name
+                        )),
+                        cx,
+                    );
+                }
+            },
             Err(error) => {
                 window
                     .push_notification(Notification::error(redact_secrets(&error.to_string())), cx);
@@ -14694,10 +12406,6 @@ impl AppView {
         self.start_in_flight = false;
     }
 
-    /// Ticket 05: stop the selected config; its endpoint closes, the rest
-    /// keep serving on a regenerated config.
-    /// Ticket 41: a stop failure toasts instead of claiming false success.
-    /// Ticket 43: no selection explains itself — never a dead click.
     fn stop_selected_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -14706,8 +12414,6 @@ impl AppView {
         self.stop_row(&config.id, window, cx);
     }
 
-    /// Throne-adoption 03: stop THAT row (card menu), never the selection.
-    /// Same toasts as the selected path above. Ghost rows warn.
     fn stop_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -14716,9 +12422,6 @@ impl AppView {
         let id = config.id.clone();
         let (removed, stop_error) = self.engine.stop_one_result(&id);
         if removed {
-            // Ticket 41: the membership moved but the re-gen failed — the
-            // engine restored its snapshot, so this is a failure toast,
-            // never a "Stopped" claim.
             if let Some(error) = stop_error {
                 self.reload(window, cx);
                 window.push_notification(
@@ -14731,8 +12434,7 @@ impl AppView {
                 );
                 return;
             }
-            // Ticket 26: loud on flag-write failure (the endpoint stopped
-            // while the flag still claims enabled).
+
             match self.store.set_enabled(&id, false) {
                 Ok(_) => {
                     self.reload(window, cx);
@@ -14756,8 +12458,6 @@ impl AppView {
                 }
             }
         } else {
-            // Ticket 17: honest stop-on-stopped (never silence, never a
-            // success claim over nothing).
             window.push_notification(
                 Notification::warning(already_stopped_message(&config.name)),
                 cx,
@@ -14765,12 +12465,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 02 (throne-adoption): the round global Start/Stop toggle —
-    /// Idle (nothing running) starts all, Running stops all, and a start
-    /// in flight toasts the busy guard instead of double-applying. Both
-    /// arms reuse the same gated handlers as the menus, palette, and tray
-    /// (LAN confirm, stop confirm, honest toasts), so the toggle can never
-    /// drift from them.
     fn toggle_global_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
@@ -14783,23 +12477,12 @@ impl AppView {
         }
     }
 
-    /// Ticket 05: start every stored config at once (each keeps its own
-    /// endpoint; the enabled flag follows the engine state).
-    /// Ticket 09: any non-loopback bind routes through one confirm dialog
-    /// naming every LAN-bound row — nothing starts until the user confirms.
-    /// Ticket 26 (L2 ruling): the confirm text snapshots the rows at open
-    /// while [`AppView::commit_start_all`] re-lists fresh at commit. The text
-    /// is point-in-time information; the commit set is authoritative, and the
-    /// LAN gate re-evaluates on the fresh rows — a row added or removed
-    /// between open and confirm can neither sneak past nor dodge the gate.
     fn start_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Ticket 30: a second Start-all while one is in flight is ignored.
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
         }
-        // Ticket 26: a broken database errors here (never "the library is
-        // empty" over rows we simply failed to read).
+
         let Some(rows) = self.list_or_notify(window, cx) else {
             return;
         };
@@ -14837,26 +12520,13 @@ impl AppView {
         }
     }
 
-    /// Ticket 09: the actual start-all (post-gate). Rows are re-listed so a
-    /// confirmed dialog never starts a stale set.
-    /// Ticket 17: an empty library warns honestly (never "Started 0").
-    /// Ticket 23: post-gate starts use the confirmed variant; check output
-    /// is redacted for display.
-    /// Ticket 30: best-effort — one broken row never blocks the rest.
-    /// Ticket 41: single-apply subset — the fast path starts the whole set
-    /// at once; on a row-local failure the maximal healthy subset serves
-    /// exactly once (no O(n²) per-row flapping) while the toast names the
-    /// failed rows plus both counts. Union-level failures stay atomic.
-    /// Re-entrant calls are ignored (busy guard). Idempotent: when every
-    /// row already serves, this is a no-op (no restart flap).
     fn commit_start_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
         }
         self.start_in_flight = true;
-        // Ticket 26: same honesty as the pre-gate read — a corrupt database
-        // names its error instead of claiming an empty library.
+
         let Some(rows) = self.list_or_notify(window, cx) else {
             self.start_in_flight = false;
             return;
@@ -14874,8 +12544,7 @@ impl AppView {
             );
             return;
         }
-        // Ticket 37: attached preset rules merge at serve time — sync them
-        // first; a corrupt store aborts the start loudly, never preset-less.
+
         if let Err(reason) = self.sync_presets_to_engine() {
             self.start_in_flight = false;
             window.push_notification(Notification::error(format!("Cannot start: {reason}")), cx);
@@ -14883,8 +12552,6 @@ impl AppView {
         }
         match self.engine.start_all_confirmed(&rows) {
             Ok(()) => {
-                // Ticket 26: flag writes after a successful start are loud
-                // in aggregate (never silent per-row `let _`).
                 let mut flag_errors = 0;
                 let mut first_error = String::new();
                 for row in &rows {
@@ -14914,11 +12581,6 @@ impl AppView {
                 }
             }
             Err(fast_error) => {
-                // Ticket 30: union-level failures (port conflicts, missing
-                // binaries, check/spawn, bridge, LAN gate) stay atomic —
-                // nothing starts, exactly like before. Only row-local schema
-                // failures isolate per-row so one broken row never blocks the
-                // rest (best-effort fallback below).
                 if !is_row_local_start_error(&fast_error) {
                     self.reload(window, cx);
                     self.start_in_flight = false;
@@ -14928,12 +12590,9 @@ impl AppView {
                     );
                     return;
                 }
-                // Best-effort fallback: single-apply subset (ticket 41) — the
-                // maximal healthy subset serves exactly once while every
-                // excluded row is named. No per-row O(n²) flapping.
+
                 let outcome = self.engine.start_all_subset(&rows, true);
                 if let Some(error) = outcome.error.as_deref() {
-                    // Union-level abort: nothing applied.
                     self.reload(window, cx);
                     self.start_in_flight = false;
                     window.push_notification(Notification::error(redact_secrets(error)), cx);
@@ -14960,8 +12619,7 @@ impl AppView {
                     window.push_notification(Notification::error(redact_secrets(&reason)), cx);
                     return;
                 }
-                // Flag only the rows that actually serve (never claim a
-                // failed row started).
+
                 let mut flag_errors = 0;
                 let mut first_error = String::new();
                 for row in &started {
@@ -14989,8 +12647,7 @@ impl AppView {
                     Notification::warning(start_all_partial_message(started.len(), &failed_names)),
                     cx,
                 );
-                // Ticket 41: plan warnings (typo hints) surface beside the
-                // partial toast — never silent, never blocking.
+
                 if !outcome.warnings.is_empty() {
                     window
                         .push_notification(Notification::warning(outcome.warnings.join("; ")), cx);
@@ -14999,14 +12656,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 05: stop everything and take the sidecar down.
-    /// Ticket 17: honest when nothing runs (never a success claim over
-    /// silence).
-    /// Ticket 41: a stop failure toasts instead of claiming false success.
-    /// Ticket 43: stop-all behind a confirm that names the count plus every
-    /// running row — one click never kills everything silently. With nothing
-    /// running there is nothing to confirm, so the honest idle warning fires
-    /// directly (no confirm over silence).
     fn stop_all_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.engine.running_count() == 0 {
             let message = stop_all_message(0);
@@ -15035,8 +12684,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 43: the actual stop-all (post-confirm). Stops every endpoint,
-    /// clears flags best-effort-loud, and names the stopped count.
     fn commit_stop_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let running = self.engine.running_count();
         let stop_error = self.engine.stop_all_result().map(|error| error.to_string());
@@ -15048,8 +12695,7 @@ impl AppView {
             );
             return;
         }
-        // Ticket 26: the engine stops regardless; the flag sweep after it is
-        // loud on database failure (and skips the stale-flag lie).
+
         match self.store.list() {
             Ok(rows) => {
                 let mut flag_errors = 0;
@@ -15087,9 +12733,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 33: names of the currently running endpoints (for the
-    /// close-confirm). A broken database yields no names — the close then
-    /// proceeds, since there is nothing nameable to protect.
     fn running_names_for_close(&self) -> Vec<String> {
         let running = self.engine.running_ids();
         if running.is_empty() {
@@ -15105,10 +12748,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 33: close-confirm verdict for the `on_window_should_close`
-    /// hook. Returns the confirm text when the close must be vetoed (the
-    /// caller opens the dialog and returns false); `None` lets the close
-    /// proceed (nothing running, or already confirmed).
     fn close_veto_text(&self) -> Option<String> {
         if self.close_confirmed {
             return None;
@@ -15116,12 +12755,6 @@ impl AppView {
         close_confirm_description(&self.running_names_for_close())
     }
 
-    /// Ticket 33: the confirmed close path (runs from the confirm dialog's
-    /// OK): stops every endpoint, best-effort clears the enabled flags so a
-    /// relaunch does not show running rows that died with the window, and
-    /// marks the close confirmed so the hook lets the second close through.
-    /// Ticket 38: also clears the running snapshot (nothing serves after
-    /// this close, so a restore must not resurrect it).
     fn confirm_close_stop(&mut self) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
@@ -15135,9 +12768,6 @@ impl AppView {
         self.close_confirmed = true;
     }
 
-    /// Ticket 38: persist the running set when it changes (the restore
-    /// source). Ticket 40: write errors surface (never silent loss — a
-    /// read-only disk fails loudly here instead of `let _ =`).
     fn snapshot_running_set(&mut self, running: &[String]) {
         if self.last_snapshot.as_slice() == running {
             return;
@@ -15148,9 +12778,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 38: build tray presence on the main thread. Loud failure
-    /// leaves `tray` as `None` (the close-confirm stays) — never a tray
-    /// without hide.
     fn create_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match crate::tray::TrayHandle::build() {
             Ok(tray) => {
@@ -15169,17 +12796,13 @@ impl AppView {
         }
     }
 
-    /// Ticket 38: hide to tray instead of closing (endpoints keep serving —
-    /// hiding is purely windowing, the engine is untouched). The tooltip
-    /// refreshes with the live count so the icon never misreports.
     fn hide_to_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(windows)]
         match crate::tray::hwnd_from_window(window) {
             Some(hwnd) => {
                 crate::tray::hide_window_handle(hwnd);
             }
-            // No HWND behind the window: minimize rather than lie about a
-            // hide (should not happen on Windows; never silent).
+
             None => window.minimize_window(),
         }
         #[cfg(not(windows))]
@@ -15190,7 +12813,6 @@ impl AppView {
         cx.notify();
     }
 
-    /// Ticket 38: restore a hidden window (tray Show / left-click).
     fn show_window_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(windows)]
         if let Some(hwnd) = crate::tray::hwnd_from_window(window) {
@@ -15200,16 +12822,11 @@ impl AppView {
         cx.notify();
     }
 
-    /// Ticket 38: one tray poll on the main thread — drains menu events
-    /// (Show / Start all / Stop all / Quit) plus left-click toggles.
-    /// Returns true when the app should quit (handled by the caller, which
-    /// owns the `App` for `quit()`).
     fn poll_tray_once(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.tray.is_none() {
             return false;
         }
-        // Drain the menu queue first so a queued Quit wins over an earlier
-        // Start/Stop (no wasted start before the quit).
+
         let mut actions = Vec::new();
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if let Some(action) = crate::tray::action_for_menu_id(event.id.as_ref()) {
@@ -15237,14 +12854,6 @@ impl AppView {
         false
     }
 
-    /// Ticket 38: tray menu dispatch (Quit is handled by the caller —
-    /// see [`AppView::poll_tray_once`]). Start/Stop first restore the
-    /// window so their confirm dialogs never open modal on a hidden
-    /// window (which looks hung); Show itself is the restore.
-    /// Ticket 10 (US-30): Select exit opens the preset picker for the
-    /// selected row (the ROUTING chooser twin); Select preset opens the
-    /// presets manager; Open config folder copies the data folder path
-    /// (copy, never a shell-out — the shell never launches an explorer).
     fn handle_tray_action(
         &mut self,
         action: crate::tray::TrayAction,
@@ -15277,15 +12886,10 @@ impl AppView {
         }
     }
 
-    /// Ticket 10 (US-30): tray Select-exit — the preset picker for the
-    /// selected row. No selection explains itself (never a dead click).
     fn open_tray_exit_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_preset_chooser_for_selected(window, cx);
     }
 
-    /// Ticket 10 (US-29/30): the ROUTING chooser — the preset picker for
-    /// the selected row (tray Select-exit rides the same path). No
-    /// selection explains itself (never a dead click).
     fn open_preset_chooser_for_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_config(cx) {
             Some(config) => self.open_preset_attach_dialog(config, window, cx),
@@ -15293,8 +12897,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 10 (US-30): tray Open-config-folder — copies the data folder
-    /// path (copy, never a shell-out).
     fn copy_config_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let folder = crate::tray::config_folder();
         cx.write_to_clipboard(ClipboardItem::new_string(folder.clone()));
@@ -15304,10 +12906,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 38: tray Quit — stops every endpoint, clears the snapshot
-    /// (nothing serves after quit), drops the icon (no orphan), and asks
-    /// the caller to quit the app. Clears the enabled flags so a relaunch
-    /// never shows running rows that died with the quit.
     fn quit_from_tray(&mut self) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
@@ -15318,15 +12916,10 @@ impl AppView {
             }
         }
         self.snapshot_running_set(&[]);
-        // Drop first so the icon (NIM_DELETE) is gone before the loop ends.
+
         self.tray = None;
     }
 
-    /// Ticket 38: explicit autostart opt-in behind the Settings checkbox.
-    /// The ONLY UI path to [`crate::tray::set_autostart_enabled`] (the only
-    /// writer of the real Run key). Returns true on success. Loud on
-    /// failure, and the dialog re-renders from the caller's state cell so a
-    /// failed write never shows a lying switch.
     fn commit_autostart(
         &mut self,
         enabled: bool,
@@ -15355,10 +12948,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 38: explicit session-restore opt-in behind the Settings
-    /// checkbox (default off; the store is the only persistence). Returns
-    /// true on success (see [`AppView::commit_autostart`] for the honesty
-    /// contract).
     fn commit_restore_opt_in(
         &mut self,
         enabled: bool,
@@ -15387,9 +12976,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 10 (US-30): skip-delete-confirm commit — the explicit
-    /// Settings opt-in behind the toggle. Returns true on success (the
-    /// switch cell advances only then, like the restore opt-in).
     fn commit_skip_delete_confirm(
         &mut self,
         skip: bool,
@@ -15418,10 +13004,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 01: Appearance commit — persist the choice, then apply it to
-    /// the kit theme at once (no restart; every surface rides theme tokens).
-    /// Returns true on success (see [`AppView::commit_autostart`] for the
-    /// honesty contract: the radio cell advances only on success).
     fn commit_appearance(
         &mut self,
         value: &str,
@@ -15446,31 +13028,17 @@ impl AppView {
         }
     }
 
-    /// Ticket 38: Settings dialog — the two explicit opt-ins (autostart +
-    /// session restore, both default off) with their exact side effects
-    /// stated inline. Switches are controlled values over shared cells:
-    /// a toggle commits immediately, and the cell advances only on success,
-    /// so a failed write repaints the old (true) state with an error toast
-    /// instead of a lying switch. Cells are snapshotted before the dialog
-    /// opens — the builder must never borrow the view (it can run while
-    /// the view is already borrowed).
     fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
-        // Ticket 10 (US-30): skip-delete-confirm snapshot (same
-        // commit-on-success cell pattern as the opt-ins above).
+
         let skip_delete_state = Rc::new(RefCell::new(self.store.skip_delete_confirm()));
-        // Ticket 01: Appearance snapshot (the radio cell advances only on a
-        // successful commit, like the opt-in switches below) plus a System
-        // re-resolve on every open, so an OS flip since launch paints no
-        // later than the next Settings visit.
+
         let appearance_state = Rc::new(RefCell::new(self.store.appearance()));
         let appearance_view = view.clone();
         apply_appearance(&self.store.appearance(), Some(window), cx);
-        // Ticket 01: routing inventory snapshot for the Routing/Preset
-        // sections (pure reads — a broken store reads unavailable, never a
-        // lying zero).
+
         let preset_total = self.store.list_presets().ok().map(|presets| presets.len());
         let attached_total = self
             .store
@@ -15480,8 +13048,7 @@ impl AppView {
         let routing_summary = routing_summary_text(preset_total, attached_total);
         let preset_summary = preset_summary_text(preset_total);
         let presets_view = view.clone();
-        // Ticket 43: test-URL field prefilled with the override (blank means
-        // the documented default); the commit validates + persists.
+
         let current_test_url = self.store.test_url().unwrap_or_default();
         let test_url_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -15493,21 +13060,21 @@ impl AppView {
         let db_path = Store::default_path().display().to_string();
         let export_path = Store::default_export_path().display().to_string();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            // Ticket 43: copy-path + clear-data buttons (each re-reads live
-            // state through the view — never a stale snapshot). Every clone
-            // is per-render (the builder is `Fn`): button handlers own these,
-            // never the outer bindings.
+
+
+
+
             let autostart_view = view.clone();
             let restore_view = view.clone();
             let autostart_cell = autostart_state.clone();
             let restore_cell = restore_state.clone();
-            // Ticket 10 (US-30): per-render clones for the skip-delete
-            // switch (the builder is `Fn` — handlers own these, never
-            // the outer bindings).
+
+
+
             let skip_delete_view = view.clone();
             let skip_delete_cell = skip_delete_state.clone();
-            // Ticket 01: per-render clones (the builder is `Fn` — handlers
-            // own these, never the outer bindings).
+
+
             let appearance_render_view = appearance_view.clone();
             let appearance_render_cell = appearance_state.clone();
             let presets_render_view = presets_view.clone();
@@ -15532,16 +13099,16 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        // Ticket 02 (US-2/CAP-2): tail clearance — bottom
-                        // padding on the shared body stack (never a per-line
-                        // nudge) so the last content row clears the sticky
-                        // footer when the body is scrolled to its end; any
-                        // future section tail inherits the clearance.
+
+
+
+
+
                         .pb_4()
-                        // Ticket 01: Basic section — the pre-existing Startup /
-                        // Probe / Paths / Maintenance blocks verbatim (their
-                        // ids and fold positions stay pinned); Appearance
-                        // closes the section so nothing above moves.
+
+
+
+
                         .child(
                             div()
                                 .id("settings-section-basic")
@@ -15614,8 +13181,8 @@ impl AppView {
                                      directly; LAN-bound rows still need their confirm. Default off.",
                                 ),
                         )
-                        // Ticket 43: probe URL (global override; blank =
-                        // default; per-row overrides ride in each row's Test).
+
+
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15648,20 +13215,20 @@ impl AppView {
                                     });
                                 }),
                         )
-                        // Ticket 43: tick intervals (read-only — the real
-                        // constants, so the copy cannot drift).
+
+
                         .child(
                             div()
                                 .id("settings-ticks")
                                 .test_support()
                                 .child(format!("Timers: {}", tick_interval_summary())),
                         )
-                        // Ticket 10 (US-30): skip-delete-confirm toggle —
-                        // single + bulk deletes run at once when on (stop-
-                        // first still applies); preset detach-deletes always
-                        // ask. Default off (fail-closed to the confirm).
-                        // Kept below Probe so Startup/Probe keep their fold
-                        // slots.
+
+
+
+
+
+
                         .child(
                             div()
                                 .id("settings-skip-delete")
@@ -15691,8 +13258,8 @@ impl AppView {
                                      Preset detach-deletes still ask. Default off.",
                                 ),
                         )
-                        // Ticket 43: paths (display + copy; reveal = copy —
-                        // the shell never shells out to an explorer).
+
+
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15743,8 +13310,8 @@ impl AppView {
                                     });
                                 }),
                         )
-                        // Ticket 43: destructive maintenance — each behind
-                        // its own explicit click + honest count toast.
+
+
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15783,10 +13350,10 @@ impl AppView {
                                     });
                                 }),
                         )
-                        // Ticket 01: Appearance closes Basic (positioned here
-                        // so the pre-existing blocks keep their fold slots).
-                        // Exclusive choices ride kit `Radio` with real checked
-                        // state, like the interval picker and log-level row.
+
+
+
+
                         .child(
                             div()
                                 .id("settings-appearance-caption")
@@ -15844,10 +13411,10 @@ impl AppView {
                                      (AppsUseLightTheme). A change paints at once — no restart.",
                                 ),
                         )
-                        // Ticket 01: Routing section — the single copy of the
-                        // routing controls lives in the presets manager; this
-                        // section links there (the ROUTING menu opens these
-                        // settings, never a second copy).
+
+
+
+
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15880,9 +13447,9 @@ impl AppView {
                                      (proxy | direct | block — no system paths).",
                                 ),
                         )
-                        // Ticket 01: Preset section — read-only inventory; edits
-                        // stay in the presets manager, per-row attach in the
-                        // inspector Presets pane.
+
+
+
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15905,9 +13472,9 @@ impl AppView {
                                     "Attach a preset to a row from the inspector Presets pane.",
                                 ),
                         )
-                        // Ticket 01: Hotkey section — the same
-                        // [`SHORTCUT_LINES`] the About dialog prints (a
-                        // read-only reference, never a second binding).
+
+
+
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15933,26 +13500,20 @@ impl AppView {
                             ),
                         ),
                 )
-                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
-                // shared footer renders the single `Close` and `Esc` still
-                // closes through the dialog Cancel key path.
+
+
+
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "settings-dialog-ok",
                     "settings-dialog-cancel",
-                    // Ticket 05: pure-close dialog — `Close`, never `Done`.
+
                     footer_commit_label("settings"),
                     Rc::new(|_, _| true),
                 ))
         });
     }
 
-    /// Ticket 38: launch-time session restore. Runs only with the explicit
-    /// opt-in; loopback rows start immediately while LAN-bound rows stay
-    /// behind the standard LAN confirm (the gate is never bypassed —
-    /// `start_all_confirmed`-style silent confirms are NOT used here).
-    /// Unknown (deleted) snapshot ids are dropped; an empty snapshot or a
-    /// broken database restores nothing.
     fn restore_on_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.store.restore_running() {
             return;
@@ -15977,18 +13538,12 @@ impl AppView {
         }
     }
 
-    /// Ticket 38: start the loopback restore subset (post-partition, no LAN
-    /// rows inside — the gate never sees this call). Best-effort per row so
-    /// one broken row never blocks the rest; flags follow the engine.
     fn commit_restore_subset(
         &mut self,
         rows: &[ProxyConfig],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Ticket 37: attached preset rules merge at serve time — sync them
-        // first like every other start path; a corrupt store aborts the
-        // restore loudly instead of serving preset-less.
         if let Err(reason) = self.sync_presets_to_engine() {
             window.push_notification(Notification::error(format!("Cannot restore: {reason}")), cx);
             return;
@@ -16021,9 +13576,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 38: LAN confirm for the gated restore subset — the standard
-    /// LAN gate copy over exactly these rows; nothing starts until the user
-    /// confirms, dismissing starts nothing.
     fn open_restore_lan_confirm(
         &mut self,
         rows: Vec<ProxyConfig>,
@@ -16059,15 +13611,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 33: About dialog — version + git hash + sidecar presence +
-    /// data paths + shortcuts list. Informational only; OK just closes.
-    /// Ticket 47: presence lines come from the startup cache (no
-    /// filesystem re-probe per open).
-    /// Ticket 10 (US-23): Tools > Runtime Stats — one screen for health
-    /// checks: uptime, running endpoints, stored traffic, live connections,
-    /// session deltas, subscription refresh state, DB size, and the selected
-    /// row's health. CPU/RAM process counters have no sampler in
-    /// this build, so the dialog says so (never a fabricated chart).
     fn open_runtime_stats_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let uptime = format_uptime(self.started_at.elapsed().as_secs());
         let running = self.engine.running_count();
@@ -16156,9 +13699,6 @@ impl AppView {
             dialog
                 .title("Runtime stats")
                 .child(body)
-                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
-                // shared footer renders the single `Close` and `Esc` still
-                // closes through the dialog Cancel key path.
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "runtime-stats-ok",
@@ -16169,11 +13709,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 10 (US-22): Tools > Traffic Stats — period selector plus
-    /// stacked per-exit bars (By Profile: one row per exit, heaviest
-    /// first) with the period summary. Periods summarize the same stored
-    /// cumulative totals (per-period history is phase-2), so the summary
-    /// labels itself all-time and the bars always match it.
     fn open_traffic_stats_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let period = self.traffic_period;
@@ -16246,9 +13781,6 @@ impl AppView {
             dialog
                 .title("Traffic stats")
                 .child(body)
-                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
-                // shared footer renders the single `Close` and `Esc` still
-                // closes through the dialog Cancel key path.
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "traffic-stats-ok",
@@ -16277,9 +13809,6 @@ impl AppView {
         });
     }
 
-    /// Map a palette (section, row) to its op. Section 0 is Library (15
-    /// rows), section 1 is Manage (11 rows) — the same order the dialog
-    /// builds below.
     fn palette_op_at(index: IndexPath) -> Option<PaletteOp> {
         match (index.section, index.row) {
             (0, 0) => Some(PaletteOp::Add),
@@ -16295,9 +13824,7 @@ impl AppView {
             (0, 10) => Some(PaletteOp::DetailsTab),
             (0, 11) => Some(PaletteOp::HealthTab),
             (0, 12) => Some(PaletteOp::PresetsTab),
-            // T08 (gpui-18-sweep CAP-9): the two menu-only Library
-            // destinations ride the same rows so every toolbar + menu
-            // destination resolves through the palette too.
+
             (0, 13) => Some(PaletteOp::ImportClipboard),
             (0, 14) => Some(PaletteOp::ExportLibrary),
             (1, 0) => Some(PaletteOp::Subscriptions),
@@ -16309,16 +13836,13 @@ impl AppView {
             (1, 6) => Some(PaletteOp::StartAll),
             (1, 7) => Some(PaletteOp::StopAll),
             (1, 8) => Some(PaletteOp::TestAll),
-            // Ticket 10 (throne-adoption): stats ride the Manage tail so
-            // no existing row renumbers.
+
             (1, 9) => Some(PaletteOp::RuntimeStats),
             (1, 10) => Some(PaletteOp::TrafficStats),
             _ => None,
         }
     }
 
-    /// Open the palette (single dialog — the Ctrl-K handler guards against
-    /// stacking it over another overlay; see [`overlay_open`]).
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if overlay_open(window, cx) {
             return;
@@ -16372,10 +13896,10 @@ impl AppView {
                             CommandItem::new()
                                 .label("Show Presets tab")
                                 .keywords(["preset", "tab"]),
-                            // T08 (gpui-18-sweep CAP-9): the Library menu's
-                            // two menu-only destinations (same handlers as
-                            // the `import-clipboard` / `export-library`
-                            // menu items — dispatched, not duplicated).
+
+
+
+
                             CommandItem::new()
                                 .label("Import from clipboard")
                                 .keywords(["clipboard", "paste", "import"]),
@@ -16411,9 +13935,9 @@ impl AppView {
                             CommandItem::new()
                                 .label("Test all")
                                 .keywords(["test", "all", "probe"]),
-                            // Ticket 10 (throne-adoption): stats ride the
-                            // Manage tail ((1, 9) + (1, 10)) so no existing
-                            // row renumbers.
+
+
+
                             CommandItem::new()
                                 .label("Runtime stats")
                                 .keywords(["runtime", "stats", "health", "cpu", "memory"]),
@@ -16428,9 +13952,6 @@ impl AppView {
         });
     }
 
-    /// Run one palette op: the palette closes first, then the op runs
-    /// through the same handlers the buttons, menus, and keys use (the
-    /// shell dialog guard would block direct dispatch while hosted).
     fn run_palette_op(&mut self, index: IndexPath, window: &mut Window, cx: &mut Context<Self>) {
         let Some(op) = Self::palette_op_at(index) else {
             return;
@@ -16463,14 +13984,12 @@ impl AppView {
             }
             PaletteOp::RuntimeStats => self.open_runtime_stats_dialog(window, cx),
             PaletteOp::TrafficStats => self.open_traffic_stats_dialog(window, cx),
-            // T08 (gpui-18-sweep CAP-9): menu-only twins dispatch through
-            // the same handlers the Library menu items use.
+
             PaletteOp::ImportClipboard => self.open_import_from_clipboard(window, cx),
             PaletteOp::ExportLibrary => self.open_export_dialog(window, cx),
         }
     }
 
-    /// Ticket 06: per-row summaries for the virtualized list.
     fn health_map(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for id in self.engine.running_ids() {
@@ -16482,19 +14001,10 @@ impl AppView {
         map
     }
 
-    /// Ticket 06: `(live, dead)` over the running endpoints for the
-    /// status bar.
     fn health_counts(&self) -> (usize, usize) {
         self.health_store.counts(&self.engine.running_ids())
     }
 
-    /// Signal-box 06: the status-bar describer keeps the short form —
-    /// the 880px frame fits every segment today, so the next step lives
-    /// in the detail Health module and the Test tooltip beside it.
-    /// BUG-2: session-scoped wording — after Stop the persisted Health pane
-    /// still shows probes/samples, so `never tested` read as a contradiction.
-    /// `no probes this session` names the same (live, dead) == (0, 0) state
-    /// without claiming nothing was ever tested.
     fn health_status_text(&self) -> String {
         let (live, dead) = self.health_counts();
         if live == 0 && dead == 0 {
@@ -16504,13 +14014,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 12: record probe outcomes into the session store and persist
-    /// each row's latest sample (+ dead flag) for restart. Traffic stays
-    /// session-only; logs are never persisted. Persistence failures log
-    /// loudly (a full disk must not break the health view, but it must not
-    /// fail silently either).
-    /// Ticket 47: one transaction per probe round (batched snapshots via
-    /// [`Store::save_health_snapshots`]) instead of one tx per outcome.
     fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
         let mut snapshots = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
@@ -16530,8 +14033,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 47: true when a probe of the `ping` kind (TCP-ping) — or the
-    /// URL-test kind when `ping` is false — is already running off-thread.
     fn probe_kind_in_flight(&self, ping: bool) -> bool {
         if ping {
             self.probe_ping_in_flight
@@ -16540,14 +14041,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 06: run one URL test per active endpoint, record samples +
-    /// traffic, refresh the rows, and summarize.
-    /// Ticket 12: outcomes persist (latest sample + dead flag survive
-    /// restart) via [`AppView::record_and_persist`].
-    /// Ticket 26 (ticket-25 consumer): the blocking probes run on the
-    /// background executor via [`AppView::spawn_probe`] — the click returns
-    /// after starting them, never after a 5s-per-row freeze. Returns the
-    /// number of probes started.
     fn test_all_health(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let Some(rows) = self.running_rows_or_notify(window, cx) else {
             return 0;
@@ -16563,11 +14056,6 @@ impl AppView {
         self.spawn_probe(rows, false, true, Some(window.window_handle()), cx)
     }
 
-    /// Ticket 06: URL-test just the selected config's endpoint.
-    /// Ticket 26: off-thread via [`AppView::spawn_probe`] (silent record,
-    /// like before — no toast).
-    /// Ticket 43: the selected test toasts its result (latency or redacted
-    /// cause, naming the row); no selection explains itself.
     fn test_selected_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -16576,9 +14064,6 @@ impl AppView {
         self.test_row(&config.id, window, cx);
     }
 
-    /// Throne-adoption 03: URL-test THAT row (card menu), never the
-    /// selection. Same guards + toast as the selected path above. Ghost
-    /// rows warn.
     fn test_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -16598,8 +14083,6 @@ impl AppView {
         self.spawn_probe(vec![config], false, true, Some(window.window_handle()), cx);
     }
 
-    /// Ticket 09 (throne-adoption): running rows of one group (display
-    /// order). Empty when the store fails — callers toast, never probe.
     fn group_running_rows(&self, group: &str) -> Vec<ProxyConfig> {
         let running = self.engine.running_ids();
         self.store
@@ -16610,9 +14093,6 @@ impl AppView {
             .collect()
     }
 
-    /// Ticket 09 (throne-adoption): URL-test the focused group (facet
-    /// filter first, selected row's group second). Only running rows probe
-    /// (Test-all rule); the run is stoppable and toasts its group summary.
     fn test_group_health(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(
@@ -16638,10 +14118,6 @@ impl AppView {
         self.spawn_group_probe(rows, group, Some(window.window_handle()), cx);
     }
 
-    /// Ticket 09 (throne-adoption): run one group's URL tests off the UI
-    /// thread with `Stop Testing` support. Completion records + persists
-    /// like [`AppView::record_and_persist`], then toasts the group summary
-    /// (stopped runs say so).
     fn spawn_group_probe(
         &mut self,
         rows: Vec<ProxyConfig>,
@@ -16704,10 +14180,6 @@ impl AppView {
         .detach();
     }
 
-    /// Ticket 09 (throne-adoption): `Stop Testing` — raise the stop flag
-    /// so group test/speed/resolve runs stop pulling new rows. In-flight
-    /// rows still record; the completion toast says the run stopped early.
-    /// Quiet when nothing runs (never a fake stop).
     fn stop_group_tests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use std::sync::atomic::Ordering;
         if !self.group_test_in_flight {
@@ -16718,9 +14190,6 @@ impl AppView {
         window.push_notification(Notification::info("Stopping the group test…"), cx);
     }
 
-    /// Ticket 09 (throne-adoption): speedtest THAT row (card menu), never
-    /// the selection. Ghost rows warn; stopped rows probe and report
-    /// honestly through the runner (a refused dial is a named failure).
     fn speedtest_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -16733,8 +14202,6 @@ impl AppView {
         self.speedtest_rows(vec![config], None, Some(window.window_handle()), cx);
     }
 
-    /// Ticket 09 (throne-adoption): speedtest the selected row's endpoint
-    /// (mode + pinned timeout). Records samples without traffic credit.
     fn speedtest_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -16743,8 +14210,6 @@ impl AppView {
         self.speedtest_rows(vec![config], None, Some(window.window_handle()), cx);
     }
 
-    /// Ticket 09 (throne-adoption): speedtest the focused group's running
-    /// rows (same group focus as URL tests, same stop support).
     fn speedtest_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(
@@ -16770,9 +14235,6 @@ impl AppView {
         self.speedtest_rows(rows, Some(group), Some(window.window_handle()), cx);
     }
 
-    /// Ticket 09 (throne-adoption): run speedtests off-thread (sequential —
-    /// concurrent transfers would share the pipe). `scope` names the toast
-    /// (`Some(group)` for groups, the row name for singles).
     fn speedtest_rows(
         &mut self,
         rows: Vec<ProxyConfig>,
@@ -16868,9 +14330,6 @@ impl AppView {
         .detach();
     }
 
-    /// Ticket 09 (throne-adoption): record speedtest outcomes — samples
-    /// plus restart persistence, never traffic (see
-    /// [`HealthStore::record_speed_sample`]).
     fn record_and_persist_speed(&mut self, outcomes: &[SpeedtestOutcome]) {
         let mut snapshots = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
@@ -16890,8 +14349,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 09 (throne-adoption): cycle the speedtest mode
-    /// (download → upload → download). The timeout stays pinned.
     fn cycle_speedtest_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.speedtest_mode = self.speedtest_mode.next();
         window.push_notification(
@@ -16900,8 +14357,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 09 (throne-adoption): resolve THAT row's out-IP (card menu),
-    /// never the selection. Ghost rows warn.
     fn resolve_out_ip_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -16914,8 +14369,6 @@ impl AppView {
         self.resolve_out_ip_rows(vec![config], None, Some(window.window_handle()), cx);
     }
 
-    /// Ticket 09 (throne-adoption): resolve the selected row's out-IP
-    /// through its endpoint (toast shows the address or the named failure).
     fn resolve_out_ip_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -16928,8 +14381,6 @@ impl AppView {
         self.resolve_out_ip_rows(vec![config], None, Some(window.window_handle()), cx);
     }
 
-    /// Ticket 09 (throne-adoption): resolve the focused group's running
-    /// rows' out-IPs (stoppable; summary toast dedupes addresses).
     fn resolve_out_ip_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(
@@ -16960,8 +14411,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 09 (throne-adoption): fetch out-IPs off-thread. Results are
-    /// toasted, never stored (no row field carries the egress IP).
     fn resolve_out_ip_rows(
         &mut self,
         rows: Vec<ProxyConfig>,
@@ -17041,9 +14490,6 @@ impl AppView {
         .detach();
     }
 
-    /// Ticket 09 (throne-adoption): row Resolve-Domain — resolve the row's
-    /// server hostname and save the looked-up IP into params. IP literals
-    /// and keyless rows toast honestly instead of rewriting.
     fn resolve_domain_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -17123,9 +14569,6 @@ impl AppView {
         .detach();
     }
 
-    /// Ticket 09 (throne-adoption): group Resolve-Domain behind a confirm
-    /// naming the group scope and the domain rows. Each domain resolves and
-    /// saves; the toast names rewrites plus failures.
     fn open_resolve_domain_group_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(
@@ -17181,8 +14624,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 09 (throne-adoption): commit the group Resolve-Domain —
-    /// resolve each candidate off-thread, save rewrites, toast the result.
     fn commit_resolve_domain_group(
         &mut self,
         candidates: &[(String, String, String)],
@@ -17268,11 +14709,6 @@ impl AppView {
         .detach();
     }
 
-    /// Ticket 09 (throne-adoption): group prunes behind scope-naming
-    /// confirms (see the `*_confirm_text` store seams). Each confirm names
-    /// the group plus the count (duplicates also preview ≤20 names);
-    /// commits stop running endpoints first (bulk-delete precedent), then
-    /// remove, then toast the actually-removed rows.
     fn open_prune_confirm(
         &mut self,
         kind: GroupPruneKind,
@@ -17385,8 +14821,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 09 (throne-adoption): persisted test-sample count for one
-    /// group (the Clear-tests confirm input).
     fn group_test_sample_count(&self, group: &str) -> usize {
         let ids: HashSet<String> = self
             .store
@@ -17404,9 +14838,6 @@ impl AppView {
             .count()
     }
 
-    /// Ticket 09 (throne-adoption): commit one group prune over the
-    /// currently focused group (re-resolved at commit; the toast names the
-    /// actually-removed rows so a mid-confirm change never lies).
     fn commit_prune(&mut self, kind: GroupPruneKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(
@@ -17415,8 +14846,7 @@ impl AppView {
             );
             return;
         };
-        // Stop-first (bulk-delete precedent): deleting a running row
-        // without stopping would orphan its endpoint.
+
         let stop_running = |view: &mut Self, rows: &[ProxyConfig]| {
             for row in rows {
                 let _ = view.engine.stop_one(&row.id);
@@ -17501,9 +14931,6 @@ impl AppView {
         window.push_notification(Notification::success(text), cx);
     }
 
-    /// Ticket 09 (throne-adoption): drop the session health samples of one
-    /// group's rows after `Clear tests` (persisted snapshots go through
-    /// the store; the session ring here must agree).
     fn health_store_prune_group(&mut self, group: &str) {
         let ids: HashSet<String> = self
             .store
@@ -17516,7 +14943,6 @@ impl AppView {
         self.health_store.prune_configs(&ids);
     }
 
-    /// Ticket 09 (throne-adoption): Show-Security toggle (list repaint).
     fn toggle_show_security(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let show = !self.libraries.read(cx).delegate().show_security;
         self.libraries.update(cx, |state, list_cx| {
@@ -17533,8 +14959,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 09 (throne-adoption): `Type|Security` sort toggle (display
-    /// order only; store order untouched).
     fn toggle_type_security_sort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sort = !self.libraries.read(cx).delegate().type_security_sort;
         self.libraries.update(cx, |state, list_cx| {
@@ -17551,9 +14975,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 06: TCP-ping just the selected config's endpoint.
-    /// Ticket 26: off-thread via [`AppView::spawn_probe`] (silent record).
-    /// Ticket 43: the selected ping toasts its result like the test above.
     fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.selected_config(cx) else {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -17562,8 +14983,6 @@ impl AppView {
         self.ping_row(&config.id, window, cx);
     }
 
-    /// Throne-adoption 03: TCP-ping THAT row (card menu), never the
-    /// selection. Same guards as the selected path above. Ghost rows warn.
     fn ping_row(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -17583,9 +15002,6 @@ impl AppView {
         self.spawn_probe(vec![config], true, false, None, cx);
     }
 
-    /// Ticket 43: the probe URL for these rows — a lone selected row uses its
-    /// own override when set, otherwise the global override, otherwise the
-    /// documented default. Multi-row probes share the global (never a mix).
     fn effective_test_url(&self, rows: &[ProxyConfig]) -> String {
         let global = self.store.test_url();
         if rows.len() == 1 {
@@ -17595,19 +15011,6 @@ impl AppView {
         effective_probe_url(None, global.as_deref())
     }
 
-    /// Ticket 26 (ticket-25 consumer): run `test_all`/`ping_all` off the UI
-    /// thread. The boxed prober moves into the background task (a default
-    /// stands in, guarded by the per-kind in-flight flags so it is never observable);
-    /// completion restores the prober and records on the main thread via
-    /// [`AppView::finish_probe`]. `toast` selects the manual-test summary
-    /// (the captured window) versus the silent tick record. A released view
-    /// — or a window closed mid-flight — fails closed: outcomes are recorded
-    /// quietly or dropped without touching dead state.
-    /// Ticket 43: probes use the effective test URL (per-row override, then
-    /// the global override, then the documented default). A single selected
-    /// probe toasts its own result (latency or redacted cause, naming the
-    /// row); multi-probe toasts name all three counts.
-    /// Returns the number of probes started.
     fn spawn_probe(
         &mut self,
         rows: Vec<ProxyConfig>,
@@ -17632,8 +15035,7 @@ impl AppView {
         }
         let prober = std::mem::replace(&mut self.prober, Box::new(RealHealthProber::default()));
         let weak = cx.entity().downgrade();
-        // `ping` moves into the background task below; the toast half keeps
-        // its own copy (`bool` is `Copy`, but the inner `async move` takes it).
+
         let toast_ping = ping;
         cx.spawn(async move |_entity, cx| {
             let (outcomes, prober) = cx
@@ -17649,9 +15051,6 @@ impl AppView {
                 })
                 .await;
             cx.update(|cx| {
-                // Record half: restore the prober, clear the flag, persist.
-                // The borrow ends here so the toast half below re-enters
-                // cleanly (never update-while-updating).
                 let recorded = weak.update(cx, |view, _| {
                     view.prober = prober;
                     if ping {
@@ -17668,11 +15067,7 @@ impl AppView {
                 let Some(view) = weak.upgrade() else {
                     return;
                 };
-                // Toast half (fresh borrow): manual tests toast through the
-                // captured window; everything else reloads quietly.
-                // Ticket 43: a single selected probe toasts its own result
-                // (latency or redacted cause, naming the row); anything else
-                // toasts the three counts.
+
                 if toast {
                     let message = if count == 1 {
                         match outcomes.first() {
@@ -17710,41 +15105,22 @@ impl AppView {
         count
     }
 
-    /// Ticket 13: ingest buffered sidecar stderr into the session LogStore
-    /// (existing tag match, ingest-time redaction, bounded ring). Runs on
-    /// every reload, so live lines appear without user clicks and the exit
-    /// note path stays silent-free. Logs stay session-only (never
-    /// persisted).
-    /// Ticket 47: tags against the caller's rows (no second store list per
-    /// reload — `reload_inner` lists once and reuses it here).
     fn drain_engine_logs(&mut self, active: &[ProxyConfig]) {
         let lines = self.engine.drain_log_lines();
         if lines.is_empty() {
             return;
         }
-        // Ticket 47: the tag index builds once per batch (not once per
-        // config per line); ingest strips ANSI + caches the search blob.
+
         let tags = LogTagIndex::build(active);
         for line in &lines {
             self.logs.push_raw(line, &tags);
         }
     }
 
-    /// Ticket 06: visible log lines for the dialog — the selected config's
-    /// lines when a row is selected, else engine-global + all — further
-    /// narrowed by the `log_filter` substring. Newest last, capped.
-    /// Ticket 43: the severity filter (`log_level`) applies on top — `None`
-    /// shows every level.
     fn log_lines(&self, cx: &App) -> Vec<String> {
         self.visible_log_lines(cx)
     }
 
-    /// Ticket 05 (throne-adoption): one visible log line against the extra
-    /// legs — exclude keyword (the line drops when it contains it) plus a
-    /// regex over the redacted display line (post-redaction, so a pattern
-    /// can never pull a secret back into view). Empty legs are inactive; an
-    /// invalid regex fails open at the compile site (ignored, never a silent
-    /// empty). Pure seam for tests.
     fn log_line_passes_filters(
         line: &str,
         exclude_lower: &str,
@@ -17756,14 +15132,6 @@ impl AppView {
         pattern.is_none_or(|re| re.is_match(line))
     }
 
-    /// Ticket 45: the level filter (`log_level`) applies first; the tail
-    /// toggle picks the newest 200 (tail on) or the oldest 200 (tail off,
-    /// paused at the head). This is the single source behind the dialog,
-    /// Save-visible, and Copy-all — all three always agree.
-    /// Lane B (B8): every line passes through [`redact_secrets`] (ANSI
-    /// stripped first, so escape codes can never split a secret the
-    /// scrubber must see) — the dialog, Copy, and Save can never leak a
-    /// credential through this path.
     fn visible_log_lines(&self, cx: &App) -> Vec<String> {
         let selected = self.selected_config(cx).map(|config| config.id);
         let filter = self.log_filter.trim().to_lowercase();
@@ -17783,9 +15151,7 @@ impl AppView {
         if !filter.is_empty() {
             lines.retain(|line| line.to_lowercase().contains(&filter));
         }
-        // Ticket 05 (throne-adoption): the exclude-keyword + regex legs
-        // (include stays above). The pattern compiles once per render; an
-        // invalid pattern fails open — see `log_line_passes_filters`.
+
         let exclude = self.log_exclude.trim().to_lowercase();
         let raw_pattern = self.log_regex.trim();
         let pattern = if raw_pattern.is_empty() {
@@ -17805,9 +15171,7 @@ impl AppView {
         }
         lines
     }
-    /// Ticket 45: write exactly the visible lines to `path` (Save-visible).
-    /// Atomic like the library export (temp sibling + rename), so a crash
-    /// mid-save never leaves a half file. Returns the path for the toast.
+
     fn write_visible_logs_to(&self, path: &std::path::Path, cx: &App) -> Result<(), String> {
         let body = self.visible_log_lines(cx).join("\n");
         let tmp = path.with_extension("tmp");
@@ -17816,11 +15180,6 @@ impl AppView {
         Ok(())
     }
 
-    /// Ticket 45: Save-visible commit — writes to
-    /// [`Store::default_logs_path`] (the export-path pattern) and toasts the
-    /// path; failures toast instead of silently dropping evidence.
-    /// Lane B (B8): an existing file gates behind an overwrite confirm
-    /// naming the exact destination — Save never clobbers silently.
     fn save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = Store::default_logs_path();
         if path.exists() {
@@ -17849,7 +15208,6 @@ impl AppView {
         self.commit_save_visible_logs(window, cx);
     }
 
-    /// Lane B (B8): the Save-visible write behind the overwrite gate.
     fn commit_save_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = Store::default_logs_path();
         match self.write_visible_logs_to(&path, cx) {
@@ -17861,9 +15219,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: copy the currently visible log lines to the clipboard
-    /// (the same snapshot the dialog shows — substring + level filtered,
-    /// newest last, capped). Empty warns instead of copying nothing.
     fn copy_visible_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let lines = self.visible_log_lines(cx);
         if lines.is_empty() {
@@ -17877,8 +15232,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 43: set the logs-sheet severity filter and re-render the open
-    /// sheet around the new filter (the filter text is preserved).
     fn set_log_level(
         &mut self,
         level: Option<LogLevel>,
@@ -17895,8 +15248,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: pause/resume the live tail. Resuming reopens around the
-    /// latest lines so the sheet catches up; the toast names the state.
     fn toggle_log_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.log_tail = !self.log_tail;
         window.push_notification(
@@ -17916,15 +15267,9 @@ impl AppView {
         }
     }
 
-    /// T04 (gpui-18-sweep CAP-5): clear the log text filter + level back to
-    /// All, behind the no-lines Empty's working button. Same close + reopen
-    /// rhythm as [`toggle_log_tail`](Self::toggle_log_tail) so the sheet
-    /// repaints around the restored tail; no toast (the reopen is the
-    /// confirmation).
     fn clear_log_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.log_filter.clear();
-        // Ticket 05: the extra legs clear together — clearing text alone
-        // while an exclude/regex hides everything would look broken.
+
         self.log_exclude.clear();
         self.log_regex.clear();
         self.log_level = None;
@@ -17936,28 +15281,13 @@ impl AppView {
             cx.notify();
         }
     }
-    /// Ticket 06: per-config log dialog with a filter field. OK applies the
-    /// filter and re-renders when still open.
-    /// Ticket 26 (L4 ruling): the lines snapshot at open; new sidecar lines
-    /// need a reopen. Live re-rendering an open dialog on every engine tick
-    /// would fight the user's scroll position and filter typing.
-    /// Ticket 43: the dialog gains a severity filter, a Copy-visible button,
-    /// and a Pause/Resume tail switch; while tailing, [`AppView::reload`]
-    /// reopens the dialog when new lines land (paused dialogs never move).
-    /// Ticket 05: logs filter commit — stores the typed filter so the list
-    /// re-renders around it. The footer commit path calls this; Cancel never
-    /// does (discarding leaves the previous filter intact).
-    /// Throne-adoption 05 keeps this single-leg seam for headless tests; the
-    /// sheet commits the triple via [`AppView::apply_log_filters`].
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
         self.log_filter = filter;
         cx.notify();
     }
 
-    /// Ticket 05 (throne-adoption): include + exclude + regex commit behind
-    /// the logs-sheet footer (same close-exactly-once rhythm as the single
-    /// commit; Cancel never reaches here, discarding all three edits).
     fn apply_log_filters(
         &mut self,
         include: String,
@@ -17978,8 +15308,7 @@ impl AppView {
                 .placeholder("Filter logs")
                 .default_value(current)
         });
-        // Ticket 05 (throne-adoption): exclude-keyword + regex fields beside
-        // the include filter (same per-open entity pattern, same commit).
+
         let current_exclude = self.log_exclude.clone();
         let exclude_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -17997,10 +15326,7 @@ impl AppView {
         let exclude_reader = exclude_state.clone();
         let pattern_reader = pattern_state.clone();
         let lines = self.log_lines(cx);
-        // T07 (gpui-18-sweep CAP-8): the virtualized viewport syncs from the
-        // same snapshot the dialog shows — kit `List` mounts only viewport
-        // rows, so the 200-line tail never becomes a 200-child `flex_col`.
-        // Unselectable: log lines are evidence, never a target.
+
         self.log_list = Some(cx.new(|cx| {
             ListState::new(
                 LogLinesDelegate {
@@ -18016,13 +15342,7 @@ impl AppView {
             Some(config) => format!("Logs — {}", config.name),
             None => "Logs".to_string(),
         };
-        // Ticket 18: Rc-shared with the footer OK button (mouse commits
-        // identically to the Confirm key path).
-        // Ticket 26 (L5): the commit never closes directly — returning true
-        // lets the key path (framework) and the mouse path (footer) each
-        // close exactly once. The previous explicit `close_all_dialogs` here
-        // double-closed on the mouse path.
-        // Ticket 43: cloned up front — the chrome snapshot below needs one too.
+
         let commit_view = view.clone();
         let commit: DialogCommit = Rc::new(move |_window, cx| {
             let filter = reader.read(cx).value().to_string();
@@ -18033,45 +15353,33 @@ impl AppView {
             });
             true
         });
-        // Ticket 43: mark the sheet live (tail watermark = stored records).
+
         self.logs_open = true;
         self.logs_seen = self.logs.all().len();
-        // Ticket 43: dialog-chrome snapshot for the level/tail buttons (the
-        // builder re-runs per render, so the labels track state). Copied up
-        // front — the builder runs synchronously inside `update` callers
-        // (level set, tail toggle, tail reopen), so it must never read the
-        // view entity itself while the view is borrowed.
+
         let chrome_view = view.clone();
         let chrome_level = self.log_level;
         let chrome_tail = self.log_tail;
-        // T04 (CAP-5): the no-lines Empty names whether a filter is active
-        // so the copy stays honest (empty tail vs filtered-out tail).
+
         let chrome_filter_active = !self.log_filter.trim().is_empty();
-        // T08 (gpui-18-sweep CAP-9): reference flow — the logs viewer is a
-        // `Sheet` via `WindowExt::open_sheet` (there is no `Sheet::open`),
-        // so the library stays visible behind it. True commits (Add/Edit/
-        // Import/Export/confirms) stay `Dialog`s. The sheet keeps the same
-        // body, ids, and footer verbs; the `button_props.on_ok` Confirm-key
-        // path has no sheet equivalent (kit-forced), so Apply-filter commits
-        // through the footer button only. Escape closes the topmost layer
-        // with focus returning to the trigger (kit `Root`, verified 0.6.6).
+
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
-            // Ticket 43: severity filter row + Copy/tail row. Each button
-            // re-renders this same sheet around its new state.
+
+
             let (current_level, tail_on) = (chrome_level, chrome_tail);
-            // Lane B (B9): the single level control — labels map through
-            // `LogLevel::from_label` (one source, never a hand-duplicated
-            // table).
-            // Ticket T03 (gpui-18-sweep CAP-3): exactly one grouped exclusive
-            // choice — kit `RadioGroup` with `selected_index` + `on_change`
-            // over All/Debug/Info/Warn/Error. Each level reads as selected
-            // instead of a `● ` text prefix, with arrow-key navigation the
-            // standalone row lacked. The group re-keys children by index and
-            // does not self-register for headless observation (verified 0.6.6
-            // `radio.rs` / `radio_group.rs`), so the per-level string ids are
-            // retired: the pinned `log-level-row` id rides an observed
-            // wrapper and headless clicks scope within it by index.
+
+
+
+
+
+
+
+
+
+
+
+
             const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
             let selected_level = LOG_LEVEL_LABELS
                 .iter()
@@ -18079,7 +15387,7 @@ impl AppView {
             let mut level_group = RadioGroup::horizontal("log-level-options")
                 .selected_index(selected_level)
                 .on_change({
-                    // Per-render clone — the sheet builder is `Fn`.
+
                     let group_view = chrome_view.clone();
                     move |ix, window, cx| {
                         let level = LOG_LEVEL_LABELS
@@ -18104,15 +15412,15 @@ impl AppView {
             let tail_view = chrome_view.clone();
             let save_view = chrome_view.clone();
             let clear_view = chrome_view.clone();
-            // Lane B (B9): the five-button level row above is the single
-            // level control — no second cycle button beside Copy/tail/Save.
-            // T04 (CAP-4): log actions ride `.small()` like every other
-            // action row, with tooltips naming each action.
-            // T07 (CAP-8): the live-tail streaming indicator — a small
-            // `Spinner` beside the toggle while the tail streams (every
-            // tail-reopen lands with it painted); pausing drops it. The
-            // toggle itself keeps a `min_w` floor so Pause/Resume never
-            // reflows the row.
+
+
+
+
+
+
+
+
+
             let mut action_row = div()
                 .id("log-actions-row")
                 .test_support()
@@ -18175,9 +15483,9 @@ impl AppView {
                     .gap_2()
                     .child(level_row)
                     .child(action_row)
-                    // Lane B (B8): redaction + destination disclosure — Copy and
-                    // Save carry scrubbed lines to the named path (the
-                    // `MANYPROXY_LOGS` override when set), never raw secrets.
+
+
+
                     .child(div().id("log-redact-note").test_support().text_sm().child(
                         "Copy and Save carry redacted lines — secrets never leave this dialog.",
                     ))
@@ -18204,17 +15512,17 @@ impl AppView {
                         pattern_state.clone(),
                     ));
             let mut list = div().id("log-lines").test_support().w_full();
-            // T07 (gpui-18-sweep CAP-8): lines render through the kit `List`
-            // viewport (`log-line-<ix>`, only visible rows mount) instead of a
-            // `flex_col` of raw strings — the same snapshot, virtualized. The
-            // builder is `Fn`, so the synced state rides in per open.
+
+
+
+
             let log_list_viewport = log_list_state.as_ref();
             if lines.is_empty() {
-                // T04 (gpui-18-sweep CAP-5): no-lines renders the kit `Empty`
-                // (title + description + working Clear-filter button in
-                // content), never a bare string. The button clears the text
-                // filter + level together — clearing text alone while a level
-                // hides everything would look broken.
+
+
+
+
+
                 let clear_filter_view = clear_view.clone();
                 list = list.child(
                     Empty::new()
@@ -18272,35 +15580,16 @@ impl AppView {
                 .footer(sheet_footer(
                     "logs-dialog-ok",
                     "logs-dialog-cancel",
-                    // Ticket 05: filter commit is distinct from discarding via Cancel.
+
                     footer_commit_label("logs"),
                     commit_click,
                 ))
         });
     }
-    /// Ticket 11: user-owned JSON export behind the plaintext-secret
-    /// warning. The confirm dialog shows [`export_confirm_description`]
-    /// (the [`store::export_warning_text`] verbatim); confirming writes the
-    /// file, dismissing writes nothing. The payload round-trips through the
-    /// import grammar (re-import yields duplicates, never adds).
-    /// Ticket 17: the dialog previews row counts, the destination path, and
-    /// an overwrite warning when the file already exists.
-    /// Ticket 26 (L3 ruling): the preview snapshots at open (standard dialog
-    /// behavior). The commit re-lists for its toast, and the overwrite
-    /// confirm stands regardless — reopening the dialog refreshes the
-    /// preview.
-    /// Ticket 43: the destination is an editable path (prefilled with the
-    /// default) — gate one names the path and offers the choice; when the
-    /// chosen file already exists, gate two names it again and demands an
-    /// explicit overwrite confirm. No silent clobber, ever.
-    /// Ticket 05 (signal-box): the warning rides the kit error Alert (red
-    /// caution border on theme tokens) with the secrets text verbatim, plus
-    /// a visible safer path (Copy URLs never carries secrets). Cancel
-    /// closes with no write and no toast.
+
     fn open_export_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
-        // Ticket 26: a broken database errors instead of previewing counts
-        // over rows we failed to read.
+
         let Some(rows) = self.list_or_notify(window, cx) else {
             return;
         };
@@ -18319,8 +15608,7 @@ impl AppView {
         let warning = export_confirm_description().to_string();
         let reader = path_state.clone();
         let commit_view = view.clone();
-        // Ticket 18: Rc-shared with the footer OK button (mouse commits
-        // identically to the Confirm key path, including the second gate).
+
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let path = reader.read(cx).value().to_string();
             commit_view.update(cx, |view, cx| view.commit_export_dialog(path, window, cx))
@@ -18365,16 +15653,12 @@ impl AppView {
                 .footer(dialog_footer(
                     "export-dialog-ok",
                     "export-dialog-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("export"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 43: export dialog commit — gate two. A blank path errors (never
-    /// a guessed destination); an existing file opens the explicit overwrite
-    /// confirm naming the path; anything else writes immediately.
     fn commit_export_dialog(
         &mut self,
         path: String,
@@ -18417,19 +15701,12 @@ impl AppView {
         true
     }
 
-    /// Ticket 43: the actual export write to one explicit path (both gates
-    /// passed). Headless/test seam — the dialog commit funnels here.
-    /// Ticket 11/16 (moved with the path choice): the notification names
-    /// only the destination path and the honest import-shaped-vs-total
-    /// count — never secrets, never an inflated claim.
     fn commit_export_write_to(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let target = std::path::PathBuf::from(path.trim());
         match self.store.commit_export(&target, true) {
             Ok(Some(path)) => {
                 let rendered = path.display().to_string();
-                // Ticket 14: the export itself succeeded — name the path with
-                // the real count, or without a count when the count query
-                // fails (never claim "0 config(s)").
+
                 match self.store.list() {
                     Ok(rows) => window.push_notification(
                         Notification::success(export_count_message(
@@ -18453,12 +15730,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 26 (ticket-25 consumer): library-export restore behind an
-    /// explicit confirm. The payload carries full-fidelity rows, subs, and
-    /// tombstones; restoring replaces the current library verbatim (row ids,
-    /// groups, enabled flags, subscriptions, and deletions land exactly as
-    /// exported), so the dialog names what it will do. Dismissing changes
-    /// nothing. The notification names only counts — never row contents.
     fn open_restore_confirm(
         &mut self,
         payload: String,
@@ -18492,15 +15763,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 26: the actual restore (post-confirm). The payload is dry-run
-    /// into a throwaway store first (a malformed backup must never wipe a
-    /// good library), then the current library is wiped and the payload
-    /// rebuilt verbatim in its single transaction. Success reloads and names
-    /// the restored counts ([`restore_done_message`]); failure names the
-    /// export error. Row ids survive, so running endpoints are unaffected.
-    /// Ticket 40: file-backed stores restore atomically — timestamped backup
-    /// first, temp sibling DB + validate + quick_check + rename, so a kill
-    /// mid-restore leaves the old library intact.
     fn commit_library_restore(
         &mut self,
         payload: &str,
@@ -18517,15 +15779,13 @@ impl AppView {
                 return;
             }
         }
-        // File-backed atomic path: backup + temp-DB + rename (mid-kill safe).
+
         if let Some(live_path) = self.store.db_path() {
             match Store::restore_library_file(&live_path, payload, now_unix()) {
                 Ok((outcome, backup)) => {
-                    // No live file existed → no backup was taken (never a
-                    // phantom path); name that instead of a location.
                     let backup_text = backup.as_deref().map(|path| path.display().to_string());
                     let backup_text = backup_text.as_deref().unwrap_or("(no prior library file)");
-                    // Reopen the swapped file so the live handle tracks it.
+
                     match Store::open_file(&live_path) {
                         Ok(fresh) => {
                             self.store = fresh;
@@ -18575,8 +15835,6 @@ impl AppView {
                 window.push_notification(Notification::success(restore_done_message(&outcome)), cx);
             }
             Err(error) => {
-                // The dry run passed, so this is unreachable in practice;
-                // reported loudly all the same (the library was cleared).
                 self.reload(window, cx);
                 window.push_notification(
                     Notification::error(format!(
@@ -18588,12 +15846,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 26: empty the library ahead of a verbatim restore.
-    /// Subscriptions go first: [`Store::remove_subscription`] releases their
-    /// rows to hand-owned instead of deleting them, so the wipe itself
-    /// records no tombstones; the row sweep then deletes cleanly. Tombstones
-    /// that predate the wipe carry over (they only gate re-adding vanished
-    /// rows, never the restored rows themselves).
     fn wipe_library_for_restore(&mut self) -> Result<(), StoreError> {
         let subs = self.store.list_subscriptions()?;
         for sub in &subs {
@@ -18606,15 +15858,6 @@ impl AppView {
         Ok(())
     }
 
-    /// Ticket 06 (throne-adoption): the second small dialog behind
-    /// `Advanced Settings` — Dial Fields plus TLS extras over the SAME
-    /// form entities, so typing writes direct to the object: closing keeps
-    /// everything with no extra validation (the main commit still gates).
-    /// A stacked `Dialog` over the Add/Edit dialog: kit sheets do not
-    /// deliver mouse events to their content in 0.6.6 (proven headless —
-    /// sheet buttons never fire), while stacked dialogs use the same
-    /// proven layer mechanics as every other form. Back pops only the top
-    /// dialog and the main form is never dropped, so no edit is ever lost.
     fn open_advanced_dialog(
         &mut self,
         form: &ConfigForm,
@@ -18646,9 +15889,7 @@ impl AppView {
             if tls_panel_plan(&protocol).is_some() {
                 body = body.child(adv_form.s2_extras_section(&repaint));
             }
-            // Enter behaves like Back (nothing to commit — edits already
-            // apply direct to the object): pop exactly the top dialog and
-            // report `false` so the kit does not close a second layer.
+
             let back = Rc::new(|window: &mut Window, cx: &mut App| {
                 window.close_dialog(cx);
             });
@@ -18678,15 +15919,12 @@ impl AppView {
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut form = ConfigForm::blank(window, cx);
         let view = cx.entity();
-        // Ticket 31: the shared first-error slot — the commit records it and
-        // the builder renders it inline under the fields on the next frame.
+
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
         let error_for_commit = form_error.clone();
-        // Ticket 31: rows snapshot for the live bind/port collision warning
-        // (a broken database warns nothing — the commit still reports it).
+
         let rows = self.store.list().unwrap_or_default();
-        // Config-completeness T07: the chain hop picker + labels read this
-        // dialog-open snapshot (id, name, protocol per row).
+
         let library: Vec<ChainLibraryEntry> = rows
             .iter()
             .map(|row| ChainLibraryEntry {
@@ -18698,12 +15936,9 @@ impl AppView {
         form.chain_library = Rc::new(RefCell::new(library.clone()));
         form.chain_pick = ConfigForm::panel_select(window, cx, chain_pick_choices(&library), "");
         let reader = form.clone();
-        // Port budget readout rides the dialog (auto-assign draws from it).
+
         let budget = ConfigForm::port_budget_text(&rows);
-        // Ticket 18: Rc-shared with the footer OK button (mouse commits
-        // identically to the Confirm key path, including stay-open-on-error).
-        // Ticket 43: cloned up front — the builder needs one for the params
-        // Format/Template buttons too.
+
         let element_view = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             view.update(cx, |view, cx| {
@@ -18712,16 +15947,10 @@ impl AppView {
         });
         let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, window, cx| {
-            // Config-completeness T01: pristine-only template sync — a picker
-            // switch rewrites an untouched starter once via
-            // `pristine_template_rewrite`, dirty JSON never. The builder is the
-            // only window-holding frame scope (the kit Confirm subscription
-            // has no Window, and render has no &mut).
             form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
-            // Ticket 31: live warning inputs — the builder re-runs every
-            // render, so the collision line tracks typing.
+
             let live = form.clone();
             let bind = live.bind.read(cx).value().to_string();
             let port = live.port.read(cx).value().to_string();
@@ -18729,9 +15958,6 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title("Add proxy configuration")
-                // Ticket 06: the Advanced dialog stacks above this dialog —
-                // overlay clicks must not discard the form (Cancel/Escape
-                // still close).
                 .overlay_closable(false)
                 .child(form.clone().element(
                     element_view.clone(),
@@ -18749,7 +15975,6 @@ impl AppView {
                 .footer(dialog_footer(
                     "add-dialog-ok",
                     "add-dialog-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("add"),
                     commit_click,
                 ))
@@ -18771,15 +15996,12 @@ impl AppView {
         let view = cx.entity();
         let id = config.id.clone();
         let title = format!("Edit {}", config.name);
-        // Ticket 31: the shared first-error slot (see `open_add_dialog`).
+
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
         let error_for_commit = form_error.clone();
-        // Ticket 31: rows snapshot for the live collision warning; the edited
-        // row itself is excluded.
+
         let rows = self.store.list().unwrap_or_default();
-        // Config-completeness T07: the chain hop picker + labels read this
-        // dialog-open snapshot (the edited row stays listed — adding it back
-        // is refused naming the flat-chain rule).
+
         let library: Vec<ChainLibraryEntry> = rows
             .iter()
             .map(|row| ChainLibraryEntry {
@@ -18791,17 +16013,10 @@ impl AppView {
         form.chain_library = Rc::new(RefCell::new(library.clone()));
         form.chain_pick = ConfigForm::panel_select(window, cx, chain_pick_choices(&library), "");
         let reader = form.clone();
-        // Port budget readout rides the dialog (auto-assign draws from it).
+
         let budget = ConfigForm::port_budget_text(&rows);
         let exclude = id.clone();
-        // Ticket 18: Rc-shared with the footer OK button (mouse commits
-        // identically to the Confirm key path, including stay-open-on-error).
-        // Ticket 26: the patch is relative to this dialog-open snapshot —
-        // only fields the user actually changed are written, so a refresh
-        // that lands mid-edit survives on every untouched field.
-        // Ticket 43: cloned up front — the builder needs one for the params
-        // Format/Template buttons too. The per-row test URL commits
-        // alongside the patch (unchanged URLs stay silent).
+
         let snapshot = config.clone();
         let element_view = view.clone();
         let url_id = id.clone();
@@ -18819,8 +16034,6 @@ impl AppView {
         });
         let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, window, cx| {
-            // Config-completeness T01: template sync (no-op on locked Edit
-            // rows — kept at both builders so the rule lives in one place).
             form.sync_protocol_template(window, cx);
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
@@ -18831,9 +16044,6 @@ impl AppView {
             let inline = form_error.borrow().clone();
             dialog
                 .title(title.clone())
-                // Ticket 06: the Advanced dialog stacks above this dialog —
-                // overlay clicks must not discard the form (Cancel/Escape
-                // still close).
                 .overlay_closable(false)
                 .child(form.clone().element(
                     element_view.clone(),
@@ -18851,7 +16061,6 @@ impl AppView {
                 .footer(dialog_footer(
                     "edit-dialog-ok",
                     "edit-dialog-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("edit"),
                     commit_click,
                 ))
@@ -18864,9 +16073,6 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Ticket 10 (US-30): skip-delete-confirm toggle — the explicit
-        // Settings opt-in deletes without asking (stop-first still rides
-        // `commit_remove`, like the confirm path).
         if self.store.skip_delete_confirm() {
             self.commit_remove(&config.id, window, cx);
             return;
@@ -18874,8 +16080,7 @@ impl AppView {
         let view = cx.entity();
         let id = config.id.clone();
         let name = config.name.clone();
-        // Ticket 43: a running row is promised stop-first; the idle copy
-        // stays (it would lie about stopping here).
+
         let description = if self.engine.is_running(&config.id) {
             delete_running_confirm_text(&name)
         } else {
@@ -18902,8 +16107,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 45: confirm resetting one row's usage counters (explicit
-    /// second gate — one click never zeroes silently).
     fn open_usage_reset_confirm(
         &mut self,
         config: ProxyConfig,
@@ -18935,8 +16138,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 45: zero one row's persisted usage counters after the confirm
-    /// gate. Unknown rows warn; store failures name the error.
     fn commit_usage_reset(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.reset_traffic_counters(id) {
             Ok(()) => {
@@ -18955,8 +16156,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 03: paste/clipboard entry point. The batch commits through the
-    /// existing add flow, so every record lands disabled in the chosen group.
     fn open_import_dialog(
         &mut self,
         prefill_text: &str,
@@ -18975,9 +16174,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 16: multi-file opener — the dialog shows the merged text but
-    /// retains every `(file_name, content)` pair so an unedited commit keeps
-    /// per-file stems/keys; any edit falls back to single-text sniffing.
     fn open_import_dialog_with_files(
         &mut self,
         prefill_text: &str,
@@ -18995,12 +16191,7 @@ impl AppView {
         };
         let view = cx.entity();
         let reader = form.clone();
-        // Ticket 18: Rc-shared with the footer OK button (mouse commits
-        // identically to the Confirm key path, including stay-open-on-error).
-        // Ticket 26: the dialog commit parses on the background executor
-        // ([`AppView::commit_import_dialog`]) — it returns false immediately
-        // and the completion closes the dialog on success.
-        // Ticket 43: cloned up front — the builder needs one for Browse too.
+
         let commit_view = view.clone();
         let element_view = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
@@ -19028,19 +16219,12 @@ impl AppView {
                 .footer(dialog_footer(
                     "import-dialog-ok",
                     "import-dialog-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("import"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 03: clipboard entry point. Clipboard text prefills the same
-    /// dialog (same group choice, same commit path).
-    /// Ticket 08 (cua-fixes): prose on the clipboard toasts honestly
-    /// instead of opening a junk-prefilled dialog — never silent, and never
-    /// an echo (clipboard text may carry secrets, so both toasts are static
-    /// copy).
     fn open_import_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = cx
             .read_from_clipboard()
@@ -19054,15 +16238,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 08 (cua-fixes): paste-intake gate for the Ctrl+V handler
-    /// above (the same handler as the palette `ImportClipboard` op and the
-    /// Library-menu "From clipboard" item). `None` opens the prefilled
-    /// dialog exactly as before; `Some(reason)` is the honest toast. The
-    /// shaped arms mirror the commit diversions in
-    /// [`commit_import_with_context`] (library export, addsub,
-    /// route/remoteroute, preset JSON), and the fallback asks
-    /// [`import_text`] — the same parse the dialog preview and commit use —
-    /// so the gate can never block a valid import.
     fn paste_intake_refusal(text: &str) -> Option<&'static str> {
         use crate::preset::{is_remote_route_attempt, is_route_attempt, looks_like_preset_json};
         if text.trim().is_empty() {
@@ -19090,11 +16265,6 @@ impl AppView {
         None
     }
 
-    /// Ticket 07 (throne-adoption): OS open-with handoff. Bare `http(s)` URLs
-    /// are ambiguous (subscription feed vs proxy) and get the chooser;
-    /// everything else arrives pre-disambiguated and prefills one import
-    /// dialog (the commit path diverts addsub/preset/restore identically —
-    /// one argv string is one batch result with one honest toast).
     fn handle_launch_intake(
         &mut self,
         intake: OpenWithKind,
@@ -19109,11 +16279,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 07: bare-`http(s)` chooser — the URL never parses silently as
-    /// a proxy row (the batch path would read it as one). Both options are
-    /// explicit; Cancel (or footer Close) drops the handoff with nothing
-    /// stored. Body buttons close the chooser before acting (no stacked
-    /// dialogs).
     fn open_bare_url_chooser(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let proxy_view = view.clone();
@@ -19121,9 +16286,9 @@ impl AppView {
         let sub_view = view.clone();
         let sub_url = url.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            // Per-render clones: the builder is `Fn`, so each render hands
-            // the handlers fresh clones instead of moving the captured
-            // originals (which `Fn` forbids).
+
+
+
             let proxy_view = proxy_view.clone();
             let proxy_url = proxy_url.clone();
             let sub_view = sub_view.clone();
@@ -19175,9 +16340,9 @@ impl AppView {
                             },
                         ),
                 )
-                // Ticket 03 (US-3): pure-close — no kit Cancel affordance; the
-                // shared footer renders the single `Close` and `Esc` still
-                // closes through the dialog Cancel key path.
+
+
+
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
                     "bare-url-close",
@@ -19188,9 +16353,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 07: chooser "Add as subscription" — records the feed with the
-    /// host-derived label and starts the first refresh (the same tail as the
-    /// addsub fast path). The chooser closes first either way.
     fn commit_bare_url_subscription(
         &mut self,
         url: String,
@@ -19210,23 +16372,12 @@ impl AppView {
         );
     }
 
-    /// Ticket 03: drag-drop/file entry point. Readable files are concatenated
-    /// into the same import dialog; a single dropped file keeps its name so
-    /// `.conf` content parses as WireGuard with stem-based peer names.
-    /// Ticket 16: multi-file drops retain every file's bytes so per-file
-    /// `.conf` stems/keys survive; the dialog still shows the merged text.
-    /// Ticket 26: unreadable files are named (basenames only — full paths can
-    /// carry OS usernames), never silently skipped.
     fn import_dropped_files(
         &mut self,
         paths: &ExternalPaths,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Signal-box 03: drops never stack import dialogs — while any
-        // overlay is open the drop is refused with an honest toast (the
-        // drop hint names the same precondition), never silently
-        // swallowed and never stacked.
         if overlay_open(window, cx) {
             window.push_notification(
                 Notification::warning(
@@ -19240,10 +16391,7 @@ impl AppView {
         let mut names: Vec<String> = Vec::new();
         let mut files: Vec<(String, String)> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
-        // Ticket 07 (throne-adoption): the 50MB cap + content-sniff run on
-        // every dropped file (oversize, image, binary, and non-UTF8 bytes
-        // are named with their reason — never silently skipped, never
-        // buffered into the dialog).
+
         for path in paths.0.iter() {
             let display = path.to_string_lossy().into_owned();
             match read_import_file(path) {
@@ -19295,10 +16443,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: Browse button behind the import dialog — the platform file
-    /// picker (multi-select); picked bytes merge with the current box text
-    /// via [`finish_browse_pick`]. Cancelling picks nothing and changes
-    /// nothing; unreadable files are named, never swallowed.
     fn browse_for_import_files(
         &mut self,
         current_text: String,
@@ -19321,9 +16465,7 @@ impl AppView {
             };
             let mut files: Vec<(String, String)> = Vec::new();
             let mut unreadable: Vec<String> = Vec::new();
-            // Ticket 07 (throne-adoption): picked files run the same guards
-            // as drops (50MB cap + content-sniff; refusals ride the
-            // unreadable line with their reason).
+
             for path in &paths {
                 let display = path.to_string_lossy().into_owned();
                 match read_import_file(path) {
@@ -19357,12 +16499,6 @@ impl AppView {
         .detach();
     }
 
-    /// Config-completeness T06: Browse button behind the SSH page — the
-    /// platform file picker (single-select, Import-Browse pattern); the
-    /// picked key bytes fill the path input and load into the key textarea
-    /// (no hand-paste). Cancelling picks nothing and changes nothing; a
-    /// wrong path toasts naming the full path via
-    /// [`ssh_key_pick_error`].
     fn browse_for_ssh_key(
         &mut self,
         path_entity: Entity<InputState>,
@@ -19395,10 +16531,6 @@ impl AppView {
         .detach();
     }
 
-    /// Config-completeness T06: SSH Browse completion (windowed) — success
-    /// fills the path input and loads the key bytes into the textarea
-    /// (overwrite, so path and content never disagree); failure toasts
-    /// naming the full path and changes nothing.
     fn finish_ssh_key_pick(
         &mut self,
         path_entity: Entity<InputState>,
@@ -19424,11 +16556,6 @@ impl AppView {
         );
     }
 
-    /// Config-completeness T07: chain hop-list Add behind the editor button —
-    /// resolves the picked id through the library, applies the Throne
-    /// rejection rules (refusals toast naming the rule and change nothing),
-    /// appends the id reference on success and resets the picker. Returns
-    /// whether the hop landed (headless tests pin the state directly).
     fn chain_add_hop(
         &mut self,
         hops: &Rc<RefCell<Vec<serde_json::Value>>>,
@@ -19470,11 +16597,6 @@ impl AppView {
         true
     }
 
-    /// Config-completeness T07: chain hop-list Replace behind the per-hop
-    /// button — same resolution + rules as
-    /// [`AppView::chain_add_hop`] against the target index (replacing the
-    /// index-0 extracore with another extracore is allowed; anything else
-    /// follows the add rules). Returns whether the hop landed.
     #[allow(clippy::too_many_arguments)]
     fn chain_replace_hop(
         &mut self,
@@ -19517,11 +16639,6 @@ impl AppView {
         true
     }
 
-    /// Config-completeness T07: extra-core Browse (windowed) — fills the exe
-    /// input with the picked FILE NAME (the engine resolves it in the app
-    /// directory and refuses paths, so the full pick never lands verbatim).
-    /// The binary is never read (unlike the SSH key text). Nothing picked
-    /// changes nothing.
     fn browse_for_extra_exe(
         &mut self,
         path_entity: Entity<InputState>,
@@ -19552,9 +16669,6 @@ impl AppView {
         .detach();
     }
 
-    /// Config-completeness T07: extra-core Browse completion (windowed) —
-    /// stores the file name (see [`AppView::browse_for_extra_exe`]) and
-    /// toasts it. Pure enough for headless tests to pin without a picker.
     fn finish_extra_exe_pick(
         &mut self,
         path_entity: Entity<InputState>,
@@ -19576,10 +16690,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 43: Browse completion (windowed) — unreadable files toast by
-    /// name, picked bytes reopen the dialog merged with the carried box text
-    /// (stems/keys survive via [`merge_browse_results`]), and the read toast
-    /// names every file. Nothing picked changes nothing.
     fn finish_browse_pick(
         &mut self,
         current_text: String,
@@ -19605,15 +16715,6 @@ impl AppView {
         window.push_notification(Notification::success(browse_read_message(&names)), cx);
     }
 
-    /// Ticket 03: commit a paste box through the existing add flow. Valid
-    /// items become disabled records in `group`; failures are reported with
-    /// item index + reason (never partial silent import); identical
-    /// re-imports add nothing. Import never starts configs.
-    /// Ticket 04: a lone `throne://addsub/...` line diverts to the
-    /// subscription intake instead (record + immediate first refresh).
-    /// Ticket 16: stale `.conf` hints are cleared when the text no longer
-    /// looks like a conf, and single-addsub honors the dialog group.
-    /// Test-only callers (existing import_commit_* tests) go through here.
     #[cfg_attr(not(test), allow(dead_code))]
     fn commit_import(
         &mut self,
@@ -19626,13 +16727,6 @@ impl AppView {
         self.commit_import_with_context(text, group, file_hint, None, None, window, cx)
     }
 
-    /// Ticket 16: context-aware commit behind [`commit_import`]. `original`
-    /// is the dialog prefill (when `text` differs, the drop hint and the
-    /// multi-file bytes are stale and the edited text sniffs as its own
-    /// type); `multi` carries every dropped file for unedited multi-commits.
-    /// Ticket 26: library-export payloads divert to the restore confirm
-    /// path; everything else shares [`resolve_import_inputs`] /
-    /// [`parse_import_inputs`] with the background dialog path.
     #[allow(clippy::too_many_arguments)]
     fn commit_import_with_context(
         &mut self,
@@ -19659,13 +16753,6 @@ impl AppView {
         self.finish_import_batch(batch, &resolved.group, window, cx)
     }
 
-    /// Ticket 26: the dialog import commit — the CPU parse runs on the
-    /// background executor, the store commit stays on the main thread (the
-    /// store owns a `!Send` connection; the single-transaction
-    /// [`commit_batch`] keeps it fast). Returns false immediately: the dialog
-    /// stays open until the completion commits and closes it on success, or
-    /// toasts the failure with the dialog kept open. A second OK while a
-    /// parse runs is ignored (no double commit).
     #[allow(clippy::too_many_arguments)]
     fn commit_import_dialog(
         &mut self,
@@ -19693,10 +16780,7 @@ impl AppView {
         }
         self.import_parse_in_flight = true;
         let weak = cx.entity().downgrade();
-        // Ticket 26: the completion commits through THIS window's handle
-        // (captured now — `active_window` is unreliable by completion time,
-        // and the dialog to close lives here). A window closed mid-parse
-        // falls back to the silent headless commit.
+
         let handle = window.window_handle();
         cx.spawn(async move |_entity, cx| {
             let group = resolved.group.clone();
@@ -19728,10 +16812,6 @@ impl AppView {
         false
     }
 
-    /// Ticket 26: main-thread completion for [`AppView::commit_import_dialog`].
-    /// Commits through the shared [`AppView::finish_import_batch`] tail and
-    /// closes the dialog on success (total failure keeps it open with the
-    /// error, exactly like the synchronous path).
     fn finish_import_parse(
         &mut self,
         batch: crate::import::BatchResult,
@@ -19745,10 +16825,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 26: window-less completion (the window closed mid-parse). The
-    /// user-initiated commit still lands via the single-transaction
-    /// [`commit_batch`]; with no window there is nothing to toast to and
-    /// nothing to close.
     fn finish_import_parse_no_window(
         &mut self,
         batch: crate::import::BatchResult,
@@ -19761,12 +16837,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 26: single-line `throne://addsub/...` fast path shared by the
-    /// synchronous and background commits. Returns `Some(done)` when the
-    /// inputs are addsub-shaped (the parse itself is trivial CPU; the intake
-    /// touches the store on this thread), `None` for everything else.
-    /// Ticket 14: a malformed link reports its own parse reason (never the
-    /// generic unknown-command) and keeps the dialog open.
     fn try_addsub_commit(
         &mut self,
         resolved: &ResolvedImport,
@@ -19792,7 +16862,6 @@ impl AppView {
         })
     }
 
-    /// Ticket 03/14: shared batch-commit tail (reload + truthful summary).
     fn finish_import_batch(
         &mut self,
         batch: crate::import::BatchResult,
@@ -19803,8 +16872,7 @@ impl AppView {
         match commit_batch(&mut self.store, batch, group) {
             Ok(outcome) => {
                 self.reload(window, cx);
-                // Ticket 14: total failure keeps the dialog open and lists
-                // every failure (index/label/reason), not just the first.
+
                 if outcome.imported == 0 && !outcome.failures.is_empty() {
                     window.push_notification(
                         Notification::error(format!(
@@ -19815,7 +16883,7 @@ impl AppView {
                     );
                     return false;
                 }
-                // Ticket 07: honest partial-success toast (pure helper, pinned).
+
                 let summary =
                     import_success_summary(outcome.imported, outcome.duplicates, &outcome.failures);
                 if outcome.failures.is_empty() {
@@ -19823,9 +16891,7 @@ impl AppView {
                 } else {
                     window.push_notification(Notification::warning(summary), cx);
                 }
-                // The new rows arrive selected (first imported) and checked
-                // (all imported) so F5 and the bulk bar act on them at once —
-                // no click-a-row round trip after a successful import.
+
                 if !outcome.imported_ids.is_empty() {
                     let first = outcome.imported_ids.clone();
                     self.libraries.update(cx, |list_state, list_cx| {
@@ -19855,11 +16921,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 04: `throne://addsub/...` intake — record the subscription
-    /// (label from the URL host, never the query) and fetch immediately so
-    /// members appear without waiting for the next startup pass.
-    /// Ticket 16: the dialog group wins over the payload group (see
-    /// [`effective_addsub_group`]).
     fn commit_addsub_request_with_group(
         &mut self,
         request: AddSubRequest,
@@ -19879,15 +16940,6 @@ impl AppView {
         )
     }
 
-    /// Ticket 04: add a subscription record; on success the dialog closes and
-    /// a first refresh starts in the background. Invalid input keeps the
-    /// dialog open with an error notification.
-    /// Ticket 17: the add-form auto-refresh checkbox lands here (no more
-    /// create-then-toggle).
-    /// Ticket 31: an already-subscribed URL takes the friendly path — a
-    /// warning naming the existing label, no double row, dialog stays open.
-    /// Ticket 45: the add-form interval picker lands here too (applied
-    /// right after the insert; a set failure toasts but keeps the row).
     #[allow(clippy::too_many_arguments)]
     fn commit_subscription_add(
         &mut self,
@@ -19899,8 +16951,6 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // A broken-database lookup must not block the add: fall through and
-        // let the insert report the real error.
         if let Ok(Some(existing)) = self.store.find_subscription_by_url(&url) {
             window.push_notification(
                 Notification::warning(already_subscribed_message(&existing.label)),
@@ -19937,14 +16987,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 31: edit a subscription's label/url/group in place. Persists
-    /// via [`Store::update_subscription`], refreshes the list, and closes on
-    /// success (the manager dialog reopens with the new values through
-    /// [`AppView::reopen_subscriptions_if_open`]). A row removed mid-edit
-    /// warns and closes; validation failures keep the dialog open with the
-    /// error (retryable).
-    /// Ticket 45: the edit-dialog interval picker lands here too (applied
-    /// right after the update; a set failure toasts but keeps the edit).
     #[allow(clippy::too_many_arguments)]
     fn commit_subscription_edit(
         &mut self,
@@ -19984,15 +17026,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 17: open a coalescing batch for background refreshes. Member
-    /// completions accumulate instead of notifying; the last member flushes
-    /// at most one toast (see [`AppView::accumulate_batch_member`]). Empty
-    /// input is a no-op (never an empty toast).
-    /// Ticket 26: opening never resets an open batch. A tick that fires while
-    /// members are still in flight unions its ids in (totals grow by the new
-    /// ids only) and keeps every accumulated count — no partial loss, no dup
-    /// toasts. The generation bumps only on the empty → open transition, so
-    /// tests can pin the batch epoch.
     fn begin_refresh_batch(&mut self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -20007,13 +17040,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 17: accumulate one batch member completion. Returns true when
-    /// this completion finished the batch (the caller then flushes once).
-    /// Callers check [`AppView::is_batch_member`] first: non-members notify
-    /// immediately instead of accumulating.
-    /// Ticket 26: conflicts (preserved user edits) accumulate alongside the
-    /// churn counts for the coalesced copy.
-    /// Ticket 08: `in_use` (kept serving rows) accumulates alongside.
     #[allow(clippy::too_many_arguments)]
     fn accumulate_batch_member(
         &mut self,
@@ -20037,19 +17063,10 @@ impl AppView {
         self.refresh_batch_members.is_empty()
     }
 
-    /// Ticket 17: true while `sub_id` belongs to the open background batch.
     fn is_batch_member(&self, sub_id: &str) -> bool {
         self.refresh_batch_members.contains(sub_id)
     }
 
-    /// T08 (gpui-18-sweep CAP-10): honest bounded progress over the open
-    /// refresh batch — `(completed, total)` while members are still in
-    /// flight, `None` when no batch is open. Completions land through
-    /// [`AppView::accumulate_batch_member`] (which removes the member but
-    /// keeps the total) and the adopt-first retry path (which removes the
-    /// member and returns its slot), so `total - members` always counts
-    /// finished fetches — never a fabricated fraction. The subscriptions
-    /// sheet renders this as a kit `Progress`.
     fn refresh_batch_progress(&self) -> Option<(usize, usize)> {
         if self.refresh_batch_members.is_empty() {
             return None;
@@ -20063,27 +17080,16 @@ impl AppView {
         ))
     }
 
-    /// Ticket 17: close one batch slot, flushing the single coalesced toast
-    /// when the last member lands. No-op for non-members.
     fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
         if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0) {
             self.flush_refresh_batch(window, cx);
         }
     }
 
-    /// Ticket 08 (throne-adoption): log one refresh completion to Logs.
-    /// Every completion logs — manual, batch, and headless alike — while
-    /// the toast still fires only on manual paths (see
-    /// [`AppView::route_refresh_completion`]). The `error`/`warning`
-    /// prefix drives the log's keyword severity; labels here name the
-    /// subscription (never its token-bearing URL).
     fn push_refresh_log(&mut self, line: &str) {
         self.logs.push_raw(line, &LogTagIndex::default());
     }
 
-    /// Ticket 17: route one refresh completion. Batch members accumulate
-    /// (the last member flushes at most one toast); everyone else notifies
-    /// immediately with `notice`.
     #[allow(clippy::too_many_arguments)]
     fn route_refresh_completion(
         &mut self,
@@ -20109,9 +17115,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 26: take every batch counter (plus the member set size) and
-    /// reset the batch in one step — the atomic swap. A completion racing a
-    /// flush can never observe a half-reset batch.
     fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize, usize) {
         self.refresh_batch_members.clear();
         let total = std::mem::take(&mut self.refresh_batch_total);
@@ -20124,9 +17127,6 @@ impl AppView {
         (total, added, updated, removed, failed, conflicts, in_use)
     }
 
-    /// Ticket 17: flush a completed batch as at most one toast, then reset.
-    /// `total` is always ≥ 1 here (batches never open empty), so the message
-    /// helper always returns `Some`.
     fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
         let (total, added, updated, removed, failed, conflicts, in_use) = self.take_batch_counts();
         let (warn, text) =
@@ -20145,23 +17145,12 @@ impl AppView {
         );
     }
 
-    /// Ticket 14: manual per-row refresh with truthful outcomes — a missing
-    /// subscription warns (it was already removed), a store failure names
-    /// the error (never a dead click).
-    /// Ticket 17: manual refreshes leave any background batch (their
-    /// completion notifies immediately instead of merging into it).
-    /// Ticket 26: a manual refresh never double-fetches. When the sub already
-    /// has a fetch in flight (tick or earlier click), the manual call adopts
-    /// it — the sub leaves the background batch (with the total adjusted so
-    /// the coalesced copy stays honest) and the shared completion notifies
-    /// immediately. Returns true when a new fetch started.
     fn refresh_subscription_by_id(
         &mut self,
         sub_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // Adopt first: the completion must notify immediately either way.
         if self.refresh_batch_members.remove(sub_id) {
             self.refresh_batch_total = self.refresh_batch_total.saturating_sub(1);
         }
@@ -20179,21 +17168,13 @@ impl AppView {
                 false
             }
         };
-        // T08 (gpui-18-sweep CAP-10): a started fetch rebuilds the open
-        // sheet so the row's streaming shimmer paints immediately (a no-op
-        // with no stash — foreign overlays are never touched).
+
         if started {
             self.reopen_subscriptions_if_open(window, cx);
         }
         started
     }
 
-    /// Ticket 14: auto-refresh toggle with truthful outcomes (never a dead
-    /// click on store failure).
-    /// Ticket 26: the current value is re-read at commit — the row's `Auto`
-    /// button snapshot may be stale (a tick or another click may have flipped
-    /// it since the dialog rendered). A missing row warns; a store failure
-    /// names the error.
     fn commit_subscription_auto(
         &mut self,
         sub_id: &str,
@@ -20228,24 +17209,10 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    /// Ticket 26: record one fetch as in flight. Returns false when the sub
-    /// already has a fetch running (manual-vs-tick double fetch is skipped,
-    /// never stacked). Pure state — tests drive it without touching the
-    /// network.
     fn note_refresh_started(&mut self, sub_id: &str) -> bool {
         self.inflight_refreshes.insert(sub_id.to_string())
     }
 
-    /// Ticket 04: fetch one subscription without blocking the UI, then merge
-    /// through the tested [`Store::refresh_with_body`] seam.
-    /// Ticket 12: window-free (the completion path branches on the active
-    /// window itself) so the due-subscription background tick can call it.
-    /// Ticket 26: the task holds a `WeakEntity` — a released view fails
-    /// closed (no post-close store writes). A sub with a fetch already in
-    /// flight is skipped (see [`AppView::note_refresh_started`]); manual
-    /// callers adopt the shared fetch instead (see
-    /// [`AppView::refresh_subscription_by_id`]). Returns true when a fetch
-    /// started.
     fn start_subscription_refresh(
         &mut self,
         sub: ProxySubscription,
@@ -20282,10 +17249,6 @@ impl AppView {
         true
     }
 
-    /// Ticket 04: apply a fetched body (or fetch error) with user feedback,
-    /// then refresh the dialog contents if it is still open.
-    /// Ticket 17: completions for background-batch members accumulate and
-    /// flush at most one toast; every other completion notifies immediately.
     fn finish_subscription_refresh(
         &mut self,
         sub_id: &str,
@@ -20295,18 +17258,12 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Ticket 26: the fetch is no longer in flight (a manual refresh may
-        // already have adopted its completion — see
-        // [`AppView::refresh_subscription_by_id`]).
         self.inflight_refreshes.remove(sub_id);
-        // Ticket 14: the subscription may have been deleted while the fetch
-        // was in flight — drop the result silently (no failure toast for a
-        // sub the user removed on purpose). A store failure here still
-        // surfaces instead of silently swallowing the completion.
+
         match self.store.get_subscription(sub_id) {
             Ok(None) => {
                 self.reload(window, cx);
-                // Ticket 17: a deleted batch member still closes its slot.
+
                 self.close_batch_slot(sub_id, window, cx);
                 self.reopen_subscriptions_if_open(window, cx);
                 return;
@@ -20331,8 +17288,7 @@ impl AppView {
             }
             Ok(Some(_)) => {}
         }
-        // Ticket 08: the live-endpoint set makes the merge sticky —
-        // vanished-but-serving rows are kept, never deleted under us.
+
         let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
             Ok(fetched) => {
@@ -20359,13 +17315,6 @@ impl AppView {
                                 cx,
                             );
                         } else {
-                            // Ticket 26 (ticket-25 consumer): conflicts surface —
-                            // the merge kept the user's edits, and the toast says
-                            // so instead of reporting a clean sync.
-                            // Ticket 08: quota commits only on a clean merge —
-                            // a success without a header clears stale numbers;
-                            // parse/fetch failures never reach this arm, so
-                            // last-good quota survives them.
                             let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
                             let failed = outcome.failures.len();
                             let (warn, summary) = refresh_summary_text(
@@ -20379,9 +17328,7 @@ impl AppView {
                                 outcome.conflicts,
                                 outcome.in_use,
                             );
-                            // Ticket 08: every completion logs; the toast below
-                            // fires only for manual single refreshes (batch
-                            // members coalesce inside route_refresh_completion).
+
                             if warn {
                                 self.push_refresh_log(&format!(
                                     "warning subscription refresh {summary}"
@@ -20410,7 +17357,6 @@ impl AppView {
                     }
                     Err(error) => {
                         if matches!(error, StoreError::NotFound(_)) {
-                            // Deleted between the check above and the merge.
                             self.reload(window, cx);
                             self.close_batch_slot(sub_id, window, cx);
                         } else {
@@ -20453,7 +17399,6 @@ impl AppView {
                     );
                 }
                 Err(StoreError::NotFound(_)) => {
-                    // Deleted mid-flight: silent, like the pre-check arm.
                     self.reload(window, cx);
                     self.close_batch_slot(sub_id, window, cx);
                 }
@@ -20479,14 +17424,6 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    /// Ticket 04: headless completion path (no window for notifications).
-    /// Ticket 17: batch members accumulate silently (no window exists to
-    /// flush a toast to); the counters reset when the batch completes.
-    /// Ticket 26: conflicts accumulate like any other count; the reset is
-    /// the atomic [`AppView::take_batch_counts`] swap. L1 ruling: a
-    /// completed headless batch drops its toast by necessity (no window
-    /// exists to toast to — the ticket-14 window-free precedent); the counts
-    /// still accumulate so a later windowed flush stays honest.
     fn finish_subscription_refresh_no_window(
         &mut self,
         sub_id: &str,
@@ -20495,8 +17432,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.inflight_refreshes.remove(sub_id);
-        // Ticket 08: the live-endpoint set makes the merge sticky —
-        // vanished-but-serving rows are kept, never deleted under us.
+
         let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
             Ok(fetched) => {
@@ -20505,8 +17441,6 @@ impl AppView {
                     .refresh_with_body_running(sub_id, &fetched.body, now, &running)
                 {
                     Ok(outcome) => {
-                        // Ticket 08: quota commits only on a clean merge; the
-                        // log line lands headless exactly like windowed.
                         if outcome.error.is_none() {
                             let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
                         }
@@ -20569,9 +17503,6 @@ impl AppView {
         self.reload_quiet(cx);
     }
 
-    /// Ticket 43: flip one subscription row's expanded state, then re-render
-    /// the manager when it owns the screen (same guard as every other
-    /// manager mutation — foreign dialogs are never touched).
     fn toggle_sub_expanded(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.expanded_subs.remove(id) {
             self.expanded_subs.insert(id.to_string());
@@ -20579,26 +17510,12 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    /// Ticket 04: re-render the subscriptions sheet after an action, but
-    /// only if the user still has it open.
-    /// Ticket 26: never touch a foreign overlay. The reopen fires only while
-    /// the subscriptions sheet itself owns the screen — tracked by the
-    /// stashed [`SubForm`], which every dismiss path (OK, Cancel, Escape,
-    /// backdrop/X via `.on_close`) clears. A background refresh completing
-    /// while the user types in Add/Import/Edit/Export/Logs finds no stash
-    /// and leaves that overlay and its input intact. A genuine reopen carries
-    /// the in-progress add-form text across instead of rebuilding it blank.
-    /// T08: the sheet closes through `close_sheet` (after any stacked
-    /// dialogs, which owned the old `close_all_dialogs`-only path the same
-    /// way) before the restored sheet opens.
     fn reopen_subscriptions_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !window.has_active_dialog(cx) && !window.has_active_sheet(cx) {
-            // No overlay at all: drop any stale stash and leave.
             self.subs_form = None;
             return;
         }
         let Some(form) = &self.subs_form else {
-            // Some other overlay owns the screen — leave it alone.
             return;
         };
         let label = form.label.read(cx).value().to_string();
@@ -20611,11 +17528,6 @@ impl AppView {
         self.open_subscriptions_dialog_restored(&label, &url, &group, auto, interval, window, cx);
     }
 
-    // -- Ticket 37: routing presets -------------------------------------
-
-    /// Ticket 37: sync the store's presets into the engine merge map before
-    /// every start. A corrupt stored rules array aborts the start loudly
-    /// (never a silent preset-less serve).
     fn sync_presets_to_engine(&mut self) -> Result<(), String> {
         match self.store.preset_rules_map() {
             Ok(map) => {
@@ -20626,13 +17538,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 37: preset intake shared by the synchronous and background
-    /// import commits. Returns `Some(done)` when the inputs are
-    /// preset-shaped: a single `throne://route/...` line (stored at once),
-    /// a single `throne://remoteroute/...` line (shell stored, explicit
-    /// fetch fills the rules), or preset JSON (object or bare rules array).
-    /// `None` for everything else (endpoint path). Malformed input reports
-    /// its own reason and keeps the dialog open.
     fn try_preset_commit(
         &mut self,
         resolved: &ResolvedImport,
@@ -20661,9 +17566,6 @@ impl AppView {
                     true
                 }
                 Err(error) => {
-                    // Decode and validation failures share the typed
-                    // `StoreError::Invalid` path (field + reason, never
-                    // payload echoes); the dialog stays open for retry.
                     self.report_save_error(error, window, cx);
                     false
                 }
@@ -20730,9 +17632,6 @@ impl AppView {
         None
     }
 
-    /// Ticket 37: create a preset from the manager dialog (name + optional
-    /// rules body). An empty name just closes; success toasts and closes;
-    /// validation failures keep the dialog open with the error.
     fn commit_preset_create(
         &mut self,
         name: String,
@@ -20755,9 +17654,6 @@ impl AppView {
             }
         };
         let create_name = if name.trim().is_empty() {
-            // A bare rules array still needs a name — the parser already
-            // rejected the nameless case above; this is unreachable, but a
-            // loud error beats a silent default.
             window.push_notification(
                 Notification::error("Invalid routing preset: preset needs a name"),
                 cx,
@@ -20785,10 +17681,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 10 (US-29): New-Structured commit — name plus one Basic
-    /// action (`direct`/`proxy`/`block`) builds the catch-all rule. Empty
-    /// names keep the dialog open with the error; success reloads and
-    /// reopens the manager.
     fn commit_preset_create_structured(
         &mut self,
         name: String,
@@ -20830,10 +17722,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 10 (US-29): New-Structured dialog — name plus the Basic
-    /// action radio (`Direct`/`Proxy`/`Block`; no warp-bypass — warp has
-    /// no endpoint design). Stacks above the manager, which stays intact
-    /// underneath.
     fn open_preset_structured_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Preset name"));
         let action_cell = Rc::new(RefCell::new("direct".to_string()));
@@ -20908,11 +17796,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 10 (US-29): New-Remote commit — name plus preset URL records
-    /// an empty-rules shell and starts the explicit fetch (same refresh
-    /// path as pasted `remoteroute` links). Non-http(s) and internal-host
-    /// URLs fail with the SSRF reason (never the URL); success reloads
-    /// and reopens the manager.
     fn commit_preset_create_remote(
         &mut self,
         name: String,
@@ -20964,9 +17847,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 10 (US-29): New-Remote dialog — name plus preset URL (the
-    /// remote source). Stacks above the manager, which stays intact
-    /// underneath.
     fn open_preset_remote_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Preset name"));
         let url_state =
@@ -21021,10 +17901,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 43: edit a preset's name + rules (manager edit path). Rules
-    /// validate pre-commit via the same parser as create; failures keep the
-    /// dialog open with the error. Success reloads, reopens the manager, and
-    /// toasts name + rule count (never rule content).
     fn commit_preset_edit(
         &mut self,
         id: &str,
@@ -21076,10 +17952,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 10 (US-29): manager Export-copy-link — copies the preset's
-    /// `throne://route` share link (never empty by construction of
-    /// [`crate::preset::preset_share_link`]). Corrupt stored rules fail
-    /// loudly instead of copying nothing; ghosts warn.
     fn commit_preset_export_link(
         &mut self,
         preset: &store::RoutePreset,
@@ -21115,8 +17987,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: duplicate a preset — same source/rules under a unique
-    /// `… copy` name. Ghost rows warn; the toast names the copy.
     fn commit_preset_duplicate(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let preset = match self.store.get_preset(id) {
             Ok(Some(preset)) => preset,
@@ -21157,13 +18027,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 43: preset edit dialog — name + rules prefilled from the
-    /// record (re-read fresh so a stale row cannot overwrite a removed
-    /// preset). Stacks above the manager, which stays intact underneath.
-    /// Ticket 10 (US-29): an Advanced section lists the stored rules with
-    /// their per-attribute tabs plus an Action cycle and Delete per rule
-    /// (ops rewrite the dialog's rules box in place — Save still commits
-    /// everything at once, so nothing writes half-edited).
     fn open_preset_edit_dialog(
         &mut self,
         preset: store::RoutePreset,
@@ -21209,17 +18072,12 @@ impl AppView {
                 .footer(dialog_footer(
                     "preset-edit-ok",
                     "preset-edit-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("preset-edit"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 10 (US-29): rewrite the edit dialog's rules box in place —
-    /// parse the live text (failures toast and keep the dialog open),
-    /// apply `op` to the rules, and write the box back. The store is
-    /// untouched until Save.
     fn rewrite_preset_rules_box(
         form: &PresetForm,
         op: &PresetRulesOp,
@@ -21277,10 +18135,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 37: remove a preset. Success reloads and reopens the manager;
-    /// an already-gone row warns; a refused (attached) delete opens the
-    /// explicit detach-delete confirm; any other store failure names the
-    /// error.
     fn commit_preset_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_preset(id) {
             Ok(true) => {
@@ -21291,7 +18145,6 @@ impl AppView {
                 window.push_notification(Notification::warning("Already removed"), cx);
             }
             Err(StoreError::Invalid(_)) => {
-                // Attached: offer the explicit detach-then-delete path.
                 let (name, attached) = match self.store.get_preset(id) {
                     Ok(Some(preset)) => {
                         let rows = self
@@ -21319,9 +18172,6 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    /// Ticket 37: explicit detach-then-delete confirm for an attached preset.
-    /// Confirming detaches every listed row and deletes; dismissing changes
-    /// nothing.
     fn open_preset_detach_delete_confirm(
         &mut self,
         id: &str,
@@ -21356,7 +18206,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 37: the actual detach-delete (post-confirm).
     fn commit_preset_detach_delete(
         &mut self,
         id: &str,
@@ -21384,9 +18233,6 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    /// Ticket 37: attach (`Some`) or detach (`None`) a preset on one row.
-    /// Ghost presets/rows report `NotFound`-loud; success reloads and closes
-    /// the picker.
     fn commit_preset_attach(
         &mut self,
         config_id: &str,
@@ -21418,9 +18264,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 37: attached preset name for one row (detail bar). `None`
-    /// when unattached or the store fails (the bar never blocks on a preset
-    /// lookup).
     fn preset_name_for(&self, preset_id: Option<&str>) -> Option<String> {
         let id = preset_id?;
         self.store
@@ -21430,9 +18273,6 @@ impl AppView {
             .map(|preset| preset.name)
     }
 
-    /// Lane B (B9): attached preset name plus its rule count for the
-    /// inspector Presets pane (`(name, rules)` — `None` when unattached,
-    /// missing, or unparsable, so the pane degrades to the plain line).
     fn preset_summary_for(&self, preset_id: Option<&str>) -> Option<(String, usize)> {
         let id = preset_id?;
         let preset = self.store.get_preset(id).ok().flatten()?;
@@ -21440,10 +18280,6 @@ impl AppView {
         Some((preset.name, count))
     }
 
-    /// Ticket 37: explicit refresh of one URL preset (fetch + replace rules).
-    /// Re-reads the record so a stale snapshot cannot fetch a removed
-    /// preset. Only URL presets with a source URL refresh; anything else
-    /// explains itself.
     fn refresh_preset_by_id(
         &mut self,
         id: &str,
@@ -21476,10 +18312,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 37: fetch one preset URL without blocking the UI, then replace
-    /// its rules through the tested [`Store::set_preset_rules`] seam. Every
-    /// fetch is user-initiated (Refresh button or remote-link paste) — never
-    /// automatic, never on a timer.
     fn start_preset_refresh(&mut self, preset: store::RoutePreset, cx: &mut Context<Self>) -> bool {
         let Some(url) = preset.source_url.clone() else {
             return false;
@@ -21514,9 +18346,6 @@ impl AppView {
         true
     }
 
-    /// Ticket 37: apply a fetched preset body (or fetch error) with user
-    /// feedback. A preset deleted mid-flight drops its result silently; a
-    /// parse failure names the rule index + field.
     fn finish_preset_refresh(
         &mut self,
         id: &str,
@@ -21567,9 +18396,6 @@ impl AppView {
         self.reopen_presets_if_open(window, cx);
     }
 
-    /// Ticket 37: window-less completion (the window closed mid-fetch). The
-    /// user-initiated fetch still lands; with no window there is nothing to
-    /// toast to and nothing to reopen.
     fn finish_preset_refresh_no_window(
         &mut self,
         id: &str,
@@ -21595,16 +18421,10 @@ impl AppView {
         }
     }
 
-    /// Ticket 37: presets manager dialog — stored presets with per-row
-    /// Refresh (URL only) / Remove plus a create form committed by OK. An
-    /// empty create form just closes the dialog.
     fn open_presets_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_presets_dialog_restored("", "", window, cx);
     }
 
-    /// Ticket 37: presets dialog with a prefilled create form (the
-    /// list-mutation reopen path carries in-progress text forward, mirroring
-    /// the subscriptions dialog stash).
     fn open_presets_dialog_restored(
         &mut self,
         name: &str,
@@ -21676,11 +18496,11 @@ impl AppView {
                     attached.get(&preset.id).cloned().unwrap_or_default(),
                 ));
             }
-            // Ticket 10 (US-29): Manage-Routes creation paths — Structured
-            // (name + Basic action → catch-all rule), Raw (the name + JSON
-            // form below), Remote (name + URL shell, explicit fetch fills
-            // the rules). Import stays in PROGRAM (single-line route links
-            // and preset JSON divert there identically).
+
+
+
+
+
             {
                 let structured_view = view_for_rows.clone();
                 let remote_view = view_for_rows.clone();
@@ -21729,17 +18549,13 @@ impl AppView {
                 .footer(dialog_footer(
                     "presets-dialog-ok",
                     "presets-dialog-cancel",
-                    // Ticket 05: manager create names its verb (empty form closes).
+
                     footer_commit_label("presets"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 37: reopen the presets manager when it owns the screen (list
-    /// mutations from its own row buttons), carrying the create form text
-    /// forward. Foreign dialogs are never touched; with no dialog open the
-    /// stash is dropped.
     fn reopen_presets_if_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !window.has_active_dialog(cx) {
             self.preset_form = None;
@@ -21754,9 +18570,6 @@ impl AppView {
         self.open_presets_dialog_restored(&name, &rules, window, cx);
     }
 
-    /// Ticket 37: per-row preset picker — every stored preset with an Attach
-    /// action plus a Detach action when the row carries one. One choice
-    /// commits, reloads, and closes the picker.
     fn open_preset_attach_dialog(
         &mut self,
         config: ProxyConfig,
@@ -21833,26 +18646,22 @@ impl AppView {
                 .title(format!("Routing preset for \"{config_name}\""))
                 .child(body)
                 .button_props(
-                    // Ticket 03 (US-3): pure-close footer — no kit Cancel
-                    // affordance; the shared footer renders the single
-                    // `Close`. The Confirm-key commit stays a no-op close.
+
+
+
                     DialogButtonProps::default()
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
                 .footer(dialog_footer(
                     "preset-attach-ok",
                     "preset-attach-cancel",
-                    // Ticket 05: footer just closes — per-row buttons do the attaching.
+
                     footer_commit_label("preset-attach"),
                     commit_click,
                 ))
         });
     }
 
-    /// Lane B (B8): full subscription URL copy behind an explicit
-    /// plaintext warning (the export-dialog pattern) — display and Copy URL
-    /// stay redacted; the token-bearing original only leaves the app on a
-    /// second, informed click.
     fn open_sub_full_url_confirm(
         &mut self,
         label: &str,
@@ -21889,12 +18698,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 04: subscription manager dialog — existing subscriptions with
-    /// per-row Refresh / Auto / Remove plus an add form committed by OK.
-    /// An empty add form just closes the dialog.
-    /// Ticket 26: user entry always starts blank; refresh-driven reopens go
-    /// through [`AppView::open_subscriptions_dialog_restored`] (carries
-    /// in-progress text).
     fn open_subscriptions_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_subscriptions_dialog_restored(
             "",
@@ -21907,14 +18710,6 @@ impl AppView {
         );
     }
 
-    /// Ticket 26: subscriptions dialog with a prefilled add form (the
-    /// refresh-driven reopen path). The form is stashed on the view so the
-    /// next genuine reopen can carry the text forward again; any OK-dismiss
-    /// (empty close or committed add) clears the stash, and Cancel/close
-    /// leftovers are dropped by
-    /// [`AppView::reopen_subscriptions_if_open`] when no dialog is open.
-    /// Ticket 45: the add-form interval picker rides the same stash, and the
-    /// header carries the global kill-switch + Refresh-all-due.
     #[allow(clippy::too_many_arguments)]
     fn open_subscriptions_dialog_restored(
         &mut self,
@@ -21932,8 +18727,7 @@ impl AppView {
         let reader = form.clone();
         let subs = match self.store.list_subscriptions() {
             Ok(subs) => subs,
-            // Ticket 14: a broken database must not render as a lying empty
-            // state — the dialog still opens (form usable) plus a notice.
+
             Err(error) => {
                 window.push_notification(
                     Notification::error(format!("Cannot load subscriptions: {error}")),
@@ -21958,13 +18752,10 @@ impl AppView {
                 *counts.entry(owner.to_string()).or_insert(0) += 1;
             }
         }
-        // Ticket 43: expanded-row snapshot + member names for the builder.
+
         let expanded = self.expanded_subs.clone();
         let member_rows = rows.clone();
-        // Ticket 18: Rc-shared with the footer OK button (mouse commits
-        // identically to the Confirm key path; an empty add form just closes).
-        // `commit_view` is a clone: the builder below still needs `view` for
-        // the per-row Refresh / Auto / Remove buttons.
+
         let commit_view = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let label = reader.label.read(cx).value().to_string();
@@ -21979,31 +18770,21 @@ impl AppView {
                 view.commit_subscription_add(label, url, group, auto, interval, window, cx)
             })
         });
-        // Ticket 45: header state snapshots — the global kill-switch position
-        // and the manual due count (explicit consent, ignores the switch).
+
         let auto_all = self.store.subs_auto_refresh_enabled();
         let now = now_unix();
         let due_count = subs
             .iter()
             .filter(|sub| due_for_refresh_for(sub, now))
             .count();
-        // T08 (gpui-18-sweep CAP-10): loading snapshots for the builder —
-        // the open batch's bounded progress plus the per-row in-flight set.
-        // The builder is `Fn` and re-runs per render, so snapshots (never
-        // live view reads) feed it, like `expanded` above.
+
         let batch_progress = self.refresh_batch_progress();
         let refreshing_rows = self.inflight_refreshes.clone();
         let kill_view = view.clone();
         let due_view = view.clone();
-        // Ticket 26: every dismiss path (OK-close, Cancel, Escape,
-        // backdrop/X) clears the stashed form through `.on_close`, so a
-        // later foreign overlay can never be mistaken for this one.
+
         let close_view = view.clone();
-        // T08 (gpui-18-sweep CAP-9): reference flow — subscriptions manage
-        // in a `Sheet` via `WindowExt::open_sheet` (no `Sheet::open`), with
-        // the same body, ids, and footer verbs. The `button_props.on_ok`
-        // Confirm-key path has no sheet equivalent (kit-forced): the Add
-        // commit runs through the footer button only.
+
         window.open_sheet(cx, move |sheet: Sheet, _, cx| {
             let commit_click = commit.clone();
             let view_for_rows = view.clone();
@@ -22013,8 +18794,8 @@ impl AppView {
             let batch_progress = batch_progress;
             let refreshing_rows = refreshing_rows.clone();
             let mut body = div().flex().flex_col().gap_2();
-            // Ticket 45: controllable auto-update — the kill-switch gates
-            // the automatic pass only; Refresh-all-due is explicit consent.
+
+
             let kill_now = auto_all;
             body = body.child(
                 div()
@@ -22028,9 +18809,9 @@ impl AppView {
                         Switch::new("subs-auto-all")
                             .checked(kill_now)
                             .label("Auto-refresh all")
-                            // Ticket 08: the switch states what it governs
-                            // (automatic background refresh of every
-                            // subscription; explicit Refresh never gated).
+
+
+
                             .tooltip(
                                 "Automatic background refresh of all subscriptions. Manual Refresh always works.",
                             )
@@ -22057,10 +18838,10 @@ impl AppView {
             if subs.is_empty() {
                 body = body.child("No subscriptions yet — paste a subscription URL below");
             }
-            // T08 (gpui-18-sweep CAP-10): bounded work reads a kit
-            // `Progress` — the open refresh batch's real completed/total
-            // (see [`AppView::refresh_batch_progress`]), painted only while
-            // members are still in flight. Never a fabricated fraction.
+
+
+
+
             if let Some((done, total)) = batch_progress {
                 let percent =
                     (done as f32 / total.max(1) as f32 * 100.0).clamp(0.0, 100.0);
@@ -22105,16 +18886,13 @@ impl AppView {
                 .footer(sheet_footer(
                     "subscriptions-dialog-ok",
                     "subscriptions-dialog-cancel",
-                    // Ticket 05: manager create names its verb (empty form closes).
+
                     footer_commit_label("subscriptions"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 14: truthful remove-subscription outcome — success reloads, an
-    /// already-gone row warns "Already removed", and any store failure names
-    /// the error (never "Already removed", which would lie about an `Err`).
     fn commit_subscription_remove(
         &mut self,
         id: &str,
@@ -22138,13 +18916,6 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    /// Ticket 31: edit a subscription's label/url/group. The fields open
-    /// prefilled (no auto-refresh toggle here — the commit writes only
-    /// label/url/group, so no control may imply otherwise). The plaintext
-    /// warning tracks the live URL input. Commits through
-    /// [`AppView::commit_subscription_edit`], which reopens the manager on
-    /// success. Cancel closes this dialog (stacked above the manager, which
-    /// stays intact underneath).
     fn open_subscription_edit_dialog(
         &mut self,
         sub: ProxySubscription,
@@ -22172,16 +18943,13 @@ impl AppView {
         let read_label = label_state.clone();
         let read_url = url_state.clone();
         let read_group = group_state.clone();
-        // Ticket 45: the edit-dialog interval picker (same presets as the
-        // add form, prefilled from the row).
+
         let interval_cell: Rc<RefCell<i64>> = Rc::new(RefCell::new(sub.interval_secs));
         let read_interval = interval_cell.clone();
         let edit_interval = interval_cell.clone();
-        // Ticket T03: repaint handle for the interval group (the commit
-        // below moves `view`; the dialog builder clones per render).
+
         let repaint_view = view.clone();
-        // Ticket 18: Rc-shared with the footer OK button (mouse commits
-        // identically to the Confirm key path, including stay-open-on-error).
+
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let label = read_label.read(cx).value().to_string();
             let url = read_url.read(cx).value().to_string();
@@ -22195,10 +18963,9 @@ impl AppView {
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
-            // Ticket T03: per-render clone — the builder re-runs every frame.
+
             let repaint_view = repaint_view.clone();
-            // Ticket 31: live plaintext warning for the URL being typed.
-            // Ticket 08: beside the URL field it describes, not the form foot.
+
             let url_now = url_state.read(cx).value().to_string();
             let edit_warning = http_subscription_warning(&url_now).map(|warning| {
                 div()
@@ -22206,8 +18973,7 @@ impl AppView {
                     .test_support()
                     .child(warning)
             });
-            // Ticket T03: edit body on kit `v_form` + `field()` with the
-            // shared interval `RadioGroup`.
+
             let mut form = v_form()
                 .small()
                 .child(dialog_field(
@@ -22248,15 +19014,12 @@ impl AppView {
                 .footer(dialog_footer(
                     "subscription-edit-dialog-ok",
                     "subscription-edit-dialog-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("subscription-edit"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 04: confirm removing a subscription. Members stay in the
-    /// library as hand-owned configs (release, never delete).
     fn open_subscription_remove_confirm(
         &mut self,
         sub: ProxySubscription,
@@ -22290,21 +19053,12 @@ impl AppView {
         });
     }
 
-    /// Ticket 04: refresh due subscriptions once at startup (the auto-refresh
-    /// scheduling hook evaluation). Never called by tests, so no headless
-    /// test ever touches the network.
-    /// Ticket 12: delegates to [`AppView::due_subscriptions`].
-    /// Ticket 47: production calls the deferred wrapper (first paint
-    /// precedes refresh work); this stays as the immediate seam.
     fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
         for sub in self.due_subscriptions() {
             self.start_subscription_refresh(sub, cx);
         }
     }
 
-    /// Ticket 47: startup refresh after first paint — waits
-    /// [`STARTUP_REFRESH_DEFER_SECS`], then runs the due pass unless ticks
-    /// were stopped or the view released (fail-closed, never a dead update).
     fn refresh_due_on_startup_deferred(&mut self, cx: &mut Context<Self>) {
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_entity, cx| {
@@ -22324,50 +19078,27 @@ impl AppView {
         .detach();
     }
 
-    // -- Ticket 12: background ticks (bounded, stoppable) --------------------
-
-    /// Subscriptions due for auto-refresh right now (pure query behind the
-    /// due-subscription pass and the startup pass). Never enables anything;
-    /// the pass only fetches already-due subscription URLs.
-    /// Ticket 26: window-less by necessity (ticks and startup have no window
-    /// to notify through), so a database error yields no due subs — the pass
-    /// starts nothing instead of acting on a lie (ticket-14 precedent).
-    /// Ticket 45: the global kill-switch gates this automatic selection
-    /// (fail closed on a broken read — no automatic network without
-    /// consent). Manual refreshes use [`AppView::due_for_manual_refresh`].
     fn due_subscriptions(&self) -> Vec<ProxySubscription> {
         if !self.store.subs_auto_refresh_enabled() {
             return Vec::new();
         }
-        // Ticket 08: skip-flagged groups never auto-refresh (ticks are not
-        // explicit consent). Manual paths (Refresh-all-due, per-row Update,
-        // Update-current, Update-all) decide for themselves.
+
         self.due_for_manual_refresh()
             .into_iter()
             .filter(|sub| !self.store.group_skip_refresh(&sub.group))
             .collect()
     }
 
-    /// Ticket 45: due subscriptions ignoring the global kill-switch — the
-    /// manual Refresh-all-due selection (explicit consent, so the switch
-    /// never blocks it). Each entry still honors its own per-sub interval
-    /// and auto flag via [`due_for_refresh_for`].
     fn due_for_manual_refresh(&self) -> Vec<ProxySubscription> {
         let now = now_unix();
         self.store
             .list_subscriptions()
             .unwrap_or_default()
             .into_iter()
-            // Ticket 40: per-sub intervals (each sub honors its own
-            // `interval_secs`, never the global daily).
             .filter(|sub| due_for_refresh_for(sub, now))
             .collect()
     }
 
-    /// Ticket 45: manual Refresh-all-due — starts one fetch per due
-    /// subscription (explicit consent, so the kill-switch never blocks it).
-    /// Returns the number of fetches started; an empty due set toasts
-    /// instead of dead-clicking.
     fn refresh_all_due(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let due = self.due_for_manual_refresh();
         if due.is_empty() {
@@ -22389,8 +19120,6 @@ impl AppView {
         started
     }
 
-    /// Ticket 08 (throne-adoption): the focused group — facet filter first,
-    /// selected row's group second. `None` when neither names a group.
     fn current_group(&self, cx: &App) -> Option<String> {
         if let Some(group) = self.libraries.read(cx).delegate().facet_group.clone() {
             return Some(group);
@@ -22398,9 +19127,6 @@ impl AppView {
         self.selected_config(cx).map(|config| config.group)
     }
 
-    /// Ticket 08: start fetches for an explicit subscription set. One sub
-    /// takes the manual-single path (immediate toast); several share one
-    /// coalescing batch. Returns the fetches started.
     fn start_explicit_refresh(
         &mut self,
         subs: Vec<ProxySubscription>,
@@ -22426,11 +19152,6 @@ impl AppView {
         started
     }
 
-    /// Ticket 08: Update-current — refresh the subscriptions feeding the
-    /// focused group (see [`AppView::current_group`]). Explicit consent, so
-    /// skip-flagged groups still run (the flag gates automatic refresh,
-    /// never a direct order). Empty/no-sub groups toast honestly instead of
-    /// dead-clicking.
     fn update_current_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.current_group(cx) else {
             window.push_notification(
@@ -22456,8 +19177,6 @@ impl AppView {
         self.start_explicit_refresh(subs, window, cx);
     }
 
-    /// Ticket 08: per-row Update from Manage Groups — refresh one group's
-    /// subscriptions (explicit consent, like Update-current).
     fn update_group_subs(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
         let subs = self
             .store
@@ -22476,10 +19195,6 @@ impl AppView {
         self.start_explicit_refresh(subs, window, cx);
     }
 
-    /// Ticket 08: Update-all behind an explicit confirm — every
-    /// subscription outside skip-flagged groups refreshes; flagged ones
-    /// are named in the confirm and never fetched. An empty run set toasts
-    /// instead of opening a confirm over nothing.
     fn open_update_all_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let subs = self.store.list_subscriptions().unwrap_or_default();
         let flagged: HashSet<String> = self
@@ -22521,9 +19236,7 @@ impl AppView {
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
                         view.begin_refresh_batch(&ids);
-                        // Re-read at commit (a tick may have removed one
-                        // since the confirm rendered — missing rows skip,
-                        // in-flight fetches dedupe, never stack).
+
                         for id in &ids {
                             if let Ok(Some(sub)) = view.store.get_subscription(id) {
                                 view.start_subscription_refresh(sub, cx);
@@ -22536,8 +19249,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 45: the global auto-refresh kill-switch commit. Persists the
-    /// explicit toggle (ticks never flip it) and re-renders the manager.
     fn commit_subs_global_auto(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.store.set_subs_auto_refresh_enabled(on) {
             window.push_notification(
@@ -22548,35 +19259,21 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    /// Stop the background ticks (each tick also no-ops once stopped, so a
-    /// stopped view never touches the network or the engine).
     #[cfg_attr(not(test), allow(dead_code))]
     fn stop_background_ticks(&mut self) {
         self.ticks_enabled = false;
     }
 
-    /// One engine-crash poll without user clicks: surfaces the named cause
-    /// via the status bar on the next render. Bounded (one `poll`, no I/O
-    /// beyond reaping an exited sidecar) and stoppable.
-    /// Ticket 30: windowless ticks stay status-only by necessity (no window
-    /// exists to notify through — ticket-14 precedent); windowed callers use
-    /// [`AppView::tick_engine_poll_notify`] for the error notification.
     fn tick_engine_poll(&mut self, cx: &mut Context<Self>) -> Option<String> {
         if !self.ticks_enabled {
             return None;
         }
-        // Single one-shot poll per tick: the reload below must not poll a
-        // second time (it would come back empty and lose the crash).
+
         let cause = self.poll_engine();
         self.reload_quiet_no_poll(cx);
         cause
     }
 
-    /// Ticket 30: windowed engine-crash tick — polls the joined per-shard
-    /// detail, reloads, and pushes the error notification naming shard/cause
-    /// with the View-logs path. Returns the detail when a crash was reported.
-    /// Test-only seam: the live tick (`tick_engine_poll`) is windowless by
-    /// necessity, so production notifies via `reload` → `notify_engine_crash`.
     #[cfg(test)]
     fn tick_engine_poll_notify(
         &mut self,
@@ -22595,14 +19292,6 @@ impl AppView {
         None
     }
 
-    /// One due-subscription pass without user clicks: starts a refresh only
-    /// for already-due subscriptions (never beyond them, never enabling or
-    /// starting configs). Returns the number of refreshes started. Stopped
-    /// views start nothing.
-    /// Ticket 17: the pass opens one coalescing batch, so N completions
-    /// flush at most one toast instead of N.
-    /// Ticket 26: returns the number of fetches actually started (a sub with
-    /// a fetch already in flight is skipped, never double-fetched).
     fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
@@ -22619,17 +19308,6 @@ impl AppView {
         started
     }
 
-    /// One re-probe of running rows only, without user clicks: silent (no
-    /// notification), recorded + persisted like a manual test. Idle views
-    /// (nothing running) do nothing: no network traffic, no errors.
-    /// Stopped views probe nothing.
-    /// Ticket 26: off-thread via [`AppView::spawn_probe`]. Returns the number
-    /// of probes started (outcomes land on completion).
-    /// Ticket 41: rows on crashed shards are skipped (their sidecar is
-    /// down — probing a dead socket only manufactures errors). The skip reads
-    /// the crashed-shard set explicitly (the same source the traffic tick
-    /// polls via `live_clash_targets`), so the guarantee holds by
-    /// construction instead of incidentally through backend liveness alone.
     fn tick_reprobe_running(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
@@ -22653,11 +19331,6 @@ impl AppView {
         self.spawn_probe(rows, false, false, None, cx)
     }
 
-    /// Ticket 47: lazy traffic totals — hydrate the display mirror from
-    /// persisted counters ONCE (first traffic tick), over the rows already
-    /// in the delegate (no extra store list). Only known rows hydrate, and
-    /// only nonzero totals flip the display — untracked rows keep the
-    /// probe-byte display, and removed configs never resurrect.
     fn ensure_traffic_mirror(&mut self, cx: &mut Context<Self>) {
         if self.traffic_mirror_hydrated {
             return;
@@ -22681,20 +19354,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 36: one data-plane traffic pass over every serving core's
-    /// clash controller: poll live entries, diff per-connection bytes
-    /// against the last-seen map, persist per-row deltas, mirror persisted
-    /// absolutes for display, repaint. Probe flows never reach the traffic
-    /// columns ([`crate::health::is_probe_destination`]); missed polls keep
-    /// last totals (never zero). Stopped views and untracked cores do
-    /// nothing (no network). Returns the number of rows with new bytes.
-    /// Ticket 41: crashed cores are skipped via `live_clash_targets` (dead
-    /// sockets are never trusted), and probe attribution normalizes
-    /// (lowercase, no port, no trailing dot) plus the resolved-IP leg.
-    /// Ticket 47: cores poll concurrently (bounded, per-core timeout +
-    /// total deadline via [`poll_clash_targets`]); production ticks run
-    /// this fetch off the UI thread ([`spawn_traffic_poll`]) — this method
-    /// stays as the headless/test seam.
     #[cfg_attr(not(test), allow(dead_code))]
     fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
@@ -22715,20 +19374,11 @@ impl AppView {
         self.apply_traffic_results(results, &probe, &probe_ips, cx)
     }
 
-    /// Ticket 47: off-UI traffic tick (the [`spawn_probe`] pattern:
-    /// in-flight guard + owned inputs into `background_executor` + weak
-    /// commit via `cx.update` + detach). A second tick while one is in
-    /// flight is SKIPPED (returns 0), never queued — slow controllers can
-    /// never stack ticks. Returns 1 when a poll started. DNS resolution of
-    /// the probe host also runs off-thread (never a UI stall).
     fn spawn_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled || self.traffic_tick_in_flight {
             return 0;
         }
-        // Ticket 05: 1Hz while the Connections/Traffic pane is visible, else
-        // the 5s base cadence (the loop itself runs at 1Hz — see
-        // [`TRAFFIC_FAST_TICK_SECS`]). A skipped tick returns 0 and never
-        // touches the throttle stamp, so the next due pass still fires.
+
         let now = now_unix();
         if !traffic_poll_due(self.inspector_tab, now, self.last_traffic_poll_at) {
             return 0;
@@ -22767,11 +19417,6 @@ impl AppView {
         1
     }
 
-    /// Ticket 47: commit one round of clash poll results (pure commit — no
-    /// I/O of its own): diff per-connection bytes against the bounded
-    /// last-seen map, persist per-row deltas in one transaction, mirror
-    /// absolutes for display, repaint. Returns the number of rows with new
-    /// bytes. Shared by the headless tick and the off-UI completion.
     fn apply_traffic_results(
         &mut self,
         results: Vec<(
@@ -22786,12 +19431,9 @@ impl AppView {
         let mut deltas: HashMap<String, (u64, u64)> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut ok_cores: HashSet<String> = HashSet::new();
-        // Ticket 41: rows freshly polled on live cores (clears stale below).
+
         let mut fresh_rows: HashSet<String> = HashSet::new();
-        // Ticket 05: the live-connections snapshot rides the same pass —
-        // one `(core, entry)` per non-probe connection (unclaimed entries
-        // stay: they render as unclaimed, never guessed) plus this poll's
-        // per-connection session delta. Committed wholesale after the loop.
+
         let mut snapshot: Vec<(String, crate::health::ClashConn)> = Vec::new();
         let mut conn_deltas: HashMap<String, (u64, u64)> = HashMap::new();
         for (target, result) in &results {
@@ -22800,8 +19442,6 @@ impl AppView {
             };
             ok_cores.insert(target.core.clone());
             for entry in entries {
-                // Probe flows never reach the traffic columns, the persisted
-                // totals, or the connections snapshot.
                 if crate::health::is_probe_destination_with_ips(&entry.dest, probe, probe_ips) {
                     continue;
                 }
@@ -22811,8 +19451,6 @@ impl AppView {
                 let (delta_rx, delta_tx) = if (rx, tx) >= (last_rx, last_tx) {
                     (rx - last_rx, tx - last_tx)
                 } else {
-                    // Controller reset (sidecar restart): a new epoch, so the
-                    // current reading is the delta.
                     (rx, tx)
                 };
                 self.traffic_last_seen.insert(key.clone(), rx, tx, now);
@@ -22832,28 +19470,19 @@ impl AppView {
                 }
             }
         }
-        // Bounded sweep: connections closed since the last poll leave the
-        // map (their bytes were already persisted as deltas while they
-        // lived); cores whose poll failed keep their ids — a failed poll
-        // must never look like a mass close (that would double-count on
-        // recovery). Dead-core entries TTL out; the cap holds absolutely.
+
         let live_cores: HashSet<String> = results
             .iter()
             .map(|(target, _)| target.core.clone())
             .collect();
         self.traffic_last_seen
             .sweep(now, &ok_cores, &seen, &live_cores);
-        // Ticket 05: publish the live-connections snapshot + session deltas
-        // (closed connections leave with the sweep — their persisted bytes
-        // stay in the store). The stamp keeps the 1Hz loop honest even for
-        // headless ticks that bypass the spawn throttle.
+
         self.conn_snapshot = snapshot;
         self.conn_delta = conn_deltas;
         self.last_traffic_poll_at = now;
         let mut updated = 0;
-        // Ticket 40: one transaction per tick (batched, saturating
-        // single-statement UPDATEs). Unknown ids skip (a row removed mid-tick
-        // misses its write); errors log loudly, never swallowed.
+
         if !deltas.is_empty() {
             let batch: Vec<(String, u64, u64)> = deltas
                 .iter()
@@ -22862,9 +19491,7 @@ impl AppView {
             match self.store.add_traffic_batch(&batch) {
                 Ok(count) => {
                     updated = count;
-                    // Ticket 47: mirror previous + delta (no second
-                    // full-table scan per tick — exact while counters stay
-                    // under i64::MAX, i.e. always in practice).
+
                     for (row, (rx, tx)) in &deltas {
                         let (prev_rx, prev_tx) =
                             self.health_store.data_traffic(row).unwrap_or((0, 0));
@@ -22878,9 +19505,7 @@ impl AppView {
                 Err(error) => eprintln!("traffic tick failed: {error}"),
             }
         }
-        // Ticket 41: rows on crashed cores keep last totals but read stale
-        // (their cores were skipped above); rows freshly polled on live
-        // cores clear the marker on recovery.
+
         self.health_store
             .mark_stale_all(&self.engine.ids_on_crashed_shards());
         for row in &fresh_rows {
@@ -22892,12 +19517,6 @@ impl AppView {
         updated
     }
 
-    /// Spawn the four background tick loops. Each loop sleeps its interval,
-    /// runs one bounded pass, and exits when ticks are stopped or the view
-    /// is released. Never called by tests (headless tests call the tick
-    /// methods directly with mock seams, never touching the network).
-    /// Idempotent: a second call is a no-op (otherwise it would double to
-    /// eight loops).
     fn start_background_ticks(&mut self, cx: &mut Context<Self>) {
         if self.ticks_started {
             return;
@@ -22917,8 +19536,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 45: one row's persisted usage buckets (down/up) for the
-    /// detail pane. A broken read renders honestly, never a lying zero.
     fn usage_line(&self, config_id: &str) -> String {
         match self.store.traffic_totals() {
             Ok(totals) => match totals.get(config_id) {
@@ -22933,12 +19550,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 45: one row's persisted usage buckets (down/up) for the
-    /// detail pane. A broken read renders honestly, never a lying zero.
-    /// Ticket 44 sweep (T02): formatted down/up pair behind the boxed
-    /// usage module's `DescriptionList`. `None` when nothing has flowed
-    /// or the read breaks — the module falls back to
-    /// [`usage_line`](Self::usage_line), never a lying zero.
     fn usage_parts(&self, config_id: &str) -> Option<(String, String)> {
         match self.store.traffic_totals() {
             Ok(totals) => totals
@@ -22948,12 +19559,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 45: bounded history line for the detail pane — the newest 120
-    /// successful samples as a native sparkline. Under two points (fresh
-    /// rows) it renders nothing — progressive disclosure, so the detail
-    /// pane stays short and the virtual list keeps its rows (see
-    /// `library_mutations_repaint_and_keep_selection`). A broken read
-    /// renders honestly, never a lying chart.
     fn history_line(&self, config_id: &str) -> AnyElement {
         let since = now_unix().saturating_sub(90 * 86_400);
         let entries = match self.store.load_health_history(config_id, Some(since)) {
@@ -22966,25 +19571,17 @@ impl AppView {
             .collect();
         let latencies = sparkline_latencies(&samples, 120);
         if latencies.len() < 2 {
-            // Honest empty state — a bare `div()` painted a titled GroupBox
-            // with a silent body, the one spot the sweep left speaking no
-            // language. Same voice as the Logs tail ("No log lines to show")
-            // and the preset line ("no routing preset").
             return div()
                 .id("config-history-empty")
                 .test_support()
                 .child(match latencies.len() {
-                    // One sample cannot draw a trend — say so, and keep the
-                    // sample visible so the number is not simply lost.
                     1 => format!("1 probe recorded — no trend yet ({})", latencies[0]),
                     _ => "no health history yet — press Test to record a probe".to_string(),
                 })
                 .into_any_element();
         }
         let latest = latencies.last().copied().unwrap_or(0);
-        // Compact single row (text + mini chart side by side): the
-        // vertical shell gives the list `flex_1`, so the detail pane
-        // must stay short — every extra row squeezes painted list rows.
+
         div()
             .flex()
             .flex_row()
@@ -22995,24 +19592,8 @@ impl AppView {
             .into_any_element()
     }
 
-    /// Ticket 09 (CAP-9/US-4): restrained-motion budget for app-owned
-    /// surfaces. Dialog open/close is kit chrome (kit `Dialog` fade + slide,
-    /// reduced-motion-honored); the inspector pane body and the bulk bar are
-    /// app code, so they enter here — opacity-only (flat world: no shadow,
-    /// glow, gradient, glass, second radius, or third text size), capped at
-    /// `MOTION_FAST_MS` (≤200ms). `with_animation` renders the end state
-    /// with no frames under reduced motion, so every state change stays
-    /// perceivable without animation.
     const MOTION_FAST_MS: u64 = 150;
 
-    /// Ticket 09: the duration the enter fade below actually runs with.
-    /// Reduced motion collapses to Duration::ZERO, so the surface paints its
-    /// end state on the first frame with no intermediate frames.
-    ///
-    /// This was a #[cfg(test)] policy twin that no production code called,
-    /// so it asserted GPUI's behavior rather than the app's. motion_enter now
-    /// reads it, which makes the reduced-motion guarantee structural: the
-    /// number under test IS the number animated with.
     fn motion_fast_duration(cx: &App) -> Duration {
         if cx.reduce_motion() {
             Duration::ZERO
@@ -23021,12 +19602,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 09: mount-enter fade for one app-owned surface. Opacity only,
-    /// on an anonymous wrapper (same verified `Animation`/`with_animation`
-    /// pattern the kit dialog entrance uses) — the wrapped content keeps
-    /// its own ids and unset opacity, so headless `assert_painted` seams
-    /// never read a mid-fade parent as invisible. Reduced motion settles
-    /// on opaque with no frames.
     fn motion_enter(
         child: impl IntoElement + 'static,
         id: impl Into<ElementId>,
@@ -23041,20 +19616,8 @@ impl AppView {
             .child(child)
     }
 
-    /// Startup-stack split: `render_detail` was one ~450-line builder chain whose
-    /// unoptimized debug frame alone approached half a megabyte on the 1 MB
-    /// main-thread stack at startup (see
-    /// .planning/follow-ups/startup-stack-overflow.md). It now dispatches to
-    /// small per-section builders; content (ids, strings, handlers, the 240px
-    /// scroll cap) is unchanged.
     fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
-            // Empty library: the list already paints its own Empty with the
-            // Add/Import CTAs in content (`LibraryDelegate::render_empty`).
-            // Painting the no-selection `Empty` as well stacks a second title
-            // + button row into the same strip and the rows visually collide,
-            // while "select a configuration" is nonsense with zero rows. Keep
-            // the stable id as a zero-height placeholder instead.
             if self.config_count(cx) == 0 {
                 return div().id("config-detail").test_support().into_any_element();
             }
@@ -23063,13 +19626,12 @@ impl AppView {
         self.render_detail_selected(cx, &config).into_any_element()
     }
 
-    /// Detail pane with no selection (unchanged Empty + Add/Import CTAs).
     fn render_detail_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("config-detail")
             .test_support()
-            // Hairline separates the pane from the list above: without it the
-            // clipped last row reads as broken layout, not a scroll edge.
+
+
             .border_t_1()
             .border_color(cx.theme().border)
             .p_2()
@@ -23084,7 +19646,7 @@ impl AppView {
                             .title(EmptyTitle::new().child(
                                 "Select a configuration to inspect its endpoint, health, and usage",
                             ))
-                            // T04 (CAP-5): the empty names its next step inline.
+
                             .description(EmptyDescription::new().child(
                                 "Pick a row in the library — its endpoints and controls appear here.",
                             )),
@@ -23099,7 +19661,7 @@ impl AppView {
                                 .gap_2()
                                 .child(
                                     Button::new("detail-add")
-                                        // T04: `.small()` like every empty-state button.
+
                                         .small()
                                         .label("Add configuration")
                                         .tooltip("Add a proxy configuration")
@@ -23109,7 +19671,7 @@ impl AppView {
                                 )
                                 .child(
                                     Button::new("detail-import")
-                                        // T04: `.small()` like every empty-state button.
+
                                         .small()
                                         .label("Import configurations")
                                         .tooltip("Import share links or files")
@@ -23129,14 +19691,6 @@ impl AppView {
             .into_any_element()
     }
 
-    /// Detail pane for the selected row: capped scroll box with the Ticket
-    /// 05 inspector tabs driving the per-section builders below.
-    /// `config-detail` id, 240px cap, internal scroll, and the resizable
-    /// 240..480 range are unchanged.
-    /// Ticket 04 (throne-adoption): the detail header + Endpoints render
-    /// once in the shared overview leading the pane body (not once per
-    /// pane builder), so tab switches never repaint identical blocks; each
-    /// pane below the overview carries only its tab-specific sections.
     fn render_detail_selected(
         &self,
         cx: &mut Context<Self>,
@@ -23145,45 +19699,15 @@ impl AppView {
         div()
             .id("config-detail")
             .test_support()
-            // Hairline separates the pane from the list above (same rule as
-            // the no-selection pane).
             .border_t_1()
             .border_color(cx.theme().border)
             .p_2()
             .flex()
             .flex_col()
-            // T05: tight section rhythm (gap_1) so the titled sections,
-            // the action rows, and three library rows share the 700px test
-            // frame without clipping the list.
             .gap_1()
-            // The vertical split owns the height (the detail
-            // `resizable_panel` starts at 240px, range 240..480): the pane
-            // fills its panel and scrolls inside it, so dragging the
-            // divider grows real inspector space up to the range end.
-            // Never a fixed max_h here — a fixed cap desyncs from the grown
-            // panel and paints empty space below a still-scrolling box.
             .h_full()
             .min_h_0()
-            // Ticket 04 (throne-adoption): the tab bar stays pinned above
-            // the scrolling body; the shared overview (header + failure
-            // alert when failed + Endpoints, one call site) leads the body
-            // itself, so every pane opens on the same acting row without
-            // per-tab copies. CAP-7 frozen order holds geometrically on
-            // every pane: Header → [Alert] → Endpoints → tab-specific.
-            // (Pinning the 140px overview above the bar instead would
-            // collapse the body viewport to ~22px in the 240px panel,
-            // hiding usage/history/presets and the alert itself.)
             .child(self.render_inspector_tabs(cx))
-            // The tab bar stays pinned: only the pane body scrolls, so the
-            // tabs never scroll away and the operate row is always one
-            // scroll from a visible anchor.
-            // Ticket 09: the pane content enters on a restrained opacity
-            // fade (≤200ms, reduced-motion-honored) inside an anonymous
-            // wrapper keyed per tab, so every switch remounts the fade
-            // while `config-detail-body` and all pane ids keep unset
-            // opacity (headless paint seams never read a mid-fade parent).
-            // The shared overview sits outside the fade so tab switches
-            // never remount it — only the tab-specific section re-enters.
             .child(
                 div()
                     .id("config-detail-body")
@@ -23220,48 +19744,18 @@ impl AppView {
                         cx,
                     )),
             )
-            // The operate row is PINNED below the scroller, not the last
-            // child inside it. Inside, a tall pane (Health carries the
-            // history chart, Presets the rule list) pushed Start/Stop/
-            // Test/Ping/Logs/Copy URLs below the pane's bottom edge at the
-            // 240px start, clipping the controls that act on the selection.
-            // Pinned, the pane body scrolls its own sections and the operate
-            // row is always painted — the pane no longer has to grow to fit
-            // every section.
             .child(self.render_detail_actions(cx, config))
             .into_any_element()
     }
 
-    /// Switch the inspector pane and reset the pane body's scroll to the top.
-    ///
-    /// One setter for all four call sites (the tab bar and the three
-    /// `Inspector*` actions) because `config-detail-body` is the SAME element
-    /// across tab switches — only its child changes — so the tracked offset
-    /// survives the switch. Scrolling down the Health pane and then opening
-    /// Details left the new pane at an arbitrary offset with blank space above
-    /// its first section.
     fn set_inspector_tab(&mut self, tab: InspectorTab) {
         self.inspector_tab = tab;
         self.detail_scroll.set_offset(point(px(0.), px(0.)));
     }
 
-    /// Ticket 05: `Details / Health / Presets` segmented bar over the
-    /// existing detail builders, extended by throne-adoption 05 with
-    /// `Logs / Connections / Traffic`. Stable per-tab ids ride as zero-size
-    /// marker children (the `Tab` element id is owned by the bar's index), tabs
-    /// carry aria labels, and selection lives in
-    /// [`AppView::inspector_tab`] — the bar is `RenderOnce`, so it is
-    /// rebuilt from the field each frame; no entity is created in render.
-    /// T06 (CAP-7): each tab carries its bound key twice — the full
-    /// `Name (Key)` accessible name plus a visible `Kbd` suffix chip
-    /// (Ctrl-1/2/3 are bound in [`bind_app_keys`], so the hints are never
-    /// unbound-action lies). No `Tab::id` invention: the wrapper +
-    /// markers stay the only anchors.
     fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        // Kit `TabBar::new` owns the id for state keys only — it never lands
-        // on the rendered element — so the stable test anchor rides on this
-        // wrapper (same convention as the `facet-*-tip` hover wrappers).
+
         div().id("inspector-tabs").test_support().child(
             TabBar::new("inspector-tabs")
                 .segmented()
@@ -23317,18 +19811,6 @@ impl AppView {
         )
     }
 
-    /// Ticket 04 (throne-adoption): single shared inspector overview —
-    /// the detail header + Endpoints rendered ONCE at the top of the pane
-    /// body and reused by all three panes (not copy-pasted per pane). The
-    /// builders stay shared (`render_detail_header` +
-    /// `render_detail_endpoints`), so the acting-row echo, serving badge,
-    /// and endpoint copies cannot diverge between tabs; ids paint exactly
-    /// once per frame. A failed row (see [`detail_failed`]) additionally
-    /// carries the failure Alert directly under the acting row — the same
-    /// pinned copy + ids the Health module used to own — so the evidence
-    /// stays inside the minimum pane and reads on every tab without
-    /// resizing; the Health module keeps only the data line, never a
-    /// second Alert.
     fn render_inspector_overview(
         &self,
         cx: &mut Context<Self>,
@@ -23355,9 +19837,6 @@ impl AppView {
         overview.child(self.render_detail_endpoints(cx, config))
     }
 
-    /// Ticket 05: Details pane — usage only (the shared overview leading
-    /// the pane body already carries header + failure alert + endpoints;
-    /// Ticket 04). Health/history/preset sections own the other panes.
     fn render_inspector_details(
         &self,
         cx: &mut Context<Self>,
@@ -23370,17 +19849,6 @@ impl AppView {
             .child(self.render_detail_usage(cx, config))
     }
 
-    /// Ticket 05: Health pane — health + history plus the shared operate
-    /// row (same handlers, ids, and loading states as the Details pane;
-    /// only one pane renders per frame, so the ids never collide). Logs
-    /// open in the dialog — no inline tail.
-    /// Lane B (B6): the shared overview leading the pane body names the
-    /// row the operate row acts on (acting row + protocol/group tags +
-    /// bind endpoint + serving Badge), so every pane shares one header.
-    /// Ticket 04 (throne-adoption): CAP-7 frozen order holds geometrically
-    /// — Header → [failure Alert] → Endpoints (shared overview) → health /
-    /// history (here) — so Endpoints stays above the fold, every tab scans
-    /// the same, and the failure evidence reads without resizing.
     fn render_inspector_health(
         &self,
         _cx: &mut Context<Self>,
@@ -23394,128 +19862,81 @@ impl AppView {
             .child(self.render_detail_history(config))
     }
 
-    /// Ticket 05: Presets pane — attached routing preset plus the attach
-    /// picker entry point (same dialog as before).
-    /// Lane B (B6): the shared overview leading the pane body names the
-    /// acting row like on the other panes (same echo, same ids, no
-    /// collisions — one pane renders per frame).
-    /// Ticket 04 (throne-adoption): CAP-7 frozen order holds geometrically
-    /// — Header → [failure Alert] → Endpoints (shared overview) → preset
-    /// block (here) — so Endpoints stays above the fold on every tab.
     fn render_inspector_presets(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            // Ticket 37: attached routing preset plus the picker entry
-            // point. Lane B (B9): the line carries the rule count and an
-            // attached row detaches inline (no dialog round-trip); rules
-            // themselves still live in the presets manager.
-            // Ticket 44 sweep (T02): the preset module shares the boxed
-            // `GroupBox` + gap_1 rhythm (same `config-preset` id). The
-            // summary reads as a one-item `DescriptionList` (label
-            // `Preset`, value names the rule count; `bordered(false)` so
-            // no second box lands inside the group), with the attach row
-            // as the group's second child. Detach stays in-pane behind
-            // `preset-detach-inline` (same handler); unattached rows keep
-            // the `preset-detach-idle` marker so the row never reflows.
-            // T04 (CAP-4): the kit list clips values via `overflow_hidden`
-            // (verified 0.6.6 `description_list.rs`) with no tooltip slot,
-            // so the full preset line rides an outer hover wrapper — the
-            // same legal pattern as the facet `Select` tips.
-            .child({
-                let preset_line = match self.preset_summary_for(config.preset_id.as_deref()) {
-                    Some((name, count)) => {
-                        format!("{name} ({count} rule(s))")
-                    }
-                    None => match self.preset_name_for(config.preset_id.as_deref()) {
-                        Some(name) => name,
-                        None => "no routing preset".to_string(),
-                    },
-                };
-                div().id("config-preset").test_support().child(
-                    GroupBox::new()
-                        .title("Routing preset")
+        div().flex().flex_col().gap_1().child({
+            let preset_line = match self.preset_summary_for(config.preset_id.as_deref()) {
+                Some((name, count)) => {
+                    format!("{name} ({count} rule(s))")
+                }
+                None => match self.preset_name_for(config.preset_id.as_deref()) {
+                    Some(name) => name,
+                    None => "no routing preset".to_string(),
+                },
+            };
+            div().id("config-preset").test_support().child(
+                GroupBox::new().title("Routing preset").gap_1().child(
+                    div()
+                        .flex()
+                        .flex_col()
                         .gap_1()
-                        // Ticket 44 sweep (T02): one wrapper child keeps the
-                        // group's 4px rhythm — the box's inner content gap is
-                        // kit-owned, so two direct children would drift to it.
+                        .child({
+                            let tip = preset_line.clone();
+                            div()
+                                .id("preset-line-tip")
+                                .test_support()
+                                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                                .child(
+                                    DescriptionList::new()
+                                        .bordered(false)
+                                        .small()
+                                        .columns(1)
+                                        .label_width(px(72.))
+                                        .item("Preset", preset_line, 1),
+                                )
+                        })
                         .child(
                             div()
                                 .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child({
-                                    let tip = preset_line.clone();
-                                    div()
-                                        .id("preset-line-tip")
-                                        .test_support()
-                                        .tooltip(move |_, cx| {
-                                            cx.new(|_| Tooltip::new(tip.clone())).into()
-                                        })
-                                        .child(
-                                            DescriptionList::new()
-                                                .bordered(false)
-                                                .small()
-                                                .columns(1)
-                                                .label_width(px(72.))
-                                                .item("Preset", preset_line, 1),
-                                        )
-                                })
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
                                 .child(
+                                    Button::new("preset-open")
+                                        .small()
+                                        .label("Preset")
+                                        .tooltip("Attach a routing preset")
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            if let Some(config) = view.selected_config(cx) {
+                                                view.open_preset_attach_dialog(config, window, cx);
+                                            }
+                                        })),
+                                )
+                                .child(if config.preset_id.is_some() {
+                                    let detach_id = config.id.clone();
+                                    Button::new("preset-detach-inline")
+                                        .small()
+                                        .label("Detach")
+                                        .tooltip("Detach the routing preset from this row")
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.commit_preset_attach(&detach_id, None, window, cx);
+                                        }))
+                                        .into_any_element()
+                                } else {
                                     div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("preset-open")
-                                                // Ticket 44: small + tooltip (detail-bar density for the
-                                                // 1000x700 paint frame; tooltips name every action).
-                                                .small()
-                                                .label("Preset")
-                                                .tooltip("Attach a routing preset")
-                                                .on_click(cx.listener(|view, _, window, cx| {
-                                                    if let Some(config) = view.selected_config(cx) {
-                                                        view.open_preset_attach_dialog(
-                                                            config, window, cx,
-                                                        );
-                                                    }
-                                                })),
-                                        )
-                                        .child(if config.preset_id.is_some() {
-                                            let detach_id = config.id.clone();
-                                            Button::new("preset-detach-inline")
-                                                .small()
-                                                .label("Detach")
-                                                .tooltip("Detach the routing preset from this row")
-                                                .on_click(cx.listener(
-                                                    move |view, _, window, cx| {
-                                                        view.commit_preset_attach(
-                                                            &detach_id, None, window, cx,
-                                                        );
-                                                    },
-                                                ))
-                                                .into_any_element()
-                                        } else {
-                                            div()
-                                                .id("preset-detach-idle")
-                                                .test_support()
-                                                .into_any_element()
-                                        }),
-                                ),
+                                        .id("preset-detach-idle")
+                                        .test_support()
+                                        .into_any_element()
+                                }),
                         ),
-                )
-            })
+                ),
+            )
+        })
     }
 
-    /// Ticket 05: click-copies one connection destination (the raw dest — a
-    /// host/IP from clash metadata, never credentials). Empty warns instead
-    /// of copying nothing.
     fn copy_connection_dest(&mut self, dest: &str, window: &mut Window, cx: &mut Context<Self>) {
         if dest.is_empty() {
             window.push_notification(Notification::warning("No destination to copy"), cx);
@@ -23525,16 +19946,9 @@ impl AppView {
         window.push_notification(Notification::success(format!("Copied {dest}")), cx);
     }
 
-    /// Ticket 05 (throne-adoption): Logs pane — the same redacted visible
-    /// lines the dialog shows (the shared [`AppView::visible_log_lines`]
-    /// seam, so dialog, Save, Copy, and this pane always agree), with the
-    /// level row, the active-filter summary, and the sheet entry point where
-    /// the include/exclude/regex fields live. Filter inputs own entities, so
-    /// they live in the dialog — never built in render.
     fn render_inspector_logs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lines = self.visible_log_lines(cx);
-        // The single level control (same labels + `from_label` mapping as the
-        // sheet; its own state key so sheet and pane never collide).
+
         const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
         let current_level = self.log_level;
         let selected_level = LOG_LEVEL_LABELS
@@ -23663,14 +20077,6 @@ impl AppView {
         pane
     }
 
-    /// Ticket 05 (throne-adoption): Connections pane — honest v1 table over
-    /// the live snapshot: `Destination / Exit row + bind:port / Row protocol
-    /// / Traffic ↓↑ / Session Δ`. Clicking a destination copies it; rows
-    /// sort by traffic (descending default) and filter to the selected row
-    /// while the toggle is on; probes never reach the snapshot.
-    /// Ticket 10 (US-26): the destination column rides the persisted width
-    /// ([`Store::conn_column_widths`]); Columns −/+ resize every column by
-    /// 20px and Refresh Column Widths restores the defaults.
     fn render_inspector_connections(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected_config(cx).map(|config| config.id);
         let rows = build_conn_rows(
@@ -23681,8 +20087,7 @@ impl AppView {
             self.conn_sort_desc,
         );
         let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
-        // Ticket 10 (US-26): persisted destination-column width snapshot
-        // (handlers below re-read live state — never this snapshot).
+
         let dest_width_px = self.store.conn_column_widths()[0] as f32;
         let mut pane = div()
             .id("config-connections")
@@ -23731,8 +20136,8 @@ impl AppView {
                                         cx.notify();
                                     })),
                             )
-                            // Ticket 10 (US-26): persisted column widths —
-                            // resize all five columns or restore defaults.
+
+
                             .child(
                                 Button::new("conn-columns-narrow")
                                     .small()
@@ -23814,9 +20219,6 @@ impl AppView {
         pane
     }
 
-    /// Ticket 10 (US-26): resize every Connections column by `delta` px
-    /// (persisted per column, clamped 40..=600 by the store seam). Loud
-    /// on store failure; the pane repaints from the persisted widths.
     fn adjust_conn_column_widths(
         &mut self,
         delta: i32,
@@ -23837,8 +20239,6 @@ impl AppView {
         cx.notify();
     }
 
-    /// Ticket 10 (US-26): Refresh Column Widths — restore the defaults
-    /// (explicit button only; ticks never touch widths).
     fn refresh_conn_column_widths(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.reset_conn_column_widths() {
             Ok(()) => {
@@ -23857,11 +20257,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 05 (throne-adoption): Traffic pane — per-exit aggregates from
-    /// the persisted totals (which already fold in clash-poll deltas),
-    /// heaviest exit first. There is deliberately no Direct line: presets
-    /// emit no per-rule decisions yet, so a Direct aggregate would be
-    /// fabricated.
     fn render_inspector_traffic(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let library: Vec<ProxyConfig> = self.libraries.read(cx).delegate().rows.clone();
         let totals = self.store.traffic_totals().unwrap_or_default();
@@ -23925,26 +20320,16 @@ impl AppView {
         pane
     }
 
-    /// W1/failed evidence shared by the detail builders: a crashed sidecar
-    /// shard or a `dead` health summary. One helper so the call sites
-    /// (the shared overview's Alert, the serving badge tone, the Start
-    /// label phase) cannot diverge.
     fn detail_failed(&self, config: &ProxyConfig) -> bool {
         self.engine.ids_on_crashed_shards().contains(&config.id)
             || self.health_store.row_summary(&config.id).trim() == "dead"
     }
 
-    /// Detail header: name, protocol/group tags, bind endpoint, serving badge.
     fn render_detail_header(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
-        // Ticket 30: the header carries the same serving badge as the list
-        // row (`● Running :port · health` / `○ Stopped`); the enabled flag
-        // stays secondary (Switch only — the duplicate Enable button is
-        // gone). The Start button reads `Starting…` while a start is in
-        // flight (second clicks are ignored, never double-applied).
         let is_running = self.engine.is_running(&config.id);
         let summary_text = self.health_store.row_summary(&config.id);
         let summary_trimmed = summary_text.trim().to_string();
@@ -23966,11 +20351,6 @@ impl AppView {
             .items_center()
             .gap_2()
             .w_full()
-            // Ticket 01: the header echoes the acting row — the same
-            // selected row F5 and the detail Start touch. The name renders
-            // once via `detail-acting-on` (no second copy beside it). The
-            // status role announces selection changes to assistive tech —
-            // arrow-keying the list is no longer silent.
             .child(
                 div()
                     .id("detail-acting-on")
@@ -23980,19 +20360,11 @@ impl AppView {
                     .text_color(cx.theme().muted_foreground)
                     .child(acting_on_label(config)),
             )
-            // T02: protocol and group ride as Tag chips; the bind
-            // endpoint stays plain text (id/text presence asserted).
             .child(Tag::new().child(config.protocol.clone()))
             .child(Tag::new().child(config.group.clone()))
             .child(format!("{}:{}", config.bind_ip, config.port))
             .child(
                 div().id("detail-serving").test_support().child(
-                    // T02: the serving line is a Badge — the pinned
-                    // copy is the child, the dot names the state.
-                    // Lane B (B6): the dot shares [`serving_tone`] with the
-                    // row lamp and badge (danger on failed evidence while
-                    // serving, success while serving, secondary when
-                    // stopped) — one rule, three paint sites.
                     Badge::new()
                         .dot()
                         .color(match serving_tone(is_running, summary_opt, crashed) {
@@ -24005,34 +20377,15 @@ impl AppView {
             )
     }
 
-    /// Detail endpoints section: compact one-line rows (fixed small muted
-    /// label, truncating value, trailing per-row Copy), each bind endpoint
-    /// with its own Copy.
-    /// Ticket 44 sweep (T02): boxed in the shared `GroupBox` + gap_1
-    /// rhythm. The rows stay custom (not `DescriptionList`): the trailing
-    /// per-row Copy buttons and the pinned `endpoint-value-*` ids need a
-    /// three-cell row the list grid cannot host at the 72px label width
-    /// the 880px-minimum containment depends on — labels already ride the
-    /// description-label token and values truncate with full-text tooltips.
-    /// Upstream is display-only (never editable); its Copy carries
-    /// host:port alone behind the pinned `copy-upstream` id, like the
-    /// SOCKS/HTTP copies carry bind:port alone (never params or secrets).
     fn render_detail_endpoints(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
-        // Ticket 19: endpoint URLs (bind + port only, never params or
-        // secrets) plus the upstream host:port when known.
         let (socks_url, http_url) = proxy_urls(&config.bind_ip, config.port);
-        // Ticket 47: the detail upstream reads the same set_rows cache as
-        // the list rows (one HashMap lookup per frame, never a JSON parse).
+
         let upstream = self.cached_upstream(cx, config);
-        // Signal-box 06: per-row copy closes the all-or-nothing gap —
-        // each endpoint copies alone beside its value (upstream included:
-        // host:port only, never params or secrets). Labels ride the
-        // description label token and buttons are kit small with tooltips,
-        // so focus, tab order, and density match the operate row below.
+
         div().id("config-endpoints").test_support().child(
             GroupBox::new().title("Endpoints").gap_1().child(
                 div()
@@ -24064,14 +20417,6 @@ impl AppView {
         )
     }
 
-    /// Signal-box 06: one compact endpoint row — fixed small muted label,
-    /// truncating value, and an optional trailing per-row Copy button.
-    /// `label` is a static scheme name; `which` wires the copy target.
-    /// One line per endpoint (label | value | copy) keeps all three rows
-    /// above the fold inside the inspector height.
-    /// Lane B (B7): the truncating value carries the full text as its
-    /// tooltip (still bind-side only — never params or secrets), so a
-    /// narrowed inspector never hides the endpoint it acts on.
     fn endpoint_row(
         cx: &mut Context<Self>,
         label: &'static str,
@@ -24148,43 +20493,20 @@ impl AppView {
             .child(value_row)
     }
 
-    /// Detail health section (the data line; the failure Alert chrome for
-    /// failed rows lives once in the shared overview, never here).
-    /// Ticket 44 sweep (T02): `gap_1` like every other module — the lone
-    /// `gap_2` broke the shared container rhythm for no reading gain.
-    /// Ticket 04 (throne-adoption): a dead/crashed row keeps the same
-    /// pinned health copy as its plain line; the error Alert rendering
-    /// that copy moved to [`render_inspector_overview`] (directly under
-    /// the acting row, on every tab), so the `config-health-alert` id
-    /// never paints twice in one frame.
     fn render_detail_health(&self, config: &ProxyConfig) -> impl IntoElement {
         div().id("config-health").test_support().child(
-            GroupBox::new().title("Health").gap_1().child(
-                // T05: the plain line for every row (no Alert element at
-                // all — failed rows read their Alert from the overview).
-                self.health_store.detail_line(&config.id).into_any_element(),
-            ),
+            GroupBox::new()
+                .title("Health")
+                .gap_1()
+                .child(self.health_store.detail_line(&config.id).into_any_element()),
         )
     }
 
-    /// Detail usage readout (persisted down/up buckets, display only).
-    /// Signal-box 04: the `usage-reset` action moved into the row menu
-    /// (same id, label, tooltip, handler) — the module keeps the numbers.
-    /// Ticket 44 sweep (T02): boxed in the shared `GroupBox` + gap_1
-    /// rhythm with the other four modules (same `config-usage` id, no
-    /// naked gray string beside boxed neighbors). The buckets read as a
-    /// two-item `DescriptionList` (`bordered(false)`, 72px labels like the
-    /// endpoint rows); the Ticket 04 hairline-only form gave back 54px at
-    /// the 880x620 minimum, but the operate row is pinned below the pane
-    /// scroller now, so the boxed module scrolls inside the body while
-    /// Start stays painted — `t04_detail_fits_minimum_window` guards it.
     fn render_detail_usage(
         &self,
         cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
-        // Ticket 45: persisted down/up buckets (the confirm-gated reset
-        // lives in the row menu now, never silent).
         div().id("config-usage").test_support().child(
             GroupBox::new()
                 .title("Usage")
@@ -24207,13 +20529,7 @@ impl AppView {
         )
     }
 
-    /// Detail history section (bounded latency sparkline).
-    /// Ticket 44 sweep (T02): `gap_1` like every other module — the lone
-    /// `gap_2` broke the shared container rhythm for no reading gain.
     fn render_detail_history(&self, config: &ProxyConfig) -> impl IntoElement {
-        // Ticket 45: trend-visible health — bounded history sparkline
-        // (native LineChart; 90d retention window served from
-        // `health_history`, never the latest-snapshot fast path).
         div().id("config-history").test_support().child(
             GroupBox::new()
                 .title("History")
@@ -24222,12 +20538,6 @@ impl AppView {
         )
     }
 
-    /// Signal-box 04: single operate row — the Enabled switch, the six
-    /// inline ops (Start, Stop, Test, Ping, Logs, Copy URLs), and the row
-    /// menu trigger. Stable ids, labels, tooltips, handlers, and loading
-    /// states are unchanged — only the packing changed (the manage row
-    /// collapsed into `row-menu`, so the Endpoints module stays above the
-    /// fold in the 240px cap with no horizontal scroll).
     fn render_detail_actions(
         &self,
         cx: &mut Context<Self>,
@@ -24236,18 +20546,11 @@ impl AppView {
         let switch_id = format!("enabled-{}", config.id);
         let switch_view = cx.entity();
         let switch_id_for_handler = config.id.clone();
-        // W1: the selected row's lifecycle phase (see [`detail_failed`]
-        // for the evidence rule); the Start copy derives from the phase
-        // (same strings as before — `Starting…` while a start is in
-        // flight, `Start` otherwise).
+
         let is_running = self.engine.is_running(&config.id);
         let failed = self.detail_failed(config);
         let start_label = RowPhase::of(is_running, self.start_in_flight, failed).start_label();
-        // Signal-box 04: one operate row — the switch, the six inline
-        // ops, and the row menu trigger. Eight small controls fit the
-        // 1000px frame in a single row, so the Endpoints module stays
-        // above the fold with no horizontal scroll. The row wraps to a
-        // second line (never sideways scroll) at narrower widths.
+
         div()
             .id("detail-operate")
             .test_support()
@@ -24269,34 +20572,12 @@ impl AppView {
                         let enabled = *enabled;
                         let id = switch_id_for_handler.clone();
                         switch_view.update(cx, |view, cx| {
-                            // Ticket 26: one flag semantic — the
-                            // switch writes the stored flag only (see
-                            // [`AppView::commit_enabled_flag`]);
-                            // starting/stopping stays on Start/Stop.
-                            // Ticket 30: the Switch is the only
-                            // enabled control (no duplicate button).
                             view.commit_enabled_flag(&id, enabled, window, cx);
                         });
                     }),
             )
             .child({
-                // T05 (CAP-6): primaries ride one `ButtonGroup` (joined
-                // Start/Stop/Test). The group stays callback-free on purpose:
-                // verified `button_group.rs` replaces each child's handler
-                // with selection-state bookkeeping once a group `on_click`
-                // is set, so setting one would break dispatch-through-the-
-                // same-handlers. Each child keeps its id, label, tooltip,
-                // Kbd chip, loading flag, spinner, and existing handler
-                // (same toasts + in-flight guards as the toolbar; labels
-                // differ by scope only). Ping/Logs/Copy URLs stay loose —
-                // the ticket groups Start/Stop/Test only.
-                // T06: loading state + inline spinner while a start
-                // is in flight (the label already reads `Starting…`
-                // via `RowPhase::start_label`).
-                // Lane B (B6): the F5 hint rides as a Kbd chip like Stop/Test
-                // (pinned string stays on the accessible name + tooltip).
                 let mut start = Button::new("engine-start")
-                    // Ticket 44: small + tooltip (detail-bar density).
                     .small()
                     .label(start_label)
                     .accessibility_label("Start the selected endpoint (F5)")
@@ -24314,13 +20595,9 @@ impl AppView {
                             .child(Spinner::new().small()),
                     );
                 }
-                // T06: loading state + inline spinner while a start
-                // is in flight (stop waits on the same fence).
+
                 let mut stop = Button::new("engine-stop")
-                    // Ticket 44: small + tooltip (detail-bar density).
                     .small()
-                    // T08: keystroke rides as a `Kbd` chip; the
-                    // pinned string stays on the accessible name.
                     .label("Stop")
                     .accessibility_label("Stop (Shift-F5)")
                     .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
@@ -24337,13 +20614,9 @@ impl AppView {
                             .child(Spinner::new().small()),
                     );
                 }
-                // T06: loading state + inline spinner while a
-                // URL-test probe is in flight.
+
                 let mut test = Button::new("health-test")
-                    // Ticket 44: small + tooltip (detail-bar density).
                     .small()
-                    // T08: keystroke rides as a `Kbd` chip; the
-                    // pinned string stays on the accessible name.
                     .label("Test")
                     .accessibility_label("Test (Ctrl-T)")
                     .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
@@ -24366,10 +20639,7 @@ impl AppView {
                     .child(test)
             })
             .child({
-                // T06: loading state + inline spinner while a
-                // TCP-ping probe is in flight.
                 let mut ping = Button::new("health-ping")
-                    // Ticket 44: small + tooltip (detail-bar density).
                     .small()
                     .label("Ping")
                     .tooltip("TCP-ping the selected endpoint")
@@ -24398,8 +20668,6 @@ impl AppView {
             )
             .child(
                 Button::new("copy-urls")
-                    // Ticket 44: small + tooltip; clipboard carries bind
-                    // + port only (never params or secrets).
                     .small()
                     .label("Copy URLs")
                     .tooltip("Copy bind endpoints (no secrets)")
@@ -24410,17 +20678,6 @@ impl AppView {
             .child(self.render_row_menu(cx))
     }
 
-    /// Throne-adoption 03: one card-menu item closing over THAT row's id.
-    /// The div carries a stable `rowctx-<verb>-<row id>` id (never the
-    /// detail `row-menu` ids — both menus can paint at once); the click
-    /// resolves the row fresh so the menu acts on the right-clicked row,
-    /// never the selection. Ghost rows warn; the selection is untouched.
-    /// Ticket 07 (CUA US-5/CAP-5): role + name through the accessibility
-    /// bridge — `Role::MenuItem` with the visible label as the accessible
-    /// name, the same contract `topbar_menu_row` already carries, so the
-    /// UIA walk names every card-menu item. No synthetic nodes: the div is
-    /// the real clickable row, and keyboard (arrows/`Enter`/`Esc`) rides
-    /// the kit `PopupMenu` bindings.
     fn row_menu_item(
         verb: &str,
         row_id: &str,
@@ -24456,15 +20713,6 @@ impl AppView {
         })
     }
 
-    /// Throne-adoption 03: the card right-click menu — one item per row
-    /// action (`Start/Stop/Test/Ping/Copy URLs/Edit/Duplicate/Delete/
-    /// Reset traffic/Reset usage/Move to group`), each closing over THAT
-    /// row's id. `Duplicate` is the only copy verb (`Clone` alias
-    /// removed); `Copy URLs` carries `bind:port` only, never secrets.
-    /// Ticket 09 (throne-adoption): plus `Speedtest`, `Resolve Out-IP`,
-    /// and `Resolve domain` (the row half of resolve-domain rewrite).
-    /// Ticket 10 (throne-adoption): plus `Share` (the link share-out —
-    /// `ExportToLink || ExportJsonLink`, never an empty copy).
     fn row_context_menu(menu: PopupMenu, row_id: &str, view: &Entity<AppView>) -> PopupMenu {
         menu.item(Self::row_menu_item(
             "start",
@@ -24588,23 +20836,11 @@ impl AppView {
         ))
     }
 
-    /// Signal-box 04: row menu — Edit, Delete, Duplicate, Reset traffic,
-    /// and Reset usage behind one `row-menu` trigger (same labels,
-    /// tooltips, and handlers the manage row and Usage module carried;
-    /// each item keeps its stable id on a custom element because
-    /// `PopupMenuItem` carries no id of its own — the toolbar-menu
-    /// precedent).
     fn render_row_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let row_view = cx.entity();
-        // Lane B (B6): the Delete item carries no danger styling — the
-        // naming confirm (`open_remove_confirm`) is the danger voice
-        // (DESIGN.md Do's: the row-menu Delete gates through a naming
-        // confirm instead of carrying danger styling).
+
         Button::new("row-menu")
             .small()
-            // Lane B (B9): the trigger names what it holds — the bare `Row`
-            // label hid Edit/Delete behind a mystery menu (id, tooltip, and
-            // items unchanged).
             .label("Row actions…")
             .tooltip("Edit, delete, duplicate, or reset this row")
             .dropdown_menu(move |menu, _, _| {
@@ -24753,11 +20989,6 @@ impl AppView {
             })
     }
 
-    /// Ticket 45: one detail-pane latency sparkline from bounded history —
-    /// gpui-kit native [`LineChart`] (zero new deps; the research spike
-    /// confirmed `chart::LineChart` in gpui-component 0.6.6 with `f64`
-    /// values). Callers guarantee at least two points; errors never plot
-    /// (see [`sparkline_latencies`]).
     fn latency_sparkline(latencies: &[u64]) -> impl IntoElement {
         struct SparkPoint {
             x: String,
@@ -24786,12 +21017,7 @@ impl AppView {
         let (total, enabled) = delegate.counts();
         let engine_text = self.engine.status_text();
         let health_text = self.health_status_text();
-        // Lane B (B9): live segments — the active filter echo (left) and
-        // the serving bind ports (center). Each paints only while its state
-        // is set, so the strip never carries a stale or lying segment. Tail
-        // stays dialog-local (its Pause/Resume toggle + toast name the
-        // state): a permanent strip flag does not fit the 880px minimum
-        // beside the other live segments.
+
         let filter_text = delegate.active_filter_text();
         let ports: Vec<u16> = delegate
             .rows
@@ -24800,27 +21026,7 @@ impl AppView {
             .map(|row| row.port)
             .collect();
         let ports_text = serving_ports_text(&ports);
-        // T08 (gpui-18-sweep CAP-10): the three regions feed the kit
-        // `StatusBar` directly — `left()` pins the counts, `child()` feeds
-        // the center (no `.center()` exists), `right()` pins the totals.
-        // With both ends pinned the kit centers the middle itself, so no
-        // manual spacers. Separators split the regions so the segments
-        // still read as one strip.
-        // Ticket 45: summed usage totals ride the right region (absent on
-        // a broken read — never a lying zero).
-        // Ticket 10: fixed slots — each region reserves its width (`min_w`
-        // floor, a verified `Styled` helper) so value changes (counts,
-        // engine/health text, traffic totals) reflow inside the slot instead
-        // of pushing siblings. Regions stay shrinkable to their floors (no
-        // `flex_shrink_0`) so the 880px minimum still fits: floors sum to
-        // 790px + ~58px furniture, inside 880 by construction, spacers first.
-        // Optional segments truncate under caps sized past their honest
-        // maxima instead of growing the strip. Ledger ruling: floors freeze
-        // value changes, not segment appearance — a serving flip legitimately
-        // widens the center (engine + ports evidence), and freezing that too
-        // would need ~940px, breaking the minimum frame.
-        // T04 (CAP-4): every truncating segment carries its full text as a
-        // tooltip, so a narrowed strip never hides the value it reports.
+
         let count_text = format!(
             "{} {} · {} enabled",
             total,
@@ -24849,9 +21055,7 @@ impl AppView {
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(count_text)
             });
-        // Lane B (B9): the active filter echo rides the left region (long
-        // queries truncate with the full text on hover — same pattern as
-        // the endpoint rows).
+
         if !filter_text.is_empty() {
             let tip = filter_text.clone();
             left = left.child(Separator::vertical()).child(
@@ -24894,11 +21098,7 @@ impl AppView {
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(health_text)
             });
-        // Lane B (B9): serving bind ports ride the center region beside the
-        // engine + health they evidence (absent while nothing serves).
-        // Ticket 10: capped + truncating (same pattern as the filter echo).
-        // The 200px cap clears the honest maximum (`:port :port :port +N`)
-        // so caps never clip real content, only pathological growth.
+
         if let Some(ports) = ports_text {
             center = center.child(Separator::vertical()).child({
                 let tip = ports.clone();
@@ -24921,8 +21121,6 @@ impl AppView {
             .gap_2()
             .min_w(px(150.));
         if let Some(totals) = summed_traffic_text(&self.store) {
-            // Ticket 10: capped like ports — `↓ X.X UU · ↑ Y.Y UU` holds its
-            // width across units, so the 200px cap never clips honest totals.
             right = right.child(Separator::vertical()).child({
                 let tip = totals.clone();
                 div()
@@ -24935,24 +21133,10 @@ impl AppView {
                     .child(totals)
             });
         }
-        // T08 (gpui-18-sweep CAP-10): the kit `StatusBar` owns the spread —
-        // `left()` pins the counts, `child()` feeds the center region
-        // (verified `status_bar.rs`: no `.center()` method exists —
-        // `ParentElement::child/children` is the center path), `right()`
-        // pins the usage totals. With both ends pinned the kit centers the
-        // middle region itself, so the manual `flex_1` spacers retire. The
-        // `min_w` floors + `max_w` truncate + tooltips on every segment are
-        // unchanged, so values still reflow inside their slots.
+
         StatusBar::new().left(left).child(center).right(right)
     }
 
-    /// Ticket 30: `N of M` search count above the list.
-    /// Ticket 03: persistently visible beside the library search field
-    /// (live even with no query). The Clear-search button rides alongside
-    /// only while a query is active and clears the query alone (facets +
-    /// checked survive). The button resets the filter in place.
-    /// Ticket 31 deviation (mechanical repair — the helper lives on the
-    /// delegate, not on `ListState`): route through `.delegate()`.
     fn render_search_count(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (visible, total, query) = self
             .libraries
@@ -24971,7 +21155,6 @@ impl AppView {
             .child(search_count_text(visible, total))
             .child(if has_query {
                 Button::new("clear-search")
-                    // T04: `.small()` like every search/facet clear.
                     .small()
                     .label("Clear search")
                     .tooltip("Clear the search query (keeps facet filters and checked)")
@@ -24990,21 +21173,12 @@ impl AppView {
             .into_any_element()
     }
 
-    /// Signal-box 03: visible search affordance — moves keyboard focus to
-    /// the library search field (the kit `List` focuses its query input
-    /// while searchable). No new key binding; the `search-focus` button
-    /// itself is the affordance and stays in the tab order.
     fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             state.focus(window, list_cx);
         });
     }
 
-    /// Ticket 30: clear the library search filter in place (selection
-    /// re-derives by id via `apply_filter`).
-    /// BUG-1: routes through `ListState::set_query` so the kit search input
-    /// (`query_input` + `last_query`) clears together with `delegate.query`
-    /// — a delegate-only reset leaves stale text that blocks row selection.
     fn clear_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             state.set_query("", window, list_cx);
@@ -25012,20 +21186,10 @@ impl AppView {
         cx.notify();
     }
 
-    /// T04 (gpui-18-sweep CAP-5): retired strip — the truly-empty Add/Import
-    /// CTAs live in the `library-empty` Empty's content now (see
-    /// [`LibraryDelegate::render_empty`]), so assistive tech hears the empty
-    /// and its actions together instead of apart. The `empty-ctas` anchor
-    /// stays as a zero-size placeholder (never a second button row); a
-    /// filtered-to-zero list keeps the Clear-search/Clear-all path inside
-    /// the list's own Empty.
     fn render_empty_ctas(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         div().id("empty-ctas").test_support()
     }
 
-    /// T03: refresh the three pickers from the live delegate. Guarded twice
-    /// (options equal + selection equal ⇒ no entity update), so a stable
-    /// frame never notifies and the sync cannot drive a render loop.
     fn sync_facet_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for menu in FacetMenu::ALL {
             let (choices, current) = menu.choices(self.libraries.read(cx).delegate());
@@ -25061,11 +21225,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 44: facet filter bar. Shows the three facet pickers with the
-    /// current choice in the label, plus a clear action while any facet is
-    /// active. T03: pickers are inline `Select` popovers (no dialogs, no
-    /// `SelectState` in render — options refresh through the guarded
-    /// [`AppView::sync_facet_pickers`]).
     fn render_facet_bar(
         &mut self,
         window: &mut Window,
@@ -25073,10 +21232,7 @@ impl AppView {
     ) -> impl IntoElement {
         self.sync_facet_pickers(window, cx);
         let has_facets = self.libraries.read(cx).delegate().facets_active();
-        // T06 (CAP-7): hover copy names the active choice (with its result
-        // count) plus the live `N of M` — owned strings moved into the
-        // wrapper tooltip builders below (outer wrappers only: kit
-        // `Select` has no tooltip slot).
+
         let (group_tip, protocol_tip, status_tip) = {
             let libraries = self.libraries.read(cx);
             let delegate = libraries.delegate();
@@ -25111,14 +21267,8 @@ impl AppView {
             .items_center()
             .gap_2()
             .px_2()
-            // T01: hairline under the filter row separates filters from the
-            // card list below.
             .border_b_1()
             .border_color(cx.theme().border)
-            // Signal-box 03: visible search affordance — a small `Search`
-            // button that moves focus to the library search field (the
-            // kit list owns the field itself, so this is the persistent
-            // entry point; no new key binding, tooltips name the action).
             .child(
                 Button::new("search-focus")
                     .small()
@@ -25131,9 +21281,6 @@ impl AppView {
                     })),
             )
             .child(
-                // Kit `Select` has no tooltip slot of its own, so the
-                // filter name rides on a hover wrapper (T06: the active
-                // choice + live count, same text the trigger shows).
                 div()
                     .id("facet-group-tip")
                     .test_support()
@@ -25179,10 +21326,6 @@ impl AppView {
                     })),
             )
             .child(if has_facets {
-                // Ticket 03: the facet clear names its target (group, protocol
-                // and status filters) and keeps the search query + checked
-                // set — distinct from `clear-search` (query) and `bulk-clear`
-                // (checked).
                 Button::new("clear-facets")
                     .small()
                     .label("Clear facet filters")
@@ -25197,32 +21340,27 @@ impl AppView {
             .into_any_element()
     }
 
-    /// Ticket 44: honest bulk bar. Hidden while nothing is checked. The label
-    /// comes from `bulk_label` (names both counts under a filter), so the bar
-    /// can never claim the visible slice is the bulk set.
     fn render_bulk_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self.libraries.read(cx).delegate().bulk_label();
         if label.is_empty() {
             return div().id("bulk-bar").test_support().into_any_element();
         }
-        // Ticket 09: the appearing bar enters on the same restrained
-        // opacity fade as the inspector panes (ids, labels, handlers, and
-        // the empty-branch bare div are unchanged).
+
         Self::motion_enter(
             div()
                 .id("bulk-bar")
                 .test_support()
                 .flex()
                 .flex_row()
-                // Lane B (B5): the crowded bulk set wraps like `detail-operate`
-                // (No-Sideways-Scroll Rule) so every bulk action paints inside
-                // the 880px minimum frame instead of clipping.
+
+
+
                 .flex_wrap()
                 .items_center()
                 .gap_2()
                 .px_2()
-                // T01: the selection band is a bounded surface on the same tokens
-                // as the row cards; the empty branch stays bare (no stray hairline).
+
+
                 .bg(cx.theme().group_box)
                 .border_b_1()
                 .border_color(cx.theme().border)
@@ -25240,9 +21378,9 @@ impl AppView {
                         })
                         .child(label),
                 )
-                // T05 (CAP-6): selection verbs first (the opposite pair
-                // stays adjacent so Check-all-visible / Uncheck-all read as
-                // one choice), then a separator into the state verbs.
+
+
+
                 .child(
                     Button::new("bulk-select-visible")
                         .small()
@@ -25307,8 +21445,8 @@ impl AppView {
                             view.open_bulk_move_dialog(window, cx);
                         })),
                 )
-                // T05 (CAP-6): destructive trails behind its own separator —
-                // `Delete.danger` closes the bar, never interleaves it.
+
+
                 .child(Separator::vertical())
                 .child(
                     Button::new("bulk-delete")
@@ -25327,7 +21465,6 @@ impl AppView {
         .into_any_element()
     }
 
-    /// Ticket 44: clear all three facets (text query untouched).
     fn clear_facets(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().clear_facets();
@@ -25336,21 +21473,16 @@ impl AppView {
         cx.notify();
     }
 
-    /// Ticket 44: empty the multi-select set.
     fn clear_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().clear_checked();
             list_cx.notify();
         });
-        // The bulk bar unmounts with the set — focus returns to the shell
-        // so it never strands on a removed button.
+
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
-    /// Ticket 44: Escape path for the multi-select set. False while any
-    /// overlay is open (the set is preserved — the sheet/dialog keeps
-    /// Escape for its own dismiss); otherwise clears and returns true.
     fn clear_checked_unless_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if overlay_open(window, cx) {
             return false;
@@ -25359,7 +21491,6 @@ impl AppView {
         true
     }
 
-    /// Ticket 44: check every visible row (filter-aware select-all).
     fn select_visible_checked(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.libraries.update(cx, |state, list_cx| {
             let ids: Vec<String> = state
@@ -25379,8 +21510,6 @@ impl AppView {
         cx.notify();
     }
 
-    /// Ticket 44: bulk enable/disable over the checked set. One reload, one
-    /// honest toast. Ghost ids prune on the next reload via `set_rows`.
     fn commit_bulk_enable(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .libraries
@@ -25417,10 +21546,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 44: bulk start over the checked set. Loops the single-row
-    /// engine path (correctness first — one combined regen per row is the
-    /// existing atomic unit), then reloads once. LAN-bound rows stop at the
-    /// same confirm gate as start-all.
     fn commit_bulk_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.libraries.read(cx).delegate().checked_rows();
         if rows.is_empty() {
@@ -25469,7 +21594,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 44: bulk start for an explicit id set (post-gate).
     fn commit_bulk_start_ids(
         &mut self,
         ids: &[String],
@@ -25529,15 +21653,6 @@ impl AppView {
         }
     }
 
-    /// Off-UI start wrappers: the click returns immediately so the
-    /// `Starting…` state paints first; the synchronous `commit_*` seam
-    /// (still the headless/test entry) runs on the next pump via the
-    /// window handle. The engine stays on the main thread (it is not
-    /// `Send`); the async defer keeps the UI from freezing on the click
-    /// itself while the heavy apply still runs as one bounded unit.
-    /// Tests call the `commit_*` seams directly and stay synchronous
-    /// (`cfg!(test)` at the call sites), so headless assertions never
-    /// need to pump async completions.
     #[allow(dead_code)]
     fn spawn_commit_start_selected(&mut self, id: String, window: &Window, cx: &mut Context<Self>) {
         let handle = window.window_handle();
@@ -25592,7 +21707,6 @@ impl AppView {
         .detach();
     }
 
-    /// Ticket 44: bulk stop over the checked set. One reload, one toast.
     fn commit_bulk_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .libraries
@@ -25628,12 +21742,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 44: bulk delete confirm (AlertDialog — irreversible, names the
-    /// count). Running rows stop first via the same stop-one path as single
-    /// delete.
-    /// Ticket 10: the confirm lists the affected rows beside the count (via
-    /// [`bulk_delete_confirm_description`]) and commits an (id, name) acting
-    /// set so the toast can report per-row outcomes on the same rows.
     fn open_bulk_delete_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.libraries.read(cx).delegate().checked_rows();
         if rows.is_empty() {
@@ -25645,9 +21753,7 @@ impl AppView {
             .iter()
             .map(|row| (row.id.clone(), row.name.clone()))
             .collect();
-        // Ticket 10 (US-30): skip-delete-confirm toggle — the explicit
-        // Settings opt-in deletes without asking (stop-first still rides
-        // `commit_bulk_delete`, like the confirm path).
+
         if self.store.skip_delete_confirm() {
             view.update(cx, |view, cx| view.commit_bulk_delete(&targets, window, cx));
             return;
@@ -25677,12 +21783,6 @@ impl AppView {
         });
     }
 
-    /// Ticket 44: bulk delete for an explicit id set (post-confirm).
-    /// Ticket 10: the acting set is (id, name) pairs resolved from the
-    /// checked rows, so the outcome toast names every row; stop-first rides
-    /// the same stop-one path as single delete. Store misses and errors land
-    /// in the failed set instead of vanishing from the counts, and the toast
-    /// level tells the outcome (success / warning / error).
     fn commit_bulk_delete(
         &mut self,
         targets: &[(String, String)],
@@ -25703,8 +21803,7 @@ impl AppView {
             list_cx.notify();
         });
         self.reload(window, cx);
-        // Focus returns to the shell so keyboard control survives the bulk
-        // delete (the checked set it acted on is gone).
+
         window.focus(&self.focus, cx);
         if targets.is_empty() {
             window.push_notification(Notification::info(no_selection_message()), cx);
@@ -25720,9 +21819,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 44: bulk move dialog. One Input for the target group; OK moves
-    /// the checked ids via `move_to_group` (unknown ids skip, empty names
-    /// refuse with the dialog kept open).
     fn open_bulk_move_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .libraries
@@ -25769,17 +21865,12 @@ impl AppView {
                 .footer(dialog_footer(
                     "bulk-move-ok",
                     "bulk-move-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("bulk-move"),
                     commit_click,
                 ))
         });
     }
 
-    /// Throne-adoption 03: single-row move dialog for the card menu. Same
-    /// Input + [`AppView::commit_bulk_move`] path as the bulk dialog above
-    /// (one id, never the checked set); the title names the row so the
-    /// commit target is never ambiguous. Ghost rows warn.
     fn open_row_move_dialog(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.row_config(id) else {
             window.push_notification(Notification::warning("Already removed"), cx);
@@ -25818,15 +21909,12 @@ impl AppView {
                 .footer(dialog_footer(
                     "row-move-ok",
                     "row-move-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("bulk-move"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 44: bulk move commit. Returns false (keeps the dialog open) on
-    /// empty-group validation so the user can fix it in place.
     fn commit_bulk_move(
         &mut self,
         ids: &[String],
@@ -25837,8 +21925,7 @@ impl AppView {
         match self.store.move_to_group(ids, group) {
             Ok(moved) => {
                 self.reload(window, cx);
-                // Ticket 44: facet counts + inspector follow the move through
-                // the existing reload + picker sync (no picker-local state).
+
                 self.sync_facet_pickers(window, cx);
                 window.push_notification(
                     Notification::success(format!(
@@ -25856,8 +21943,6 @@ impl AppView {
         }
     }
 
-    /// Ticket 44: group manager. Lists live groups with counts, plus rename
-    /// (dialog) and delete (empty-only, refuses loudly while rows remain).
     fn open_groups_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let counts = self.store.group_counts().unwrap_or_default();
@@ -25868,27 +21953,20 @@ impl AppView {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        // Ticket 08: GroupItem-style rows — kind badge (`Basic` vs
-        // `Subscription (N)`) plus the `Last update | Used/Remain/Expire`
-        // line from the Subscription-Userinfo snapshots, per-row Update,
-        // and Edit (rename + auto-skip). Snapshot the rows first: the
-        // sheet closure owns plain data, never the store.
+
         let rows = group_row_views(&counts, &subs, &|group| flagged.contains(group), now_unix());
         let commit: DialogCommit = Rc::new(|_, _| true);
-        // T08 (gpui-18-sweep CAP-9): reference flow — the groups manager is
-        // a `Sheet` via `WindowExt::open_sheet` (no `Sheet::open`), with the
-        // same form body, row ids, and footer verbs. Pure-close manager:
-        // `Close`, never `Done` (Ticket 05).
+
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
-            // Ticket T03 (gpui-18-sweep CAP-3): the manager body composes on
-            // kit `v_form` + `field()` — each group row is a labeled field
-            // (name + count label, Rename/Delete actions), so the manager
-            // reads in the same form language as the other dialogs. Row
-            // button ids are unchanged.
+
+
+
+
+
             let mut form = v_form().small();
-            // Ticket 08: bulk verbs ride the manager (per-row Update lives
-            // on each subscription row below).
+
+
             {
                 let current_view = view.clone();
                 let all_view = view.clone();
@@ -25945,8 +22023,8 @@ impl AppView {
                 let delete_group = row.name.clone();
                 let slug = slugify_group_id(&row.name);
                 let mut buttons = div().flex().flex_row().items_center().gap_2().child(
-                    // Ticket 44: manager ids slug the label (slashes never
-                    // reach an element id); the row label stays verbatim.
+
+
                     Button::new(format!("group-rename-{slug}"))
                         .label("Rename")
                         .on_click(move |_, window, cx| {
@@ -25967,8 +22045,8 @@ impl AppView {
                             });
                         }),
                 );
-                // Ticket 08: per-row Update only on subscription-fed rows —
-                // basic groups have nothing to fetch (no dead button).
+
+
                 if !row.sub_ids.is_empty() {
                     buttons = buttons.child(
                         Button::new(format!("group-update-{slug}"))
@@ -25985,8 +22063,8 @@ impl AppView {
                     );
                 }
                 buttons = buttons.child(
-                    // Ticket 44: manager ids slug the label (slashes never
-                    // reach an element id); the row label stays verbatim.
+
+
                     Button::new(format!("group-delete-{slug}"))
                         .label("Delete")
                         .on_click(move |_, window, cx| {
@@ -25996,8 +22074,8 @@ impl AppView {
                             });
                         }),
                 );
-                // Ticket 08: kind badge + quota line stack under the actions
-                // (same field, so the row reads as one GroupItem).
+
+
                 let mut column = div()
                     .flex()
                     .flex_col()
@@ -26030,15 +22108,13 @@ impl AppView {
                 .footer(sheet_footer(
                     "groups-dialog-ok",
                     "groups-dialog-cancel",
-                    // Ticket 05: pure-close manager — `Close`, never `Done`.
+
                     footer_commit_label("groups"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 44: rename-group dialog. Empty names refuse with the dialog kept
-    /// open; missing groups move zero rows with an honest toast.
     fn open_group_rename_dialog(&mut self, old: &str, window: &mut Window, cx: &mut Context<Self>) {
         let old_name = old.to_string();
         let name_state = cx.new(|cx| {
@@ -26061,9 +22137,6 @@ impl AppView {
             let commit_click = commit.clone();
             dialog
                 .title(format!("Rename group \"{old_name}\""))
-                // Ticket T03: single-field body on kit `v_form` + `field()`.
-                // The new `field-group-rename-name` anchor keeps the input
-                // findable now that the kit field owns the label.
                 .child(v_form().small().child(dialog_field(
                     "field-group-rename-name",
                     "New group name",
@@ -26077,17 +22150,12 @@ impl AppView {
                 .footer(dialog_footer(
                     "group-rename-ok",
                     "group-rename-cancel",
-                    // Ticket 05: commit names its verb.
                     footer_commit_label("group-rename"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 08 (throne-adoption): Edit-group dialog — rename plus the
-    /// skip-automatic-refresh switch. Same `v_form` + footer language as
-    /// the rename dialog; the switch mirrors the subscription add-form
-    /// `Switch` (shared cell, committed on Save).
     fn open_group_edit_dialog(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
         let old_name = group.to_string();
         let name_state = cx.new(|cx| {
@@ -26137,9 +22205,9 @@ impl AppView {
                                          Manual Update still works.",
                                     )
                                     .on_change({
-                                        // Clone per build: the dialog body
-                                        // rebuilds (Fn), so the switch keeps
-                                        // a private handle on the shared cell.
+
+
+
                                         let skip_for_change = skip_for_change.clone();
                                         move |next: &bool, _, _| {
                                             *skip_for_change.borrow_mut() = *next;
@@ -26156,17 +22224,13 @@ impl AppView {
                 .footer(dialog_footer(
                     "group-edit-ok",
                     "group-edit-cancel",
-                    // Ticket 05: commit names its verb.
+
                     footer_commit_label("group-edit"),
                     commit_click,
                 ))
         });
     }
 
-    /// Ticket 08: edit-group commit. False keeps the dialog open on
-    /// validation/store failure (like the rename commit); success reloads,
-    /// follows a rename in the facet filter, toasts, and reopens the
-    /// manager fresh.
     fn commit_edit_group(
         &mut self,
         old: &str,
@@ -26196,7 +22260,7 @@ impl AppView {
             return false;
         }
         self.reload(window, cx);
-        // Ticket 44: a facet pinned to the old label follows the rename.
+
         self.libraries.update(cx, |state, list_cx| {
             let delegate = state.delegate_mut();
             if delegate.facet_group.as_deref() == Some(old) {
@@ -26214,8 +22278,6 @@ impl AppView {
         true
     }
 
-    /// Ticket 44: rename-group commit. False keeps the dialog open on empty
-    /// names; zero-move toasts honestly.
     fn commit_rename_group(
         &mut self,
         old: &str,
@@ -26234,9 +22296,7 @@ impl AppView {
             Ok(moved) => {
                 let renamed = new.trim().to_string();
                 self.reload(window, cx);
-                // Ticket 44: a facet pinned to the old label follows the rename
-                // (otherwise the list empties under a stale filter); counts +
-                // inspector refresh via the existing reload + picker sync.
+
                 self.libraries.update(cx, |state, list_cx| {
                     let delegate = state.delegate_mut();
                     if delegate.facet_group.as_deref() == Some(old) {
@@ -26265,17 +22325,9 @@ impl AppView {
         }
     }
 
-    /// Ticket 44: delete-group commit. Non-empty groups refuse loudly (names
-    /// the count so the manager can offer move-first); empty groups close
-    /// clean. Dialog-free: the confirm caller owns the refresh, so this
-    /// never nukes unrelated dialogs.
     fn commit_delete_group(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.store.delete_group(name) {
             Ok(()) => {
-                // Ticket 44: rows are unchanged (empty-only delete) but the
-                // group inventory shrank — reload + picker sync refresh facet
-                // counts and the inspector; a facet pinned to the removed
-                // label clears instead of filtering to nothing.
                 self.reload(window, cx);
                 self.libraries.update(cx, |state, list_cx| {
                     let delegate = state.delegate_mut();
@@ -26299,11 +22351,6 @@ impl AppView {
         }
     }
 
-    /// Lane B (B7): group delete behind a count-naming confirm. The refresh
-    /// pops only the confirm + the stale manager (scoped `close_dialog`
-    /// pair, never a full `close_all_dialogs`) and reopens the manager, so
-    /// dialogs stacked beneath survive. Returns false so the alert framework
-    /// pops nothing further.
     fn open_group_delete_confirm(
         &mut self,
         name: &str,
@@ -26338,9 +22385,7 @@ impl AppView {
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
                         view.commit_delete_group(&group, window, cx);
-                        // Scoped refresh: pop the confirm, pop the stale
-                        // manager, reopen it fresh. Anything stacked beneath
-                        // the manager is untouched.
+
                         window.close_dialog(cx);
                         window.close_dialog(cx);
                         view.open_groups_dialog(window, cx);
@@ -26350,9 +22395,6 @@ impl AppView {
         });
     }
 
-    /// Startup-stack split (same cause as [AppView::render_toolbar]): the shell
-    /// chrome (focus, key context, app actions, file drop) builds in its own frame
-    /// instead of inside [Render::render]'s chain. Content is unchanged.
     fn render_shell(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let drop_view = cx.entity();
         div()
@@ -26362,11 +22404,6 @@ impl AppView {
             .flex_col()
             .track_focus(&self.focus)
             .key_context(APP_KEY_CONTEXT)
-            // Ticket 26: app shortcuts (Add/Import/Start/Stop/Test). Each
-            // handler no-ops while any overlay is open (see
-            // [`overlay_open`]), so shortcut keys never steal sheet or
-            // dialog input.
-            // Ticket 44: Escape clears the checked set through the same guard.
             .on_action(cx.listener(|view, _: &AddConfig, window, cx| {
                 if overlay_open(window, cx) {
                     return;
@@ -26379,9 +22416,6 @@ impl AppView {
                 }
                 view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
             }))
-            // Config-completeness T08 (CAP-11): paste-intake binding — the
-            // same handler as the palette `ImportClipboard` op and the
-            // Library-menu "From clipboard" item (same guard, no new path).
             .on_action(cx.listener(|view, _: &PasteImport, window, cx| {
                 if overlay_open(window, cx) {
                     return;
@@ -26421,21 +22455,12 @@ impl AppView {
                 }
                 view.copy_selected_urls(window, cx);
             }))
-            // Ticket 08 (throne-adoption): Update-current (Ctrl-R) refreshes
-            // the subscriptions feeding the focused group — facet filter
-            // first, selected row's group second. Same overlay guard as
-            // every other shortcut (the groups sheet carries its own
-            // Update buttons, which need no guard).
             .on_action(cx.listener(|view, _: &UpdateCurrentGroup, window, cx| {
                 if overlay_open(window, cx) {
                     return;
                 }
                 view.update_current_group(window, cx);
             }))
-            // Lane B (B9): row edit/delete + search focus + inspector tabs.
-            // Each handler no-ops while any overlay is open (same guard as
-            // the Ticket 26 actions); Delete opens the naming confirm and
-            // Edit opens the edit dialog, so neither ever acts silently.
             .on_action(cx.listener(|view, _: &EditSelected, window, cx| {
                 if overlay_open(window, cx) {
                     return;
@@ -26511,31 +22536,13 @@ impl AppView {
             })
     }
 
-    /// Startup-stack split: the toolbar builds in its own frame instead of
-    /// inside [Render::render]'s single builder chain, so a debug first frame no
-    /// longer nests the whole window tree in one function frame (main-thread stack
-    /// overflow at startup - see .planning/follow-ups/startup-stack-overflow.md).
-    /// Ticket 02 (throne-adoption): PROGRAM | SETTINGS | GROUPS | ROUTING |
-    /// TOOLS dropdown menus plus a trailing round global Start/Stop — the
-    /// same handlers throughout (top menus, palette, tray, and keys share
-    /// every op, so nothing is orphaned).
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Ticket 02 (throne-adoption): five menus in fixed order —
-        // PROGRAM (single-config intake + app lifecycle) | SETTINGS |
-        // GROUPS (subscriptions + group ops) | ROUTING (preset manager +
-        // settings link) | TOOLS (selection ops, diagnostics, palette) —
-        // plus a trailing round global Start/Stop (Start-all / Stop-all).
-        // Every item keeps its stable id; handlers are the same ones the
-        // palette, tray, bulk bar, and keys use. Shortcuts,
-        // SHORTCUT_LINES, and the About list are untouched.
         let program_view = cx.entity();
         let settings_view = cx.entity();
         let groups_view = cx.entity();
         let routing_view = cx.entity();
         let tools_view = cx.entity();
-        // Global toggle state: a start in flight renders the `Connecting…`
-        // spinner; otherwise play offers Start-all and stop offers
-        // Stop-all. Only Idle/Running act — busy toasts the guard.
+
         let running = self.engine.running_count();
         let busy = self.start_in_flight;
         let (glyph, name) = global_toggle_present(running, busy);
@@ -26550,27 +22557,27 @@ impl AppView {
             .id("manyproxy-toolbar")
             .flex()
             .flex_row()
-            // Ticket 02: the 880px minimum fits all six controls on one
-            // row (small density pins the single-row strip); BUG-5 wrap is
-            // replaced by nowrap so nothing wraps or clips at the minimum.
-            // Ticket 02: tight gaps (sm) keep the nowrap strip inside 880.
+
+
+
+
             .flex_nowrap()
             .items_center()
             .gap_1()
             .p_2()
-            // T01: hairline under the toolbar — the chrome reads as a
-            // band on the same theme tokens as the rest of the shell.
+
+
             .border_b_1()
             .border_color(cx.theme().border)
-            // Ticket 33: shortcut hints ride in the menu rows
-            // (F5/Shift-F5/Ctrl-T/Ctrl-N/Ctrl-O/Ctrl-V/Ctrl-K) so the
-            // bindings in [`bind_app_keys`] stay visible without opening
-            // About. Bound rows carry `Kbd` chips; tooltips name each
-            // action.
-            // Ticket 02 (throne-adoption): PROGRAM — single-config intake
-            // plus app lifecycle (user story 1: New/clipboard/file live in
-            // one predictable place; QR-file/batch parity lands with the
-            // intake tickets, same handlers).
+
+
+
+
+
+
+
+
+
             .child(
                 Button::new("program-menu")
                     .small()
@@ -26643,11 +22650,11 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                // Ticket 07 (throne-adoption): direct
-                                // file-picker entry (same picker as the
-                                // dialog Browse button — All-files, 50MB
-                                // cap, content-sniff). Ctrl-O stays on the
-                                // Import dialog (pinned binding).
+
+
+
+
+
                                 topbar_menu_row(
                                     "import-files",
                                     "From file(s)",
@@ -26710,9 +22717,9 @@ impl AppView {
                         )
                     }),
             )
-            // Ticket 02 (throne-adoption): SETTINGS — the dialog owns every
-            // control (user story 18: one copy of each); the menu only
-            // opens it.
+
+
+
             .child(
                 Button::new("settings-menu")
                     .small()
@@ -26741,10 +22748,10 @@ impl AppView {
                         )
                     }),
             )
-            // Ticket 02 (throne-adoption): GROUPS — subscriptions only
-            // (user story 5: group ops never confuse row ops). The
-            // facet-bar `groups-dialog` button stays put (same dialog,
-            // distinct element id).
+
+
+
+
             .child(
                 Button::new("groups-menu")
                     .small()
@@ -26790,9 +22797,9 @@ impl AppView {
                                 }
                             }),
                         )
-                        // Ticket 09 (throne-adoption): group prunes — each
-                        // resolves the focused group and confirms naming
-                        // the scope (never a blind sweep).
+
+
+
                         .item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
@@ -26887,12 +22894,12 @@ impl AppView {
                         )
                     }),
             )
-            // Ticket 02 (throne-adoption): ROUTING — preset chooser plus
-            // the manager link (user story 29 v1: the presets manager is
-            // the single copy; the Settings Routing section links there
-            // too, never a second copy).
-            // Ticket 10 (throne-adoption): plus the chooser — attach a
-            // preset to the selected row without opening the manager.
+
+
+
+
+
+
             .child(
                 Button::new("routing-menu")
                     .small()
@@ -26959,10 +22966,10 @@ impl AppView {
                         )
                     }),
             )
-            // Ticket 02 (throne-adoption): TOOLS — selection ops (the same
-            // handlers the bulk bar, cards, and keys use), diagnostics,
-            // and the palette entry point. No mode checkboxes anywhere on
-            // this bar (no Tun / System Proxy / System DNS — local-only).
+
+
+
+
             .child(
                 Button::new("tools-menu")
                     .small()
@@ -26972,10 +22979,10 @@ impl AppView {
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
-                                // Ticket 43: F5 starts the SELECTED row (see
-                                // [`bind_app_keys`]) — selected actions
-                                // carry their key hints; bulk actions carry
-                                // none.
+
+
+
+
                                 topbar_menu_row(
                                     "start-selected",
                                     "Start selected",
@@ -27046,9 +23053,9 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-                                // Ticket 10 (throne-adoption): runtime +
-                                // traffic stats (user stories 22-23) ride
-                                // the diagnostics cluster behind Logs.
+
+
+
                                 topbar_menu_row(
                                     "runtime-stats",
                                     "Runtime stats",
@@ -27142,12 +23149,12 @@ impl AppView {
                                 }
                             }),
                         )
-                        // Ticket 09 (throne-adoption): Selected-vs-Group test
-                        // split — group URL test, selected/group speedtest
-                        // (mode + pinned timeout), selected/group out-IP,
-                        // group domain rewrite, Stop Testing, Show-Security,
-                        // and the Type|Security sort. No new shortcuts
-                        // (Ctrl-R stays Update-current, Ctrl-U stays Copy URLs).
+
+
+
+
+
+
                         .item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
@@ -27359,17 +23366,17 @@ impl AppView {
                         )
                     }),
             )
-            // The spacer pins the global toggle at the trailing end, after
-            // all five menus in PROGRAM | SETTINGS | GROUPS | ROUTING |
-            // TOOLS order.
+
+
+
             .child(div().flex_1())
-            // Ticket 02 (throne-adoption): labeled global Start/Stop (user
-            // story 9 — one throw controls the room). Play offers
-            // Start-all, stop offers Stop-all, and a start in flight shows
-            // the `Connecting…` spinner; only Idle/Running act (busy
-            // toasts the guard). The glyph + name read together on the
-            // button (a glyph-only toggle violates the short-visible-labels
-            // rule); the pinned name stays on the accessible label.
+
+
+
+
+
+
+
             .child(
                 Button::new("global-start-stop")
                     .small()
@@ -27387,11 +23394,6 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // T04 (gpui-18-sweep CAP-5): back-link the delegate to this view once,
-        // so the truly-empty `Empty` hosts working Add/Import buttons in
-        // content. Guarded (one update, then quiet) like `sync_facet_pickers`
-        // — a stable frame never notifies. Runs before the list builds, so
-        // the same frame's empty view already sees the link.
         let app_entity = cx.entity();
         self.libraries.update(cx, |state, cx| {
             let delegate = state.delegate_mut();
@@ -27400,12 +23402,7 @@ impl Render for AppView {
                 cx.notify();
             }
         });
-        // The sketch: fixed top bar (TitleBar + toolbar + drop hint),
-        // then a vertical split — middle list over bottom info bar — then a
-        // fixed status strip. Only the middle/bottom split resizes; the top
-        // bar never takes a divider. `config-list` keeps its id and the
-        // detail pane keeps `config-detail` inside its panel, so selection,
-        // search, and scroll ownership are unchanged.
+
         let show_detail = self.config_count(cx) != 0;
         let search_count = self.render_search_count(cx);
         let facet_bar = self.render_facet_bar(window, cx);
@@ -27421,22 +23418,14 @@ impl Render for AppView {
             .child(search_count)
             .child(facet_bar)
             .child(bulk_bar)
-            // The list absorbs the slack so the empty-CTA strip
-            // stays pinned inside the pane: block-stacked children
-            // overflowed the pane bottom and the CTA buttons
-            // rendered below the window edge.
             .child(
                 List::new(&self.libraries)
                     .search_placeholder(SEARCH_PLACEHOLDER)
                     .flex_1(),
             );
         list_pane = list_pane.child(empty_ctas);
-        // File drops land anywhere on the shell via on_drop (see
-        // [`AppView::import_dropped_files`]); a drop while any dialog is
-        // open is refused with an honest toast — no persistent hint band.
+
         self.render_shell(cx)
-            // T04 (CAP-4): the caption rides kit text (`Label`), never a raw
-            // string child — verified `label.rs` `Label::new(impl Into<SharedString>)`.
             .child(TitleBar::new().child(Label::new(APP_TITLE)))
             .child(self.render_toolbar(cx))
             .child(
@@ -27458,17 +23447,6 @@ impl Render for AppView {
                                 resizable_panel()
                                     .visible(show_detail)
                                     .size(px(240.))
-                                    // Min 240 keeps three library rows intact in
-                                    // the default 1000x700 frame and still holds
-                                    // the pinned operate row plus the acting
-                                    // row; the failure alert now sits directly
-                                    // under the acting row (see
-                                    // `render_inspector_health`), so the
-                                    // evidence never falls below the fold.
-                                    // Dragging the divider down shrinks the
-                                    // scrolling body only — the operate row
-                                    // stays painted. The divider still grows
-                                    // the inspector to 480.
                                     .size_range(px(240.)..px(480.))
                                     .child(self.render_detail(cx)),
                             ),
@@ -27482,19 +23460,14 @@ impl Render for AppView {
 }
 
 fn main() {
-    // Ticket 38: drop a dead autostart entry (target exe gone) at startup so
-    // a moved/uninstalled copy never lingers in HKCU Run. Best-effort.
     let _ = crate::tray::clear_dead_autostart_target();
-    // Ticket 07 (throne-adoption): open-with payload — the first launch
-    // argument that classifies as intake (`manyproxy://add|addsub`, throne
-    // equivalents, a bare `http(s)` URL, or a share link). Flags (`--tray`),
-    // file paths, and junk classify as nothing and are ignored.
+
     let launch_intake = std::env::args()
         .skip(1)
         .find_map(|arg| classify_open_with(&arg));
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        // Ticket 26: app keyboard shortcuts (Add/Import/Start/Stop/Test).
+
         bind_app_keys(cx);
         cx.spawn(async move |cx| {
             cx.open_window(app_window_options(), |window, cx| {
@@ -27503,74 +23476,50 @@ fn main() {
                     view.refresh_due_on_startup_deferred(cx);
                     view.start_background_ticks(cx);
                 });
-                // Ticket 38: tray presence + session restore, both on the
-                // main thread. A refused tray icon keeps the ticket-33
-                // close-confirm below (never a tray-less hide); restore runs
-                // only behind its explicit opt-in with the LAN gate intact.
+
                 view.update(cx, |view, cx| {
                     view.create_tray(window, cx);
                     view.restore_on_launch(window, cx);
-                    // Ticket 38: login launches (autostart `--tray`) start
-                    // hidden in the tray instead of popping a window.
+
                     if crate::tray::launched_minimized() {
                         view.hide_to_tray(window, cx);
                     }
-                    // Ticket 07 (throne-adoption): open-with handoff after
-                    // first paint ordering (tray/restore first — the handoff
-                    // opens a dialog, never a silent commit).
+
                     if let Some(intake) = launch_intake.clone() {
                         view.handle_launch_intake(intake, window, cx);
                     }
                 });
-                // Ticket 38: tray event pump (menu actions + left-click
-                // toggle) on the main thread. Ends when the window is gone;
-                // a Quit action stops the engines, drops the icon, and quits
-                // the app from here (the view owns engine + icon only).
-                // Skipped entirely when the tray is absent (no 500ms pump
-                // forever with `tray == None`); the loop also exits if the
-                // icon ever goes away without a Quit.
+
                 let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
                 if has_tray {
                     let poll_view = view.clone();
                     let poll_handle = window.window_handle();
-                    cx.spawn(async move |cx| {
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(TRAY_PUMP_MILLIS))
-                                .await;
-                            // `Err` when the window or app is gone: the pump
-                            // ends with it. `Ok(true)` is a tray Quit.
-                            let tick = cx.update_window(poll_handle, |_, window, cx| {
-                                poll_view.update(cx, |view, cx| view.poll_tray_once(window, cx))
-                            });
-                            match tick {
-                                // Quit requested: stop the pump, then quit.
-                                Ok(true) => {
-                                    cx.update(|cx| cx.quit());
-                                    break;
-                                }
-                                Ok(false) => {}
-                                Err(_) => break,
+                    cx.spawn(async move |cx| loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(TRAY_PUMP_MILLIS))
+                            .await;
+
+                        let tick = cx.update_window(poll_handle, |_, window, cx| {
+                            poll_view.update(cx, |view, cx| view.poll_tray_once(window, cx))
+                        });
+                        match tick {
+                            Ok(true) => {
+                                cx.update(|cx| cx.quit());
+                                break;
                             }
+                            Ok(false) => {}
+                            Err(_) => break,
                         }
                     })
                     .detach();
                 }
-                // Ticket 33: never silently kill running endpoints on window
-                // close. Ticket 38: with a tray icon the close hides to the
-                // tray instead (endpoints keep serving); without one the hook
-                // vetoes the close while endpoints run and opens a confirm
-                // naming them; OK stops everything and closes via
-                // `remove_window` (the confirmed flag lets that second close
-                // through). No minimize in v1 (kit-only, no new deps) — see
-                // PACKAGING-NOTES.md.
+
                 let weak = view.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     let Some(view) = weak.upgrade() else {
                         return true;
                     };
-                    // Ticket 38: tray present → hide (never confirm, never
-                    // kill — the endpoints survive behind the icon).
+
                     let has_tray = view.read_with(cx, |view, _| view.tray.is_some());
                     if has_tray {
                         view.update(cx, |view, cx| view.hide_to_tray(window, cx));
@@ -27636,9 +23585,6 @@ mod tests {
         }
     }
 
-    /// Ticket 21: the branded window options carry the OS title (the
-    /// `TitleBar::window_options` base leaves `TitlebarOptions::title` as
-    /// `None`, which renders as untitled).
     #[test]
     fn window_options_carry_app_title() {
         let options = crate::app_window_options();
@@ -27650,8 +23596,6 @@ mod tests {
         assert_eq!(title.as_str(), crate::APP_TITLE);
     }
 
-    /// Ticket 09: fresh launch opens at 1000x700 with an 880x620 minimum
-    /// (pure: reads the options struct, never opens a window).
     #[test]
     fn window_options_carry_startup_size() {
         let options = crate::app_window_options();
@@ -27666,8 +23610,6 @@ mod tests {
         assert_eq!(min.height, gpui_kit::px(620.));
     }
 
-    /// Ticket 21: the exe icon asset is committed in the repo (no external
-    /// fetch at build) and is a well-formed ICO.
     #[test]
     fn exe_icon_asset_is_valid_ico() {
         let bytes = std::fs::read("assets/icon.ico").expect("assets/icon.ico is committed");
@@ -27677,8 +23619,6 @@ mod tests {
         assert!(count >= 1, "at least one icon image");
     }
 
-    /// Ticket 33: close-confirm names every running row (never a blind
-    /// kill); nothing running means no veto text.
     #[test]
     fn close_confirm_names_running_rows() {
         assert_eq!(crate::close_confirm_description(&[]), None);
@@ -27689,10 +23629,6 @@ mod tests {
         assert!(text.contains('2'), "counts rows, got {text}");
     }
 
-    /// Ticket 33: About carries version + git hash + sidecar presence +
-    /// data paths + the shortcut list (and the opt-in-only contract).
-    /// Ticket 38: the old "No autostart" line is gone — autostart exists
-    /// behind the Settings opt-in, so About states the opt-in contract.
     #[test]
     fn about_body_carries_version_sidecars_paths_shortcuts() {
         let body = crate::about_body(
@@ -27733,9 +23669,6 @@ mod tests {
         );
     }
 
-    /// Ticket 47: the Logs dialog shows ingest-stripped lines (sidecar ANSI
-    /// colors never reach storage or render — stripping moved from render
-    /// to ingest; stored records carry no escapes).
     #[gpui_kit::test]
     fn logs_dialog_strips_sidecar_ansi(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -27779,9 +23712,6 @@ mod tests {
         );
     }
 
-    /// Ticket 33: the close veto passes with nothing running, and the
-    /// confirmed path marks the close confirmed (headless: in-memory store,
-    /// no sidecars — `stop_all` on an idle engine is a no-op).
     #[gpui_kit::test]
     fn close_veto_passes_when_nothing_running(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -27804,13 +23734,6 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, _| view.close_veto_text()), None);
     }
 
-    /// Ticket 01, scenario 1: cold start shows an empty library.
-    /// Ticket 01, scenario 2: the mounted dialog layer renders a dialog.
-    ///
-    /// NOTE: compiling this test needs a large rustc stack on Windows
-    /// (`RUST_MIN_STACK=67108864`) plus the crate `#![recursion_limit]`
-    /// above; both come from the `gpui_kit::test` harness expansion.
-    /// Hermetic: uses an in-memory store (never the real app-data file).
     #[gpui_kit::test]
     fn shell_boots_with_empty_library(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -27858,8 +23781,6 @@ mod tests {
         );
     }
 
-    /// Ticket 02: stored rows render with stable domain ids; the detail bar
-    /// and status bar follow the stored data.
     #[gpui_kit::test]
     fn library_lists_stored_rows(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -27895,7 +23816,6 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("config-detail").is_some()));
     }
 
-    /// Ticket 02: the add dialog opens through WindowExt with all fields.
     #[gpui_kit::test]
     fn add_dialog_opens_with_fields(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -27925,8 +23845,7 @@ mod tests {
         });
 
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        // Config-completeness T01: the protocol free-text input is a kit
-        // `Select` now (`protocol-select`); `field-protocol` is retired.
+
         for field in ["field-name", "protocol-select", "field-bind", "field-port"] {
             assert!(
                 cx.update(|window, _| window.try_find(field).is_some()),
@@ -27935,17 +23854,6 @@ mod tests {
         }
     }
 
-    /// Config-completeness T01: Add renders the kit protocol `Select` listing
-    /// exactly the 24 canonical types as stable option rows — no free-text
-    /// protocol input remains, so a typo'd protocol is unrepresentable.
-    /// Kit: `Select::new(&state)` + `.id().small().accessibility_label()`.
-    /// The popup list virtualizes (only visible rows paint), so paint asserts
-    /// cover the opened popup's top rows while full 24-membership is pinned
-    /// through the delegate (`set_selected_value` resolves every canonical
-    /// type — a missing row would come back `None`).
-    /// Config-completeness T08: `direct` (CAP-12 trivial final) is the 24th
-    /// row, appended last so the existing order never shifts.
-    /// Ticket 07 (throne-adoption): 24 + mieru/juicity/trusttunnel.
     #[gpui_kit::test]
     fn t01_protocol_picker_lists_27_canonical_types(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -27959,7 +23867,7 @@ mod tests {
         });
         paint_dialog_open(cx);
         assert_painted(cx, "protocol-select");
-        // Open the popup — the top rows paint with stable option ids.
+
         cx.update(|window, cx| {
             window.click("protocol-select", cx);
         });
@@ -27968,7 +23876,7 @@ mod tests {
         for protocol in ["vless", "vmess", "trojan"] {
             assert_painted(cx, &format!("protocol-option-{protocol}"));
         }
-        // Enter confirms the highlight and closes the popup (guard-covered).
+
         let keystroke = gpui_kit::Keystroke::parse("enter").expect("test keystroke parses");
         cx.update(|window, cx| {
             window.dispatch_keystroke(keystroke, cx);
@@ -27976,8 +23884,7 @@ mod tests {
         cx.run_until_parked();
         paint_dialog_open(cx);
         assert_absent(cx, "protocol-option-vless".to_string());
-        // Full membership: every canonical type resolves through the picker
-        // delegate (27 rows, `VALID_PROTOCOLS` order — the store owns it).
+
         assert_eq!(
             VALID_PROTOCOLS.len(),
             27,
@@ -28006,9 +23913,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T01: Edit locks the type — read-only
-    /// `protocol-lock` paints, the picker is absent, and committing an
-    /// edited row keeps the baseline type (Throne §7.7 parity).
     #[gpui_kit::test]
     fn t01_edit_locks_protocol_type(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -28024,7 +23928,7 @@ mod tests {
         paint_dialog_open(cx);
         assert_painted(cx, "protocol-lock");
         assert_absent(cx, "protocol-select".to_string());
-        // An untouched edit carries no protocol change.
+
         let untouched = cx.update(|window, cx| {
             view.update(cx, |_, cx| {
                 let form = ConfigForm::prefilled(window, cx, &seeded, None);
@@ -28032,7 +23936,7 @@ mod tests {
             })
         });
         assert!(untouched, "locked edit changes no type");
-        // A real commit (name edited) keeps the baseline type.
+
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
         let committed = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -28057,13 +23961,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T01: virtual types (`chain`, `custom-outbound`,
-    /// `custom-config`, `extra-core`) hide the guided Server/Server port
-    /// inputs (Throne gating parity); endpoint types keep them. Driven
-    /// through the real picker with keyboard navigation (the popup list
-    /// virtualizes — off-screen rows never paint, so clicks can't reach
-    /// them; arrows + Enter is the honest path) so the builder sync runs
-    /// each switch. Cursor starts at `vless` (row 0); deltas track it.
     #[gpui_kit::test]
     fn t01_virtual_types_hide_server_port(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -28076,7 +23973,7 @@ mod tests {
             view.update(cx, |view, cx| view.open_add_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // Default (vless) keeps the endpoint inputs.
+
         assert_painted(cx, "field-guided-server");
         assert_painted(cx, "field-guided-port");
         let row_of = |protocol: &str| {
@@ -28117,8 +24014,6 @@ mod tests {
             "custom-outbound",
             "custom-config",
             "extra-core",
-            // Config-completeness T08: `direct` is label-only (CAP-12), so
-            // it hides the endpoint inputs like the other virtual types.
             "direct",
         ] {
             pick(cx, row_of(virtual_proto), &mut cursor);
@@ -28127,16 +24022,13 @@ mod tests {
             assert_painted(cx, "protocol-select");
             assert_painted(cx, "guided-hint");
         }
-        // Switching back to an endpoint type restores the inputs.
+
         pick(cx, row_of("vless"), &mut cursor);
         assert_painted(cx, "field-guided-server");
         assert_painted(cx, "field-guided-port");
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T01: the picker switch rewrites pristine JSON to
-    /// the new starter and preserves dirty JSON (contract C1), wired through
-    /// [`ConfigForm::sync_protocol_template`] — the builder-called seam.
     #[gpui_kit::test]
     fn t01_template_sync_rewrites_pristine_only(cx: &mut TestAppContext) {
         use crate::store::protocol_params_template;
@@ -28146,14 +24038,13 @@ mod tests {
         let (view, cx) = mount_view(store, cx);
         let (pristine_after, dirty_after) = cx.update(|window, cx| {
             view.update(cx, |_, cx| {
-                // Pristine starter + switch rewrites to the new starter.
                 let form = ConfigForm::blank(window, cx);
                 form.protocol_select.update(cx, |state, cx| {
                     state.set_selected_value(&"chain".to_string(), window, cx);
                 });
                 form.sync_protocol_template(window, cx);
                 let pristine_after = form.params.read(cx).value().to_string();
-                // User-typed JSON + switch stands untouched.
+
                 form.params.update(cx, |state, cx| {
                     state.set_value(
                         "{\"type\":\"vless\",\"server\":\"a.example.com\"}",
@@ -28180,13 +24071,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T01 ENTER-guard: Confirm from inside the protocol
-    /// picker popup stops at the picker wrapper — the dialog never commits a
-    /// half-filled row (audit §10.9 incident regression). The test is
-    /// validation-sensitive by construction: a broken guard would run the
-    /// commit on the untouched (invalid) template and fire exactly one error
-    /// toast, so zero toasts plus an open dialog plus zero rows pins the
-    /// guard rather than the validator.
     #[gpui_kit::test]
     fn t01_enter_in_picker_popup_does_not_commit(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -28233,8 +24117,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Tall frame fitting the full VLESS page (the 880x620 minimum shows
-    /// the top; t11 pins that contract separately).
     fn paint_tall_dialog(cx: &mut VisualTestContext) {
         cx.simulate_resize(size(px(1000.), px(1800.)));
         cx.update(|window, cx| {
@@ -28243,11 +24125,6 @@ mod tests {
         });
     }
 
-    /// Config-completeness T02: VLESS Add renders inner + Network/TLS/Mux as kit
-    /// primitives with pinned ids; default tcp shows no conditionals.
-    /// The page rides one outer collapsed disclosure (t11 minimum-frame
-    /// contract) with per-panel sections inside — the test pins the
-    /// collapsed default, then expands outer + panels and paints bodies.
     #[gpui_kit::test]
     fn t02_vless_panels_paint(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -28260,8 +24137,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Collapsed default: outer caption paints, everything inside stays
-        // unmounted (one header row at the minimum frame).
+
         assert_painted(cx, "vless-section-caption");
         assert_absent(cx, "s1-caption".to_string());
         assert_absent(cx, "vless-uuid".to_string());
@@ -28272,10 +24148,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Inner fields paint; left-column panel sections stay collapsed
-        // inside; the right column (TLS Security, always expanded) and the
-        // Common-box Advanced opener paint alongside. Dial Fields left the
-        // main form for the Advanced dialog (Ticket 06).
+
         for id in [
             "vless-uuid",
             "vless-uuid-generate",
@@ -28319,8 +24192,7 @@ mod tests {
         }
         assert_absent(cx, "s1-path".to_string());
         assert_absent(cx, "s3-vision-note".to_string());
-        // Ticket 06: dial + TLS extras ride the Advanced dialog, never the
-        // main form — the main dialog carries no trace of them.
+
         for id in [
             "s4-caption",
             "s4-reuse",
@@ -28330,9 +24202,7 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
-        // The Advanced Settings button opens the second small dialog with
-        // Dial Fields + TLS extras only — the small dialog shows every
-        // section expanded, no inner toggles.
+
         cx.update(|window, cx| {
             window.click("advanced-settings", cx);
         });
@@ -28352,8 +24222,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // Escape dismisses the topmost layer (the advanced dialog); the
-        // main dialog survives with its form untouched.
+
         let esc = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
         cx.update(|window, cx| {
             window.dispatch_keystroke(esc.clone(), cx);
@@ -28371,8 +24240,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T02: the uuid Generate button fills + toasts
-    /// (the masked value itself is unreadable headless by design).
     #[gpui_kit::test]
     fn t02_uuid_generate_button_toasts(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -28386,7 +24253,7 @@ mod tests {
         cx.run_until_parked();
         paint_tall_dialog(cx);
         assert_eq!(notification_count(cx), 0, "no toast before Generate");
-        // The Generate button lives inside the outer VLESS disclosure.
+
         cx.update(|window, cx| {
             window.click("vless-section-toggle", cx);
         });
@@ -28406,8 +24273,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T02: uuid v4 shape (RFC 4122 bits, hyphenated,
-    /// unique) — pure unit test for the Generate backend.
     #[test]
     fn t02_generate_uuid_v4_shape() {
         use crate::generate_uuid_v4;
@@ -28432,9 +24297,6 @@ mod tests {
         assert_ne!(generate_uuid_v4(), generate_uuid_v4(), "unique");
     }
 
-    /// Config-completeness T02: ws shows path/host; back to tcp hides them
-    /// (entities persist, JSON preserved per the store fold tests); the
-    /// round trip restores the inputs. Driven through the real picker.
     #[gpui_kit::test]
     fn t02_ws_to_tcp_hides_and_restores(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -28461,8 +24323,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Edit opens on the raw JSON (Advanced expanded) — collapse into
-        // the guided page before asserting panel gating.
+
         cx.update(|window, cx| {
             window.click("params-advanced-toggle", cx);
         });
@@ -28470,8 +24331,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Expand the outer VLESS disclosure, then the Transport section
-        // (both collapsed by default per t11).
+
         cx.update(|window, cx| {
             window.click("vless-section-toggle", cx);
         });
@@ -28479,7 +24339,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Expand the Transport section (collapsed by default per t11).
+
         cx.update(|window, cx| {
             window.click("s1-toggle", cx);
         });
@@ -28489,7 +24349,7 @@ mod tests {
         paint_tall_dialog(cx);
         assert_painted(cx, "s1-path");
         assert_painted(cx, "s1-host");
-        // ws (row 1) → tcp (row 0): option click commits.
+
         cx.update(|window, cx| {
             window.click("s1-network", cx);
         });
@@ -28504,7 +24364,7 @@ mod tests {
         paint_tall_dialog(cx);
         assert_absent(cx, "s1-path".to_string());
         assert_absent(cx, "s1-host".to_string());
-        // Back to ws: inputs repaint (entities + JSON values preserved).
+
         cx.update(|window, cx| {
             window.click("s1-network", cx);
         });
@@ -28522,9 +24382,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T02: an imported Reality+Vision link prefills
-    /// every panel (uuid/flow/TLS/transport) and refolds byte-identical —
-    /// untouched Edit commits zero spurious patch.
     #[gpui_kit::test]
     fn t02_reality_vision_prefill_round_trips(cx: &mut TestAppContext) {
         use crate::import::import_text;
@@ -28593,8 +24450,6 @@ mod tests {
         assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
     }
 
-    /// Config-completeness T02: `flow=vision` unmounts S3 with reason text
-    /// (Throne parity); back to default restores the section.
     #[gpui_kit::test]
     fn t02_vision_disables_mux_with_reason(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -28607,8 +24462,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Expand the outer VLESS disclosure, then Mux (both collapsed by
-        // default per t11).
+
         cx.update(|window, cx| {
             window.click("vless-section-toggle", cx);
         });
@@ -28655,8 +24509,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T02: brutal on forces mux On — the reason note
-    /// paints and the fold writes `mux:"on"` even with a default cell.
     #[gpui_kit::test]
     fn t02_brutal_forces_mux_on(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -28671,8 +24523,7 @@ mod tests {
         cx.run_until_parked();
         paint_tall_dialog(cx);
         assert_absent(cx, "s3-brutal-note".to_string());
-        // Expand the outer VLESS disclosure, then the Mux section (both
-        // collapsed by default per t11), then flip the brutal switch.
+
         cx.update(|window, cx| {
             window.click("vless-section-toggle", cx);
         });
@@ -28707,9 +24558,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T03: new dropdown sizes — vmess security 5,
-    /// packet_encoding 3, ss method 18 (plus the blank "no selection" row),
-    /// ss plugin 3. Pure constructors, no window needed.
     #[test]
     fn t03_dropdown_counts() {
         assert_eq!(
@@ -28734,9 +24582,6 @@ mod tests {
         assert_eq!(crate::ss_plugin_choices().len(), 3, "ss plugin lists 3");
     }
 
-    /// Config-completeness T03: VMess Edit renders uuid (+uuidgen) + aid +
-    /// cipher + packet_encoding + S1–S4 as kit primitives with pinned ids;
-    /// every cipher and packet spelling resolves through the delegate.
     #[gpui_kit::test]
     fn t03_vmess_page_paints(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -28766,8 +24611,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Edit opens on the raw JSON (Advanced expanded) — collapse into
-        // the guided page, then expand the VMess disclosure.
+
         cx.update(|window, cx| {
             window.click("params-advanced-toggle", cx);
         });
@@ -28796,7 +24640,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // Foreign pages never paint here.
+
         for id in [
             "ss-method",
             "trojan-password",
@@ -28824,9 +24668,7 @@ mod tests {
             assert_painted(cx, id);
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Delegate membership: every cipher (5) and packet spelling (3)
-        // resolves through `set_selected_value` (virtualized popups only
-        // paint visible rows, so counts pin here, not in the tree).
+
         let row = ProxyConfig {
             id: "t03-v".to_string(),
             name: "V".to_string(),
@@ -28875,9 +24717,6 @@ mod tests {
         });
     }
 
-    /// Config-completeness T03: Trojan Edit renders the masked password +
-    /// full S1+S2+S3 as kit primitives (S4 dial rides the Advanced dialog);
-    /// nothing from the other pages.
     #[gpui_kit::test]
     fn t03_trojan_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -28940,11 +24779,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T03: Shadowsocks Edit renders method, password,
-    /// plugin, plugin_opts and uot with Mux-only Settings (no
-    /// Network/Security panels — Throne HasMux parity); dial fields ride
-    /// the Advanced dialog with no TLS extras (HasTLS gating). All 18
-    /// methods and all 3 plugin spellings resolve through the delegate.
     #[gpui_kit::test]
     fn t03_ss_page_paints_mux_only(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -28997,8 +24831,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // Mux-only Settings: no Transport/TLS panels; nothing from the
-        // other pages; no plugin footer on a plugin-less row.
+
         for id in [
             "s1-caption",
             "s2-caption",
@@ -29016,15 +24849,12 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Mux paints in the main form; dial fields ride the Advanced
-        // dialog with no TLS extras (HasTLS gating holds — the dialog
-        // carries no extras section for a TLS-less row).
+
         assert_painted(cx, "s3-mux-group");
         for id in ["s1-caption", "s2-caption", "s2-enable", "s2-pbk"] {
             assert_absent(cx, id.to_string());
         }
-        // The Advanced dialog carries dial fields only here — everything
-        // expanded, no inner toggles.
+
         cx.update(|window, cx| {
             window.click("advanced-settings", cx);
         });
@@ -29038,8 +24868,7 @@ mod tests {
             assert_painted(cx, id);
         }
         assert_absent(cx, "tls-extras-caption".to_string());
-        // Back pops only the top dialog; the main dialog survives (see the
-        // VLESS test for the Escape path).
+
         cx.update(|window, cx| {
             window.click("advanced-dialog-back", cx);
         });
@@ -29050,7 +24879,7 @@ mod tests {
             "back drops the advanced dialog"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Delegate membership: all 18 methods + all 3 plugin spellings.
+
         let row = ProxyConfig {
             id: "t03-s".to_string(),
             name: "S".to_string(),
@@ -29099,9 +24928,6 @@ mod tests {
         });
     }
 
-    /// Config-completeness T03: picking a plugin paints the honest footer
-    /// (the executable must sit beside the engine); back to none hides it.
-    /// Driven through the real picker (3 rows fit — clicks reach them).
     #[gpui_kit::test]
     fn t03_ss_plugin_note_paints_on_pick(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -29172,10 +24998,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T03: an imported legacy `vmess://` link (boolean
-    /// `tls`, cipher in `security` — exactly what the grammar writes)
-    /// prefills every inner field and refolds byte-identical — untouched
-    /// Edit commits zero spurious patch.
     #[gpui_kit::test]
     fn t03_legacy_vmess_prefill_round_trips(cx: &mut TestAppContext) {
         use crate::import::import_text;
@@ -29235,8 +25057,6 @@ mod tests {
         assert_eq!(folded, parsed.params, "untouched refold is byte-identical");
     }
 
-    /// Config-completeness T03: seeded trojan/shadowsocks rows prefill and
-    /// refold byte-identical (passwords, method, plugin opts, uot, mux).
     #[gpui_kit::test]
     fn t03_trojan_ss_prefill_round_trips(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -29304,15 +25124,6 @@ mod tests {
         }
     }
 
-    /// Config-completeness T03 ENTER-guard (audit §10.9 incident regression
-    /// per dropdown ticket): Confirm from inside a new picker popup stops
-    /// at the picker wrapper — the dialog never commits a half-filled row.
-    /// Driven through the real protocol picker with keyboard navigation
-    /// (virtualized list — arrows + Enter is the honest path, T01
-    /// precedent), then into the ss method popup. Validation-sensitive by
-    /// construction like the T01 guard test: a broken guard would run the
-    /// commit on the untouched (invalid) ss template and fire exactly one
-    /// error toast.
     #[gpui_kit::test]
     fn t03_enter_in_ss_picker_popup_does_not_commit(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -29326,8 +25137,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Switch Add to shadowsocks through the real picker (cursor starts
-        // at `vless`, row 0; deltas track it).
+
         let row_of = |protocol: &str| {
             VALID_PROTOCOLS
                 .iter()
@@ -29359,7 +25169,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // The Shadowsocks page renders (Add wiring holds for the new page).
+
         assert_painted(cx, "ss-section-caption");
         cx.update(|window, cx| {
             window.click("ss-section-toggle", cx);
@@ -29369,8 +25179,7 @@ mod tests {
         cx.run_until_parked();
         paint_tall_dialog(cx);
         assert_painted(cx, "ss-method");
-        // Open the method popup, then Enter: the pick lands, the commit
-        // must not run.
+
         assert_eq!(notification_count(cx), 0, "no toast before Enter");
         cx.update(|window, cx| {
             window.click("ss-method", cx);
@@ -29406,10 +25215,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T04: WireGuard Edit renders the nine peer/net
-    /// rows + keygen as kit primitives with pinned ids (dial rides Advanced); no
-    /// Transport/TLS/Mux panels (endpoint parity) and nothing from the
-    /// other pages.
     #[gpui_kit::test]
     fn t04_wireguard_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -29467,7 +25272,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // No Transport/TLS/Mux panels; nothing from the other pages.
+
         for id in [
             "s1-caption",
             "s2-caption",
@@ -29480,7 +25285,7 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
-        // Dial fields ride the Advanced dialog (Ticket 06) — expanded.
+
         cx.update(|window, cx| {
             window.click("advanced-settings", cx);
         });
@@ -29491,8 +25296,7 @@ mod tests {
         for id in ["advanced-dialog", "s4-caption", "s4-reuse", "s4-timeout"] {
             assert_painted(cx, id);
         }
-        // Back pops only the top dialog and keeps the main dialog (see the
-        // VLESS test for the Escape path).
+
         cx.update(|window, cx| {
             window.click("advanced-dialog-back", cx);
         });
@@ -29502,8 +25306,7 @@ mod tests {
             cx.update(|window, _| window.try_find("advanced-dialog").is_none()),
             "back drops the advanced dialog"
         );
-        // Keygen toasts once and keeps the dialog open (the key backend is
-        // pinned by `t04_generate_wireguard_key_shape`).
+
         assert_eq!(notification_count(cx), 0, "no toast before Generate");
         cx.update(|window, cx| {
             window.click("wg-private-key-generate", cx);
@@ -29517,18 +25320,11 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T04: AmneziaWG Edit renders WG rows + enable +
-    /// version + the J/S/H/I matrix (dial rides Advanced); the v3 section hides
-    /// until 3.x is picked (entities persist — hide-preserve is pinned at fold
-    /// level by `t04_awg_version_toggle_hide_preserves`). The page is the longest
-    /// guided page, so it paints jumbo-tall (the t11 minimum-frame contract
-    /// pins the collapsed core, not open pages).
     #[gpui_kit::test]
     fn t04_amneziawg_page_paints_and_version_gates(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| cx.set_reduce_motion(true));
-        // Jumbo paint: the full AWG page (peer rows + matrix + v3) needs
-        // more than the shared 1800px tall paint to be visible in-frame.
+
         let paint_jumbo_dialog = |cx: &mut VisualTestContext| {
             cx.simulate_resize(size(px(1000.), px(3600.)));
             cx.update(|window, cx| {
@@ -29597,8 +25393,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // 2.0 rows hide the v3 section (with the honest note); nothing from
-        // the other pages and no Transport/TLS/Mux panels.
+
         assert_painted(cx, "awg-v3-note");
         for id in [
             "awg-hpk",
@@ -29614,8 +25409,7 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
-        // Picking 3.x mounts the v3 section live (option-click precedent:
-        // small lists paint every row, like the ss plugin note test).
+
         cx.update(|window, cx| {
             window.click("awg-version", cx);
         });
@@ -29643,8 +25437,7 @@ mod tests {
             assert_painted(cx, id);
         }
         assert_absent(cx, "awg-v3-note".to_string());
-        // Picking back to no-selection unmounts it again (values persist —
-        // fold-level proof below).
+
         cx.update(|window, cx| {
             window.click("awg-version", cx);
         });
@@ -29660,8 +25453,7 @@ mod tests {
         assert_painted(cx, "awg-v3-note");
         assert_absent(cx, "awg-hpk".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Delegate membership: blank + both versions resolve (virtualized
-        // popups only paint visible rows, so membership pins here).
+
         let row = crate::store::ProxyConfig {
             id: "t04-a".to_string(),
             name: "A".to_string(),
@@ -29701,10 +25493,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T04: version-toggle hide-preserves at the fold
-    /// level — a v3 matrix survives a 2.0 refold byte-identical (R5); the
-    /// engine version gate (not the fold) is what rejects v3 keys on 2.0
-    /// rows at generate (pinned by `t04_awg_markers_strip_…` in engine).
     #[gpui_kit::test]
     fn t04_awg_version_toggle_hide_preserves(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -29736,8 +25524,7 @@ mod tests {
                     params,
                     "untouched v3 row refolds byte-identical"
                 );
-                // Hide the v3 section (toggle to 2.0) with v3 values still
-                // typed: the refold keeps every v3 key (never wiped).
+
                 form.awg_version.update(cx, |state, cx| {
                     state.set_selected_value(&"2.0".to_string(), window, cx);
                 });
@@ -29757,10 +25544,6 @@ mod tests {
         assert_eq!(folded_value["jc"], "5", "visible matrix kept");
     }
 
-    /// Config-completeness T04: `.conf` imports land in kit fields (nothing
-    /// JSON-only) — reserved/keepalive/MTU/DNS round-trip on WG, the full
-    /// J/S/H/I matrix + version on AWG; untouched refolds stay
-    /// byte-identical (zero spurious patch).
     #[gpui_kit::test]
     fn t04_conf_prefill_round_trips(cx: &mut TestAppContext) {
         use crate::import::import_text;
@@ -29877,12 +25660,6 @@ mod tests {
         }
     }
 
-    /// Config-completeness T04 ENTER-guard (R12 per-dropdown-ticket): Confirm
-    /// from inside the AWG version popup stops at the picker wrapper — the
-    /// dialog never commits a half-filled row. Validation-sensitive by
-    /// construction like the T01/T03 guard tests: a broken guard would run
-    /// the commit on the untouched (invalid) awg template and fire exactly
-    /// one error toast.
     #[gpui_kit::test]
     fn t04_enter_in_awg_picker_popup_does_not_commit(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -29896,8 +25673,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Switch Add to amneziawg through the real picker (cursor starts at
-        // `vless`, row 0; deltas track it).
+
         let row_of = |protocol: &str| {
             VALID_PROTOCOLS
                 .iter()
@@ -29929,7 +25705,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // The AmneziaWG page renders (Add wiring holds for the new page).
+
         assert_painted(cx, "awg-section-caption");
         cx.update(|window, cx| {
             window.click("awg-section-toggle", cx);
@@ -29939,8 +25715,7 @@ mod tests {
         cx.run_until_parked();
         paint_tall_dialog(cx);
         assert_painted(cx, "awg-version");
-        // Open the version popup, then Enter: the pick lands, the commit
-        // must not run.
+
         assert_eq!(notification_count(cx), 0, "no toast before Enter");
         cx.update(|window, cx| {
             window.click("awg-version", cx);
@@ -29976,9 +25751,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T04: wireguard key shape (base64 32 bytes —
-    /// exactly what `wg genkey` emits — unique) — pure unit test for the
-    /// keygen backend.
     #[test]
     fn t04_generate_wireguard_key_shape() {
         use crate::generate_wireguard_key;
@@ -29994,9 +25766,6 @@ mod tests {
         assert_ne!(generate_wireguard_key(), generate_wireguard_key(), "unique");
     }
 
-    /// Config-completeness T05: picker option counts — hysteria `auth_type`
-    /// (blank + STRING + BASE64), tuic cc (blank + 3) and relay (blank + 2).
-    /// One source behind picker, prefill and fold (store consts).
     #[test]
     fn t05_dropdown_counts() {
         use crate::store::{HY_AUTH_TYPES, TUIC_CC_MODES, TUIC_RELAY_MODES};
@@ -30016,11 +25785,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T05: Hysteria Add toggles the v1/v2 layouts —
-    /// common rows persist while v1-only (auth family) vs v2-only (password)
-    /// swap as kit primitives; the forced-TLS section carries no enable
-    /// toggle. The page is long, so it paints jumbo-tall (the t11
-    /// minimum-frame contract pins the collapsed core, not open pages).
     #[gpui_kit::test]
     fn t05_hysteria_add_toggles_layouts(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -30047,8 +25811,7 @@ mod tests {
                 .position(|candidate| *candidate == protocol)
                 .expect("canonical protocol")
         };
-        // Drive the picker through real keystrokes (T01 precedent: cursor
-        // starts at `vless`; deltas track it; Enter picks, never commits).
+
         let pick = |cx: &mut VisualTestContext, target: &str, current: &str| {
             let start = row_of(current);
             let end = row_of(target);
@@ -30087,8 +25850,7 @@ mod tests {
         paint_jumbo_dialog(cx);
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
-        // v1 layout: version switch + common + auth family; no password, no
-        // edit lock, no Transport/Mux panels.
+
         for id in [
             "hy-version-group",
             "hy-server-ports",
@@ -30117,7 +25879,7 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
-        // The forced-TLS section opens with the lock note (never a toggle).
+
         cx.update(|window, cx| {
             window.click("s2-toggle", cx);
         });
@@ -30128,13 +25890,12 @@ mod tests {
         for id in ["s2-forced-note", "s2-sni", "s2-alpn", "s2-fp"] {
             assert_painted(cx, id);
         }
-        // TLS extras + dial left the main form for the Advanced dialog.
+
         for id in ["s2-insecure", "s2-pbk", "s2-sid", "s4-caption"] {
             assert_absent(cx, id.to_string());
         }
         assert_absent(cx, "s2-enable".to_string());
-        // Toggle to v2: the auth family unmounts, the password mounts,
-        // common rows persist.
+
         pick(cx, "hysteria2", "hysteria");
         for id in [
             "hy-version-group",
@@ -30157,8 +25918,7 @@ mod tests {
         ] {
             assert_absent(cx, id.to_string());
         }
-        // Toggle back: the v1 layout returns (entities persist — the
-        // fold-level proof below pins hide-preserve byte-identical).
+
         pick(cx, "hysteria", "hysteria2");
         for id in ["hy-auth-type", "hy-auth", "hy-mtu", "hy-version-group"] {
             assert_painted(cx, id);
@@ -30167,10 +25927,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T05: layout-toggle hide-preserves at the fold
-    /// level — v1-only values survive a v2 refold (R5; the exclusive
-    /// credential is the only branch) and an untouched row refolds
-    /// byte-identical on both layouts.
     #[gpui_kit::test]
     fn t05_hysteria_toggle_hide_preserves(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -30202,8 +25958,7 @@ mod tests {
                     params,
                     "untouched v1 row refolds byte-identical"
                 );
-                // Hide the v1 half (refold as v2): every v1-only value stays
-                // in the JSON (never wiped); only the credential swaps.
+
                 let as_v2 = crate::store::fold_hysteria_into_params(
                     params,
                     &crate::store::HysteriaFold {
@@ -30231,9 +25986,6 @@ mod tests {
         assert_eq!(folded, params, "v1 refold still byte-identical");
     }
 
-    /// Config-completeness T05 scenario (v1 commit blank up/down): save
-    /// refuses naming up_mbps/down_mbps with zero rows stored; filling the
-    /// speeds on the same form then commits.
     #[gpui_kit::test]
     fn t05_hysteria_v1_blank_up_down_refuses_commit(cx: &mut TestAppContext) {
         use crate::store::protocol_params_template;
@@ -30251,8 +26003,7 @@ mod tests {
                 form.protocol_select.update(cx, |state, cx| {
                     state.set_selected_value(&"hysteria".to_string(), window, cx);
                 });
-                // The dialog builder rewrites the pristine starter on switch
-                // — mirror it (dirty JSON would stand instead).
+
                 form.params.update(cx, |state, cx| {
                     state.set_value(protocol_params_template("hysteria"), window, cx);
                 });
@@ -30291,10 +26042,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T05: TUIC Edit renders uuid (+uuidgen) + password
-    /// + cc/relay + uot/zero-rtt/heartbeat + S2-forced (dial rides Advanced),
-    /// all kit; an
-    /// untouched row refolds byte-identical.
     #[gpui_kit::test]
     fn t05_tuic_edit_round_trips(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -30361,8 +26108,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // No enable toggle, no Transport/Mux panels, nothing from the other
-        // pages.
+
         for id in [
             "s2-enable",
             "s1-caption",
@@ -30384,12 +26130,12 @@ mod tests {
         for id in ["s2-forced-note", "s2-sni", "s2-fp"] {
             assert_painted(cx, id);
         }
-        // TLS extras + dial left the main form for the Advanced dialog.
+
         for id in ["s2-insecure", "s4-caption"] {
             assert_absent(cx, id.to_string());
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Prefill + refold at the form level (no typing simulation).
+
         let row = ProxyConfig {
             id: "t05-t".to_string(),
             name: "T".to_string(),
@@ -30436,8 +26182,7 @@ mod tests {
             "tuic values sit in kit fields"
         );
         assert_eq!(folded, params, "untouched tuic refolds byte-identical");
-        // Delegate membership: blank + every mode resolves (virtualized
-        // popups only paint visible rows, so membership pins here).
+
         cx.update(|window, cx| {
             view.update(cx, |_, cx| {
                 let form = ConfigForm::prefilled(window, cx, &row, None);
@@ -30479,10 +26224,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T05 ENTER-guard (R12 per-dropdown-ticket): Confirm
-    /// from inside a TUIC picker popup stops at the wrapper — the dialog
-    /// never commits a half-filled row. Validation-sensitive by construction
-    /// like the T01/T03/T04 guard tests.
     #[gpui_kit::test]
     fn t05_enter_in_tuic_picker_popup_does_not_commit(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -30496,8 +26237,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Switch Add to tuic through the real picker (cursor starts at
-        // `vless`, row 0; deltas track it).
+
         let row_of = |protocol: &str| {
             VALID_PROTOCOLS
                 .iter()
@@ -30529,7 +26269,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // The TUIC page renders (Add wiring holds for the new page).
+
         assert_painted(cx, "tuic-section-caption");
         cx.update(|window, cx| {
             window.click("tuic-section-toggle", cx);
@@ -30539,8 +26279,7 @@ mod tests {
         cx.run_until_parked();
         paint_tall_dialog(cx);
         assert_painted(cx, "tuic-cc");
-        // Open the cc popup, then Enter: the pick lands, the commit must
-        // not run.
+
         assert_eq!(notification_count(cx), 0, "no toast before Enter");
         cx.update(|window, cx| {
             window.click("tuic-cc", cx);
@@ -30576,8 +26315,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T06: panel dropdown counts — socks version lists
-    /// blank + 2, socks network lists tcp + udp, naive cc lists blank + 4.
     #[test]
     fn t06_dropdown_counts() {
         use crate::store::{NAIVE_CC_MODES, SOCKS_VERSIONS};
@@ -30596,10 +26333,6 @@ mod tests {
         assert_eq!(crate::naive_cc_choices().len(), 5, "cc lists blank + 4");
     }
 
-    /// Config-completeness T06: SOCKS Add renders version + credentials +
-    /// network + uot as kit primitives (dial rides Advanced); a stored "5" echoes
-    /// into the picker and delegate membership covers blank + both versions
-    /// (virtualized popups paint visible rows only, so membership pins here).
     #[gpui_kit::test]
     fn t06_socks_page_paints(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -30671,8 +26404,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // S4-only page: no Transport/TLS/Mux panels, nothing from the other
-        // small pages; dial rides the Advanced dialog.
+
         for id in [
             "s1-caption",
             "s2-caption",
@@ -30686,7 +26418,7 @@ mod tests {
             assert_absent(cx, id.to_string());
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Delegate membership: blank + both versions resolve.
+
         let row = crate::store::ProxyConfig {
             id: "t06-s".to_string(),
             name: "S".to_string(),
@@ -30721,10 +26453,6 @@ mod tests {
         });
     }
 
-    /// Config-completeness T06: HTTP Add renders username/password/path/
-    /// headers + S2-optional (S4 dial rides the Advanced dialog); HTTPS
-    /// renders the same block (one entity set, two protocols) with the
-    /// enable toggle present.
     #[gpui_kit::test]
     fn t06_http_page_paints(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -30786,8 +26514,7 @@ mod tests {
         for target in ["http", "https"] {
             pick(cx, target);
             assert_painted(cx, "http-section-caption");
-            // Section-open states persist across the protocol switch (T05
-            // precedent), so toggles open once — re-clicking would close them.
+
             if first {
                 cx.update(|window, cx| {
                     window.click("http-section-toggle", cx);
@@ -30807,8 +26534,7 @@ mod tests {
             ] {
                 assert_painted(cx, id);
             }
-            // The optional-TLS section opens with the enable toggle (never
-            // the forced lock note).
+
             if first {
                 cx.update(|window, cx| {
                     window.click("s2-toggle", cx);
@@ -30830,12 +26556,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T06: AnyTLS Add renders password + the three
-    /// session tunables + S2-forced (S4 dial rides the Advanced dialog),
-    /// all kit; no enable toggle anywhere.
-    /// Ticket 06: the edit shows a single password input (the generic
-    /// Identity row hides — the type box owns the secret), TLS and dial
-    /// ride separate labeled boxes, and Advanced opens the second dialog.
     #[gpui_kit::test]
     fn t06_anytls_page_paints(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -30908,8 +26628,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // Ticket 06: single password — the generic Identity row (and its
-        // state caption) stays unmounted while the type box owns it.
+
         for id in ["field-guided-identity", "field-guided-identity-state"] {
             assert_absent(cx, id.to_string());
         }
@@ -30929,8 +26648,7 @@ mod tests {
         for id in ["s2-enable", "s1-caption", "s3-caption", "ssh-user"] {
             assert_absent(cx, id.to_string());
         }
-        // Ticket 06: Advanced opens the second small dialog — Dial Fields
-        // + TLS extras only, rare knobs absent from the main form.
+
         for id in ["s4-caption", "tls-extras-caption", "s2-insecure"] {
             assert_absent(cx, id.to_string());
         }
@@ -30947,8 +26665,7 @@ mod tests {
         for id in ["s4-reuse", "s2-insecure", "s2-pbk"] {
             assert_painted(cx, id);
         }
-        // Back pops only the top dialog (keyboard Escape is covered in the
-        // VLESS test); the main dialog survives with its form untouched.
+
         cx.update(|window, cx| {
             window.click("advanced-dialog-back", cx);
         });
@@ -30965,10 +26682,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 06: AnyTLS Edit regroup — the edit opens with the protocol
-    /// locked, a single password input (generic Identity hidden), the
-    /// Common box + right-column TLS Security beside the type box, and
-    /// Dial Fields confined to the Advanced dialog.
     #[gpui_kit::test]
     fn t06_anytls_edit_regroups_single_password(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -31001,10 +26714,10 @@ mod tests {
         paint_jumbo_dialog(cx);
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
-        // Protocol stays locked on Edit (no type switch, Throne §7.7).
+
         assert_painted(cx, "protocol-lock");
         assert_absent(cx, "protocol-select".to_string());
-        // Edit opens on the raw JSON — collapse into the guided page.
+
         cx.update(|window, cx| {
             window.click("params-advanced-toggle", cx);
         });
@@ -31012,8 +26725,7 @@ mod tests {
         paint_jumbo_dialog(cx);
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
-        // Common box + Advanced opener + right-column TLS Security paint;
-        // the generic Identity row stays unmounted (single password).
+
         for id in [
             "common-caption",
             "advanced-settings",
@@ -31032,15 +26744,13 @@ mod tests {
         paint_jumbo_dialog(cx);
         cx.run_until_parked();
         paint_jumbo_dialog(cx);
-        // The type box owns the one password; TLS and dial ride separate
-        // labeled boxes (dial only in the Advanced dialog).
+
         for id in ["anytls-password", "anytls-password-state", "s2-caption"] {
             assert_painted(cx, id);
         }
         assert_absent(cx, "s4-caption".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // The untouched edit refolds byte-identical (the hidden generic
-        // echoes the same password the type box owns).
+
         let folded = cx.update(|window, cx| {
             view.update(cx, |_, cx| {
                 let form = crate::ConfigForm::prefilled(window, cx, &seeded, None);
@@ -31053,10 +26763,6 @@ mod tests {
         );
     }
 
-    /// Ticket 06: invalid params keep the dialog open — the commit reports
-    /// the owning field inline (no close, no row written). Port collisions
-    /// stay a warning line, never a save gate (see
-    /// `bind_port_collision_warning`).
     #[gpui_kit::test]
     fn t06_invalid_port_stays_open_naming_field(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -31096,9 +26802,6 @@ mod tests {
         assert!(rows.is_empty(), "nothing stored on failed commit");
     }
 
-    /// Config-completeness T06: Naïve Add renders username/password/uot/
-    /// quic/cc + S2-forced (dial rides Advanced), all kit; delegate membership
-    /// covers blank + all four modes.
     #[gpui_kit::test]
     fn t06_naive_page_paints(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -31181,7 +26884,7 @@ mod tests {
             assert_absent(cx, id.to_string());
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Delegate membership: blank + every mode resolves.
+
         let row = crate::store::ProxyConfig {
             id: "t06-n".to_string(),
             name: "N".to_string(),
@@ -31216,11 +26919,6 @@ mod tests {
         });
     }
 
-    /// Config-completeness T06: SSH Edit renders user/password/key blob +
-    /// path picker + passphrase + host-key lists + client version (S4 dial
-    /// rides the Advanced dialog); an untouched row refolds byte-identical
-    /// (stored host-key arrays echo as comma text); simulating the Browse
-    /// completion fills the path and loads the key without hand-paste.
     #[gpui_kit::test]
     fn t06_ssh_edit_round_trips_and_key_pick(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -31285,8 +26983,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // No TLS/Transport/Mux panels, nothing from the other small pages;
-        // dial rides the Advanced dialog.
+
         for id in [
             "s1-caption",
             "s2-caption",
@@ -31300,7 +26997,7 @@ mod tests {
             assert_absent(cx, id.to_string());
         }
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Prefill + refold at the form level (no typing simulation).
+
         let row = ProxyConfig {
             id: "t06-k".to_string(),
             name: "K".to_string(),
@@ -31341,8 +27038,7 @@ mod tests {
             "ssh values sit in kit fields (arrays echo as comma text)"
         );
         assert_eq!(folded, params, "untouched ssh refolds byte-identical");
-        // The Browse completion fills the path and loads the key (the same
-        // two entity writes `finish_ssh_key_pick` performs).
+
         cx.update(|window, cx| {
             view.update(cx, |_, cx| {
                 let form = crate::ConfigForm::prefilled(window, cx, &row, None);
@@ -31361,9 +27057,6 @@ mod tests {
         });
     }
 
-    /// Config-completeness T06: small-matrix round-trips at the form level —
-    /// socks/http/anytls/naive rows echo their fields and refold
-    /// byte-identical (no paint needed).
     #[gpui_kit::test]
     fn t06_small_pages_round_trip(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -31427,8 +27120,6 @@ mod tests {
         }
     }
 
-    /// Config-completeness T06: the SSH key-file Browse failure names the
-    /// full picked path (never a basename, never silent).
     #[test]
     fn t06_ssh_key_pick_error_names_path() {
         let error = crate::ssh_key_pick_error("C:\\keys\\missing_rsa");
@@ -31438,10 +27129,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T06 ENTER-guard (R12 per-dropdown-ticket): Confirm
-    /// from inside a Naïve picker popup stops at the wrapper — the dialog
-    /// never commits a half-filled row. Validation-sensitive by construction
-    /// like the T01/T03/T04/T05 guard tests.
     #[gpui_kit::test]
     fn t06_enter_in_naive_picker_popup_does_not_commit(cx: &mut TestAppContext) {
         use crate::store::VALID_PROTOCOLS;
@@ -31455,8 +27142,7 @@ mod tests {
         paint_tall_dialog(cx);
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // Switch Add to naive through the real picker (cursor starts at
-        // `vless`, row 0; deltas track it).
+
         let row_of = |protocol: &str| {
             VALID_PROTOCOLS
                 .iter()
@@ -31488,7 +27174,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_tall_dialog(cx);
-        // The Naïve page renders (Add wiring holds for the new page).
+
         assert_painted(cx, "naive-section-caption");
         cx.update(|window, cx| {
             window.click("naive-section-toggle", cx);
@@ -31498,8 +27184,7 @@ mod tests {
         cx.run_until_parked();
         paint_tall_dialog(cx);
         assert_painted(cx, "naive-cc");
-        // Open the cc popup, then Enter: the pick lands, the commit must
-        // not run.
+
         assert_eq!(notification_count(cx), 0, "no toast before Enter");
         cx.update(|window, cx| {
             window.click("naive-cc", cx);
@@ -31535,8 +27220,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T07: open Add switched to `protocol` through the
-    /// real picker (cursor starts at `vless`, row 0), painted tall.
     fn t07_open_add_on(view: &Entity<AppView>, cx: &mut VisualTestContext, protocol: &str) {
         use crate::store::VALID_PROTOCOLS;
         cx.update(|window, cx| {
@@ -31580,8 +27263,6 @@ mod tests {
         paint_tall_dialog(cx);
     }
 
-    /// Config-completeness T07: picker tables behind the new dropdowns —
-    /// blank head + every engine-mapped value, nothing else.
     #[test]
     fn t07_dropdown_counts() {
         use crate::store::{
@@ -31611,9 +27292,6 @@ mod tests {
         assert_eq!(crate::xray_mux_choices().len(), 3, "mux lists blank + 2");
     }
 
-    /// Config-completeness T07: Snell Add renders psk + version + obfs/host +
-    /// userkey + reuse + network + mode as kit primitives (dial rides Advanced),
-    /// all with pinned ids; no Transport/TLS/Mux panels, nothing from sibling pages.
     #[gpui_kit::test]
     fn t07_snell_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -31657,9 +27335,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T07: ShadowTLS Add renders version + password +
-    /// S2-forced as kit primitives (S4 dial rides the Advanced dialog);
-    /// the TLS panel reads forced (no enable toggle page), S1/S3 stay off.
     #[gpui_kit::test]
     fn t07_shadowtls_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -31697,10 +27372,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T07: Xray-VLESS Add renders the Ph1 subset (uuid
-    /// +generate, enc, flow, sni/fp/alpn, pbk/sid/spiderx, network, mode, mux)
-    /// with pinned ids and the honest Ph1 footer; no shared panels ride the
-    /// bridge page.
     #[gpui_kit::test]
     fn t07_xray_page_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -31747,10 +27418,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Config-completeness T07: edge round-trips at the form level —
-    /// snell/shadowtls/xray/chain/extra rows echo their fields and refold
-    /// byte-identical (no paint needed). The xray case carries Ph2-only keys
-    /// to pin preserve-not-strip through the real echo path.
     #[gpui_kit::test]
     fn t07_small_pages_round_trip(cx: &mut TestAppContext) {
         use crate::store::ProxyConfig;
@@ -31820,10 +27487,6 @@ mod tests {
         }
     }
 
-    /// Config-completeness T07: chain Add renders the hop picker + Add over a
-    /// kit `Empty` (never a hand-rolled placeholder); the Throne add/replace
-    /// rules hold behind the buttons with rule-naming refusals that change
-    /// nothing; labels read `name (protocol)`, never params contents.
     #[gpui_kit::test]
     fn t07_chain_page_paints_empty_and_rules(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -31850,7 +27513,7 @@ mod tests {
         }
         assert_absent(cx, "chain-hops-list".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Hop rules behind the buttons, no dialog needed.
+
         let (landed, refused_chain, refused_off_index, refused_second, replaced) =
             cx.update(|window, cx| {
                 view.update(cx, |view, cx| {
@@ -31880,9 +27543,7 @@ mod tests {
                         crate::chain_pick_choices(&library.borrow()),
                         "",
                     );
-                    // The picker id rides along for the UI path; the rules
-                    // below drive the same fns the Add/Replace buttons call
-                    // with the picked row id directly.
+
                     let refused_chain = view.chain_add_hop(&hops, &library, &pick, "b", window, cx);
                     let landed_extra = view.chain_add_hop(&hops, &library, &pick, "c", window, cx);
                     let refused_second =
@@ -31920,10 +27581,6 @@ mod tests {
         assert!(replaced, "chain replace refused, hops unchanged");
     }
 
-    /// Config-completeness T07: extra-core Add renders exe + Browse + args +
-    /// config with pinned ids and deliberately no `no_logs` control; Browse
-    /// completion stores the file name; dialog commit refuses an exeless row
-    /// naming the field and lands once exe + config shape hold.
     #[gpui_kit::test]
     fn t07_extra_page_paints_validates_and_gates_commit(cx: &mut TestAppContext) {
         use crate::store::protocol_params_template;
@@ -31950,12 +27607,10 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // No `no_logs` control anywhere on the page (Throne non-persist bug —
-        // never copied).
+
         assert_absent(cx, "extra-no-logs".to_string());
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Browse completion stores the file name (the engine resolves it in
-        // the app directory and refuses paths).
+
         let stored = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 let form = ConfigForm::blank(window, cx);
@@ -31969,8 +27624,7 @@ mod tests {
             })
         });
         assert_eq!(stored, "my-core.exe", "Browse stores the file name");
-        // Validate gates commit: the pristine template (no exe/config)
-        // refuses naming exe; filling both lands exactly one row.
+
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
         let (closed, message, closed2) = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -31996,10 +27650,7 @@ mod tests {
                 form.extra_config.update(cx, |state, cx| {
                     state.set_value("{}", window, cx);
                 });
-                // Review: the bare extra-core starter needs no dummy server —
-                // the folded exe/config over it commits clean (virtual rows
-                // carry no endpoint address; the store gate only constrains
-                // import-shaped rows).
+
                 let closed2 = view.commit_add_with_focus(&form, &form_error, window, cx);
                 (closed, message, closed2)
             })
@@ -32017,9 +27668,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T07 ENTER-guard (R12 per-dropdown-ticket): Confirm
-    /// from inside an Xray picker popup stops at the wrapper — the dialog
-    /// never commits a half-filled row.
     #[gpui_kit::test]
     fn t07_enter_in_xray_picker_popup_does_not_commit(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -32071,7 +27719,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 02: edit dialog and delete confirm open for a stored config.
     #[gpui_kit::test]
     fn edit_and_remove_dialogs_open(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -32122,8 +27769,6 @@ mod tests {
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
-    /// Ticket 03: the import dialog opens with a paste box and a group field,
-    /// wiring paste/clipboard/drop entry points to the add flow.
     #[gpui_kit::test]
     fn import_dialog_opens_with_fields(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -32159,8 +27804,6 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("field-import-group").is_some()));
     }
 
-    /// Ticket 03: committing pasted links stores disabled records in the
-    /// chosen group without starting anything.
     #[gpui_kit::test]
     fn import_commit_stores_disabled_records(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -32190,9 +27833,6 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
     }
 
-    /// Post-import landing: the new rows arrive selected (first) and
-    /// checked (all), so F5 and the bulk bar act on them with no extra
-    /// click.
     #[gpui_kit::test]
     fn import_commit_selects_and_checks_new_rows(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -32240,7 +27880,6 @@ mod tests {
         );
     }
 
-    /// Port budget: empty and partially-filled libraries read honestly.
     #[test]
     fn port_budget_text_counts_auto_ports() {
         use crate::ConfigForm;
@@ -32261,8 +27900,6 @@ mod tests {
         assert!(text.contains("2 of 499"), "both ranges count: {text}");
     }
 
-    /// Ticket 11: the Export button opens a confirm dialog carrying the
-    /// plaintext-secret warning verbatim; nothing is written until confirm.
     #[gpui_kit::test]
     fn export_dialog_opens_with_verbatim_warning(cx: &mut TestAppContext) {
         use crate::store::export_confirm_description;
@@ -32280,7 +27917,6 @@ mod tests {
         });
         let view = stash.borrow().clone().expect("AppView stashed");
 
-        // The dialog description is the warning text verbatim by construction.
         assert_eq!(export_confirm_description(), export_warning_text());
 
         cx.simulate_resize(size(px(1000.), px(700.)));
@@ -32288,8 +27924,7 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // Ticket 02 (throne-adoption): Export lives in the PROGRAM menu —
-        // open it first.
+
         assert!(cx.update(|window, _| window.try_find("program-menu").is_some()));
         cx.update(|window, cx| {
             window.click("program-menu", cx);
@@ -32313,8 +27948,6 @@ mod tests {
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
-    // -- Ticket 12: health persistence + background ticks --------------------
-
     fn tick12_seed(name: &str, port: &str) -> NewConfig {
         NewConfig {
             name: name.to_string(),
@@ -32329,8 +27962,6 @@ mod tests {
         }
     }
 
-    /// Ticks idle with nothing running: no network traffic, no errors, no
-    /// crash reports.
     #[gpui_kit::test]
     fn ticks_idle_with_nothing_running_touch_no_network(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -32373,8 +28004,6 @@ mod tests {
         );
     }
 
-    /// The re-probe tick covers running rows only: records + persists, and
-    /// never probes stopped rows.
     #[gpui_kit::test]
     fn tick_reprobe_running_records_and_persists(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -32413,7 +28042,7 @@ mod tests {
 
         let reprobed = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_reprobe_running(cx)));
         assert_eq!(reprobed, 2, "both running rows re-probed");
-        // Ticket 26: probes complete off-thread — pump the completion.
+
         cx.run_until_parked();
         assert_eq!(handle.calls_for(&alpha.id).len(), 1);
         assert_eq!(handle.calls_for(&beta.id).len(), 1);
@@ -32436,10 +28065,6 @@ mod tests {
         assert_eq!(snaps.len(), 2, "latest samples persisted");
     }
 
-    /// W2: the re-probe tick never dials rows on crashed shards. After a
-    /// crash is observed by the engine poll, the reprobe pass starts nothing
-    /// for the crashed rows (no manufactured errors, no health writes), while
-    /// surviving siblings keep probing.
     #[gpui_kit::test]
     fn tick_reprobe_skips_rows_on_crashed_shards(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -32479,8 +28104,6 @@ mod tests {
             "rows run before the crash"
         );
 
-        // One crash on the shared stock sidecar; the engine poll observes it
-        // (marking the shard crashed) before the next reprobe runs.
         stock.inject_crash("signal: segmentation fault");
         let poll = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_engine_poll(cx)));
         assert!(poll.is_some(), "the crash is reported once");
@@ -32521,8 +28144,6 @@ mod tests {
         );
     }
 
-    /// Restart restores last latencies + dead flags (file-backed store,
-    /// second view hydrates with no new probing).
     #[gpui_kit::test]
     fn restart_restores_last_latency_and_dead_flags(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -32570,11 +28191,10 @@ mod tests {
         let tested =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(tested, 2);
-        // Ticket 26: probes complete off-thread — pump the completion.
+
         cx.run_until_parked();
         drop(view);
 
-        // "Restart": a fresh view over the same file, no probing at all.
         let store = Store::open_file(&path).expect("restart reopen works");
         let stash2: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
         let stash2_for_window = stash2.clone();
@@ -32603,9 +28223,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Stopped ticks start nothing even with due subs and running rows (no
-    /// telemetry, no auto-start, no fetch beyond due subs — here, no fetch
-    /// at all).
     #[gpui_kit::test]
     fn stopped_ticks_start_nothing(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -32641,7 +28258,7 @@ mod tests {
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.start_all_engines(window, cx));
         });
-        // The due-sub selection itself is pure (one due sub found).
+
         assert_eq!(
             view.read_with(cx, |view, _| view.due_subscriptions().len()),
             1
@@ -32662,10 +28279,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 36: data-plane traffic tick ---------------------------------
-
-    /// Stub clash controller: serves one `/connections` body per accepted
-    /// connection (Bearer-checked like the real sidecar), then exits.
     fn stub_clash_server(bodies: Vec<String>, secret: &str) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub binds");
@@ -32700,8 +28313,6 @@ mod tests {
         (port, server)
     }
 
-    /// One data flow plus one health-probe flow for `row` (synthetic bytes
-    /// only — never the live DB, never real credentials).
     fn traffic_body(row: &str, rx: u64, tx: u64) -> String {
         serde_json::json!({
             "connections": [
@@ -32723,9 +28334,6 @@ mod tests {
         .to_string()
     }
 
-    /// Ticket 36: the traffic tick persists per-row data-plane deltas
-    /// (probe flows excluded), mirrors absolutes for display, and never
-    /// double-counts a repeated poll.
     #[gpui_kit::test]
     fn tick_traffic_poll_persists_deltas_and_mirrors(cx: &mut TestAppContext) {
         use crate::engine::{ClashTarget, EngineController};
@@ -32802,9 +28410,6 @@ mod tests {
         server.join().expect("stub drains");
     }
 
-    /// Ticket 47: the off-UI traffic tick polls concurrently off-thread and
-    /// commits on the main thread — deltas persist, the mirror tracks, and
-    /// a second tick while one is in flight is skipped, never queued.
     #[gpui_kit::test]
     fn t47_spawn_traffic_poll_off_ui_and_skips_in_flight(cx: &mut TestAppContext) {
         use crate::engine::{ClashTarget, EngineController};
@@ -32839,7 +28444,6 @@ mod tests {
             });
         });
 
-        // Guard first: a tick already in flight is skipped, never queued.
         cx.update(|_, cx| {
             view.update(cx, |view, _| view.traffic_tick_in_flight = true);
         });
@@ -32853,7 +28457,7 @@ mod tests {
         assert_eq!(started, 1, "poll started off-thread");
         let dup = cx.update(|_, cx| view.update(cx, |view, cx| view.spawn_traffic_poll(cx)));
         assert_eq!(dup, 0, "second tick skipped while one runs");
-        // Off-thread completion lands on the main thread.
+
         cx.run_until_parked();
         let totals = view.read_with(cx, |view, _| {
             view.store.traffic_totals().expect("totals read")
@@ -32875,10 +28479,6 @@ mod tests {
         server.join().expect("stub drains");
     }
 
-    /// Ticket 05 (throne-adoption): multi-flow clash body — one data flow
-    /// per `(row, rx, tx)` with a distinct destination, plus the
-    /// health-probe flow the Connections pane must exclude. Synthetic bytes
-    /// only — never the live DB, never real credentials.
     fn traffic_body_multi(flows: &[(&str, u64, u64)]) -> String {
         let mut connections: Vec<serde_json::Value> = flows
             .iter()
@@ -32909,10 +28509,6 @@ mod tests {
         .to_string()
     }
 
-    /// Ticket 05, scenarios 1+2: two exits passing traffic → the Connections
-    /// pane shows one row per live connection (exit name + bind:port join,
-    /// traffic deltas move on poll) with probe destinations excluded;
-    /// click-copies the dest and nothing else.
     #[gpui_kit::test]
     fn t05_connections_snapshot_excludes_probes_and_tracks_deltas(cx: &mut TestAppContext) {
         use crate::engine::{ClashTarget, EngineController};
@@ -32948,7 +28544,7 @@ mod tests {
 
         let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
         assert_eq!(updated, 2, "both exits gain data-plane bytes");
-        // Snapshot: one row per live connection, the probe flow excluded.
+
         let snapshot = view.read_with(cx, |view, _| view.conn_snapshot.clone());
         assert_eq!(snapshot.len(), 2, "probe flow never reaches the snapshot");
         for (_, entry) in &snapshot {
@@ -32958,7 +28554,7 @@ mod tests {
                 entry.dest
             );
         }
-        // Display rows sort by traffic, descending by default (Beta first).
+
         let (first, second) = view.read_with(cx, |view, _| {
             let rows =
                 crate::build_conn_rows(&view.conn_snapshot, &view.conn_delta, None, false, true);
@@ -32966,8 +28562,7 @@ mod tests {
         });
         assert_eq!(first.as_deref(), Some(beta.id.as_str()), "heaviest first");
         assert_eq!(second.as_deref(), Some(alpha.id.as_str()));
-        // The exit join names the row honestly (name + bind:port + protocol);
-        // unclaimed entries are never guessed.
+
         let (join, unclaimed) = view.read_with(cx, |view, cx| {
             let rows = view.libraries.read(cx).delegate().rows.clone();
             (
@@ -32991,8 +28586,6 @@ mod tests {
             "unclaimed rows read unclaimed"
         );
 
-        // Second poll: session deltas move, and the hidden-pane throttle
-        // holds (the spawn path skips while the 5s base cadence elapses).
         let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
         assert_eq!(updated, 2, "grown connections persist the delta");
         let deltas = view.read_with(cx, |view, _| view.conn_delta.clone());
@@ -33004,8 +28597,6 @@ mod tests {
             "hidden Connections pane throttles the 1Hz loop to the base cadence"
         );
 
-        // The pane paints one copyable row per live connection; selecting
-        // Beta filters to its flow; clicking copies the dest alone.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.inspector_tab = crate::InspectorTab::Connections;
@@ -33048,9 +28639,7 @@ mod tests {
             "selected row keeps its flow"
         );
         assert_absent(cx, "conn-copy-1".to_string());
-        // Click-copies the dest: the handler path is exercised directly
-        // (the inspector has no scroll seam for below-fold clicks — the t06
-        // rationale); presence above proves the copy affordance renders.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.copy_connection_dest("flow-1.example.com", window, cx)
@@ -33072,8 +28661,6 @@ mod tests {
         server.join().expect("stub drains");
     }
 
-    /// Ticket 05, traffic watcher: per-exit aggregates read heaviest-first
-    /// with no fabricated Direct line; idle rows stay quiet.
     #[gpui_kit::test]
     fn t05_traffic_aggregates_per_exit_without_direct(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -33102,7 +28689,7 @@ mod tests {
                 "no fabricated Direct aggregate"
             );
         }
-        // An idle row adds no quiet zero bar.
+
         store
             .add(tick12_seed("Gamma", "10858"))
             .expect("seed works");
@@ -33115,9 +28702,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05, log reader: include narrows, exclude drops the noisy leg,
-    /// and regex replaces the keywords — redaction holding on every leg,
-    /// invalid patterns failing open, the level row still composing.
     #[gpui_kit::test]
     fn t05_log_include_exclude_regex_keep_redaction(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -33177,8 +28761,6 @@ mod tests {
         });
     }
 
-    /// Ticket 05, poll tuning: 1Hz while the Connections/Traffic pane is
-    /// visible, else the 5s base cadence. Pure seam over the throttle stamp.
     #[gpui_kit::test]
     fn t05_traffic_poll_cadence_visible_fast_hidden_slow(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -33206,11 +28788,6 @@ mod tests {
         );
     }
 
-    /// Ticket 36: restart resumes data-plane counters from persisted
-    /// totals (never zeroed) with no new polling.
-    /// Ticket 47: totals hydrate LAZILY — the fresh view shows no mirror
-    /// until the first traffic tick (startup never scans); the first tick
-    /// (even with zero targets) restores the counters.
     #[gpui_kit::test]
     fn restart_restores_traffic_mirror(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -33253,10 +28830,7 @@ mod tests {
             Some((1_048_782, 88)),
             "counters resume from persisted totals on first tick"
         );
-        // TEMP files auto-removed: swap the view's store for an empty
-        // in-memory one (direct field assignment, the fake-engine
-        // precedent) so the file connection closes and unlocks, then
-        // remove the DB + WAL sidecars and prove it.
+
         cx.update(|_, cx| {
             restarted.update(cx, |view, _| {
                 view.store = Store::open_in_memory().expect("swap works");
@@ -33269,11 +28843,6 @@ mod tests {
         assert!(!path.exists(), "restart temp db removed");
     }
 
-    // -- Ticket 13: live sidecar log pipe ------------------------------------
-
-    /// Mock sidecar emits tagged lines → drain → the logs dialog shows them
-    /// under the right config with secrets redacted; an untagged line stays
-    /// engine-global (never cross-config).
     #[gpui_kit::test]
     fn live_sidecar_lines_appear_under_right_config_redacted(cx: &mut TestAppContext) {
         use crate::engine::{inbound_tag, EngineController};
@@ -33309,7 +28878,6 @@ mod tests {
 
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
-                // Ticket 47: ingest reuses one store list (no second scan).
                 let rows = view.store.list().expect("seeded rows list");
                 view.drain_engine_logs(&rows);
             });
@@ -33338,7 +28906,6 @@ mod tests {
         );
         assert_eq!(beta_lines, 0, "no cross-config attribution");
 
-        // The dialog renders the live lines for the selected row.
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, _| {
@@ -33360,14 +28927,12 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // T08 (gpui-18-sweep CAP-9): logs opens as a sheet, never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("log-lines").is_some()));
     }
 
-    /// Ticket 04: the subscriptions dialog opens with a label/URL/group
-    /// form for the add flow.
     #[gpui_kit::test]
     fn subscriptions_dialog_opens_with_fields(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -33396,8 +28961,6 @@ mod tests {
             window.render_frame(cx);
         });
 
-        // T08 (gpui-18-sweep CAP-9): subscriptions opens as a sheet
-        // (reference flow), never a dialog.
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-sub-label").is_some()));
@@ -33405,10 +28968,6 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("field-sub-group").is_some()));
     }
 
-    /// Ticket 05: start-all over the mock driver brings up one endpoint per
-    /// config (generated JSON asserted structurally); stop-all takes them
-    /// down; a port collision blocks start naming both configs. The
-    /// engine-status element and start/stop controls render headless.
     #[gpui_kit::test]
     fn engine_start_all_and_stop_all_via_fake(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -33448,7 +29007,6 @@ mod tests {
         });
         let view = stash.borrow().clone().expect("AppView stashed");
 
-        // Swap the real driver for the mock; production never starts here.
         let handle = cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 let (engine, handle) = EngineController::fake();
@@ -33478,11 +29036,7 @@ mod tests {
             window.render_frame(cx);
         });
         assert!(cx.update(|window, _| window.try_find("engine-status").is_some()));
-        // Ticket 02 (throne-adoption): bulk engine actions live in the
-        // TOOLS menu plus the global toggle — menu reachability is proven
-        // by `command_strip_all_ids_present` (this test owns start/stop
-        // behavior, and menu popovers race toast overlays under full-suite
-        // load, so it does not reopen them here).
+
         assert!(cx.update(|window, _| window.try_find("tools-menu").is_some()));
         assert!(cx.update(|window, _| window.try_find("global-start-stop").is_some()));
 
@@ -33492,7 +29046,6 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
         assert!(!handle.is_running());
 
-        // Collision path: two rows on one port block start, naming both.
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 let _ = view.store.update(
@@ -33522,9 +29075,6 @@ mod tests {
         );
     }
 
-    /// Ticket 06: health test-all over the mock driver records per-row
-    /// latency, flags the dead row with its named cause, and renders the
-    /// health line, status totals, and toolbar controls headless.
     #[gpui_kit::test]
     fn health_test_all_via_fake_flags_dead(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -33577,7 +29127,7 @@ mod tests {
         let tested =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(tested, 2);
-        // Ticket 26: probes complete off-thread — pump the completion.
+
         cx.run_until_parked();
 
         let (alpha_live, beta_dead) = view.read_with(cx, |view, _| {
@@ -33603,17 +29153,12 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // Ticket 02 (throne-adoption): bulk test lives in the TOOLS menu
-        // plus the global toggle — menu reachability is proven by
-        // `command_strip_all_ids_present` (same toast-overlay rationale
-        // as above); this test owns probe behavior.
+
         assert!(cx.update(|window, _| window.try_find("tools-menu").is_some()));
         assert!(cx.update(|window, _| window.try_find("global-start-stop").is_some()));
         assert!(cx.update(|window, _| window.try_find("health-status").is_some()));
     }
 
-    /// Ticket 06: the logs dialog opens with a per-config filter field and
-    /// shows only the selected config's redacted lines.
     #[gpui_kit::test]
     fn logs_dialog_filters_to_selected_and_redacts(cx: &mut TestAppContext) {
         use crate::engine::inbound_tag;
@@ -33675,18 +29220,12 @@ mod tests {
             window.render_frame(cx);
         });
 
-        // T08 (gpui-18-sweep CAP-9): logs opens as a sheet, never a dialog.
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-log-filter").is_some()));
         assert!(cx.update(|window, _| window.try_find("log-lines").is_some()));
     }
 
-    // -- Ticket 09: hardening + release proof --------------------------------
-
-    /// Subscription labels never carry credentials: userinfo and query are
-    /// both stripped (the only network surface besides health probes is the
-    /// user-initiated subscription refresh, and its errors never echo URLs).
     #[test]
     fn subscription_label_strips_credentials_and_query() {
         use crate::subscription_label_from_url;
@@ -33702,8 +29241,6 @@ mod tests {
         assert_eq!(subscription_label_from_url(""), "Subscription");
     }
 
-    /// Copy-URL clipboard content is bind + port only: no params, keys, or
-    /// tokens can reach the clipboard through this path by construction.
     #[test]
     fn copy_urls_carry_binds_not_secrets() {
         use crate::store::proxy_urls;
@@ -33727,8 +29264,6 @@ mod tests {
         }
     }
 
-    /// LAN single-start stops at the confirm gate: a dialog opens and the
-    /// engine stays stopped until the user confirms.
     #[gpui_kit::test]
     fn lan_single_start_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -33768,8 +29303,6 @@ mod tests {
         );
     }
 
-    /// LAN start-all stops at the confirm gate too: one dialog naming the
-    /// LAN rows, engine stopped until confirm.
     #[gpui_kit::test]
     fn lan_start_all_opens_confirm_and_stays_stopped(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -33804,8 +29337,6 @@ mod tests {
         );
     }
 
-    /// Loopback single-start skips the confirm gate (no dialog); the start
-    /// itself fails here only because no real sidecar binary ships in tests.
     #[gpui_kit::test]
     fn loopback_single_start_skips_confirm(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -33836,8 +29367,6 @@ mod tests {
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
-    // -- Ticket 14: import-safety ------------------------------------------
-
     use gpui_kit::VisualTestContext;
 
     fn mount_view(
@@ -33859,7 +29388,6 @@ mod tests {
         cx.update(|window, cx| window.notifications(cx).len())
     }
 
-    /// Scenario: subscription URL with userinfo → userinfo never displayed.
     #[test]
     fn redact_subscription_url_strips_userinfo() {
         use crate::redact_subscription_url;
@@ -33883,8 +29411,6 @@ mod tests {
         assert!(shown.ends_with('…'), "still truncated: {shown}");
     }
 
-    /// Scenario: bad addsub link → original reason, never generic
-    /// unknown-command.
     #[test]
     fn addsub_error_message_surfaces_original_reason() {
         use crate::addsub_error_message;
@@ -33904,7 +29430,6 @@ mod tests {
         assert!(text.contains("bad-host"), "original kind kept, got {text}");
     }
 
-    /// Ticket 45: interval picker + last-refresh display copy.
     #[test]
     fn t45_interval_and_last_refresh_format() {
         use crate::{format_interval_secs, format_last_refresh, INTERVAL_PRESETS};
@@ -33929,8 +29454,6 @@ mod tests {
         );
     }
 
-    /// Ticket 45: the kill-switch gates automatic due selection but never a
-    /// manual refresh-all-due (explicit consent); only due subs are listed.
     #[gpui_kit::test]
     fn t45_kill_switch_gates_auto_not_manual(cx: &mut TestAppContext) {
         use crate::store::now_unix;
@@ -33942,7 +29465,7 @@ mod tests {
         let _fresh = store
             .add_subscription("Fresh", "https://example.com/fresh.txt", "g", true)
             .expect("seed works");
-        // Fresh succeeds now → not due; Due never refreshed → due.
+
         let now = now_unix();
         store
             .refresh_with_body(
@@ -33966,7 +29489,7 @@ mod tests {
         });
         assert_eq!(auto, vec![due.id.clone()]);
         assert_eq!(manual, vec![due.id.clone()]);
-        // Kill-switch off: automatic pass finds nothing, manual still lists.
+
         view.update(cx, |view, _| {
             view.store
                 .set_subs_auto_refresh_enabled(false)
@@ -33985,8 +29508,6 @@ mod tests {
         assert_eq!(manual, vec![due.id.clone()], "manual still lists due");
     }
 
-    /// Ticket 45: usage reset zeroes persisted counters and notifies; the
-    /// status totals helper sums rows.
     #[gpui_kit::test]
     fn t45_usage_reset_zeroes_and_totals_sum(cx: &mut TestAppContext) {
         use crate::store::NewConfig;
@@ -34030,8 +29551,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "reset notifies");
     }
 
-    /// Ticket 45: saved logs match the visible lines (level + text filter +
-    /// tail); copy-all carries the same text.
     #[gpui_kit::test]
     fn t45_logs_save_matches_visible(cx: &mut TestAppContext) {
         use crate::health::LogLevel;
@@ -34049,7 +29568,7 @@ mod tests {
                 view.log_tail = true;
             });
         });
-        // Level filter narrows to errors; tail keeps the newest cap.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.log_level = Some(LogLevel::Error);
@@ -34057,7 +29576,7 @@ mod tests {
                 assert_eq!(visible, vec!["[error] error boom one".to_string()]);
             });
         });
-        // Tail off shows the head instead of the newest.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.log_level = None;
@@ -34083,21 +29602,11 @@ mod tests {
         });
     }
 
-    /// Lane B (B9): one level control — the level group is the only
-    /// severity switch in the logs dialog (no second cycle button), and each
-    /// choice narrows through the same `set_log_level` seam.
-    /// Ticket T03: the row rides kit `RadioGroup` (`selected_index` +
-    /// `on_change`). The group re-keys children by index and does not
-    /// self-register for headless observation (verified 0.6.6 `radio.rs` /
-    /// `radio_group.rs`), so the per-level string ids are retired — the
-    /// pinned `log-level-row` id rides an observed wrapper and the headless
-    /// click scopes within it by index (4 = Error).
     #[gpui_kit::test]
     fn laneb_logs_single_level_control(cx: &mut TestAppContext) {
         use crate::health::LogLevel;
         cx.update(gpui_kit::init);
-        // Settle the dialog entrance animation so the click's down/up share
-        // one button position (same as the other dialog-click tests).
+
         cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
@@ -34122,8 +29631,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Scenario: paste with all-invalid items → dialog stays open (false),
-    /// one notification, nothing stored.
     #[gpui_kit::test]
     fn import_commit_all_invalid_stays_open(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34144,8 +29651,6 @@ mod tests {
         );
     }
 
-    /// Scenario: bad addsub link → dialog stays open with the original
-    /// reason instead of the generic unknown-command.
     #[gpui_kit::test]
     fn import_commit_bad_addsub_stays_open(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34166,8 +29671,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1);
     }
 
-    /// A non-addsub all-invalid single line still takes the generic import
-    /// path — and stays open too.
     #[gpui_kit::test]
     fn import_commit_generic_single_invalid_stays_open(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34182,8 +29685,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1);
     }
 
-    /// Scenario: DB error on toggle → error notification, flag unchanged
-    /// (never a dead click).
     #[gpui_kit::test]
     fn db_error_on_toggle_notifies(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -34211,8 +29712,6 @@ mod tests {
         assert_eq!(enabled, Some(false), "failed toggle changes nothing");
     }
 
-    /// Scenario: DB error on list → error notification, never a silent
-    /// empty list.
     #[gpui_kit::test]
     fn db_error_on_reload_notifies(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34229,8 +29728,6 @@ mod tests {
         assert!(notification_count(cx) >= 1, "list failure notifies");
     }
 
-    /// Scenario: DB error on manual refresh → error notification, never a
-    /// dead click.
     #[gpui_kit::test]
     fn db_error_on_subscription_refresh_notifies(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34253,7 +29750,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "refresh failure notifies");
     }
 
-    /// A refresh for an unknown id warns without touching the network.
     #[gpui_kit::test]
     fn refresh_unknown_subscription_warns_without_fetch(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34267,7 +29763,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "gone sub warns, no fetch");
     }
 
-    /// Scenario: DB error on the auto-refresh toggle → error notification.
     #[gpui_kit::test]
     fn db_error_on_subscription_auto_toggle_notifies(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34290,8 +29785,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "auto-toggle failure notifies");
     }
 
-    /// Scenario: remove subscription with a broken store → error
-    /// notification, never "Already removed".
     #[gpui_kit::test]
     fn remove_subscription_db_error_is_truthful(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34311,14 +29804,10 @@ mod tests {
                 view.commit_subscription_remove(&sub_id, window, cx)
             });
         });
-        // Exactly one notice: the store truthfully reports Err (never
-        // Ok(false)), so the error arm fires — pinned at the store seam too.
+
         assert_eq!(notification_count(cx), 1);
     }
 
-    /// Scenario: subscriptions sheet with a broken store → sheet still
-    /// opens (form usable) plus an error notification, never a lying empty
-    /// state.
     #[gpui_kit::test]
     fn subscriptions_dialog_db_error_notifies(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34337,14 +29826,12 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(notification_count(cx) >= 1, "listing failure notifies");
     }
 
-    /// Scenario: background refresh for a deleted sub → silently ignored,
-    /// no failure toast, for both body and fetch-error completions.
     #[gpui_kit::test]
     fn background_refresh_deleted_sub_is_silent(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34388,7 +29875,6 @@ mod tests {
         assert_eq!(notification_count(cx), 0, "deleted sub: no failure toast");
     }
 
-    /// Guard: a live subscription's refresh failure still notifies.
     #[gpui_kit::test]
     fn background_refresh_live_sub_failure_still_notifies(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34417,9 +29903,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "live sub failure notifies");
     }
 
-    // -- Ticket 16: validation coherence + dedupe/group consistency --------
-
-    /// Scenario 4 (pure): an edited dialog group beats the payload group.
     #[test]
     fn effective_addsub_group_dialog_wins() {
         use crate::effective_addsub_group;
@@ -34437,8 +29920,6 @@ mod tests {
         );
     }
 
-    /// Scenario 7 (pure): the toast equals re-importable rows, or states
-    /// both numbers when hand-made rows exist.
     #[test]
     fn export_count_message_states_both_numbers() {
         use crate::export_count_message;
@@ -34452,8 +29933,6 @@ mod tests {
         assert!(both.contains("/tmp/x.json"), "path in: {both}");
     }
 
-    /// Scenario 5 (commit): dropping a `.conf` then editing the box to links
-    /// parses the edited text, not the old file type.
     #[gpui_kit::test]
     fn import_commit_stale_conf_hint_parses_edited_links(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34478,7 +29957,6 @@ mod tests {
         assert_eq!(rows[0].group, "travel");
     }
 
-    /// Scenario 6 (commit): an unedited multi-file drop keeps per-file stems.
     #[gpui_kit::test]
     fn import_commit_multi_files_keep_stems(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34517,8 +29995,6 @@ mod tests {
         assert_eq!(names, vec!["a-p1".to_string(), "b-p1".to_string()]);
     }
 
-    /// Scenario 6 (edited multi): editing the merged text drops the per-file
-    /// bytes and sniffs the edited text instead.
     #[gpui_kit::test]
     fn import_commit_edited_multi_parses_edited_text(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34546,11 +30022,6 @@ mod tests {
         assert_eq!(rows[0].protocol, "vless");
     }
 
-    // -- Ticket 17: UX feedback across library flows -------------------------
-
-    /// Scenario: add/edit/remove → success toast naming the row (content at
-    /// the pure seam — notification text is framework-private, so delivery
-    /// is asserted by count in `crud_commits_toast_once_naming_row`).
     #[test]
     fn crud_toast_messages_name_the_row() {
         use crate::row_action_message;
@@ -34559,7 +30030,6 @@ mod tests {
         assert_eq!(row_action_message("Removed", "Work"), "Removed \"Work\"");
     }
 
-    /// Scenario: add/edit/remove commits each fire exactly one toast.
     #[gpui_kit::test]
     fn crud_commits_toast_once_naming_row(cx: &mut TestAppContext) {
         use crate::store::ConfigPatch;
@@ -34594,25 +30064,21 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 0);
     }
 
-    /// Scenario: import dialog with pasted text → live `X valid · Y invalid`
-    /// preview before commit (pure counts + message).
     #[test]
     fn import_preview_counts_and_message() {
         use crate::{import_preview_counts, import_preview_message};
         let body = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one\nbogus://x";
         assert_eq!(import_preview_counts(body, None), (1, 1));
         assert_eq!(import_preview_message(1, 1), "1 valid · 1 invalid");
-        // BUG-4: an empty box previews neutral, never `0 valid · 1 invalid`.
+
         assert_eq!(import_preview_counts("", None), (0, 0));
         assert_eq!(import_preview_counts("   \n  ", None), (0, 0));
         assert_eq!(import_preview_message(0, 0), "0 valid · 0 invalid");
-        // A dropped conf keeps its hint for the preview too.
+
         let conf = "[Interface]\nPrivateKey = QUJD\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\n";
         assert_eq!(import_preview_counts(conf, Some("home.conf")), (1, 0));
     }
 
-    /// Scenario: import dialog shows the preview line and the dropped file
-    /// names after a drop.
     #[gpui_kit::test]
     fn import_dialog_shows_preview_and_files(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34646,16 +30112,6 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("import-files").is_some()));
     }
 
-    // -- Ticket 07: import live feedback (CAP-7 / US-2) -----------------------
-    // Ledger Ruling: preview + first-failure + stay-open/commit pins live at
-    // headless seams (pure counts/message/failures + sync commit + dialog
-    // paint). Grammar acceptance, basenames-only files line, and the
-    // library-export restore path are unchanged (pinned by existing
-    // import-grammar, `import_files_label_basenames`, and restore tests).
-
-    /// Ticket 07 scenario 1 (pure): paste 2 valid + 1 invalid → preview reads
-    /// `2 valid · 1 invalid` with the failure's item number, label, and
-    /// reason inline.
     #[test]
     fn t07_preview_two_valid_one_invalid_names_first_failure() {
         use crate::{first_import_failure_reason, import_preview_counts, import_preview_message};
@@ -34671,9 +30127,6 @@ mod tests {
         );
     }
 
-    /// Ticket 07: multi-file preview uses the same resolve + parse as the
-    /// commit (unedited drops parse per file); edited text drops the stale
-    /// multi bytes; empty stays neutral.
     #[test]
     fn t07_preview_multi_files_match_commit_parse() {
         use crate::preview_batch_for_form;
@@ -34684,7 +30137,7 @@ mod tests {
             ("a.conf".to_string(), a.to_string()),
             ("b.conf".to_string(), b.to_string()),
         ];
-        // Unedited multi drop: per-file parse keeps both stems.
+
         let batch =
             preview_batch_for_form(&merged, None, Some(merged.clone()), Some(files.clone()));
         assert_eq!(batch.configs.len(), 2, "both files preview");
@@ -34696,18 +30149,16 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["a-p1".to_string(), "b-p1".to_string()]);
-        // Edited text drops the stale multi bytes and sniffs as its own type.
+
         let links = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one";
         let edited = preview_batch_for_form(links, None, Some(merged), Some(files));
         assert_eq!(edited.configs.len(), 1, "edited text previews alone");
         assert_eq!(edited.configs[0].protocol, "vless");
-        // Empty stays neutral, never `0 valid · 1 invalid`.
+
         let empty = preview_batch_for_form("", None, None, None);
         assert!(empty.configs.is_empty() && empty.failures.is_empty());
     }
 
-    /// Ticket 07: honest partial-success toast pins imported / duplicates /
-    /// failed counts plus every failure when present.
     #[test]
     fn t07_success_summary_pins_counts() {
         use crate::import::{ImportErrorKind, ImportFailure};
@@ -34733,8 +30184,6 @@ mod tests {
         );
     }
 
-    /// Ticket 07 scenario 2: fully invalid paste → press Import → dialog stays
-    /// open listing every failure, nothing added.
     #[gpui_kit::test]
     fn t07_total_failure_stays_open_lists_every_failure(cx: &mut TestAppContext) {
         use crate::import::format_import_failures;
@@ -34755,7 +30204,7 @@ mod tests {
             0,
             "nothing stored"
         );
-        // The failure list names every item (number + label + reason).
+
         let batch = import_text(body);
         assert_eq!(batch.configs.len(), 0);
         assert_eq!(batch.failures.len(), 3);
@@ -34765,8 +30214,6 @@ mod tests {
         }
     }
 
-    /// Ticket 07 scenario 3: partial paste → import closes, toast reports
-    /// imported/skipped/failed counts, new rows arrive selected and checked.
     #[gpui_kit::test]
     fn t07_partial_import_toasts_counts_and_selects_checks(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34804,8 +30251,6 @@ mod tests {
         );
     }
 
-    /// Ticket 07 dialog paint: 2 valid + 1 invalid in the box → the live
-    /// `X valid · Y invalid` line and the first-failure line both paint.
     #[gpui_kit::test]
     fn t07_dialog_paints_preview_and_first_failure(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34833,9 +30278,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Polish: no persistent drop-hint band — file drops land anywhere on
-    /// the shell (see `t03_drop_while_dialog_open_refuses_honestly` for the
-    /// blocked-drop toast); the top strip stays TitleBar + toolbar only.
     #[gpui_kit::test]
     fn no_persistent_drop_hint_band(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34849,8 +30291,6 @@ mod tests {
         assert!(cx.update(|window, _| window.try_find("drop-hint").is_none()));
     }
 
-    /// Scenario: export dialog → row counts + destination path + overwrite
-    /// warning when the file exists (pure description).
     #[test]
     fn export_preview_shows_counts_path_and_overwrite() {
         use crate::export_preview_description;
@@ -34870,8 +30310,6 @@ mod tests {
         );
     }
 
-    /// Scenario: subscription refresh with item failures → failures viewable
-    /// per subscription (stored vec rendering, empty when clean).
     #[test]
     fn subscription_failures_text_renders_items() {
         use crate::import::{ImportErrorKind, ImportFailure};
@@ -34892,8 +30330,6 @@ mod tests {
         assert!(text.contains("unknown-scheme"), "reason in: {text}");
     }
 
-    /// Scenario: subscriptions dialog shows the auto-refresh checkbox and
-    /// the per-subscription failures after a partial refresh.
     #[gpui_kit::test]
     fn subscriptions_dialog_shows_auto_and_failures(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -34923,7 +30359,7 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-sub-auto").is_some()));
@@ -34933,9 +30369,6 @@ mod tests {
         );
     }
 
-    /// Scenario: subscription add form → auto-refresh checkbox present and
-    /// default on.
-    /// Ticket 45: the interval picker defaults to daily.
     #[gpui_kit::test]
     fn sub_add_form_auto_defaults_on(cx: &mut TestAppContext) {
         use crate::store::{DEFAULT_AUTO_REFRESH_SECS, DEFAULT_GROUP};
@@ -34965,17 +30398,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08: the subscriptions interval control is exactly one grouped
-    /// exclusive choice of the six presets with the current value marked —
-    /// one static group caption (no redundant summary line), six choices
-    /// sharing one cell (last click wins).
-    /// Ticket T03: the choice rides kit `RadioGroup` (`selected_index` +
-    /// `on_change`). The group re-keys children by index (verified 0.6.6
-    /// `radio.rs`: `radio.id = ix.into()`) and does not self-register for
-    /// headless observation, so per-option string ids cannot survive — the
-    /// anchors are the static caption, the `field-sub-interval` wrapper, and
-    /// the new observed `sub-interval-add-group` id; headless clicks scope
-    /// within the group by preset index (0/always … 5/7d).
     #[gpui_kit::test]
     fn t08_interval_picker_one_grouped_exclusive_choice(cx: &mut TestAppContext) {
         use crate::INTERVAL_PRESETS;
@@ -34987,15 +30409,15 @@ mod tests {
             view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-        // One static group caption, never a repeating summary of the value.
+
         assert_painted(cx, "sub-interval-add-caption");
-        // Exactly one group hosting the six preset choices.
+
         assert_eq!(INTERVAL_PRESETS.len(), 6, "six interval choices");
         assert_painted(cx, "sub-interval-add-group");
-        // Exclusive: each click moves the one shared cell (current = marked).
+
         cx.update(|window, cx| {
             window.within("sub-interval-add-group").click(1_usize, cx);
         });
@@ -35027,8 +30449,6 @@ mod tests {
         cx.update(|window, cx| window.close_sheet(cx));
     }
 
-    /// Ticket 08: the six interval presets render six distinct labels
-    /// (always/1h/6h/12h/24h/7d) — one choice each, no duplicates.
     #[test]
     fn t08_interval_presets_six_distinct_labels() {
         use crate::{format_interval_secs, INTERVAL_PRESETS};
@@ -35045,10 +30465,6 @@ mod tests {
         assert_eq!(labels.len(), 6, "six distinct labels: {labels:?}");
     }
 
-    /// Ticket 08: global auto-refresh off never gates an explicit refresh.
-    /// The automatic pass finds nothing while the manual selection still
-    /// lists the due sub; one sub's completion notifies once and stamps
-    /// only that sub's record.
     #[gpui_kit::test]
     fn t08_global_off_explicit_refresh_still_reports(cx: &mut TestAppContext) {
         use crate::refresh_summary_text;
@@ -35065,7 +30481,7 @@ mod tests {
         let one_label = one.label.clone();
         let two_id = two.id.clone();
         let now = now_unix();
-        // Two succeeds now → not due; One never refreshed → due.
+
         store
             .refresh_with_body(
                 &two_id,
@@ -35081,8 +30497,7 @@ mod tests {
                     .expect("kill writes");
             });
         });
-        // The kill-switch gates the automatic pass only — the explicit
-        // selection (the seam per-row Refresh reads) still lists the due sub.
+
         let (auto, manual) = view.read_with(cx, |view, _| {
             (
                 view.due_subscriptions().len(),
@@ -35098,13 +30513,13 @@ mod tests {
             vec![one_id.clone()],
             "explicit refresh still sees One"
         );
-        // The reported outcome names its own sub (pure copy seam).
+
         let (_, summary) = refresh_summary_text(&one_label, 1, 0, 0, 0, 0, 0, 0, 0);
         assert!(
             summary.starts_with("One:"),
             "outcome names its sub: {summary}"
         );
-        // One sub's completion notifies once and stamps only that sub.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.finish_subscription_refresh(
@@ -35140,8 +30555,6 @@ mod tests {
         assert_eq!(two_after, Some(now), "the other subscription untouched");
     }
 
-    /// Ticket 08: a plain-HTTP URL in the subscriptions form shows the
-    /// plaintext-fetch warning beside the URL field; https stays quiet.
     #[gpui_kit::test]
     fn t08_http_warning_beside_url_field(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -35151,8 +30564,7 @@ mod tests {
             view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // Type a plaintext URL → reopen carries the text (the same path a
-        // background completion takes) → the warning paints.
+
         cx.update(|window, cx| {
             let form = view.read_with(cx, |view, _| view.subs_form.clone());
             let form = form.expect("subs form stashed on open");
@@ -35165,7 +30577,7 @@ mod tests {
         });
         paint_dialog_open(cx);
         assert_painted(cx, "sub-add-http-warning");
-        // https → quiet.
+
         cx.update(|window, cx| {
             let form = view.read_with(cx, |view, _| view.subs_form.clone());
             let form = form.expect("subs form restashed");
@@ -35184,8 +30596,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Scenario: background tick refreshes 3 subs → at most one coalesced
-    /// toast, not three (pure message + headless batch).
     #[test]
     fn coalesced_refresh_message_single_toast() {
         use crate::coalesced_refresh_message;
@@ -35199,8 +30609,7 @@ mod tests {
         let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 2, 0, 0).expect("batch reports");
         assert!(warn, "failures warn: {text}");
         assert!(text.contains('2'), "failed count in: {text}");
-        // Ticket 26: preserved user edits surface in the coalesced copy and
-        // warn (a "clean" sync that silently kept yours would lie).
+
         let (warn, text) = coalesced_refresh_message(3, 5, 1, 0, 0, 2, 0).expect("batch reports");
         assert!(warn, "conflicts warn: {text}");
         assert!(
@@ -35209,7 +30618,6 @@ mod tests {
         );
     }
 
-    /// Scenario: 3 background completions flush exactly one toast.
     #[gpui_kit::test]
     fn background_batch_coalesces_to_one_toast(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -35252,8 +30660,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "three refreshes, one toast");
     }
 
-    /// Scenario: Start all on empty library / Stop on stopped row → honest
-    /// messages, never "Started 0" (pure copy).
     #[test]
     fn honest_start_stop_messages() {
         use crate::{already_stopped_message, start_all_message, stop_all_message};
@@ -35263,16 +30669,13 @@ mod tests {
         assert!(start_all_message(3).contains('3'));
         let idle = stop_all_message(0);
         assert!(idle.contains("Nothing to stop"), "honest: {idle}");
-        // Ticket 43: the stop-all success names the count, never a bare claim.
+
         let stopped = stop_all_message(2);
         assert!(stopped.contains('2'), "names the count: {stopped}");
         assert!(already_stopped_message("Work").contains("Work"));
         assert!(already_stopped_message("Work").contains("already stopped"));
     }
 
-    /// Ticket 43: stop-all confirm names the count + every row; restart
-    /// prompt names the row; removed-running says the endpoint stopped first;
-    /// duplicate names are unique.
     #[test]
     fn ticket43_honest_mutation_copy() {
         use crate::{
@@ -35313,8 +30716,6 @@ mod tests {
         );
     }
 
-    /// Ticket 43: single probe toasts name latency or the redacted cause;
-    /// multi probe toasts name both counts.
     #[test]
     fn ticket43_probe_result_toasts() {
         use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
@@ -35347,7 +30748,6 @@ mod tests {
         assert!(summary.contains('3') && summary.contains('2') && summary.contains('1'));
     }
 
-    /// Ticket 43: test-URL validation + precedence (row > global > default).
     #[test]
     fn ticket43_test_url_rules() {
         use crate::{effective_probe_url, normalize_test_url, DEFAULT_TEST_URL};
@@ -35372,7 +30772,6 @@ mod tests {
         assert_eq!(effective_probe_url(None, None), DEFAULT_TEST_URL);
     }
 
-    /// Ticket 43: traffic formatting (per-row + status) hides all-zero.
     #[test]
     fn ticket43_traffic_text() {
         use crate::{format_bytes, traffic_status_text, traffic_summary_text};
@@ -35387,8 +30786,6 @@ mod tests {
         assert!(status.contains("traffic"), "{status}");
     }
 
-    /// Ticket 43: extended search covers sub label, preset name, state words,
-    /// running words, and health words.
     #[test]
     fn ticket43_search_covers_sub_preset_state() {
         use crate::store::ProxyConfig;
@@ -35449,7 +30846,6 @@ mod tests {
         );
     }
 
-    /// Ticket 43: params format/validate are honest about bad JSON.
     #[test]
     fn ticket43_params_format_validate() {
         use crate::{format_params_json, validate_params_json};
@@ -35464,8 +30860,6 @@ mod tests {
         assert!(validate_params_json("{oops").is_err(), "broken JSON named");
     }
 
-    /// Ticket 43: import preview names the first failure pre-commit; browse
-    /// merge keeps stems and carries existing text.
     #[test]
     fn ticket43_import_preview_and_browse() {
         use crate::{browse_read_message, first_import_failure_reason, merge_browse_results};
@@ -35492,8 +30886,6 @@ mod tests {
         assert!(msg.contains('2') && msg.contains("a.conf"), "{msg}");
     }
 
-    /// Ticket 43: export overwrite gate names the path; log level filter
-    /// matches severities; sub members list names.
     #[test]
     fn ticket43_export_logs_subs_copy() {
         use crate::health::LogLevel;
@@ -35537,8 +30929,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 43: UI honesty slice (headless) ------------------------------
-
     fn ticket43_seed(name: &str, port: &str) -> NewConfig {
         NewConfig {
             name: name.to_string(),
@@ -35553,8 +30943,6 @@ mod tests {
         }
     }
 
-    /// Scenario: running row deleted → endpoint stops first, row disappears,
-    /// one toast (US-1).
     #[gpui_kit::test]
     fn ticket43_delete_running_stops_first(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -35595,8 +30983,6 @@ mod tests {
         );
     }
 
-    /// Scenario: running row edited → restart-to-apply toast (US-6); idle
-    /// row edited → plain updated toast.
     #[gpui_kit::test]
     fn ticket43_edit_running_prompts_restart(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -35638,8 +31024,6 @@ mod tests {
         );
     }
 
-    /// Scenario: nothing selected → Stop/Copy/Toggle/Test/Ping each toast
-    /// "Select a configuration first" (US-5).
     #[gpui_kit::test]
     fn ticket43_no_selection_toasts(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -35670,8 +31054,6 @@ mod tests {
         assert_eq!(notification_count(cx), before + 5, "every action toasts");
     }
 
-    /// Scenario: Duplicate → new disabled row, fresh auto port, unique name
-    /// (US-8).
     #[gpui_kit::test]
     fn ticket43_duplicate_creates_disabled_auto_row(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -35699,10 +31081,6 @@ mod tests {
         assert_eq!(copy.params, alpha.params);
     }
 
-    /// Throne-adoption 03: two rows, row A selected → row-targeted
-    /// actions (the seams the card right-click menu closes over) act on
-    /// row B, never the selection. Clipboard carries `bind:port` only —
-    /// never secrets.
     #[gpui_kit::test]
     fn t03_row_actions_target_clicked_row_not_selection(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -35746,10 +31124,6 @@ mod tests {
         );
     }
 
-    /// Throne-adoption 03: duplicate + move through row ids ignore the
-    /// selection too — the copy derives from row B (disabled, fresh
-    /// auto-port) and the move lands row B in the new group while row A
-    /// stays put.
     #[gpui_kit::test]
     fn t03_row_duplicate_and_move_ignore_selection(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -35803,12 +31177,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T08 (CAP-11): a share link on the clipboard +
-    /// the paste-intake binding opens the Import dialog prefilled with the
-    /// live valid/invalid preview — the same handler as the palette
-    /// `ImportClipboard` op (no regression, no new path). The
-    /// first-failure line paints only for a non-empty prefill, so it pins
-    /// the clipboard text landed in the box (an empty box stays neutral).
     #[gpui_kit::test]
     fn t08_paste_binding_opens_import_prefilled(cx: &mut TestAppContext) {
         use gpui_kit::Keystroke;
@@ -35822,8 +31190,7 @@ mod tests {
                     .to_string(),
             ));
         });
-        // Focus the shell so the library key context matches (keyboard-test
-        // precedent); the binding stays inert while typing or under a dialog.
+
         let focus = view.read_with(cx, |view, _| view.focus.clone());
         cx.update(|window, cx| window.focus(&focus, cx));
         let paste = Keystroke::parse("ctrl-v").expect("test keystroke parses");
@@ -35842,11 +31209,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 08 (cua-fixes): the paste-intake gate — importable shapes
-    /// pass (`None`, dialog opens as before), empty/non-importable
-    /// clipboards refuse with static copy (`Some`). The refusal never
-    /// echoes clipboard text (it may carry secrets). Pure gate, no window
-    /// needed.
     #[test]
     fn cua08_paste_intake_refusal_gates_prose_not_links() {
         assert_eq!(
@@ -35897,10 +31259,6 @@ mod tests {
         );
     }
 
-    /// Config-completeness T08 (CAP-12): the `direct` page is label-only —
-    /// switching to it rewrites the box to the bare marker and the dialog
-    /// commit carries no endpoint fields (form-level; the T01 virtual test
-    /// pins the Server/Port hiding through the real picker).
     #[gpui_kit::test]
     fn t08_direct_form_commits_bare_marker(cx: &mut TestAppContext) {
         use crate::store::protocol_params_template;
@@ -35922,7 +31280,6 @@ mod tests {
         assert_eq!(params, "{\"type\":\"direct\"}");
     }
 
-    /// Scenario: edited concrete port → "auto" returns to auto-assign (US-3).
     #[gpui_kit::test]
     fn ticket43_reauto_port_via_auto_word(cx: &mut TestAppContext) {
         use crate::store::ConfigPatch;
@@ -35956,8 +31313,6 @@ mod tests {
         assert!(crate::store::is_auto_port(row.port), "back to auto-assign");
     }
 
-    /// Scenario: N running → stop-all opens a confirm (no silent kill);
-    /// the post-confirm half stops everything with a counted toast (US-15).
     #[gpui_kit::test]
     fn ticket43_stop_all_confirms_naming_count(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -36008,8 +31363,6 @@ mod tests {
         );
     }
 
-    /// Scenario: Settings test URL validates + persists; blank clears to the
-    /// default; per-row override round-trips (US-11).
     #[gpui_kit::test]
     fn ticket43_test_url_commits(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -36056,8 +31409,6 @@ mod tests {
         assert!(!row_bad, "bad row URL fails");
     }
 
-    /// Scenario: selected Test toasts through the fake (latency recorded);
-    /// traffic reset zeroes one row; clear commits zero everything (US-12/14).
     #[gpui_kit::test]
     fn ticket43_probe_toast_and_traffic_resets(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -36134,8 +31485,6 @@ mod tests {
         );
     }
 
-    /// Scenario: preset edit validates pre-commit + duplicate copies rules
-    /// (US-17).
     #[gpui_kit::test]
     fn ticket43_preset_edit_and_duplicate(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -36185,8 +31534,6 @@ mod tests {
         assert!(presets.iter().any(|preset| preset.name == "Renamed copy"));
     }
 
-    /// Scenario: export writes to the chosen path with honest counts; browse
-    /// picks merge into the dialog (US-7/9 headless halves).
     #[gpui_kit::test]
     fn ticket43_export_to_path_and_browse_pick(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -36228,8 +31575,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Scenario: logs level filter narrows; copy-visible writes the clipboard
-    /// (US-13 headless halves).
     #[gpui_kit::test]
     fn ticket43_logs_level_and_copy(cx: &mut TestAppContext) {
         use crate::health::LogLevel;
@@ -36274,9 +31619,6 @@ mod tests {
         assert!(clip.contains("panic"), "clipboard carries visible lines");
     }
 
-    /// Lane B (B8): visible log lines redact secrets (dialog, Copy, and
-    /// Save share the path), the dialog discloses the redaction + the exact
-    /// Save destination, and Save gates on overwrite instead of clobbering.
     #[gpui_kit::test]
     fn laneb_logs_redact_and_save_gate(cx: &mut TestAppContext) {
         use crate::logs_overwrite_text;
@@ -36308,7 +31650,7 @@ mod tests {
             logs_overwrite_text(&path).contains(&path.display().to_string()),
             "overwrite gate names the destination"
         );
-        // The gate itself: no pre-existing file writes straight through.
+
         let _ = std::fs::remove_file(&path);
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
@@ -36321,7 +31663,7 @@ mod tests {
             "saved file carries no secrets: {body}"
         );
         let _ = std::fs::remove_file(&path);
-        // Dialog discloses the redaction note + the save destination.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
         });
@@ -36331,18 +31673,11 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// T07 (gpui-18-sweep CAP-8): a 10k-line tail stays virtualized and
-    /// redacted — the ring + 200-line visible window bound the work, the
-    /// dialog mounts only viewport rows (`log-line-<ix>`), level/filter
-    /// narrow through the same seam, the tail-reopen paints a `Spinner`,
-    /// and Pause/Resume keeps a stable width. No sleeps: all state flips
-    /// are synchronous dialog reopens.
     #[gpui_kit::test]
     fn t07_logs_virtualized_filter_level_tail(cx: &mut TestAppContext) {
         use crate::health::{LogLevel, LogTagIndex};
         cx.update(gpui_kit::init);
-        // Settle the dialog entrance animation so the toggle/level clicks'
-        // down/up share one position (dialog-click precedent).
+
         cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
@@ -36370,8 +31705,7 @@ mod tests {
                 view.log_tail = true;
             });
         });
-        // Perf by construction: the ring caps storage, the visible window
-        // caps the render snapshot (newest last while tailing).
+
         let visible = view.read_with(cx, |view, cx| view.visible_log_lines(cx));
         assert_eq!(visible.len(), 200, "visible window caps the tail");
         assert!(
@@ -36387,7 +31721,7 @@ mod tests {
                 );
             }
         }
-        // The dialog paints the virtualized viewport + streaming chrome.
+
         cx.simulate_resize(size(px(1000.), px(700.)));
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
@@ -36412,7 +31746,7 @@ mod tests {
             cx.update(|window, _| window.try_find("log-line-199").is_none()),
             "off-viewport rows never mount (virtualized, not a 200-child flex_col)"
         );
-        // Pause/Resume keeps a stable width; pausing drops the spinner.
+
         let pause_width = cx.update(|window, _| {
             window
                 .try_find("log-tail-toggle")
@@ -36443,15 +31777,14 @@ mod tests {
             pause_width, resume_width,
             "Pause/Resume keeps a stable width (no row reflow)"
         );
-        // Resuming reopens around the latest lines with the spinner back.
+
         cx.update(|window, cx| {
             window.click("log-tail-toggle", cx);
         });
         cx.run_until_parked();
         paint_dialog_open(cx);
         assert_painted(cx, "log-tail-spinner");
-        // The level row is the single level control — picking Error narrows
-        // through the same seam with no second switch beside it.
+
         cx.update(|window, cx| {
             window.within("log-level-row").click(4_usize, cx);
         });
@@ -36473,7 +31806,7 @@ mod tests {
         );
         assert_painted(cx, "log-line-0");
         assert_painted(cx, "log-tail-spinner");
-        // Copy carries the same redacted snapshot the dialog shows.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.copy_visible_logs(window, cx));
         });
@@ -36488,7 +31821,7 @@ mod tests {
         for secret in ["hunter2", "secret-abc", "555555555555"] {
             assert!(!clip.contains(secret), "clipboard stays redacted: {clip}");
         }
-        // Save writes exactly the visible redacted lines.
+
         let dir = std::env::temp_dir().join(format!("manyproxy-t07-logs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir creates");
         let path = dir.join("visible.txt");
@@ -36506,9 +31839,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// T07 (gpui-18-sweep CAP-8): the save disclosure names the exact
-    /// destination plus the `MANYPROXY_LOGS` override (pure seam — the
-    /// dialog paints the same string under `log-save-path`).
     #[test]
     fn t07_logs_save_path_discloses_override() {
         use crate::logs_save_path_text;
@@ -36523,10 +31853,6 @@ mod tests {
         );
     }
 
-    /// Lane B (B8): the guided identity secret renders masked (uuid /
-    /// password / token never sit visible in Add/Edit) while values still
-    /// set + fold normally; the subscription full-URL copy gates behind a
-    /// plaintext warning instead of copying the token outright.
     #[gpui_kit::test]
     fn laneb_identity_masked_and_sub_full_url_confirm(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -36568,11 +31894,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 02 (throne-adoption): the top bar is exactly five menus in
-    /// PROGRAM | SETTINGS | GROUPS | ROUTING | TOOLS order plus the
-    /// trailing round global Start/Stop — every command reachable with
-    /// unchanged handlers. Menu items render on open, so each menu is
-    /// opened (click its trigger) before asserting its items.
     #[gpui_kit::test]
     fn command_strip_all_ids_present(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -36580,7 +31901,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Always-visible strip: five menu triggers plus the global toggle.
+
         for id in [
             "program-menu",
             "settings-menu",
@@ -36594,8 +31915,7 @@ mod tests {
                 "{id} renders in the command strip"
             );
         }
-        // Retired lever/trigger ids never render (the five-menu rewrite
-        // supersedes the lever strip plus the interim menus).
+
         for id in [
             "add-config",
             "import-config",
@@ -36609,8 +31929,7 @@ mod tests {
                 "{id} stays retired"
             );
         }
-        // Left-to-right order: five triggers, then the global toggle last
-        // (row-major x positions on one nowrap row).
+
         let xs = cx.update(|window, _| {
             [
                 "program-menu",
@@ -36635,13 +31954,7 @@ mod tests {
             xs.windows(2).all(|pair| pair[0] <= pair[1]),
             "menus read PROGRAM | SETTINGS | GROUPS | ROUTING | TOOLS + global last: {xs:?}"
         );
-        // Open-then-assert: each menu shows its items (the Groups menu
-        // Groups item carries `menu-groups-dialog`: same dialog as the
-        // facet-bar `groups-dialog` button, distinct element id so headless
-        // lookups never see duplicates as ambiguous). Menus use
-        // `overlay_closable(false)`, so each menu is dismissed with Escape
-        // before the next opens — otherwise an open popover covers the next
-        // trigger and the click never reaches it.
+
         for (trigger, items) in [
             (
                 "program-menu",
@@ -36655,7 +31968,6 @@ mod tests {
                 ][..],
             ),
             ("settings-menu", &["settings-dialog"][..]),
-            // Ticket 09 (throne-adoption): group prunes ride the GROUPS menu.
             (
                 "groups-menu",
                 &[
@@ -36681,7 +31993,6 @@ mod tests {
                     "engine-start-all",
                     "engine-stop-all",
                     "health-test-all",
-                    // Ticket 09 (throne-adoption): Selected-vs-Group tests.
                     "test-group",
                     "speedtest-selected",
                     "speedtest-group",
@@ -36719,10 +32030,6 @@ mod tests {
         }
     }
 
-    /// Ticket 02 (throne-adoption a11y): every menu trigger, menu item,
-    /// and the global toggle announces its visible label (plus shortcut
-    /// where bound); no silent menu items. Headless `label()` reads the
-    /// native accessibility name.
     #[gpui_kit::test]
     fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -36730,8 +32037,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Menu triggers announce their visible labels (no shortcuts bound).
-        // The idle global toggle offers Start-all on an empty library.
+
         for (id, pinned) in [
             ("program-menu", "Program"),
             ("settings-menu", "Settings"),
@@ -36753,7 +32059,7 @@ mod tests {
                 "{id} announces its visible label"
             );
         }
-        // Menu items announce visible label + shortcut where bound.
+
         for (trigger, items) in [
             (
                 "program-menu",
@@ -36761,7 +32067,6 @@ mod tests {
                     ("menu-add-config", "Add configuration (Ctrl-N)"),
                     ("menu-import-config", "Import (Ctrl-O)"),
                     ("import-clipboard", "From clipboard (Ctrl-V)"),
-                    // Ticket 07 (throne-adoption): direct file-picker entry.
                     ("import-files", "From file(s)"),
                     ("export-library", "Export"),
                     ("about-dialog", "About"),
@@ -36773,7 +32078,6 @@ mod tests {
                 &[
                     ("subscriptions", "Subscriptions"),
                     ("menu-groups-dialog", "Groups"),
-                    // Ticket 09 (throne-adoption): prune labels pinned.
                     ("prune-duplicates", "Remove duplicates"),
                     ("prune-unavailable", "Remove unavailable"),
                     ("prune-invalid", "Remove invalid"),
@@ -36797,7 +32101,6 @@ mod tests {
                     ("engine-start-all", "Start all"),
                     ("engine-stop-all", "Stop all"),
                     ("health-test-all", "Test all"),
-                    // Ticket 09 (throne-adoption): test-action labels pinned.
                     ("test-group", "Test group"),
                     ("speedtest-selected", "Speedtest selected"),
                     ("speedtest-group", "Speedtest group"),
@@ -36843,14 +32146,6 @@ mod tests {
         }
     }
 
-    /// Ticket 07 (CUA US-5/CAP-5): PROGRAM menu UIA-walk snapshot — every
-    /// item exposes role MenuItem + its pinned accessible name through the
-    /// native accessibility facts (`role()`/`label()` read the same
-    /// AccessKit properties the OS UIA bridge serves). The committed
-    /// fixture `tests/fixtures/uia-program-menu.json` is the contract; the
-    /// live walk must match it entry for entry. The ticket names five
-    /// entries (`Add configuration`, `Import`, `From clipboard`,
-    /// `From file(s)`, `Export`); `About` rides the same menu and pins too.
     #[gpui_kit::test]
     fn cua07_program_menu_uia_walk_matches_fixture(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -36916,12 +32211,6 @@ mod tests {
         paint_frame(cx);
     }
 
-    /// Ticket 07 (CUA US-5/CAP-5): card context-menu UIA-walk snapshot —
-    /// all 15 items expose role MenuItem + name, and no sixteenth node
-    /// rides the `rowctx-` prefix. The committed fixture
-    /// `tests/fixtures/uia-card-context-menu.json` is the contract; the
-    /// observed native-fact walk (the same properties UIA serves) must
-    /// match it exactly as a set.
     #[gpui_kit::test]
     fn cua07_card_context_menu_exposes_fifteen_items(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -36974,7 +32263,7 @@ mod tests {
                 "{id} announces its fixture name"
             );
         }
-        // No sixteenth: every observed `rowctx-` node is one of the 15.
+
         let wanted: std::collections::HashSet<String> = items
             .iter()
             .map(|item| {
@@ -37020,11 +32309,6 @@ mod tests {
         paint_frame(cx);
     }
 
-    /// Ticket 07 (CUA US-5/CAP-5): keyboard fallback contract — the kit
-    /// `PopupMenu` bindings (arrows move, `Enter` confirms, `Esc`
-    /// dismisses) operate both menus with no mouse. PROGRAM: open, `Down`
-    /// selects the first item, `Enter` opens Add, `Esc` closes it with
-    /// nothing committed. Card menu: right-click opens, `Esc` dismisses.
     #[gpui_kit::test]
     fn cua07_menus_keyboard_operable(cx: &mut TestAppContext) {
         use gpui_kit::Keystroke;
@@ -37092,11 +32376,6 @@ mod tests {
         );
     }
 
-    /// Ticket 07 (CUA US-5/CAP-5): invoke parity spot-check — the Edit and
-    /// Test card-menu items reach the same postconditions as their
-    /// handlers: Edit opens the Edit dialog for THAT row, Test on a
-    /// stopped row toasts the honest not-running warning (no fakes needed:
-    /// a stopped row never touches the network).
     #[gpui_kit::test]
     fn cua07_card_menu_invoke_matches_click(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -37151,9 +32430,6 @@ mod tests {
         );
     }
 
-    /// Ticket 02 (throne-adoption layout): at the 880x620 minimum all five
-    /// menu triggers plus the global toggle share one row with nothing
-    /// clipped.
     #[gpui_kit::test]
     fn t02_toolbar_fits_one_row_at_880(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -37200,9 +32476,6 @@ mod tests {
         );
     }
 
-    /// Ticket 02 (throne-adoption handlers): each menu's item runs the
-    /// same handler as its palette twin (one item per menu exercised
-    /// headlessly).
     #[gpui_kit::test]
     fn t02_menu_items_run_same_handlers(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -37210,12 +32483,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Ticket 02: menus use `overlay_closable(false)` — dismiss with
-        // Escape before the next opens, otherwise an open popover covers
-        // the next trigger and the click never reaches it.
-        //
-        // PROGRAM: menu Add opens the add dialog (same handler the
-        // palette Add dispatches).
+
         cx.update(|window, cx| {
             window.click("program-menu", cx);
         });
@@ -37242,7 +32510,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // GROUPS: Subscriptions opens the subscriptions dialog.
+
         cx.update(|window, cx| {
             window.click("groups-menu", cx);
         });
@@ -37266,7 +32534,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // ROUTING: Routing presets opens the presets manager.
+
         cx.update(|window, cx| {
             window.click("routing-menu", cx);
         });
@@ -37290,9 +32558,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // SETTINGS: Settings opens the settings dialog. Runs before the
-        // toast-only tools item so the tools toast never covers a later
-        // trigger.
+
         cx.update(|window, cx| {
             window.click("settings-menu", cx);
         });
@@ -37323,9 +32589,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // TOOLS: Start all on an empty library toasts honestly (same
-        // handler the palette StartAll dispatches). Last so its toast
-        // never covers a later trigger.
+
         let before = notification_count(cx);
         cx.update(|window, cx| {
             window.click("tools-menu", cx);
@@ -37346,10 +32610,6 @@ mod tests {
         );
     }
 
-    /// Ticket 02 (throne-adoption): global toggle presentation pins the
-    /// three states at the pure seam — Idle offers Start-all, Running
-    /// offers Stop-all, busy offers only `Connecting…` (never a second
-    /// apply — see [`AppView::toggle_global_engines`]).
     #[test]
     fn t02_global_toggle_present_pins_three_states() {
         assert_eq!(crate::global_toggle_present(0, false), ("▶", "Start all"));
@@ -37358,8 +32618,6 @@ mod tests {
         assert_eq!(crate::global_toggle_present(2, true), ("…", "Connecting…"));
     }
 
-    /// Ticket 02 scenario: all stopped → global Start starts everything —
-    /// the toggle morphs to the stop glyph and one honest toast fires.
     #[gpui_kit::test]
     fn t02_global_start_all_stopped_starts_all(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -37379,7 +32637,7 @@ mod tests {
             });
         });
         paint_frame(cx);
-        // Idle toggle offers Start-all.
+
         let label = cx.update(|window, _| {
             window
                 .try_find("global-start-stop".to_string())
@@ -37400,7 +32658,7 @@ mod tests {
             "global Start starts every endpoint"
         );
         assert_eq!(notification_count(cx), before + 1, "one honest toast");
-        // Toggle morphs to the stop glyph.
+
         let label = cx.update(|window, _| {
             window
                 .try_find("global-start-stop".to_string())
@@ -37411,9 +32669,6 @@ mod tests {
         assert_eq!(label.as_deref(), Some("Stop all"));
     }
 
-    /// Ticket 02 scenario: empty library → global Start toasts honestly
-    /// (`Nothing to start`, pinned at the pure seam) — no crash, nothing
-    /// running, toggle stays on Start.
     #[gpui_kit::test]
     fn t02_global_start_empty_library_toasts_honestly(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -37454,9 +32709,6 @@ mod tests {
         assert_eq!(label.as_deref(), Some("Start all"));
     }
 
-    /// Ticket 02 scenario: a LAN-bound row gates the global Start behind
-    /// the confirm — the dialog opens naming the row, nothing serves yet
-    /// (same gate the menus, palette, and tray share).
     #[gpui_kit::test]
     fn t02_global_start_lan_rows_confirm_first(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -37490,9 +32742,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 02 prohibited side effect: no Tun / System Proxy / System
-    /// DNS (or adjacent system-mutation) controls anywhere on the top bar
-    /// — triggers and every menu item read clean (local-only promise).
     #[gpui_kit::test]
     fn t02_topbar_has_no_mode_controls(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -37501,7 +32750,7 @@ mod tests {
         let (_view, cx) = mount_view(store, cx);
         paint_frame(cx);
         let mut names: Vec<String> = Vec::new();
-        // Trigger names first (global toggle idle on an empty library).
+
         for id in [
             "program-menu",
             "settings-menu",
@@ -37519,8 +32768,7 @@ mod tests {
                     .unwrap_or_default()
             }));
         }
-        // Then every menu item (same homes `command_strip_all_ids_present`
-        // pins — menus open one at a time, Escape between).
+
         for (trigger, items) in [
             (
                 "program-menu",
@@ -37534,7 +32782,6 @@ mod tests {
                 ][..],
             ),
             ("settings-menu", &["settings-dialog"][..]),
-            // Ticket 09 (throne-adoption): group prunes ride the GROUPS menu.
             (
                 "groups-menu",
                 &[
@@ -37560,7 +32807,6 @@ mod tests {
                     "engine-start-all",
                     "engine-stop-all",
                     "health-test-all",
-                    // Ticket 09 (throne-adoption): Selected-vs-Group tests.
                     "test-group",
                     "speedtest-selected",
                     "speedtest-group",
@@ -37619,9 +32865,6 @@ mod tests {
         assert!(!names.is_empty(), "scanned the whole bar");
     }
 
-    /// Ticket 02 (throne-adoption): the PROGRAM menu Import entry opens
-    /// the same import dialog (regroup, not rewiring — verified by click),
-    /// carrying the Ctrl-O hint.
     #[gpui_kit::test]
     fn t03_toolbar_import_opens_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -37655,9 +32898,6 @@ mod tests {
         paint_frame(cx);
     }
 
-    /// Signal-box 03: the visible search affordance focuses the library
-    /// search field (one click or Tab+Enter lands in the query input —
-    /// the keyboard path stays mouseless from there).
     #[gpui_kit::test]
     fn t03_search_focus_button_focuses_query(cx: &mut TestAppContext) {
         use gpui_kit::Focusable as _;
@@ -37671,8 +32911,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // A searchable `List` focuses its query input, so the focused
-        // handle must equal the libraries' focus handle afterwards.
+
         let query_focused = cx.update(|window, cx| {
             let handle = view.read(cx).libraries.read(cx).focus_handle(cx);
             window.focused(cx).as_ref() == Some(&handle)
@@ -37683,9 +32922,6 @@ mod tests {
         );
     }
 
-    /// Signal-box 03: a file drop while a dialog is open refuses honestly —
-    /// no stacked import dialog, one toast naming the block (refusal is
-    /// toast-only; no persistent hint band).
     #[gpui_kit::test]
     fn t03_drop_while_dialog_open_refuses_honestly(cx: &mut TestAppContext) {
         use gpui_kit::ExternalPaths;
@@ -37709,13 +32945,11 @@ mod tests {
             before + 1,
             "blocked drop toasts honestly"
         );
-        // Still exactly the Add dialog — no stacked import dialog.
+
         assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
         assert!(cx.update(|window, _| window.try_find("import-dialog-ok").is_none()));
     }
 
-    /// Scenario: subscription expand flips + toolbar/empty/params/import/
-    /// settings chrome paints (US-2/4/9/10/13/16/19 paint halves).
     #[gpui_kit::test]
     fn ticket43_chrome_paints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -37723,12 +32957,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Ticket 02 (throne-adoption): the lever strip is five menus plus
-        // the global toggle — selected ops live in TOOLS (same handlers)
-        // and stay on the cards/bulk bar, so presence here pins the new
-        // homes (the toolbar overflows at test width, so presence — not
-        // paint — is the assertion here, matching the existing
-        // engine-status precedent).
+
         for id in [
             "tools-menu",
             "global-start-stop",
@@ -37758,10 +32987,7 @@ mod tests {
             view.update(cx, |view, cx| view.open_add_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // Ticket 05: the add dialog opens guided-first — the mini-form and
-        // the Advanced toggle paint while the raw JSON stays disclosed.
-        // Ticket 06: the default type (vless) owns its secret in the type
-        // box, so the generic Identity row stays unmounted (single secret).
+
         assert_painted(cx, "field-guided-server");
         assert_painted(cx, "field-guided-port");
         assert_absent(cx, "field-guided-identity".to_string());
@@ -37795,8 +33021,7 @@ mod tests {
         assert_painted(cx, "settings-save-test-url");
         assert_painted(cx, "settings-section-startup");
         assert_painted(cx, "settings-section-probe");
-        // The dialog scrolls at test height — below-the-fold controls assert
-        // presence (they render in the completed frame).
+
         for id in [
             "settings-ticks",
             "settings-section-paths",
@@ -37823,9 +33048,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Lane B (B7): the Settings destructive buttons gate behind naming
-    /// confirms — the click opens a confirm dialog (no silent one-click
-    /// wipe) and the copy names the scope.
     #[gpui_kit::test]
     fn laneb_settings_clears_confirm(cx: &mut TestAppContext) {
         use crate::{
@@ -37872,7 +33094,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Scenario: honest empty start-all and stop-on-stopped toasts headless.
     #[gpui_kit::test]
     fn empty_start_and_stopped_stop_warn_honestly(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -37880,7 +33101,7 @@ mod tests {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         store.add(seed_input("Work")).expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Empty-library arm first: remove the seed so start-all is honest.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 let rows = view.store.list().expect("list works");
@@ -37924,8 +33145,6 @@ mod tests {
         assert_eq!(notification_count(cx), 3, "idle stop-all warns once");
     }
 
-    /// Scenario: search matches host/bind/port as well as
-    /// name/protocol/group (pure matcher + delegate filter).
     #[test]
     fn library_search_matches_host_bind_port() {
         use crate::store::ProxyConfig;
@@ -37977,9 +33196,6 @@ mod tests {
         assert_eq!(delegate.visible.len(), 2, "empty query shows all");
     }
 
-    /// Ticket 47 (RED): the delegate search index answers exactly like the
-    /// per-row scan across nasty inputs — identical filter semantics
-    /// (ticket 44 owns the semantics; this only caches them).
     #[test]
     fn t47_search_index_matches_scan_parity() {
         use crate::store::ProxyConfig;
@@ -38103,9 +33319,6 @@ mod tests {
         }
     }
 
-    /// Ticket 47 merge: the extended index agrees with
-    /// [`library_row_matches_full`] under a non-empty context (labels,
-    /// serving set, health summaries, mixed enabled flags).
     #[test]
     fn t47_search_index_matches_full_with_context() {
         use crate::store::ProxyConfig;
@@ -38170,8 +33383,6 @@ mod tests {
         }
     }
 
-    /// Ticket 44: group + status + protocol facets AND with the text query;
-    /// visible rows satisfy every predicate at once.
     #[test]
     fn t44_facets_and_with_text_query() {
         use crate::store::ProxyConfig;
@@ -38203,11 +33414,11 @@ mod tests {
         health.insert("1".to_string(), "87ms".to_string());
         health.insert("3".to_string(), "dead".to_string());
         delegate.set_health(health);
-        // Text alone matches two vless rows.
+
         delegate.query = "vless".to_string();
         delegate.apply_filter();
         assert_eq!(delegate.visible.len(), 2);
-        // Group facet narrows to the team vless row only.
+
         delegate.set_facet_group(Some("team".to_string()));
         let shown: Vec<String> = delegate
             .visible
@@ -38215,7 +33426,7 @@ mod tests {
             .map(|&i| delegate.rows[i].id.clone())
             .collect();
         assert_eq!(shown, vec!["1".to_string()]);
-        // Status facet ANDs further: Stopped excludes running row 1.
+
         delegate.set_facet_status(Some(FacetStatus::Stopped));
         assert!(delegate.visible.is_empty(), "all predicates must hold");
         delegate.set_facet_status(Some(FacetStatus::Running));
@@ -38225,8 +33436,7 @@ mod tests {
             .map(|&i| delegate.rows[i].id.clone())
             .collect();
         assert_eq!(shown, vec!["1".to_string()]);
-        // Protocol facet is exact, not substring: "VLES" matches no
-        // protocol even though every vless row contains it.
+
         delegate.query = String::new();
         delegate.set_facet_status(None);
         delegate.set_facet_protocol(Some("VLES".to_string()));
@@ -38248,7 +33458,7 @@ mod tests {
             .map(|&i| delegate.rows[i].id.clone())
             .collect();
         assert_eq!(shown, vec!["2".to_string()]);
-        // Live/Dead/Untested/Enabled/Disabled arms.
+
         delegate.query = String::new();
         delegate.set_facet_protocol(None);
         delegate.set_facet_status(Some(FacetStatus::Live));
@@ -38279,16 +33489,13 @@ mod tests {
             .map(|&i| delegate.rows[i].id.clone())
             .collect();
         assert_eq!(shown, vec!["2".to_string()]);
-        // Clearing restores the full list; query untouched by facet clears.
+
         delegate.query = "a".to_string();
         delegate.clear_facets();
         assert_eq!(delegate.visible.len(), 3);
         assert_eq!(delegate.query, "a");
     }
 
-    /// Ticket 44: the bulk set survives filtering (hidden members stay
-    /// checked), the label names both counts under a filter, and `set_rows`
-    /// prunes vanished ids.
     #[test]
     fn t44_checked_set_honest_label_and_prune() {
         use crate::store::ProxyConfig;
@@ -38320,7 +33527,7 @@ mod tests {
         delegate.toggle_checked("ghost");
         assert_eq!(delegate.checked.len(), 2, "unknown ids never check");
         assert_eq!(delegate.bulk_label(), "2 checked (of 3 visible)");
-        // Filter hides a member: set intact, label honest, rows in order.
+
         delegate.query = "alpha".to_string();
         delegate.apply_filter();
         assert_eq!(delegate.checked.len(), 2);
@@ -38331,12 +33538,12 @@ mod tests {
             .map(|r| r.id.clone())
             .collect();
         assert_eq!(checked, vec!["1".to_string(), "3".to_string()]);
-        // Facets also drive the `(M visible)` arm.
+
         delegate.query = String::new();
         delegate.set_facet_group(Some("nope".to_string()));
         assert_eq!(delegate.bulk_label(), "2 checked (of 0 visible)");
         delegate.clear_facets();
-        // Reload without row 3 prunes it; toggle twice round-trips.
+
         delegate.set_rows(vec![row("1", "Alpha", "g"), row("2", "Beta", "g")]);
         assert_eq!(delegate.checked.len(), 1);
         assert_eq!(delegate.bulk_label(), "1 checked (of 2 visible)");
@@ -38346,9 +33553,6 @@ mod tests {
         assert_eq!(delegate.bulk_label(), "");
     }
 
-    /// Ticket 09 (throne-adoption): Show-Security splices the posture into
-    /// the meta line only when on; `Type|Security` reorders the visible
-    /// indices only (store order untouched).
     #[test]
     fn t09_show_security_and_type_security_sort() {
         use crate::apply_show_security;
@@ -38408,8 +33612,6 @@ mod tests {
         assert!(delegate.show_security);
     }
 
-    /// Ticket 09 (throne-adoption): group/speed/out-ip/resolve texts name
-    /// their scope (never a blind toast).
     #[test]
     fn t09_group_toast_texts_name_scope() {
         use crate::health::{SpeedtestMode, SpeedtestOutcome};
@@ -38485,10 +33687,6 @@ mod tests {
         assert!(message.contains("1 failed"), "names failures: {message}");
     }
 
-    /// Ticket 01: selection grammar at the delegate seam — checked rows
-    /// carry 1-based count-chip positions in library order while the wash
-    /// (selection) names a different row; the bulk label names both
-    /// counts; selection and checks never retarget each other.
     #[test]
     fn t01_checked_positions_and_selection_stay_distinct() {
         use crate::store::ProxyConfig;
@@ -38536,7 +33734,7 @@ mod tests {
             vec!["1".to_string(), "3".to_string()],
             "bulk acts on the checked set, never the selection"
         );
-        // Unchecking re-numbers the chips; clearing selection keeps checks.
+
         delegate.toggle_checked("1");
         assert_eq!(delegate.checked_position("3"), Some(1));
         assert_eq!(delegate.bulk_label(), "1 checked (of 3 visible)");
@@ -38548,9 +33746,6 @@ mod tests {
         );
     }
 
-    /// Ticket 01: the detail header names the acting row — the selected
-    /// row, which is also the F5/detail-Start target (`selected_config`).
-    /// The checked set stays a different target.
     #[test]
     fn t01_detail_header_names_acting_row() {
         use crate::acting_on_label;
@@ -38585,8 +33780,6 @@ mod tests {
         assert_ne!(acting.id, "1", "header names the selection, not a check");
     }
 
-    /// Ticket 44: facet pickers inventory the real rows (labels + counts,
-    /// protocols), never free text.
     #[test]
     fn t44_facet_options_inventory_rows() {
         use crate::store::ProxyConfig;
@@ -38616,15 +33809,12 @@ mod tests {
             delegate.group_options(),
             vec![("lab".to_string(), 1), ("team".to_string(), 2)]
         );
-        // Ticket 03: protocol options carry result counts like groups
-        // (same-commit seam update: `protocol_options` now returns
-        // `(label, count)` so the picker trigger names choice + count).
+
         assert_eq!(
             delegate.protocol_options(),
             vec![("vless".to_string(), 2), ("vmess".to_string(), 1)]
         );
-        // Ticket 02 (throne-density): the closed picker label carries the
-        // live count too, so the count reads without opening the menu.
+
         use crate::FacetMenu;
         let (group_choices, _) = FacetMenu::Group.choices(&delegate);
         let team = group_choices
@@ -38638,8 +33828,6 @@ mod tests {
         );
     }
 
-    /// Ticket 44 UI: facet bar, bulk bar, and row checkboxes paint with stable
-    /// domain ids. The bulk label stays honest under a filter.
     #[gpui_kit::test]
     fn t44_ui_bars_and_row_checks_paint(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -38657,16 +33845,14 @@ mod tests {
         assert_painted(cx, "facet-group");
         assert_painted(cx, "facet-protocol");
         assert_painted(cx, "facet-status");
-        // Review follow-up: kit `Select` has no tooltip slot, so each
-        // picker rides in a hover wrapper — the wrappers must paint too,
-        // or the facet tooltips silently vanish again.
+
         assert_painted(cx, "facet-group-tip");
         assert_painted(cx, "facet-protocol-tip");
         assert_painted(cx, "facet-status-tip");
         assert_painted(cx, "groups-dialog");
         assert_painted(cx, &format!("check-{}", first.id));
         assert_painted(cx, &format!("check-{}", second.id));
-        // Check one row: the bulk bar names the set honestly.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -38691,7 +33877,7 @@ mod tests {
             view.libraries.read(cx).delegate().bulk_label()
         });
         assert_eq!(label, "1 checked (of 2 visible)");
-        // Filter to the other row: the set stays, the label names both counts.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -38706,7 +33892,7 @@ mod tests {
             view.libraries.read(cx).delegate().bulk_label()
         });
         assert_eq!(label, "1 checked (of 1 visible)");
-        // Select-visible checks the visible row too; clear empties the set.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.select_visible_checked(window, cx));
         });
@@ -38723,9 +33909,6 @@ mod tests {
         assert_eq!(label, "");
     }
 
-    /// Lane B (B5): the bulk bar wraps inside the minimum frame — with two
-    /// rows checked every bulk action paints within 880x620 (no clipped
-    /// tail like the old toolbar `He…` clip).
     #[gpui_kit::test]
     fn laneb_bulk_bar_wraps_within_min_frame(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -38769,9 +33952,6 @@ mod tests {
         }
     }
 
-    /// Ticket 01 UI: two rows checked plus a third selected — the checked
-    /// rows paint count chips, the selected-only row paints none, and the
-    /// bulk bar names both counts.
     #[gpui_kit::test]
     fn t01_selection_grammar_paints(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -38805,8 +33985,7 @@ mod tests {
         assert_absent(cx, format!("row-check-chip-{}", third.id));
         assert_painted(cx, "bulk-bar");
         assert_painted(cx, "bulk-label");
-        // The third row is selected: the detail header echoes it as the
-        // acting row (the F5/detail-Start target).
+
         assert_painted(cx, "detail-acting-on");
         let label = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().bulk_label()
@@ -38814,10 +33993,6 @@ mod tests {
         assert_eq!(label, "2 checked (of 3 visible)");
     }
 
-    /// Ticket 01 (ui-polish): the dense meta line carries at most 3 facts so
-    /// a 50-row library stays scannable; the full 5-fact route (protocol,
-    /// upstream, group, bind:port, enabled) stays available via
-    /// [`library_row_full_route`] for the meta tooltip and detail pane.
     #[test]
     fn t01_dense_meta_carries_at_most_three_facts() {
         use crate::store::ProxyConfig;
@@ -38856,7 +34031,7 @@ mod tests {
                 dense[1]
             );
         }
-        // Serving state reads without color alone: pinned ●/○ glyphs.
+
         assert!(
             dense[2].contains('●'),
             "running badge carries its glyph:\n{}",
@@ -38884,9 +34059,6 @@ mod tests {
         }
     }
 
-    /// Ticket 01 UI: one row both selected and bulk-checked — the card keeps
-    /// the selection wash (the detail header echoes it as the acting row)
-    /// while the checked rim + numeral chip stay painted on the same row.
     #[gpui_kit::test]
     fn t01_combined_selected_and_checked_shows_both(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -38910,11 +34082,11 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Wash: the selected row owns the detail header echo.
+
         assert_painted(cx, &format!("library-row-{}", only.id));
         assert_painted(cx, &format!("row-card-{}", only.id));
         assert_painted(cx, "detail-acting-on");
-        // Rim + numeral chip: the same row is still bulk-checked.
+
         assert_painted(cx, &format!("check-{}", only.id));
         assert_painted(cx, &format!("row-check-chip-{}", only.id));
         assert_painted(cx, "bulk-bar");
@@ -38926,8 +34098,6 @@ mod tests {
         assert_eq!(label, "1 checked (of 1 visible)");
     }
 
-    /// Ticket 01 UI: the occupancy lamp keeps a 12px-minimum target while
-    /// serving, so the state signal stays hittable at 50-row density.
     #[gpui_kit::test]
     fn t01_lamp_meets_twelve_px_minimum(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -38958,8 +34128,6 @@ mod tests {
         );
     }
 
-    /// Ticket 44 UI: Escape clears the checked set with no dialog open and
-    /// preserves it while a dialog owns Escape for its own dismiss.
     #[gpui_kit::test]
     fn t44_ui_escape_clears_checked_only_without_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -38977,7 +34145,7 @@ mod tests {
                 });
             });
         });
-        // No dialog open: clears and reports true.
+
         let cleared = cx.update(|window, cx| {
             view.update(cx, |view, cx| view.clear_checked_unless_dialog(window, cx))
         });
@@ -38988,7 +34156,7 @@ mod tests {
             }),
             ""
         );
-        // Dialog open: preserves the set and reports false.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -39015,8 +34183,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 44 UI: bulk enable/disable writes every checked row with one
-    /// reload and one honest toast; empty sets explain themselves.
     #[gpui_kit::test]
     fn t44_ui_bulk_enable_commits(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39029,13 +34195,13 @@ mod tests {
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
         cx.run_until_parked();
-        // Empty set explains itself, never a silent no-op.
+
         let before = notification_count(cx);
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.commit_bulk_enable(true, window, cx));
         });
         assert_eq!(notification_count(cx), before + 1);
-        // Check both, enable, then disable.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -39071,8 +34237,6 @@ mod tests {
         assert!(enabled.iter().all(|&flag| !flag), "both disabled");
     }
 
-    /// Ticket 44 UI: bulk move lands rows in the target group; rename moves
-    /// the label; delete refuses while rows remain and clears empty labels.
     #[gpui_kit::test]
     fn t44_ui_bulk_move_and_group_manager(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39104,7 +34268,7 @@ mod tests {
             view.store.group_counts().expect("counts work")
         });
         assert_eq!(groups, vec![("team".to_string(), 2)]);
-        // Empty names keep the dialog open for a fix.
+
         let single = [first.id.clone()];
         let kept = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -39112,7 +34276,7 @@ mod tests {
             })
         });
         assert!(!kept, "empty group keeps the dialog open");
-        // Rename the label; delete refuses while rows remain.
+
         let renamed = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.commit_rename_group("team", "crew", window, cx)
@@ -39132,7 +34296,7 @@ mod tests {
             before + 1,
             "non-empty delete refuses loudly"
         );
-        // Empty labels delete clean.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.commit_delete_group("ghost-label", window, cx)
@@ -39147,9 +34311,6 @@ mod tests {
         );
     }
 
-    /// Ticket 44 (06 parity): renaming `home` → `cabin` refreshes facet
-    /// options and the synced picker (new name with correct counts, old name
-    /// gone) and the inspector follows the selected row into the new label.
     #[gpui_kit::test]
     fn t44_ui_rename_group_refreshes_facets_and_inspector(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -39164,7 +34325,7 @@ mod tests {
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
         cx.run_until_parked();
-        // Pin the selection so the inspector has a row to follow.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -39179,8 +34340,7 @@ mod tests {
             })
         });
         assert!(renamed, "rename commits");
-        // Facet options carry the new name with the moved count; the old
-        // label is gone from options and from the synced picker.
+
         let options = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().group_options()
         });
@@ -39207,7 +34367,7 @@ mod tests {
             synced.iter().any(|id| id == "facet-group-cabin"),
             "synced picker ids follow the rename: {synced:?}"
         );
-        // Inspector follows the selected row into the new label.
+
         let selected = view.read_with(cx, |view, cx| view.selected_config(cx));
         assert_eq!(
             selected.map(|row| row.group),
@@ -39216,10 +34376,6 @@ mod tests {
         );
     }
 
-    /// Ticket 44 (06 parity): deleting a group that still holds rows refuses
-    /// loudly (existing store copy names the count), deletes nothing, and
-    /// keeps the rows; a slashed label slugifies to a safe element id while
-    /// display stays verbatim.
     #[gpui_kit::test]
     fn t44_ui_delete_group_refuses_while_rows_remain(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39249,8 +34405,7 @@ mod tests {
             rows.iter().all(|row| row.group == "site/east"),
             "rows keep the verbatim label"
         );
-        // The slashed label never reaches an element id raw: the facet id
-        // slugs the slash away while the title stays verbatim with counts.
+
         let (choices, _) = view.read_with(cx, |view, cx| {
             crate::FacetMenu::Group.choices(view.libraries.read(cx).delegate())
         });
@@ -39271,9 +34426,6 @@ mod tests {
         assert!(!slashed.id.contains('/'), "no raw slash in element ids");
     }
 
-    /// Lane B (B7): group delete gates behind a count-naming confirm — the
-    /// copy names the group + row count for both arms, and opening the gate
-    /// raises a dialog (the commit itself stays dialog-free).
     #[gpui_kit::test]
     fn laneb_group_delete_confirms_naming_count(cx: &mut TestAppContext) {
         assert!(
@@ -39307,9 +34459,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 44 (06 parity): group-label slug keeps plain names stable
-    /// (existing `facet-group-travel` ids never shift) and maps every other
-    /// byte to a dash (slashes/spaces never reach an element id).
     #[test]
     fn t44_slugify_group_id_keeps_plain_names_stable() {
         assert_eq!(crate::slugify_group_id("travel"), "travel");
@@ -39321,7 +34470,6 @@ mod tests {
         assert_eq!(crate::slugify_group_id(""), "group");
     }
 
-    /// Ticket 44 UI: facet pickers narrow the visible list; clear restores it.
     #[gpui_kit::test]
     fn t44_ui_facets_filter_and_clear(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39335,8 +34483,7 @@ mod tests {
         let (view, cx) = mount_view(store, cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Group facet narrows to the travel rows (both seeds share it), then
-        // a missing label empties the view without losing rows.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -39384,7 +34531,7 @@ mod tests {
             }),
             2
         );
-        // Status round-trips through the label parser.
+
         for status in crate::FacetStatus::ALL {
             let parsed = crate::FacetStatus::from_label(status.label());
             assert_eq!(parsed, Some(status), "label round-trips");
@@ -39392,10 +34539,6 @@ mod tests {
         assert_eq!(crate::FacetStatus::from_label("Nope"), None);
     }
 
-    /// Ticket 44: search never matches credential fields. A row whose params
-    /// carry a password/uuid/token matches its upstream host but never the
-    /// secret values — across the base matcher, the extended matcher, and
-    /// the precomputed [`crate::RowSearchIndex`] path (delegate filter).
     #[test]
     fn w1_search_never_matches_credentials() {
         use crate::store::ProxyConfig;
@@ -39413,13 +34556,12 @@ mod tests {
             identity_key: None,
             preset_id: None,
         };
-        // The upstream host is searchable (acceptance: name/protocol/group/
-        // bind/port/upstream-server).
+
         assert!(library_row_matches(&row, "a.example.com"));
         assert!(library_row_matches(&row, "10801"));
         let ctx = MatchContext::default();
         assert!(library_row_matches_full(&row, "a.example.com", &ctx));
-        // Credential values never match on any path.
+
         for secret in ["hunter2", "SECRET-UUID", "abc123", "HUNTER2"] {
             assert!(
                 !library_row_matches(&row, secret),
@@ -39430,8 +34572,7 @@ mod tests {
                 "extended matcher leaks {secret}"
             );
         }
-        // The delegate index agrees (production filter path, not just the
-        // oracle functions).
+
         let mut delegate = LibraryDelegate::new();
         delegate.set_rows(vec![row]);
         for secret in ["hunter2", "SECRET-UUID", "abc123"] {
@@ -39448,9 +34589,6 @@ mod tests {
         assert_eq!(delegate.visible.len(), 1, "upstream still searchable");
     }
 
-    /// Ticket 44: the virtualized library holds 50 rows at the 1000x700
-    /// desktop frame — counts stay exact, the list + status bar paint, and
-    /// search narrows without a rebuild.
     #[gpui_kit::test]
     fn w1_library_fifty_rows_paint_and_filter(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39480,7 +34618,7 @@ mod tests {
         assert_painted(cx, "config-list");
         assert_painted(cx, "status-count");
         assert_painted(cx, &format!("library-row-{}", ids[0]));
-        // Search narrows the painted set; clearing restores all 50.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -39521,21 +34659,15 @@ mod tests {
         );
     }
 
-    /// W1: the row lifecycle state machine — stopped → starting → running,
-    /// with failed for serving rows whose sidecar died or whose health reads
-    /// dead. Starting dominates (a second Start is ignored, never
-    /// double-applied); Failed dominates Running so a dead endpoint never
-    /// counts as healthy-running; only Starting changes the Start copy.
     #[test]
     fn w1_row_phase_precedence_and_start_copy() {
         use crate::RowPhase;
         assert_eq!(RowPhase::of(false, false, false), RowPhase::Stopped);
         assert_eq!(RowPhase::of(true, false, false), RowPhase::Running);
         assert_eq!(RowPhase::of(true, false, true), RowPhase::Failed);
-        // Failed evidence on a non-serving row still reports Failed (the row
-        // needs attention), but the Start copy is identical either way.
+
         assert_eq!(RowPhase::of(false, false, true), RowPhase::Failed);
-        // Starting dominates everything (the in-flight guard is global).
+
         assert_eq!(RowPhase::of(false, true, false), RowPhase::Starting);
         assert_eq!(RowPhase::of(true, true, false), RowPhase::Starting);
         assert_eq!(RowPhase::of(true, true, true), RowPhase::Starting);
@@ -39545,9 +34677,6 @@ mod tests {
         assert_eq!(RowPhase::Starting.start_label(), "Starting…");
     }
 
-    /// Ticket 47 (RED): filter + render serve from the set_rows caches -
-    /// poisoning params after set_rows changes neither (zero per-row parses
-    /// at filter/render time).
     #[test]
     fn t47_delegate_caches_survive_params_poison() {
         use crate::store::ProxyConfig;
@@ -39569,8 +34698,7 @@ mod tests {
         delegate.set_rows(vec![row]);
         let before = delegate.upstream_for("1").map(str::to_string);
         assert_eq!(before.as_deref(), Some("a.example.com:443"));
-        // Poison the stored params: any live parse at filter/render time
-        // would now give a different answer.
+
         delegate.rows[0].params = "not json{{{".to_string();
         delegate.query = "a.example.com".to_string();
         delegate.apply_filter();
@@ -39584,13 +34712,11 @@ mod tests {
             before,
             "render served from the cache, not a live parse"
         );
-        // The oracle confirms the poison worked (a live scan disagrees).
+
         assert!(!library_row_matches(&delegate.rows[0], "a.example.com"));
         assert_eq!(upstream_host_port(&delegate.rows[0]), None);
     }
 
-    /// Scenario: add/edit with a non-loopback bind → inline hint that
-    /// starting will need the LAN confirm.
     #[test]
     fn lan_hint_for_bind() {
         use crate::lan_hint_for_bind;
@@ -39602,8 +34728,6 @@ mod tests {
         assert!(hint.contains("LAN confirm"), "names the gate: {hint}");
     }
 
-    /// Scenario: add dialog with a LAN bind shows the inline hint; the
-    /// loopback add dialog shows none.
     #[gpui_kit::test]
     fn add_dialog_shows_lan_hint_only_for_lan_bind(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39658,7 +34782,6 @@ mod tests {
         );
     }
 
-    /// Scenario: dropped file names render as basenames (never full paths).
     #[test]
     fn import_files_label_basenames() {
         use crate::import_files_label;
@@ -39679,14 +34802,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 18: dialog footers (mouse OK/Cancel on every plain dialog) ---
-
-    /// Paint the freshly opened dialog to rest (same two-frame rhythm the
-    /// existing dialog tests use) so footer buttons are visible + clickable.
-    /// Callers set reduce-motion first (see below): without it the dialog's
-    /// 250ms slide-down entrance can still be in flight under parallel-test
-    /// load, moving the button between the click's down/up frames and
-    /// flaking the hit.
     fn paint_dialog_open(cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
@@ -39699,15 +34814,10 @@ mod tests {
         });
     }
 
-    /// Scenario: import dialog with valid text → click OK → rows created,
-    /// dialog closes, one success toast. This is the previously-missing mouse
-    /// path end to end (plain `Dialog` paints no footer buttons on its own).
     #[gpui_kit::test]
     fn dialog_footer_ok_commits_import_end_to_end(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        // Settle the dialog entrance animation on its first frame so the
-        // click's down/up frames share one button position (framework's own
-        // dialog tests do the same).
+
         cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
@@ -39749,7 +34859,6 @@ mod tests {
         assert_eq!(group, "travel");
     }
 
-    /// Scenario: add dialog → click Cancel → dialog closes, no row created.
     #[gpui_kit::test]
     fn dialog_footer_cancel_closes_add_without_row(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39782,9 +34891,6 @@ mod tests {
         assert_eq!(notification_count(cx), 0, "Cancel fires no toast");
     }
 
-    /// Scenario: every overlay call site renders a footer with stable
-    /// button ids — no dialog relies on the key-only commit path, and no
-    /// sheet invents one (footer buttons are the sheet commit path).
     #[gpui_kit::test]
     fn dialog_footers_audit_every_plain_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39811,8 +34917,7 @@ mod tests {
                     "add" => view.open_add_dialog(window, cx),
                     "edit" => view.open_edit_dialog(target, window, cx),
                     "import" => view.open_import_dialog("vless://x", "travel", None, window, cx),
-                    // Ticket 05: export rides the same shared commit path
-                    // (footer OK + Confirm key through one closure).
+
                     "export" => view.open_export_dialog(window, cx),
                     "subscriptions" => view.open_subscriptions_dialog(window, cx),
                     "presets" => view.open_presets_dialog(window, cx),
@@ -39820,9 +34925,7 @@ mod tests {
                 });
             });
             paint_dialog_open(cx);
-            // T08 (gpui-18-sweep CAP-9): subscriptions + logs open as
-            // sheets (reference flows), never dialogs; true commits stay
-            // dialogs. Every overlay still renders its footer verbs.
+
             let is_sheet = open == "subscriptions" || open == "logs";
             if is_sheet {
                 assert!(
@@ -39855,8 +34958,6 @@ mod tests {
         }
     }
 
-    /// Scenario: footer OK with an invalid form behaves exactly like the
-    /// Enter path — stays open + error, never a silent close.
     #[gpui_kit::test]
     fn dialog_footer_ok_invalid_import_stays_open(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39890,12 +34991,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "one error notice, never silent");
     }
 
-    /// Ticket 05 scenario 1: honest footer labels — one source pins every
-    /// commit label, so a future lie fails here instead of hiding inline.
-    /// Pure-close dialogs read `Close`; commits name their verb; the Logs
-    /// filter commit is distinct from discarding; never a bare `OK`.
-    /// Ticket 03 (US-3): the pure-close set pins `Close` (the shared footer
-    /// renders Close-only exactly for these labels).
     #[test]
     fn honest_footer_labels_name_their_effect() {
         use crate::footer_commit_label;
@@ -39947,10 +35042,6 @@ mod tests {
         assert_eq!(footer_commit_label("group-rename"), "Rename");
     }
 
-    /// Ticket 03 (US-3): single-close footers — Settings and Runtime stats
-    /// each render exactly one footer button (`Close`, no `Cancel` sibling),
-    /// every stats line still paints, and `Esc` closes with nothing
-    /// committed.
     #[gpui_kit::test]
     fn single_close_footers_render_one_close_and_esc_closes(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -39958,7 +35049,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
         let esc = gpui_kit::Keystroke::parse("escape").expect("test keystroke parses");
-        // Settings: exactly one Close, no Cancel; Esc closes silently.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
         });
@@ -39982,7 +35073,7 @@ mod tests {
             "Esc closes Settings"
         );
         assert_eq!(notification_count(cx), before, "Esc commits nothing");
-        // Runtime stats: same single Close, every stats line paints, Esc closes.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
         });
@@ -40014,9 +35105,6 @@ mod tests {
         assert_eq!(notification_count(cx), before, "Esc commits nothing");
     }
 
-    /// Ticket 05 scenario 1: pure-close footers commit nothing — Settings,
-    /// Groups, and the preset picker close silently with no row, preset, or
-    /// toast side effects.
     #[gpui_kit::test]
     fn honest_footers_close_silently_without_side_effects(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -40033,7 +35121,7 @@ mod tests {
             .expect("preset seeds");
         let row_id = row.id.clone();
         let (view, cx) = mount_view(store, cx);
-        // Settings footer closes with no toast and no row change.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
         });
@@ -40058,13 +35146,12 @@ mod tests {
             1,
             "Settings footer stores nothing"
         );
-        // Groups footer closes with no toast and no row change.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_groups_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // T08 (gpui-18-sweep CAP-9): groups opens as a sheet (reference
-        // flow), never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         let before = notification_count(cx);
@@ -40086,8 +35173,7 @@ mod tests {
             1,
             "Groups footer stores nothing"
         );
-        // Preset-picker footer closes without attaching (per-row buttons own
-        // the `Attach` verb; the footer never implied one).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.open_preset_attach_dialog(row, window, cx)
@@ -40122,8 +35208,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05 scenario 1: manager footers that create name `Add` — filling
-    /// the presets create form and clicking the footer stores the preset.
     #[gpui_kit::test]
     fn honest_footers_add_creates_preset(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -40135,7 +35219,7 @@ mod tests {
         });
         paint_dialog_open(cx);
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        // Fill the stashed create form (the same entities the dialog renders).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 let form = view.preset_form.clone().expect("manager stashes its form");
@@ -40175,16 +35259,13 @@ mod tests {
         assert_eq!(notification_count(cx), before + 1, "one honest toast");
     }
 
-    /// Ticket 05 scenario 3: the Logs footer commits the typed filter while
-    /// Cancel discards it — committing vs discarding is distinctly labeled
-    /// (`Apply filter` vs `Cancel`).
     #[gpui_kit::test]
     fn logs_footer_commits_filter_while_cancel_discards(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
-        // The footer commit path stores the typed filter.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.apply_log_filter("boom".to_string(), cx);
@@ -40195,13 +35276,12 @@ mod tests {
             "boom",
             "footer commit stores the filter"
         );
-        // Cancel never writes: the committed filter survives a discarded edit.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // T08 (gpui-18-sweep CAP-9): logs opens as a sheet (reference
-        // flow), never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("logs-dialog-ok").is_some()));
@@ -40225,18 +35305,13 @@ mod tests {
         );
     }
 
-    /// Ticket 05 scenario 2: destructive confirms gate on a named affirmative
-    /// carrying its result — remove names the config, group delete names the
-    /// group, and the Settings wipes confirm before zeroing. Danger styling
-    /// rides `ok_variant(ButtonVariant::Danger)` at each site (untouched by
-    /// this ticket); this test pins the gating behavior.
     #[gpui_kit::test]
     fn destructive_confirms_gate_on_named_affirmative(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let row = store.add(seed_input("Work")).expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Remove confirm names the config and gates (nothing removed yet).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_remove_confirm(row, window, cx));
         });
@@ -40251,7 +35326,7 @@ mod tests {
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
-        // Group delete confirm names the group and gates.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.open_group_delete_confirm("default", window, cx)
@@ -40263,7 +35338,7 @@ mod tests {
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
-        // Settings traffic wipe confirms before zeroing.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_clear_traffic_confirm(window, cx));
         });
@@ -40274,10 +35349,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 10 (US-5.2): bulk-delete confirm names the count, the affected
-    /// rows, and the stop-first promise (content at the pure seam —
-    /// notification/dialog text is framework-private, so delivery is asserted
-    /// by dialog presence in `t10_bulk_delete_stops_running_and_removes_checked`).
     #[test]
     fn t10_bulk_delete_confirm_names_count_rows_and_stop_first() {
         use crate::bulk_delete_confirm_description;
@@ -40303,9 +35374,6 @@ mod tests {
         );
     }
 
-    /// Ticket 10 (US-5.2): bulk-delete toast reports per-row outcomes, never
-    /// a bare count — full success names the removed rows, any failure names
-    /// the failed rows beside both counts.
     #[test]
     fn t10_bulk_delete_result_reports_per_row_outcomes() {
         use crate::bulk_delete_result_message;
@@ -40335,9 +35403,6 @@ mod tests {
         );
     }
 
-    /// Ticket 10 (US-5.2): bulk delete of checked rows including a running
-    /// one confirms first (nothing removed until commit), then stops the
-    /// endpoint and removes every row with exactly one outcome toast.
     #[gpui_kit::test]
     fn t10_bulk_delete_stops_running_and_removes_checked(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -40353,8 +35418,7 @@ mod tests {
             .add(t30_engine_seed("Home", "10982"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Fake engine + F5 serves the selected row (the
-        // `laneb_status_live_segments` path — no real sidecar spawns).
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 let (engine, _) = EngineController::fake();
@@ -40379,8 +35443,7 @@ mod tests {
             1,
             "one endpoint serves before the bulk delete"
         );
-        // Check both rows, then open the confirm: the dialog gates and
-        // nothing is removed yet.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 let all: Vec<String> = view
@@ -40408,8 +35471,7 @@ mod tests {
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
-        // Post-confirm commit: every checked row removed, the running
-        // endpoint stopped first, exactly one outcome toast.
+
         let before = notification_count(cx);
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -40441,10 +35503,6 @@ mod tests {
         );
     }
 
-    // -- Signal-box 05: ruled train-order dialogs ---------------------------
-
-    /// Ticket 05: the Bind guard says leaving loopback exposes the machine
-    /// (plain words, naming the bind); loopback and blank stay quiet.
     #[test]
     fn t05_bind_guard_says_leaving_loopback_exposes_machine() {
         use crate::lan_hint_for_bind;
@@ -40462,8 +35520,6 @@ mod tests {
         assert!(lan_hint_for_bind("").is_none(), "blank stays quiet");
     }
 
-    /// Ticket 05: export stays a red-bordered caution order — the verbatim
-    /// warning plus a visible safer path — and Cancel writes nothing.
     #[gpui_kit::test]
     fn t05_export_caution_offers_safer_path_and_cancel_writes_nothing(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -40501,7 +35557,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05: guided label + hint copy for the live protocol text.
     #[test]
     fn t05_guided_label_and_hint_name_protocol_needs() {
         use crate::{guided_hint_line, guided_identity_label};
@@ -40523,11 +35578,6 @@ mod tests {
         assert_eq!(guided_hint_line("bogus"), None);
     }
 
-    /// Ticket 06: panel-plan helpers mirror the guided pages — the generic
-    /// Identity row hides exactly where a `<Type>` box owns the secret
-    /// (AnyTLS single password), TLS/Network/Mux/Dial applicability matches
-    /// the section call sites, and secret presence reads `Not Set` vs
-    /// `Already Set` without ever rendering the value.
     #[test]
     fn t06_panel_plan_helpers_mirror_guided_pages() {
         use crate::{
@@ -40595,9 +35645,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05 scenario 1: a new user completes Add through the guided
-    /// mini-form only — the raw JSON box stays the untouched blank template,
-    /// Advanced stays collapsed, and the row lands with merged params.
     #[gpui_kit::test]
     fn t05_guided_add_without_json_creates_row(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -40643,9 +35690,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05 scenario 1 (invalid): a blank identity keeps the dialog
-    /// open, names params inline, and auto-expands Advanced so the box the
-    /// error points at is visible.
     #[gpui_kit::test]
     fn t05_guided_blank_identity_stays_open_naming_params(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -40681,9 +35725,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05: the Advanced swap round-trips losslessly — expand merges
-    /// guided values into the box and clears the inputs; collapse echoes
-    /// back; a garbage box never loses guided values.
     #[gpui_kit::test]
     fn t05_advanced_swap_round_trips_losslessly(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -40724,7 +35765,7 @@ mod tests {
                     "11111111-2222-4333-8444-555555555555",
                     "identity echoes back"
                 );
-                // Garbage box: guided values survive the expand attempt.
+
                 form.params.update(cx, |state, cx| {
                     state.set_value("{{{", window, cx);
                 });
@@ -40742,8 +35783,6 @@ mod tests {
         });
     }
 
-    /// Ticket 05: edit prefills the guided mini-form from the row and opens
-    /// with Advanced expanded (existing JSON rows keep their view).
     #[gpui_kit::test]
     fn t05_edit_prefills_guided_and_starts_expanded(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -40791,8 +35830,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 05 (prohibited side effect): import commits through the shared
-    /// footer path and never starts an endpoint.
     #[gpui_kit::test]
     fn t05_import_commit_never_starts_endpoints(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -40836,9 +35873,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05 scenario 2: a non-loopback bind stops at an explicit
-    /// confirm naming the config and bind before anything starts; the
-    /// post-start warning names them too.
     #[gpui_kit::test]
     fn t05_lan_start_gates_with_naming_confirm(cx: &mut TestAppContext) {
         use crate::{lan_confirm_text, lan_exposure_warning};
@@ -40882,9 +35916,6 @@ mod tests {
         );
     }
 
-    // -- Ticket 19: library list paints stored rows --------------------------
-
-    /// One completed frame at desktop size after external changes.
     fn paint_frame(cx: &mut VisualTestContext) {
         cx.simulate_resize(size(px(1000.), px(700.)));
         cx.update(|window, cx| {
@@ -40893,8 +35924,6 @@ mod tests {
         });
     }
 
-    /// Paint means painted: present in the completed frame, visible, with
-    /// non-zero bounds. Element presence alone never proves paint.
     fn assert_painted(cx: &mut VisualTestContext, id: &str) {
         let snapshot = cx.update(|window, _| window.try_find(id.to_owned()));
         let snapshot =
@@ -40928,8 +35957,6 @@ mod tests {
         }
     }
 
-    /// Scenario: store with 2 configs, fresh window → 2 painted rows with
-    /// stable ids, findable in a completed frame.
     #[gpui_kit::test]
     fn library_paints_two_stored_rows(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -40951,10 +35978,6 @@ mod tests {
         assert_painted(cx, &format!("library-row-{}", second.id));
     }
 
-    /// T01 red-first: every row wraps its lines in a themed card container —
-    /// `row-card-<id>` paints with non-zero bounds, and adjacent cards keep a
-    /// visible gap (surface/border/radius live on the card, separation lives
-    /// in the row padding, not in the shell).
     #[gpui_kit::test]
     fn library_row_cards_paint_with_gap(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -40992,11 +36015,6 @@ mod tests {
         );
     }
 
-    /// Signal-box ticket 02: every row carries its occupancy lamp in the
-    /// fixed leading cell — lit while serving, dark when stopped — so all
-    /// rows share one exact geometry. Migrates the throne-density
-    /// `present-iff-serving` dot rule into the always-present lamp (same
-    /// `row-dot-<id>` anchor, flat fill, never glow or shadow).
     #[gpui_kit::test]
     fn library_row_lamp_paints_in_every_state(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -41006,7 +36024,6 @@ mod tests {
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
 
-        // Serving: the row joins the running set before the first frame.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -41021,7 +36038,6 @@ mod tests {
         paint_frame(cx);
         assert_painted(cx, &format!("row-dot-{}", seeded.id));
 
-        // Stopped: the lamp stays in its cell, dark — geometry unchanged.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -41037,11 +36053,6 @@ mod tests {
         assert_painted(cx, &format!("row-dot-{}", seeded.id));
     }
 
-    /// Signal-box ticket 02 scenario 1: mixed running, stopped, and dead
-    /// rows render one exact anatomy — lamp, name, meta, badge in fixed
-    /// positions with identical geometry, every row carrying its port,
-    /// endpoint, and (where it exists) health numbers. Pinned badge strings
-    /// never change: only the wrappers carry style.
     #[gpui_kit::test]
     fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
         use crate::library_row_dense_lines_with_upstream;
@@ -41076,13 +36087,12 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
 
-        // Every row paints the full anatomy: card, lamp, checkbox.
         for row in [&running, &stopped, &dead] {
             assert_painted(cx, &format!("row-card-{}", row.id));
             assert_painted(cx, &format!("row-dot-{}", row.id));
             assert_painted(cx, &format!("check-{}", row.id));
         }
-        // Fixed cells: lamps share one x origin, cards share one height.
+
         let (lamp_x, card_h): (Vec<_>, Vec<_>) = cx.update(|window, _| {
             [&running, &stopped, &dead]
                 .iter()
@@ -41107,10 +36117,7 @@ mod tests {
             card_h.windows(2).all(|pair| pair[0] == pair[1]),
             "cards share one height: {card_h:?}"
         );
-        // No numberless rows: meta always carries port + bind endpoint +
-        // upstream; the badge adds port + health while serving (pinned
-        // strings — a stopped row honestly shows `○ Stopped`, never a
-        // fabricated latency).
+
         for (row, upstream, health, serving) in [
             (&running, "a.example.com:443", Some("87ms"), true),
             (&stopped, "b.example.com:443", None, false),
@@ -41147,12 +36154,6 @@ mod tests {
         );
     }
 
-    /// Signal-box ticket 02 scenario 2: a 50-row stress library stays
-    /// uniform and scannable — every painted card shares one width, one
-    /// height, and one lamp column, before and after a filter narrows the
-    /// visible window. (No `ListState` scroll seam is used anywhere in this
-    /// codebase, so the filter drives the visible-window change — the same
-    /// repaint-uniformity property a scroll would exercise.)
     #[gpui_kit::test]
     fn t02_row_anatomy_stress_stays_uniform(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -41227,8 +36228,6 @@ mod tests {
         }
         assert_column("full library", cx, &ids);
 
-        // Filter to the `node-4` window (node-4, node-40..49): a different
-        // painted subset must hold the same geometry.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -41246,7 +36245,6 @@ mod tests {
         assert_column("filtered library", cx, &ids);
     }
 
-    /// T03: facet picker seeds with a non-default group/protocol.
     fn facet_seed(name: &str, protocol: &str, group: &str, port: &str) -> NewConfig {
         NewConfig {
             name: name.to_string(),
@@ -41261,9 +36259,6 @@ mod tests {
         }
     }
 
-    /// T03 tests-first: the group picker opens inline (never a dialog);
-    /// picking an option applies the facet to the visible rows; Clear
-    /// restores. RED while the pickers open dialogs.
     #[gpui_kit::test]
     fn facet_group_picker_selects_without_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -41334,8 +36329,6 @@ mod tests {
         assert_painted(cx, &format!("library-row-{}", team.id));
     }
 
-    /// T03 tests-first: the protocol picker opens inline; picking applies
-    /// the protocol facet to the visible rows. RED while dialogs open.
     #[gpui_kit::test]
     fn facet_protocol_picker_selects_without_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -41390,8 +36383,6 @@ mod tests {
         );
     }
 
-    /// T03 tests-first: the status picker opens inline; picking applies the
-    /// status facet. RED while the pickers open dialogs.
     #[gpui_kit::test]
     fn facet_status_picker_selects_without_dialog(cx: &mut TestAppContext) {
         use crate::FacetStatus;
@@ -41436,9 +36427,6 @@ mod tests {
         );
     }
 
-    /// T05 red-first: a dead row's health section renders the failure Alert
-    /// (same pinned copy, new container); once the row tests live again the
-    /// Alert leaves with the failure.
     #[gpui_kit::test]
     fn dead_row_health_section_renders_alert(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, ProbeSuccess, TestOutcome};
@@ -41450,7 +36438,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the detail pane renders it.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -41459,15 +36447,14 @@ mod tests {
                 });
             });
         });
-        // Ticket 05: health lives in the Health pane — open it before
-        // asserting the section.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.inspector_tab = crate::InspectorTab::Health;
                 cx.notify();
             });
         });
-        // Dead outcome: errored sample, no success.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _cx| {
                 view.health_store.record_outcome(&TestOutcome {
@@ -41486,13 +36473,9 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Ticket 04 (throne-adoption): the shared overview carries the
-        // failure Alert directly under the acting row, so the alert
-        // paints in place with no scroll (visible, not just present).
+
         assert_painted(cx, "config-health-alert");
-        // The Health module sits below the taller failed overview — scroll
-        // the pane body and it paints in place (reachable, not just
-        // present), the pinned operate row untouched.
+
         cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -41505,7 +36488,7 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "config-health");
-        // Live again: the Alert leaves with the failure.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _cx| {
                 view.health_store.record_outcome(&TestOutcome {
@@ -41532,9 +36515,6 @@ mod tests {
         assert_absent(cx, "config-health-alert".to_string());
     }
 
-    /// Ticket 05: failed row → Health pane carries the named failure plus
-    /// Start/Stop, Test, Ping, and Logs operating on the same row, while
-    /// the Details-only sections leave with the pane switch.
     #[gpui_kit::test]
     fn health_pane_carries_failure_and_row_actions(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, TestOutcome};
@@ -41546,7 +36526,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row and open the Health pane.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -41557,7 +36537,7 @@ mod tests {
                 cx.notify();
             });
         });
-        // Dead outcome: errored sample, no success.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _cx| {
                 view.health_store.record_outcome(&TestOutcome {
@@ -41576,7 +36556,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // The tab bar and its tabs render with stable ids.
+
         assert!(
             cx.update(|window, _| window.try_find("inspector-tabs".to_string()).is_some()),
             "inspector tab bar renders"
@@ -41594,18 +36574,11 @@ mod tests {
                 "{id} renders"
             );
         }
-        // Named failure paints in the Health pane, directly under the
-        // acting row with the endpoints below it (one shared overview on
-        // every pane — the URL stays readable beside the failure it
-        // explains)...
+
         assert_painted(cx, "config-endpoints");
-        // Ticket 04 (throne-adoption): the shared overview carries the
-        // failure Alert directly under the acting row, so the alert
-        // paints in place with no scroll (visible, not just present).
+
         assert_painted(cx, "config-health-alert");
-        // The Health module sits below the taller failed overview — scroll
-        // the pane body and it paints in place (reachable, not just
-        // present), the pinned operate row untouched.
+
         cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -41618,13 +36591,12 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "config-health");
-        // ...history exists on the pane (below the fold at short panel
-        // heights — the tab bar stays pinned and the body scrolls to it).
+
         assert!(
             cx.update(|window, _| window.try_find("config-history".to_string()).is_some()),
             "config-history renders on the Health pane"
         );
-        // ...with the row ops present on the same row...
+
         for id in [
             "engine-start",
             "engine-stop",
@@ -41637,13 +36609,10 @@ mod tests {
                 "{id} operates on the Health pane row"
             );
         }
-        // ...while the Presets-only section leaves with the pane switch.
+
         assert_absent(cx, "config-preset".to_string());
     }
 
-    /// Lane B (B6): every inspector pane opens with the shared detail
-    /// header — the Health and Presets panes echo the same acting row the
-    /// operate row acts on (previously Details-only).
     #[gpui_kit::test]
     fn laneb_every_pane_shares_detail_header(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -41677,9 +36646,7 @@ mod tests {
             paint_frame(cx);
             assert_painted(cx, "detail-acting-on");
             assert_painted(cx, "detail-serving");
-            // Endpoints ride every pane (the URL is never a tab away);
-            // the operate row exists on every pane (below the fold at
-            // short panel heights — the body scrolls to it).
+
             assert_painted(cx, "config-endpoints");
             assert!(
                 cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
@@ -41688,9 +36655,6 @@ mod tests {
         }
     }
 
-    /// Command palette: the (section, row) table covers both groups in
-    /// full and rejects out-of-range indices (the dialog build order and
-    /// this table must agree — this pins both).
     #[test]
     fn palette_op_at_covers_both_groups() {
         use crate::{AppView, PaletteOp};
@@ -41709,8 +36673,6 @@ mod tests {
             PaletteOp::DetailsTab,
             PaletteOp::HealthTab,
             PaletteOp::PresetsTab,
-            // T08 (gpui-18-sweep CAP-9): the Library menu's menu-only
-            // destinations ride the same rows (dispatched, not duplicated).
             PaletteOp::ImportClipboard,
             PaletteOp::ExportLibrary,
         ];
@@ -41731,7 +36693,6 @@ mod tests {
             PaletteOp::StartAll,
             PaletteOp::StopAll,
             PaletteOp::TestAll,
-            // Ticket 10 (throne-adoption): stats ride the Manage tail.
             PaletteOp::RuntimeStats,
             PaletteOp::TrafficStats,
         ];
@@ -41747,8 +36708,6 @@ mod tests {
         assert_eq!(AppView::palette_op_at(IndexPath::new(0).section(2)), None);
     }
 
-    /// Command palette opens as a dialog and running the Add op lands the
-    /// Add dialog (close-then-dispatch through the real shell handlers).
     #[gpui_kit::test]
     fn command_palette_opens_and_runs_add(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -41778,12 +36737,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// T08 (gpui-18-sweep CAP-9): Logs/Subscriptions/Groups open as sheets
-    /// via `WindowExt::open_sheet` — never dialogs — with the library still
-    /// behind them; Escape closes the topmost sheet and the trigger paints
-    /// again. Focus return rides the kit (`Root` captures the previously
-    /// focused handle on open and restores it on close — verified 0.6.6
-    /// `root.rs:379-423`); headless pins open/close plus trigger presence.
     #[gpui_kit::test]
     fn t08_reference_flows_open_as_sheets(cx: &mut TestAppContext) {
         use gpui_kit::Keystroke;
@@ -41793,8 +36746,7 @@ mod tests {
         store.add(seed_input("Work")).expect("seed works");
         let (view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        // Groups opens from its real trigger button, so the sheet captures
-        // the trigger's focus for its return.
+
         cx.update(|window, cx| {
             window.click("groups-dialog", cx);
         });
@@ -41813,7 +36765,7 @@ mod tests {
             cx.update(|window, _| window.try_find("config-list").is_some()),
             "library stays behind the sheet"
         );
-        // Escape closes the topmost sheet; the trigger paints again.
+
         cx.update(|window, cx| {
             let escape = Keystroke::parse("escape").expect("test keystroke parses");
             window.dispatch_keystroke(escape, cx);
@@ -41825,8 +36777,7 @@ mod tests {
             "Escape closes the sheet"
         );
         assert_painted(cx, "groups-dialog");
-        // Logs + Subscriptions open the same way (direct calls — their
-        // trigger paths need selections/menu hops pinned elsewhere).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
         });
@@ -41857,9 +36808,6 @@ mod tests {
         cx.update(|window, cx| window.close_sheet(cx));
     }
 
-    /// T08 (gpui-18-sweep CAP-9): the palette covers the Library menu's
-    /// menu-only destinations through the same handlers the menu items use
-    /// (dispatched, not duplicated).
     #[gpui_kit::test]
     fn t08_palette_menu_only_ops_dispatch_same_handlers(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -41868,8 +36816,7 @@ mod tests {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         store.add(seed_input("Work")).expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Export op opens the export dialog (same handler as the
-        // `export-library` menu item).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.run_palette_op(IndexPath::new(14).section(0), window, cx)
@@ -41884,8 +36831,7 @@ mod tests {
         assert_painted(cx, "export-warning");
         assert_painted(cx, "export-preview");
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // From-clipboard op with an empty clipboard warns exactly like the
-        // `import-clipboard` menu item (same handler, no overlay).
+
         let before = notification_count(cx);
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -41908,10 +36854,6 @@ mod tests {
         );
     }
 
-    /// T08 (gpui-18-sweep CAP-10): the status strip reads left/center/right
-    /// through the kit `StatusBar` (`left()`/`right()` pin the ends, center
-    /// rides `children()` — no `.center()` exists), with `min_w` floors
-    /// holding each region so value changes reflow inside their slots.
     #[gpui_kit::test]
     fn t08_status_bar_regions_hold_order_and_floors(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -41949,11 +36891,6 @@ mod tests {
         }
     }
 
-    /// T08 (gpui-18-sweep CAP-10): bounded refresh work reads a kit
-    /// `Progress` driven by the real batch counts, and rows with a fetch in
-    /// flight compose `Skeleton` + `ShimmerText` for the streaming wait (no
-    /// `Skeleton::shimmer` — composed per 0.6.6 API). Every transition here
-    /// is pure state (no network headlessly).
     #[gpui_kit::test]
     fn t08_refresh_batch_progress_and_streaming_rows(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -41967,7 +36904,7 @@ mod tests {
             .expect("seed works");
         let (a, b) = (first.id.clone(), second.id.clone());
         let (view, cx) = mount_view(store, cx);
-        // Pure seam: no batch → None; opened batch → (done, total).
+
         assert_eq!(
             view.read_with(cx, |view, _| view.refresh_batch_progress()),
             None,
@@ -41983,13 +36920,13 @@ mod tests {
             Some((0, 2)),
             "opened batch starts at 0 of 2"
         );
-        // The open sheet paints the bounded progress.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
         });
         paint_dialog_open(cx);
         assert_painted(cx, "subs-refresh-progress");
-        // One member completion moves the fraction while the batch is open.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
@@ -42003,8 +36940,7 @@ mod tests {
             Some((1, 2)),
             "one completion reads 1 of 2"
         );
-        // A row with a fetch in flight renders the streaming compose on
-        // reopen (loading button + spinner + Skeleton/ShimmerText row).
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(view.note_refresh_started(&b), "fetch starts");
@@ -42017,8 +36953,7 @@ mod tests {
         assert_painted(cx, "subs-refresh-progress");
         assert_painted(cx, format!("sub-refresh-spinner-{b}").as_str());
         assert_painted(cx, format!("sub-refreshing-{b}").as_str());
-        // Tidy: land the last member (batch closes → progress leaves) and
-        // drop the in-flight mark, then close the sheet.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
@@ -42036,8 +36971,6 @@ mod tests {
         cx.update(|window, cx| window.close_sheet(cx));
     }
 
-    /// T08 (gpui-18-sweep CAP-10): a dead row renders the error `Alert`
-    /// with the same operate row inline beside it.
     #[gpui_kit::test]
     fn t08_dead_row_alert_keeps_operate_row_inline(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, TestOutcome};
@@ -42048,7 +36981,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the detail pane renders it, on the Health pane.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -42059,7 +36992,7 @@ mod tests {
                 cx.notify();
             });
         });
-        // Dead outcome: errored sample, no success.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _cx| {
                 view.health_store.record_outcome(&TestOutcome {
@@ -42078,17 +37011,11 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Ticket 04 (throne-adoption): the shared overview leading the
-        // pane body carries header + Endpoints once, and the failure Alert
-        // directly under the acting row — the alert paints in place with
-        // no scroll.
+
         assert_painted(cx, "config-health-alert");
         assert_painted(cx, "detail-operate");
     }
 
-    /// Lane B (B6): one serving-evidence rule — dead-while-serving reads
-    /// Failed (dead summary or crashed shard on a running row), serving
-    /// reads Serving, everything stopped reads Stopped.
     #[test]
     fn laneb_serving_tone_single_evidence_rule() {
         use crate::{serving_tone, ServingTone};
@@ -42110,12 +37037,6 @@ mod tests {
         assert_eq!(serving_tone(false, None, false), ServingTone::Stopped);
     }
 
-    /// Signal-box 04: the detail pane is a block shelf — the Endpoints
-    /// module paints above a single operate row (Start, Stop, Test, Ping,
-    /// Logs, Copy URLs inline) with the manage actions (Edit, Delete,
-    /// Duplicate, resets) behind one `row-menu` trigger, and the Health
-    /// pane carries the failure alert with the same operate row on the
-    /// same row. The 240px cap keeps the evidence painted.
     #[gpui_kit::test]
     fn t04_detail_block_shelf_packs_modules_with_operate_row(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, TestOutcome};
@@ -42127,7 +37048,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the detail pane renders it (Details tab default).
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -42140,21 +37061,16 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // The Acting-on echo rides the module header, naming the row.
+
         assert_painted(cx, "detail-acting-on");
-        // Endpoints module above the fold, above the single operate row.
-        // (`detail-operate` is a transparent packing row, so presence +
-        // geometry — not paint — is the assertion, same as the command
-        // strip container.)
+
         assert_painted(cx, "config-endpoints");
         assert_within_frame(cx, "config-endpoints");
         assert!(
             cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
             "detail-operate renders the single operate row"
         );
-        // No horizontal scroll: the row's right edge stays inside the
-        // 1000px frame width (vertical placement is the scrolling pane's
-        // job — the t08 contract keeps ops reachable below the fold).
+
         let operate_bounds = cx.update(|window, _| {
             window
                 .try_find("detail-operate".to_string())
@@ -42181,7 +37097,7 @@ mod tests {
             endpoints_bottom <= operate_top,
             "endpoints sit above the operate row: {endpoints_bottom:?} <= {operate_top:?}"
         );
-        // The six inline ops render in the single operate row...
+
         for id in [
             "engine-start",
             "engine-stop",
@@ -42195,19 +37111,12 @@ mod tests {
                 "{id} rides the operate row"
             );
         }
-        // The row-menu trigger rides the same operate row (presence —
-        // opening it needs a visible click, and the headless harness has
-        // no scroll seam to bring below-fold triggers into view: no test
-        // anywhere in the suite clicks inside the scrolling inspector,
-        // and scenario 1 verifies by manual UX review per the ticket).
-        // The menu items carry the same ids, labels, tooltips, and
-        // handlers the manage row and Usage module carried (see Ruling).
+
         assert!(
             cx.update(|window, _| window.try_find("row-menu".to_string()).is_some()),
             "row-menu trigger rides the operate row"
         );
-        // Failed row → Health pane: the failure alert renders in place
-        // with the same operate row on the same row.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.inspector_tab = crate::InspectorTab::Health;
@@ -42232,14 +37141,9 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Ticket 04 (throne-adoption): the shared overview leading the
-        // pane body carries header + Endpoints once, and the dead-row
-        // Alert directly under the acting row — it paints in place with
-        // no scroll (visible, not just present).
+
         assert_painted(cx, "config-health-alert");
-        // The Health module sits below the taller failed overview — scroll
-        // the pane body and it paints in place (reachable, not just
-        // present), the pinned operate row untouched.
+
         cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -42270,16 +37174,6 @@ mod tests {
         }
     }
 
-    /// Live-review regression: the operate row is PINNED below the scrolling
-    /// pane body, so a tall tab (Health carries health + history, Presets
-    /// carries the preset block) can never push Start/Stop/Test/Ping/Logs/
-    /// Copy URLs past the pane's bottom edge at the 240px panel. Before the
-    /// pin, `render_detail_actions` was the last child INSIDE `config-detail-body`
-    /// and the 1000x700 default frame clipped it on those two tabs.
-    ///
-    /// Also pins the honest History empty state — `history_line` used to
-    /// return a bare `div()` under two samples, painting a titled box with a
-    /// silent body.
     #[gpui_kit::test]
     fn operate_row_stays_pinned_on_every_inspector_tab(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -42315,8 +37209,7 @@ mod tests {
             paint_frame(cx);
             cx.run_until_parked();
             paint_frame(cx);
-            // Presence AND paint: the whole defect was the row rendering but
-            // sitting outside the visible pane.
+
             assert!(
                 cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
                 "{name}: detail-operate renders"
@@ -42333,7 +37226,7 @@ mod tests {
                 "{name}: operate row sits inside the 700px frame, not clipped: \
                  {operate_top:?}..{operate_bottom:?}"
             );
-            // The six inline ops are the controls the clipping hid.
+
             for id in [
                 "engine-start",
                 "engine-stop",
@@ -42349,8 +37242,7 @@ mod tests {
                 );
             }
         }
-        // The History module speaks when it has nothing to draw: an untested
-        // row has no samples, so the box must say so rather than sit silent.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.inspector_tab = crate::InspectorTab::Health;
@@ -42361,11 +37253,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // The History module sits last on the Health pane, below the endpoints
-        // table, so it is below the fold in the 240px panel and scrolls —
-        // presence, not paint, is the assertion here (same contract as the
-        // operate row in `t04_detail_block_shelf_packs_modules_with_operate_row`).
-        // What matters is that the box is not silent.
+
         assert!(
             cx.update(|window, _| window.try_find("config-history".to_string()).is_some()),
             "History module renders"
@@ -42378,17 +37266,6 @@ mod tests {
         );
     }
 
-    /// Closes the gap the live review could not confirm: the inspector body is a
-    /// real scroll container, so content below the fold in the 240px panel is
-    /// reachable by wheel.
-    ///
-    /// The assertion is on the tracked [`AppView::detail_scroll`] handle, not
-    /// on child bounds: GPUI applies a scroller's offset at PAINT time via
-    /// `window.with_element_offset`, so a child's layout bounds never move
-    /// when the pane scrolls and cannot witness a scroll at all.
-    /// `max_offset().y > 0` states a tab's sections really do exceed the panel
-    /// (something is below the fold to reach); a wheel event moving
-    /// `offset().y` states the user can reach it.
     #[gpui_kit::test]
     fn inspector_body_scrolls_to_reach_below_fold_sections(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -42417,16 +37294,14 @@ mod tests {
             paint_frame(cx);
         };
         select_health_tab(&view, cx);
-        // Overflow exists: the Health pane's sections exceed the 240px panel.
+
         let max_offset = cx.update(|_, cx| view.read(cx).detail_scroll.max_offset());
         assert!(
             max_offset.y > px(0.),
             "the Health pane overflows the panel, so there is something below \
              the fold to scroll to: {max_offset:?}"
         );
-        // A wheel over the pane body moves the tracked offset. GPUI's scroller
-        // keeps `offset.y` in `[-max_offset.y, 0]` — negative is further down
-        // the content — so scrolling down takes a NEGATIVE wheel delta.
+
         let scrolled = cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -42439,7 +37314,7 @@ mod tests {
             scrolled < px(0.),
             "wheeling the inspector body scrolls it down: offset={scrolled:?}"
         );
-        // It clamps at the end rather than running away.
+
         let over = cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -42457,9 +37332,7 @@ mod tests {
             "the pane clamps at its maximum offset: {:?}",
             over
         );
-        // Switching panes via the real InspectorDetails action starts the
-        // new pane at the top rather than inheriting the previous tab's
-        // scroll position, and drives the shared set_inspector_tab path.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.focus.focus(window, cx);
@@ -42489,15 +37362,6 @@ mod tests {
         );
     }
 
-    /// Ticket 04: detail pane fits the 880x620 minimum window — with a row
-    /// selected on the Details pane, the endpoint values, their Copy
-    /// buttons, and the Start control all paint inside the minimum frame
-    /// (no inspector scroll needed to reach them), with endpoints above
-    /// the operate row.
-    /// Ledger Ruling: `assert_within_frame_min` is the headless proxy for
-    /// "visible without scrolling" (an element whose far edge is inside
-    /// 880x620 needs no scroll to be seen); manual UX review stays the
-    /// human-grader half per the ticket.
     #[gpui_kit::test]
     fn t04_detail_fits_minimum_window(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -42519,8 +37383,7 @@ mod tests {
         paint_frame_min(cx);
         cx.run_until_parked();
         paint_frame_min(cx);
-        // Endpoints, per-row Copy buttons, and Start all paint inside the
-        // minimum frame.
+
         for id in [
             "config-endpoints",
             "endpoint-value-socks",
@@ -42532,7 +37395,7 @@ mod tests {
             assert_painted(cx, id);
             assert_within_frame_min(cx, id);
         }
-        // Endpoints stay above the operate row at the minimum size too.
+
         let (endpoints_bottom, operate_top) = cx.update(|window, _| {
             let endpoints = window
                 .try_find("config-endpoints".to_string())
@@ -42550,13 +37413,6 @@ mod tests {
         );
     }
 
-    /// Ticket 04: operate row at minimum width — never exceeds two wrapped
-    /// lines, never scrolls horizontally, and management actions live
-    /// behind exactly one disclosed menu (`row-menu`).
-    /// Ledger Ruling: "two wrapped lines" is measured against the real
-    /// rendered Start-button height (operate height <= 2x button height +
-    /// one gap + hairline + rounding), never a hardcoded pixel budget, so
-    /// font-metric shifts cannot silently pass or fail it.
     #[gpui_kit::test]
     fn t04_operate_row_fits_minimum_width(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -42578,7 +37434,7 @@ mod tests {
         paint_frame_min(cx);
         cx.run_until_parked();
         paint_frame_min(cx);
-        // No horizontal scroll: the row's right edge stays inside 880.
+
         let (operate_bounds, start_height) = cx.update(|window, _| {
             let operate = window
                 .try_find("detail-operate".to_string())
@@ -42595,13 +37451,12 @@ mod tests {
                 && operate_bounds.origin.x + operate_bounds.size.width <= px(880.) + px(1.),
             "operate row never scrolls horizontally: {operate_bounds:?}"
         );
-        // At most two wrapped lines of small controls.
+
         assert!(
             operate_bounds.size.height <= start_height * 2. + px(12.),
             "operate row fits two wrapped lines: row {operate_bounds:?} vs button {start_height:?}"
         );
-        // Management actions ride behind exactly one disclosed menu: the
-        // trigger renders, every managed item stays unmounted until opened.
+
         assert!(
             cx.update(|window, _| window.try_find("row-menu".to_string()).is_some()),
             "row-menu trigger rides the operate row"
@@ -42617,17 +37472,6 @@ mod tests {
         }
     }
 
-    /// Ticket 05 (CAP-6): primaries ride one `ButtonGroup`, management stays
-    /// behind the single `Row actions…` trigger, and operate Start reaches the
-    /// selected row through the same handler as the TOOLS menu Start (same
-    /// outcome, same toast — scope-named labels only).
-    /// Ledger Ruling: headless snapshots expose presence + bounds, not DOM
-    /// order, so "grouped" asserts as row-major Start/Stop/Test adjacency and
-    /// "same handler" asserts as equal outcomes + equal toast counts across
-    /// the two triggers on one mount (fake engine, loopback seed). Row-menu
-    /// choice stays the `DropdownMenu` pattern (`Button.dropdown_menu`):
-    /// `DropdownButton` is a split action+menu and the row has no single
-    /// action half worth promoting.
     #[gpui_kit::test]
     fn t05_operate_primaries_grouped_dispatch_same_handler(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -42655,8 +37499,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Primaries paint with their pinned ids; Ping, Logs, Copy URLs, and
-        // the single menu trigger ride the same row untouched.
+
         for id in [
             "engine-start",
             "engine-stop",
@@ -42668,7 +37511,7 @@ mod tests {
         ] {
             assert_painted(cx, id);
         }
-        // Grouped: Start, Stop, Test sort consecutively in row-major order.
+
         let mut primaries = Vec::new();
         for id in ["engine-start", "engine-stop", "health-test"] {
             let bounds = cx.update(|window, _| {
@@ -42683,11 +37526,7 @@ mod tests {
             primaries[0] <= primaries[1] && primaries[1] <= primaries[2],
             "primaries group in Start/Stop/Test order: {primaries:?}"
         );
-        // Same handler: the TOOLS menu Start and operate Start reach the
-        // same outcome (running + one toast each) on the same mount
-        // (Ticket 02: selected ops moved from the lever strip into TOOLS
-        // with unchanged handlers — the menu opens per click because it
-        // closes on select).
+
         let before = notification_count(cx);
         cx.update(|window, cx| {
             window.click("tools-menu", cx);
@@ -42734,8 +37573,7 @@ mod tests {
             0,
             "TOOLS Stop stops it again"
         );
-        // Re-pin the selection across the stop's reload (the same row a
-        // user still has selected) before the operate-Start click.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -42761,8 +37599,7 @@ mod tests {
             before + 1,
             "operate Start toasts once"
         );
-        // Minimum frame: the grouped row still fits two wrapped lines with
-        // no horizontal scroll (same measure as the t04 two-line rule).
+
         cx.run_until_parked();
         paint_frame_min(cx);
         cx.run_until_parked();
@@ -42789,13 +37626,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05 (CAP-6): bulk verbs read selection | state | destructive-
-    /// trailing with the `N checked (of M visible)` label, wrapping to at most
-    /// three lines without sideways scroll at the minimum frame.
-    /// Ledger Ruling: kit `Separator` carries no id slot, so "grouped"
-    /// asserts as row-major reading order (selection pair, then state verbs,
-    /// `bulk-delete` last) and "≤3 lines" measures against the real button
-    /// height like the t04 two-line rule.
     #[gpui_kit::test]
     fn t05_bulk_bar_grouped_delete_trailing(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -42823,7 +37653,7 @@ mod tests {
         paint_frame_min(cx);
         assert_painted(cx, "bulk-bar");
         assert_painted(cx, "bulk-label");
-        // Every verb paints inside the minimum frame (no sideways scroll).
+
         let verbs = [
             "bulk-select-visible",
             "bulk-clear",
@@ -42838,8 +37668,7 @@ mod tests {
             assert_painted(cx, id);
             assert_within_frame_min(cx, id);
         }
-        // Reading order is the grouping: selection pair, state verbs,
-        // destructive trailing last.
+
         let mut order = Vec::new();
         for id in verbs {
             let bounds = cx.update(|window, _| {
@@ -42862,7 +37691,7 @@ mod tests {
             }),
             "2 checked (of 2 visible)"
         );
-        // At most three wrapped lines of small controls.
+
         let (bar_bounds, button_height) = cx.update(|window, _| {
             let bar = window
                 .try_find("bulk-bar".to_string())
@@ -42880,11 +37709,6 @@ mod tests {
         );
     }
 
-    /// Ticket 05 (CAP-6): management hides behind exactly one disclosed
-    /// `Row actions…` trigger — the five items stay unmounted while closed
-    /// (t04 pins the closed half) and all five paint once opened.
-    /// Throne-adoption 03: the `Clone` alias is gone — `Duplicate` is the
-    /// only copy verb, so `clone-config` stays absent even while open.
     #[gpui_kit::test]
     fn t05_row_menu_opens_management_items(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -42935,15 +37759,6 @@ mod tests {
         assert_absent(cx, "clone-config".to_string());
     }
 
-    /// Ticket 04: every pane (Details, Health, Presets) names the acted-on
-    /// row — the header echo reads `Acting on: <name>` for the selected
-    /// row on each pane.
-    /// Ledger Ruling: headless snapshots expose presence + bounds, not
-    /// rendered text runs, so the wording half asserts through the shared
-    /// `acting_on_label` seam against the live selection while the painted
-    /// half asserts the header anchor on every pane — together they pin
-    /// "each pane names its row" without a text-extraction seam that does
-    /// not exist.
     #[gpui_kit::test]
     fn t04_every_pane_names_acting_row(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -42988,23 +37803,17 @@ mod tests {
         }
     }
 
-    /// Signal-box 06: endpoints carry per-row copy — each bind URL
-    /// copies alone beside its value (secret-free by construction: the
-    /// same bind+port forms `copy-urls` carries), and both buttons paint
-    /// in the Details pane. The handler path is exercised directly (the
-    /// inspector has no scroll seam for below-fold clicks — the t04
-    /// rationale), presence is asserted on the painted frame.
     #[gpui_kit::test]
     fn t06_endpoint_per_row_copy_copies_single_url(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
-        // Secret-bearing params: the clipboard must still carry bind+port only.
+
         store
             .add(t30_engine_seed("Work", "10981"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the detail pane renders its endpoints.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43058,7 +37867,7 @@ mod tests {
                 "clipboard carries bind+port only, found {canary}: {clip}"
             );
         }
-        // Lane B (B7): the upstream line copies its host:port alone.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.copy_single_endpoint_url(crate::EndpointUrl::Upstream, window, cx)
@@ -43069,8 +37878,7 @@ mod tests {
             clip, "198.51.100.9:443",
             "upstream copies host:port: {clip}"
         );
-        // The upstream host:port is display metadata (row meta line shows it
-        // too) — only credential canaries are forbidden here.
+
         for canary in ["11111111", "uuid", "password"] {
             assert!(
                 !clip.contains(canary),
@@ -43079,17 +37887,6 @@ mod tests {
         }
     }
 
-    /// Ticket 44 sweep (T02): every inspector module shares one container
-    /// grammar — a row selected on each of Details/Health/Presets paints
-    /// all five modules boxed (usage/preset join endpoints/health/history
-    /// in `GroupBox` + gap_1), endpoint values keep their truncating ids
-    /// with per-row copies beside them, and the preset pane detaches
-    /// inline only when attached.
-    /// Ledger Ruling: headless snapshots expose presence + bounds, not
-    /// rendered text runs, so the wording halves assert through the pure
-    /// seams (`usage_line` honest-empty, `preset_summary_for` rule count
-    /// pinned by laneb) while the painted half asserts every module
-    /// anchor on its pane.
     #[gpui_kit::test]
     fn t02_detail_modules_share_container_grammar(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -43099,15 +37896,11 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Fresh seed: nothing has flowed, so the boxed usage module falls
-        // back to the honest line through `usage_parts` = None (never a
-        // lying zero).
+
         let row_id = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().rows[0].id.clone()
         });
-        // The boxed buckets and the honest line share one seam: buckets
-        // present render as the `DescriptionList`, absent buckets fall
-        // back to the line (never a lying zero either way).
+
         let (parts, line) = view.read_with(cx, |view, _| {
             (view.usage_parts(&row_id), view.usage_line(&row_id))
         });
@@ -43141,12 +37934,7 @@ mod tests {
             paint_frame(cx);
             cx.run_until_parked();
             paint_frame(cx);
-            // Endpoints ride every pane (the box anchor paints at the top);
-            // the full rows + per-row copies paint on Details, while on
-            // Health/Presets the lower rows sit below the fold at short
-            // panel heights — presence (not paint) there, per the
-            // below-fold convention. The bind:port-only clipboard path
-            // stays pinned by the t06/t10 clip asserts.
+
             assert_painted(cx, "config-endpoints");
             match tab {
                 crate::InspectorTab::Details => {
@@ -43179,9 +37967,7 @@ mod tests {
                     }
                 }
             }
-            // Tab-specific modules share the same box rhythm; history
-            // sits below the fold at short panel heights, so presence
-            // (not paint) is the assertion there.
+
             match tab {
                 crate::InspectorTab::Details => {
                     assert_painted(cx, "config-usage");
@@ -43209,10 +37995,7 @@ mod tests {
                 }
             }
         }
-        // Unattached row on the Presets pane: the inline detach stays
-        // unmounted behind its idle marker (attached detach is pinned by
-        // `laneb_preset_pane_detaches_inline_with_rule_count`). Reopen the
-        // Presets pane first — the tab loop above ends elsewhere.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 view.set_inspector_tab(crate::InspectorTab::Presets);
@@ -43229,20 +38012,17 @@ mod tests {
         assert_absent(cx, "preset-detach-inline".to_string());
     }
 
-    /// Ticket 10 (US-5.3): the bulk Copy URLs action carries bind + port
-    /// only — secret-bearing params (uuid, upstream host) never reach the
-    /// clipboard through this path either.
     #[gpui_kit::test]
     fn t10_copy_selected_urls_carry_binds_not_secrets(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
-        // Secret-bearing params: the clipboard must still carry bind+port only.
+
         store
             .add(t30_engine_seed("Work", "10981"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the bulk copy has a row to act on.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43281,11 +38061,6 @@ mod tests {
         assert_eq!(notification_count(cx), before + 1, "one copy toast");
     }
 
-    /// T06 red-first: in-flight flags surface as loading spinners on the
-    /// four action buttons. Presence ⟺ in-flight: the buttons sit below
-    /// the fold of the scrolling inspector, so presence (not paint) is the
-    /// assertion here, and no sleeps are involved — the flags flip directly
-    /// through the existing seams.
     #[gpui_kit::test]
     fn in_flight_flags_show_button_spinners(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -43295,7 +38070,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the detail action buttons render.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43307,7 +38082,7 @@ mod tests {
         let has_spinner = |cx: &mut VisualTestContext, id: &str| {
             cx.update(|window, _| window.try_find(id.to_string()).is_some())
         };
-        // Start in-flight: both engine buttons load, probes do not.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.start_in_flight = true;
@@ -43327,7 +38102,7 @@ mod tests {
             !has_spinner(cx, "health-test-spinner"),
             "no probe running, no test spinner"
         );
-        // URL-test probe in-flight: only the Test button loads.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.start_in_flight = false;
@@ -43348,7 +38123,7 @@ mod tests {
             !has_spinner(cx, "health-ping-spinner"),
             "ping is a separate kind"
         );
-        // TCP-ping probe in-flight: only the Ping button loads.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.probe_url_in_flight = false;
@@ -43365,7 +38140,7 @@ mod tests {
             "url-test flag cleared"
         );
         assert!(has_spinner(cx, "health-ping-spinner"), "ping shows loading");
-        // All clear: no spinner anywhere.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.probe_ping_in_flight = false;
@@ -43386,13 +38161,10 @@ mod tests {
         }
     }
 
-    // -- Ticket 09: restrained motion and focus ----------------------------
-
-    /// Ticket 09 (CAP-9): the app-owned motion budget never exceeds 200ms.
     #[test]
     fn t09_motion_fast_budget_capped() {
         use crate::AppView;
-        // Compile-time budget proof (clippy `assertions_on_constants`).
+
         const {
             assert!(
                 AppView::MOTION_FAST_MS <= 200,
@@ -43401,20 +38173,6 @@ mod tests {
         }
     }
 
-    /// Ticket 09 (CAP-9): the motion policy honors reduced motion — zero under
-    /// it, the capped budget otherwise.
-    ///
-    /// This now asserts PRODUCTION behavior, not a twin: `motion_fast_duration`
-    /// is what [`AppView::motion_enter`] hands to `Animation::new`, so the
-    /// number checked here is the number animated with. The earlier version was
-    /// `#[cfg(test)]` and nothing in the app called it, which made the
-    /// reduced-motion guarantee unfalsifiable.
-    ///
-    /// GPUI closes the loop: an animation whose `Duration` resolves under
-    /// `App::reduce_motion` renders its final frame with no intermediate
-    /// frames (gpui `elements/animation.rs`, the `cx.reduce_motion()` branch in
-    /// the keyframe layout pass), so `Duration::ZERO` means "paint the end
-    /// state on the first frame" rather than "divide by zero".
     #[gpui_kit::test]
     fn t09_motion_fast_duration_honors_reduce_motion(cx: &mut TestAppContext) {
         use std::time::Duration;
@@ -43428,8 +38186,7 @@ mod tests {
                 Duration::ZERO,
                 "reduced motion means no animation"
             );
-            // Read twice: the policy must track the live setting, not latch
-            // the first value it saw.
+
             assert_eq!(
                 AppView::motion_fast_duration(cx),
                 Duration::ZERO,
@@ -43441,8 +38198,7 @@ mod tests {
                 Duration::from_millis(AppView::MOTION_FAST_MS),
                 "motion stays on the capped budget"
             );
-            // Back on: the OS-level toggle is honored in both directions, which
-            // is what a user flipping the setting at runtime sees.
+
             cx.set_reduce_motion(true);
             assert_eq!(
                 AppView::motion_fast_duration(cx),
@@ -43452,9 +38208,6 @@ mod tests {
         });
     }
 
-    /// Ticket 09: the busy-guard copy pins the `Starting…` label the
-    /// scenario expects (same string the detail Start button shows while a
-    /// start is in flight).
     #[test]
     fn t09_start_busy_copy_names_starting() {
         use crate::start_busy_message;
@@ -43465,8 +38218,6 @@ mod tests {
         );
     }
 
-    /// Ticket 09: a second Import commit while a parse is in flight is
-    /// ignored — no double commit, no state churn.
     #[gpui_kit::test]
     fn t09_import_double_commit_ignored(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -43503,9 +38254,6 @@ mod tests {
         );
     }
 
-    /// Ticket 09 (CAP-9/US-4): with reduced motion on, opening a dialog,
-    /// switching inspector tabs, and toggling the bulk bar stay perceivable
-    /// without animation — every pinned anchor still paints.
     #[gpui_kit::test]
     fn t09_reduce_motion_state_changes_stay_perceivable(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -43518,7 +38266,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the inspector renders.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43527,8 +38275,7 @@ mod tests {
                 });
             });
         });
-        // Inspector tab switch: each pane paints its own markers plus the
-        // shared operate row, with no animation frames scheduled.
+
         for (index, marker) in [
             (0, "config-usage"),
             (1, "config-health"),
@@ -43548,15 +38295,13 @@ mod tests {
             assert_painted(cx, "inspector-tabs");
             assert_painted(cx, "config-detail-body");
             assert_painted(cx, marker);
-            // The shared operate row survives every switch. Like the
-            // in-flight spinner seam it sits below the inspector fold, so
-            // presence (not painted-visibility) is the assertion here.
+
             assert!(
                 cx.update(|window, _| window.try_find("detail-operate".to_string()).is_some()),
                 "operate row present on every pane"
             );
         }
-        // Bulk bar toggle: checking names the set, clearing hides it.
+
         let row_id = view.read_with(cx, |view, cx| {
             view.libraries.read(cx).delegate().rows[0].id.clone()
         });
@@ -43570,8 +38315,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // The bar keeps its own ids with unset opacity (the fade rides an
-        // anonymous wrapper), so painted-visibility is deterministic here.
+
         assert_painted(cx, "bulk-bar");
         assert_painted(cx, "bulk-label");
         assert_eq!(
@@ -43585,9 +38329,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // Cleared: the bar falls back to its bare zero-size anchor (same
-        // stable-id placeholder convention as the empty `config-detail`),
-        // so presence — not painted-visibility — is the assertion here.
+
         assert!(
             cx.update(|window, _| window.try_find("bulk-bar".to_string()).is_some()),
             "bulk anchor persists while empty"
@@ -43596,7 +38338,7 @@ mod tests {
             cx.update(|window, _| window.try_find("bulk-label".to_string()).is_none()),
             "cleared set hides the bulk label"
         );
-        // Dialog open: the Add dialog paints its first field.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_add_dialog(window, cx));
         });
@@ -43606,8 +38348,6 @@ mod tests {
         assert_painted(cx, "field-name");
     }
 
-    /// Ticket 09 (US-4): clearing the bulk set returns keyboard focus to
-    /// the shell, since the bar it acted from unmounts.
     #[gpui_kit::test]
     fn t09_bulk_clear_returns_focus_to_shell(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -43640,12 +38380,6 @@ mod tests {
         assert!(home, "bulk clear returns keyboard focus to the shell");
     }
 
-    /// T08 (throne-adoption): shortcut rows keep their exact pinned
-    /// accessible strings even though the keystroke renders as a `Kbd` chip
-    /// beside the name (the accessible name — what tests and assistive tech
-    /// read — never changes). Ticket 02 moved the strip buttons into
-    /// PROGRAM / TOOLS menus with unchanged `Name (Key)` strings; the
-    /// operate-row buttons stay put.
     #[gpui_kit::test]
     fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -43655,7 +38389,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the row so the detail action buttons render too.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43668,7 +38402,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // PROGRAM menu rows keep their pinned `Name (Key)` strings.
+
         cx.update(|window, cx| {
             window.click("program-menu", cx);
         });
@@ -43700,7 +38434,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // TOOLS menu rows keep theirs.
+
         cx.update(|window, cx| {
             window.click("tools-menu", cx);
         });
@@ -43733,7 +38467,7 @@ mod tests {
         });
         cx.run_until_parked();
         paint_frame(cx);
-        // Operate-row buttons are untouched.
+
         for (id, pinned) in [
             ("engine-stop", "Stop (Shift-F5)"),
             ("health-test", "Test (Ctrl-T)"),
@@ -43753,12 +38487,6 @@ mod tests {
         }
     }
 
-    /// T07 red-first: the no-hits hint is a working control — clicking it
-    /// clears the query in place and the rows repaint (previously static
-    /// text duplicating the `clear-search` button).
-    /// BUG-1: the filter is established through `set_query` (the real typing
-    /// path, kit `query_input` + `delegate.query` together) so the test fails
-    /// if either clear path regresses to a delegate-only reset.
     #[gpui_kit::test]
     fn clear_search_hint_clears_query(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -43767,7 +38495,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Narrow to no hits via the real typing path.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43798,10 +38526,6 @@ mod tests {
         assert_painted(cx, &format!("library-row-{}", seeded.id));
     }
 
-    /// T07 red-first: the empty-library CTAs are the real working buttons
-    /// folded under the `empty-library-ctas` id — Add opens the add dialog,
-    /// Import opens the import dialog (previously static text duplicating
-    /// them from inside the list).
     #[gpui_kit::test]
     fn empty_library_ctas_open_add_and_import(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -43812,7 +38536,7 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "library-empty");
-        // The CTA id folds in the working buttons (not a duplicate).
+
         let (outer, add, import) = cx.update(|window, _| {
             let outer = window
                 .try_find("empty-library-ctas".to_string())
@@ -43862,8 +38586,6 @@ mod tests {
         );
     }
 
-    /// Scenario: empty store → the empty state actually paints (asserted via
-    /// bounds/visibility, not just element presence).
     #[gpui_kit::test]
     fn library_paints_empty_state(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -43877,9 +38599,6 @@ mod tests {
         assert_painted(cx, "library-empty");
     }
 
-    /// Scenario: add/remove/search each repaint to match the store with no
-    /// restart and no stale rows; selection survives by id; the detail pane
-    /// paints endpoint URLs for the selected row.
     #[gpui_kit::test]
     fn library_mutations_repaint_and_keep_selection(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -43895,8 +38614,6 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
 
-        // Select the first row, then add a third: the list repaints with all
-        // three and the selection stays on the first row's id.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43933,8 +38650,6 @@ mod tests {
         );
         assert_painted(cx, "config-endpoints");
 
-        // Remove the third: it leaves the painted frame (no stale row) and
-        // the selection still follows the first row's id.
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.commit_remove(&third_id, window, cx));
         });
@@ -43953,8 +38668,6 @@ mod tests {
             "selection preserved by id across remove"
         );
 
-        // Search narrows the painted rows (incremental filter, no rebuild);
-        // clearing it repaints everything.
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -43985,8 +38698,6 @@ mod tests {
         assert_painted(cx, &format!("library-row-{}", first.id));
         assert_painted(cx, &format!("library-row-{}", second.id));
 
-        // Removing everything paints the empty state (never a blank list
-        // with no rows and no empty text).
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.commit_remove(&first.id, window, cx);
@@ -44007,12 +38718,6 @@ mod tests {
         );
     }
 
-    /// Scenario: a health tick (fake engine + scripted prober) refreshes the
-    /// rows in place — painted rows match the store and carry the new health
-    /// summaries with no restart.
-    /// Ticket 41: seeds use documentation IPs — the start path resolves
-    /// egress hostnames before spawn, so unresolvable doc names stay in the
-    /// render/search tests that never start.
     #[gpui_kit::test]
     fn library_health_tick_repaints_rows(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -44045,7 +38750,7 @@ mod tests {
         let tested =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(tested, 2);
-        // Ticket 26: probes complete off-thread — pump the completion.
+
         cx.run_until_parked();
         cx.run_until_parked();
         paint_frame(cx);
@@ -44069,12 +38774,6 @@ mod tests {
         );
     }
 
-    /// Row content (pure seam): name, protocol, upstream host:port, bind
-    /// endpoint, enabled state, and the health summary are all present; the
-    /// health line appears only when a summary exists.
-    /// Ticket 31 deviation (mechanical repair — ticket 30 changed the
-    /// signature mid-flight without updating this caller): passes the serving
-    /// flag through; the badge line is always present, so the count is 4.
     #[test]
     fn library_row_lines_show_complete_content() {
         use crate::library_row_lines;
@@ -44140,12 +38839,6 @@ mod tests {
         );
     }
 
-    /// Ticket 01 (throne-density): dense lines merge meta and fold traffic
-    /// into the badge — 3 lines max, same visible facts, no secrets.
-    /// Ticket 01 (ui-polish) same-ticket update: the dense meta now carries
-    /// the route only (protocol · upstream · bind, at most 3 facts) while
-    /// group + enabled ride [`library_row_full_route`] for the meta tooltip
-    /// and detail pane — reason: 50-row skim density per CAP-1.
     #[test]
     fn library_row_dense_lines_merge_meta_and_badge() {
         use crate::store::ProxyConfig;
@@ -44214,8 +38907,6 @@ mod tests {
         assert!(idle[2].contains("Stopped"), "idle badge honest");
     }
 
-    /// Upstream extraction reads host/port keys only — credentials in params
-    /// can never reach the row text through this seam.
     #[test]
     fn upstream_host_port_reads_only_host_keys() {
         use crate::store::ProxyConfig;
@@ -44272,10 +38963,6 @@ mod tests {
         }
     }
 
-    // -- Ticket 26: UI-state races + error surfacing -------------------------
-
-    /// Seed with engine-startable params (the fake driver validates like the
-    /// real one; bare `seed_input` rows fail the start gate).
     fn t26_engine_seed(name: &str, port: &str) -> NewConfig {
         NewConfig {
             name: name.to_string(),
@@ -44290,8 +38977,6 @@ mod tests {
         }
     }
 
-    /// Scenario: select A, filter to only C → the selection clears (never
-    /// lands on C); a filter that still matches A keeps A (pure delegate).
     #[test]
     fn filter_selection_follows_id_never_wrong_row() {
         use crate::store::ProxyConfig;
@@ -44319,8 +39004,7 @@ mod tests {
             delegate.selected_row().map(|row| row.id),
             Some("1".to_string())
         );
-        // Narrow to only Gamma: Alpha is gone, so the selection clears
-        // instead of pointing at Gamma's index.
+
         delegate.query = "gamma".to_string();
         delegate.apply_filter();
         assert_eq!(
@@ -44328,12 +39012,11 @@ mod tests {
             None,
             "filtered-out selection clears"
         );
-        // Clearing the filter restores all rows (selection stays cleared —
-        // filtering never invents one).
+
         delegate.query = String::new();
         delegate.apply_filter();
         assert_eq!(delegate.selected_row(), None);
-        // A filter matching every row keeps Alpha by id (not by index).
+
         delegate.selected = Some(IndexPath::new(0));
         delegate.query = "a".to_string();
         delegate.apply_filter();
@@ -44344,8 +39027,6 @@ mod tests {
         );
     }
 
-    /// Scenario: type in the Add dialog during a background refresh →
-    /// the Add dialog and its input stay intact (never hijacked).
     #[gpui_kit::test]
     fn background_refresh_never_hijacks_add_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44357,7 +39038,7 @@ mod tests {
         paint_dialog_open(cx);
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
-        // A background refresh completion arrives mid-typing.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.reopen_subscriptions_if_open(window, cx));
         });
@@ -44377,8 +39058,6 @@ mod tests {
         assert_eq!(notification_count(cx), 0, "no toast for a non-event");
     }
 
-    /// Scenario: subscriptions sheet open with typed text + background
-    /// refresh → the sheet reopens with the text intact, not blank.
     #[gpui_kit::test]
     fn subs_dialog_reopen_preserves_form_text(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44388,10 +39067,10 @@ mod tests {
             view.update(cx, |view, cx| view.open_subscriptions_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-        // Type into the add form (the stashed live entities).
+
         cx.update(|window, cx| {
             let form = view.read_with(cx, |view, _| view.subs_form.clone());
             let form = form.expect("subs form stashed on open");
@@ -44399,7 +39078,7 @@ mod tests {
                 state.set_value("https://example.com/typed.txt", window, cx);
             });
         });
-        // Genuine reopen (background completion while subs is open).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.reopen_subscriptions_if_open(window, cx));
         });
@@ -44420,22 +39099,20 @@ mod tests {
         assert_eq!(url, "https://example.com/typed.txt", "typed text survives");
     }
 
-    /// Scenario: edit opened, refresh changes params underneath, user renames
-    /// → commit writes ONLY the rename; the refreshed params survive.
     #[gpui_kit::test]
     fn edit_commit_writes_only_user_changed_fields(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let seeded = store.add(seed_input("Work")).expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Dialog-open snapshot.
+
         let snapshot = view.read_with(cx, |view, _| {
             view.store
                 .get(&seeded.id)
                 .expect("get works")
                 .expect("row there")
         });
-        // Concurrent refresh lands after the dialog opened.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 use crate::store::ConfigPatch;
@@ -44450,7 +39127,7 @@ mod tests {
                     .expect("concurrent edit works");
             });
         });
-        // User renames only: build the relative patch like the dialog does.
+
         let renamed = cx.update(|window, cx| {
             view.update(cx, |_view, cx| {
                 use crate::ConfigForm;
@@ -44482,8 +39159,6 @@ mod tests {
         );
     }
 
-    /// Scenario: row deleted while the edit dialog is open → commit warns
-    /// "Already removed" and closes (never edits a ghost).
     #[gpui_kit::test]
     fn edit_commit_missing_row_warns_and_closes(cx: &mut TestAppContext) {
         use crate::store::ConfigPatch;
@@ -44505,8 +39180,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "removal warns once");
     }
 
-    /// Scenario: batch {a,b} open, tick adds {c} mid-flight → union, no
-    /// reset, one toast; the generation only bumps on empty → open.
     #[gpui_kit::test]
     fn batch_union_never_resets_open_batch(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44527,7 +39200,7 @@ mod tests {
         });
         let gen1 = view.read_with(cx, |view, _| view.refresh_generation);
         assert_eq!(gen1, gen0 + 1, "fresh batch bumps the generation");
-        // First member completes with churn.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.finish_subscription_refresh(
@@ -44545,7 +39218,7 @@ mod tests {
             });
         });
         assert_eq!(notification_count(cx), 0, "open batch stays silent");
-        // A second tick unions its id: no reset, same generation.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 view.begin_refresh_batch(&[ids[2].0.clone()]);
@@ -44585,8 +39258,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "one batch, one toast");
     }
 
-    /// Scenario: manual refresh while a tick fetch runs → adopted (no second
-    /// fetch); the shared completion notifies immediately, once.
     #[gpui_kit::test]
     fn manual_refresh_adopts_inflight_fetch(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44603,14 +39274,14 @@ mod tests {
                 assert!(!view.note_refresh_started(&sub_id), "second fetch dedupes");
             });
         });
-        // Manual click adopts: no new fetch, member leaves the batch.
+
         let started = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.refresh_subscription_by_id(&sub_id, window, cx)
             })
         });
         assert!(!started, "in-flight fetch is adopted, not restarted");
-        // The shared completion notifies immediately (not batched).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.finish_subscription_refresh(
@@ -44634,8 +39305,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08: `[=] Still in use` surfaces kept serving rows in both the
-    /// single and coalesced copy; zero keeps the old shape (pure copy).
     #[test]
     fn t08_still_in_use_counts_in_single_and_coalesced_copy() {
         use crate::{coalesced_refresh_message, refresh_summary_text};
@@ -44649,8 +39318,6 @@ mod tests {
         assert!(!text.contains("[=]"), "quiet when nothing serves: {text}");
     }
 
-    /// Ticket 08: manual single refresh with a userinfo header commits
-    /// quota, logs the completion, and pops exactly one toast.
     #[gpui_kit::test]
     fn t08_manual_refresh_commits_quota_and_logs(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44709,9 +39376,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08 scenario 2 (UI half): fetch failure keeps last-good
-    /// members AND the failure toast names the subscription; the
-    /// completion logs too.
     #[gpui_kit::test]
     fn t08_refresh_failure_names_subscription_and_logs(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44766,9 +39430,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08: Manage-Groups rows — `Basic` vs `Subscription (N)`
-    /// kinds, the quota line from the header snapshot, the skip marker,
-    /// and name order (pure data seam).
     #[test]
     fn t08_group_rows_kind_quota_skip() {
         use crate::{group_quota_line, group_row_views};
@@ -44847,7 +39508,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08: expiry buckets (pure copy).
     #[test]
     fn t08_format_expire_buckets() {
         use crate::format_expire;
@@ -44860,9 +39520,6 @@ mod tests {
         assert_eq!(format_expire(now + 259_200, now), "3d left");
     }
 
-    /// Ticket 08: Update-current selection (one group's subs in stable
-    /// order) and Update-all partition (flagged groups reported, never
-    /// fetched) plus the confirm copy (pure seams).
     #[test]
     fn t08_update_targets_partition_and_confirm() {
         use crate::{update_all_confirm_text, update_all_targets, update_target_subs};
@@ -44898,8 +39555,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08: the Groups sheet paints per-row Update/Edit plus the
-    /// kind/quota lines and the bulk verbs.
     #[gpui_kit::test]
     fn t08_groups_sheet_paints_update_edit_quota(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44927,8 +39582,6 @@ mod tests {
         assert_painted(cx, "group-quota-travel");
     }
 
-    /// Ticket 08: Edit-group commit renames, flips the skip flag, toasts
-    /// once, and reopens the manager; empty renames keep it open.
     #[gpui_kit::test]
     fn t08_edit_group_commit_renames_and_flags(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44966,9 +39619,6 @@ mod tests {
         assert!(!kept, "empty rename keeps the dialog open");
     }
 
-    /// Ticket 08: skip-flagged groups never auto-refresh (the tick
-    /// selection reads empty); unflagged due subs still list. The tick
-    /// itself is windowless — no dialog can exist without a window.
     #[gpui_kit::test]
     fn t08_due_subscriptions_respect_skip_flag(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -44996,8 +39646,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08: Update-current focuses the facet group first, else the
-    /// selected row's group; nothing focused reads None.
     #[gpui_kit::test]
     fn t08_current_group_prefers_facet(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -45025,8 +39673,6 @@ mod tests {
         );
     }
 
-    /// Scenario: auto flag flipped behind the dialog's back → commit toggles
-    /// the CURRENT value, not the stale rendered one.
     #[gpui_kit::test]
     fn commit_subscription_auto_rereads_current(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -45036,7 +39682,7 @@ mod tests {
             .expect("seed works");
         let sub_id = sub.id.clone();
         let (view, cx) = mount_view(store, cx);
-        // Someone flips it behind the dialog's back (dialog still shows on).
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 view.store
@@ -45059,8 +39705,6 @@ mod tests {
         assert!(current, "fresh false toggles back to true (not stale on)");
     }
 
-    /// Scenario: corrupt DB → Start all errors honestly, never claims the
-    /// library is empty (pure copy + headless delivery).
     #[test]
     fn db_list_error_names_database_never_empty() {
         use crate::db_list_error_message;
@@ -45070,8 +39714,6 @@ mod tests {
         assert!(!text.contains("empty"), "never the empty claim: {text}");
     }
 
-    /// Scenario: corrupt DB → Start all errors honestly, never claims the
-    /// library is empty (headless delivery: exactly one notice).
     #[gpui_kit::test]
     fn corrupt_db_start_all_errors_never_empty_claim(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -45094,7 +39736,6 @@ mod tests {
         );
     }
 
-    /// Scenario: the enable toast always says flag-only (pure copy).
     #[test]
     fn enabled_flag_message_names_row_and_meaning() {
         use crate::enabled_flag_message;
@@ -45107,8 +39748,6 @@ mod tests {
         assert!(off.contains("Stop"), "points at Stop: {off}");
     }
 
-    /// Scenario: a successful toggle toasts the flag meaning (never silent,
-    /// never start-shaped).
     #[gpui_kit::test]
     fn toggle_success_toasts_flag_meaning(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -45136,8 +39775,6 @@ mod tests {
         );
     }
 
-    /// Scenario: read-only DB → Start toasts the flag failure loudly (the
-    /// endpoint runs while the flag lies — never silent).
     #[gpui_kit::test]
     fn start_selected_flag_write_failure_is_loud(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -45169,8 +39806,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "flag failure is loud");
     }
 
-    /// Scenario: dropped paths name the unreadable files (pure copy +
-    /// headless delivery, basenames only).
     #[test]
     fn unreadable_drop_message_names_basenames() {
         use crate::unreadable_drop_message;
@@ -45179,7 +39814,6 @@ mod tests {
         assert!(!text.contains("Users"), "never full paths: {text}");
     }
 
-    /// Scenario: dropping an unreadable path toasts its name, stores nothing.
     #[gpui_kit::test]
     fn import_drop_names_unreadable_files(cx: &mut TestAppContext) {
         use gpui_kit::ExternalPaths;
@@ -45203,9 +39837,6 @@ mod tests {
         );
     }
 
-    /// Ticket 07 (throne-adoption): file guards on the read seam — plain
-    /// text passes, image/NUL/non-UTF8 refuse with static reasons, and the
-    /// cap constant is exactly 50MB.
     #[test]
     fn t07_read_import_file_guards() {
         use crate::import::MAX_IMPORT_FILE_BYTES;
@@ -45245,10 +39876,6 @@ mod tests {
         }
     }
 
-    /// Ticket 07 (throne-adoption): a mixed drop (one link file, one image,
-    /// one binary, one oversize) opens one dialog for the readable bytes and
-    /// names every refused file with its reason — a single honest result,
-    /// nothing stored silently.
     #[gpui_kit::test]
     fn t07_drop_names_refused_files_with_reasons(cx: &mut TestAppContext) {
         use crate::import::MAX_IMPORT_FILE_BYTES;
@@ -45295,14 +39922,10 @@ mod tests {
         }
     }
 
-    /// Ticket 07 (throne-adoption): the bare-URL chooser renders both
-    /// explicit options; "Import as proxy here" lands in the import dialog
-    /// (nothing parses silently, nothing commits on open).
     #[gpui_kit::test]
     fn t07_bare_url_chooser_offers_both_paths(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        // Settle the dialog entrance animation so the click lands (the
-        // dialog-footer tests do the same).
+
         cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
@@ -45343,8 +39966,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Scenario: Ctrl+N opens Add; a second Ctrl+N with the dialog open is a
-    /// no-op (never steals dialog keys, never stacks dialogs).
     #[gpui_kit::test]
     fn keyboard_shortcuts_open_and_guard_dialogs(cx: &mut TestAppContext) {
         use gpui_kit::Keystroke;
@@ -45352,7 +39973,7 @@ mod tests {
         cx.update(crate::bind_app_keys);
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
-        // Focus the shell so the library key context matches.
+
         let focus = view.read_with(cx, |view, _| view.focus.clone());
         cx.update(|window, cx| window.focus(&focus, cx));
         let press = |cx: &mut VisualTestContext, key: &str| {
@@ -45368,7 +39989,7 @@ mod tests {
             "Ctrl+N opens Add"
         );
         assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
-        // Guarded while open: no second dialog, no toast, no steal.
+
         press(cx, "ctrl-n");
         cx.run_until_parked();
         assert!(
@@ -45378,7 +39999,6 @@ mod tests {
         assert_eq!(notification_count(cx), 0, "guarded shortcut is silent");
     }
 
-    /// Scenario: F5 starts the selected loopback row headless.
     #[gpui_kit::test]
     fn keyboard_f5_starts_selected(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -45416,10 +40036,6 @@ mod tests {
         );
     }
 
-    /// Lane B (B9): Delete opens the naming confirm for the selected row
-    /// (honest toast with no selection), Ctrl-E opens Edit, Ctrl-F focuses
-    /// search without side effects, Ctrl-1/2/3 switch inspector panes, and
-    /// every one of them no-ops while a dialog is open.
     #[gpui_kit::test]
     fn laneb_keyboard_edit_delete_search_tabs(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -45448,7 +40064,7 @@ mod tests {
             });
             cx.run_until_parked();
         };
-        // Ctrl-2 lands on the Health pane.
+
         press(cx, "ctrl-2");
         assert_eq!(
             view.read_with(cx, |view, _| view.inspector_tab),
@@ -45485,7 +40101,7 @@ mod tests {
             crate::InspectorTab::Details,
             "Ctrl-1 switches pane"
         );
-        // Ctrl-F focuses search with no dialog and no toast.
+
         let before = notification_count(cx);
         press(cx, "ctrl-f");
         assert_eq!(notification_count(cx), before, "search focus is silent");
@@ -45493,7 +40109,7 @@ mod tests {
             !cx.update(|window, cx| window.has_active_dialog(cx)),
             "search focus opens nothing"
         );
-        // Ctrl-E opens the edit dialog for the selected row.
+
         press(cx, "ctrl-e");
         assert!(
             cx.update(|window, cx| window.has_active_dialog(cx)),
@@ -45501,9 +40117,7 @@ mod tests {
         );
         assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Delete opens the naming confirm for the selected row (refocus
-        // the shell first — closing the edit dialog parks focus elsewhere,
-        // same as real usage returning to the list).
+
         cx.update(|window, cx| window.focus(&focus, cx));
         press(cx, "delete");
         assert!(
@@ -45511,7 +40125,7 @@ mod tests {
             "Delete confirms the selected row"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // Guarded while open: Delete with the edit dialog up changes nothing.
+
         press(cx, "ctrl-e");
         let guarded = notification_count(cx);
         cx.update(|window, cx| window.focus(&focus, cx));
@@ -45519,7 +40133,7 @@ mod tests {
         assert_eq!(notification_count(cx), guarded, "guarded Delete is silent");
         assert!(cx.update(|window, _| window.try_find("field-name").is_some()));
         cx.update(|window, cx| window.close_all_dialogs(cx));
-        // No selection explains itself instead of confirming nothing.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -45542,8 +40156,6 @@ mod tests {
         );
     }
 
-    /// Scenario: Logs OK applies the filter and closes exactly once (L5:
-    /// never an explicit close plus a framework close).
     #[gpui_kit::test]
     fn logs_ok_closes_exactly_once(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -45554,7 +40166,7 @@ mod tests {
             view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
         });
         paint_dialog_open(cx);
-        // T08 (gpui-18-sweep CAP-9): sheet, never a dialog.
+
         assert!(cx.update(|window, cx| window.has_active_sheet(cx)));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         cx.update(|window, cx| {
@@ -45569,8 +40181,6 @@ mod tests {
         assert_eq!(notification_count(cx), 0, "filter apply is silent");
     }
 
-    /// Scenario: a refresh that preserves user edits warns and names the
-    /// conflict count (pure copy).
     #[test]
     fn refresh_summary_text_names_conflicts() {
         use crate::refresh_summary_text;
@@ -45592,19 +40202,17 @@ mod tests {
         );
     }
 
-    /// Scenario: pasting an export payload opens the restore confirm (never
-    /// the import path); confirming restores rows verbatim.
     #[gpui_kit::test]
     fn export_payload_restores_library(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         store.add(seed_input("Work")).expect("seed works");
         let payload = store.export_library_json().expect("export works");
-        // Diverge: an extra row the backup does not have.
+
         store.add(seed_input("Extra")).expect("seed works");
         let (view, cx) = mount_view(store, cx);
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
-        // Pasting the payload diverts to the restore confirm.
+
         let closed = cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.commit_import(payload.clone(), "g".to_string(), None, window, cx)
@@ -45617,7 +40225,7 @@ mod tests {
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
-        // Confirm path restores verbatim (Extra is gone, Work is back).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.commit_library_restore(&payload, window, cx)
@@ -45631,8 +40239,6 @@ mod tests {
         assert_eq!(notification_count(cx), 1, "restore names its counts");
     }
 
-    /// Scenario: a second probe while one runs is deduped with an info
-    /// toast (never stacked blocking work).
     #[gpui_kit::test]
     fn probe_dedupe_second_request_warns(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -45662,7 +40268,7 @@ mod tests {
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(second, 0, "second probe dedupes");
         cx.run_until_parked();
-        // Info (already running) + success (completion) = two new notices.
+
         assert_eq!(notification_count(cx) - before, 2, "dedupe explains itself");
         assert!(
             !view.read_with(cx, |view, _| view.probe_kind_in_flight(false)),
@@ -45670,9 +40276,6 @@ mod tests {
         );
     }
 
-    /// Ticket 47: per-kind probe flags — an in-flight URL-test probe blocks
-    /// a second URL test but never a TCP ping (and vice versa), so the 60s
-    /// re-probe tick cannot block a manual ping.
     #[gpui_kit::test]
     fn t47_probe_flags_isolate_kinds(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -45694,15 +40297,15 @@ mod tests {
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.start_all_engines(window, cx));
         });
-        // Start a URL-test probe (manual test-all path).
+
         let started =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(started, 1, "url probe starts");
-        // Same kind dedupes while in flight…
+
         let dup =
             cx.update(|window, cx| view.update(cx, |view, cx| view.test_all_health(window, cx)));
         assert_eq!(dup, 0, "second url probe dedupes");
-        // …but the other kind is free: a ping spawn succeeds mid-flight.
+
         let ping = cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.spawn_probe(vec![config.clone()], true, false, None, cx)
@@ -45720,9 +40323,6 @@ mod tests {
         );
     }
 
-    /// Ticket 47: idle cadences stay minimal — tray pump 500–1000ms, one
-    /// timer per interval (tick constants unchanged, single-sleep loops),
-    /// startup refresh deferred a few seconds past first paint.
     #[test]
     fn t47_idle_cadences_minimal() {
         use crate::{STARTUP_REFRESH_DEFER_SECS, TRAY_PUMP_MILLIS};
@@ -45734,7 +40334,7 @@ mod tests {
             (1..=10).contains(&STARTUP_REFRESH_DEFER_SECS),
             "refresh deferred past first paint, got {STARTUP_REFRESH_DEFER_SECS}s"
         );
-        // One timer per interval: every tick cadence is a single sleep.
+
         for (name, secs) in [
             ("engine", crate::ENGINE_POLL_TICK_SECS),
             ("traffic", crate::TRAFFIC_TICK_SECS),
@@ -45745,11 +40345,6 @@ mod tests {
         }
     }
 
-    // -- Ticket 30: list + engine feedback -----------------------------------
-
-    /// Scenario: serving badge copy — running rows show
-    /// `● Running :port · health`, stopped rows show `○ Stopped`; the
-    /// enabled flag never leaks into the badge (synthetic ports only).
     #[test]
     fn serving_badge_copy() {
         use crate::serving_badge;
@@ -45766,8 +40361,6 @@ mod tests {
         }
     }
 
-    /// T01 (gpui-18-sweep): lamp + chip text equivalents — state perceivable
-    /// without hue alone; chip names its position of the total.
     #[test]
     fn t01_status_text_equivalents() {
         use crate::{check_chip_tip, lamp_access_label, ServingTone};
@@ -45791,8 +40384,6 @@ mod tests {
         assert_eq!(check_chip_tip(3, 3), "Checked 3 of 3 — bulk action target");
     }
 
-    /// Scenario: running vs stopped rows render the badge in the row lines;
-    /// the enabled flag stays secondary in its own line.
     #[test]
     fn row_lines_badge_follows_serving_not_flag() {
         use crate::store::ProxyConfig;
@@ -45832,8 +40423,6 @@ mod tests {
         );
     }
 
-    /// Scenario: honest start-on-running / no-selection / busy / partial /
-    /// crash / search-count copies (pure).
     #[test]
     fn honest_engine_feedback_copies() {
         use crate::engine::EngineController;
@@ -45859,7 +40448,7 @@ mod tests {
         assert!(partial.contains('4'), "{partial}");
         assert!(partial.contains('1'), "{partial}");
         assert!(partial.contains("Broken"), "{partial}");
-        // Row-local schema failures isolate; union failures stay atomic.
+
         assert!(crate::is_row_local_start_error(
             &crate::engine::EngineError::BadParams {
                 name: "Broken".to_string(),
@@ -45913,10 +40502,6 @@ mod tests {
         }
     }
 
-    // -- R3: inline loopback-endpoint editing -------------------------------
-
-    /// R3: every library row carries fixed bind + port editors plus per-row
-    /// Start/Edit — loopback IP:port:serve always on, one row.
     #[gpui_kit::test]
     fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -45938,8 +40523,7 @@ mod tests {
                 );
             }
         }
-        // Polish: editors hold their fixed cells; serve/edit announce full
-        // `Name (Key)` accessible names, not bare verbs.
+
         let (bind_w, port_w) = cx.update(|window, _| {
             let bind = window
                 .try_find(format!("row-bind-input-{}", alpha.id))
@@ -45979,7 +40563,6 @@ mod tests {
         }
     }
 
-    /// R3: per-row Start serves THAT row (fake engine) with one honest toast.
     #[gpui_kit::test]
     fn r3_row_serve_button_starts_that_row(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46013,8 +40596,6 @@ mod tests {
         assert_eq!(notification_count(cx), before + 1, "one honest toast");
     }
 
-    /// R3: a dirty port draft commits through [`AppView::commit_row_endpoint`] —
-    /// store updated, toast names the row, editors canonicalize.
     #[gpui_kit::test]
     fn r3_row_endpoint_commit_writes_store(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46058,8 +40639,6 @@ mod tests {
         assert_eq!(notification_count(cx), before + 1, "one honest toast");
     }
 
-    /// R3: a privileged port fails the save gate loudly — toast, no write,
-    /// draft kept for correction.
     #[gpui_kit::test]
     fn r3_row_endpoint_reserved_port_fails_gate(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46111,8 +40690,6 @@ mod tests {
         assert_eq!(notification_count(cx), before + 1, "one loud toast");
     }
 
-    /// R3: a draft colliding with another row paints the inline warning
-    /// before Enter is ever pressed (saving would still be allowed).
     #[gpui_kit::test]
     fn r3_row_endpoint_collision_warns_inline(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46155,7 +40732,6 @@ mod tests {
         assert_eq!(stored, 10951, "warning alone writes nothing");
     }
 
-    /// R3: Esc on a dirty field snaps back to stored truth (direct seam).
     #[gpui_kit::test]
     fn r3_row_endpoint_escape_reverts_draft(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46198,8 +40774,6 @@ mod tests {
         assert_eq!(draft, "10951", "editors show stored truth again");
     }
 
-    /// R3: Enter inside a dirty port field commits through the deferred
-    /// subscription path (no direct commit call).
     #[gpui_kit::test]
     fn r3_row_endpoint_enter_key_commits(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46244,7 +40818,6 @@ mod tests {
         assert_eq!(stored, 10961, "Enter commits the draft");
     }
 
-    /// R3: Escape inside a dirty field reverts through the row key handler.
     #[gpui_kit::test]
     fn r3_row_endpoint_escape_key_reverts(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46297,8 +40870,6 @@ mod tests {
         assert_eq!(draft, "10951", "Escape reverts the draft");
     }
 
-    /// R3: removing a row prunes its cached editors on reload (no ghost
-    /// Enter commits, no leak).
     #[gpui_kit::test]
     fn r3_row_endpoint_inputs_pruned_on_remove(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46351,8 +40922,6 @@ mod tests {
         }
     }
 
-    /// Scenario: Start-all with 1 broken of 5 → valid rows keep serving,
-    /// one toast naming the failed row plus both counts.
     #[gpui_kit::test]
     fn start_all_partial_names_failed_row_and_serves_rest(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46366,7 +40935,7 @@ mod tests {
         ] {
             store.add(t30_engine_seed(name, port)).expect("seed works");
         }
-        // Broken: stored params are not valid for the engine (never echoes).
+
         store
             .add(NewConfig {
                 name: "Broken".to_string(),
@@ -46393,14 +40962,11 @@ mod tests {
             "valid rows keep serving"
         );
         assert_eq!(notification_count(cx), 1, "one partial toast");
-        // The copy itself (names + counts) is pinned at the pure seam.
+
         let copy = crate::start_all_partial_message(4, &["\"Broken\"".to_string()]);
         assert!(copy.contains('4') && copy.contains('1') && copy.contains("Broken"));
     }
 
-    /// Scenario: saving a row inside a reserved range (or with a garbage
-    /// bind) fails at the save gate — nothing is written, the error names
-    /// the range. Blank ports (auto) still save.
     #[gpui_kit::test]
     fn t41_save_gate_rejects_reserved_port_and_garbage_bind(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46413,19 +40979,19 @@ mod tests {
                 view.engine = engine;
             });
         });
-        // Clash-reserved port.
+
         let mut squatter = t30_engine_seed("Squatter", "18501");
         let added = cx.update(|window, cx| {
             view.update(cx, |view, cx| view.commit_add(squatter.clone(), window, cx))
         });
         assert!(!added, "reserved port never saves");
-        // Bridge-reserved port.
+
         squatter.port = "11801".to_string();
         let added = cx.update(|window, cx| {
             view.update(cx, |view, cx| view.commit_add(squatter.clone(), window, cx))
         });
         assert!(!added, "bridge range never saves");
-        // Garbage bind.
+
         squatter.port = "10991".to_string();
         squatter.bind_ip = "999.999.0.1".to_string();
         let added = cx.update(|window, cx| {
@@ -46438,7 +41004,7 @@ mod tests {
             "nothing written"
         );
         assert_eq!(notification_count(cx), 3, "one error toast per refusal");
-        // Blank port (auto) still saves.
+
         squatter.bind_ip = String::new();
         squatter.port = String::new();
         let added = cx
@@ -46447,8 +41013,6 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
     }
 
-    /// Scenario: editing a row into a reserved range fails before any write
-    /// — the stored port is untouched.
     #[gpui_kit::test]
     fn t41_commit_edit_into_reserved_range_rejected(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46484,9 +41048,6 @@ mod tests {
         assert_eq!(row.port, 10931, "stored port untouched, got {}", row.port);
     }
 
-    /// Scenario: one crashed shard → Restart recovers it with a success
-    /// toast; Restart with nothing crashed is a quiet info (never a fake
-    /// "Restarted").
     #[gpui_kit::test]
     fn t41_restart_crashed_recovers_and_idle_quiet(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46512,7 +41073,7 @@ mod tests {
             "serving before the crash"
         );
         handle.inject_crash("signal: segmentation fault");
-        // The windowless tick registers the crash (no toast by necessity).
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| view.tick_engine_poll(cx));
         });
@@ -46534,15 +41095,13 @@ mod tests {
             view.read_with(cx, |view, _| view.engine.clash_targets().len() == 1),
             "clash recovered"
         );
-        // Idle restart: quiet info, no fake success.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.restart_crashed_engines(window, cx));
         });
         assert_eq!(notification_count(cx), before + 2, "one idle toast");
     }
 
-    /// Scenario: double Start while busy → ignored with an info toast, no
-    /// second apply.
     #[gpui_kit::test]
     fn double_start_while_busy_is_ignored(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46586,8 +41145,6 @@ mod tests {
         });
     }
 
-    /// Scenario: Start on already-running → honest `already running
-    /// (restarted)` path, still serving exactly once.
     #[gpui_kit::test]
     fn start_on_running_restarts_honestly(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46628,15 +41185,13 @@ mod tests {
         assert_eq!(notification_count(cx), 2, "restart toasts honestly");
     }
 
-    /// Scenario: no selection + Start (F5 path) → info toast, never a dead
-    /// click.
     #[gpui_kit::test]
     fn start_with_no_selection_explains_itself(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         store.add(seed_input("Work")).expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // No selection by default.
+
         assert!(view.read_with(cx, |view, cx| view.selected_config(cx).is_none()));
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.start_selected_engine(window, cx));
@@ -46649,8 +41204,6 @@ mod tests {
         );
     }
 
-    /// Scenario: sidecar crash → poll tick pushes an error notification
-    /// naming shard/cause with the View-logs path (not status-bar-only).
     #[gpui_kit::test]
     fn crash_tick_notifies_with_shard_and_logs_path(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -46686,8 +41239,6 @@ mod tests {
         );
     }
 
-    /// Scenario: search no-hits vs empty library at the delegate seam —
-    /// no-hits keeps the total (`0 of M`), empty stays `0 of 0`.
     #[test]
     fn search_no_hits_vs_empty_counts() {
         use crate::store::ProxyConfig;
@@ -46720,9 +41271,6 @@ mod tests {
         assert!(crate::empty_library_text().contains("Add"));
     }
 
-    /// Scenario: no-hits paints `No matches — Clear search` + `N of M`
-    /// with a clear affordance; the detail pane carries the serving badge
-    /// and no duplicate enable button.
     #[gpui_kit::test]
     fn no_hits_paints_and_detail_has_single_switch(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -46743,9 +41291,7 @@ mod tests {
                 });
             });
         });
-        // Selection cleared by the narrowing filter (filtered-out rows never
-        // keep the selection); reselect is impossible with zero visible, so
-        // restore the query for the detail half of this scenario.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -46772,7 +41318,7 @@ mod tests {
             cx.update(|window, _| window.try_find("toggle-enabled".to_string()).is_none()),
             "no duplicate enable button — Switch only"
         );
-        // No-hits half: narrow again and check the empty-state affordances.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -46796,9 +41342,6 @@ mod tests {
         );
     }
 
-    /// Lane B (B9): facet-only filters that hide every row read as no-hits
-    /// (never as an empty library) with the active filters named, and the
-    /// combined Clear all restores query + facets together.
     #[gpui_kit::test]
     fn laneb_facet_empty_and_clear_all(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46847,10 +41390,6 @@ mod tests {
         assert_eq!(visible, 2, "Clear all restores every row");
     }
 
-    /// Ticket 03 (CAP-3.1) tests-first: filter band shows a persistently
-    /// visible search affordance with placeholder `Search configurations`
-    /// and an adjacent live `N of M` count — even with no query active.
-    /// RED while `render_search_count` stays empty without a query.
     #[gpui_kit::test]
     fn ticket03_search_count_persistent_with_live_count(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46866,13 +41405,13 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Placeholder pinned at the seam (kit List owns the field itself).
+
         assert_eq!(
             crate::SEARCH_PLACEHOLDER,
             "Search configurations",
             "search field placeholder pinned"
         );
-        // Live N of M with no query: the full library is visible.
+
         let (visible, total, query) = view.read_with(cx, |view, cx| {
             view.libraries
                 .read(cx)
@@ -46882,7 +41421,7 @@ mod tests {
         assert_eq!((visible, total), (2, 2), "unfiltered library counts");
         assert!(query.trim().is_empty(), "no query active");
         assert_eq!(crate::search_count_text(visible, total), "2 of 2");
-        // The count + facet band paint persistently (no query needed).
+
         assert_painted(cx, "search-count");
         assert_painted(cx, "facet-bar");
         assert_painted(cx, "search-focus");
@@ -46891,10 +41430,6 @@ mod tests {
         assert_painted(cx, "facet-status");
     }
 
-    /// Ticket 03 (CAP-3.2) tests-first: the three clears each name their
-    /// target and affect only that target — query vs facet filters vs the
-    /// checked set. Established through the real `set_query` typing path so
-    /// a delegate-only reset regresses here.
     #[gpui_kit::test]
     fn ticket03_clears_affect_only_their_target(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -46910,8 +41445,7 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // Establish all three targets: query via set_query, facets via the
-        // delegate setters, checked via the checkbox seam.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -46954,7 +41488,7 @@ mod tests {
         assert_painted(cx, "clear-search");
         assert_painted(cx, "clear-facets");
         assert_painted(cx, "bulk-clear");
-        // Clear 1: query only — facets + checked survive.
+
         cx.update(|window, cx| {
             window.click("clear-search", cx);
         });
@@ -46985,7 +41519,7 @@ mod tests {
             "Clear search keeps the protocol facet"
         );
         assert!(after_query.3, "Clear search keeps the checked set");
-        // Re-establish the query, then Clear 2: facets only.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -47015,7 +41549,7 @@ mod tests {
         assert_eq!(after_facets.2, None, "Clear facets drops protocol");
         assert_eq!(after_facets.3, None, "Clear facets drops status");
         assert!(after_facets.4, "Clear facets keeps the checked set");
-        // Re-establish facets, then Clear 3: checked only.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -47056,9 +41590,6 @@ mod tests {
         assert!(after_checked.3, "Clear checked empties the set");
     }
 
-    /// Ticket 03 (CAP-3.3) tests-first: facet pickers show the active choice
-    /// plus its result count on the trigger — group already did; protocol
-    /// and status now match. RED while their displays carry bare labels.
     #[gpui_kit::test]
     fn ticket03_facet_triggers_show_active_choice_with_count(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -47127,13 +41658,6 @@ mod tests {
         );
     }
 
-    /// T06 (gpui-18-sweep CAP-7): one persistently visible search field —
-    /// `ListState::searchable(true)` plus `List::search_placeholder` — with
-    /// a live `N of M` count. Ctrl-F lands focus in the kit query input
-    /// (behavioral proof the field paints and takes focus); typing through
-    /// the real `set_query` path moves the count; the placeholder seam
-    /// stays pinned. Scoped clears themselves ride the existing
-    /// `ticket03_clears_affect_only_their_target` isolation test.
     #[gpui_kit::test]
     fn t06_search_field_focusable_with_live_count(cx: &mut TestAppContext) {
         use gpui_kit::Focusable as _;
@@ -47158,8 +41682,7 @@ mod tests {
             "search field placeholder pinned"
         );
         assert_painted(cx, "search-count");
-        // Ctrl-F focuses the kit query input — the field exists and takes
-        // focus (same shell-focus + keystroke rhythm as the laneb tab test).
+
         let focus = view.read_with(cx, |view, _| view.focus.clone());
         cx.update(|window, cx| window.focus(&focus, cx));
         let keystroke = Keystroke::parse("ctrl-f").expect("test keystroke parses");
@@ -47168,14 +41691,11 @@ mod tests {
         });
         cx.run_until_parked();
         let query_focused = cx.update(|window, cx| {
-            // A searchable `List` focuses its query input, so the focused
-            // handle must equal the libraries' focus handle afterwards
-            // (same seam as `t03_search_focus_button_focuses_query`).
             let handle = view.read(cx).libraries.read(cx).focus_handle(cx);
             window.focused(cx).as_ref() == Some(&handle)
         });
         assert!(query_focused, "Ctrl-F lands in the library search field");
-        // Typing through the real path moves the live count (2 of 2 → 1).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -47198,10 +41718,6 @@ mod tests {
         assert_painted(cx, "clear-search");
     }
 
-    /// T06 (CAP-7): facet hover tooltips name the active choice (with its
-    /// result count, same text as the trigger) plus the live `N of M` —
-    /// painted on the outer wrapper divs, never an invented
-    /// `Select::tooltip`. Pure delegate seams + painted wrappers.
     #[gpui_kit::test]
     fn t06_facet_tips_name_active_choice_with_count(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -47217,11 +41733,11 @@ mod tests {
         paint_frame(cx);
         cx.run_until_parked();
         paint_frame(cx);
-        // The wrappers paint — the only legal tooltip anchors.
+
         assert_painted(cx, "facet-group-tip");
         assert_painted(cx, "facet-protocol-tip");
         assert_painted(cx, "facet-status-tip");
-        // Establish a group facet + query: visible 1 of 2, travel holds 2.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -47275,11 +41791,6 @@ mod tests {
         assert_eq!(status_tip, "Filter by status: Status: All · 1 of 2 shown");
     }
 
-    /// T06 (CAP-7): inspector tabs carry Ctrl-1/2/3 hints (accessible names
-    /// pin the keys; the visible `Kbd` suffix chips mirror them), keep the
-    /// wrapper + zero-size-marker anchors, reset the pane scroll on switch,
-    /// and keep pane order frozen Header → Endpoints → tab-specific on
-    /// every pane. No per-tab id invention (`Tab::ix` is `pub(crate)`).
     #[gpui_kit::test]
     fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -47292,8 +41803,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Accessible names pin the bound keys (the `Kbd` suffix chips have
-        // no element id to assert headless — these strings are the contract).
+
         assert_eq!(
             crate::InspectorTab::Details.a11y_label(),
             "Inspector Details tab (Ctrl-1)"
@@ -47318,7 +41828,7 @@ mod tests {
             crate::InspectorTab::Traffic.a11y_label(),
             "Inspector Traffic tab (Ctrl-6)"
         );
-        // Select the row so every pane renders its sections.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -47329,9 +41839,7 @@ mod tests {
         });
         let focus = view.read_with(cx, |view, _| view.focus.clone());
         cx.update(|window, cx| window.focus(&focus, cx));
-        // Frozen order on every pane: header, then endpoints, then the
-        // tab-specific module (layout bounds keep DOM order — the scroller
-        // only offsets at paint time, so tops strictly increase).
+
         for (tab, specific) in [
             (crate::InspectorTab::Details, "config-usage"),
             (crate::InspectorTab::Health, "config-health"),
@@ -47381,8 +41889,7 @@ mod tests {
                 "pane order frozen Header → Endpoints → tab-specific on {tab:?}: {tops:?}"
             );
         }
-        // Scroll reset through the real key path: sink the Health pane to
-        // the bottom, then Ctrl-1 starts Details at the top.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 view.set_inspector_tab(crate::InspectorTab::Health);
@@ -47430,7 +41937,7 @@ mod tests {
             px(0.),
             "the Details pane starts scrolled to the top, not mid-pane"
         );
-        // Ctrl-2..6 drive the other panes through the same actions.
+
         press(cx, "ctrl-2");
         assert_eq!(
             view.read_with(cx, |view, _| view.inspector_tab),
@@ -47463,12 +41970,6 @@ mod tests {
         );
     }
 
-    /// Ticket 04 (throne-adoption): one shared overview for all panes — a
-    /// failing row shows the acting row, the failure Alert directly under
-    /// it, and Endpoints on every pane alike (no per-pane
-    /// copies), with CAP-7 order Header → Alert → Endpoints → tab-specific
-    /// on every pane. Healthy rows keep Header → Endpoints with no Alert
-    /// element at all (pinned by `dead_row_health_section_renders_alert`).
     #[gpui_kit::test]
     fn throne04_inspector_overview_shared_across_panes(cx: &mut TestAppContext) {
         use crate::health::{HealthKind, HealthSample, TestOutcome};
@@ -47487,7 +41988,7 @@ mod tests {
                 });
             });
         });
-        // Dead outcome: errored sample, no success.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _cx| {
                 view.health_store.record_outcome(&TestOutcome {
@@ -47519,8 +42020,7 @@ mod tests {
             paint_frame(cx);
             cx.run_until_parked();
             paint_frame(cx);
-            // One shared overview on every pane: header, failure Alert,
-            // and Endpoints all paint (the Alert reads without scrolling).
+
             for id in [
                 "inspector-overview",
                 "detail-acting-on",
@@ -47529,7 +42029,7 @@ mod tests {
             ] {
                 assert_painted(cx, id);
             }
-            // CAP-7 order holds geometrically on every pane.
+
             let tops = cx.update(|window, _| {
                 [
                     "detail-acting-on",
@@ -47555,7 +42055,6 @@ mod tests {
         }
     }
 
-    /// Scenario: empty library paints Add/Import CTAs (never a bare blank).
     #[gpui_kit::test]
     fn empty_library_paints_ctas(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -47572,10 +42071,6 @@ mod tests {
         );
     }
 
-    /// Signal-box 06: the empty library teaches its next step with no
-    /// dead ends — Add/Import CTAs paint beside the empty copy, and the
-    /// status describer stays honest (zero counts named, never-tested
-    /// health, usage absent instead of a lying zero).
     #[gpui_kit::test]
     fn t06_empty_library_describer_teaches_next_step(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -47600,8 +42095,7 @@ mod tests {
             "health: no probes this session",
             "empty health never reads as failure"
         );
-        // Usage on empty: the readable store totals zero honestly (the
-        // segment hides only on a broken read — never a lying nonzero).
+
         let traffic = view.read_with(cx, |view, _| crate::summed_traffic_text(&view.store));
         assert!(
             traffic.is_none() || traffic.as_deref() == Some("↓ 0 B · ↑ 0 B"),
@@ -47609,11 +42103,6 @@ mod tests {
         );
     }
 
-    /// T04 (gpui-18-sweep CAP-5): the truly-empty CTAs live INSIDE the
-    /// `library-empty` Empty content — the CTA row's bounds sit inside the
-    /// empty's bounds, so assistive tech hears the empty and its actions
-    /// together. Handler behavior stays covered by
-    /// `empty_library_ctas_open_add_and_import`.
     #[gpui_kit::test]
     fn t04_empty_library_actions_live_inside_empty(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -47647,11 +42136,6 @@ mod tests {
         );
     }
 
-    /// T04 (gpui-18-sweep CAP-4): density anchors paint — the search clear
-    /// (query active), the facet clear (facet active), the no-selection
-    /// detail CTAs (rows exist, none selected), and the truncating status
-    /// segments. `.small()` + tooltip ride the builders (compiler-pinned);
-    /// this test guards the ids they ride on.
     #[gpui_kit::test]
     fn t04_density_anchors_paint(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -47660,8 +42144,7 @@ mod tests {
             .add(row19_seed("Work", "a.example.com", "10801"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Query + facet active (hiding every row) so both clears paint;
-        // no selection so the detail no-selection CTAs paint.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -47691,9 +42174,6 @@ mod tests {
         }
     }
 
-    /// T04 (gpui-18-sweep CAP-5): the log viewer with no matching lines
-    /// renders the kit Empty with a working Clear-filter action; clicking
-    /// it restores the full tail (filter + level cleared, dialog reopens).
     #[gpui_kit::test]
     fn t04_log_no_lines_empty_clears_filter(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -47745,11 +42225,6 @@ mod tests {
         assert_painted(cx, "log-lines");
     }
 
-    // -- Ticket 31: dialogs + import + subscriptions ---------------------
-
-    /// Ticket 31: field errors map to their owning dialog field (first error
-    /// wins); non-field errors map nowhere. Credentials never appear: the
-    /// mapping carries field names only.
     #[test]
     fn field_error_targets_name_the_owning_field() {
         use crate::field_error_target;
@@ -47805,8 +42280,6 @@ mod tests {
         );
     }
 
-    /// Ticket 31: bind/port collision warns naming the colliding row (save
-    /// still allowed); free, self, auto, and invalid pairs stay quiet.
     #[test]
     fn bind_port_collision_warning_names_colliding_row() {
         use crate::bind_port_collision_warning;
@@ -47853,8 +42326,6 @@ mod tests {
         );
     }
 
-    /// Ticket 31: plaintext http subscription URLs surface the fetch warning;
-    /// https (and unparseable input) stays quiet.
     #[test]
     fn http_subscription_warning_only_for_plaintext() {
         use crate::http_subscription_warning;
@@ -47877,7 +42348,6 @@ mod tests {
         );
     }
 
-    /// Ticket 31: the friendly duplicate message names the existing label.
     #[test]
     fn already_subscribed_message_names_existing_label() {
         use crate::already_subscribed_message;
@@ -47889,8 +42359,6 @@ mod tests {
         assert!(text.contains("Nightly"), "names the row, got {text}");
     }
 
-    /// Ticket 31: invalid add commit stays open with the error, focuses the
-    /// owning field, and stores nothing.
     #[gpui_kit::test]
     fn add_commit_invalid_stays_open_and_focuses_field(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -47926,9 +42394,6 @@ mod tests {
         );
     }
 
-    /// Ticket 06 (required): Add with a blank name AND malformed params →
-    /// commit keeps the dialog open, the inline error names the first field
-    /// (`name`) with its fix, and focus lands on it.
     #[gpui_kit::test]
     fn t06_add_blank_name_and_bad_params_names_first_field(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -47967,9 +42432,6 @@ mod tests {
         );
     }
 
-    /// Ticket 06 (important): the Add dialog paints the live auto-port
-    /// budget under the Port field (`N of 499 in use (10801–10999, spill
-    /// 18081–18380)`).
     #[gpui_kit::test]
     fn t06_add_dialog_paints_live_port_budget(cx: &mut TestAppContext) {
         use crate::ConfigForm;
@@ -47977,7 +42439,7 @@ mod tests {
         cx.update(|cx| cx.set_reduce_motion(true));
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
-        // Headless seam: empty library reads `0 of 499` with both ranges.
+
         let budget = ConfigForm::port_budget_text(&[]);
         assert!(
             budget.contains("0 of 499 in use (10801–10999, spill 18081–18380)"),
@@ -47992,12 +42454,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 06 (important): a non-loopback bind typed into the Add form
-    /// surfaces the loopback-exposure hint before commit. The dialog reads
-    /// it live every render and Add/Edit share [`ConfigForm::element`], so
-    /// the headless wording pin plus the default-quiet Add paint below
-    /// cover the Add path (the LAN-bind paint arm lives on the shared
-    /// element in `add_dialog_shows_lan_hint_only_for_lan_bind`).
     #[gpui_kit::test]
     fn t06_add_form_lan_bind_shows_loopback_hint_before_commit(cx: &mut TestAppContext) {
         use crate::{lan_hint_for_bind, ConfigForm};
@@ -48025,7 +42481,7 @@ mod tests {
                 assert!(hint.contains("LAN confirm"), "names the gate: {hint}");
             });
         });
-        // The Add dialog itself opens quiet on the loopback default.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.open_add_dialog(window, cx));
         });
@@ -48038,8 +42494,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 31: duplicate subscription URL takes the friendly path — the
-    /// dialog stays open with a warning and no double row appears.
     #[gpui_kit::test]
     fn duplicate_subscription_url_warns_without_double_row(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48070,9 +42524,6 @@ mod tests {
         assert_eq!(subs[0].label, "Nightly", "original kept");
     }
 
-    /// Ticket 31: edit subscription persists label/url/group via
-    /// `Store::update_subscription` and refreshes the list; a ghost edit
-    /// warns and closes.
     #[gpui_kit::test]
     fn edit_subscription_persists_and_refreshes(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48121,8 +42572,6 @@ mod tests {
         assert_eq!(notification_count(cx), 2, "ghost warns once more");
     }
 
-    // -- Ticket 37: routing presets --------------------------------------
-
     fn t37_route_link(name: &str) -> String {
         use base64::Engine as _;
         let payload = base64::engine::general_purpose::STANDARD.encode(format!(
@@ -48131,8 +42580,6 @@ mod tests {
         format!("throne://route/{payload}")
     }
 
-    /// Ticket 37: pure preset copies — errors name reasons, summaries name
-    /// names/sources/counts/attachments, never rule content.
     #[test]
     fn preset_copy_names_reasons_never_content() {
         use crate::store::RoutePreset;
@@ -48163,8 +42610,6 @@ mod tests {
         assert!(confirm.contains("detaches"), "{confirm}");
     }
 
-    /// Ticket 37: a single `throne://route` line in the import box stores a
-    /// named preset with its rules (replaces the v1 named error).
     #[gpui_kit::test]
     fn preset_route_link_commit_stores_preset(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48186,8 +42631,6 @@ mod tests {
         );
     }
 
-    /// Ticket 37: preset JSON in the import box stores a preset; malformed
-    /// rules keep the dialog open and never echo rule content.
     #[gpui_kit::test]
     fn preset_json_commit_stores_preset_and_rejects_bad_rules(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48237,7 +42680,6 @@ mod tests {
         assert_eq!(notification_count(cx), 2, "success + error notices");
     }
 
-    /// Ticket 37: per-row attach/detach commits persist and toast honestly.
     #[gpui_kit::test]
     fn preset_attach_and_detach_commit(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48278,8 +42720,6 @@ mod tests {
         assert_eq!(detached.preset_id, None);
     }
 
-    /// Lane B (B9): the Presets pane names the attached preset + its rule
-    /// count and detaches inline (no attach-dialog round-trip for removal).
     #[gpui_kit::test]
     fn laneb_preset_pane_detaches_inline_with_rule_count(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -48322,11 +42762,7 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
         assert_painted(cx, "config-preset");
-        // T06 (same-ticket rationale): frozen pane order (Header →
-        // Endpoints → tab-specific) puts the endpoints above the preset
-        // block, so the inline Detach starts below the fold of the 240px
-        // panel — scroll the pane body, then the control paints in place
-        // and the click below lands on the visible element.
+
         cx.update(|window, cx| {
             window.scroll(
                 "config-detail-body",
@@ -48355,8 +42791,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 37: the presets manager opens with footer buttons and lists
-    /// the stored preset.
     #[gpui_kit::test]
     fn presets_dialog_opens_with_footer(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48382,8 +42816,6 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// Ticket 01: pure Appearance → kit mode mapping (dark default, light,
-    /// System follows the flag, junk reads dark) plus the inventory lines.
     #[test]
     fn appearance_mapping_and_summaries() {
         use crate::{appearance_theme_mode, preset_summary_text, routing_summary_text};
@@ -48417,10 +42849,6 @@ mod tests {
         );
     }
 
-    /// Ticket 01: Settings restructured to exactly Basic | Routing | Preset |
-    /// Hotkey top to bottom — Basic carries the Appearance radio (dark
-    /// default) plus the pre-existing blocks, Routing links once into the
-    /// presets manager, Hotkey references the shortcut list.
     #[gpui_kit::test]
     fn settings_dialog_has_four_sections_and_appearance(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48476,8 +42904,6 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// Ticket 01: the ROUTING menu entry links into Settings (the dialog
-    /// holding the single copy of the Routing section).
     #[gpui_kit::test]
     fn routing_menu_links_into_settings(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48512,8 +42938,6 @@ mod tests {
         let _ = view;
     }
 
-    /// Ticket 01: the Appearance choice persists and repaints live with no
-    /// restart (kit mode follows the commit); junk fails loudly.
     #[gpui_kit::test]
     fn appearance_choice_persists_and_paints_live(cx: &mut TestAppContext) {
         use gpui_kit::component::ActiveTheme as _;
@@ -48521,7 +42945,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
-        // Fresh mount applies the persisted choice (dark default).
+
         cx.update(|_, cx| {
             assert_eq!(cx.theme().mode, ThemeMode::Dark, "dark paints by default");
         });
@@ -48563,8 +42987,6 @@ mod tests {
         );
     }
 
-    /// Ticket 37: attached start serves preset rules ahead of the isolation
-    /// rule end to end (store → engine sync → fake sidecar config).
     #[gpui_kit::test]
     fn attached_start_serves_preset_rules_first(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -48607,9 +43029,7 @@ mod tests {
                 });
             });
         });
-        // The library snapshot predates the attach (selection by id
-        // re-resolves after reload); force a reload through any toast-free
-        // path first by selecting after a fresh read.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.reload_quiet(cx);
@@ -48633,9 +43053,7 @@ mod tests {
             "isolation closes the table"
         );
     }
-    // -- Ticket 10: routing manager + stats + share-out + tray -----------
 
-    /// Ticket 10 (US-23): uptime reads largest-two-units, never empty.
     #[test]
     fn t10_format_uptime_units() {
         use crate::format_uptime;
@@ -48646,8 +43064,6 @@ mod tests {
         assert_eq!(format_uptime(3 * 86_400 + 4 * 3_600), "3d 4h");
     }
 
-    /// Ticket 10 (US-22): stacked bars split rx/tx over 12 cells and the
-    /// heaviest exit fills the bar.
     #[test]
     fn t10_traffic_stacked_bar_splits_rx_tx() {
         use crate::traffic_stacked_bar;
@@ -48661,8 +43077,6 @@ mod tests {
         assert!(!heaviest.contains('░'), "heaviest fills: {heaviest}");
     }
 
-    /// Ticket 10 (US-22): the period summary labels itself all-time and
-    /// names counts + bytes, never one profile.
     #[test]
     fn t10_traffic_stats_summary_labels_all_time() {
         use crate::store::TrafficPeriod;
@@ -48673,8 +43087,6 @@ mod tests {
         assert!(text.contains("2 exit(s)"), "{text}");
     }
 
-    /// Ticket 10 (US-28): the share dialog copies a non-empty link; ghosts
-    /// warn instead of copying nothing.
     #[gpui_kit::test]
     fn t10_share_dialog_copies_nonempty_link(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48699,7 +43111,7 @@ mod tests {
             cx.update(|window, _| window.try_find("share-warning").is_some()),
             "credential warning rides along"
         );
-        // The footer Copy-link commits the copy.
+
         cx.update(|window, cx| {
             window.click("share-dialog-ok", cx);
         });
@@ -48712,7 +43124,7 @@ mod tests {
         });
         assert!(!clip.is_empty(), "share copy never empty");
         assert!(clip.starts_with("manyproxy://add/"), "{clip}");
-        // Re-imports through the batch path with identity intact.
+
         let back = crate::import::parse_link(&clip).expect("share re-imports");
         assert_eq!(back.protocol, "vless");
         assert_eq!(back.host, "198.51.100.9");
@@ -48723,8 +43135,6 @@ mod tests {
         assert_eq!(notification_count(cx), before + 1, "ghost warns");
     }
 
-    /// Ticket 10 (US-29): manager Export-copy-link copies a throne://route
-    /// link that decodes to the stored name + rules.
     #[gpui_kit::test]
     fn t10_preset_export_link_copies_decodable_link(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48755,9 +43165,6 @@ mod tests {
         assert_eq!(parsed.rules.len(), 1);
     }
 
-    /// Ticket 10 (US-29): New-Structured builds the catch-all rule for
-    /// each Basic action; nameless and non-basic commits fail with the
-    /// dialog kept open (no silent preset).
     #[gpui_kit::test]
     fn t10_structured_commit_builds_catch_all(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48816,8 +43223,6 @@ mod tests {
         );
     }
 
-    /// Ticket 10 (US-29): New-Remote refuses internal hosts before any
-    /// fetch (SSRF reason, never the URL); nameless refuses too.
     #[gpui_kit::test]
     fn t10_remote_commit_blocks_internal_hosts(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48855,8 +43260,6 @@ mod tests {
         assert!(!kept, "nameless stays open");
     }
 
-    /// Ticket 10 (US-29): Update lands fetched rules through the tested
-    /// refresh path (no network — the body is handed in directly).
     #[gpui_kit::test]
     fn t10_preset_update_lands_fetched_rules(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48891,10 +43294,6 @@ mod tests {
         assert_eq!(rules[0]["action"], serde_json::json!("block"));
     }
 
-    /// Ticket 10 (US-29): the Advanced action cycle rewrites the dialog's
-    /// rules box in place (`direct → proxy → block → direct`); Delete
-    /// drops the rule; Add appends a fresh direct rule. The store is
-    /// untouched until Save.
     #[gpui_kit::test]
     fn t10_advanced_rule_ops_rewrite_rules_box(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -48954,9 +43353,6 @@ mod tests {
         assert_eq!(rules[1]["action"], serde_json::json!("direct"));
     }
 
-    /// Ticket 10 (US-23/US-22): both stats dialogs open with their pinned
-    /// ids; Traffic Stats cycles the period and its bars match the stored
-    /// totals.
     #[gpui_kit::test]
     fn t10_stats_dialogs_open_with_matching_bars(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -49009,9 +43405,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 10 (US-29): the ROUTING chooser opens the attach picker for
-    /// the selected row; with no selection it explains itself instead of
-    /// opening nothing.
     #[gpui_kit::test]
     fn t10_routing_chooser_opens_attach_for_selection(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -49067,9 +43460,6 @@ mod tests {
         );
     }
 
-    /// Ticket 10 (US-26/US-30): Columns −/+ persist, Refresh restores
-    /// defaults; skip-delete-confirm round-trips and skips the single
-    /// confirm (stop-first still applies).
     #[gpui_kit::test]
     fn t10_widths_persist_and_skip_confirm_skips(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -49108,7 +43498,7 @@ mod tests {
             view.read_with(cx, |view, _| view.store.skip_delete_confirm()),
             "toggle persists"
         );
-        // Skipped: no confirm dialog, the row is gone at once.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 let config = view.row_config(&row.id).expect("row reads");
@@ -49130,9 +43520,6 @@ mod tests {
         );
     }
 
-    /// Ticket 10 (US-30): tray Select-preset opens the manager,
-    /// Select-exit with no selection explains itself, and Open-config
-    /// copies the folder path (never a shell-out).
     #[gpui_kit::test]
     fn t10_tray_select_and_config_copy(cx: &mut TestAppContext) {
         use crate::tray::TrayAction;
@@ -49178,8 +43565,6 @@ mod tests {
         assert!(!clip.is_empty(), "folder never empty");
     }
 
-    // -- Ticket 38: tray + autostart + session restore ------------------------
-
     fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {
         NewConfig {
             name: name.to_string(),
@@ -49194,10 +43579,6 @@ mod tests {
         }
     }
 
-    /// Ticket 38: launch restore starts loopback snapshot rows immediately
-    /// while LAN rows wait behind the standard confirm (the gate is never
-    /// bypassed); unknown snapshot ids are dropped; dismissing the confirm
-    /// starts nothing.
     #[gpui_kit::test]
     fn restore_on_launch_starts_loopback_and_gates_lan(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -49247,8 +43628,6 @@ mod tests {
         );
     }
 
-    /// Ticket 38: without the opt-in the snapshot is ignored (default off
-    /// restores nothing, never a silent start).
     #[gpui_kit::test]
     fn restore_off_restores_nothing(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -49283,8 +43662,6 @@ mod tests {
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
-    /// Ticket 38: start-all persists the running set, stop-all clears it
-    /// (the snapshot always matches the engine, via the reload hook).
     #[gpui_kit::test]
     fn start_all_snapshots_running_set_and_stop_clears(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -49326,9 +43703,6 @@ mod tests {
         );
     }
 
-    /// Ticket 38: the restore checkbox commits to the store (the headless
-    /// half; the autostart checkbox writes the real Run key, so it is
-    /// manual-review only by design).
     #[gpui_kit::test]
     fn settings_restore_commit_round_trips(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -49347,8 +43721,6 @@ mod tests {
         assert_eq!(notification_count(cx), 2, "each commit toasts once");
     }
 
-    /// Ticket 38: the Settings dialog opens with both opt-in switches plus
-    /// their side-effect notes (and the toolbar carries the entry point).
     #[gpui_kit::test]
     fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -49361,8 +43733,7 @@ mod tests {
             window.draw(cx).clear(cx);
             window.render_frame(cx);
         });
-        // Ticket 02 (throne-adoption): Settings lives in the SETTINGS menu
-        // — open it first.
+
         cx.update(|window, cx| {
             window.click("settings-menu", cx);
         });
@@ -49404,9 +43775,6 @@ mod tests {
         }
     }
 
-    /// Ticket 38: tray Quit stops the engine, clears the snapshot, and
-    /// drops the icon (headless: no real icon — the poll short-circuits
-    /// without one and never quits the app).
     #[gpui_kit::test]
     fn quit_from_tray_stops_engine_and_clears_snapshot(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -49451,13 +43819,6 @@ mod tests {
         assert!(!quit, "no tray, no quit, no event drain");
     }
 
-    // -- Ticket 48: tray dispatch + fetch guards ---------------------------
-
-    /// Ticket 48 (US-62): every tray menu id dispatches headless to its
-    /// handler — StartAll serves the library, StopAll stops it, Show is a
-    /// windowing no-op that never touches the engine, Quit stops +
-    /// clears + drops. Foreign ids map to nothing (tray.rs). Windowing
-    /// itself stays manual-tour only.
     #[gpui_kit::test]
     fn t48_tray_dispatch_every_menu_id_runs_its_handler(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -49479,8 +43840,6 @@ mod tests {
             });
         });
 
-        // The wall: every known id maps to exactly one action, foreign
-        // ids map to nothing and never reach a handler.
         for (id, action) in [
             (menu_id::SHOW, TrayAction::Show),
             (menu_id::START_ALL, TrayAction::StartAll),
@@ -49529,8 +43888,7 @@ mod tests {
                 view.handle_tray_action(TrayAction::StopAll, window, cx)
             });
         });
-        // Ticket-43 semantics: StopAll dispatches into the confirm gate —
-        // the dialog opens, nothing stops until the user confirms.
+
         assert_eq!(
             view.read_with(cx, |view, _| view.engine.running_count()),
             2,
@@ -49555,8 +43913,6 @@ mod tests {
             "stop clears the snapshot"
         );
 
-        // Quit from a serving state: engine stopped, snapshot cleared,
-        // icon dropped — the caller then quits the app.
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.handle_tray_action(TrayAction::StartAll, window, cx)
@@ -49584,9 +43940,6 @@ mod tests {
         );
     }
 
-    /// Ticket 48 (US-66): redirect resolution table — absolute http(s)
-    /// URLs pass through for the policy re-check, origin-absolute paths
-    /// resolve against the current origin, everything else is refused.
     #[test]
     fn t48_resolve_fetch_redirect_table() {
         use crate::{is_fetch_redirect, resolve_fetch_redirect};
@@ -49618,8 +43971,7 @@ mod tests {
             resolve_fetch_redirect("https://example.com:8443/a", "/b"),
             Some("https://example.com:8443/b".to_string())
         );
-        // Refused, never guessed: relative segments, other schemes,
-        // empties, and unparsable currents.
+
         for (current, location) in [
             ("https://example.com/a", "b/sub.txt"),
             ("https://example.com/a", "../sub.txt"),
@@ -49638,10 +43990,6 @@ mod tests {
         }
     }
 
-    /// Ticket 41: save-gate passthrough vs refusal — blank, whitespace-only,
-    /// unparseable, and auto ports flow through Ok (store validation owns
-    /// those errors); reserved ports and garbage binds fail with the named
-    /// reason before any write.
     #[test]
     fn t41_save_listen_gate_passthrough_and_refusal() {
         assert_eq!(crate::save_listen_gate("Row", "127.0.0.1", ""), Ok(()));
@@ -49670,10 +44018,6 @@ mod tests {
         assert!(err.contains("bad bind address"), "names bind, got {err}");
     }
 
-    /// Ticket 48: redirect-resolution edges — trims whitespace, preserves
-    /// absolute casing verbatim, keeps the query on origin-absolute hops,
-    /// keeps protocol-relative targets same-origin, refuses single-slash
-    /// and script targets; non-redirect statuses never follow.
     #[test]
     fn t48_resolve_fetch_redirect_edges() {
         use crate::{is_fetch_redirect, resolve_fetch_redirect};
@@ -49712,8 +44056,6 @@ mod tests {
         );
     }
 
-    /// Stub `HttpClient` recording every fetched URL in order (shared
-    /// across the `Fn` handler).
     fn t48_recording_client(
         handler: impl Fn(String) -> gpui_kit::http_client::http::Response<gpui_kit::http_client::AsyncBody>
             + Send
@@ -49754,8 +44096,6 @@ mod tests {
             .expect("response builds")
     }
 
-    /// Ticket 48 (US-66): a redirect to an internal host is blocked by
-    /// the fetch-time re-check — the second hop is never fetched.
     #[test]
     fn t48_fetch_redirect_to_internal_blocked_without_fetch() {
         let (client, fetched) = t48_recording_client(|uri| {
@@ -49778,9 +44118,6 @@ mod tests {
         );
     }
 
-    /// Ticket 48 (US-66): a redirect to a public host is followed once
-    /// (CDN compat) and its body lands; the entry policy still gates the
-    /// first hop, so direct internal URLs never touch the client.
     #[test]
     fn t48_fetch_redirect_to_public_followed_once() {
         let (client, fetched) = t48_recording_client(|uri| {
@@ -49818,8 +44155,6 @@ mod tests {
         );
     }
 
-    /// Ticket 48 (US-66): redirect loops are bounded and location-less
-    /// redirects fail loudly instead of hanging or guessing.
     #[test]
     fn t48_fetch_redirect_loop_bounded_and_locationless_loud() {
         let (client, fetched) =
@@ -49848,12 +44183,6 @@ mod tests {
         assert!(error.contains("bad redirect"), "loud cause, got {error}");
     }
 
-    // -- Ticket 08: density lock + keyboard + secrets audit ------------------
-
-    /// Ticket 08: frame containment for one painted anchor — the element
-    /// paints (see [`assert_painted`]) AND its far edge stays inside the
-    /// 1000x700 frame (1px rounding epsilon). Presence alone never proves
-    /// "without clipping".
     fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {
         let bounds = cx
             .update(|window, _| window.try_find(id.to_owned()))
@@ -49873,13 +44202,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08 (a): density lock at the 1000x700 desktop frame — the
-    /// command strip, facet bar, three dense rows, inspector, and status
-    /// strip all paint inside the frame (no clipping). Command reachability
-    /// pins the always-visible strip ids by presence (dedicated buttons
-    /// plus menu triggers per `command_strip_all_ids_present`, while the
-    /// leading `add-config` — never the clipped end — pins paint);
-    /// below-the-fold inspector actions pin presence for the same reason.
     #[gpui_kit::test]
     fn t08_density_lock_paints_without_clipping(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -49895,7 +44217,7 @@ mod tests {
             .add(row19_seed("Cabin", "c.example.com", "10803"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the first row so the inspector has a row to render.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -49909,12 +44231,6 @@ mod tests {
         cx.run_until_parked();
         paint_frame(cx);
 
-        // Command strip: the leading menu paints inside the frame (the
-        // strip container carries no test anchor; every command pins
-        // reachability by presence while `program-menu` — the first child,
-        // never the clipped end — pins paint). Ticket 02 (throne-adoption):
-        // the strip is five menu triggers plus the global toggle; menu
-        // items render on open (see `command_strip_all_ids_present`).
         assert_painted(cx, "program-menu");
         assert_within_frame(cx, "program-menu");
         for id in [
@@ -49930,12 +44246,12 @@ mod tests {
                 "{id} renders in the command strip"
             );
         }
-        // Facet bar + pickers paint inside the frame.
+
         for id in ["facet-bar", "facet-group", "facet-protocol", "facet-status"] {
             assert_painted(cx, id);
             assert_within_frame(cx, id);
         }
-        // Three dense rows paint, stacked top-to-bottom, inside the frame.
+
         for id in [&first.id, &second.id, &third.id] {
             let row = format!("library-row-{id}");
             assert_painted(cx, &row);
@@ -49958,9 +44274,7 @@ mod tests {
             tops[1] > tops[0] && tops[2] > tops[1],
             "dense rows stack without overlap: {tops:?}"
         );
-        // Inspector paints inside the frame; its tab markers stay stable
-        // (presence — they ride as zero-size markers, see the health-pane
-        // test) and the row ops stay reachable below the fold.
+
         assert_painted(cx, "config-detail");
         assert_within_frame(cx, "config-detail");
         assert_painted(cx, "config-endpoints");
@@ -49981,7 +44295,7 @@ mod tests {
                 "{id} renders in the inspector"
             );
         }
-        // Status strip paints inside the frame.
+
         assert_painted(cx, "status-count");
         assert_within_frame(cx, "status-count");
         assert_painted(cx, "status-left");
@@ -49999,9 +44313,6 @@ mod tests {
         }
     }
 
-    // Ticket 11: 880x620 minimum-frame paint helper — the t08 1000x700
-    // `paint_frame` rhythm with the frame edges at the 880x620 minimum.
-    // The t08 helper stays untouched (never weakened).
     fn paint_frame_min(cx: &mut VisualTestContext) {
         cx.simulate_resize(size(px(880.), px(620.)));
         cx.update(|window, cx| {
@@ -50010,9 +44321,6 @@ mod tests {
         });
     }
 
-    // Ticket 11: frame containment at the 880x620 minimum — the t08
-    // `assert_within_frame` rule (paints AND far edge inside, 1px rounding
-    // epsilon) with the edges at 880x620. The t08 helper stays untouched.
     fn assert_within_frame_min(cx: &mut VisualTestContext, id: &str) {
         let bounds = cx
             .update(|window, _| window.try_find(id.to_owned()))
@@ -50032,9 +44340,6 @@ mod tests {
         );
     }
 
-    /// Ticket 11 (a): 880x620 minimum with seeded rows + a selection — the
-    /// facet bar, 1+ rows, inspector, and status strip all paint with right
-    /// edges inside 880 (the t08 containment rule at the minimum size).
     #[gpui_kit::test]
     fn t11_minimum_frame_paints_without_clipping(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -50047,7 +44352,7 @@ mod tests {
             .add(row19_seed("Home", "b.example.com", "10802"))
             .expect("seed works");
         let (view, cx) = mount_view(store, cx);
-        // Select the first row so the inspector has a row to render.
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -50062,9 +44367,7 @@ mod tests {
         paint_frame_min(cx);
 
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 2);
-        // Ticket 02 (throne-adoption): five menus plus the global toggle
-        // share one row at the 880px minimum — every trigger (trailing
-        // `global-start-stop` included) paints inside 880.
+
         for id in [
             "program-menu",
             "settings-menu",
@@ -50076,12 +44379,12 @@ mod tests {
             assert_painted(cx, id);
             assert_within_frame_min(cx, id);
         }
-        // Facet bar + pickers paint inside the minimum frame.
+
         for id in ["facet-bar", "facet-group", "facet-protocol", "facet-status"] {
             assert_painted(cx, id);
             assert_within_frame_min(cx, id);
         }
-        // Seeded rows paint, stacked top-to-bottom, inside the frame.
+
         let first_row = format!("library-row-{}", first.id);
         let second_row = format!("library-row-{}", second.id);
         assert_painted(cx, &first_row);
@@ -50107,14 +44410,12 @@ mod tests {
             second_top > first_top,
             "dense rows stack without overlap at minimum size"
         );
-        // Inspector paints inside the minimum frame.
+
         assert_painted(cx, "config-detail");
         assert_within_frame_min(cx, "config-detail");
         assert_painted(cx, "config-endpoints");
         assert_within_frame_min(cx, "config-endpoints");
-        // Status strip paints inside the minimum frame; every rendered
-        // segment stays inside 880 too (measure-first: everything fits at
-        // the minimum today, so no collapse is needed).
+
         assert_painted(cx, "status-count");
         assert_within_frame_min(cx, "status-count");
         assert_painted(cx, "status-left");
@@ -50133,8 +44434,6 @@ mod tests {
         }
     }
 
-    /// Lane B (B9): the row-menu trigger names its actions (`Row actions…`
-    /// — same id, tooltip, and items; the bare `Row` hid Edit/Delete).
     #[gpui_kit::test]
     fn laneb_row_menu_names_its_actions(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -50164,10 +44463,6 @@ mod tests {
         assert_eq!(label.as_deref(), Some("Row actions…"));
     }
 
-    /// Lane B (B9): status strip carries live segments — the active filter
-    /// echo and the serving bind ports — each present only while its state
-    /// is set, all inside the 880px minimum frame (usage totals seeded too,
-    /// so the realistic full strip is the measured case).
     #[gpui_kit::test]
     fn laneb_status_live_segments(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -50201,8 +44496,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
                     state.delegate_mut().selected = Some(IndexPath::new(0));
-                    // Matching facet: the row stays visible while the filter
-                    // echo still has something to name.
+
                     state
                         .delegate_mut()
                         .set_facet_protocol(Some("vless".to_string()));
@@ -50233,12 +44527,6 @@ mod tests {
         );
     }
 
-    /// Ticket 04 (throne-adoption): status strip aggregates — 2 live +
-    /// 1 dead reads `2 live · 1 dead` beside the engine endpoint count,
-    /// the `:port` list, and traffic totals, never naming one profile.
-    /// No per-row start tracking is invented (aggregate counts only);
-    /// stopped rows carry no fabricated latency (unprobed rows count as
-    /// neither live nor dead — see `health_counts`).
     #[gpui_kit::test]
     fn throne04_status_aggregates_without_naming_a_profile(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -50268,8 +44556,7 @@ mod tests {
             3,
             "three endpoints serve"
         );
-        // Two live outcomes, one dead (same headless seam as the T05
-        // dead-row tests — no per-row start bookkeeping invented).
+
         for (index, row) in rows.iter().enumerate() {
             let live = index < 2;
             cx.update(|_, cx| {
@@ -50338,13 +44625,6 @@ mod tests {
         }
     }
 
-    /// Ticket 11 (b): status strip at minimum width — library totals stay
-    /// visible. Measure-first: every segment fits at 880 today (traffic
-    /// totals seeded so the right region renders), so the test pins the
-    /// left counts painted inside 880 plus every rendered segment inside
-    /// too — no production change. The collapse order (traffic labels
-    /// first, then center, never the left counts) is the contract if a
-    /// future segment ever overflows.
     #[gpui_kit::test]
     fn t11_status_strip_keeps_library_totals_at_minimum(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -50362,13 +44642,12 @@ mod tests {
         paint_frame_min(cx);
 
         assert_eq!(view.read_with(cx, |view, cx| view.config_count(cx)), 1);
-        // Library totals always visible at the minimum width.
+
         assert_painted(cx, "status-count");
         assert_within_frame_min(cx, "status-count");
         assert_painted(cx, "status-left");
         assert_within_frame_min(cx, "status-left");
-        // No rendered segment pushes past 880 — and nothing collapses the
-        // left counts away.
+
         for id in [
             "status-center",
             "status-right",
@@ -50383,12 +44662,6 @@ mod tests {
         assert_painted(cx, "status-left");
     }
 
-    /// Ticket 10 (CAP-10.1): status-strip fixed slots — the three regions
-    /// keep their widths while values change (a row is added, traffic
-    /// accrues KB → MB with a port serving throughout), so siblings never
-    /// shift. Serving state is identical in both frames (the appearance of a
-    /// new segment legitimately widens the center — floors freeze value
-    /// changes, not segment appearance; see the `render_status_bar` ruling).
     #[gpui_kit::test]
     fn t10_status_slots_hold_width_across_value_changes(cx: &mut TestAppContext) {
         use crate::engine::EngineController;
@@ -50404,8 +44677,7 @@ mod tests {
             .add_traffic_batch(&[(seeded.id.clone(), 2_048, 1_024)])
             .expect("traffic accrues");
         let (view, cx) = mount_view(store, cx);
-        // Fake engine + F5 serves the row before the first frame, so ports
-        // render in both states (the `laneb_status_live_segments` path).
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 let (engine, _) = EngineController::fake();
@@ -50449,11 +44721,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let before = region_widths(cx);
-        // Change the values, not the segments: counts (second row), traffic
-        // units (KB accruals into the tens of MB). Row 0 keeps serving, so
-        // engine text, health text, and ports are identical in both frames
-        // (guarded below — a serving flip would be a segment change, not a
-        // value change).
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.store
@@ -50492,10 +44760,6 @@ mod tests {
         );
     }
 
-    /// Ticket 11 (c): Add dialog at 880x620 — every field paints inside the
-    /// frame (no clipping when the window is at its minimum).
-    /// Ticket 05: guided-first — the collapsed mini-form fits the minimum
-    /// frame; expanding Advanced reveals the JSON in place.
     #[gpui_kit::test]
     fn t11_add_dialog_paints_inside_minimum_frame(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -50520,14 +44784,9 @@ mod tests {
         );
         for id in [
             "field-name",
-            // Config-completeness T01: protocol picker replaces the free-text
-            // `field-protocol` input (same row, kit `Select` trigger).
             "protocol-select",
             "field-guided-server",
             "field-guided-port",
-            // Ticket 06: the default type (vless) owns its secret in the
-            // type box — the generic Identity row stays out of the
-            // minimum-frame paint (single secret, no stacked duplicate).
             "guided-hint",
             "params-advanced-toggle",
             "field-group",
@@ -50540,7 +44799,7 @@ mod tests {
             assert_within_frame_min(cx, id);
         }
         assert_absent(cx, "field-guided-identity".to_string());
-        // Advanced disclosure: the raw JSON paints in place on expand.
+
         cx.update(|window, cx| {
             window.click("params-advanced-toggle", cx);
         });
@@ -50559,28 +44818,16 @@ mod tests {
         }
     }
 
-    /// Ticket 08 (b): keyboard-only Add -> Start -> Copy-URLs completes
-    /// pointer-free — this test issues zero `window.click` calls by
-    /// construction. Ctrl-N opens Add (the store commit runs through the
-    /// exact shared `DialogCommit` target the Confirm key path calls;
-    /// headless typing is not feasible, so the form fill is programmatic),
-    /// F5 starts the row, the copy handler fills the clipboard with both
-    /// bind+port URL forms, Shift-F5 stops it, Ctrl-T explains itself with
-    /// nothing running, Escape clears checks (never the selection), and
-    /// arrows pass through the app layer untouched (no dialog, no toast, no
-    /// selection/check change — list navigation keeps its keys).
     #[gpui_kit::test]
     fn t08_keyboard_add_start_copy_urls_pointer_free(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
         use gpui_kit::Keystroke;
         cx.update(gpui_kit::init);
         cx.update(crate::bind_app_keys);
-        // The visible hints never drift from the bindings above.
+
         let expected = [
             ("Add configuration", "Ctrl-N"),
             ("Import configurations", "Ctrl-O"),
-            // Config-completeness T08: paste-intake binding (same handler as
-            // the palette `ImportClipboard` op).
             ("Paste clipboard into Import", "Ctrl-V"),
             ("Start selected", "F5"),
             ("Stop selected", "Shift-F5"),
@@ -50601,7 +44848,7 @@ mod tests {
         }
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
-        // Fake engine + prober: starts complete headless with no network.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 use crate::engine::EngineController;
@@ -50612,8 +44859,7 @@ mod tests {
                 view.prober = Box::new(prober);
             });
         });
-        // Focus the shell so the library key context matches (existing
-        // keyboard-test pattern).
+
         let focus = view.read_with(cx, |view, _| view.focus.clone());
         cx.update(|window, cx| window.focus(&focus, cx));
         let press = |cx: &mut VisualTestContext, key: &str| {
@@ -50622,7 +44868,7 @@ mod tests {
                 window.dispatch_keystroke(keystroke, cx);
             });
         };
-        // Ctrl-N opens Add (pointer-free); the dialog carries its fields.
+
         press(cx, "ctrl-n");
         cx.run_until_parked();
         assert!(
@@ -50640,7 +44886,7 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-        // Select the new row, then F5 starts it (fake engine, loopback).
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, _| {
@@ -50659,8 +44905,7 @@ mod tests {
             "F5 starts the selected row"
         );
         assert_eq!(notification_count(cx), before + 1, "start toasts once");
-        // Copy URLs through the button's exact handler (no mouse): both
-        // bind+port forms land — never params, uuids, or upstream hosts.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
         });
@@ -50681,7 +44926,7 @@ mod tests {
             !clip.contains("198.51.100.9") && !clip.contains("11111111"),
             "clipboard carries bind+port only: {clip}"
         );
-        // Shift-F5 stops it again.
+
         let before = notification_count(cx);
         press(cx, "shift-f5");
         cx.run_until_parked();
@@ -50691,7 +44936,7 @@ mod tests {
             "Shift-F5 stops the selected row"
         );
         assert_eq!(notification_count(cx), before + 1, "stop toasts once");
-        // Ctrl-T with nothing running explains itself (never a dead key).
+
         let before = notification_count(cx);
         press(cx, "ctrl-t");
         cx.run_until_parked();
@@ -50705,8 +44950,7 @@ mod tests {
             0,
             "nothing starts"
         );
-        // Escape clears the checked set through the keybinding — silently,
-        // and never the selection.
+
         let id = view.read_with(cx, |view, cx| {
             view.selected_config(cx).expect("selected").id
         });
@@ -50738,9 +44982,7 @@ mod tests {
             Some(id.clone()),
             "Escape never eats the selection"
         );
-        // While a dialog owns Escape, the guarded path preserves the set
-        // (existing `clear_checked_unless_dialog` pattern — direct call, so
-        // the dialog's own dismiss never interferes headless).
+
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.libraries.update(cx, |state, list_cx| {
@@ -50768,8 +45010,7 @@ mod tests {
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
         cx.run_until_parked();
-        // Arrows pass through the app layer untouched: no dialog, no toast,
-        // selection and checks unchanged.
+
         let focus = view.read_with(cx, |view, _| view.focus.clone());
         cx.update(|window, cx| window.focus(&focus, cx));
         let before = notification_count(cx);
@@ -50797,12 +45038,6 @@ mod tests {
         );
     }
 
-    /// Ticket 08 (c): secrets audit — the table, inspector, clipboard, logs,
-    /// and status/export-preview surfaces carry bind+port only (no keys,
-    /// tokens, or passwords). The export payload file itself stays
-    /// plaintext by design (the store round-trip pins it), so the audit
-    /// pins the gate instead: the verbatim plaintext warning plus confirm,
-    /// with nothing written until confirm.
     #[gpui_kit::test]
     fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
         use gpui_kit::component::IndexPath;
@@ -50811,9 +45046,7 @@ mod tests {
             NewConfig {
                 name: name.to_string(),
                 protocol: "vless".to_string(),
-                // Ticket 41: documentation IPs on started rows — the start
-                // path resolves egress hostnames before spawn. Secret fields
-                // ride alongside the proven startable shape.
+
                 params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
                     \"uuid\":\"SECRET-UUID-08\",\"encryption\":\"none\",\
                     \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\",\
@@ -50846,7 +45079,7 @@ mod tests {
         });
         let row = view.read_with(cx, |view, cx| view.selected_config(cx).expect("selected"));
         assert_eq!(row.id, seeded.id);
-        // Pure row surfaces: bind+port, upstream host, badge — never params.
+
         let (socks, http) = crate::store::proxy_urls(&row.bind_ip, row.port);
         assert_eq!(socks, "socks5://127.0.0.1:10982");
         assert_eq!(http, "http://127.0.0.1:10982");
@@ -50873,15 +45106,14 @@ mod tests {
             ),
             "redact_secrets",
         );
-        // Inspector inputs: the cached upstream plus the endpoint pair.
+
         let cached = view.read_with(cx, |view, cx| {
             let row = view.selected_config(cx).expect("selected");
             view.cached_upstream(cx, &row)
         });
         assert_eq!(cached, "198.51.100.9:443");
         assert_no_canaries(&cached, "inspector upstream");
-        // Clipboard: the copy handler writes bind+port only — not even the
-        // upstream host.
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.copy_selected_urls(window, cx));
         });
@@ -50897,7 +45129,7 @@ mod tests {
             !clip.contains("198.51.100.9"),
             "clipboard carries bind+port only: {clip}"
         );
-        // Logs: ingest redacts secrets but keeps the bind+port evidence.
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 view.logs.push_raw(
@@ -50925,7 +45157,7 @@ mod tests {
         for line in &visible {
             assert_no_canaries(line, "visible log");
         }
-        // Status: counts and byte totals only.
+
         let status = view.read_with(cx, |view, _| {
             (
                 view.health_status_text(),
@@ -50936,10 +45168,7 @@ mod tests {
         assert_no_canaries(&status.0, "health status");
         assert_no_canaries(&status.1, "traffic status");
         assert_no_canaries(&status.2, "engine status");
-        // Probe failures redact through the production path (fake prober
-        // scripts a secret-bearing cause; `run_one` redacts at
-        // construction, so the delegate summary and the inspector
-        // detail line stay clean).
+
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 use crate::engine::EngineController;
@@ -50982,9 +45211,7 @@ mod tests {
         assert!(summary.contains("dead"), "failure recorded: {summary}");
         assert_no_canaries(&summary, "row health");
         assert_no_canaries(&detail, "inspector health");
-        // Export gate: the warning names every secret class, the confirm
-        // description is the warning verbatim, previews name counts+path
-        // only, and nothing is written until confirm.
+
         use crate::store::{export_confirm_description, export_warning_text};
         assert_eq!(export_confirm_description(), export_warning_text());
         for class in ["private keys", "tokens", "passwords", "plaintext"] {
@@ -51018,12 +45245,7 @@ mod tests {
             "verbatim warning paints in the dialog"
         );
         assert!(!target.exists(), "nothing is written until confirm");
-        // Windows CI file locking (Defender/icacls racing the tmp-write +
-        // rename inside `commit_export`, which the product surfaces honestly
-        // as an "Export failed" notification) can fail one attempt
-        // transiently — the ticket43 export test covers the same path. Retry
-        // the user-visible commit the same way a user would, bounded, and
-        // fail loudly when the write never lands.
+
         let before = notification_count(cx);
         let mut body = None;
         for _ in 0..3 {
@@ -51048,14 +45270,6 @@ mod tests {
         cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
-    /// Ticket 02 (CUA US-2/CAP-2): settings body tail-clearance rule — at
-    /// the 1000x700 desktop frame and the 880x620 minimum, first paint
-    /// keeps the pinned Startup/Probe sections above the fold in order
-    /// (their fold slots never move), and with the body scrolled to its
-    /// end the last content row paints fully clear of the sticky footer
-    /// (the shared body bottom pad, never a per-line nudge — future tails
-    /// inherit it). The mid-body Timers line itself stays a presence pin
-    /// at first paint: it rides below the fold until scrolled to.
     #[gpui_kit::test]
     fn cua02_settings_tail_clears_footer_both_frames(cx: &mut TestAppContext) {
         use gpui_kit::point;
@@ -51073,7 +45287,7 @@ mod tests {
                 view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
             });
             paint_dialog_open(cx);
-            // Fold slots preserved: Startup and Probe paint, in order.
+
             assert_painted(cx, "settings-section-startup");
             assert_painted(cx, "settings-section-probe");
             let (startup_top, probe_top) = cx.update(|window, _| {
@@ -51096,14 +45310,12 @@ mod tests {
                 startup_top < probe_top,
                 "Startup keeps its fold slot above Probe"
             );
-            // Timers renders (below the fold at first paint — presence,
-            // not paint, is the pin).
+
             assert!(
                 cx.update(|window, _| window.try_find("settings-ticks".to_string()).is_some()),
                 "Timers renders"
             );
-            // Scroll the body to its end through a painted anchor, then
-            // the tail must paint fully clear of the sticky footer.
+
             cx.update(|window, cx| {
                 window.scroll(
                     "settings-section-probe",
