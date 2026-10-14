@@ -17,9 +17,9 @@
       "refersTo": "button-danger"
     },
     {
-      "css": ".ds-row-card { background: #f5f5f5; border: 1px solid #e5e5e5; border-radius: 6px; padding: 4px 8px; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; } .ds-row-card:hover { background: #f5f5f5; border-color: #d4d4d4; } .ds-row-card.selected { background: #bfdbfe33; border-color: #60a5fa; } .ds-row-card.checked { border: 2px solid #60a5fa; } .ds-row-lamp { width: 6px; height: 6px; border-radius: 9999px; background: #737373; } .ds-row-lamp.running { background: #22c55e; } .ds-row-lamp.dead { background: #ef4444; } .ds-row-name { font-size: 1rem; line-height: 1.25; color: #0a0a0a; } .ds-row-meta { font-size: 0.875rem; line-height: 1.25; color: #737373; } .ds-row-badge-running { font-size: 0.875rem; color: #16a34a; } .ds-row-badge-stopped { font-size: 0.875rem; color: #737373; } .ds-check-chip { display: inline-block; font-size: 0.875rem; color: #60a5fa; border: 1px solid #60a5fa; border-radius: 9999px; padding: 0 4px; }",
-      "description": "The signal-box track circuit: occupancy lamp (fixed leading cell, flat fill — green serving, red dead-while-serving, dark stopped) plus checkbox plus name; numeral check chip beside the name while checked; muted meta line; serving-color badge line. Wash marks selection only; a 2px accent rim marks the checked set; a row both checked and selected shows both.",
-      "html": "<div class=\"ds-row-card checked\"><div><span class=\"ds-row-lamp running\"></span><span class=\"ds-row-name\">p-france-paris-p1</span><span class=\"ds-check-chip\">2</span></div><div class=\"ds-row-meta\">amneziawg &middot; 81.171.72.134:51820 &middot; europe &middot; bind 127.0.0.1:10802 &middot; enabled</div><div class=\"ds-row-badge-running\">&#9679; Running :10802</div></div>",
+      "css": ".ds-row-card { background: #f5f5f5; border: 1px solid #e5e5e5; border-radius: 6px; padding: 4px 8px; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; } .ds-row-card:hover { background: #f5f5f5; border-color: #d4d4d4; } .ds-row-card.selected { background: #bfdbfe33; border-color: #60a5fa; } .ds-row-card.checked { border: 2px solid #60a5fa; } .ds-row-lamp { width: 6px; height: 6px; border-radius: 9999px; background: #737373; } .ds-row-lamp.running { background: #22c55e; } .ds-row-lamp.dead { background: #ef4444; } .ds-row-name { font-size: 1rem; line-height: 1.25; color: #0a0a0a; } .ds-row-meta { font-size: 0.875rem; line-height: 1.25; color: #737373; } .ds-row-badge-running { font-size: 0.875rem; color: #16a34a; } .ds-row-badge-stopped { font-size: 0.875rem; color: #737373; } .ds-check-chip { display: inline-block; font-size: 0.875rem; color: #60a5fa; border: 1px solid #60a5fa; border-radius: 9999px; padding: 0 4px; } .ds-row-endpoint { display: flex; align-items: center; gap: 4px; } .ds-row-bind { width: 118px; background: #ffffff; border: 1px solid #e5e5e5; border-radius: 6px; font-size: 0.875rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; } .ds-row-port { width: 76px; background: #ffffff; border: 1px solid #e5e5e5; border-radius: 6px; font-size: 0.875rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; } .ds-row-bind:focus, .ds-row-port:focus { outline: none; border-color: #60a5fa; } .ds-row-endpoint-warn { font-size: 0.875rem; color: #ef4444; }",
+      "description": "The signal-box track circuit: occupancy lamp (fixed leading cell, flat fill — green serving, red dead-while-serving, dark stopped) plus checkbox plus name; numeral check chip beside the name while checked; muted meta line; serving-color badge line. Wash marks selection only; a 2px accent rim marks the checked set; a row both checked and selected shows both. The trailing cell is the editable serve endpoint: fixed bind + port fields plus per-row Start/Stop and Edit — Enter commits through the dialog save gate, Esc reverts, drafts warn inline (collision badge, loopback-guard hint) and survive scrolling.",
+      "html": "<div class=\"ds-row-card checked\"><div><span class=\"ds-row-lamp running\"></span><span class=\"ds-row-name\">p-france-paris-p1</span><span class=\"ds-check-chip\">2</span></div><div class=\"ds-row-meta\">amneziawg &middot; 81.171.72.134:51820 &middot; europe &middot; bind 127.0.0.1:10802 &middot; enabled</div><div class=\"ds-row-badge-running\">&#9679; Running :10802</div><div class=\"ds-row-endpoint\"><input class=\"ds-row-bind\" value=\"127.0.0.1\" /><input class=\"ds-row-port\" value=\"10802\" /><button>Stop</button><button>Edit</button></div></div>",
       "kind": "card",
       "name": "Library Row Card",
       "refersTo": "row-card"
@@ -66,7 +66,7 @@
     },
     {
       "css": ".ds-input { background: #ffffff; color: #0a0a0a; border: 1px solid #e5e5e5; border-radius: 6px; padding: 6px 8px; font-size: 1rem; line-height: 1.25; width: 100%; } .ds-input::placeholder { color: #737373; } .ds-input:focus { outline: none; border-color: #60a5fa; } .ds-guided-hint { font-size: 0.875rem; color: #737373; }",
-      "description": "Stacked label-over-field inputs in every dialog. Add opens guided-first (Server, Server-port, Identity plus a one-clause hint); JSON is an Advanced disclosure. Validation keeps the dialog open with inline errors; params errors auto-expand Advanced.",
+      "description": "Stacked label-over-field inputs in every dialog. Add opens guided-first (Server, Server-port, Identity plus a one-clause hint); JSON is an Advanced disclosure. Validation keeps the dialog open with inline errors; params errors auto-expand Advanced. The library row carries the same input voice at fixed widths (bind 118px, port 76px, mono tabular) for inline loopback editing.",
       "html": "<input class=\"ds-input\" placeholder=\"Upstream server\" />",
       "kind": "input",
       "name": "Text Input",
@@ -301,21 +301,23 @@
       }
     }
   },
-  "generatedAt": "2026-10-05",
+  "generatedAt": "2026-10-14",
   "narrative": {
     "dos": [
       "Do build new rows, bars, and panes from theme tokens (border, group_box, list_active, muted_foreground, danger, success) so light-theme changes propagate.",
       "Do keep shortcut hints visible on buttons and full `Name (Key)` strings on accessible names and tooltips.",
       "Do name affected rows in confirms, failures, and toasts — honesty is the brand voice.",
       "Do keep the serving badge, dot, and detail Badge in agreement: green serving, red dead/failed, gray stopped.",
-      "Do preserve all control states when restyling: default, hover, focus, active, disabled, loading, error, empty."
+      "Do preserve all control states when restyling: default, hover, focus, active, disabled, loading, error, empty.",
+      "Do keep row endpoint editors on stable per-row ids with Enter-commit, Esc-revert, live draft warnings, and flush-before-act on serve/edit."
     ],
     "donts": [
       "Don't introduce display type, gradient text, glass, emoji icons, or shadows — the world is plain, flat, and unadorned by decision.",
       "Don't spend color on decoration; blue is selection-only, green/red are state-only, black is primary-action-only.",
       "Don't add a third text size or a second corner radius without replacing the system, not extending it.",
       "Don't turn confirm dialogs into silent actions or collapse per-item import failures into a single toast.",
-      "Don't surface secrets: copy, logs, URLs, and search matching stay clear of credential fields."
+      "Don't surface secrets: copy, logs, URLs, and search matching stay clear of credential fields.",
+      "Don't commit row endpoint drafts on blur or focus loss — Enter commits, Esc reverts, and serve/edit flush first."
     ],
     "keyCharacteristics": [
       "Ink on paper: near-black on white, quiet gray surfaces, hairline separators.",

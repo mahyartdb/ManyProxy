@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="700" font-family="Segoe UI, system-ui, sans-serif"><rect width="1000" height="700" fill="#ffffff"/><rect x="0" y="0" width="1000" height="30" fill="#F8F8F8" stroke="#e5e5e5" stroke-width="1"/><text x="12" y="20" fill="#0a0a0a" font-size="13" font-weight="600">ManyProxy</text><text x="780" y="20" fill="#737373" font-size="11">local-only · no system proxy · no TUN</text><rect x="0" y="30" width="1000" height="34" fill="#ffffff" stroke="#e5e5e5" stroke-width="1"/><text x="12" y="52" fill="#0a0a0a" font-size="12">Program  Settings  Groups  Routing  Tools</text><rect x="842" y="35" width="146" height="24" rx="6" fill="#171717"/><text x="915" y="51" text-anchor="middle" fill="#fafafa" font-size="12" font-weight="600">▶ Start all</text><rect x="12" y="124" width="976" height="66" rx="6" fill="#f5f5f5" stroke="#60a5fa" stroke-width="2"/>
+<circle cx="34" cy="146" r="6" fill="#3a3f45"/>
+<rect x="50" y="139" width="13" height="13" rx="3" fill="#ffffff" stroke="#737373" stroke-width="1"/>
+<circle cx="122" cy="146" r="9" fill="#60a5fa"/><text x="122" y="150" text-anchor="middle" fill="#fff" font-size="10" font-weight="700">1</text>
+<text x="70" y="151" fill="#0a0a0a" font-size="14" font-weight="600">demo-berlin-p1</text>
+<text x="70" y="171" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">vless · demo-berlin.example.com:443 · europe</text>
+<text x="300" y="144" fill="#737373" font-size="10" font-family="Consolas, Cascadia Mono, monospace">SERVE BIND</text>
+<rect x="300" y="148" width="118" height="24" rx="5" fill="#ffffff" stroke="#e5e5e5" stroke-width="1"/>
+<text x="308" y="165" fill="#0a0a0a" font-size="13" font-family="Consolas, Cascadia Mono, monospace">127.0.0.1</text>
+<rect x="426" y="148" width="76" height="24" rx="5" fill="#ffffff" stroke="#e5e5e5" stroke-width="1"/>
+<text x="434" y="165" fill="#0a0a0a" font-size="13" font-family="Consolas, Cascadia Mono, monospace">:10801</text>
+<rect x="510" y="148" width="76" height="24" rx="6" fill="#171717"/><text x="548" y="165" text-anchor="middle" fill="#fafafa" font-size="12" font-weight="600">Start  F5</text>
+<rect x="594" y="148" width="62" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="625" y="165" text-anchor="middle" fill="#0a0a0a" font-size="12">Edit</text>
+<text x="666" y="165" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">○ Stopped</text><rect x="12" y="198" width="976" height="66" rx="6" fill="#dbeafe" stroke="#60a5fa" stroke-width="2"/>
+<circle cx="34" cy="220" r="6" fill="#3a3f45"/>
+<rect x="50" y="213" width="13" height="13" rx="3" fill="#ffffff" stroke="#737373" stroke-width="1"/>
+<text x="70" y="225" fill="#0a0a0a" font-size="14" font-weight="600">demo-paris-p1</text>
+<text x="70" y="245" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">vless · demo-paris.example.com:443 · europe</text>
+<text x="300" y="218" fill="#737373" font-size="10" font-family="Consolas, Cascadia Mono, monospace">SERVE BIND</text>
+<rect x="300" y="222" width="118" height="24" rx="5" fill="#ffffff" stroke="#e5e5e5" stroke-width="1"/>
+<text x="308" y="239" fill="#0a0a0a" font-size="13" font-family="Consolas, Cascadia Mono, monospace">127.0.0.1</text>
+<rect x="426" y="222" width="76" height="24" rx="5" fill="#ffffff" stroke="#e5e5e5" stroke-width="2"/>
+<rect x="424" y="220" width="80" height="28" rx="7" fill="none" stroke="#60a5fa" stroke-width="2"/>
+<text x="434" y="239" fill="#0a0a0a" font-size="13" font-family="Consolas, Cascadia Mono, monospace">:10802</text>
+<rect x="510" y="222" width="76" height="24" rx="6" fill="#171717"/><text x="548" y="239" text-anchor="middle" fill="#fafafa" font-size="12" font-weight="600">Start  F5</text>
+<rect x="594" y="222" width="62" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="625" y="239" text-anchor="middle" fill="#0a0a0a" font-size="12">Edit</text>
+<text x="666" y="239" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">○ Stopped · port field focused, Enter commits</text><rect x="12" y="272" width="976" height="66" rx="6" fill="#f5f5f5" stroke="#e5e5e5" stroke-width="1"/>
+<circle cx="34" cy="294" r="6" fill="#3a3f45"/>
+<rect x="50" y="287" width="13" height="13" rx="3" fill="#ffffff" stroke="#737373" stroke-width="1"/>
+<text x="70" y="299" fill="#0a0a0a" font-size="14" font-weight="600">demo-tokyo-p1</text>
+<text x="70" y="319" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">trojan · demo-tokyo.example.com:443 · asia</text>
+<text x="300" y="292" fill="#737373" font-size="10" font-family="Consolas, Cascadia Mono, monospace">SERVE BIND</text>
+<rect x="300" y="296" width="118" height="24" rx="5" fill="#ffffff" stroke="#e5e5e5" stroke-width="1"/>
+<text x="308" y="313" fill="#0a0a0a" font-size="13" font-family="Consolas, Cascadia Mono, monospace">127.0.0.1</text>
+<rect x="426" y="296" width="76" height="24" rx="5" fill="#ffffff" stroke="#e5e5e5" stroke-width="1"/>
+<text x="434" y="313" fill="#0a0a0a" font-size="13" font-family="Consolas, Cascadia Mono, monospace">:10803</text>
+<rect x="510" y="296" width="76" height="24" rx="6" fill="#171717"/><text x="548" y="313" text-anchor="middle" fill="#fafafa" font-size="12" font-weight="600">Start  F5</text>
+<rect x="594" y="296" width="62" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="625" y="313" text-anchor="middle" fill="#0a0a0a" font-size="12">Edit</text>
+<text x="666" y="313" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">○ Stopped</text><rect x="12" y="346" width="976" height="316" rx="6" fill="#ffffff" stroke="#e5e5e5"/>
+<rect x="24" y="354" width="210" height="22" rx="5" fill="#f5f5f5"/><text x="34" y="369" fill="#0a0a0a" font-size="11">Details · Health · Presets</text>
+<text x="24" y="398" fill="#0a0a0a" font-size="13" font-weight="600">Acting on: demo-paris-p1</text>
+<text x="24" y="418" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">[vless] [europe] 127.0.0.1:10802</text>
+<text x="24" y="440" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">SOCKS</text><text x="90" y="440" fill="#0a0a0a" font-size="12" font-family="Consolas, Cascadia Mono, monospace">socks5://127.0.0.1:10802</text>
+<rect x="430" y="430" width="80" height="22" rx="5" fill="#ffffff" stroke="#e5e5e5"/><text x="470" y="445" text-anchor="middle" fill="#0a0a0a" font-size="11">Copy</text>
+<text x="24" y="462" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">HTTP&nbsp;&nbsp;&nbsp;</text><text x="90" y="462" fill="#0a0a0a" font-size="12" font-family="Consolas, Cascadia Mono, monospace">http://127.0.0.1:10802</text>
+<text x="24" y="482" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">health: never tested — press Test to check · usage down 0 B · up 0 B</text>
+<rect x="24" y="628" width="110" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="79.0" y="644" text-anchor="middle" fill="#0a0a0a" font-size="11">Auto-start ○</text>
+<rect x="140" y="628" width="110" height="24" rx="6" fill="#171717" stroke="#e5e5e5"/><text x="195.0" y="644" text-anchor="middle" fill="#fafafa" font-size="11">Start F5</text>
+<rect x="256" y="628" width="86" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="299.0" y="644" text-anchor="middle" fill="#0a0a0a" font-size="11">Stop</text>
+<rect x="348" y="628" width="86" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="391.0" y="644" text-anchor="middle" fill="#0a0a0a" font-size="11">Test</text>
+<rect x="440" y="628" width="86" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="483.0" y="644" text-anchor="middle" fill="#0a0a0a" font-size="11">Ping</text>
+<rect x="532" y="628" width="86" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="575.0" y="644" text-anchor="middle" fill="#0a0a0a" font-size="11">Logs</text>
+<rect x="624" y="628" width="110" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="679.0" y="644" text-anchor="middle" fill="#0a0a0a" font-size="11">Copy URLs</text>
+<rect x="740" y="628" width="110" height="24" rx="6" fill="#ffffff" stroke="#e5e5e5"/><text x="795.0" y="644" text-anchor="middle" fill="#0a0a0a" font-size="11">Row actions…</text><rect x="0" y="670" width="1000" height="30" fill="#F8F8F8" stroke="#e5e5e5"/><text x="12" y="689" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">3 configurations · 2 enabled</text><text x="360" y="689" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">engine stopped · health: no probes</text><text x="850" y="689" fill="#737373" font-size="11" font-family="Consolas, Cascadia Mono, monospace">↓ 0 B · ↑ 0 B</text></svg>
