@@ -27,7 +27,9 @@ use gpui_kit::component::dialog::{Confirm, Dialog, DialogButtonProps, DialogFoot
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::form::{field, v_form, Field};
 use gpui_kit::component::group_box::GroupBox;
-use gpui_kit::component::input::{AnyInputState, Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{
+    AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState,
+};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
@@ -496,6 +498,29 @@ struct LibraryDelegate {
     /// CTA strands in a separate strip below the list. `None` only before
     /// the first frame (bare-delegate unit tests never render).
     app_view: Option<Entity<AppView>>,
+    /// R3 inline loopback-endpoint editing: cached per-row serve bind + port
+    /// [`InputState`]s, keyed by config id (never indices — a reload or
+    /// filter never re-targets a draft). Created lazily on first render;
+    /// pruned by [`set_rows`] like `checked`.
+    endpoint_inputs: HashMap<String, RowEndpointInputs>,
+    /// R3: row ids whose endpoint inputs fired Enter since the last render.
+    /// The subscription records the id only (no window at event time); the
+    /// write itself runs deferred, outside the render borrow.
+    pending_endpoint_commits: Vec<String>,
+}
+
+/// R3 inline loopback-endpoint editing: one row's cached editors. The two
+/// [`InputState`]s render in the row card; `_subs` keeps the Enter
+/// subscriptions alive (dropping them unsubscribes); `clean_*` is the last
+/// committed-or-synced text, so uncommitted drafts survive scrolling while
+/// external writes (Edit dialog, subscriptions) still repaint untouched
+/// fields.
+struct RowEndpointInputs {
+    bind: Entity<InputState>,
+    port: Entity<InputState>,
+    _subs: Vec<Subscription>,
+    clean_bind: String,
+    clean_port: String,
 }
 
 /// Ticket 44: status facet over row state + serving set + health summaries —
@@ -726,6 +751,8 @@ impl LibraryDelegate {
             show_security: false,
             type_security_sort: false,
             app_view: None,
+            endpoint_inputs: HashMap::new(),
+            pending_endpoint_commits: Vec::new(),
         }
     }
 
@@ -751,6 +778,12 @@ impl LibraryDelegate {
         // the bulk bar label recomputes from this set, never stale).
         let live: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
         self.checked.retain(|id| live.contains(id.as_str()));
+        // R3: drop cached editors + pending commits for vanished rows
+        // (dropping a subscription unsubscribes — no ghost Enter commits).
+        self.endpoint_inputs
+            .retain(|id, _| live.contains(id.as_str()));
+        self.pending_endpoint_commits
+            .retain(|id| live.contains(id.as_str()));
         self.refresh_search_words();
         self.apply_filter();
         self.selected = selected_id.and_then(|id| {
@@ -766,6 +799,146 @@ impl LibraryDelegate {
     /// "no upstream" — callers fall back to a live parse).
     fn upstream_for(&self, id: &str) -> Option<&str> {
         self.upstream_cache.get(id).map(String::as_str)
+    }
+
+    /// R3: lazily create (once per row id) the serve bind + port editors and
+    /// their Enter subscriptions. Render-safe: creation never touches the
+    /// store or the owning view.
+    fn ensure_row_inputs(
+        &mut self,
+        row_id: &str,
+        bind_default: &str,
+        port_default: &str,
+        window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) {
+        if self.endpoint_inputs.contains_key(row_id) {
+            return;
+        }
+        let bind = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("127.0.0.1")
+                .default_value(bind_default.to_string())
+        });
+        let port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("auto")
+                .default_value(port_default.to_string())
+        });
+        // Enter records the id only — the write runs deferred with a window
+        // (see the render drain). One subscription per editor, owned here.
+        let mut subs = Vec::with_capacity(2);
+        for state in [&bind, &port] {
+            let id = row_id.to_string();
+            subs.push(cx.subscribe(
+                state,
+                move |list: &mut ListState<Self>,
+                      _emitter: Entity<InputState>,
+                      event: &InputEvent,
+                      cx: &mut Context<ListState<Self>>| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        let delegate = list.delegate_mut();
+                        if !delegate.pending_endpoint_commits.contains(&id) {
+                            delegate.pending_endpoint_commits.push(id.clone());
+                        }
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+        self.endpoint_inputs.insert(
+            row_id.to_string(),
+            RowEndpointInputs {
+                bind,
+                port,
+                _subs: subs,
+                clean_bind: bind_default.to_string(),
+                clean_port: port_default.to_string(),
+            },
+        );
+    }
+
+    /// R3: repaint editors whose stored row moved underneath them (Edit
+    /// dialog, subscription refresh) while leaving focused fields and
+    /// uncommitted drafts exactly alone.
+    fn sync_row_inputs(
+        &mut self,
+        row_id: &str,
+        bind_stored: &str,
+        port_stored: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
+            return;
+        };
+        let bind_current = inputs.bind.read(cx).value().to_string();
+        let port_current = inputs.port.read(cx).value().to_string();
+        if !inputs.bind.focus_handle(cx).is_focused(window)
+            && bind_current != bind_stored
+            && bind_current == inputs.clean_bind
+        {
+            inputs.bind.update(cx, |state, cx| {
+                state.set_value(bind_stored.to_string(), window, cx)
+            });
+            inputs.clean_bind = bind_stored.to_string();
+        }
+        if !inputs.port.focus_handle(cx).is_focused(window)
+            && port_current != port_stored
+            && port_current == inputs.clean_port
+        {
+            inputs.port.update(cx, |state, cx| {
+                state.set_value(port_stored.to_string(), window, cx)
+            });
+            inputs.clean_port = port_stored.to_string();
+        }
+    }
+
+    /// R3: true while either of one row's editors holds keyboard focus.
+    /// The row Esc handler only reverts the focused row, so a propagated
+    /// Escape never touches drafts in rows the user is not editing.
+    fn row_inputs_focused(&self, row_id: &str, window: &Window, cx: &App) -> bool {
+        let Some(inputs) = self.endpoint_inputs.get(row_id) else {
+            return false;
+        };
+        inputs.bind.focus_handle(cx).is_focused(window)
+            || inputs.port.focus_handle(cx).is_focused(window)
+    }
+
+    /// R3: current draft texts for one row (`None` before first render).
+    fn endpoint_draft_texts(&self, row_id: &str, cx: &App) -> Option<(String, String)> {
+        let inputs = self.endpoint_inputs.get(row_id)?;
+        Some((
+            inputs.bind.read(cx).value().to_string(),
+            inputs.port.read(cx).value().to_string(),
+        ))
+    }
+
+    /// R3: snap one row's editors back to stored truth (Esc path). Returns
+    /// true when anything was dirty — callers stop a global-Escape action
+    /// only then, so a clean Esc still clears the checked set.
+    fn revert_row_inputs(&mut self, row_id: &str, window: &mut Window, cx: &mut App) -> bool {
+        let Some(row) = self.rows.iter().find(|row| row.id == row_id).cloned() else {
+            return false;
+        };
+        let port_stored = row.port.to_string();
+        let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
+            return false;
+        };
+        let dirty = inputs.bind.read(cx).value().as_str() != row.bind_ip.as_str()
+            || inputs.port.read(cx).value().as_str() != port_stored.as_str();
+        if dirty {
+            inputs.bind.update(cx, |state, cx| {
+                state.set_value(row.bind_ip.clone(), window, cx)
+            });
+            inputs.port.update(cx, |state, cx| {
+                state.set_value(port_stored.clone(), window, cx)
+            });
+            inputs.clean_bind = row.bind_ip;
+            inputs.clean_port = port_stored;
+            self.pending_endpoint_commits.retain(|id| id != row_id);
+        }
+        dirty
     }
 
     fn apply_filter(&mut self) {
@@ -1196,7 +1369,7 @@ impl ListDelegate for LibraryDelegate {
     fn render_item(
         &mut self,
         index: IndexPath,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
         let row = self.row_at(index)?;
@@ -1214,8 +1387,8 @@ impl ListDelegate for LibraryDelegate {
         let health = self
             .health
             .get(&row.id)
-            .map(String::as_str)
-            .filter(|summary| !summary.is_empty());
+            .filter(|summary| !summary.is_empty())
+            .cloned();
         let is_running = self.running.contains(&row.id);
         // Ticket 43: per-row persisted traffic totals ride into the row.
         let traffic = self.traffic.get(&row.id).copied();
@@ -1250,6 +1423,29 @@ impl ListDelegate for LibraryDelegate {
                     cx.notify();
                 });
             });
+        // R3 inline loopback editing: editors live per row id; drafts sync
+        // from stored truth unless focused or dirty.
+        let port_stored = row.port.to_string();
+        self.ensure_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
+        self.sync_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
+        // R3 Enter drain: the subscription recorded the id (no window at
+        // event time); the write runs deferred, outside this render borrow.
+        if self.pending_endpoint_commits.contains(&row_id) {
+            self.pending_endpoint_commits.retain(|id| id != &row_id);
+            if let Some(app_view) = self.app_view.clone() {
+                let commit_id = row_id.clone();
+                window.defer(cx, move |window, cx| {
+                    app_view.update(cx, |view, cx| {
+                        view.commit_row_endpoint(&commit_id, window, cx);
+                    });
+                });
+            }
+        }
+        let (bind_state, port_state) = self
+            .endpoint_inputs
+            .get(&row_id)
+            .map(|inputs| (inputs.bind.clone(), inputs.port.clone()))
+            .expect("R3: row editors ensured above");
         // T01: the row keeps only a narrow gutter (px_1) — the card owns the
         // text padding (px_2) so the pre-card text inset (12px) is unchanged.
         let item = ListItem::new(format!("library-row-{}", row.id))
@@ -1287,8 +1483,13 @@ impl ListDelegate for LibraryDelegate {
         if !selected {
             card = card.hover(|this| this.bg(cx.theme().list_hover));
         }
-        let mut rendered =
-            library_row_dense_lines_with_upstream(&row, &upstream, health, is_running, traffic);
+        let mut rendered = library_row_dense_lines_with_upstream(
+            &row,
+            &upstream,
+            health.as_deref(),
+            is_running,
+            traffic,
+        );
         // Ticket 09 (throne-adoption): Show-Security splices the posture
         // into the meta line (render-only; the pinned line builder above
         // is untouched).
@@ -1302,7 +1503,11 @@ impl ListDelegate for LibraryDelegate {
         // stopped). Pinned strings unchanged — only the wrappers carry style.
         // Lane B (B6): lamp and badge share [`serving_tone`] — one evidence
         // rule, so the two can never disagree about a row.
-        let tone = serving_tone(is_running, health, self.crashed.contains(&row.id));
+        let tone = serving_tone(
+            is_running,
+            health.as_deref(),
+            self.crashed.contains(&row.id),
+        );
         let badge_color = match tone {
             ServingTone::Failed => cx.theme().danger,
             ServingTone::Serving => cx.theme().success,
@@ -1359,27 +1564,131 @@ impl ListDelegate for LibraryDelegate {
                         })
                         .child(Label::new(first)),
                 )
-                // Signal-refined P1: the local port is the row's identity, so
-                // it rides pinned in a fixed trailing cell (never truncated)
-                // instead of hiding last inside the truncating meta line. The
-                // meta line keeps its pinned strings; this cell duplicates
-                // only the port (display-safe, no secrets).
+                // R3 inline loopback editing: the serve endpoint edits where
+                // it lives — fixed bind + port fields plus per-row
+                // Start/Stop + Edit in the header line. Commits ride Enter
+                // (deferred write), Esc reverts; serve/edit flush a dirty
+                // draft first, then act on it. Field ids stay stable per row.
                 .child(
                     div()
-                        .id(format!("row-port-{row_id}"))
-                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .flex_shrink_0()
-                        .text_sm()
-                        .px_1()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .tooltip({
-                            let tip = format!("Local endpoint {}:{}", row.bind_ip, row.port);
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(format!("Local port {} on {}", row.port, row.bind_ip))
-                        .child(format!(":{}", row.port)),
+                        .key_context("row-endpoint")
+                        .on_key_down(cx.listener({
+                            let revert_id = row_id.clone();
+                            move |list: &mut ListState<LibraryDelegate>,
+                                  event: &KeyDownEvent,
+                                  window: &mut Window,
+                                  cx: &mut Context<ListState<LibraryDelegate>>| {
+                                if event.keystroke.key != "escape" {
+                                    return;
+                                }
+                                // Polish: only the focused row reverts, so one
+                                // Escape can never touch drafts in rows the
+                                // user is not editing. A clean Esc falls
+                                // through to the global clear-checked action.
+                                let reverted = {
+                                    let delegate = list.delegate_mut();
+                                    delegate.row_inputs_focused(&revert_id, window, cx)
+                                        && delegate.revert_row_inputs(&revert_id, window, cx)
+                                };
+                                if reverted {
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            }
+                        }))
+                        .child(
+                            div()
+                                .id(format!("row-bind-{row_id}"))
+                                .test_support()
+                                .w(px(118.))
+                                .tooltip({
+                                    let tip = format!(
+                                        "Serve bind address for \"{}\" — Enter commits, Esc reverts",
+                                        row.name
+                                    );
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .child(Input::new(&bind_state).id(format!("row-bind-input-{row_id}")).small().aria_label(format!(
+                                    "Serve bind address for {}",
+                                    row.name
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .id(format!("row-port-{row_id}"))
+                                .test_support()
+                                .w(px(76.))
+                                .tooltip({
+                                    let tip = format!(
+                                        "Local endpoint {}:{} — Enter commits, Esc reverts",
+                                        row.bind_ip, row.port
+                                    );
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .aria_label(format!("Local port {} on {}", row.port, row.bind_ip))
+                                .child(Input::new(&port_state).id(format!("row-port-input-{row_id}")).small().aria_label(format!(
+                                    "Local port for {}",
+                                    row.name
+                                ))),
+                        )
+                        .child(
+                            Button::new(format!("row-serve-{row_id}"))
+                                .small()
+                                .label(if is_running { "■ Stop" } else { "Start" })
+                                .accessibility_label(if is_running {
+                                    format!("Stop \"{}\"", row.name)
+                                } else {
+                                    format!("Start \"{}\" (F5)", row.name)
+                                })
+                                .tooltip(if is_running {
+                                    format!("Stop \"{}\"", row.name)
+                                } else {
+                                    format!("Start \"{}\" (F5)", row.name)
+                                })
+                                .on_click({
+                                    let act_app = self.app_view.clone();
+                                    let act_id = row_id.clone();
+                                    let act_running = is_running;
+                                    move |_, window, cx| {
+                                        if let Some(app) = act_app.clone() {
+                                            let id = act_id.clone();
+                                            app.update(cx, |view, cx| {
+                                                view.commit_row_endpoint(&id, window, cx);
+                                                if act_running {
+                                                    view.stop_row(&id, window, cx);
+                                                } else {
+                                                    view.start_row(&id, window, cx);
+                                                }
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new(format!("row-edit-{row_id}"))
+                                .small()
+                                .label("Edit")
+                                .accessibility_label(format!("Edit \"{}\"", row.name))
+                                .tooltip(format!("Edit \"{}\"", row.name))
+                                .on_click({
+                                    let edit_app = self.app_view.clone();
+                                    let edit_id = row_id.clone();
+                                    move |_, window, cx| {
+                                        if let Some(app) = edit_app.clone() {
+                                            let id = edit_id.clone();
+                                            app.update(cx, |view, cx| {
+                                                view.commit_row_endpoint(&id, window, cx);
+                                                view.open_edit_for_row(&id, window, cx);
+                                            });
+                                        }
+                                    }
+                                }),
+                        ),
                 );
             if let Some(position) = check_chip {
                 let chip_tip = check_chip_tip(position, checked_total);
@@ -1426,6 +1735,34 @@ impl ListDelegate for LibraryDelegate {
                 );
             } else {
                 card = card.child(div().text_sm().text_color(badge_color).child(line));
+            }
+        }
+        // R3 live endpoint warnings: the collision + LAN guards read the
+        // current draft (not just stored truth), so a bad edit warns before
+        // Enter is ever pressed. Saving stays allowed — a shared endpoint is
+        // an activation-time concern (see `bind_port_collision_warning`).
+        if let Some((bind_text, port_text)) = self.endpoint_draft_texts(&row_id, cx) {
+            if let Some(warning) =
+                bind_port_collision_warning(&self.rows, Some(&row_id), &bind_text, &port_text)
+            {
+                card = card.child(
+                    div()
+                        .id(format!("row-endpoint-warn-{row_id}"))
+                        .test_support()
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .truncate()
+                        .child(warning),
+                );
+            } else if let Some(hint) = lan_hint_for_bind(bind_text.trim()) {
+                card = card.child(
+                    div()
+                        .id(format!("row-endpoint-warn-{row_id}"))
+                        .test_support()
+                        .text_sm()
+                        .truncate()
+                        .child(hint),
+                );
             }
         }
         // Throne-adoption 03: single-click still selects (the outer List
@@ -13308,6 +13645,78 @@ impl AppView {
                 }
             }
         }
+    }
+
+    /// R3 inline endpoint editing: commit one row's loopback bind/port draft
+    /// (Enter path, deferred out of render; serve/edit buttons flush through
+    /// here too). Same gates + toasts as the dialog path ([`commit_edit`]);
+    /// a draft matching stored truth closes silently (Enter with no edits).
+    /// Editors canonicalize to freshly stored truth on success; a failed
+    /// draft stays visible for correction. Returns whether the row may
+    /// proceed (true also covers no-change and ghost rows, which warn).
+    fn commit_row_endpoint(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (bind_raw, port_raw, stored) = self.libraries.read_with(cx, |list, cx| {
+            let delegate = list.delegate();
+            let drafts = delegate.endpoint_draft_texts(id, cx).unwrap_or_default();
+            let stored = delegate
+                .rows
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| (row.name.clone(), row.bind_ip.clone(), row.port.to_string()));
+            (drafts.0, drafts.1, stored)
+        });
+        let Some((name, bind_stored, port_stored)) = stored else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return true;
+        };
+        if bind_raw.trim() == bind_stored && port_raw.trim() == port_stored {
+            self.libraries.update(cx, |list, _| {
+                if let Some(inputs) = list.delegate_mut().endpoint_inputs.get_mut(id) {
+                    inputs.clean_bind = bind_raw.clone();
+                    inputs.clean_port = port_raw.clone();
+                }
+            });
+            return true;
+        }
+        if let Err(reason) = save_listen_gate(&name, &bind_raw, &port_raw) {
+            window.push_notification(Notification::error(reason), cx);
+            return false;
+        }
+        let patch = ConfigPatch {
+            bind_ip: Some(bind_raw),
+            port: Some(port_raw),
+            ..Default::default()
+        };
+        let ok = self.commit_edit(id, patch, window, cx);
+        if ok {
+            // Canonicalize editors to freshly stored truth (reload ran).
+            if let Ok(Some(fresh)) = self.store.get(id) {
+                let bind_fresh = fresh.bind_ip.clone();
+                let port_fresh = fresh.port.to_string();
+                self.libraries.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    delegate
+                        .pending_endpoint_commits
+                        .retain(|pending| pending != id);
+                    if let Some(inputs) = delegate.endpoint_inputs.get_mut(id) {
+                        inputs.bind.update(cx, |state, cx| {
+                            state.set_value(bind_fresh.clone(), window, cx);
+                        });
+                        inputs.port.update(cx, |state, cx| {
+                            state.set_value(port_fresh.clone(), window, cx);
+                        });
+                        inputs.clean_bind = bind_fresh;
+                        inputs.clean_port = port_fresh;
+                    }
+                });
+            }
+        }
+        ok
     }
 
     /// Ticket 31: dialog commit behind [`AppView::commit_edit`]. Same
@@ -45502,6 +45911,430 @@ mod tests {
                 assert!(!text.contains(canary), "no secrets in {text}");
             }
         }
+    }
+
+    // -- R3: inline loopback-endpoint editing -------------------------------
+
+    /// R3: every library row carries fixed bind + port editors plus per-row
+    /// Start/Edit — loopback IP:port:serve always on, one row.
+    #[gpui_kit::test]
+    fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        let beta = store
+            .add(t30_engine_seed("Beta", "10952"))
+            .expect("seed works");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        for id in [&alpha.id, &beta.id] {
+            for slot in ["row-bind-", "row-port-", "row-serve-", "row-edit-"] {
+                let element = format!("{slot}{id}");
+                assert!(
+                    cx.update(|window, _| window.try_find(element.clone()).is_some()),
+                    "{element} renders in the row"
+                );
+            }
+        }
+        // Polish: editors hold their fixed cells; serve/edit announce full
+        // `Name (Key)` accessible names, not bare verbs.
+        let (bind_w, port_w) = cx.update(|window, _| {
+            let bind = window
+                .try_find(format!("row-bind-input-{}", alpha.id))
+                .expect("bind input renders")
+                .bounds()
+                .size
+                .width;
+            let port = window
+                .try_find(format!("row-port-input-{}", alpha.id))
+                .expect("port input renders")
+                .bounds()
+                .size
+                .width;
+            (bind, port)
+        });
+        assert!(
+            bind_w > px(100.) && bind_w < px(136.),
+            "bind field holds its 118px cell, got {bind_w:?}"
+        );
+        assert!(
+            port_w > px(60.) && port_w < px(92.),
+            "port field holds its 76px cell, got {port_w:?}"
+        );
+        for (slot, pinned) in [
+            ("row-serve-", "Start \"Alpha\" (F5)"),
+            ("row-edit-", "Edit \"Alpha\""),
+        ] {
+            let element = format!("{slot}{}", alpha.id);
+            let name = cx.update(|window, _| {
+                window
+                    .try_find(element.clone())
+                    .unwrap_or_else(|| panic!("{element} renders"))
+                    .label()
+                    .map(str::to_string)
+            });
+            assert_eq!(name.as_deref(), Some(pinned), "{element} announces");
+        }
+    }
+
+    /// R3: per-row Start serves THAT row (fake engine) with one honest toast.
+    #[gpui_kit::test]
+    fn r3_row_serve_button_starts_that_row(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        store
+            .add(t30_engine_seed("Beta", "10952"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        paint_frame(cx);
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click(format!("row-serve-{}", alpha.id), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "per-row Start serves exactly that row"
+        );
+        assert_eq!(notification_count(cx), before + 1, "one honest toast");
+    }
+
+    /// R3: a dirty port draft commits through [`AppView::commit_row_endpoint`] —
+    /// store updated, toast names the row, editors canonicalize.
+    #[gpui_kit::test]
+    fn r3_row_endpoint_commit_writes_store(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    let inputs = delegate
+                        .endpoint_inputs
+                        .get(&alpha.id)
+                        .expect("row editors exist after paint");
+                    inputs.port.update(cx, |state, cx| {
+                        state.set_value("10961", window, cx);
+                    });
+                });
+            });
+        });
+        let before = notification_count(cx);
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_endpoint(&alpha.id, window, cx)
+            })
+        });
+        assert!(committed, "clean draft commits");
+        cx.run_until_parked();
+        paint_frame(cx);
+        let stored = view.read_with(cx, |view, _| {
+            view.store
+                .get(&alpha.id)
+                .expect("store reads")
+                .expect("row")
+                .port
+        });
+        assert_eq!(stored, 10961, "store carries the edited port");
+        assert_eq!(notification_count(cx), before + 1, "one honest toast");
+    }
+
+    /// R3: a privileged port fails the save gate loudly — toast, no write,
+    /// draft kept for correction.
+    #[gpui_kit::test]
+    fn r3_row_endpoint_reserved_port_fails_gate(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    let inputs = delegate
+                        .endpoint_inputs
+                        .get(&alpha.id)
+                        .expect("row editors exist after paint");
+                    inputs.port.update(cx, |state, cx| {
+                        state.set_value("80", window, cx);
+                    });
+                });
+            });
+        });
+        let before = notification_count(cx);
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_endpoint(&alpha.id, window, cx)
+            })
+        });
+        assert!(!committed, "privileged port refuses");
+        let (stored, draft) = view.read_with(cx, |view, cx| {
+            let stored = view
+                .store
+                .get(&alpha.id)
+                .expect("store reads")
+                .expect("row")
+                .port;
+            let draft = view
+                .libraries
+                .read(cx)
+                .delegate()
+                .endpoint_draft_texts(&alpha.id, cx)
+                .expect("drafts readable")
+                .1;
+            (stored, draft)
+        });
+        assert_eq!(stored, 10951, "rejected edit writes nothing");
+        assert_eq!(draft, "80", "failed draft stays for correction");
+        assert_eq!(notification_count(cx), before + 1, "one loud toast");
+    }
+
+    /// R3: a draft colliding with another row paints the inline warning
+    /// before Enter is ever pressed (saving would still be allowed).
+    #[gpui_kit::test]
+    fn r3_row_endpoint_collision_warns_inline(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        store
+            .add(t30_engine_seed("Beta", "10952"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    let inputs = delegate
+                        .endpoint_inputs
+                        .get(&alpha.id)
+                        .expect("row editors exist after paint");
+                    inputs.port.update(cx, |state, cx| {
+                        state.set_value("10952", window, cx);
+                    });
+                });
+            });
+        });
+        paint_frame(cx);
+        let warn = format!("row-endpoint-warn-{}", alpha.id);
+        assert!(
+            cx.update(|window, _| window.try_find(warn.clone()).is_some()),
+            "collision warning paints inline"
+        );
+        let stored = view.read_with(cx, |view, _| {
+            view.store
+                .get(&alpha.id)
+                .expect("store reads")
+                .expect("row")
+                .port
+        });
+        assert_eq!(stored, 10951, "warning alone writes nothing");
+    }
+
+    /// R3: Esc on a dirty field snaps back to stored truth (direct seam).
+    #[gpui_kit::test]
+    fn r3_row_endpoint_escape_reverts_draft(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    let inputs = delegate
+                        .endpoint_inputs
+                        .get(&alpha.id)
+                        .expect("row editors exist after paint");
+                    inputs.port.update(cx, |state, cx| {
+                        state.set_value("10961", window, cx);
+                    });
+                });
+            });
+        });
+        let reverted = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    list.delegate_mut().revert_row_inputs(&alpha.id, window, cx)
+                })
+            })
+        });
+        assert!(reverted, "dirty draft reverts");
+        let draft = view.read_with(cx, |view, cx| {
+            view.libraries
+                .read(cx)
+                .delegate()
+                .endpoint_draft_texts(&alpha.id, cx)
+                .expect("drafts readable")
+                .1
+        });
+        assert_eq!(draft, "10951", "editors show stored truth again");
+    }
+
+    /// R3: Enter inside a dirty port field commits through the deferred
+    /// subscription path (no direct commit call).
+    #[gpui_kit::test]
+    fn r3_row_endpoint_enter_key_commits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    let inputs = delegate
+                        .endpoint_inputs
+                        .get(&alpha.id)
+                        .expect("row editors exist after paint");
+                    inputs.port.update(cx, |state, cx| {
+                        state.focus(window, cx);
+                    });
+                    inputs.port.update(cx, |state, cx| {
+                        state.set_value("10961", window, cx);
+                    });
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            window.dispatch_keystroke(Keystroke::parse("enter").expect("enter parses"), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let stored = view.read_with(cx, |view, _| {
+            view.store
+                .get(&alpha.id)
+                .expect("store reads")
+                .expect("row")
+                .port
+        });
+        assert_eq!(stored, 10961, "Enter commits the draft");
+    }
+
+    /// R3: Escape inside a dirty field reverts through the row key handler.
+    #[gpui_kit::test]
+    fn r3_row_endpoint_escape_key_reverts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    let inputs = delegate
+                        .endpoint_inputs
+                        .get(&alpha.id)
+                        .expect("row editors exist after paint");
+                    inputs.port.update(cx, |state, cx| {
+                        state.focus(window, cx);
+                    });
+                    inputs.port.update(cx, |state, cx| {
+                        state.set_value("10961", window, cx);
+                    });
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            use gpui_kit::Keystroke;
+            window.dispatch_keystroke(Keystroke::parse("escape").expect("escape parses"), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (stored, draft) = view.read_with(cx, |view, cx| {
+            let stored = view
+                .store
+                .get(&alpha.id)
+                .expect("store reads")
+                .expect("row")
+                .port;
+            let draft = view
+                .libraries
+                .read(cx)
+                .delegate()
+                .endpoint_draft_texts(&alpha.id, cx)
+                .expect("drafts readable")
+                .1;
+            (stored, draft)
+        });
+        assert_eq!(stored, 10951, "Escape writes nothing");
+        assert_eq!(draft, "10951", "Escape reverts the draft");
+    }
+
+    /// R3: removing a row prunes its cached editors on reload (no ghost
+    /// Enter commits, no leak).
+    #[gpui_kit::test]
+    fn r3_row_endpoint_inputs_pruned_on_remove(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        store
+            .add(t30_engine_seed("Beta", "10952"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        let cached = view.read_with(cx, |view, cx| {
+            view.libraries
+                .read(cx)
+                .delegate()
+                .endpoint_inputs
+                .contains_key(&alpha.id)
+        });
+        assert!(cached, "editors cached after paint");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.store.remove(&alpha.id).expect("remove works");
+                view.reload(window, cx);
+            });
+        });
+        paint_frame(cx);
+        let pruned = view.read_with(cx, |view, cx| {
+            !view
+                .libraries
+                .read(cx)
+                .delegate()
+                .endpoint_inputs
+                .contains_key(&alpha.id)
+        });
+        assert!(pruned, "removed rows lose their editors");
     }
 
     fn t30_engine_seed(name: &str, port: &str) -> NewConfig {

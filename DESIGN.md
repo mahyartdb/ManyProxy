@@ -58,6 +58,10 @@ components:
   row-card:
     backgroundColor: "{colors.quiet-surface}"
     rounded: "{rounded.md}"
+  row-endpoint-field:
+    backgroundColor: "{colors.paper}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.md}"
   row-selected:
     backgroundColor: "{colors.selection-wash}"
   row-checked:
@@ -198,6 +202,7 @@ Five menus in fixed order — Program (`program-menu`: intake + lifecycle), Sett
 ### Inputs / Fields
 
 - **Style:** hairline stroke, paper fill, theme radius; stacked label-over-field at 4px gaps. Params box fixed at 96px, import box at 160px. The Port field carries a live auto-port budget readout (`port-budget`: used of 499 across `10801–10999` plus spill `18081–18380`) on Add and Edit.
+- **Row editors:** the library's bind/port fields are small kit inputs at fixed widths (bind 118px, port 76px) in the system face — the same hairline/paper/radius voice as dialog fields, with the kit focus ring. Placeholders read `127.0.0.1` / `auto`; blank port still means auto-assign.
 - **Guided-first:** the Add dialog opens on Server / Server-port / Identity mini-fields with a one-clause hint (`vless needs uuid.`); JSON is an Advanced disclosure toggled from the hint row (collapsed) or the Params header (expanded). Guided and JSON swap, never stack; expanding merges guided values into JSON, collapsing echoes JSON into blank guided inputs only. Edit opens expanded to preserve existing JSON.
 - **Focus:** kit focus ring; validation keeps dialogs open with an inline error notification rather than closing; params errors auto-expand Advanced.
 - **Error / Disabled:** inline error lines and collision warnings inside the form; `lan-hint` names the loopback guard in plain words (`Leaving loopback exposes this machine — …`); disabled rows read `disabled` in their muted meta line. No disabled-control styling exists — see honest-toast above.
@@ -210,7 +215,9 @@ Five menus in fixed order — Program (`program-menu`: intake + lifecycle), Sett
 
 ### Library Row (signature component)
 
-Occupancy lamp (`row-dot-<id>`, fixed leading cell, flat fill) plus checkbox plus name on line one, with the numeral check chip beside the name while checked and the local port pinned in a fixed trailing pill (`row-port-<id>`, `:port`, never truncated); the name (`row-name-<id>`) and meta line (`row-meta-<id>`) truncate with full-text hover tooltips, like the endpoint rows. Small muted meta line (`protocol · upstream · group · bind:port · state`); small badge line in serving color with optional traffic totals. Hover tints quiet; selection takes wash plus rim; checked takes the 2px accent rim. Stopped rows honestly show pinned `○ Stopped` with no fabricated latency; a row both checked and selected shows both marks. A successful import selects the first new row and checks all of them, so `F5` and the bulk bar act at once.
+Occupancy lamp (`row-dot-<id>`, fixed leading cell, flat fill) plus checkbox plus name on line one, with the numeral check chip beside the name while checked; the name (`row-name-<id>`) and meta line (`row-meta-<id>`) truncate with full-text hover tooltips, like the endpoint rows. Small muted meta line (`protocol · upstream · group · bind:port · state`); small badge line in serving color with optional traffic totals. Hover tints quiet; selection takes wash plus rim; checked takes the 2px accent rim. Stopped rows honestly show pinned `○ Stopped` with no fabricated latency; a row both checked and selected shows both marks. A successful import selects the first new row and checks all of them, so `F5` and the bulk bar act at once.
+
+The row's trailing cell is the serve endpoint, editable where it lives: a fixed bind field (`row-bind-<id>`, 118px small input) plus a fixed port field (`row-port-<id>`, 76px small input), then a small per-row Start/Stop (`row-serve-<id>`, `Start` when stopped, `■ Stop` when serving) and a small Edit (`row-edit-<id>`) — loopback IP:port:serve always on, one row. Enter commits the draft through the same save gate as the Edit dialog (reserved ranges and garbage binds toast loudly, store untouched, draft kept); Esc reverts to stored truth and stops the global-Escape from clearing the checked set; clicking elsewhere never commits, and drafts survive scrolling while external writes still repaint untouched fields. Serve/Edit flush a dirty draft first, then act on it, so the action always lands on visible values. A draft colliding with another row paints an inline `row-endpoint-warn-<id>` collision badge, and a non-loopback draft paints the loopback-guard hint — both read the draft, never just stored truth. Upstream and secrets stay dialog-owned and never render inline.
 
 ### Endpoints module
 
@@ -239,6 +246,7 @@ Concrete guardrails grounded in the implementation. Every `Button::new` id, pinn
 - **Do** preserve all control states when restyling: default, hover, focus, active, loading, error, empty — and keep actions enabled-with-honest-toast rather than introducing disabled styling.
 - **Do** keep the selection grammar split: wash for the selected row only, rim plus numeral chip for the checked set, `N checked (of M visible)` on the bulk bar, `Acting on: <name>` on the detail header.
 - **Do** keep endpoints above the operate row and failure evidence inside the 240px minimum.
+- **Do** keep row endpoint editors on stable per-row ids (`row-bind-<id>`, `row-port-<id>`, `row-serve-<id>`, `row-edit-<id>`) with Enter-commit, Esc-revert, live draft warnings, and flush-before-act on serve/edit — the draft is never silently dropped, blurred away, or committed without the save gate.
 
 ### Don't:
 
@@ -249,3 +257,4 @@ Concrete guardrails grounded in the implementation. Every `Button::new` id, pinn
 - **Don't** surface secrets: copy, logs, URLs, and search matching stay clear of credential fields.
 - **Don't** invent per-row start tracking (the amber starting state stays global: `Starting…` label plus spinner plus busy guard) or per-row latency for stopped rows.
 - **Don't** add Kbd chips to unbound actions — a hint without a binding is a lie.
+- **Don't** commit row endpoint drafts on blur or focus loss — Enter commits, Esc reverts, and serve/edit flush first; a draft the user hasn't confirmed must survive scrolling untouched.

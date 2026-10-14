@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="700" font-family="Segoe UI, system-ui, sans-serif">
+<rect width="1000" height="700" fill="#f4f4f5"/>
+<rect x="0" y="0" width="1000" height="44" fill="#e8e8ea"/>
+<text x="16" y="27" fill="#141414" font-size="14" font-weight="600">ManyProxy — A · Strip-Chart Bench (light) · P3-dual upstream group | loopback group · #07</text>
+<text x="16" y="70" fill="#6b7280" font-size="12" font-family="Consolas, Cascadia Mono, monospace">Search · Group: All · Protocol: All · Status: All · 3 of 3 · inline addr+port+start in one row</text>
+<rect x="16" y="100" width="968" height="64" rx="7" fill="#ffffff" />
+<circle cx="36" cy="122" r="6" fill="#3a3f45"/>
+<text x="50" y="127" fill="#141414" font-size="14" font-weight="700" font-family="Segoe UI, system-ui, sans-serif">demo-berlin-p1</text>
+<text x="50" y="148" fill="#6b7280" font-size="11" font-family="Consolas, Cascadia Mono, monospace">vless · europe · ○ Stopped</text>
+<text x="264" y="122" fill="#6b7280" font-size="10" font-family="Consolas, Cascadia Mono, monospace">UPSTREAM</text>
+<rect x="264" y="126" width="240" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="272" y="142" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">demo-berlin.example.com</text>
+<rect x="510" y="126" width="64" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="518" y="142" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">443</text>
+<text x="590" y="122" fill="#6b7280" font-size="10" font-family="Consolas, Cascadia Mono, monospace">LOOPBACK</text>
+<rect x="590" y="126" width="80" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="598" y="142" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">127.0.0.1</text>
+<rect x="676" y="126" width="74" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="684" y="142" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">:10801</text>
+<rect x="758" y="126" width="86" height="24" rx="6" fill="#141414"/><text x="801" y="143" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">Start</text>
+<rect x="852" y="126" width="58" height="24" rx="6" fill="none" stroke="#6b7280" stroke-width="1"/><text x="881" y="143" text-anchor="middle" fill="#6b7280" font-size="12">Test</text>
+<rect x="918" y="126" width="50" height="24" rx="6" fill="none" stroke="#6b7280" stroke-width="1"/><text x="943" y="143" text-anchor="middle" fill="#6b7280" font-size="12">⎘</text>
+<rect x="16" y="176" width="968" height="64" rx="7" fill="#ffffff" stroke="#1d4ed8" stroke-width="3"/>
+<circle cx="36" cy="198" r="6" fill="#3a3f45"/>
+<text x="50" y="203" fill="#141414" font-size="14" font-weight="700" font-family="Segoe UI, system-ui, sans-serif">demo-paris-p1</text>
+<text x="50" y="224" fill="#6b7280" font-size="11" font-family="Consolas, Cascadia Mono, monospace">vless · europe · ○ Stopped</text>
+<text x="264" y="198" fill="#6b7280" font-size="10" font-family="Consolas, Cascadia Mono, monospace">UPSTREAM</text>
+<rect x="264" y="202" width="240" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="272" y="218" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">demo-paris.example.com</text>
+<rect x="510" y="202" width="64" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="518" y="218" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">443</text>
+<text x="590" y="198" fill="#6b7280" font-size="10" font-family="Consolas, Cascadia Mono, monospace">LOOPBACK</text>
+<rect x="590" y="202" width="80" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="598" y="218" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">127.0.0.1</text>
+<rect x="676" y="202" width="74" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="684" y="218" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">:10802</text>
+<rect x="758" y="202" width="86" height="24" rx="6" fill="#141414"/><text x="801" y="219" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">Start</text>
+<rect x="852" y="202" width="58" height="24" rx="6" fill="none" stroke="#6b7280" stroke-width="1"/><text x="881" y="219" text-anchor="middle" fill="#6b7280" font-size="12">Test</text>
+<rect x="918" y="202" width="50" height="24" rx="6" fill="none" stroke="#6b7280" stroke-width="1"/><text x="943" y="219" text-anchor="middle" fill="#6b7280" font-size="12">⎘</text>
+<rect x="16" y="252" width="968" height="64" rx="7" fill="#ffffff" />
+<circle cx="36" cy="274" r="6" fill="#ef4444"/>
+<text x="50" y="279" fill="#141414" font-size="14" font-weight="700" font-family="Segoe UI, system-ui, sans-serif">demo-tokyo-p1</text>
+<text x="50" y="300" fill="#6b7280" font-size="11" font-family="Consolas, Cascadia Mono, monospace">trojan · asia · ✕ Failed</text>
+<text x="264" y="274" fill="#6b7280" font-size="10" font-family="Consolas, Cascadia Mono, monospace">UPSTREAM</text>
+<rect x="264" y="278" width="240" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="272" y="294" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">demo-tokyo.example.com</text>
+<rect x="510" y="278" width="64" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="518" y="294" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">443</text>
+<text x="590" y="274" fill="#6b7280" font-size="10" font-family="Consolas, Cascadia Mono, monospace">LOOPBACK</text>
+<rect x="590" y="278" width="80" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="598" y="294" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">127.0.0.1</text>
+<rect x="676" y="278" width="74" height="24" rx="5" fill="#f4f1e6" stroke="#c9c4b2" stroke-width="1"/><text x="684" y="294" fill="#141414" font-size="13" font-family="Consolas, Cascadia Mono, monospace">:10803</text>
+<rect x="758" y="278" width="86" height="24" rx="6" fill="#141414"/><text x="801" y="295" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="700">Start</text>
+<rect x="852" y="278" width="58" height="24" rx="6" fill="none" stroke="#6b7280" stroke-width="1"/><text x="881" y="295" text-anchor="middle" fill="#6b7280" font-size="12">Test</text>
+<rect x="918" y="278" width="50" height="24" rx="6" fill="none" stroke="#6b7280" stroke-width="1"/><text x="943" y="295" text-anchor="middle" fill="#6b7280" font-size="12">⎘</text>
+<rect x="16" y="330" width="968" height="120" rx="7" fill="#e8e8ea"/>
+<text x="32" y="356" fill="#6b7280" font-size="12" font-family="Consolas, Cascadia Mono, monospace">Acting on: demo-paris-p1 · edits validate inline (port budget · collisions · loopback guard) · Enter commits · Esc reverts</text>
+<text x="32" y="380" fill="#6b7280" font-size="12" font-family="Consolas, Cascadia Mono, monospace">SOCKS socks5://127.0.0.1:10802 [Copy] · HTTP http://127.0.0.1:10802 [Copy] · health: never tested — press Test</text>
+<text x="32" y="404" fill="#6b7280" font-size="12" font-family="Consolas, Cascadia Mono, monospace">Start F5 · Stop · Test Ctrl+T · Ping · Logs · Copy URLs Ctrl+U · Row actions…</text>
+<text x="32" y="428" fill="#6b7280" font-size="12" font-family="Consolas, Cascadia Mono, monospace">secrets never shown inline · upstream edits merge into stored params like the guided Add form</text>
+<rect x="0" y="662" width="1000" height="38" fill="#e8e8ea"/>
+<text x="16" y="685" fill="#6b7280" font-size="12" font-family="Consolas, Cascadia Mono, monospace">3 configurations · 2 enabled | engine stopped | health: no probes | ↓ 0 B · ↑ 0 B</text>
+</svg>
