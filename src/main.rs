@@ -34459,6 +34459,8 @@ mod tests {
                 .endpoint_is_dirty(&dirty.id, cx)),
             "draft is dirty"
         );
+        assert_painted(cx, &format!("row-dirty-{}", dirty.id));
+        assert_absent(cx, format!("row-dirty-{}", clean.id));
         let before = notification_count(cx);
         cx.update(|window, cx| {
             view.update(cx, |view, cx| view.start_row(&dirty.id, window, cx));

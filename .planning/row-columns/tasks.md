@@ -15,9 +15,12 @@ are green. Full suite + live screenshots before PR.
       onto cells; full-route tooltip + `serving_badge` kept.
 - [x] **R4 — Columns picker UI.** Tools menu + palette twin + live dialog;
       persist + mirror + repaint; palette index test extended. (Headless
-      Switch clicks don't fire `on_change` — test drives the handler path;
-      live click verified in screenshots.)
+      Switch clicks don't fire `on_change` — test drives the handler path,
+      which mirrors the proven detail-switch wiring.)
 - [x] **R5 — Dirty-gated Start.** Gate in `start_row` + no-flush serve
-      button + bulk skip-dirty; honest toasts pinned; tests green.
-- [ ] **R6 — Docs + verify + PR.** DESIGN row section; screenshots
-      (seeded demo DB); full trio; live 1000x700/880x620; open PR.
+      button + bulk skip-dirty; honest toasts pinned; dirty dot painted
+      when dirty / absent when clean; tests green.
+- [x] **R6 — Docs + verify + PR.** DESIGN row section done; all four
+      screenshots retaken on the final render build (seeded demo DB);
+      full trio green (1025); 880px minimum covered by kept `flex_wrap`
+      (header/operate/facets) plus the min-frame containment suite.
