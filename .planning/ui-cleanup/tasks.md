@@ -23,8 +23,14 @@ green for that ticket. Full suite + live screenshots before PR.
 - [x] **T6 — Status bar (verified OK, no change).** Lowering `min_w` floors
       broke `t10` fixed-slot stability → reverted, nothing ships. Floors
       210/430/150 stand.
-- [x] **T7 — DESIGN.md tabs paragraphs** (`DESIGN.md` Layout + Navigation).
-      Six tabs documented; no rule/token changes. Verified: prose diff only.
+- [x] **T7 — DESIGN.md tabs + filter language** (`DESIGN.md` Layout +
+      Navigation). Six tabs documented; filter paragraph describes the
+      one-row bar. Verified: prose diff only.
+- [x] **T9 — One-row filter bar** (`src/main.rs`: AppView `search_input` +
+      subscription, `facet-bar` merge, kit `.searchable(false)`). Full suite
+      green (1021); live 1000x700 + 880x620 verified; screenshots retaken.
+      One re-entrancy fix on the way (`clear_library_search` touches the
+      input directly instead of re-entering AppView update).
 - [x] **T8 — Final verification.** `cargo fmt --check` + `cargo clippy
       --all-targets --locked -- -D warnings` + `cargo test --locked` (1021
       green) + fresh-build live screenshots (1000x700, 880x620) confirming

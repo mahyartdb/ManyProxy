@@ -33,6 +33,21 @@ frozen; only padding, wrap, widths, and radius change.
    fixed widths across value changes) and was reverted. Measured floors
    (210/430/150) fit the 880 minimum with truncate + tooltips. No change.
 7. **T7 DESIGN.md tabs paragraphs** (Layout ~:145, Navigation ~:212).
+   Document the 6 shipped inspector tabs (Details/Health/Presets/Logs/
+   Connections/Traffic) instead of 3; note endpoints render on the overview
+   above every pane. No token or rule changes.
+8. **T9 one-row filter bar.** The `search-focus` button plus the kit List's
+   own search box made three stacked rows for one job (count, facets,
+   query). The kit search is disabled (`.searchable(false)`, placeholder
+   builder removed); AppView owns one `search_input` rendered inline in
+   `facet-bar` beside the `search-count` block, wired to the delegate via an
+   `InputEvent::Change` subscription that needs no window (direct
+   `query` + `apply_filter`, mirroring `perform_search`). Ctrl-F, Clear
+   search, and both empty-state clears sync the box explicitly (`set_value`
+   emits no `Change`, so no loops). Esc behavior unchanged (kit never
+   cleared the query on Esc). Two tests re-expressed onto the new widget
+   (`t03_inline_search_field_focusable`, `t06` focus handle); placeholder
+   const and shortcut binding untouched.
 
 ## Verification per ticket
 

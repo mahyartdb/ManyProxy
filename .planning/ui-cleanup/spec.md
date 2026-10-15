@@ -12,11 +12,11 @@ current HEAD (`a055335`) and re-verify live on a fresh build.
 
 ## Defects (user-visible, all confirmed against HEAD code)
 
-1. **Filter bands are cramped and read as one wall.** `search-count`
-   (`src/main.rs:21140`, no padding) → `facet-bar` (`:21228`, `px_2` only, no
-   vertical padding) → `bulk-bar` (`:21343`, `px_2` only) → kit `List` search
-   input stack with zero breathing room. In the screenshot the bulk bar sits
-   directly on the `Search configurations` placeholder; arrows flag every band.
+1. **Filter bands are cramped and read as one wall** (superseded by T9).
+   The `search-count` row, `facet-bar`, kit List search box, and conditional
+   `bulk-bar` stacked four rows for one job. Fix shipped: single `facet-bar`
+   row carrying the inline search field + `N of M` count + facet pickers
+   (kit search disabled); bulk bar unchanged below it.
 2. **Endpoints block has a ~400px void.** `endpoint_row` (`:20420`) is `w_full`
    with value `flex_1`, so Copy buttons hug the far right edge while values
    are short. User marked it "empty space".

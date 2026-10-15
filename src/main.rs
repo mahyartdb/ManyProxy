@@ -1486,6 +1486,8 @@ impl ListDelegate for LibraryDelegate {
             }
             let hint_view = list_view.clone();
             let all_view = list_view.clone();
+            let hint_sync = self.app_view.clone();
+            let all_sync = self.app_view.clone();
             return div().id("library-empty").test_support().size_full().child(
                 Empty::new()
                     .header(
@@ -1516,6 +1518,9 @@ impl ListDelegate for LibraryDelegate {
 
                                                 state.set_query("", window, list_cx);
                                             });
+                                            if let Some(app) = hint_sync.clone() {
+                                                AppView::sync_search_box(&app, "", window, cx);
+                                            }
                                         }),
                                 )
                                 .child(
@@ -1530,6 +1535,9 @@ impl ListDelegate for LibraryDelegate {
                                                 state.delegate_mut().clear_facets();
                                                 list_cx.notify();
                                             });
+                                            if let Some(app) = all_sync.clone() {
+                                                AppView::sync_search_box(&app, "", window, cx);
+                                            }
                                         }),
                                 ),
                         ),
@@ -10986,6 +10994,9 @@ struct AppView {
     facet_protocol: FacetPicker,
     facet_status: FacetPicker,
 
+    search_input: Entity<InputState>,
+    _search_subscription: Subscription,
+
     inspector_tab: InspectorTab,
 
     conn_snapshot: Vec<(String, crate::health::ClashConn)>,
@@ -11031,9 +11042,10 @@ impl AppView {
     fn with_store(window: &mut Window, cx: &mut Context<Self>, store: Store) -> Self {
         let libraries = cx.new(|cx| {
             ListState::new(LibraryDelegate::new(), window, cx)
-                .searchable(true)
+                .searchable(false)
                 .selectable(true)
         });
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(SEARCH_PLACEHOLDER));
 
         let empty_delegate = LibraryDelegate::new();
         let (group_choices, group_current) = FacetMenu::Group.choices(&empty_delegate);
@@ -11126,6 +11138,23 @@ impl AppView {
             _libraries_subscription: cx.subscribe(
                 &libraries,
                 |_view, _state, _event: &ListEvent, cx| {
+                    cx.notify();
+                },
+            ),
+            search_input: search_input.clone(),
+            _search_subscription: cx.subscribe(
+                &search_input,
+                |view: &mut Self, emitter: Entity<InputState>, event: &InputEvent, cx| {
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
+                    let query = emitter.read(cx).value().to_string();
+                    view.libraries.update(cx, |state, list_cx| {
+                        let delegate = state.delegate_mut();
+                        delegate.query = query;
+                        delegate.apply_filter();
+                        list_cx.notify();
+                    });
                     cx.notify();
                 },
             ),
@@ -21178,12 +21207,21 @@ impl AppView {
     }
 
     fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.libraries.update(cx, |state, list_cx| {
-            state.focus(window, list_cx);
+        self.search_input.focus_handle(cx).focus(window, cx);
+    }
+
+    fn sync_search_box(view: &Entity<Self>, text: &str, window: &mut Window, cx: &mut App) {
+        view.update(cx, |view, cx| {
+            view.search_input.update(cx, |input, cx| {
+                input.set_value(text.to_string(), window, cx);
+            });
         });
     }
 
     fn clear_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input.update(cx, |input, cx| {
+            input.set_value(String::new(), window, cx);
+        });
         self.libraries.update(cx, |state, list_cx| {
             state.set_query("", window, list_cx);
         });
@@ -21275,16 +21313,18 @@ impl AppView {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                Button::new("search-focus")
-                    .small()
-                    .label("Search")
-                    .accessibility_label("Focus the library search field (Ctrl-F)")
-                    .child(shortcut_kbd("ctrl-f", "(Ctrl-F)"))
-                    .tooltip("Focus the library search field (Ctrl-F)")
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.focus_library_search(window, cx);
-                    })),
+                div()
+                    .id("library-search")
+                    .test_support()
+                    .flex_1()
+                    .min_w(px(140.))
+                    .child(
+                        Input::new(&self.search_input)
+                            .small()
+                            .aria_label("Search configurations (Ctrl-F)"),
+                    ),
             )
+            .child(self.render_search_count(cx))
             .child(
                 div()
                     .id("facet-group-tip")
@@ -23407,7 +23447,6 @@ impl Render for AppView {
         });
 
         let show_detail = self.config_count(cx) != 0;
-        let search_count = self.render_search_count(cx);
         let facet_bar = self.render_facet_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
         let empty_ctas = self.render_empty_ctas(cx);
@@ -23418,14 +23457,9 @@ impl Render for AppView {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(search_count)
             .child(facet_bar)
             .child(bulk_bar)
-            .child(
-                List::new(&self.libraries)
-                    .search_placeholder(SEARCH_PLACEHOLDER)
-                    .flex_1(),
-            );
+            .child(List::new(&self.libraries).flex_1());
         list_pane = list_pane.child(empty_ctas);
 
         self.render_shell(cx)
@@ -32902,26 +32936,26 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn t03_search_focus_button_focuses_query(cx: &mut TestAppContext) {
+    fn t03_inline_search_field_focusable(cx: &mut TestAppContext) {
         use gpui_kit::Focusable as _;
         cx.update(gpui_kit::init);
         let store = Store::open_in_memory().expect("in-memory store opens");
         let (view, cx) = mount_view(store, cx);
         paint_frame(cx);
-        assert_painted(cx, "search-focus");
+        assert_painted(cx, "library-search");
         cx.update(|window, cx| {
-            window.click("search-focus", cx);
+            view.update(cx, |view, cx| view.focus_library_search(window, cx));
         });
         cx.run_until_parked();
         paint_frame(cx);
 
         let query_focused = cx.update(|window, cx| {
-            let handle = view.read(cx).libraries.read(cx).focus_handle(cx);
+            let handle = view.read(cx).search_input.read(cx).focus_handle(cx);
             window.focused(cx).as_ref() == Some(&handle)
         });
         assert!(
             query_focused,
-            "Search button focuses the library search field"
+            "Ctrl-F path focuses the inline library search field"
         );
     }
 
@@ -41427,7 +41461,7 @@ mod tests {
 
         assert_painted(cx, "search-count");
         assert_painted(cx, "facet-bar");
-        assert_painted(cx, "search-focus");
+        assert_painted(cx, "library-search");
         assert_painted(cx, "facet-group");
         assert_painted(cx, "facet-protocol");
         assert_painted(cx, "facet-status");
@@ -41694,7 +41728,7 @@ mod tests {
         });
         cx.run_until_parked();
         let query_focused = cx.update(|window, cx| {
-            let handle = view.read(cx).libraries.read(cx).focus_handle(cx);
+            let handle = view.read(cx).search_input.read(cx).focus_handle(cx);
             window.focused(cx).as_ref() == Some(&handle)
         });
         assert!(query_focused, "Ctrl-F lands in the library search field");
