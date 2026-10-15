@@ -6895,6 +6895,22 @@ impl Store {
         self.set_meta(Self::META_SKIP_DELETE_CONFIRM, if skip { "1" } else { "0" })
     }
 
+    pub const META_LIBRARY_COLUMNS: &str = "library_columns";
+
+    pub fn library_columns_raw(&self) -> Option<String> {
+        self.get_meta(Self::META_LIBRARY_COLUMNS).ok().flatten()
+    }
+
+    pub fn set_library_columns(&mut self, value: &str) -> Result<(), StoreError> {
+        if value.trim().is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "library_columns",
+                "library_columns must list visible columns",
+            )]));
+        }
+        self.set_meta(Self::META_LIBRARY_COLUMNS, value.trim())
+    }
+
     pub const CONN_COLUMNS: [(&str, u32); 5] = [
         ("destination", 220),
         ("exit", 180),
@@ -12995,6 +13011,24 @@ mod tests {
             .set_meta(Store::META_APPEARANCE, "midnight")
             .expect("raw write");
         assert_eq!(store.appearance(), "dark", "corrupt reads dark");
+    }
+
+    #[test]
+    fn library_columns_absent_and_round_trips() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(store.library_columns_raw(), None, "default absent");
+        store
+            .set_library_columns("upstream,health")
+            .expect("valid set writes");
+        assert_eq!(
+            store.library_columns_raw().as_deref(),
+            Some("upstream,health"),
+            "round-trips verbatim"
+        );
+        assert!(
+            store.set_library_columns("  ").is_err(),
+            "blank fails loudly"
+        );
     }
 
     #[test]

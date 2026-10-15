@@ -374,6 +374,8 @@ struct LibraryDelegate {
 
     type_security_sort: bool,
 
+    row_columns: RowColumns,
+
     app_view: Option<Entity<AppView>>,
 
     endpoint_inputs: HashMap<String, RowEndpointInputs>,
@@ -591,6 +593,7 @@ impl LibraryDelegate {
             facet_status: None,
             show_security: false,
             type_security_sort: false,
+            row_columns: RowColumns::default(),
             app_view: None,
             endpoint_inputs: HashMap::new(),
             pending_endpoint_commits: Vec::new(),
@@ -732,6 +735,21 @@ impl LibraryDelegate {
             inputs.bind.read(cx).value().to_string(),
             inputs.port.read(cx).value().to_string(),
         ))
+    }
+
+    fn endpoint_is_dirty(&self, row_id: &str, cx: &App) -> bool {
+        let Some(row) = self.rows.iter().find(|row| row.id == row_id) else {
+            return false;
+        };
+        let Some(inputs) = self.endpoint_inputs.get(row_id) else {
+            return false;
+        };
+        inputs.bind.read(cx).value().as_str() != row.bind_ip.as_str()
+            || inputs.port.read(cx).value().as_str() != row.port.to_string().as_str()
+    }
+
+    fn set_row_columns(&mut self, columns: RowColumns) {
+        self.row_columns = columns;
     }
 
     fn revert_row_inputs(&mut self, row_id: &str, window: &mut Window, cx: &mut App) -> bool {
@@ -1189,19 +1207,6 @@ impl ListDelegate for LibraryDelegate {
         if !selected {
             card = card.hover(|this| this.bg(cx.theme().list_hover));
         }
-        let mut rendered = library_row_dense_lines_with_upstream(
-            &row,
-            &upstream,
-            health.as_deref(),
-            is_running,
-            traffic,
-        );
-
-        if self.show_security {
-            apply_show_security(&mut rendered, &row);
-        }
-        let mut lines = rendered.into_iter();
-
         let tone = serving_tone(
             is_running,
             health.as_deref(),
@@ -1212,16 +1217,137 @@ impl ListDelegate for LibraryDelegate {
             ServingTone::Serving => cx.theme().success,
             ServingTone::Stopped => cx.theme().muted_foreground,
         };
-        if let Some(first) = lines.next() {
-            let lamp_color = match tone {
-                ServingTone::Failed => cx.theme().danger,
-                ServingTone::Serving => cx.theme().success,
-                ServingTone::Stopped => cx.theme().muted_foreground,
-            };
-            let check_chip = self.checked_position(&row_id);
-            let checked_total = self.checked.len();
-            let lamp_label = lamp_access_label(tone, &row.name);
-            let mut header = div()
+        let lamp_color = match tone {
+            ServingTone::Failed => cx.theme().danger,
+            ServingTone::Serving => cx.theme().success,
+            ServingTone::Stopped => cx.theme().muted_foreground,
+        };
+        let check_chip = self.checked_position(&row_id);
+        let checked_total = self.checked.len();
+        let lamp_label = lamp_access_label(tone, &row.name);
+        let columns = self.row_columns;
+        let dirty = self.endpoint_is_dirty(&row_id, cx);
+        let full_route = library_row_full_route(&row, &upstream);
+        let [upstream_text, health_text, group_text, traffic_text] = library_row_cells(
+            &row,
+            &upstream,
+            health.as_deref(),
+            is_running,
+            traffic,
+            self.show_security,
+        );
+        {
+            let name = row.name.clone();
+            let mut leading: Vec<AnyElement> = Vec::new();
+            if let Some(position) = check_chip {
+                let chip_tip = check_chip_tip(position, checked_total);
+                leading.push(
+                    div()
+                        .id(format!("row-check-chip-{row_id}"))
+                        .test_support()
+                        .text_sm()
+                        .px_1()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(cx.theme().accent)
+                        .text_color(cx.theme().accent)
+                        .tooltip({
+                            let tip = chip_tip.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .aria_label(chip_tip)
+                        .child(format!("{position}"))
+                        .into_any_element(),
+                );
+            }
+            if dirty {
+                let dirty_tip = format!(
+                    "\"{}\" has unapplied endpoint edits — Enter applies, Esc reverts",
+                    row.name
+                );
+                leading.push(
+                    div()
+                        .id(format!("row-dirty-{row_id}"))
+                        .test_support()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(cx.theme().accent)
+                        .tooltip({
+                            let tip = dirty_tip.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .aria_label(dirty_tip)
+                        .into_any_element(),
+                );
+            }
+            let mut cells: Vec<AnyElement> = Vec::new();
+            if columns.upstream {
+                let tip = upstream_text.clone();
+                cells.push(
+                    div()
+                        .id(format!("row-upstream-{row_id}"))
+                        .test_support()
+                        .w(px(180.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .tooltip({
+                            let tip = tip.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .child(upstream_text.clone())
+                        .into_any_element(),
+                );
+            }
+            if columns.health {
+                let tip = health_text.clone();
+                cells.push(
+                    div()
+                        .id(format!("row-health-{row_id}"))
+                        .test_support()
+                        .w(px(150.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(badge_color)
+                        .tooltip({
+                            let tip = tip.clone();
+                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                        })
+                        .child(health_text.clone())
+                        .into_any_element(),
+                );
+            }
+            if columns.group {
+                cells.push(
+                    div()
+                        .id(format!("row-group-{row_id}"))
+                        .test_support()
+                        .w(px(100.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(group_text.clone())
+                        .into_any_element(),
+                );
+            }
+            if columns.traffic {
+                cells.push(
+                    div()
+                        .id(format!("row-traffic-{row_id}"))
+                        .test_support()
+                        .w(px(120.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(traffic_text.clone())
+                        .into_any_element(),
+                );
+            }
+            let header = div()
                 .flex()
                 .flex_row()
                 .flex_wrap()
@@ -1241,6 +1367,7 @@ impl ListDelegate for LibraryDelegate {
                         .aria_label(lamp_label.clone()),
                 )
                 .child(checkbox)
+                .children(leading)
                 .child(
                     div()
                         .id(format!("row-name-{row_id}"))
@@ -1248,11 +1375,12 @@ impl ListDelegate for LibraryDelegate {
                         .min_w_0()
                         .truncate()
                         .tooltip({
-                            let tip = first.clone();
+                            let tip = full_route.clone();
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                         })
-                        .child(Label::new(first)),
+                        .child(Label::new(name)),
                 )
+                .children(cells)
 
 
 
@@ -1347,7 +1475,6 @@ impl ListDelegate for LibraryDelegate {
                                         if let Some(app) = act_app.clone() {
                                             let id = act_id.clone();
                                             app.update(cx, |view, cx| {
-                                                view.commit_row_endpoint(&id, window, cx);
                                                 if act_running {
                                                     view.stop_row(&id, window, cx);
                                                 } else {
@@ -1379,46 +1506,7 @@ impl ListDelegate for LibraryDelegate {
                                 }),
                         ),
                 );
-            if let Some(position) = check_chip {
-                let chip_tip = check_chip_tip(position, checked_total);
-                header = header.child(
-                    div()
-                        .id(format!("row-check-chip-{row_id}"))
-                        .test_support()
-                        .text_sm()
-                        .px_1()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(cx.theme().accent)
-                        .text_color(cx.theme().accent)
-                        .tooltip({
-                            let tip = chip_tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(chip_tip)
-                        .child(format!("{position}")),
-                );
-            }
             card = card.child(header);
-        } else {
-            card = card.child(checkbox);
-        }
-
-        for (index, line) in lines.enumerate() {
-            if index == 0 {
-                let tip = library_row_full_route(&row, &upstream);
-                card = card.child(
-                    div()
-                        .id(format!("row-meta-{row_id}"))
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .truncate()
-                        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                        .child(line),
-                );
-            } else {
-                card = card.child(div().text_sm().text_color(badge_color).child(line));
-            }
         }
 
         if let Some((bind_text, port_text)) = self.endpoint_draft_texts(&row_id, cx) {
@@ -8117,14 +8205,9 @@ fn probe_summary_toast(count: usize, live: usize, dead: usize) -> String {
     format!("Tested {count} endpoint(s): {live} live · {dead} dead")
 }
 
-fn apply_show_security(lines: &mut [String], row: &ProxyConfig) {
-    if let Some(meta) = lines.get_mut(1) {
-        *meta = format!(
-            "{} · {}",
-            meta,
-            row_security_label(&row.protocol, &row.params)
-        );
-    }
+fn apply_show_security(text: &mut String, row: &ProxyConfig) {
+    text.push_str(" · ");
+    text.push_str(row_security_label(&row.protocol, &row.params));
 }
 
 fn group_test_summary_toast(
@@ -8322,6 +8405,17 @@ fn already_running_message(name: &str) -> String {
     format!("\"{name}\" already running (restarted)")
 }
 
+fn dirty_endpoint_message(name: &str) -> String {
+    format!("\"{name}\" has unapplied endpoint edits — press Enter to apply or Esc to revert")
+}
+
+fn skipped_dirty_message(names: &[String]) -> String {
+    format!(
+        "Skipped with unapplied edits (Enter applies, Esc reverts): {}",
+        names.join(", ")
+    )
+}
+
 fn no_selection_message() -> String {
     "Select a configuration first".to_string()
 }
@@ -8389,6 +8483,70 @@ fn start_all_partial_message(started: usize, failed_names: &[String]) -> String 
 }
 
 const SEARCH_PLACEHOLDER: &str = "Search configurations";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowColumns {
+    upstream: bool,
+    health: bool,
+    group: bool,
+    traffic: bool,
+}
+
+impl Default for RowColumns {
+    fn default() -> Self {
+        Self {
+            upstream: true,
+            health: true,
+            group: false,
+            traffic: false,
+        }
+    }
+}
+
+impl RowColumns {
+    const ORDER: [&'static str; 4] = ["upstream", "health", "group", "traffic"];
+
+    fn parse(raw: &str) -> Self {
+        if raw.trim().is_empty() {
+            return Self::default();
+        }
+        let mut columns = Self {
+            upstream: false,
+            health: false,
+            group: false,
+            traffic: false,
+        };
+        for token in raw.split(',').map(str::trim) {
+            match token {
+                "upstream" => columns.upstream = true,
+                "health" => columns.health = true,
+                "group" => columns.group = true,
+                "traffic" => columns.traffic = true,
+                _ => {}
+            }
+        }
+        columns
+    }
+
+    fn display(self) -> String {
+        if !self.upstream && !self.health && !self.group && !self.traffic {
+            return "none".to_string();
+        }
+        let mut names = Vec::with_capacity(4);
+        for name in Self::ORDER {
+            let enabled = match name {
+                "upstream" => self.upstream,
+                "health" => self.health,
+                "group" => self.group,
+                _ => self.traffic,
+            };
+            if enabled {
+                names.push(name);
+            }
+        }
+        names.join(",")
+    }
+}
 
 fn search_count_text(visible: usize, total: usize) -> String {
     format!("{visible} of {total}")
@@ -8606,24 +8764,31 @@ fn library_row_lines_with_upstream(
     lines
 }
 
-fn library_row_dense_lines_with_upstream(
+fn library_row_cells(
     row: &ProxyConfig,
     upstream: &str,
     health: Option<&str>,
     is_running: bool,
     traffic: Option<(u64, u64)>,
-) -> Vec<String> {
-    let meta = format!(
-        "{} · {upstream} · bind {}:{}",
-        row.protocol, row.bind_ip, row.port
-    );
-    let mut badge = serving_badge(is_running, row.port, health);
-    if let Some((rx, tx)) = traffic {
-        if let Some(summary) = traffic_summary_text(rx, tx) {
-            badge = format!("{badge} · {summary}");
-        }
+    show_security: bool,
+) -> [String; 4] {
+    let mut upstream_cell = upstream.to_string();
+    if show_security {
+        apply_show_security(&mut upstream_cell, row);
     }
-    vec![row.name.clone(), meta, badge]
+    let health_cell = if is_running {
+        serving_badge(true, row.port, health)
+    } else {
+        String::new()
+    };
+    let traffic_cell = if is_running {
+        traffic
+            .and_then(|(rx, tx)| traffic_summary_text(rx, tx))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    [upstream_cell, health_cell, row.group.clone(), traffic_cell]
 }
 
 fn library_row_full_route(row: &ProxyConfig, upstream: &str) -> String {
@@ -10709,6 +10874,7 @@ enum PaletteOp {
     TestAll,
     ImportClipboard,
     ExportLibrary,
+    RowColumns,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10997,6 +11163,8 @@ struct AppView {
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
 
+    row_columns: RowColumns,
+
     inspector_tab: InspectorTab,
 
     conn_snapshot: Vec<(String, crate::health::ClashConn)>,
@@ -11046,6 +11214,11 @@ impl AppView {
                 .selectable(true)
         });
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(SEARCH_PLACEHOLDER));
+        let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
+        libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_row_columns(row_columns);
+            list_cx.notify();
+        });
 
         let empty_delegate = LibraryDelegate::new();
         let (group_choices, group_current) = FacetMenu::Group.choices(&empty_delegate);
@@ -11161,6 +11334,7 @@ impl AppView {
             facet_group,
             facet_protocol,
             facet_status,
+            row_columns,
             inspector_tab: InspectorTab::Details,
             conn_snapshot: Vec::new(),
             conn_delta: HashMap::new(),
@@ -12341,6 +12515,10 @@ impl AppView {
             return;
         };
 
+        if self.libraries.read(cx).delegate().endpoint_is_dirty(id, cx) {
+            window.push_notification(Notification::info(dirty_endpoint_message(&config.name)), cx);
+            return;
+        }
         if self.start_in_flight {
             window.push_notification(Notification::info(start_busy_message()), cx);
             return;
@@ -13869,6 +14047,7 @@ impl AppView {
 
             (1, 9) => Some(PaletteOp::RuntimeStats),
             (1, 10) => Some(PaletteOp::TrafficStats),
+            (1, 11) => Some(PaletteOp::RowColumns),
             _ => None,
         }
     }
@@ -13974,6 +14153,9 @@ impl AppView {
                             CommandItem::new()
                                 .label("Traffic stats")
                                 .keywords(["traffic", "stats", "usage", "profile"]),
+                            CommandItem::new()
+                                .label("Row columns")
+                                .keywords(["column", "columns", "rows", "display"]),
                         ]))
                     .on_confirm(move |index, window, cx| {
                         view.update(cx, |view, cx| view.run_palette_op(index, window, cx));
@@ -14014,6 +14196,7 @@ impl AppView {
             }
             PaletteOp::RuntimeStats => self.open_runtime_stats_dialog(window, cx),
             PaletteOp::TrafficStats => self.open_traffic_stats_dialog(window, cx),
+            PaletteOp::RowColumns => self.open_row_columns_dialog(window, cx),
 
             PaletteOp::ImportClipboard => self.open_import_from_clipboard(window, cx),
             PaletteOp::ExportLibrary => self.open_export_dialog(window, cx),
@@ -15944,6 +16127,111 @@ impl AppView {
                     ),
                 )
         });
+    }
+
+    fn open_row_columns_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let live: Rc<RefCell<RowColumns>> = Rc::new(RefCell::new(self.row_columns));
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view = view.clone();
+            let current = *live.borrow();
+            let mut body = div().flex().flex_col().gap_2();
+            for (id, label, tip, enabled) in [
+                (
+                    "columns-upstream",
+                    "Upstream",
+                    "Show the upstream host:port on each row",
+                    current.upstream,
+                ),
+                (
+                    "columns-health",
+                    "Health",
+                    "Show serving state and probe evidence on each row",
+                    current.health,
+                ),
+                (
+                    "columns-group",
+                    "Group",
+                    "Show the group tag on each row",
+                    current.group,
+                ),
+                (
+                    "columns-traffic",
+                    "Traffic",
+                    "Show data-plane totals on serving rows",
+                    current.traffic,
+                ),
+            ] {
+                let column = match id {
+                    "columns-upstream" => "upstream",
+                    "columns-health" => "health",
+                    "columns-group" => "group",
+                    _ => "traffic",
+                };
+                let live = live.clone();
+                let switch_view = view.clone();
+                body = body.child(
+                    Switch::new(id)
+                        .checked(enabled)
+                        .label(label)
+                        .accessibility_label(label)
+                        .tooltip(tip)
+                        .on_change(move |enabled: &bool, window, cx| {
+                            let enabled = *enabled;
+                            {
+                                let mut current = live.borrow_mut();
+                                match column {
+                                    "upstream" => current.upstream = enabled,
+                                    "health" => current.health = enabled,
+                                    "group" => current.group = enabled,
+                                    _ => current.traffic = enabled,
+                                }
+                            }
+                            switch_view.update(cx, |view, cx| {
+                                view.set_row_column(column, enabled, window, cx);
+                            });
+                        }),
+                );
+            }
+            let close: DialogCommit = Rc::new(|_, _| true);
+            dialog
+                .title("Row columns")
+                .child(body)
+                .footer(dialog_footer(
+                    "columns-dialog-close",
+                    "columns-dialog-cancel",
+                    "Close",
+                    close,
+                ))
+        });
+    }
+
+    fn set_row_column(
+        &mut self,
+        column: &'static str,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut columns = self.row_columns;
+        match column {
+            "upstream" => columns.upstream = enabled,
+            "health" => columns.health = enabled,
+            "group" => columns.group = enabled,
+            _ => columns.traffic = enabled,
+        }
+        self.row_columns = columns;
+        self.libraries.update(cx, |state, list_cx| {
+            state.delegate_mut().set_row_columns(columns);
+            list_cx.notify();
+        });
+        if let Err(error) = self.store.set_library_columns(&columns.display()) {
+            window.push_notification(
+                Notification::error(format!("Could not save column choice: {error}")),
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -21656,7 +21944,14 @@ impl AppView {
         }
         let mut started = 0usize;
         let mut failed: Vec<String> = Vec::new();
+        let mut skipped_dirty: Vec<String> = Vec::new();
         for id in ids {
+            if self.libraries.read(cx).delegate().endpoint_is_dirty(id, cx) {
+                if let Ok(Some(config)) = self.store.get(id) {
+                    skipped_dirty.push(config.name.clone());
+                }
+                continue;
+            }
             let Ok(Some(config)) = self.store.get(id) else {
                 continue;
             };
@@ -21680,6 +21975,12 @@ impl AppView {
         }
         self.start_in_flight = false;
         self.reload(window, cx);
+        if !skipped_dirty.is_empty() {
+            window.push_notification(
+                Notification::info(skipped_dirty_message(&skipped_dirty)),
+                cx,
+            );
+        }
         if failed.is_empty() {
             window.push_notification(
                 Notification::success(format!("Started {started} configuration(s)")),
@@ -23366,6 +23667,25 @@ impl AppView {
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.toggle_show_security(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "menu-row-columns",
+                                    "Row columns…",
+                                    "Row columns",
+                                    "Choose which columns each library row shows",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_row_columns_dialog(window, cx);
                                     });
                                 }
                             }),
@@ -33611,14 +33931,12 @@ mod tests {
             }
         }
         let tls_row = row("1", "A", "vless", r#"{"security":"tls"}"#);
-        let mut lines = vec![
-            "A".to_string(),
-            "vless · h:1".to_string(),
-            "badge".to_string(),
-        ];
-        apply_show_security(&mut lines, &tls_row);
-        assert_eq!(lines[1], "vless · h:1 · tls", "posture spliced");
-        assert_eq!(lines.len(), 3, "no new lines");
+        let mut cell = "a.example.com:443".to_string();
+        apply_show_security(&mut cell, &tls_row);
+        assert_eq!(cell, "a.example.com:443 · tls", "posture spliced");
+        let mut plain = "b.example.com:443".to_string();
+        apply_show_security(&mut plain, &row("2", "B", "vmess", "{}"));
+        assert_eq!(plain, "b.example.com:443 · none", "plain protocols labeled");
         let mut delegate = LibraryDelegate::new();
         delegate.set_rows(vec![
             row("1", "T", "trojan", "{}"),
@@ -34030,10 +34348,206 @@ mod tests {
         assert_eq!(label, "2 checked (of 3 visible)");
     }
 
+    #[gpui_kit::test]
+    fn r04_row_columns_dialog_toggles_and_persists(cx: &mut TestAppContext) {
+        use crate::RowColumns;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let seeded = store
+            .add(row19_seed("Work", "a.example.com", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_row_columns_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "columns dialog opens"
+        );
+        for id in [
+            "columns-upstream",
+            "columns-health",
+            "columns-group",
+            "columns-traffic",
+            "columns-dialog-close",
+        ] {
+            assert_painted(cx, id);
+        }
+        assert_eq!(
+            view.read_with(cx, |view, _| view.row_columns),
+            RowColumns::default(),
+            "safe subset on by default"
+        );
+        assert_painted(cx, &format!("row-upstream-{}", seeded.id));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_row_column("upstream", false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        let after = view.read_with(cx, |view, cx| {
+            (
+                view.row_columns,
+                view.libraries.read(cx).delegate().row_columns,
+                view.store.library_columns_raw(),
+            )
+        });
+        assert!(
+            !after.0.upstream && after.0.health,
+            "toggle flips one column, keeps the rest: {:?}",
+            after.0
+        );
+        assert_eq!(after.0, after.1, "delegate mirrors the choice");
+        assert_eq!(after.2.as_deref(), Some("health"), "choice persists");
+        assert_absent(cx, format!("row-upstream-{}", seeded.id));
+    }
+
+    #[gpui_kit::test]
+    fn r05_dirty_start_gates_and_clean_launches(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        assert_eq!(
+            crate::dirty_endpoint_message("Work"),
+            "\"Work\" has unapplied endpoint edits — press Enter to apply or Esc to revert",
+            "gate toast pinned"
+        );
+        assert_eq!(
+            crate::skipped_dirty_message(&["Work".to_string()]),
+            "Skipped with unapplied edits (Enter applies, Esc reverts): Work",
+            "bulk skip toast pinned"
+        );
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let dirty = store
+            .add(t30_engine_seed("Dirty", "10801"))
+            .expect("seed works");
+        let clean = store
+            .add(t30_engine_seed("Clean", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let bind = view.libraries.read(cx).delegate().endpoint_inputs[&dirty.id]
+                    .bind
+                    .clone();
+                bind.update(cx, |input, cx| {
+                    input.set_value("127.0.0.2".to_string(), window, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert!(
+            view.read_with(cx, |view, cx| view
+                .libraries
+                .read(cx)
+                .delegate()
+                .endpoint_is_dirty(&dirty.id, cx)),
+            "draft is dirty"
+        );
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&dirty.id, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "dirty Start launches nothing"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "dirty Start toasts honestly"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&clean.id, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "clean Start launches"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    let delegate = state.delegate_mut();
+                    delegate.toggle_checked(&dirty.id);
+                    delegate.toggle_checked(&clean.id);
+                    list_cx.notify();
+                });
+            });
+        });
+        let before_bulk = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_bulk_start(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "bulk skips the dirty row"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before_bulk + 2,
+            "bulk reports started plus skipped"
+        );
+    }
+
     #[test]
-    fn t01_dense_meta_carries_at_most_three_facts() {
+    fn r01_row_columns_defaults_parse_and_display() {
+        use crate::RowColumns;
+        let defaults = RowColumns::default();
+        assert!(
+            defaults.upstream && defaults.health && !defaults.group && !defaults.traffic,
+            "safe subset on by default: {defaults:?}"
+        );
+        assert_eq!(defaults.display(), "upstream,health");
+        assert_eq!(RowColumns::parse(""), defaults, "missing reads defaults");
+        assert_eq!(
+            RowColumns::parse("group,traffic,bogus"),
+            RowColumns {
+                upstream: false,
+                health: false,
+                group: true,
+                traffic: true,
+            },
+            "unknown tokens ignored, missing means off"
+        );
+        assert_eq!(
+            RowColumns::parse("none"),
+            RowColumns {
+                upstream: false,
+                health: false,
+                group: false,
+                traffic: false,
+            },
+            "all-off persists as none"
+        );
+        assert_eq!(
+            RowColumns::parse(&defaults.display()),
+            defaults,
+            "display round-trips"
+        );
+    }
+
+    #[test]
+    fn t01_row_cells_carry_one_fact_each() {
         use crate::store::ProxyConfig;
-        use crate::{library_row_dense_lines_with_upstream, library_row_full_route};
+        use crate::{library_row_cells, library_row_full_route};
         let row = ProxyConfig {
             id: "7".to_string(),
             name: "Work".to_string(),
@@ -34047,39 +34561,46 @@ mod tests {
             identity_key: None,
             preset_id: None,
         };
-        let dense = library_row_dense_lines_with_upstream(
+        let cells = library_row_cells(&row, "a.example.com:443", Some("87ms"), true, None, false);
+        assert_eq!(
+            cells[0], "a.example.com:443",
+            "upstream cell carries upstream"
+        );
+        assert!(
+            cells[1].contains('●') && cells[1].contains("87ms"),
+            "health cell carries state plus probe:\n{}",
+            cells[1]
+        );
+        assert_eq!(cells[2], "travel", "group cell carries group");
+        assert_eq!(cells[3], "", "no traffic without totals");
+        let busy = library_row_cells(
             &row,
             "a.example.com:443",
             Some("87ms"),
             true,
-            None,
+            Some((1_048_782, 88)),
+            false,
         );
-        assert_eq!(dense.len(), 3, "dense rows are name + meta + badge");
-        let facts: Vec<&str> = dense[1].split('·').map(str::trim).collect();
         assert!(
-            facts.len() <= 3,
-            "meta carries at most 3 facts: {:?}",
-            dense[1]
+            busy[3].contains("1.0 MB"),
+            "traffic cell carries totals:\n{}",
+            busy[3]
         );
-        for want in ["vless", "a.example.com:443", "127.0.0.1:10801"] {
-            assert!(
-                dense[1].contains(want),
-                "{want} stays on the meta line:\n{}",
-                dense[1]
-            );
-        }
-
         assert!(
-            dense[2].contains('●'),
-            "running badge carries its glyph:\n{}",
-            dense[2]
+            !busy[1].contains("1.0 MB"),
+            "health cell stays state-only:\n{}",
+            busy[1]
         );
-        let idle =
-            library_row_dense_lines_with_upstream(&row, "a.example.com:443", None, false, None);
-        assert!(
-            idle[2].contains('○'),
-            "stopped badge carries its glyph:\n{}",
-            idle[2]
+        let idle = library_row_cells(&row, "a.example.com:443", None, false, None, false);
+        assert_eq!(
+            idle[1], "",
+            "stopped health cell stays empty — the gray lamp carries stopped"
+        );
+        let secured = library_row_cells(&row, "a.example.com:443", None, true, None, true);
+        assert_eq!(
+            secured[0], "a.example.com:443 · none",
+            "security posture splices onto upstream:\n{}",
+            secured[0]
         );
         let full = library_row_full_route(&row, "a.example.com:443");
         for want in [
@@ -34091,7 +34612,7 @@ mod tests {
         ] {
             assert!(
                 full.contains(want),
-                "{want} stays on the full route:\n{full}"
+                "{want} stays on the full route tooltip:\n{full}"
             );
         }
     }
@@ -36092,7 +36613,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn t02_row_anatomy_uniform_across_states(cx: &mut TestAppContext) {
-        use crate::library_row_dense_lines_with_upstream;
+        use crate::library_row_cells;
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let running = store
@@ -36160,34 +36681,33 @@ mod tests {
             (&stopped, "b.example.com:443", None, false),
             (&dead, "c.example.com:443", Some("dead"), true),
         ] {
-            let text = library_row_dense_lines_with_upstream(row, upstream, health, serving, None)
-                .join("\n");
-            let port = format!(":{}", row.port);
-            assert!(text.contains(&port), "port in row:\n{text}");
-            assert!(
-                text.contains(&format!("127.0.0.1:{0}", row.port)),
-                "bind endpoint in row:\n{text}"
-            );
-            assert!(text.contains(upstream), "upstream in row:\n{text}");
+            let cells = library_row_cells(row, upstream, health, serving, None, false);
+            assert_eq!(cells[0], upstream, "upstream cell in row");
+            assert_painted(cx, &format!("row-upstream-{}", row.id));
+            if serving {
+                assert!(
+                    !cells[1].is_empty(),
+                    "serving rows carry health text:\n{cells:?}"
+                );
+                assert_painted(cx, &format!("row-health-{}", row.id));
+            } else {
+                assert!(
+                    cells[1].is_empty(),
+                    "stopped health cell stays empty — gray lamp carries stopped"
+                );
+            }
         }
-        let live = library_row_dense_lines_with_upstream(
+        let live = library_row_cells(
             &running,
             "a.example.com:443",
             Some("87ms"),
             true,
             None,
-        )
-        .join("\n");
-        assert!(
-            live.contains("87ms"),
-            "health number rides running row:\n{live}"
+            false,
         );
-        let idle =
-            library_row_dense_lines_with_upstream(&stopped, "b.example.com:443", None, false, None)
-                .join("\n");
         assert!(
-            idle.contains("○ Stopped"),
-            "stopped badge stays pinned:\n{idle}"
+            live[1].contains("87ms"),
+            "health number rides running row:\n{live:?}"
         );
     }
 
@@ -36732,6 +37252,7 @@ mod tests {
             PaletteOp::TestAll,
             PaletteOp::RuntimeStats,
             PaletteOp::TrafficStats,
+            PaletteOp::RowColumns,
         ];
         for (row, want) in manage.into_iter().enumerate() {
             assert_eq!(
@@ -36741,7 +37262,7 @@ mod tests {
             );
         }
         assert_eq!(AppView::palette_op_at(IndexPath::new(15).section(0)), None);
-        assert_eq!(AppView::palette_op_at(IndexPath::new(11).section(1)), None);
+        assert_eq!(AppView::palette_op_at(IndexPath::new(12).section(1)), None);
         assert_eq!(AppView::palette_op_at(IndexPath::new(0).section(2)), None);
     }
 
@@ -38877,9 +39398,9 @@ mod tests {
     }
 
     #[test]
-    fn library_row_dense_lines_merge_meta_and_badge() {
+    fn library_row_cells_split_state_route_and_accounting() {
         use crate::store::ProxyConfig;
-        use crate::{library_row_dense_lines_with_upstream, library_row_full_route};
+        use crate::{library_row_cells, library_row_full_route};
         let row = ProxyConfig {
             id: "7".to_string(),
             name: "Work".to_string(),
@@ -38894,54 +39415,49 @@ mod tests {
             identity_key: None,
             preset_id: None,
         };
-        let dense = library_row_dense_lines_with_upstream(
+        let cells = library_row_cells(
             &row,
             "a.example.com:443",
             Some("87ms"),
             true,
             Some((1_048_782, 88)),
+            false,
         );
-        assert_eq!(dense.len(), 3, "dense rows are 3 lines max");
-        let facts: Vec<&str> = dense[1].split('·').map(str::trim).collect();
         assert_eq!(
-            facts.len(),
-            3,
-            "dense meta is the route only (protocol · upstream · bind): {:?}",
-            dense[1]
-        );
-        let full = dense.join("\n");
-        for want in [
-            "Work",
-            "vless",
-            "a.example.com:443",
-            "127.0.0.1:10801",
-            "Running",
-            "87ms",
-            "1.0 MB",
-        ] {
-            assert!(full.contains(want), "{want} visible in:\n{full}");
-        }
-        assert!(
-            !dense[1].contains("travel"),
-            "group rides the tooltip, not the meta line:\n{}",
-            dense[1]
+            cells[0], "a.example.com:443",
+            "upstream cell is upstream only"
         );
         assert!(
-            !dense[1].contains("enabled"),
-            "enabled flag rides the tooltip, not the meta line:\n{}",
-            dense[1]
+            cells[1].contains("Running") && cells[1].contains("87ms"),
+            "health cell is state plus probe:\n{cells:?}"
+        );
+        assert!(
+            !cells[1].contains("1.0 MB"),
+            "accounting stays out of health:\n{cells:?}"
+        );
+        assert_eq!(cells[2], "travel", "group has its own cell");
+        assert!(
+            cells[3].contains("1.0 MB"),
+            "traffic cell carries totals:\n{cells:?}"
         );
         let route = library_row_full_route(&row, "a.example.com:443");
-        for want in ["travel", "enabled"] {
+        for want in ["travel", "enabled", "127.0.0.1:10801"] {
             assert!(
                 route.contains(want),
-                "{want} stays on the full route:\n{route}"
+                "{want} stays on the full route tooltip:\n{route}"
             );
         }
-        assert!(!full.contains("s3cret"), "no secrets in dense rows");
-        let idle = library_row_dense_lines_with_upstream(&row, "no upstream", None, false, None);
-        assert_eq!(idle.len(), 3, "idle dense rows keep badge line");
-        assert!(idle[2].contains("Stopped"), "idle badge honest");
+        let shown = [row.name.clone(), route.clone()]
+            .into_iter()
+            .chain(cells.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!shown.contains("s3cret"), "no secrets in row cells");
+        let idle = library_row_cells(&row, "no upstream", None, false, None, false);
+        assert_eq!(
+            idle[1], "",
+            "idle health cell empty — gray lamp carries stopped"
+        );
     }
 
     #[test]
@@ -45125,14 +45641,18 @@ mod tests {
         let upstream = crate::upstream_host_port(&row).expect("upstream reads");
         assert_eq!(upstream, "198.51.100.9:443");
         assert_no_canaries(&upstream, "upstream");
-        let dense =
-            crate::library_row_dense_lines_with_upstream(&row, &upstream, Some("87ms"), true, None)
-                .join("\n");
+        let cells = crate::library_row_cells(&row, &upstream, Some("87ms"), true, None, false);
+        let route = crate::library_row_full_route(&row, &upstream);
         assert!(
-            dense.contains("127.0.0.1:10982"),
-            "bind+port visible: {dense}"
+            route.contains("127.0.0.1:10982"),
+            "bind+port visible on the route tooltip: {route}"
         );
-        assert_no_canaries(&dense, "dense row");
+        let shown = [row.name.clone(), upstream.clone(), route.clone()]
+            .into_iter()
+            .chain(cells.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_no_canaries(&shown, "row cells");
         let base = crate::library_row_lines(&row, Some("87ms"), true, None).join("\n");
         assert_no_canaries(&base, "base row");
         let badge = crate::serving_badge(true, row.port, Some("87ms"));
