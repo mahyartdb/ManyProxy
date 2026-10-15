@@ -1224,6 +1224,7 @@ impl ListDelegate for LibraryDelegate {
             let mut header = div()
                 .flex()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap_2()
                 .child(
@@ -20392,6 +20393,7 @@ impl AppView {
                     .flex()
                     .flex_col()
                     .gap_1()
+                    .max_w(px(620.))
                     .child(Self::endpoint_row(
                         cx,
                         "upstream",
@@ -21152,6 +21154,8 @@ impl AppView {
             .flex_row()
             .items_center()
             .gap_2()
+            .px_2()
+            .py_1()
             .child(search_count_text(visible, total))
             .child(if has_query {
                 Button::new("clear-search")
@@ -21267,6 +21271,7 @@ impl AppView {
             .items_center()
             .gap_2()
             .px_2()
+            .py_1()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -21359,8 +21364,7 @@ impl AppView {
                 .items_center()
                 .gap_2()
                 .px_2()
-
-
+                .py_1()
                 .bg(cx.theme().group_box)
                 .border_b_1()
                 .border_color(cx.theme().border)
@@ -23380,7 +23384,6 @@ impl AppView {
             .child(
                 Button::new("global-start-stop")
                     .small()
-                    .rounded(px(999.))
                     .label(format!("{glyph} {name}"))
                     .accessibility_label(name)
                     .loading(busy)
