@@ -34,7 +34,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
@@ -51,6 +51,7 @@ use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::{IndexPath, Root, WindowExt};
@@ -61,14 +62,15 @@ use gpui_kit::*;
 use engine::{
     engine_binary_file_name, fork_binary_file_name, lan_confirm_description, lan_confirm_text,
     lan_exposure_warning, requires_lan_confirm, resolve_engine_binary, resolve_fork_binary,
-    resolve_xray_binary, strip_ansi_codes, xray_binary_file_name, EngineController, EngineError,
-    LAN_CONFIRM_TITLE,
+    resolve_xray_binary, strip_ansi_codes, xray_binary_file_name, AutoRestartConfig,
+    EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
-    format_speed_result, ping_all, redact_secrets, resolve_hostname, sparkline_latencies,
-    speed_group, test_all, test_group, truncate, HealthProber, HealthStore, LogLevel, LogStore,
-    LogTagIndex, RealHealthProber, SpeedtestConfig, SpeedtestMode, SpeedtestOutcome, TestOutcome,
-    TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL, RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
+    format_speed_result, ping_all, redact_secrets, resolve_hostname, speed_group, test_all,
+    test_group, truncate, url_test_sparkline, HealthKind, HealthProber, HealthStore, LogLevel,
+    LogStore, LogTagIndex, ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode,
+    SpeedtestOutcome, TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL,
+    RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
 };
 use import::{
     classify_open_with, commit_batch, effective_hint_for_text, format_import_failures,
@@ -298,6 +300,23 @@ fn group_delete_confirm_text(name: &str, count: usize) -> String {
              out first. This cannot be undone."
         )
     }
+}
+
+fn group_delete_confirm_description(name: &str, count: usize, subscriptions: usize) -> String {
+    if subscriptions == 0 {
+        return group_delete_confirm_text(name, count);
+    }
+    if count == 0 {
+        return format!(
+            "Delete group \"{name}\" ({subscriptions} subscription(s))? Groups feeding \
+             subscriptions refuse — remove or regroup them first. This cannot be undone."
+        );
+    }
+    format!(
+        "Delete group \"{name}\" ({count} row(s) and {subscriptions} subscription(s))? Groups \
+         with rows or subscriptions refuse — move the rows out and remove or regroup the \
+         subscriptions first. This cannot be undone."
+    )
 }
 
 fn close_confirm_description(running_names: &[String]) -> Option<String> {
@@ -6242,6 +6261,7 @@ impl ConfigForm {
             "group" => Some(AnyInputState::from(self.group.clone())),
             "bind_ip" => Some(AnyInputState::from(self.bind.clone())),
             "port" => Some(AnyInputState::from(self.port.clone())),
+            "test_url" => Some(AnyInputState::from(self.test_url.clone())),
             _ => None,
         };
         if let Some(state) = target {
@@ -8321,6 +8341,36 @@ fn already_stopped_message(name: &str) -> String {
     format!("\"{name}\" is already stopped")
 }
 
+fn resolve_domain_row_message(name: &str, ip: &str, host: &str, running: bool) -> String {
+    let base = format!("\"{name}\": server now {ip} (was {host})");
+    if running {
+        format!("{base} — restart it to apply (still serving the previous config)")
+    } else {
+        base
+    }
+}
+
+/// Severity + copy for a group resolve: a fully failed batch is an error, a
+/// partial batch is a warning, and success is honest about a pending restart.
+fn resolve_domain_group_notification(
+    saved: &[(String, String, String)],
+    failed: &[String],
+    any_running: bool,
+) -> (NotificationType, String) {
+    let mut message = resolve_domain_result_message(saved, failed);
+    if any_running && !saved.is_empty() {
+        message.push_str(" · restart the affected endpoint(s) to apply");
+    }
+    let severity = if saved.is_empty() && !failed.is_empty() {
+        NotificationType::Error
+    } else if failed.is_empty() {
+        NotificationType::Success
+    } else {
+        NotificationType::Warning
+    };
+    (severity, message)
+}
+
 fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
     if !is_running {
         return "○ Stopped".to_string();
@@ -8412,6 +8462,22 @@ fn dirty_endpoint_message(name: &str) -> String {
 fn skipped_dirty_message(names: &[String]) -> String {
     format!(
         "Skipped with unapplied edits (Enter applies, Esc reverts): {}",
+        names.join(", ")
+    )
+}
+
+fn bulk_start_unreadable_message(ids: &[String]) -> String {
+    format!(
+        "{} configuration(s) not started (could not read): {}",
+        ids.len(),
+        ids.join(", ")
+    )
+}
+
+fn bulk_start_enable_flag_failed_message(names: &[String]) -> String {
+    format!(
+        "{} started but the enabled flag could not be saved: {}",
+        names.len(),
         names.join(", ")
     )
 }
@@ -8581,6 +8647,10 @@ fn no_matches_text() -> String {
 fn empty_library_text() -> String {
     "No proxy configurations yet — Add or Import to start".to_string()
 }
+
+/// Store meta key for "Automatically restart crashed cores"; a missing or corrupt
+/// value reads as enabled, matching the engine's default.
+const META_AUTO_RESTART: &str = "auto_restart_enabled";
 
 fn crash_notification_text(detail: &str) -> String {
     format!("Engine crashed ({detail}) — View logs")
@@ -8984,6 +9054,16 @@ fn export_overwrite_confirm_description(path: &str) -> String {
     format!("\"{path}\" already exists. Overwrite it with the new export?")
 }
 
+/// The level radios filter by exact match, so the tooltip must not promise a
+/// cumulative "and above" set.
+fn log_level_tooltip(label: &str) -> String {
+    if label == "All" {
+        "Show logs of every level".to_string()
+    } else {
+        format!("Show only {label} records")
+    }
+}
+
 #[cfg(test)]
 fn log_level_matches(level: LogLevel, filter: Option<LogLevel>) -> bool {
     match filter {
@@ -9146,15 +9226,41 @@ fn already_subscribed_message(label: &str) -> String {
     format!("Already subscribed as \"{label}\" — no duplicate added")
 }
 
+fn subscription_interval_failure_message(action: &str, label: &str, error: &str) -> String {
+    format!("Subscription \"{label}\" {action} — could not set refresh interval: {error}")
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchedSubscription {
     pub body: String,
     pub userinfo: Option<store::SubscriptionQuota>,
 }
 
+type SubscriptionHostResolver = fn(&str) -> Result<Vec<std::net::IpAddr>, String>;
+
+fn resolve_subscription_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    use std::net::ToSocketAddrs as _;
+    (host, 0u16)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .map_err(|_| "subscription host does not resolve".to_string())
+}
+
+async fn resolve_subscription_addresses(
+    host: String,
+    resolver: SubscriptionHostResolver,
+) -> Vec<std::net::IpAddr> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(resolver(&host).unwrap_or_default());
+    });
+    rx.await.unwrap_or_default()
+}
+
 async fn fetch_subscription_body(
     client: Arc<dyn HttpClient>,
     url: &str,
+    resolver: SubscriptionHostResolver,
 ) -> Result<FetchedSubscription, String> {
     use futures::AsyncReadExt as _;
     const MAX_BYTES: usize = store::SUBSCRIPTION_MAX_BYTES;
@@ -9162,10 +9268,18 @@ async fn fetch_subscription_body(
     const MAX_REDIRECTS: usize = store::SUBSCRIPTION_MAX_REDIRECTS;
     let mut current = url.trim().to_string();
     for _ in 0..=MAX_REDIRECTS {
-        match store::subscription_fetch_policy(&current) {
-            store::SubscriptionFetchPolicy::Block { reason } => return Err(reason.to_string()),
-            store::SubscriptionFetchPolicy::Warn { .. } => {}
-            store::SubscriptionFetchPolicy::Allow => {}
+        if let store::SubscriptionFetchPolicy::Block { reason } =
+            store::subscription_fetch_policy(&current)
+        {
+            return Err(reason.to_string());
+        }
+        if let Some(host) = store::subscription_url_host(&current) {
+            let resolved = resolve_subscription_addresses(host, resolver).await;
+            if let store::SubscriptionFetchPolicy::Block { reason } =
+                store::subscription_fetch_policy_resolved(&current, &resolved)
+            {
+                return Err(reason.to_string());
+            }
         }
         let request = http_client::http::Request::builder()
             .uri(current.as_str())
@@ -11079,7 +11193,14 @@ struct AppView {
     log_tail: bool,
     logs_open: bool,
 
-    logs_seen: usize,
+    logs_seen: u64,
+
+    log_inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
+
+    /// Captured just before a control-driven sheet swap. The live input text
+    /// wins over the committed filter fields so typed-but-unapplied text
+    /// survives the swap, then is consumed once on the next open.
+    log_reopen_draft: Option<(String, String, String)>,
 
     log_list: Option<Entity<ListState<LogLinesDelegate>>>,
 
@@ -11119,6 +11240,10 @@ struct AppView {
     preset_form: Option<PresetForm>,
 
     import_parse_in_flight: bool,
+
+    import_parse_epoch: u64,
+
+    import_cancel_epoch: Option<u64>,
 
     close_confirmed: bool,
 
@@ -11255,6 +11380,9 @@ impl AppView {
             logs_open: false,
             logs_seen: 0,
 
+            log_inputs: None,
+            log_reopen_draft: None,
+
             log_list: None,
             expanded_subs: HashSet::new(),
             traffic_last_seen: TrafficSeenMap::default(),
@@ -11280,6 +11408,8 @@ impl AppView {
             subs_form: None,
             preset_form: None,
             import_parse_in_flight: false,
+            import_parse_epoch: 0,
+            import_cancel_epoch: None,
             close_confirmed: false,
             tray: None,
             last_snapshot,
@@ -11324,6 +11454,7 @@ impl AppView {
             started_at: std::time::Instant::now(),
         };
         let mut view = view;
+        view.apply_engine_auto_restart();
         let rows = match view.store.list() {
             Ok(rows) => rows,
 
@@ -11379,9 +11510,10 @@ impl AppView {
 
         if self.logs_open
             && self.log_tail
-            && self.logs.all().len() != self.logs_seen
+            && self.logs.push_seq() != self.logs_seen
             && window.has_active_sheet(cx)
         {
+            self.log_reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
@@ -12129,6 +12261,32 @@ impl AppView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn commit_edit_with_test_url(
+        &mut self,
+        id: &str,
+        patch: ConfigPatch,
+        raw_url: &str,
+        form: &ConfigForm,
+        form_error: &Rc<RefCell<Option<(String, String)>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.commit_edit_with_focus(id, patch, form, form_error, window, cx) {
+            return false;
+        }
+        if self.commit_row_test_url(id, raw_url, window, cx) {
+            return true;
+        }
+        *form_error.borrow_mut() = Some((
+            "test_url".to_string(),
+            "Test URL rejected — fix it or clear the field".to_string(),
+        ));
+        form.focus_field("test_url", window, cx);
+        cx.notify();
+        false
+    }
+
     fn open_clear_traffic_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let description =
@@ -12403,44 +12561,45 @@ impl AppView {
         self.engine.poll()
     }
 
-    fn poll_engine_detail(&mut self) -> Option<String> {
-        let crashes = self.engine.poll_shards();
-        if crashes.is_empty() {
-            return None;
+    /// Surfaces at most one engine-crash notification and drives the auto-restart
+    /// policy. The pending cause lives in the controller, so this still sees a
+    /// crash the 5 s tick already drained from the backend.
+    fn service_engine_crash(&mut self) -> Option<Notification> {
+        let now = std::time::Instant::now();
+        let detail = self.engine.pending_crash();
+        self.engine.settle_restart_budget(now);
+        if self.engine.auto_restart_due(now) {
+            self.engine.note_auto_restart_attempt(now);
+            let notification = match self.engine.restart_crashed() {
+                Ok(()) => Notification::success(format!(
+                    "Engine recovered ({})",
+                    detail.unwrap_or_else(|| "crashed cores restarted".to_string())
+                )),
+                Err(error) => Notification::error(format!(
+                    "Engine auto-restart failed: {}",
+                    redact_secrets(&error.to_string())
+                )),
+            };
+            self.engine.clear_pending_crash();
+            return Some(notification);
         }
-
-        if self.engine.running_count() == 0 {
-            return None;
-        }
-        Some(EngineController::crash_detail(&crashes))
+        let detail = detail?;
+        self.engine.clear_pending_crash();
+        Some(Notification::error(crash_notification_text(&detail)))
     }
 
-    fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut App) -> Option<String> {
-        let detail = self.poll_engine_detail()?;
-        if self.engine.auto_restart_due(std::time::Instant::now()) {
-            self.engine
-                .note_auto_restart_attempt(std::time::Instant::now());
-            match self.engine.restart_crashed() {
-                Ok(()) => {
-                    window.push_notification(
-                        Notification::success(format!("Engine recovered ({detail})")),
-                        cx,
-                    );
-                    return Some(detail);
-                }
-                Err(error) => {
-                    window.push_notification(
-                        Notification::error(format!(
-                            "Engine auto-restart failed: {}",
-                            redact_secrets(&error.to_string())
-                        )),
-                        cx,
-                    );
-                }
-            }
+    fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(notification) = self.service_engine_crash() {
+            window.push_notification(notification, cx);
         }
-        window.push_notification(Notification::error(crash_notification_text(&detail)), cx);
-        Some(detail)
+    }
+
+    fn push_engine_notification(&self, notification: Notification, cx: &mut Context<Self>) {
+        if let Some(handle) = cx.active_window() {
+            let _ = handle.update(cx, move |_, window, cx| {
+                window.push_notification(notification, cx);
+            });
+        }
     }
 
     #[cfg(test)]
@@ -13160,6 +13319,56 @@ impl AppView {
         }
     }
 
+    /// "Automatically restart crashed cores" setting; a missing or corrupt value
+    /// reads as enabled, matching `AutoRestartConfig::default()`.
+    fn auto_restart_enabled(&self) -> bool {
+        self.store
+            .get_meta(META_AUTO_RESTART)
+            .map(|value| value.as_deref() != Some("0"))
+            .unwrap_or(true)
+    }
+
+    /// Pushes the persisted auto-restart choice into the live engine. Called once
+    /// at startup so a saved opt-out takes effect before the first crash tick.
+    fn apply_engine_auto_restart(&mut self) {
+        self.engine.set_auto_restart(AutoRestartConfig {
+            enabled: self.auto_restart_enabled(),
+            ..AutoRestartConfig::default()
+        });
+    }
+
+    fn commit_auto_restart(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self
+            .store
+            .set_meta(META_AUTO_RESTART, if enabled { "1" } else { "0" })
+        {
+            Ok(()) => {
+                self.apply_engine_auto_restart();
+                let message = if enabled {
+                    "Auto-restart on — crashed cores restart with backoff (up to 3 tries)"
+                } else {
+                    "Auto-restart off — crashed cores stay down until you restart them"
+                };
+                window.push_notification(Notification::success(message), cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Auto-restart setting failed: {error}")),
+                    cx,
+                );
+                cx.notify();
+                false
+            }
+        }
+    }
+
     fn commit_skip_delete_confirm(
         &mut self,
         skip: bool,
@@ -13216,6 +13425,7 @@ impl AppView {
         let view = cx.entity();
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
         let restore_state = Rc::new(RefCell::new(self.store.restore_running()));
+        let auto_restart_state = Rc::new(RefCell::new(self.engine.auto_restart().enabled));
 
         let skip_delete_state = Rc::new(RefCell::new(self.store.skip_delete_confirm()));
 
@@ -13252,6 +13462,8 @@ impl AppView {
             let restore_view = view.clone();
             let autostart_cell = autostart_state.clone();
             let restore_cell = restore_state.clone();
+            let auto_restart_view = view.clone();
+            let auto_restart_cell = auto_restart_state.clone();
 
 
 
@@ -13266,6 +13478,7 @@ impl AppView {
             let preset_summary_render = preset_summary.clone();
             let autostart_on = *autostart_state.borrow();
             let restore_on = *restore_state.borrow();
+            let auto_restart_on = *auto_restart_state.borrow();
             let skip_delete_on = *skip_delete_state.borrow();
             let save_reader = test_url_reader.clone();
             let save_view = test_url_view.clone();
@@ -13398,6 +13611,45 @@ impl AppView {
                                         view.commit_test_url(&url, window, cx);
                                     });
                                 }),
+                        )
+
+
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-engine")
+                                .test_support()
+                                .text_sm()
+                                .child("Engine"),
+                        )
+                        .child(
+                            div()
+                                .id("settings-auto-restart")
+                                .test_support()
+                                .child(
+                                    Switch::new("settings-auto-restart-switch")
+                                        .checked(auto_restart_on)
+                                        .label("Automatically restart crashed cores")
+                                        .on_change(move |next: &bool, window, cx| {
+                                            let next = *next;
+                                            let cell = auto_restart_cell.clone();
+                                            auto_restart_view.update(cx, |view, cx| {
+                                                if view.commit_auto_restart(next, window, cx) {
+                                                    *cell.borrow_mut() = next;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("settings-auto-restart-note")
+                                .test_support()
+                                .child(
+                                    "On restarts a crashed core with backoff (up to 3 tries) and \
+                                     tells you when it recovers. Default on.",
+                                ),
                         )
 
 
@@ -14526,7 +14778,7 @@ impl AppView {
             snapshots.push(HealthSnapshot {
                 config_id: outcome.config_id.clone(),
                 at: now_unix(),
-                kind: "url-test".to_string(),
+                kind: HealthKind::SpeedTest.as_str().to_string(),
                 latency_ms: outcome.latency_ms,
                 error: outcome.error.clone(),
             });
@@ -14738,10 +14990,14 @@ impl AppView {
                         };
                         match view.store.update(&id, patch) {
                             Ok(_) => {
+                                let running = view.engine.is_running(&id);
                                 view.reload(window, cx);
                                 window.push_notification(
-                                    Notification::success(format!(
-                                        "\"{name}\": server now {ip} (was {host})"
+                                    Notification::success(resolve_domain_row_message(
+                                        &name,
+                                        &ip.to_string(),
+                                        &host,
+                                        running,
                                     )),
                                     cx,
                                 );
@@ -14874,7 +15130,11 @@ impl AppView {
                         let (rewritten, failed) = done;
                         let mut saved: Vec<(String, String, String)> = Vec::new();
                         let mut save_failed = failed;
+                        let mut any_running = false;
                         for (id, name, host, new_params) in rewritten {
+                            if view.engine.is_running(&id) {
+                                any_running = true;
+                            }
                             let patch = ConfigPatch {
                                 params: Some(new_params),
                                 ..Default::default()
@@ -14889,8 +15149,12 @@ impl AppView {
                             }
                         }
                         view.reload(window, cx);
-                        let message = resolve_domain_result_message(&saved, &save_failed);
-                        window.push_notification(Notification::success(message), cx);
+                        let (severity, message) =
+                            resolve_domain_group_notification(&saved, &save_failed, any_running);
+                        window.push_notification(
+                            Notification::new().message(message).with_type(severity),
+                            cx,
+                        );
                     });
                 });
             });
@@ -15036,48 +15300,16 @@ impl AppView {
             return;
         };
 
-        let stop_running = |view: &mut Self, rows: &[ProxyConfig]| {
-            for row in rows {
-                let _ = view.engine.stop_one(&row.id);
-            }
-        };
-        let removed: Vec<String> = match kind {
-            GroupPruneKind::Duplicates => {
-                let targets = self
-                    .store
-                    .duplicate_rows_in_group(&group)
-                    .unwrap_or_default();
-                stop_running(self, &targets);
-                self.store
-                    .remove_duplicates_in_group(&group)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|row| row.name)
-                    .collect()
-            }
-            GroupPruneKind::Unavailable => {
-                let targets = self
-                    .store
-                    .unavailable_rows_in_group(&group)
-                    .unwrap_or_default();
-                stop_running(self, &targets);
-                self.store
-                    .remove_unavailable_in_group(&group)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|row| row.name)
-                    .collect()
-            }
-            GroupPruneKind::Invalid => {
-                let targets = self.store.invalid_rows_in_group(&group).unwrap_or_default();
-                stop_running(self, &targets);
-                self.store
-                    .remove_invalid_in_group(&group)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|row| row.name)
-                    .collect()
-            }
+        let targets: Vec<ProxyConfig> = match kind {
+            GroupPruneKind::Duplicates => self
+                .store
+                .duplicate_rows_in_group(&group)
+                .unwrap_or_default(),
+            GroupPruneKind::Unavailable => self
+                .store
+                .unavailable_rows_in_group(&group)
+                .unwrap_or_default(),
+            GroupPruneKind::Invalid => self.store.invalid_rows_in_group(&group).unwrap_or_default(),
             GroupPruneKind::ClearTests => match self.store.clear_tests_in_group(&group) {
                 Ok(cleared) => {
                     self.health_store_prune_group(&group);
@@ -15096,12 +15328,48 @@ impl AppView {
                 }
             },
         };
+        // Stop every candidate first: a row that refuses to stop must stay in
+        // the library so the engine never orphans a live listener (BUG-07).
+        let mut skip: HashSet<String> = HashSet::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for row in &targets {
+            let (was_active, stop_error) = self.engine.stop_one_result(&row.id);
+            if was_active && stop_error.is_some() {
+                skip.insert(row.id.clone());
+                skipped.push(row.name.clone());
+            }
+        }
+        let pruned = match kind {
+            GroupPruneKind::Duplicates => self.store.remove_duplicates_in_group(&group, &skip),
+            GroupPruneKind::Unavailable => self.store.remove_unavailable_in_group(&group, &skip),
+            GroupPruneKind::Invalid => self.store.remove_invalid_in_group(&group, &skip),
+            GroupPruneKind::ClearTests => Ok(Vec::new()),
+        };
+        let removed: Vec<String> = match pruned {
+            Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
+            Err(error) => {
+                window.push_notification(Notification::error(error.to_string()), cx);
+                return;
+            }
+        };
         self.reload(window, cx);
-        if removed.is_empty() {
+        if removed.is_empty() && skipped.is_empty() {
             window.push_notification(
                 Notification::info(format!(
                     "{} in group \"{group}\": nothing removed — rows changed",
                     kind.label()
+                )),
+                cx,
+            );
+            return;
+        }
+        if removed.is_empty() {
+            window.push_notification(
+                Notification::error(format!(
+                    "{} in group \"{group}\": nothing removed — {} row(s) could not be stopped ({})",
+                    kind.label(),
+                    skipped.len(),
+                    skipped.join(", ")
                 )),
                 cx,
             );
@@ -15117,7 +15385,18 @@ impl AppView {
         if removed.len() > shown.len() {
             text.push_str(&format!(" (+{} more)", removed.len() - shown.len()));
         }
-        window.push_notification(Notification::success(text), cx);
+        if skipped.is_empty() {
+            window.push_notification(Notification::success(text), cx);
+        } else {
+            window.push_notification(
+                Notification::warning(format!(
+                    "{text} — {} could not be stopped ({})",
+                    skipped.len(),
+                    skipped.join(", ")
+                )),
+                cx,
+            );
+        }
     }
 
     fn health_store_prune_group(&mut self, group: &str) {
@@ -15429,6 +15708,7 @@ impl AppView {
     ) {
         self.log_level = level;
         if self.logs_open && window.has_active_sheet(cx) {
+            self.log_reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
@@ -15448,6 +15728,7 @@ impl AppView {
             cx,
         );
         if self.logs_open && window.has_active_sheet(cx) {
+            self.log_reopen_draft = self.log_input_draft(cx);
             window.close_sheet(cx);
             self.logs_open = false;
             self.open_logs_dialog(window, cx);
@@ -15462,6 +15743,10 @@ impl AppView {
         self.log_exclude.clear();
         self.log_regex.clear();
         self.log_level = None;
+        // Drop any in-progress draft so the reopen seeds empty, not the text
+        // the user was about to discard.
+        self.log_reopen_draft = None;
+        self.log_inputs = None;
         if self.logs_open && window.has_active_sheet(cx) {
             window.close_sheet(cx);
             self.logs_open = false;
@@ -15490,26 +15775,49 @@ impl AppView {
         cx.notify();
     }
 
+    /// Live text of the open sheet's three inputs (typed but not yet applied).
+    fn log_input_draft(&self, cx: &App) -> Option<(String, String, String)> {
+        self.log_inputs.as_ref().map(|(filter, exclude, pattern)| {
+            (
+                filter.read(cx).value().to_string(),
+                exclude.read(cx).value().to_string(),
+                pattern.read(cx).value().to_string(),
+            )
+        })
+    }
+
     fn open_logs_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.log_filter.clone();
+        // A control-driven swap hands over the live draft; otherwise seed from
+        // the committed filter fields.
+        let (current, current_exclude, current_pattern) =
+            self.log_reopen_draft.take().unwrap_or_else(|| {
+                (
+                    self.log_filter.clone(),
+                    self.log_exclude.clone(),
+                    self.log_regex.clone(),
+                )
+            });
         let filter_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Filter logs")
                 .default_value(current)
         });
 
-        let current_exclude = self.log_exclude.clone();
         let exclude_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Exclude keyword")
                 .default_value(current_exclude)
         });
-        let current_pattern = self.log_regex.clone();
         let pattern_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Regex (empty = off)")
                 .default_value(current_pattern)
         });
+        self.log_inputs = Some((
+            filter_state.clone(),
+            exclude_state.clone(),
+            pattern_state.clone(),
+        ));
         let view = cx.entity();
         let reader = filter_state.clone();
         let exclude_reader = exclude_state.clone();
@@ -15544,7 +15852,7 @@ impl AppView {
         });
 
         self.logs_open = true;
-        self.logs_seen = self.logs.all().len();
+        self.logs_seen = self.logs.push_seq();
 
         let chrome_view = view.clone();
         let chrome_level = self.log_level;
@@ -15593,7 +15901,7 @@ impl AppView {
                 level_group = level_group.child(
                     Radio::new(label)
                         .label(label)
-                        .tooltip(format!("Show {label} and above")),
+                        .tooltip(log_level_tooltip(label)),
                 );
             }
             let level_row = div().id("log-level-row").test_support().child(level_group);
@@ -16313,17 +16621,19 @@ impl AppView {
 
         let snapshot = config.clone();
         let element_view = view.clone();
-        let url_id = id.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let patch = reader.as_patch_vs(cx, &snapshot);
             let url = reader.test_url.read(cx).value().to_string();
             view.update(cx, |view, cx| {
-                let ok =
-                    view.commit_edit_with_focus(&id, patch, &reader, &error_for_commit, window, cx);
-                if ok {
-                    view.commit_row_test_url(&url_id, &url, window, cx);
-                }
-                ok
+                view.commit_edit_with_test_url(
+                    &id,
+                    patch,
+                    &url,
+                    &reader,
+                    &error_for_commit,
+                    window,
+                    cx,
+                )
             })
         });
         let commit_key = commit.clone();
@@ -16499,9 +16809,41 @@ impl AppView {
             })
         });
         let commit_key = commit.clone();
+        let cancel_view = view.clone();
+        let close_view = view.clone();
+        // Snapshot before the builder runs: reading `AppView` inside the
+        // dialog-builder closure re-enters the entity mid-update and panics.
+        let in_flight = self.import_parse_in_flight;
         window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
+            let cancel_view = cancel_view.clone();
+            let close_view = close_view.clone();
+            let footer = DialogFooter::new()
+                .child(
+                    Button::new("import-dialog-cancel")
+                        .small()
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            cancel_view.update(cx, |view, cx| view.cancel_import_parse(cx));
+                            window.close_all_dialogs(cx);
+                        }),
+                )
+                .child(
+                    Button::new("import-dialog-ok")
+                        .small()
+                        .label(if in_flight {
+                            "Importing…"
+                        } else {
+                            footer_commit_label("import")
+                        })
+                        .disabled(in_flight)
+                        .on_click(move |_, window, cx| {
+                            if commit_click(window, cx) {
+                                window.close_all_dialogs(cx);
+                            }
+                        }),
+                );
             dialog
                 .title("Import proxy configurations")
                 .child(form.clone().element(element_view.clone(), cx))
@@ -16510,12 +16852,10 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
-                .footer(dialog_footer(
-                    "import-dialog-ok",
-                    "import-dialog-cancel",
-                    footer_commit_label("import"),
-                    commit_click,
-                ))
+                .on_close(move |_, _, cx| {
+                    close_view.update(cx, |view, cx| view.cancel_import_parse(cx));
+                })
+                .footer(footer)
         });
     }
 
@@ -17074,6 +17414,10 @@ impl AppView {
             return false;
         }
         self.import_parse_in_flight = true;
+        self.import_parse_epoch = self.import_parse_epoch.wrapping_add(1);
+        let epoch = self.import_parse_epoch;
+        self.import_cancel_epoch = None;
+        cx.notify();
         let weak = cx.entity().downgrade();
 
         let handle = window.window_handle();
@@ -17089,7 +17433,7 @@ impl AppView {
                     .update(cx, |_, window, cx| {
                         if let Some((batch, group)) = pending.take() {
                             let _ = weak.update(cx, |view, cx| {
-                                view.finish_import_parse(batch, group, window, cx);
+                                view.finish_import_parse(epoch, batch, group, window, cx);
                             });
                         }
                     })
@@ -17097,7 +17441,7 @@ impl AppView {
                 if !delivered {
                     if let Some((batch, group)) = pending.take() {
                         let _ = weak.update(cx, |view, cx| {
-                            view.finish_import_parse_no_window(batch, group, cx);
+                            view.finish_import_parse_no_window(epoch, batch, group, cx);
                         });
                     }
                 }
@@ -17107,14 +17451,34 @@ impl AppView {
         false
     }
 
+    /// Marks the running (or just-finished) import parse as cancelled so its
+    /// batch is dropped instead of landing after the dialog was dismissed.
+    fn cancel_import_parse(&mut self, cx: &mut Context<Self>) {
+        self.import_cancel_epoch = Some(self.import_parse_epoch);
+        cx.notify();
+    }
+
+    fn import_parse_cancelled(&mut self, epoch: u64) -> bool {
+        if self.import_cancel_epoch == Some(epoch) {
+            self.import_cancel_epoch = None;
+            true
+        } else {
+            false
+        }
+    }
+
     fn finish_import_parse(
         &mut self,
+        epoch: u64,
         batch: crate::import::BatchResult,
         group: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.import_parse_in_flight = false;
+        if self.import_parse_cancelled(epoch) {
+            return;
+        }
         if self.finish_import_batch(batch, &group, window, cx) {
             window.close_all_dialogs(cx);
         }
@@ -17122,11 +17486,15 @@ impl AppView {
 
     fn finish_import_parse_no_window(
         &mut self,
+        epoch: u64,
         batch: crate::import::BatchResult,
         group: String,
         cx: &mut Context<Self>,
     ) {
         self.import_parse_in_flight = false;
+        if self.import_parse_cancelled(epoch) {
+            return;
+        }
         if commit_batch(&mut self.store, batch, &group).is_ok() {
             self.reload_quiet(cx);
         }
@@ -17258,20 +17626,28 @@ impl AppView {
             .add_subscription(&label, &url, &group, auto_refresh)
         {
             Ok(sub) => {
-                if let Err(error) = self.store.set_subscription_interval(&sub.id, interval_secs) {
-                    window.push_notification(
-                        Notification::error(format!("Cannot set refresh interval: {error}")),
-                        cx,
-                    );
-                }
+                let interval_error = self
+                    .store
+                    .set_subscription_interval(&sub.id, interval_secs)
+                    .err();
                 self.reload(window, cx);
-                window.push_notification(
-                    Notification::success(format!(
-                        "Subscription \"{}\" added — refreshing",
-                        sub.label
-                    )),
-                    cx,
-                );
+                match interval_error {
+                    Some(error) => window.push_notification(
+                        Notification::warning(subscription_interval_failure_message(
+                            "added",
+                            &sub.label,
+                            &error.to_string(),
+                        )),
+                        cx,
+                    ),
+                    None => window.push_notification(
+                        Notification::success(format!(
+                            "Subscription \"{}\" added — refreshing",
+                            sub.label
+                        )),
+                        cx,
+                    ),
+                }
                 self.start_subscription_refresh(sub, cx);
                 true
             }
@@ -17295,17 +17671,25 @@ impl AppView {
     ) -> bool {
         match self.store.update_subscription(id, &label, &url, &group) {
             Ok(updated) => {
-                if let Err(error) = self.store.set_subscription_interval(id, interval_secs) {
-                    window.push_notification(
-                        Notification::error(format!("Cannot set refresh interval: {error}")),
-                        cx,
-                    );
-                }
+                let interval_error = self
+                    .store
+                    .set_subscription_interval(id, interval_secs)
+                    .err();
                 self.reload(window, cx);
-                window.push_notification(
-                    Notification::success(format!("Updated \"{}\"", updated.label)),
-                    cx,
-                );
+                match interval_error {
+                    Some(error) => window.push_notification(
+                        Notification::warning(subscription_interval_failure_message(
+                            "updated",
+                            &updated.label,
+                            &error.to_string(),
+                        )),
+                        cx,
+                    ),
+                    None => window.push_notification(
+                        Notification::success(format!("Updated \"{}\"", updated.label)),
+                        cx,
+                    ),
+                }
                 self.reopen_subscriptions_if_open(window, cx);
                 true
             }
@@ -17522,7 +17906,7 @@ impl AppView {
         let label = sub.label.clone();
         let url = sub.url.clone();
         cx.spawn(async move |_entity, cx| {
-            let fetched = fetch_subscription_body(client, &url).await;
+            let fetched = fetch_subscription_body(client, &url, resolve_subscription_host).await;
             let now = now_unix();
             cx.update(|cx| {
                 if let Some(handle) = cx.active_window() {
@@ -18616,7 +19000,7 @@ impl AppView {
         let preset_id = preset.id.clone();
         let preset_name = preset.name.clone();
         cx.spawn(async move |_entity, cx| {
-            let fetched = fetch_subscription_body(client, &url).await;
+            let fetched = fetch_subscription_body(client, &url, resolve_subscription_host).await;
             cx.update(|cx| {
                 if let Some(handle) = cx.active_window() {
                     let _ = handle.update(cx, |_, window, cx| {
@@ -19566,6 +19950,9 @@ impl AppView {
 
         let cause = self.poll_engine();
         self.reload_quiet_no_poll(cx);
+        if let Some(notification) = self.service_engine_crash() {
+            self.push_engine_notification(notification, cx);
+        }
         cause
     }
 
@@ -19578,13 +19965,12 @@ impl AppView {
         if !self.ticks_enabled {
             return None;
         }
-        let detail = self.poll_engine_detail();
+        let detail = self.poll_engine();
         self.reload_quiet_no_poll(cx);
-        if let Some(detail) = detail {
-            window.push_notification(Notification::error(crash_notification_text(&detail)), cx);
-            return Some(detail);
+        if let Some(notification) = self.service_engine_crash() {
+            window.push_notification(notification, cx);
         }
-        None
+        detail
     }
 
     fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
@@ -19649,6 +20035,22 @@ impl AppView {
         }
     }
 
+    /// Probe endpoints whose own bytes must stay out of row usage: the default
+    /// test URL, the global custom test URL, and every running row's override.
+    fn traffic_probe_exclusions(&self) -> ProbeExclusions {
+        let mut exclusions = ProbeExclusions::new();
+        exclusions.push_url(DEFAULT_TEST_URL);
+        if let Some(global) = self.store.test_url() {
+            exclusions.push_url(&global);
+        }
+        for id in self.engine.running_ids() {
+            if let Some(url) = self.store.row_test_url(&id) {
+                exclusions.push_url(&url);
+            }
+        }
+        exclusions
+    }
+
     #[cfg(test)]
     fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
@@ -19664,9 +20066,9 @@ impl AppView {
             crate::health::CLASH_PER_CORE_TIMEOUT,
             crate::health::CLASH_TOTAL_DEADLINE,
         );
-        let probe = crate::health::probe_host();
-        let probe_ips = crate::health::resolve_probe_ips(&probe);
-        self.apply_traffic_results(results, &probe, &probe_ips, cx)
+        let mut exclusions = self.traffic_probe_exclusions();
+        exclusions.resolve_ips();
+        self.apply_traffic_results(results, &exclusions, cx)
     }
 
     fn spawn_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
@@ -19685,9 +20087,10 @@ impl AppView {
         }
         self.ensure_traffic_mirror(cx);
         self.traffic_tick_in_flight = true;
+        let exclusions = self.traffic_probe_exclusions();
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_entity, cx| {
-            let (results, probe, probe_ips) = cx
+            let (results, exclusions) = cx
                 .background_executor()
                 .spawn(async move {
                     let results = crate::health::poll_clash_targets(
@@ -19695,15 +20098,15 @@ impl AppView {
                         crate::health::CLASH_PER_CORE_TIMEOUT,
                         crate::health::CLASH_TOTAL_DEADLINE,
                     );
-                    let probe = crate::health::probe_host();
-                    let probe_ips = crate::health::resolve_probe_ips(&probe);
-                    (results, probe, probe_ips)
+                    let mut exclusions = exclusions;
+                    exclusions.resolve_ips();
+                    (results, exclusions)
                 })
                 .await;
             cx.update(|cx| {
                 weak.update(cx, |view, cx| {
                     view.traffic_tick_in_flight = false;
-                    view.apply_traffic_results(results, &probe, &probe_ips, cx);
+                    view.apply_traffic_results(results, &exclusions, cx);
                 })
                 .ok();
             });
@@ -19718,8 +20121,7 @@ impl AppView {
             crate::engine::ClashTarget,
             Result<Vec<crate::health::ClashConn>, String>,
         )>,
-        probe: &str,
-        probe_ips: &[std::net::IpAddr],
+        exclusions: &ProbeExclusions,
         cx: &mut Context<Self>,
     ) -> usize {
         let now = now_unix();
@@ -19737,13 +20139,13 @@ impl AppView {
             };
             ok_cores.insert(target.core.clone());
             for entry in entries {
-                if crate::health::is_probe_destination_with_ips(&entry.dest, probe, probe_ips) {
+                if exclusions.excludes(&entry.dest) {
                     continue;
                 }
                 let key = format!("{}/{}", target.core, entry.id);
                 let (rx, tx) = (entry.rx_bytes, entry.tx_bytes);
                 let (last_rx, last_tx) = self.traffic_last_seen.get(&key).unwrap_or((0, 0));
-                let (delta_rx, delta_tx) = if (rx, tx) >= (last_rx, last_tx) {
+                let (delta_rx, delta_tx) = if rx >= last_rx && tx >= last_tx {
                     (rx - last_rx, tx - last_tx)
                 } else {
                     (rx, tx)
@@ -19860,11 +20262,7 @@ impl AppView {
             Ok(entries) => entries,
             Err(_) => return div().child("history unavailable").into_any_element(),
         };
-        let samples: Vec<(i64, Option<u64>)> = entries
-            .iter()
-            .map(|entry| (entry.at, entry.latency_ms))
-            .collect();
-        let latencies = sparkline_latencies(&samples, 120);
+        let latencies = url_test_sparkline(&entries, 120);
         if latencies.len() < 2 {
             return div()
                 .id("config-history-empty")
@@ -20268,7 +20666,7 @@ impl AppView {
             level_group = level_group.child(
                 Radio::new(label)
                     .label(label)
-                    .tooltip(format!("Show {label} and above")),
+                    .tooltip(log_level_tooltip(label)),
             );
         }
         let mut parts = Vec::new();
@@ -21922,6 +22320,8 @@ impl AppView {
         let mut started = 0usize;
         let mut failed: Vec<String> = Vec::new();
         let mut skipped_dirty: Vec<String> = Vec::new();
+        let mut unreadable: Vec<String> = Vec::new();
+        let mut flag_failed: Vec<String> = Vec::new();
         for id in ids {
             if self.libraries.read(cx).delegate().endpoint_is_dirty(id, cx) {
                 if let Ok(Some(config)) = self.store.get(id) {
@@ -21929,16 +22329,22 @@ impl AppView {
                 }
                 continue;
             }
-            let Ok(Some(config)) = self.store.get(id) else {
-                continue;
+            let config = match self.store.get(id) {
+                Ok(Some(config)) => config,
+                Ok(None) => continue,
+                Err(_) => {
+                    unreadable.push(id.clone());
+                    continue;
+                }
             };
             if let Some(warning) = lan_exposure_warning(&config.name, &config.bind_ip) {
                 window.push_notification(Notification::warning(warning), cx);
             }
             match self.engine.start_one_confirmed(&config) {
                 Ok(()) => {
-                    if self.store.set_enabled(id, true).is_ok() {
-                        started += 1;
+                    started += 1;
+                    if self.store.set_enabled(id, true).is_err() {
+                        flag_failed.push(config.name.clone());
                     }
                 }
                 Err(error) => {
@@ -21955,6 +22361,18 @@ impl AppView {
         if !skipped_dirty.is_empty() {
             window.push_notification(
                 Notification::info(skipped_dirty_message(&skipped_dirty)),
+                cx,
+            );
+        }
+        if !unreadable.is_empty() {
+            window.push_notification(
+                Notification::warning(bulk_start_unreadable_message(&unreadable)),
+                cx,
+            );
+        }
+        if !flag_failed.is_empty() {
+            window.push_notification(
+                Notification::warning(bulk_start_enable_flag_failed_message(&flag_failed)),
                 cx,
             );
         }
@@ -22039,23 +22457,58 @@ impl AppView {
             window.push_notification(Notification::info(no_selection_message()), cx);
             return;
         }
-        let mut stopped = 0usize;
+        let mut stopped: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         for id in &ids {
-            let (removed, _) = self.engine.stop_one_result(id);
-            if removed {
-                stopped += 1;
+            let name = self
+                .row_config(id)
+                .map(|row| row.name)
+                .unwrap_or_else(|| id.clone());
+            let (was_active, stop_error) = self.engine.stop_one_result(id);
+            if !was_active {
+                continue;
             }
-            let _ = self.store.set_enabled(id, false);
+            if let Some(error) = stop_error {
+                failed.push(format!("{name}: {}", redact_secrets(&error.to_string())));
+                continue;
+            }
+            match self.store.set_enabled(id, false) {
+                Ok(_) => stopped.push(name),
+                Err(error) => failed.push(format!("{name}: stopped but flag not saved ({error})")),
+            }
         }
         self.reload(window, cx);
-        if stopped == 0 {
+        if failed.is_empty() {
+            if stopped.is_empty() {
+                window.push_notification(
+                    Notification::info("Nothing to stop — no checked endpoints are running"),
+                    cx,
+                );
+            } else {
+                window.push_notification(
+                    Notification::success(format!("Stopped {} configuration(s)", stopped.len())),
+                    cx,
+                );
+            }
+            return;
+        }
+        if stopped.is_empty() {
             window.push_notification(
-                Notification::info("Nothing to stop — no checked endpoints are running"),
+                Notification::error(format!(
+                    "Stop failed for {} configuration(s): {}",
+                    failed.len(),
+                    failed.join("; ")
+                )),
                 cx,
             );
         } else {
             window.push_notification(
-                Notification::success(format!("Stopped {stopped} configuration(s)")),
+                Notification::warning(format!(
+                    "Stopped {}, {} failed: {}",
+                    stopped.len(),
+                    failed.len(),
+                    failed.join("; ")
+                )),
                 cx,
             );
         }
@@ -22111,7 +22564,11 @@ impl AppView {
         let mut removed: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         for (id, name) in targets {
-            let _ = self.engine.stop_one(id);
+            let (was_active, stop_error) = self.engine.stop_one_result(id);
+            if was_active && stop_error.is_some() {
+                failed.push(name.clone());
+                continue;
+            }
             match self.store.remove(id) {
                 Ok(true) => removed.push(name.clone()),
                 _ => failed.push(name.clone()),
@@ -22605,14 +23062,14 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> bool {
         match self.store.rename_group(old, new) {
-            Ok(0) => {
+            Ok(outcome) if outcome.rows == 0 && outcome.subscriptions == 0 => {
                 window.push_notification(
                     Notification::warning(format!("Group \"{old}\" holds no rows")),
                     cx,
                 );
                 true
             }
-            Ok(moved) => {
+            Ok(outcome) => {
                 let renamed = new.trim().to_string();
                 self.reload(window, cx);
 
@@ -22624,10 +23081,17 @@ impl AppView {
                     list_cx.notify();
                 });
                 self.sync_facet_pickers(window, cx);
+                let mut moved = Vec::new();
+                if outcome.rows > 0 {
+                    moved.push(format!("{} row(s)", outcome.rows));
+                }
+                if outcome.subscriptions > 0 {
+                    moved.push(format!("{} subscription(s)", outcome.subscriptions));
+                }
                 window.push_notification(
                     Notification::success(format!(
-                        "Renamed \"{old}\" to \"{}\" ({moved} row(s))",
-                        renamed
+                        "Renamed \"{old}\" to \"{renamed}\" ({})",
+                        moved.join(", ")
                     )),
                     cx,
                 );
@@ -22686,7 +23150,14 @@ impl AppView {
             .find(|(label, _)| label == name)
             .map(|(_, count)| *count)
             .unwrap_or(0);
-        let description = group_delete_confirm_text(name, count);
+        let subscriptions = self
+            .store
+            .list_subscriptions()
+            .unwrap_or_default()
+            .iter()
+            .filter(|sub| sub.group == name)
+            .count();
+        let description = group_delete_confirm_description(name, count, subscriptions);
         window.open_alert_dialog(cx, move |alert, _, _| {
             let view = view.clone();
             let group = group.clone();
@@ -23898,6 +24369,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::engine::AutoRestartConfig;
     use crate::store::{NewConfig, Store};
     use crate::AppView;
     use gpui_kit::component::dialog::Dialog;
@@ -28423,6 +28895,10 @@ mod tests {
             view.update(cx, |view, _| {
                 let (engine, stock, _fork) = EngineController::fake_pair();
                 view.engine = engine;
+                view.engine.set_auto_restart(AutoRestartConfig {
+                    enabled: false,
+                    ..AutoRestartConfig::default()
+                });
                 view.prober = Box::new(prober);
                 stock
             })
@@ -28472,6 +28948,30 @@ mod tests {
                 )
             ),
             "no manufactured samples for crashed rows: {untouched:?}"
+        );
+
+        // Re-enabling auto-restart lets the next production tick recover the shard:
+        // the sticky crashed state is gone and probing resumes.
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.engine.set_auto_restart(AutoRestartConfig {
+                    enabled: true,
+                    ..AutoRestartConfig::default()
+                });
+            });
+        });
+        cx.update(|_, cx| view.update(cx, |view, cx| view.tick_engine_poll(cx)));
+        assert!(
+            view.read_with(cx, |view, _| view.engine.ids_on_crashed_shards().is_empty()),
+            "auto-restart clears the crashed shard"
+        );
+        let reprobed = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_reprobe_running(cx)));
+        assert_eq!(reprobed, 2, "recovered rows are re-probed again");
+        cx.run_until_parked();
+        assert_eq!(
+            handle.calls_for(&alpha.id).len(),
+            1,
+            "alpha is probed after recovery"
         );
     }
 
@@ -28665,6 +29165,183 @@ mod tests {
         .to_string()
     }
 
+    fn bug18_probe_body(row: &str, gstatic: Option<(u64, u64)>, custom: (u64, u64)) -> String {
+        let mut connections = vec![serde_json::json!({
+            "download": 1000, "id": "data-1",
+            "metadata": {"destinationIP": "93.184.216.34", "destinationPort": "80",
+                         "host": "example.com", "network": "tcp",
+                         "sourceIP": "127.0.0.1", "sourcePort": "51241",
+                         "type": format!("mixed/in-{row}")},
+            "upload": 50
+        })];
+        if let Some((rx, tx)) = gstatic {
+            connections.push(serde_json::json!({
+                "download": rx, "id": "probe-gstatic",
+                "metadata": {"destinationIP": "93.184.216.34", "destinationPort": "80",
+                             "host": "www.gstatic.com", "network": "tcp",
+                             "sourceIP": "127.0.0.1", "sourcePort": "51242",
+                             "type": format!("mixed/in-{row}")},
+                "upload": tx
+            }));
+        }
+        connections.push(serde_json::json!({
+            "download": custom.0, "id": "probe-custom",
+            "metadata": {"destinationIP": "203.0.113.9", "destinationPort": "80",
+                         "host": "203.0.113.9", "network": "tcp",
+                         "sourceIP": "127.0.0.1", "sourcePort": "51243",
+                         "type": format!("mixed/in-{row}")},
+            "upload": custom.1
+        }));
+        serde_json::json!({"connections": connections, "downloadTotal": 9_999, "uploadTotal": 999})
+            .to_string()
+    }
+
+    #[gpui_kit::test]
+    fn bug18_custom_global_test_url_excluded_from_traffic(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10864"))
+            .expect("seed works");
+        store
+            .set_test_url("http://203.0.113.9/generate_204")
+            .expect("custom global url sets");
+
+        let (port, server) = stub_clash_server(
+            vec![bug18_probe_body(&alpha.id, Some((500, 60)), (700, 70))],
+            "s3cret",
+        );
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (mut engine, _) = EngineController::fake();
+                engine.set_clash_targets(vec![ClashTarget {
+                    core: "stock".to_string(),
+                    port,
+                    secret: "s3cret".to_string(),
+                }]);
+                view.engine = engine;
+            });
+        });
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 1, "only the data-plane flow is credited");
+        let totals = view.read_with(cx, |view, _| {
+            view.store.traffic_totals().expect("totals read")
+        });
+        assert_eq!(
+            totals.get(&alpha.id),
+            Some(&(1000, 50)),
+            "gstatic and the custom-url probe bytes are both excluded"
+        );
+        let snapshot = view.read_with(cx, |view, _| view.conn_snapshot.clone());
+        assert_eq!(snapshot.len(), 1, "no probe flow reaches the snapshot");
+        server.join().expect("stub drains");
+    }
+
+    #[gpui_kit::test]
+    fn bug18_row_override_test_url_excluded_from_traffic(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10865"))
+            .expect("seed works");
+        store
+            .set_row_test_url(&alpha.id, "http://203.0.113.9/health")
+            .expect("row override sets");
+
+        let (port, server) =
+            stub_clash_server(vec![bug18_probe_body(&alpha.id, None, (700, 70))], "s3cret");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.engine = EngineController::fake().0;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.engine.set_clash_targets(vec![ClashTarget {
+                    core: "stock".to_string(),
+                    port,
+                    secret: "s3cret".to_string(),
+                }]);
+            });
+        });
+
+        let exclusions = view.read_with(cx, |view, _| view.traffic_probe_exclusions());
+        assert!(
+            exclusions.excludes("203.0.113.9"),
+            "a running row's override is excluded: {:?}",
+            exclusions.hosts
+        );
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 1);
+        let totals = view.read_with(cx, |view, _| {
+            view.store.traffic_totals().expect("totals read")
+        });
+        assert_eq!(
+            totals.get(&alpha.id),
+            Some(&(1000, 50)),
+            "the row-override probe bytes are excluded"
+        );
+        server.join().expect("stub drains");
+    }
+
+    #[gpui_kit::test]
+    fn bug21_speed_snapshot_persists_as_its_own_kind(cx: &mut TestAppContext) {
+        use crate::health::{RowState, SpeedtestMode, SpeedtestOutcome};
+
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10866"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+
+        let outcome = SpeedtestOutcome {
+            config_id: alpha.id.clone(),
+            mode: SpeedtestMode::Download,
+            latency_ms: Some(2700),
+            mbps: Some(24.0),
+            error: None,
+        };
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.record_and_persist_speed(&[outcome]));
+        });
+
+        let snaps = view.read_with(cx, |view, _| {
+            view.store.load_health_snapshots().expect("snapshots load")
+        });
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(
+            snaps[0].kind, "speed-test",
+            "speed snapshots keep their own kind"
+        );
+
+        let (state, speed) = view.read_with(cx, |view, _| {
+            (
+                view.health_store.status(&alpha.id).state,
+                view.health_store.speed_summary(&alpha.id),
+            )
+        });
+        assert_eq!(
+            state,
+            RowState::Unknown,
+            "a slow download is not a dead row"
+        );
+        assert_eq!(speed.as_deref(), Some("2.7s"));
+    }
+
     #[gpui_kit::test]
     fn tick_traffic_poll_persists_deltas_and_mirrors(cx: &mut TestAppContext) {
         use crate::engine::{ClashTarget, EngineController};
@@ -28738,6 +29415,67 @@ mod tests {
             view.store.traffic_totals().expect("totals read")
         });
         assert_eq!(totals.get(&alpha.id), Some(&(1500, 70)));
+        server.join().expect("stub drains");
+    }
+
+    #[gpui_kit::test]
+    fn traffic_delta_rx_up_tx_down_no_underflow(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10859"))
+            .expect("seed works");
+
+        // Same connection key: download grows while upload shrinks. A lexicographic
+        // `(rx, tx) >= (last_rx, last_tx)` compare passes (rx grew) and underflows
+        // `tx - last_tx` — a debug panic, a ~1.8e19 wrap in release. The component
+        // guard must fall back to the fresh counters instead.
+        let (port, server) = stub_clash_server(
+            vec![
+                traffic_body(&alpha.id, 1000, 50),
+                traffic_body(&alpha.id, 1500, 20),
+            ],
+            "s3cret",
+        );
+
+        let stash: Rc<RefCell<Option<Entity<AppView>>>> = Rc::new(RefCell::new(None));
+        let stash_for_window = stash.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| AppView::with_store(window, cx, store));
+            *stash_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = stash.borrow().clone().expect("AppView stashed");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (mut engine, _) = EngineController::fake();
+                engine.set_clash_targets(vec![ClashTarget {
+                    core: "stock".to_string(),
+                    port,
+                    secret: "s3cret".to_string(),
+                }]);
+                view.engine = engine;
+            });
+        });
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 1, "first poll persists the fresh counters");
+
+        let updated = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_traffic_poll(cx)));
+        assert_eq!(updated, 1, "shrunken upload falls back without underflow");
+
+        let totals = view.read_with(cx, |view, _| {
+            view.store.traffic_totals().expect("totals read")
+        });
+        assert_eq!(
+            totals.get(&alpha.id),
+            Some(&(2500, 70)),
+            "rx accumulated, tx fell back to a fresh count"
+        );
         server.join().expect("stub drains");
     }
 
@@ -31231,6 +31969,11 @@ mod tests {
         assert!(log_level_matches(LogLevel::Error, None));
         assert!(log_level_matches(LogLevel::Error, Some(LogLevel::Error)));
         assert!(!log_level_matches(LogLevel::Info, Some(LogLevel::Error)));
+        assert!(log_level_matches(LogLevel::Warn, Some(LogLevel::Warn)));
+        assert!(
+            !log_level_matches(LogLevel::Error, Some(LogLevel::Warn)),
+            "level filter stays exact-match"
+        );
         fn member(name: &str, sub: Option<&str>) -> ProxyConfig {
             ProxyConfig {
                 id: format!("id-{name}"),
@@ -31738,6 +32481,58 @@ mod tests {
             })
         });
         assert!(!row_bad, "bad row URL fails");
+    }
+
+    #[gpui_kit::test]
+    fn bug27_edit_commit_keeps_dialog_open_on_bad_row_url(cx: &mut TestAppContext) {
+        use crate::ConfigForm;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(ticket43_seed("Alpha", "10861"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+
+        let (ok, field) = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = ConfigForm::prefilled(window, cx, &alpha, None);
+                form.name.update(cx, |state, cx| {
+                    state.set_value("Alpha Renamed", window, cx);
+                });
+                let patch = form.as_patch_vs(cx, &alpha);
+                let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+                let ok = view.commit_edit_with_test_url(
+                    &alpha.id,
+                    patch,
+                    "gopher://x",
+                    &form,
+                    &form_error,
+                    window,
+                    cx,
+                );
+                let outcome = (ok, form_error.borrow().clone());
+                outcome
+            })
+        });
+
+        assert!(!ok, "rejected row URL keeps the dialog open");
+        assert_eq!(
+            field.map(|(name, _)| name).as_deref(),
+            Some("test_url"),
+            "inline error names the row test URL field"
+        );
+        let row = view.read_with(cx, |view, _| {
+            view.store
+                .get(&alpha.id)
+                .expect("get works")
+                .expect("row kept")
+        });
+        assert_eq!(row.name, "Alpha Renamed", "row data still saved");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.row_test_url(&alpha.id)),
+            None,
+            "rejected URL not stored"
+        );
     }
 
     #[gpui_kit::test]
@@ -34974,6 +35769,21 @@ mod tests {
             crate::group_delete_confirm_text("site/east", 2).contains("refuse"),
             "non-empty arm warns up front"
         );
+        let mixed = crate::group_delete_confirm_description("site/east", 2, 3);
+        assert!(
+            mixed.contains("2 row(s) and 3 subscription(s)"),
+            "mixed arm names both counts: {mixed}"
+        );
+        let sub_only = crate::group_delete_confirm_description("site/east", 0, 3);
+        assert!(
+            sub_only.contains("3 subscription(s)"),
+            "subscription-only arm kept: {sub_only}"
+        );
+        assert_eq!(
+            crate::group_delete_confirm_description("crew", 0, 0),
+            crate::group_delete_confirm_text("crew", 0),
+            "empty group keeps the existing copy"
+        );
         cx.update(gpui_kit::init);
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         store
@@ -36034,6 +36844,197 @@ mod tests {
             notification_count(cx),
             before + 1,
             "exactly one outcome toast"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn bug04_bulk_stop_counts_only_real_stops_and_keeps_flag(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Work", "10981"))
+            .expect("seed works");
+        store
+            .add(t30_engine_seed("Home", "10982"))
+            .expect("seed works");
+        let rows = store.list().expect("list works");
+        for row in &rows {
+            store.set_enabled(&row.id, true).expect("enable works");
+        }
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        let (mut engine, stock) = EngineController::fake();
+        engine.start_all(&rows).expect("fake rows active");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.engine = engine);
+        });
+
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            stock.fail_check("re-gen broke");
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().check_ids(&ids);
+                    list_cx.notify();
+                });
+                view.commit_bulk_stop(window, cx);
+            });
+        });
+        assert_eq!(notification_count(cx), before + 1, "one outcome toast");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            2,
+            "failed stops keep serving"
+        );
+        for id in &ids {
+            assert!(
+                view.read_with(cx, |view, _| view
+                    .store
+                    .get(id)
+                    .expect("get works")
+                    .expect("row exists")
+                    .enabled),
+                "the flag stays set for a row that did not stop"
+            );
+        }
+
+        stock.clear_failures();
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().check_ids(&ids);
+                    list_cx.notify();
+                });
+                view.commit_bulk_stop(window, cx);
+            });
+        });
+        assert_eq!(notification_count(cx), before + 1, "one outcome toast");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "clean stops clear the engine"
+        );
+        for id in &ids {
+            assert!(
+                !view.read_with(cx, |view, _| view
+                    .store
+                    .get(id)
+                    .expect("get works")
+                    .expect("row exists")
+                    .enabled),
+                "the flag is cleared only after a real stop"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn bug07_bulk_delete_keeps_rows_whose_stop_failed(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Work", "10981"))
+            .expect("seed works");
+        store
+            .add(t30_engine_seed("Home", "10982"))
+            .expect("seed works");
+        let rows = store.list().expect("list works");
+        let targets: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.id.clone(), row.name.clone()))
+            .collect();
+        let (mut engine, stock) = EngineController::fake();
+        engine.start_all(&rows).expect("fake rows active");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.engine = engine);
+        });
+
+        stock.fail_check("re-gen broke");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_bulk_delete(&targets, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            2,
+            "rows whose stop failed stay in the library"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            2,
+            "the engine still owns the endpoints, no orphans"
+        );
+
+        stock.clear_failures();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_bulk_delete(&targets, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "clean stops allow the delete"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "delete stops the engine"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn bug07_prune_keeps_rows_whose_stop_failed(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::store::GroupPruneKind;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        for (name, port) in [("A", "10981"), ("B", "10982"), ("C", "10983")] {
+            store.add(t30_engine_seed(name, port)).expect("seed works");
+        }
+        let rows = store.list().expect("list works");
+        let (mut engine, stock) = EngineController::fake();
+        engine.start_all(&rows).expect("fake rows active");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.engine = engine;
+                view.libraries.update(cx, |state, list_cx| {
+                    state
+                        .delegate_mut()
+                        .set_facet_group(Some("default".to_string()));
+                    list_cx.notify();
+                });
+            });
+        });
+
+        stock.fail_check("re-gen broke");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_prune(GroupPruneKind::Duplicates, window, cx)
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            3,
+            "a row that fails to stop is skipped, not deleted"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            3,
+            "no orphaned listeners"
+        );
+
+        stock.clear_failures();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_prune(GroupPruneKind::Duplicates, window, cx)
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "clean stops prune the duplicates"
         );
     }
 
@@ -41590,6 +42591,10 @@ mod tests {
             view.update(cx, |view, _| {
                 let (engine, handle) = EngineController::fake();
                 view.engine = engine;
+                view.engine.set_auto_restart(AutoRestartConfig {
+                    enabled: false,
+                    ..AutoRestartConfig::default()
+                });
                 handle
             })
         });
@@ -41765,6 +42770,49 @@ mod tests {
             notification_count(cx),
             before + 1,
             "crash notifies (not status-bar-only)"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn production_tick_auto_restarts_and_clears_crash(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Work", "10943"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let handle = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, handle) = EngineController::fake();
+                view.engine = engine;
+                handle
+            })
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.engine.running_count()) >= 1,
+            "serving before the crash"
+        );
+
+        handle.inject_crash("signal: segmentation fault");
+        // The production tick both reports the cause and recovers from the same
+        // detection (BUG-01 + BUG-02) — no second drain, no sticky crashed set.
+        let cause = cx.update(|_, cx| view.update(cx, |view, cx| view.tick_engine_poll(cx)));
+        assert!(cause.is_some(), "tick carries the crash cause");
+        assert!(
+            view.read_with(cx, |view, _| view.engine.crashed_shards().is_empty()),
+            "auto-restart cleared the crashed shard"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.engine.running_count()) >= 1,
+            "the core runs again after auto-restart"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.engine.pending_crash().is_none()),
+            "the pending cause is spent once handled"
         );
     }
 
@@ -44251,6 +45299,64 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn settings_auto_restart_commit_round_trips(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.auto_restart_enabled()),
+            "missing meta reads as enabled"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.engine.auto_restart().enabled),
+            "engine defaults enabled"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_auto_restart(false, window, cx));
+        });
+        assert!(!view.read_with(cx, |view, _| view.auto_restart_enabled()));
+        assert!(
+            !view.read_with(cx, |view, _| view.engine.auto_restart().enabled),
+            "commit pushes the choice into the engine"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_auto_restart(true, window, cx));
+        });
+        assert!(view.read_with(cx, |view, _| view.auto_restart_enabled()));
+        assert!(view.read_with(cx, |view, _| view.engine.auto_restart().enabled));
+        assert_eq!(notification_count(cx), 2, "each commit toasts once");
+    }
+
+    #[gpui_kit::test]
+    fn startup_applies_persisted_auto_restart(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .set_meta(crate::META_AUTO_RESTART, "0")
+            .expect("meta writes");
+        let (view, cx) = mount_view(store, cx);
+        assert!(
+            !view.read_with(cx, |view, _| view.engine.auto_restart().enabled),
+            "a persisted opt-out is pushed into the engine at startup"
+        );
+        assert!(
+            !view.read_with(cx, |view, _| view.auto_restart_enabled()),
+            "the persisted value is read back"
+        );
+    }
+
+    #[gpui_kit::test]
     fn settings_dialog_opens_with_switches(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
 
@@ -44295,6 +45401,10 @@ mod tests {
             "settings-restore",
             "settings-restore-switch",
             "settings-restore-note",
+            "settings-section-engine",
+            "settings-auto-restart",
+            "settings-auto-restart-switch",
+            "settings-auto-restart-note",
             "settings-tray-note",
         ] {
             assert!(
@@ -44625,6 +45735,18 @@ mod tests {
             .expect("response builds")
     }
 
+    fn t48_public_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        Ok(vec!["93.184.216.34".parse().expect("ip parses")])
+    }
+
+    fn t48_internal_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        Ok(vec!["127.0.0.1".parse().expect("ip parses")])
+    }
+
+    fn t48_dead_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        Err("no such host".to_string())
+    }
+
     #[test]
     fn t48_fetch_redirect_to_internal_blocked_without_fetch() {
         let (client, fetched) = t48_recording_client(|uri| {
@@ -44637,6 +45759,7 @@ mod tests {
         let error = futures::executor::block_on(crate::fetch_subscription_body(
             client,
             "https://example.com/sub.txt",
+            t48_public_resolver,
         ))
         .expect_err("internal redirect blocked");
         assert!(error.contains("internal"), "SSRF cause, got {error}");
@@ -44644,6 +45767,58 @@ mod tests {
             *fetched.lock().expect("read works"),
             vec!["https://example.com/sub.txt".to_string()],
             "the evil hop is never fetched"
+        );
+    }
+
+    #[test]
+    fn t48_fetch_short_form_literal_redirect_blocked_without_fetch() {
+        let (client, fetched) = t48_recording_client(|uri| {
+            if uri == "https://example.com/sub.txt" {
+                t48_response(302, Some("http://2130706433/evil"), "")
+            } else {
+                t48_response(200, None, "must never fetch")
+            }
+        });
+        let error = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+            t48_public_resolver,
+        ))
+        .expect_err("short-form internal redirect blocked");
+        assert!(error.contains("internal"), "SSRF cause, got {error}");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec!["https://example.com/sub.txt".to_string()],
+            "the evil hop is never fetched"
+        );
+    }
+
+    #[test]
+    fn t48_fetch_resolved_internal_and_dead_hosts_block_without_fetch() {
+        let (client, fetched) = t48_recording_client(|_| t48_response(200, None, "unreachable"));
+        let error = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://rebind.example.com/sub.txt",
+            t48_internal_resolver,
+        ))
+        .expect_err("rebind to loopback blocked");
+        assert!(error.contains("internal"), "rebind cause, got {error}");
+        assert!(
+            fetched.lock().expect("read works").is_empty(),
+            "blocked before any fetch"
+        );
+
+        let (client, fetched) = t48_recording_client(|_| t48_response(200, None, "unreachable"));
+        let error = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://dead.example.com/sub.txt",
+            t48_dead_resolver,
+        ))
+        .expect_err("unresolvable host fails closed");
+        assert!(error.contains("resolve"), "loud cause, got {error}");
+        assert!(
+            fetched.lock().expect("read works").is_empty(),
+            "blocked before any fetch"
         );
     }
 
@@ -44659,6 +45834,7 @@ mod tests {
         let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
             client,
             "https://example.com/sub.txt",
+            t48_public_resolver,
         ))
         .expect("public redirect followed");
         assert_eq!(downloaded.body, "cdn-body");
@@ -44675,6 +45851,7 @@ mod tests {
         let error = futures::executor::block_on(crate::fetch_subscription_body(
             client,
             "http://127.0.0.1/direct",
+            t48_public_resolver,
         ))
         .expect_err("direct internal blocked");
         assert!(error.contains("internal"), "SSRF cause, got {error}");
@@ -44691,6 +45868,7 @@ mod tests {
         let error = futures::executor::block_on(crate::fetch_subscription_body(
             client,
             "https://example.com/sub.txt",
+            t48_public_resolver,
         ))
         .expect_err("loop bounded");
         assert!(
@@ -44707,6 +45885,7 @@ mod tests {
         let error = futures::executor::block_on(crate::fetch_subscription_body(
             client,
             "https://example.com/sub.txt",
+            t48_public_resolver,
         ))
         .expect_err("location-less redirect fails");
         assert!(error.contains("bad redirect"), "loud cause, got {error}");
@@ -45884,5 +47063,291 @@ mod tests {
             cx.update(|window, cx| window.close_all_dialogs(cx));
             cx.run_until_parked();
         }
+    }
+
+    const BUG16_LINK: &str = "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one";
+
+    #[gpui_kit::test]
+    fn bug15_log_tail_gate_uses_push_seq_past_ring_cap(cx: &mut TestAppContext) {
+        use crate::health::LogTagIndex;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let cap = 5_000;
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let tags = LogTagIndex::default();
+                for i in 0..cap {
+                    view.logs.push_raw(&format!("info line {i}"), &tags);
+                }
+                assert_eq!(view.logs.all().len(), cap, "ring pins at the cap");
+                view.open_logs_dialog(window, cx);
+            });
+        });
+        paint_dialog_open(cx);
+        let seen = view.read_with(cx, |view, _| view.logs_seen);
+        assert_eq!(
+            seen,
+            view.read_with(cx, |view, _| view.logs.push_seq()),
+            "opening seeds the sequence"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.logs.push_raw("info one more", &LogTagIndex::default());
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.all().len()),
+            cap,
+            "length stays pinned at the cap (a length gate would freeze)"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.logs.push_seq()) > seen,
+            "push sequence still advances past the cap"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reload(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs_seen),
+            seen + 1,
+            "the sequence gate fires past the cap and re-seeds"
+        );
+        assert!(
+            cx.update(|window, cx| window.has_active_sheet(cx)),
+            "the sheet reopens around the fresh tail"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn bug16_import_cancel_drops_late_batch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_import_dialog(BUG16_LINK, "travel", None, window, cx);
+            });
+        });
+        paint_dialog_open(cx);
+        cx.update(|window, cx| {
+            let started = view.update(cx, |view, cx| {
+                view.commit_import_dialog(
+                    BUG16_LINK.to_string(),
+                    "travel".to_string(),
+                    None,
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            assert!(!started, "async parse leaves the dialog open");
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.import_parse_in_flight),
+            "parse is in flight"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.cancel_import_parse(cx));
+            window.close_all_dialogs(cx);
+        });
+        // A dialog opened after Cancel must survive the late completion.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_add_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        let before = notification_count(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            0,
+            "cancelled batch writes nothing"
+        );
+        assert_eq!(notification_count(cx), before, "cancelled batch is silent");
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "unrelated dialog survives the late completion"
+        );
+        assert!(
+            !view.read_with(cx, |view, _| view.import_parse_in_flight),
+            "in-flight flag cleared"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn bug16_import_completion_commits_when_not_cancelled(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            let started = view.update(cx, |view, cx| {
+                view.commit_import_dialog(
+                    BUG16_LINK.to_string(),
+                    "travel".to_string(),
+                    None,
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            assert!(!started, "async parse leaves the dialog open");
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.import_parse_in_flight),
+            "parse is in flight"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "uncancelled batch commits"
+        );
+        assert_eq!(notification_count(cx), 1, "one success toast");
+        assert!(
+            !view.read_with(cx, |view, _| view.import_parse_in_flight),
+            "in-flight flag cleared"
+        );
+    }
+
+    #[test]
+    fn bug17_resolve_domain_feedback_severity_and_restart() {
+        use crate::{resolve_domain_group_notification, resolve_domain_row_message};
+        use gpui_kit::component::notification::NotificationType;
+
+        let running = resolve_domain_row_message("Work", "1.2.3.4", "a.example.com", true);
+        assert!(running.contains("1.2.3.4"), "{running}");
+        assert!(running.contains("a.example.com"), "{running}");
+        assert!(
+            running.to_lowercase().contains("restart"),
+            "running row warns to restart: {running}"
+        );
+        let stopped = resolve_domain_row_message("Work", "1.2.3.4", "a.example.com", false);
+        assert!(!stopped.to_lowercase().contains("restart"), "{stopped}");
+
+        let saved = vec![("A".to_string(), "old".to_string(), "new".to_string())];
+        let (sev, msg) = resolve_domain_group_notification(&saved, &[], true);
+        assert!(
+            matches!(sev, NotificationType::Success),
+            "all saved is success"
+        );
+        assert!(
+            msg.to_lowercase().contains("restart"),
+            "pending restart is named: {msg}"
+        );
+
+        let (sev, msg) =
+            resolve_domain_group_notification(&saved, &["\"B\": boom".to_string()], false);
+        assert!(
+            matches!(sev, NotificationType::Warning),
+            "partial is a warning"
+        );
+        assert!(msg.contains("boom"), "{msg}");
+
+        let (sev, _) = resolve_domain_group_notification(&[], &["\"B\": boom".to_string()], false);
+        assert!(
+            matches!(sev, NotificationType::Error),
+            "all failed is an error"
+        );
+    }
+
+    #[test]
+    fn bug25_log_level_tooltip_matches_exact_filter() {
+        use crate::health::LogLevel;
+        use crate::{log_level_matches, log_level_tooltip};
+        assert_eq!(log_level_tooltip("All"), "Show logs of every level");
+        assert_eq!(log_level_tooltip("Warn"), "Show only Warn records");
+        for label in ["All", "Debug", "Info", "Warn", "Error"] {
+            let tip = log_level_tooltip(label).to_lowercase();
+            assert!(
+                !tip.contains("and above"),
+                "no cumulative promise for {label}: {tip}"
+            );
+        }
+        assert!(
+            !log_level_matches(LogLevel::Error, Some(LogLevel::Warn)),
+            "the filter stays exact-match, matching the tooltip"
+        );
+    }
+
+    #[test]
+    fn bug26_subscription_interval_failure_message_is_honest() {
+        use crate::subscription_interval_failure_message;
+        let added = subscription_interval_failure_message("added", "Nightly", "database is locked");
+        assert!(added.contains("Nightly"), "{added}");
+        assert!(added.contains("added"), "{added}");
+        assert!(added.contains("refresh interval"), "{added}");
+        assert!(added.contains("database is locked"), "{added}");
+        let updated = subscription_interval_failure_message("updated", "Daily", "nope");
+        assert!(
+            updated.contains("updated") && updated.contains("Daily") && updated.contains("nope"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn bug28_bulk_start_failure_messages_name_skips() {
+        use crate::{bulk_start_enable_flag_failed_message, bulk_start_unreadable_message};
+        let unreadable = bulk_start_unreadable_message(&["10801".to_string(), "10802".to_string()]);
+        assert!(unreadable.contains('2'), "{unreadable}");
+        assert!(unreadable.contains("10801"), "{unreadable}");
+        assert!(unreadable.contains("10802"), "{unreadable}");
+        assert!(
+            unreadable.to_lowercase().contains("could not read"),
+            "{unreadable}"
+        );
+
+        let flag = bulk_start_enable_flag_failed_message(&["Alpha".to_string()]);
+        assert!(flag.contains('1'), "{flag}");
+        assert!(flag.contains("Alpha"), "{flag}");
+        assert!(flag.to_lowercase().contains("started"), "{flag}");
+    }
+
+    #[gpui_kit::test]
+    fn bug37_logs_sheet_keeps_typed_draft_across_control_change(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_logs_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let (filter, _, _) = view.log_inputs.clone().expect("inputs stored");
+                filter.update(cx, |input, cx| {
+                    input.set_value("draft-only".to_string(), window, cx);
+                });
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.log_filter.clone()),
+            "",
+            "typing alone never commits"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.toggle_log_tail(window, cx));
+        });
+        cx.run_until_parked();
+        let typed = view.read_with(cx, |view, cx| {
+            view.log_inputs
+                .as_ref()
+                .expect("inputs stored")
+                .0
+                .read(cx)
+                .value()
+                .to_string()
+        });
+        assert_eq!(typed, "draft-only", "typed draft survives the control swap");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.log_filter.clone()),
+            "",
+            "commit-on-Apply is unchanged"
+        );
     }
 }
