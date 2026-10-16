@@ -313,6 +313,17 @@ fn split_host_port(text: &str) -> Result<(String, Option<String>), ImportError> 
     }
 }
 
+fn decoded_host(raw: &str) -> Result<String, ImportError> {
+    let host = percent_decode(raw.trim(), false);
+    if host.trim().is_empty() {
+        return Err(bad_host("missing host"));
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(bad_host("bad host"));
+    }
+    Ok(host)
+}
+
 fn parse_port(text: &str) -> Result<u16, ImportError> {
     let first = text.split([',', ';']).next().unwrap_or("").trim();
     if first.len() > 1 && first.starts_with('0') {
@@ -363,10 +374,7 @@ fn split_uri(_scheme: &str, rest: &str) -> Result<UriParts, ImportError> {
     };
     let (raw_host, port_text) = split_host_port(host_port)?;
 
-    let host = percent_decode(raw_host.trim(), false);
-    if host.trim().is_empty() {
-        return Err(bad_host("missing host"));
-    }
+    let host = decoded_host(&raw_host)?;
     Ok(UriParts {
         userinfo,
         host,
@@ -625,9 +633,9 @@ fn parse_vless_like(
     insert_str(&mut params, "security", security);
     insert_str(&mut params, "sni", sni);
 
-    let uri_path = parts.path.trim_matches('/');
-    if !uri_path.is_empty() && !query.contains_key("path") {
-        insert_str(&mut params, "path", uri_path.to_string());
+    let uri_path = percent_decode(&parts.path, true);
+    if !uri_path.trim_matches('/').is_empty() && !query.contains_key("path") {
+        insert_str(&mut params, "path", uri_path);
     }
     insert_opt(&mut params, query, "flow");
     insert_opt(&mut params, query, "fp");
@@ -691,8 +699,17 @@ fn parse_vmess_legacy(payload: &str, fragment: &str) -> Result<ImportedConfig, I
         if inner.trim().is_empty() {
             return Err(bad_host("vmess link has a bad \"add\" (empty host)"));
         }
+        if inner.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(bad_host("vmess link has a bad \"add\""));
+        }
         inner.to_string()
     } else {
+        if host_trimmed
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(bad_host("vmess link has a bad \"add\""));
+        }
         host_trimmed.to_string()
     };
     let port_raw = field(obj, "port").unwrap_or_default();
@@ -708,7 +725,7 @@ fn parse_vmess_legacy(payload: &str, fragment: &str) -> Result<ImportedConfig, I
         if ps.trim().is_empty() {
             format!("vmess-{host}:{port}")
         } else {
-            ps
+            cap_name(ps)
         }
     };
 
@@ -730,15 +747,18 @@ fn parse_vmess_legacy(payload: &str, fragment: &str) -> Result<ImportedConfig, I
         normalize_network(field(obj, "net").as_ref()),
     );
 
-    let tls_raw = match obj.get("tls") {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(serde_json::Value::Bool(flag)) => flag.to_string(),
-        _ => String::new(),
+    let tls_on = match obj.get("tls") {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::String(text)) => matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "enabled" | "tls"
+        ),
+        Some(serde_json::Value::Number(number)) => {
+            number.as_f64().is_some_and(|number| number != 0.0)
+        }
+        _ => false,
     };
-    params.insert(
-        "tls".to_string(),
-        serde_json::Value::Bool(tls_raw == "tls" || tls_raw == "true"),
-    );
+    params.insert("tls".to_string(), serde_json::Value::Bool(tls_on));
     for key in ["sni", "fp", "alpn", "path", "host"] {
         if let Some(value) = field(obj, key) {
             if !value.trim().is_empty() {
@@ -1175,17 +1195,38 @@ fn parse_direct_link(rest: &str) -> Result<ImportedConfig, ImportError> {
 
 fn parse_hy1(parts: &UriParts) -> Result<ImportedConfig, ImportError> {
     reject_unexpected_path("hysteria", parts)?;
-    let auth = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
+    let mut auth = percent_decode(parts.userinfo.as_deref().unwrap_or(""), false);
+    if auth.trim().is_empty() {
+        auth = parts.query.get("auth").cloned().unwrap_or_default();
+    }
     if auth.trim().is_empty() {
         return Err(missing_credential("hysteria link is missing auth"));
     }
     let port = require_port(parts.port_text.as_deref())?;
     let mut params = base_params("hysteria", &parts.host, port);
     insert_str(&mut params, "auth", auth);
+    for (alias, field) in [("upmbps", "up"), ("downmbps", "down")] {
+        if !parts.query.contains_key(field) {
+            if let Some(value) = parts
+                .query
+                .get(alias)
+                .filter(|value| !value.trim().is_empty())
+            {
+                insert_str(&mut params, field, value.clone());
+            }
+        }
+    }
     insert_extras(
         &mut params,
         &parts.query,
-        &["auth", "server", "server_port", "port"],
+        &[
+            "auth",
+            "server",
+            "server_port",
+            "port",
+            "upmbps",
+            "downmbps",
+        ],
     );
     Ok(ImportedConfig {
         name: display_name(&parts.fragment, "hysteria", &parts.host, port),
@@ -1316,6 +1357,18 @@ fn parse_socks_like(
         }
     }
     if protocol == "socks" {
+        if let Some(version) = parts.query.get("version") {
+            let version = version.trim();
+            if version == "4" {
+                return Err(unknown_scheme("SOCKS v4 is not supported"));
+            }
+            if !version.is_empty() && version != "5" {
+                return Err(unknown_scheme(format!(
+                    "SOCKS version '{}' has no mapping (only v5 is served)",
+                    cap_echo(version)
+                )));
+            }
+        }
         insert_str(&mut params, "version", "5".to_string());
     }
 
@@ -2042,10 +2095,19 @@ fn import_wg_conf(content: &str, stem: &str) -> BatchResult {
             continue;
         }
         if let (Some(entry), Some(i)) = (current.as_mut(), line.find('=')) {
-            entry
-                .1
-                .entry(line[..i].trim().to_ascii_lowercase())
-                .or_insert_with(|| line[i + 1..].trim().to_string());
+            let key = line[..i].trim().to_ascii_lowercase();
+            let value = line[i + 1..].trim().to_string();
+            match entry.1.get_mut(&key) {
+                Some(existing) if existing.is_empty() => *existing = value,
+                Some(existing) if !value.is_empty() => {
+                    existing.push_str(", ");
+                    existing.push_str(&value);
+                }
+                Some(_) => {}
+                None => {
+                    entry.1.insert(key, value);
+                }
+            }
         }
     }
     if let Some((is_peer, section)) = current {
@@ -3064,6 +3126,21 @@ pub fn import_subscription_body(body: &str) -> BatchResult {
         .filter(|line| !line.is_empty())
         .collect();
     if lines.len() > 1 {
+        let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(text) = decode_b64_utf8(&compact) {
+            let text = text.trim();
+            if text.contains("://") {
+                return import_text(text);
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                if value.is_array() || value.is_object() {
+                    if looks_like_vmess_json(text) {
+                        return import_text(&format!("vmess://{compact}"));
+                    }
+                    return import_json_value(&value);
+                }
+            }
+        }
         let mut rebuilt = Vec::with_capacity(lines.len());
         let mut decoded_any = false;
         for line in &lines {
@@ -3220,6 +3297,32 @@ fn import_clash_proxies(content: &str) -> BatchResult {
         }
         trimmed.to_string()
     }
+    fn clash_nested_key(full: &str) -> Option<&'static str> {
+        match full {
+            "ws-opts.path" => Some("path"),
+            "ws-opts.headers.host" => Some("host"),
+            "grpc-opts.grpc-service-name" => Some("service_name"),
+            "reality-opts.public-key" => Some("pbk"),
+            "reality-opts.short-id" => Some("sid"),
+            _ => None,
+        }
+    }
+    fn clash_field(fields: &mut Vec<(String, String)>, key: &str, value_raw: &str) {
+        if key == "<<" || value_raw.trim_start().starts_with('*') {
+            fields.push(("__anchor__".to_string(), clash_value(value_raw)));
+            return;
+        }
+        fields.push((key.to_ascii_lowercase(), clash_value(value_raw)));
+    }
+    fn clash_nested_field(fields: &mut Vec<(String, String)>, full: &str, value_raw: &str) {
+        if full.ends_with("<<") || value_raw.trim_start().starts_with('*') {
+            fields.push(("__anchor__".to_string(), clash_value(value_raw)));
+            return;
+        }
+        if let Some(mapped) = clash_nested_key(full) {
+            fields.push((mapped.to_string(), clash_value(value_raw)));
+        }
+    }
     let mut out = BatchResult::default();
     let lines: Vec<&str> = content.lines().collect();
     let start = lines
@@ -3231,6 +3334,7 @@ fn import_clash_proxies(content: &str) -> BatchResult {
         fields: Vec<(String, String)>,
         entry_indent: usize,
         key_indent: Option<usize>,
+        nested: Vec<(usize, String)>,
     }
     let mut entries: Vec<(Vec<(String, String)>, usize)> = Vec::new();
     let mut current: Option<Pending> = None;
@@ -3282,7 +3386,7 @@ fn import_clash_proxies(content: &str) -> BatchResult {
                 if let Some(i) = after.find(':') {
                     let (key, value) = (after[..i].trim(), after[i + 1..].trim());
                     if !key.is_empty() {
-                        fields.push((key.to_ascii_lowercase(), clash_value(value)));
+                        clash_field(&mut fields, key, value);
                     }
                 }
             }
@@ -3290,37 +3394,41 @@ fn import_clash_proxies(content: &str) -> BatchResult {
                 fields,
                 entry_indent: indent,
                 key_indent: None,
+                nested: Vec::new(),
             });
         } else if let Some(pending) = current.as_mut() {
             if indent <= pending.entry_indent {
                 flush(&mut current, &mut entries);
                 continue;
             }
-            match pending.key_indent {
-                None => {
-                    if let Some(i) = line.find(':') {
-                        let (key, value) = (line[..i].trim(), line[i + 1..].trim());
-                        if !key.is_empty() && !key.contains(' ') {
-                            pending.key_indent = Some(indent);
-                            pending
-                                .fields
-                                .push((key.to_ascii_lowercase(), clash_value(value)));
-                        }
-                    }
-                }
-                Some(key_indent) => {
-                    if indent != key_indent {
-                        continue;
-                    }
-                    if let Some(i) = line.find(':') {
-                        let (key, value) = (line[..i].trim(), line[i + 1..].trim());
-                        if !key.is_empty() && !key.contains(' ') {
-                            pending
-                                .fields
-                                .push((key.to_ascii_lowercase(), clash_value(value)));
-                        }
-                    }
-                }
+            let Some(i) = line.find(':') else {
+                continue;
+            };
+            let (key, value) = (line[..i].trim(), line[i + 1..].trim());
+            if key.is_empty() || key.contains(' ') {
+                continue;
+            }
+            if pending.key_indent.is_none() {
+                pending.key_indent = Some(indent);
+            }
+            while pending.nested.last().is_some_and(|(top, _)| *top >= indent) {
+                pending.nested.pop();
+            }
+            if value.is_empty() {
+                pending.nested.push((indent, key.to_ascii_lowercase()));
+                continue;
+            }
+            if pending.nested.is_empty() {
+                clash_field(&mut pending.fields, key, value);
+            } else {
+                let prefix = pending
+                    .nested
+                    .iter()
+                    .map(|(_, key)| key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let full = format!("{prefix}.{}", key.to_ascii_lowercase());
+                clash_nested_field(&mut pending.fields, &full, value);
             }
         }
     }
@@ -3334,6 +3442,11 @@ fn import_clash_proxies(content: &str) -> BatchResult {
     }
     for (entry_index, (fields, _)) in entries.iter().enumerate() {
         let parsed = (|| -> Result<ImportedConfig, ImportError> {
+            if fields.iter().any(|(key, _)| key == "__anchor__") {
+                return Err(invalid_json(
+                    "clash anchors/aliases (\"*\", \"<<\") are not supported",
+                ));
+            }
             if fields.iter().any(|(key, _)| key == "__flow__") {
                 return Err(invalid_json("clash flow mappings are not supported"));
             }
@@ -3421,7 +3534,7 @@ fn import_clash_proxies(content: &str) -> BatchResult {
                 if key == "tls" {
                     if matches!(
                         value.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
+                        "1" | "true" | "yes" | "on" | "tls"
                     ) {
                         security_tls = true;
                     }
@@ -4810,7 +4923,7 @@ mod tests {
     fn ticket24_vless_uri_path_preserved() {
         let config = parse_link(&format!("vless://{UUID}@a.example.com:443/extra-path#x"))
             .expect("vless with path parses");
-        assert_eq!(params_of(&config)["path"], "extra-path");
+        assert_eq!(params_of(&config)["path"], "/extra-path");
     }
 
     #[test]
@@ -5989,7 +6102,7 @@ mod tests {
 
         let config = parse_link(&format!("vless://{UUID}@a.example.com:443/ws-path#x"))
             .expect("vless path parses");
-        assert_eq!(params_of(&config)["path"], "ws-path");
+        assert_eq!(params_of(&config)["path"], "/ws-path");
     }
 
     #[test]
@@ -6119,5 +6232,336 @@ mod tests {
         let out = import_subscription_body(body);
         assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
         assert_eq!(params_of(&out.configs[0])["password"], "hunter2");
+    }
+
+    fn row_of(config: &ImportedConfig, port: u16) -> crate::store::ProxyConfig {
+        crate::store::ProxyConfig {
+            id: format!("bug-row-{port}"),
+            name: config.name.clone(),
+            protocol: config.protocol.clone(),
+            params: config.params.clone(),
+            group: "bug-regression".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    #[test]
+    fn bug09_clash_nested_blocks_map_and_empty_parent_never_leaks() {
+        let body = "proxies:\n  - name: ws-one\n    type: vless\n    server: 1.2.3.4\n    port: 443\n    uuid: <UUID>\n    network: ws\n    ws-opts:\n      path: /p\n      headers:\n        Host: h.example.com\n";
+        let out = import_subscription_body(&body.replace("<UUID>", UUID));
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        let config = &out.configs[0];
+        let params = params_of(config);
+        assert_eq!(params["path"], "/p", "ws-opts.path folds");
+        assert_eq!(
+            params["host"], "h.example.com",
+            "ws-opts.headers.Host folds"
+        );
+        assert!(
+            !params.as_object().expect("object").contains_key("ws-opts"),
+            "empty parent key must not leak: {params}"
+        );
+        let generated = crate::engine::generate(std::slice::from_ref(&row_of(config, 10801)))
+            .expect("clash ws row generates without a leaked parent");
+        let node = generated.value()["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == serde_json::json!("vless"))
+            .expect("vless egress")
+            .clone();
+        assert_eq!(node["transport"]["type"], serde_json::json!("ws"));
+        assert_eq!(node["transport"]["path"], serde_json::json!("/p"));
+        assert_eq!(
+            node["transport"]["headers"]["Host"],
+            serde_json::json!("h.example.com")
+        );
+
+        let mut leaky = row_of(config, 10899);
+        leaky.params =
+            r#"{"type":"vless","server":"1.2.3.4","server_port":443,"uuid":"<UUID>","ws-opts":""}"#
+                .replace("<UUID>", UUID);
+        let error = crate::engine::generate(std::slice::from_ref(&leaky))
+            .expect_err("an unmapped parent key is a named error, not a silent leak");
+        assert!(
+            error.to_string().contains("ws-opts"),
+            "the error names the key: {error}"
+        );
+
+        let grpc = "proxies:\n  - name: g-one\n    type: vless\n    server: 1.2.3.4\n    port: 443\n    uuid: <UUID>\n    network: grpc\n    grpc-opts:\n      grpc-service-name: exampleSvc\n";
+        let out = import_subscription_body(&grpc.replace("<UUID>", UUID));
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(params_of(&out.configs[0])["service_name"], "exampleSvc");
+
+        let reality = "proxies:\n  - name: r-one\n    type: vless\n    server: 1.2.3.4\n    port: 443\n    uuid: <UUID>\n    reality-opts:\n      public-key: A3oRvoNAnsCtWItpFcR4nQ0VyJjEJhRq8yx6shbXSVo\n      short-id: abcd\n";
+        let out = import_subscription_body(&reality.replace("<UUID>", UUID));
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        let params = params_of(&out.configs[0]);
+        assert_eq!(params["pbk"], "A3oRvoNAnsCtWItpFcR4nQ0VyJjEJhRq8yx6shbXSVo");
+        assert_eq!(params["sid"], "abcd");
+        assert!(
+            !params
+                .as_object()
+                .expect("object")
+                .contains_key("reality-opts"),
+            "reality parent must not leak: {params}"
+        );
+    }
+
+    #[test]
+    fn bug10_hysteria_v1_query_auth_and_speed_keys_serve() {
+        let config = parse_link(
+            "hysteria://h.example.com:443?auth=pw&peer=h.example.com&upmbps=100&downmbps=50#n",
+        )
+        .expect("standard hysteria v1 link parses");
+        assert_eq!(config.protocol, "hysteria");
+        let params = params_of(&config);
+        assert_eq!(params["auth"], "pw", "query auth lands");
+        assert_eq!(params["up"], "100", "upmbps folds to up");
+        assert_eq!(params["down"], "50", "downmbps folds to down");
+        assert!(
+            !params.as_object().expect("object").contains_key("upmbps"),
+            "alias never leaks: {params}"
+        );
+
+        let userinfo = parse_link("hysteria://pw@h.example.com:443?upmbps=100&downmbps=50#n")
+            .expect("userinfo dialect with speed keys parses");
+        let params = params_of(&userinfo);
+        assert_eq!(params["auth"], "pw");
+        assert_eq!(params["up"], "100");
+        assert_eq!(params["down"], "50");
+
+        let generated = crate::engine::generate(std::slice::from_ref(&row_of(&config, 10802)))
+            .expect("hy1 row generates with folded speed keys");
+        let node = generated.value()["outbounds"]
+            .as_array()
+            .expect("outbounds")
+            .iter()
+            .find(|node| node["type"] == serde_json::json!("hysteria"))
+            .expect("hysteria egress")
+            .clone();
+        assert_eq!(node["auth_str"], serde_json::json!("pw"));
+        assert_eq!(node["up"], serde_json::json!("100"));
+        assert_eq!(node["down"], serde_json::json!("50"));
+    }
+
+    #[test]
+    fn bug11_wrapped_base64_body_decodes() {
+        let inner =
+            format!("vless://{UUID}@a.example.com:443#one\ntrojan://pw@b.example.com:443#two\n");
+        let flat = b64_standard(&inner);
+        let wrapped: String = flat
+            .as_bytes()
+            .chunks(76)
+            .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ascii"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wrapped.lines().count() > 1, "fixture must wrap");
+        let out = import_subscription_body(&wrapped);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2);
+        assert_eq!(out.configs[0].protocol, "vless");
+        assert_eq!(out.configs[1].protocol, "trojan");
+    }
+
+    #[test]
+    fn bug12_vmess_legacy_tls_truthy_and_ps_sanitized() {
+        for tls in [
+            serde_json::json!(1),
+            serde_json::json!("1"),
+            serde_json::json!("TLS"),
+            serde_json::json!(true),
+        ] {
+            let json = serde_json::json!({"add": "h.example.com", "port": "443",
+                "id": UUID, "tls": tls.clone()});
+            let config = parse_link(&format!("vmess://{}", b64(&json.to_string())))
+                .unwrap_or_else(|_| panic!("vmess tls {tls:?} parses"));
+            assert_eq!(
+                params_of(&config)["tls"],
+                serde_json::json!(true),
+                "{tls:?}"
+            );
+        }
+        let off = serde_json::json!({"add": "h.example.com", "port": "443",
+            "id": UUID, "tls": "false"});
+        let config = parse_link(&format!("vmess://{}", b64(&off.to_string())))
+            .expect("explicit false parses");
+        assert_eq!(params_of(&config)["tls"], serde_json::json!(false));
+
+        let evil = format!("\u{1b}[31mred\u{7} \u{202E}evil{}", "x".repeat(400));
+        let json =
+            serde_json::json!({"ps": evil, "add": "h.example.com", "port": "443", "id": UUID});
+        let config =
+            parse_link(&format!("vmess://{}", b64(&json.to_string()))).expect("hostile ps parses");
+        assert!(
+            !config.name.contains('\u{1b}'),
+            "ANSI stripped: {:?}",
+            config.name
+        );
+        assert!(
+            !config.name.contains('\u{7}'),
+            "BEL stripped: {:?}",
+            config.name
+        );
+        assert!(
+            !config.name.contains('\u{202E}'),
+            "bidi stripped: {:?}",
+            config.name
+        );
+        assert!(
+            config.name.chars().count() <= 256,
+            "capped at 256: {}",
+            config.name.chars().count()
+        );
+    }
+
+    #[test]
+    fn bug29_wg_conf_repeated_keys_merge() {
+        let conf = "[Interface]\nPrivateKey = cHJpdmF0ZWtleQ\nAddress = 10.0.0.2/32\nAddress = fd00::2/128\nDNS = 1.1.1.1\nDNS = 8.8.8.8\nMTU = 1420\n\n[Peer]\nPublicKey = cHVia2V5\nEndpoint = 203.0.113.1:51820\nAllowedIPs = 0.0.0.0/0\nAllowedIPs = ::/0\n";
+        let out = import_file_content("dup.conf", conf);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        let params = params_of(&out.configs[0]);
+        assert_eq!(params["address"], "10.0.0.2/32, fd00::2/128");
+        assert_eq!(params["dns"], "1.1.1.1, 8.8.8.8");
+        assert_eq!(params["allowed_ips"], "0.0.0.0/0, ::/0");
+        assert_eq!(params["mtu"], "1420");
+
+        let pasted = import_text(conf);
+        assert!(
+            pasted.failures.is_empty(),
+            "failures: {:?}",
+            pasted.failures
+        );
+        assert_eq!(
+            params_of(&pasted.configs[0])["allowed_ips"],
+            "0.0.0.0/0, ::/0"
+        );
+    }
+
+    #[test]
+    fn bug30_decoded_host_and_vmess_add_validation() {
+        for host in [
+            "a%20b.example.com",
+            "x%00y.example.com",
+            "a%09b.example.com",
+        ] {
+            let error = parse_link(&format!("vless://{UUID}@{host}:443#x"))
+                .expect_err("decoded bad host fails");
+            assert_eq!(error.kind, ImportErrorKind::BadHost, "host {host}");
+        }
+
+        let json = serde_json::json!({"add": "a b.example.com", "port": "443", "id": UUID});
+        let error = parse_link(&format!("vmess://{}", b64(&json.to_string())))
+            .expect_err("unbracketed vmess add with space fails");
+        assert_eq!(error.kind, ImportErrorKind::BadHost);
+
+        let json = serde_json::json!({"add": "[::1", "port": "443", "id": UUID});
+        let error = parse_link(&format!("vmess://{}", b64(&json.to_string())))
+            .expect_err("unclosed bracket still fails");
+        assert_eq!(error.kind, ImportErrorKind::BadHost);
+
+        let ok = parse_link(&format!("vless://{UUID}@exam%70le.com:443#x"))
+            .expect("benign decode stays valid");
+        assert_eq!(ok.host, "example.com");
+        let vmess_ok = serde_json::json!({"add": "[2001:db8::1]", "port": "443", "id": UUID});
+        let ok = parse_link(&format!("vmess://{}", b64(&vmess_ok.to_string())))
+            .expect("bracketed v6 add stays valid");
+        assert_eq!(ok.host, "2001:db8::1");
+    }
+
+    #[test]
+    fn bug31_uri_path_decoded_and_normalized() {
+        let config = parse_link(&format!("vless://{UUID}@a.example.com:443/ws%20x#n"))
+            .expect("encoded uri path parses");
+        assert_eq!(
+            params_of(&config)["path"],
+            "/ws x",
+            "percent-decoded with slash"
+        );
+
+        let config = parse_link(&format!("vless://{UUID}@a.example.com:443/uri?path=%2Fq#n"))
+            .expect("query path wins");
+        assert_eq!(params_of(&config)["path"], "/q");
+
+        let config = parse_link(&format!("vless://{UUID}@a.example.com:443?path=%2Fq#n"))
+            .expect("absent uri path stays empty");
+        assert_eq!(params_of(&config)["path"], "/q");
+
+        let config = parse_link(&format!("vless://{UUID}@a.example.com:443/#n"))
+            .expect("bare slash is an empty path");
+        assert!(
+            params_of(&config).get("path").is_none(),
+            "no path param for a lone slash"
+        );
+    }
+
+    #[test]
+    fn bug31_uri_path_plus_matches_query_path() {
+        let from_uri = parse_link(&format!("vless://{UUID}@a.example.com:443/a+b#n"))
+            .expect("uri path with plus parses");
+        // `+` is literal-and-space in both dialects: the query key/value path and
+        // the URI path decode with the same flags.
+        let from_query = parse_link(&format!("vless://{UUID}@a.example.com:443?path=%2Fa+b#n"))
+            .expect("query path with plus parses");
+        assert_eq!(
+            params_of(&from_uri)["path"],
+            params_of(&from_query)["path"],
+            "URI path and query path= decode identically"
+        );
+        assert_eq!(params_of(&from_uri)["path"], "/a b");
+    }
+
+    #[test]
+    fn bug32_socks_version_query_is_honored_or_rejected() {
+        let v4 = parse_link("socks://user:pass@example.com:1080?version=4")
+            .expect_err("socks v4 rejects loudly");
+        assert_eq!(v4.kind, ImportErrorKind::UnknownScheme);
+        assert!(v4.message.contains('4'), "names v4: {v4}");
+
+        let v5 =
+            parse_link("socks://user:pass@example.com:1080?version=5").expect("socks v5 parses");
+        assert_eq!(params_of(&v5)["version"], "5");
+
+        let odd = parse_link("socks://user:pass@example.com:1080?version=9")
+            .expect_err("unsupported version rejects");
+        assert_eq!(odd.kind, ImportErrorKind::UnknownScheme);
+
+        let absent = parse_link("socks://user:pass@example.com:1080")
+            .expect("versionless socks defaults to v5");
+        assert_eq!(params_of(&absent)["version"], "5");
+    }
+
+    #[test]
+    fn bug33_clash_tls_string_is_truthy() {
+        let body = "proxies:\n  - name: t-one\n    type: trojan\n    server: t.example.com\n    port: 443\n    password: pw\n    tls: tls\n";
+        let out = import_subscription_body(body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(params_of(&out.configs[0])["security"], "tls");
+    }
+
+    #[test]
+    fn bug34_clash_anchors_and_aliases_are_rejected() {
+        let alias = "proxies:\n  - name: a-one\n    type: trojan\n    server: t.example.com\n    port: 443\n    password: pw\n    sni: *srv\n";
+        let out = import_subscription_body(alias);
+        assert!(out.configs.is_empty(), "configs: {:?}", out.configs);
+        assert_eq!(out.failures.len(), 1);
+        assert!(
+            out.failures[0].reason.contains("anchor") || out.failures[0].reason.contains("alias"),
+            "names the construct: {}",
+            out.failures[0].reason
+        );
+
+        let merge = "proxies:\n  - name: a-two\n    type: trojan\n    server: t.example.com\n    port: 443\n    password: pw\n    <<: *base\n";
+        let out = import_subscription_body(merge);
+        assert!(out.configs.is_empty(), "configs: {:?}", out.configs);
+        assert_eq!(out.failures.len(), 1);
+        assert_eq!(out.failures[0].code, ImportErrorKind::InvalidJson);
     }
 }
