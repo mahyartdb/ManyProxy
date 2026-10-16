@@ -302,7 +302,7 @@ fn canonical_type(protocol: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn is_ssh_protocol(protocol: &str) -> bool {
     matches_protocol_aliases(protocol, &["ssh"])
 }
@@ -1489,8 +1489,6 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
     let mut inbounds = Vec::with_capacity(egresses.len());
     let mut outbounds: Vec<serde_json::Value> = Vec::with_capacity(egresses.len() + 1);
     let mut rules = Vec::with_capacity(egresses.len());
-    let mut ingress_tags = Vec::with_capacity(egresses.len());
-    let mut egress_tags = Vec::with_capacity(egresses.len());
     for egress in egresses {
         if egress.bridge_port < XRAY_BRIDGE_PORT_START || egress.bridge_port > XRAY_BRIDGE_PORT_END
         {
@@ -1688,8 +1686,6 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
             "inboundTag": [egress.ingress_tag],
             "outboundTag": egress.egress_tag,
         }));
-        ingress_tags.push(egress.ingress_tag.clone());
-        egress_tags.push(egress.egress_tag.clone());
     }
     outbounds.push(serde_json::json!({"protocol": "freedom", "tag": "direct"}));
     validate_bridge_counts(
@@ -1706,18 +1702,12 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
     });
     Ok(GeneratedXrayConfig {
         json: serde_json::to_string(&document).expect("xray config serializes"),
-        ingress_tags,
-        egress_tags,
     })
 }
 
 #[derive(Debug, Clone)]
 pub struct GeneratedXrayConfig {
     pub json: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub ingress_tags: Vec<String>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub egress_tags: Vec<String>,
 }
 
 impl GeneratedXrayConfig {
@@ -2135,6 +2125,7 @@ fn validate_xray_hop(
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolationEntry {
     pub config_id: String,
@@ -2142,17 +2133,9 @@ pub struct IsolationEntry {
     pub outbound_tag: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct GeneratedConfig {
     pub json: String,
-    pub inbound_tags: Vec<String>,
-    pub outbound_tags: Vec<String>,
-    pub isolation: Vec<IsolationEntry>,
-
-    pub requires_fork: bool,
-
-    pub requires_xray: bool,
 }
 
 impl GeneratedConfig {
@@ -2162,7 +2145,7 @@ impl GeneratedConfig {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError> {
     generate_with_presets(configs, &HashMap::new())
 }
@@ -3811,8 +3794,6 @@ fn reshape_wireguard_endpoint(
 struct RowBuilt {
     nodes: Vec<(serde_json::Value, bool)>,
     serving_tag: String,
-    requires_fork: bool,
-    requires_xray: bool,
 }
 
 fn build_ticket08_row(
@@ -3849,8 +3830,6 @@ fn build_ticket08_row(
         return Ok(Some(RowBuilt {
             nodes: vec![(bridge_pointer(&out_tag, port), false)],
             serving_tag: out_tag,
-            requires_fork: false,
-            requires_xray: true,
         }));
     }
     if is_custom_outbound_protocol(&config.protocol) {
@@ -3864,8 +3843,6 @@ fn build_ticket08_row(
             return Ok(Some(RowBuilt {
                 nodes: vec![(bridge_pointer(&out_tag, port), false)],
                 serving_tag: out_tag,
-                requires_fork: false,
-                requires_xray: true,
             }));
         }
         map.insert(
@@ -3879,8 +3856,6 @@ fn build_ticket08_row(
         return Ok(Some(RowBuilt {
             nodes: vec![(serde_json::Value::Object(map), is_endpoint)],
             serving_tag: out_tag,
-            requires_fork: core == OwningCore::Fork,
-            requires_xray: false,
         }));
     }
     if is_chain_protocol(&config.protocol) {
@@ -3893,8 +3868,6 @@ fn build_ticket08_row(
         })?;
         let mut nodes = Vec::with_capacity(hops.len());
         let mut hop_tags = Vec::with_capacity(hops.len());
-        let mut requires_xray = false;
-        let mut requires_fork_hop = false;
         for (index, _) in hops.iter().enumerate() {
             let hop_tag = format!("{out_tag}-hop-{index}");
             hop_tags.push(hop_tag.clone());
@@ -3947,7 +3920,6 @@ fn build_ticket08_row(
                                 detail: format!("no bridge port assigned for \"{}\"", target.name),
                             }
                         })?;
-                        requires_xray = true;
                         bridge_pointer(&hop_tag, port)
                     } else if is_custom_outbound_protocol(&target.protocol) {
                         let target_params = params_object(target)?;
@@ -3962,12 +3934,8 @@ fn build_ticket08_row(
                                     ),
                                 }
                             })?;
-                            requires_xray = true;
                             bridge_pointer(&hop_tag, port)
                         } else {
-                            if core == OwningCore::Fork {
-                                requires_fork_hop = true;
-                            }
                             hop_map.insert(
                                 "tag".to_string(),
                                 serde_json::Value::String(hop_tag.clone()),
@@ -4004,7 +3972,6 @@ fn build_ticket08_row(
                                     config.name, hop.label
                                 ),
                             })?;
-                        requires_xray = true;
                         bridge_pointer(&hop_tag, port)
                     } else {
                         let mut hop_map = map.clone();
@@ -4034,12 +4001,7 @@ fn build_ticket08_row(
             nodes.push((node, is_endpoint));
         }
         let serving_tag = hop_tags.first().cloned().expect("chain has hops");
-        return Ok(Some(RowBuilt {
-            nodes,
-            serving_tag,
-            requires_fork: requires_fork_hop,
-            requires_xray,
-        }));
+        return Ok(Some(RowBuilt { nodes, serving_tag }));
     }
     Ok(None)
 }
@@ -4056,10 +4018,6 @@ fn build_main_config(
     let mut outbounds: Vec<serde_json::Value> = Vec::with_capacity(configs.len() + 1);
     let mut endpoints = Vec::new();
     let mut rules = Vec::with_capacity(configs.len());
-    let mut isolation = Vec::with_capacity(configs.len());
-    let mut outbound_tags = Vec::with_capacity(configs.len());
-    let mut requires_fork = false;
-    let mut requires_xray = false;
 
     for config in configs {
         let in_tag = inbound_tag(&config.id);
@@ -4089,20 +4047,9 @@ fn build_main_config(
                 "action": "route",
                 "outbound": built.serving_tag,
             }));
-            outbound_tags.push(built.serving_tag.clone());
-            isolation.push(IsolationEntry {
-                config_id: config.id.clone(),
-                inbound_tag: in_tag,
-                outbound_tag: built.serving_tag,
-            });
-            requires_fork |= built.requires_fork;
-            requires_xray |= built.requires_xray;
             continue;
         }
-        let (node, is_endpoint, fork_row) = build_standard_node(config, &mut params, &out_tag)?;
-        if fork_row {
-            requires_fork = true;
-        }
+        let (node, is_endpoint, _) = build_standard_node(config, &mut params, &out_tag)?;
         if is_endpoint {
             endpoints.push(node);
         } else {
@@ -4123,12 +4070,6 @@ fn build_main_config(
             "action": "route",
             "outbound": out_tag,
         }));
-        outbound_tags.push(out_tag.clone());
-        isolation.push(IsolationEntry {
-            config_id: config.id.clone(),
-            inbound_tag: in_tag,
-            outbound_tag: out_tag,
-        });
     }
     outbounds.push(serde_json::json!({"type": "direct", "tag": "direct"}));
 
@@ -4142,14 +4083,6 @@ fn build_main_config(
     validate_structure(&document)?;
     Ok(GeneratedConfig {
         json: serde_json::to_string(&document).expect("engine config serializes"),
-        inbound_tags: isolation
-            .iter()
-            .map(|entry| entry.inbound_tag.clone())
-            .collect(),
-        outbound_tags,
-        isolation,
-        requires_fork,
-        requires_xray,
     })
 }
 
@@ -4293,7 +4226,6 @@ pub trait EngineBackend {
 
     fn stop(&mut self);
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn is_running(&self) -> bool;
 
     fn poll_exit(&mut self) -> Option<String>;
@@ -5967,19 +5899,19 @@ impl EngineController {
         self.preset_rules = presets;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn crashed_shards(&self) -> Vec<String> {
         let mut shards: Vec<String> = self.crashed.iter().cloned().collect();
         shards.sort();
         shards
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_shard_crashed(&self, core: &str) -> bool {
         self.crashed.contains(core)
     }
@@ -6024,12 +5956,12 @@ impl EngineController {
             .collect()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn totals_stale(&self) -> bool {
         self.totals_stale
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn clear_totals_stale(&mut self) {
         self.totals_stale = false;
     }
@@ -6042,7 +5974,7 @@ impl EngineController {
             .collect()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn set_auto_restart(&mut self, config: AutoRestartConfig) {
         if !config.enabled {
             self.restart_attempts = 0;
@@ -6051,12 +5983,12 @@ impl EngineController {
         self.auto_restart = config;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn auto_restart(&self) -> &AutoRestartConfig {
         &self.auto_restart
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn restart_attempts(&self) -> u32 {
         self.restart_attempts
     }
@@ -6286,7 +6218,7 @@ impl EngineController {
             .position(|row| row.id == id)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn start_one(&mut self, config: &ProxyConfig) -> Result<(), EngineError> {
         self.start_one_inner(config, false)
     }
@@ -6360,7 +6292,6 @@ impl EngineController {
         Err(error)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stop_one(&mut self, id: &str) -> bool {
         let (removed, error) = self.stop_one_result(id);
         if let Some(error) = error {
@@ -6369,7 +6300,7 @@ impl EngineController {
         removed
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn start_all(&mut self, configs: &[ProxyConfig]) -> Result<(), EngineError> {
         self.start_all_inner(configs, false)
     }
@@ -7057,17 +6988,15 @@ impl EngineController {
         lines
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn running_ids(&self) -> Vec<String> {
         self.active.iter().map(|row| row.id.clone()).collect()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn running_count(&self) -> usize {
         self.active.len()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn clash_targets(&self) -> &[ClashTarget] {
         &self.clash
     }
@@ -7090,7 +7019,6 @@ impl EngineController {
             .collect();
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_running(&self, id: &str) -> bool {
         let Some(row) = self.active.iter().find(|row| row.id == id) else {
             return false;
@@ -7131,7 +7059,7 @@ impl EngineController {
         self.backend.is_running()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn status(&self) -> &EngineStatus {
         &self.status
     }
@@ -7146,12 +7074,12 @@ impl EngineController {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn isolation_map(&self) -> Vec<IsolationEntry> {
         self.active
             .iter()
@@ -7171,7 +7099,7 @@ impl EngineController {
             .collect()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn session_fingerprint(&self) -> SessionFingerprint {
         let mut binds: Vec<String> = self
             .active
@@ -7235,7 +7163,7 @@ pub fn lan_confirm_description(entries: &[(String, String)]) -> String {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn assert_no_system_mutation(config_json: &str) -> Result<(), String> {
     let document: serde_json::Value = serde_json::from_str(config_json)
         .map_err(|_| "generated config is not JSON".to_string())?;
@@ -7246,13 +7174,13 @@ pub fn assert_no_system_mutation(config_json: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub struct SessionFingerprint {
     pub binds: Vec<String>,
     pub config_hash: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn fnv1a_64(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in text.bytes() {
@@ -7335,18 +7263,18 @@ mod tests {
             assert!(tags.insert(inbound["tag"].as_str().unwrap().to_string()));
             assert!(ports.insert(inbound["listen_port"].as_u64().unwrap()));
         }
-        assert_eq!(generated.inbound_tags.len(), 3);
     }
 
     #[test]
     fn route_rules_isolate_each_endpoint_with_direct_final() {
-        let generated = generate(&three_standard()).expect("standard set generates");
+        let rows = three_standard();
+        let generated = generate(&rows).expect("standard set generates");
         let value = generated.value();
         let rules = value["route"]["rules"].as_array().expect("rules array");
         assert_eq!(rules.len(), 3);
-        for (entry, rule) in generated.isolation.iter().zip(rules.iter()) {
-            assert_eq!(rule["inbound"], json!([entry.inbound_tag.clone()]));
-            assert_eq!(rule["outbound"], json!(entry.outbound_tag));
+        for (row, rule) in rows.iter().zip(rules.iter()) {
+            assert_eq!(rule["inbound"], json!([inbound_tag(&row.id)]));
+            assert_eq!(rule["outbound"], json!(outbound_tag(&row.id)));
             assert_eq!(rule["action"], json!("route"));
         }
         assert_eq!(value["route"]["final"], json!("direct"));
@@ -7357,20 +7285,17 @@ mod tests {
             .filter_map(|node| node["tag"].as_str().map(str::to_string))
             .collect();
         assert!(outbound_tags.contains("direct"));
-        for entry in &generated.isolation {
+        for row in &rows {
+            let tag = outbound_tag(&row.id);
             if value["endpoints"]
                 .as_array()
                 .expect("endpoints array")
                 .iter()
-                .any(|node| node["tag"] == json!(entry.outbound_tag))
+                .any(|node| node["tag"].as_str() == Some(tag.as_str()))
             {
                 continue;
             }
-            assert!(
-                outbound_tags.contains(&entry.outbound_tag),
-                "outbound tag resolves: {}",
-                entry.outbound_tag
-            );
+            assert!(outbound_tags.contains(&tag), "outbound tag resolves: {tag}");
         }
     }
 
@@ -7390,8 +7315,7 @@ mod tests {
             .collect();
         assert!(!outbound_tags.contains(&outbound_tag("3")));
         assert_eq!(outbound_tags.len(), 3);
-        assert_eq!(generated.outbound_tags.len(), 3);
-        assert!(generated.outbound_tags.contains(&outbound_tag("1")));
+        assert!(outbound_tags.contains(&outbound_tag("1")));
     }
 
     #[test]
@@ -8175,13 +8099,14 @@ mod tests {
 
     #[test]
     fn t32_route_rules_use_inbound_array() {
-        let generated = generate(&three_standard()).expect("standard set generates");
+        let rows = three_standard();
+        let generated = generate(&rows).expect("standard set generates");
         let value = generated.value();
         let rules = value["route"]["rules"].as_array().expect("rules array");
         assert_eq!(rules.len(), 3);
-        for (entry, rule) in generated.isolation.iter().zip(rules.iter()) {
-            assert_eq!(rule["inbound"], json!([entry.inbound_tag]), "array form");
-            assert_eq!(rule["outbound"], json!(entry.outbound_tag));
+        for (row, rule) in rows.iter().zip(rules.iter()) {
+            assert_eq!(rule["inbound"], json!([inbound_tag(&row.id)]), "array form");
+            assert_eq!(rule["outbound"], json!(outbound_tag(&row.id)));
             assert_eq!(rule["action"], json!("route"));
         }
     }
@@ -8662,7 +8587,6 @@ mod tests {
         let configs = vec![awg_fixture("7", "AwgOne", params, 10807)];
         assert!(needs_fork(&configs[0]));
         let generated = generate(&configs).expect("AWG 2.0 generates");
-        assert!(generated.requires_fork);
         let value = generated.value();
         let endpoints = value["endpoints"].as_array().expect("endpoints array");
         assert_eq!(endpoints.len(), 1);
@@ -8675,7 +8599,13 @@ mod tests {
             endpoints[0].get("awg_version").is_none(),
             "no internal marker"
         );
-        assert_eq!(generated.isolation.len(), 1);
+        assert_eq!(
+            value["route"]["rules"]
+                .as_array()
+                .expect("rules array")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -8690,7 +8620,7 @@ mod tests {
         );
         let configs = vec![awg_fixture("7", "Awg31", params, 10807)];
         let generated = generate(&configs).expect("AWG 3.1 generates");
-        assert!(generated.requires_fork);
+        assert!(needs_fork(&configs[0]));
         let value = generated.value();
         assert_eq!(value["endpoints"][0]["RandomTrailers"], json!("on"));
     }
@@ -8805,7 +8735,6 @@ mod tests {
         )];
         assert!(needs_fork(&configs[0]));
         let generated = generate(&configs).expect("xhttp vless generates");
-        assert!(generated.requires_fork);
         let value = generated.value();
         let outbounds = value["outbounds"].as_array().expect("outbounds");
 
@@ -8831,8 +8760,6 @@ mod tests {
         for config in three_standard() {
             assert!(!needs_fork(&config), "stock needs no fork: {}", config.name);
         }
-        let generated = generate(&three_standard()).expect("standard set generates");
-        assert!(!generated.requires_fork);
     }
 
     #[test]
@@ -9026,7 +8953,6 @@ mod tests {
         assert_eq!(leg.egress_tag, xray_egress_tag("2"));
 
         let main = generate(&rows).expect("main config generates");
-        assert!(main.requires_xray);
         let value = main.value();
         let pointer = value["outbounds"]
             .as_array()
@@ -9042,9 +8968,16 @@ mod tests {
         );
 
         let sidecar = generate_xray_config(&plan.egresses).expect("sidecar generates");
-        assert_eq!(sidecar.ingress_tags, vec![xray_ingress_tag("2")]);
-        assert_eq!(sidecar.egress_tags, vec![xray_egress_tag("2")]);
         let xray = sidecar.value();
+        assert_eq!(xray["inbounds"][0]["tag"], json!(xray_ingress_tag("2")));
+        assert!(
+            xray["outbounds"]
+                .as_array()
+                .expect("xray outbounds")
+                .iter()
+                .any(|node| node["tag"] == json!(xray_egress_tag("2"))),
+            "egress tag present"
+        );
         let ingress = &xray["inbounds"][0];
         assert_eq!(ingress["listen"], json!("127.0.0.1"), "loopback hygiene");
         assert_eq!(ingress["port"], json!(leg.bridge_port));
@@ -9068,15 +9001,15 @@ mod tests {
         assert_eq!(rule["outboundTag"], json!(xray_egress_tag("2")));
 
         validate_bridges_present(&main.json, &plan.egresses).expect("pointers present");
-        assert_eq!(main.isolation.len(), 2, "each endpoint isolated");
-        for entry in &main.isolation {
+        assert_eq!(value["route"]["rules"].as_array().expect("rules").len(), 2);
+        for row in &rows {
             let rule = value["route"]["rules"]
                 .as_array()
                 .expect("rules")
                 .iter()
-                .find(|rule| rule["inbound"] == json!([entry.inbound_tag.clone()]))
+                .find(|rule| rule["inbound"] == json!([inbound_tag(&row.id)]))
                 .expect("rule per endpoint");
-            assert_eq!(rule["outbound"], json!(entry.outbound_tag));
+            assert_eq!(rule["outbound"], json!(outbound_tag(&row.id)));
         }
     }
 
@@ -9148,7 +9081,7 @@ mod tests {
             10809,
         )];
         let generated = generate(&rows).expect("custom merges");
-        assert!(!generated.requires_fork);
+        assert!(!needs_fork(&rows[0]));
         let node = generated.value()["outbounds"]
             .as_array()
             .expect("outbounds")
@@ -9899,7 +9832,6 @@ mod tests {
         assert!(is_ssh_protocol("SSH"));
         assert!(!needs_fork(&ssh_fixture("1", "SshOne", 10801)));
         let generated = generate(&[ssh_fixture("1", "SshOne", 10801)]).expect("ssh generates");
-        assert!(!generated.requires_fork, "native stock, not fork");
         let value = generated.value();
         let node = value["outbounds"]
             .as_array()
@@ -9933,9 +9865,9 @@ mod tests {
 
     #[test]
     fn ticket27_anytls_generates_native_stock_outbound() {
-        let generated =
-            generate(&[anytls_fixture("9", "AnyOne", 10809)]).expect("anytls generates");
-        assert!(!generated.requires_fork, "native stock, not fork");
+        let row = anytls_fixture("9", "AnyOne", 10809);
+        assert!(!needs_fork(&row), "native stock, not fork");
+        let generated = generate(std::slice::from_ref(&row)).expect("anytls generates");
         let value = generated.value();
         let node = value["outbounds"]
             .as_array()
@@ -9968,8 +9900,7 @@ mod tests {
         );
         assert!(!needs_fork(&row), "stock, not fork");
         let generated = generate(std::slice::from_ref(&row)).expect("direct generates");
-        assert!(!generated.requires_fork, "no fork");
-        assert!(!generated.requires_xray, "no bridge");
+        assert!(!needs_xray(&row), "no bridge");
         let value = generated.value();
         let node = value["outbounds"]
             .as_array()
@@ -9999,7 +9930,6 @@ mod tests {
         assert!(needs_fork(&noise_fixture("3", "NoiseOne", 10803)));
         let generated =
             generate(&[noise_fixture("3", "NoiseOne", 10803)]).expect("noise generates");
-        assert!(generated.requires_fork, "fork sidecar path");
         let value = generated.value();
         let node = value["outbounds"]
             .as_array()
@@ -10137,7 +10067,6 @@ mod tests {
         );
         assert_eq!(plan.main_rows.len(), 1);
         let generated = generate(&plan.main_rows).expect("stock generates");
-        assert!(!generated.requires_xray, "stock sidecar serves it");
         let node = t29_generated_node(&generated.value(), &outbound_tag("t29a"));
         assert_eq!(node["type"], json!("vless"));
         assert!(
@@ -10159,7 +10088,6 @@ mod tests {
         );
         assert!(!needs_xray(&row), "plain vless stays stock");
         let generated = generate(std::slice::from_ref(&row)).expect("plain generates");
-        assert!(!generated.requires_xray, "stock serves it");
         let node = t29_generated_node(&generated.value(), &outbound_tag("t29b"));
         assert_eq!(node["type"], json!("vless"));
         assert!(
@@ -10178,7 +10106,6 @@ mod tests {
             let row = t29_vless_row(id, "VlessFold", value, 19923);
             assert!(!needs_xray(&row), "{id} stays stock");
             let generated = generate(std::slice::from_ref(&row)).expect("stock generates");
-            assert!(!generated.requires_xray, "{id} served by stock");
             let node = t29_generated_node(&generated.value(), &outbound_tag(id));
             assert!(
                 !node.as_object().expect("object").contains_key("encryption"),
@@ -10213,7 +10140,6 @@ mod tests {
             "verbatim passthrough"
         );
         let generated = generate(std::slice::from_ref(&row)).expect("main generates");
-        assert!(generated.requires_xray, "main knows the bridge");
         let pointer = t29_generated_node(&generated.value(), &outbound_tag("t29x"));
         assert_eq!(pointer["type"], json!("socks"), "bridge pointer: {pointer}");
         assert_eq!(pointer["server"], json!("127.0.0.1"));

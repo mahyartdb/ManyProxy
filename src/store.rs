@@ -45,7 +45,7 @@ pub const AUTO_PORT_END: u16 = 10999;
 pub const AUTO_PORT_SPILL_START: u16 = 18081;
 pub const AUTO_PORT_SPILL_END: u16 = 18380;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub const AUTO_PORT_CAPACITY: usize = (AUTO_PORT_END - AUTO_PORT_START + 1) as usize
     + (AUTO_PORT_SPILL_END - AUTO_PORT_SPILL_START + 1) as usize;
 
@@ -53,13 +53,12 @@ pub fn auto_port_candidates() -> impl Iterator<Item = u16> {
     (AUTO_PORT_START..=AUTO_PORT_END).chain(AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_auto_port(port: u16) -> bool {
     (AUTO_PORT_START..=AUTO_PORT_END).contains(&port)
         || (AUTO_PORT_SPILL_START..=AUTO_PORT_SPILL_END).contains(&port)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub const SECRETS_AT_REST_NOTE: &str = "secrets at rest: row params DPAPI-sealed (user scope) plus user-only file permissions (0600/ACL); OS-keychain portability beyond DPAPI user scope is backlog";
 
 pub fn harden_file_permissions(path: &Path) {
@@ -169,7 +168,7 @@ pub const SUBSCRIPTION_TIMEOUT_SECS: u64 = 20;
 
 pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn subscription_fetch_policy_resolved(
     url: &str,
     resolved: &[std::net::IpAddr],
@@ -713,7 +712,6 @@ pub struct HealthHistoryEntry {
     pub error: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn map_health_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthHistoryEntry> {
     let latency_ms: Option<i64> = row.get(3)?;
     Ok(HealthHistoryEntry {
@@ -4100,7 +4098,6 @@ impl Store {
         Ok((good, quarantined))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn export_library_json_with_quarantine(&self) -> Result<(String, Vec<String>), StoreError> {
         let (rows, quarantined) = self.list_with_quarantine()?;
         let mut skipped: Vec<String> = quarantined.iter().map(|q| q.id.clone()).collect();
@@ -4477,7 +4474,7 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(config_id.to_string()))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn find_orphaned_preset_rows(&self) -> Result<Vec<ProxyConfig>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, protocol, params, grp, enabled, bind_ip, port,
@@ -4495,7 +4492,7 @@ impl Store {
         Ok(rows)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn detach_orphaned_presets(&mut self) -> Result<usize, StoreError> {
         let tx = self.conn.transaction()?;
         let cleared = tx.execute(
@@ -4626,7 +4623,7 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn add_preset_rule(
         &mut self,
         id: &str,
@@ -4654,7 +4651,7 @@ impl Store {
         Ok(preset)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn remove_preset_rule(
         &mut self,
         id: &str,
@@ -4704,20 +4701,6 @@ impl Store {
              FROM route_presets WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_preset_row)?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn get_preset_by_name(&self, name: &str) -> Result<Option<RoutePreset>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, source, source_url, rules_json, updated_at,
-                    description, is_builtin, last_used_at
-             FROM route_presets WHERE name = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![name], map_preset_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -5050,48 +5033,6 @@ impl Store {
         Ok(removed > 0)
     }
 
-    #[allow(dead_code)]
-    pub fn gc_tombstones(&mut self) -> Result<usize, StoreError> {
-        let live_ids: HashSet<String> = {
-            let mut stmt = self.conn.prepare("SELECT id FROM subscriptions")?;
-            let mapped = stmt.query_map([], |row| row.get::<_, i64>(0))?;
-            mapped
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect()
-        };
-        let live_urls: HashSet<String> = self
-            .list_subscriptions()?
-            .into_iter()
-            .map(|sub| sub.url)
-            .collect();
-        let tombs: Vec<(String, String, Option<String>)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT subscription_id, identity_key, subscription_url FROM subscription_tombstones",
-            )?;
-            let mapped = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })?;
-            mapped.collect::<Result<Vec<_>, _>>()?
-        };
-        let mut pruned = 0;
-        for (sub_id, key, url) in tombs {
-            let url_dead = url.as_deref().is_none_or(|url| !live_urls.contains(url));
-            if !live_ids.contains(&sub_id) && url_dead {
-                pruned += self.conn.execute(
-                    "DELETE FROM subscription_tombstones WHERE subscription_id = ?1 AND identity_key = ?2",
-                    params![sub_id, key],
-                )?;
-            }
-        }
-        Ok(pruned)
-    }
-
     pub fn record_subscription_error(
         &mut self,
         id: &str,
@@ -5112,7 +5053,7 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn refresh_with_bytes(
         &mut self,
         sub_id: &str,
@@ -5983,7 +5924,6 @@ impl Store {
         Ok(Some(path.to_path_buf()))
     }
 
-    #[allow(dead_code)]
     pub fn restore_library_json(&mut self, payload: &str) -> Result<RestoreOutcome, StoreError> {
         fn invalid(message: String) -> StoreError {
             StoreError::Invalid(vec![FieldError::new("export", message)])
@@ -6463,7 +6403,7 @@ impl Store {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn add_traffic(&mut self, id: &str, rx: u64, tx: u64) -> Result<(), StoreError> {
         let updated = self.add_traffic_batch(&[(id.to_string(), rx, tx)])?;
         if updated == 0 {
@@ -6565,7 +6505,7 @@ impl Store {
         Ok(changed)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn save_health_snapshot(&mut self, snapshot: &HealthSnapshot) -> Result<(), StoreError> {
         self.save_health_snapshots(std::slice::from_ref(snapshot))
     }
@@ -6629,7 +6569,7 @@ impl Store {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn append_health_history(
         &mut self,
         entries: &[HealthHistoryEntry],

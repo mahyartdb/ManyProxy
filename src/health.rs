@@ -26,7 +26,6 @@ pub fn probe_host() -> String {
 }
 
 const MAX_SAMPLES: usize = 10_000;
-#[cfg_attr(not(test), allow(dead_code))]
 const MAX_LOG_RECORDS: usize = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -778,7 +777,7 @@ pub fn test_all_stoppable(
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn ping_all_stoppable(
     configs: &[ProxyConfig],
     prober: &(dyn HealthProber + Sync),
@@ -807,7 +806,7 @@ pub fn test_group(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn ping_group(
     configs: &[ProxyConfig],
     prober: &(dyn HealthProber + Sync),
@@ -914,7 +913,7 @@ impl SpeedtestMode {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn from_label(label: &str) -> Option<SpeedtestMode> {
         match label.trim().to_ascii_lowercase().as_str() {
             "download" => Some(SpeedtestMode::Download),
@@ -1029,7 +1028,7 @@ pub fn sparkline_latencies(samples: &[(i64, Option<u64>)], limit: usize) -> Vec<
     latencies
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn parse_clash_totals(body: &str) -> Result<(u64, u64), String> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|_| "clash totals are not JSON".to_string())?;
@@ -1103,7 +1102,7 @@ pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
     Ok(out)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn is_probe_destination(dest: &str, probe_host: &str) -> bool {
     is_probe_destination_with_ips(dest, probe_host, &[])
 }
@@ -1241,7 +1240,7 @@ pub fn classify_health_cause(cause: &str) -> HealthCause {
     HealthCause::Egress
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn attribute_entries(
     entries: &[ClashConn],
     probe_host: &str,
@@ -1249,7 +1248,7 @@ pub fn attribute_entries(
     attribute_entries_with_ips(entries, probe_host, &[])
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn attribute_entries_with_ips(
     entries: &[ClashConn],
     probe_host: &str,
@@ -1327,7 +1326,7 @@ fn fetch_clash_body(
     Ok(String::from_utf8_lossy(&buf[end..]).into_owned())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn poll_clash_totals(
     port: u16,
     secret: &str,
@@ -1384,12 +1383,12 @@ impl TrafficSeenMap {
         self.inner.clear();
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -1637,7 +1636,7 @@ impl HealthStore {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn latest(&self, config_id: &str) -> Option<&HealthSample> {
         self.latest_filtered(config_id, None)
     }
@@ -1674,7 +1673,7 @@ impl HealthStore {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn prune_stale(&mut self, now: i64, max_age_secs: i64) {
         self.samples
             .retain(|sample| now.saturating_sub(sample.at) <= max_age_secs);
@@ -1703,7 +1702,7 @@ impl HealthStore {
         self.rebuild_latest_index();
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn mark_stale(&mut self, config_id: &str) {
         self.stale.insert(config_id.to_string());
     }
@@ -1849,7 +1848,7 @@ impl HealthStore {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatencyTone {
     Unknown,
@@ -1858,7 +1857,7 @@ pub enum LatencyTone {
     Poor,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn latency_tone(latency_ms: Option<u64>) -> LatencyTone {
     match latency_ms {
         None => LatencyTone::Unknown,
@@ -1868,7 +1867,7 @@ pub fn latency_tone(latency_ms: Option<u64>) -> LatencyTone {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn test_result_string(outcome: &TestOutcome) -> String {
     match (outcome.sample.latency_ms, outcome.sample.error.as_deref()) {
         (Some(ms), _) => format!("{ms}ms"),
@@ -1916,7 +1915,6 @@ fn has_any_word(lower: &str, words: &[&str]) -> bool {
     words.iter().any(|word| has_word(lower, word))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_level(line: &str) -> LogLevel {
     let lower = line.to_ascii_lowercase();
     if has_any_word(&lower, &["error", "errors", "fatal", "panic", "critical"]) {
@@ -2050,7 +2048,7 @@ fn is_crash_cause_line(message: &str) -> bool {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn tag_for_line(line: &str, active: &[ProxyConfig]) -> Option<String> {
     LogTagIndex::build(active).tag_for(line)
 }

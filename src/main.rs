@@ -7906,7 +7906,7 @@ fn row_action_message(verb: &str, name: &str) -> String {
     format!("{verb} \"{name}\"")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn import_preview_counts(text: &str, file_hint: Option<&str>) -> (usize, usize) {
     if text.trim().is_empty() {
         return (0, 0);
@@ -8712,7 +8712,7 @@ fn upstream_host_port(row: &ProxyConfig) -> Option<String> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn library_row_lines(
     row: &ProxyConfig,
     health: Option<&str>,
@@ -8720,32 +8720,6 @@ fn library_row_lines(
     traffic: Option<(u64, u64)>,
 ) -> Vec<String> {
     let upstream = upstream_host_port(row).unwrap_or_else(|| "no upstream".to_string());
-    let state = if row.enabled { "enabled" } else { "disabled" };
-    let mut lines = vec![
-        row.name.clone(),
-        format!("{} · {upstream}", row.protocol),
-        format!(
-            "{} · bind {}:{} · {state}",
-            row.group, row.bind_ip, row.port
-        ),
-        serving_badge(is_running, row.port, health),
-    ];
-    if let Some((rx, tx)) = traffic {
-        if let Some(summary) = traffic_summary_text(rx, tx) {
-            lines.push(summary);
-        }
-    }
-    lines
-}
-
-#[allow(dead_code)]
-fn library_row_lines_with_upstream(
-    row: &ProxyConfig,
-    upstream: &str,
-    health: Option<&str>,
-    is_running: bool,
-    traffic: Option<(u64, u64)>,
-) -> Vec<String> {
     let state = if row.enabled { "enabled" } else { "disabled" };
     let mut lines = vec![
         row.name.clone(),
@@ -8799,11 +8773,12 @@ fn library_row_full_route(row: &ProxyConfig, upstream: &str) -> String {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn library_row_matches(row: &ProxyConfig, query: &str) -> bool {
     library_row_matches_full(row, query, &MatchContext::empty())
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct MatchContext {
     sub_labels: HashMap<String, String>,
@@ -8812,13 +8787,15 @@ struct MatchContext {
     health: HashMap<String, String>,
 }
 
+#[cfg(test)]
 impl MatchContext {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn empty() -> Self {
         Self::default()
     }
 }
 
+#[cfg(test)]
 fn library_row_matches_full(row: &ProxyConfig, query: &str, ctx: &MatchContext) -> bool {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -8868,6 +8845,7 @@ fn library_row_matches_full(row: &ProxyConfig, query: &str, ctx: &MatchContext) 
     health_word.contains(&q)
 }
 
+#[cfg(test)]
 fn library_row_matches_base(row: &ProxyConfig, q: &str) -> bool {
     if row.name.to_lowercase().contains(q)
         || row.protocol.to_lowercase().contains(q)
@@ -8937,7 +8915,7 @@ fn traffic_summary_text(rx: u64, tx: u64) -> Option<String> {
     Some(format!("↓{} ↑{}", format_bytes(rx), format_bytes(tx)))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn traffic_status_text(total_rx: u64, total_tx: u64) -> Option<String> {
     traffic_summary_text(total_rx, total_tx).map(|summary| format!("traffic {summary}"))
 }
@@ -8958,7 +8936,7 @@ fn validate_params_json(text: &str) -> Result<(), String> {
         .map_err(|error| format!("params are not valid JSON: {error}"))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn first_import_failure_reason(text: &str, file_hint: Option<&str>) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -9006,7 +8984,7 @@ fn export_overwrite_confirm_description(path: &str) -> String {
     format!("\"{path}\" already exists. Overwrite it with the new export?")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn log_level_matches(level: LogLevel, filter: Option<LogLevel>) -> bool {
     match filter {
         None => true,
@@ -11374,7 +11352,6 @@ impl AppView {
         view
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn config_count(&self, cx: &App) -> usize {
         self.libraries.read(cx).delegate().counts().0
     }
@@ -11505,7 +11482,7 @@ impl AppView {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn commit_add(
         &mut self,
         input: NewConfig,
@@ -11661,7 +11638,6 @@ impl AppView {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn commit_edit(
         &mut self,
         id: &str,
@@ -12467,7 +12443,7 @@ impl AppView {
         Some(detail)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn restart_crashed_engines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let crashed = self.engine.crashed_shards();
         if crashed.is_empty() {
@@ -15495,7 +15471,7 @@ impl AppView {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn apply_log_filter(&mut self, filter: String, cx: &mut Context<Self>) {
         self.log_filter = filter;
         cx.notify();
@@ -17033,7 +17009,7 @@ impl AppView {
         window.push_notification(Notification::success(browse_read_message(&names)), cx);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn commit_import(
         &mut self,
         text: String,
@@ -17045,6 +17021,7 @@ impl AppView {
         self.commit_import_with_context(text, group, file_hint, None, None, window, cx)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn commit_import_with_context(
         &mut self,
@@ -19577,7 +19554,7 @@ impl AppView {
         self.reopen_subscriptions_if_open(window, cx);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn stop_background_ticks(&mut self) {
         self.ticks_enabled = false;
     }
@@ -19672,7 +19649,7 @@ impl AppView {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn tick_traffic_poll(&mut self, cx: &mut Context<Self>) -> usize {
         if !self.ticks_enabled {
             return 0;
@@ -21998,7 +21975,6 @@ impl AppView {
         }
     }
 
-    #[allow(dead_code)]
     fn spawn_commit_start_selected(&mut self, id: String, window: &Window, cx: &mut Context<Self>) {
         let handle = window.window_handle();
         let view = cx.entity().clone();
@@ -22015,7 +21991,6 @@ impl AppView {
         .detach();
     }
 
-    #[allow(dead_code)]
     fn spawn_commit_start_all(&mut self, window: &Window, cx: &mut Context<Self>) {
         let handle = window.window_handle();
         let view = cx.entity().clone();
@@ -22030,7 +22005,6 @@ impl AppView {
         .detach();
     }
 
-    #[allow(dead_code)]
     fn spawn_commit_bulk_start_ids(
         &mut self,
         ids: Vec<String>,
