@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1";
@@ -120,26 +120,20 @@ pub enum SubscriptionFetchPolicy {
     Block { reason: &'static str },
 }
 
-pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
-    const HTTP_WARN: &str =
-        "subscription uses plaintext http (tokens in the URL leak in plaintext; prefer https)";
-    const INTERNAL_BLOCK: &str =
-        "subscription targets an internal host (loopback/private/link-local are never fetched; import local files manually)";
-    let trimmed = url.trim();
+pub fn subscription_url_host(url: &str) -> Option<String> {
+    subscription_url_parts(url.trim()).map(|(_, host)| host.to_string())
+}
+
+fn subscription_url_parts(trimmed: &str) -> Option<(&'static str, &str)> {
     let (scheme, after) = match trimmed.get(..7) {
         Some(prefix) if prefix.eq_ignore_ascii_case("http://") => ("http", &trimmed[7..]),
         _ => match trimmed.get(..8) {
             Some(prefix) if prefix.eq_ignore_ascii_case("https://") => ("https", &trimmed[8..]),
-            _ => {
-                return SubscriptionFetchPolicy::Block {
-                    reason: "subscription url must use http(s)",
-                };
-            }
+            _ => return None,
         },
     };
     let authority = after.split('/').next().unwrap_or(after);
     let host_part = authority.rsplit('@').next().unwrap_or(authority);
-
     let host = if let Some(rest) = host_part.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {
@@ -147,10 +141,21 @@ pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
     };
     let host = host.trim();
     if host.is_empty() {
+        return None;
+    }
+    Some((scheme, host))
+}
+
+pub fn subscription_fetch_policy(url: &str) -> SubscriptionFetchPolicy {
+    const HTTP_WARN: &str =
+        "subscription uses plaintext http (tokens in the URL leak in plaintext; prefer https)";
+    const INTERNAL_BLOCK: &str =
+        "subscription targets an internal host (loopback/private/link-local are never fetched; import local files manually)";
+    let Some((scheme, host)) = subscription_url_parts(url.trim()) else {
         return SubscriptionFetchPolicy::Block {
             reason: "subscription url must use http(s)",
         };
-    }
+    };
     if is_internal_host(host) {
         return SubscriptionFetchPolicy::Block {
             reason: INTERNAL_BLOCK,
@@ -168,7 +173,6 @@ pub const SUBSCRIPTION_TIMEOUT_SECS: u64 = 20;
 
 pub const SUBSCRIPTION_MAX_REDIRECTS: usize = 5;
 
-#[cfg(test)]
 pub fn subscription_fetch_policy_resolved(
     url: &str,
     resolved: &[std::net::IpAddr],
@@ -182,7 +186,7 @@ pub fn subscription_fetch_policy_resolved(
             reason: "subscription host does not resolve (refusing to fetch blind)",
         };
     }
-    if resolved.iter().any(|ip| is_internal_host(&ip.to_string())) {
+    if resolved.iter().any(|ip| is_internal_ip(*ip)) {
         return SubscriptionFetchPolicy::Block {
             reason: "subscription resolves to an internal host (loopback/private/link-local are never fetched; import local files manually)",
         };
@@ -197,38 +201,95 @@ fn is_internal_host(host: &str) -> bool {
         return true;
     }
     if let Ok(ip) = bare.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => {
-                let octets = v4.octets();
-                v4.is_loopback()
-                    || v4.is_unspecified()
-                    || v4.is_link_local()
-                    || octets[0] == 10
-                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-                    || (octets[0] == 192 && octets[1] == 168)
-                    || octets[0] == 127
-            }
-            IpAddr::V6(v6) => {
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    let octets = mapped.octets();
-                    return mapped.is_loopback()
-                        || mapped.is_unspecified()
-                        || mapped.is_link_local()
-                        || octets[0] == 10
-                        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-                        || (octets[0] == 192 && octets[1] == 168)
-                        || octets[0] == 127;
-                }
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00
-            }
-        }
-    } else {
-        false
+        return is_internal_ip(ip);
     }
+    match parse_bare_ipv4(bare) {
+        Some(short) => is_internal_ip(IpAddr::V4(short)),
+        None => false,
+    }
+}
+
+fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_internal_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_internal_v4(mapped);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+fn is_internal_v4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_unspecified()
+        || v4.is_link_local()
+        || octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+        || octets[0] == 127
+}
+
+fn parse_bare_ipv4(host: &str) -> Option<Ipv4Addr> {
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | 'x' | 'X'))
+    {
+        return None;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let count = parts.len();
+    let mut addr: u32 = 0;
+    for (index, part) in parts.iter().enumerate() {
+        let value = parse_ipv4_part(part)?;
+        let (shift, bits) = if index + 1 == count {
+            (0, 8 * (4 - index))
+        } else {
+            (8 * (3 - index), 8)
+        };
+        let max = if bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << bits) - 1
+        };
+        if value > max {
+            return None;
+        }
+        addr |= value << shift;
+    }
+    Some(Ipv4Addr::from(addr))
+}
+
+fn parse_ipv4_part(part: &str) -> Option<u32> {
+    if part.is_empty() {
+        return None;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.starts_with('0') {
+        if !part.chars().all(|c| ('0'..='7').contains(&c)) {
+            return None;
+        }
+        return u32::from_str_radix(part, 8).ok();
+    }
+    if !part.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    part.parse::<u32>().ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2885,6 +2946,12 @@ pub struct RefreshOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupRenameOutcome {
+    pub rows: usize,
+    pub subscriptions: usize,
+}
+
 pub const DEFAULT_AUTO_REFRESH_SECS: i64 = 86_400;
 
 pub fn now_unix() -> i64 {
@@ -3510,6 +3577,13 @@ impl Store {
         Ok(backup)
     }
 
+    fn remove_restore_temp(tmp: &Path) {
+        let _ = std::fs::remove_file(tmp);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(sibling_sidecar(tmp, suffix));
+        }
+    }
+
     pub fn restore_library_file(
         db_path: &Path,
         payload: &str,
@@ -3547,10 +3621,8 @@ impl Store {
             _ => PathBuf::from(format!(".library.restore-{}", unique_name_suffix(now))),
         };
 
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(sibling_sidecar(&tmp, "-wal"));
-        let _ = std::fs::remove_file(sibling_sidecar(&tmp, "-shm"));
-        let outcome = {
+        Self::remove_restore_temp(&tmp);
+        let outcome = (|| -> Result<RestoreOutcome, StoreError> {
             let mut tmp_store = Store::open_with_path(
                 Connection::open(&tmp).map_err(StoreError::from)?,
                 Some(tmp.clone()),
@@ -3562,10 +3634,11 @@ impl Store {
                 .conn
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
             drop(tmp_store);
-            outcome
-        };
+            Ok(outcome)
+        })()
+        .inspect_err(|_| Self::remove_restore_temp(&tmp))?;
         swap_tmp_over_live(&tmp, db_path).map_err(|error| {
-            let _ = std::fs::remove_file(&tmp);
+            Self::remove_restore_temp(&tmp);
             StoreError::Io {
                 path: db_path.to_path_buf(),
                 message: error.to_string(),
@@ -3803,7 +3876,7 @@ impl Store {
                 out
             };
             for (sub_id, key) in rows {
-                let url: Option<String> = self
+                let stored: Option<String> = self
                     .conn
                     .query_row(
                         "SELECT url FROM subscriptions WHERE id = ?1",
@@ -3811,6 +3884,15 @@ impl Store {
                         |r| r.get(0),
                     )
                     .ok();
+                let url = match stored {
+                    Some(stored) if stored.trim_start().starts_with(crate::dpapi::MARKER) => {
+                        // A URL sealed for another user/machine must not abort
+                        // schema setup: skip this tombstone's backfill (leave
+                        // subscription_url NULL) instead of failing the open.
+                        Self::unseal_or_fail(&stored).ok()
+                    }
+                    other => other,
+                };
                 if let Some(url) = url {
                     let core = rotation_core_from_identity_key(&key);
                     self.conn.execute(
@@ -4217,7 +4299,7 @@ impl Store {
         Ok(out)
     }
 
-    pub fn rename_group(&mut self, old: &str, new: &str) -> Result<usize, StoreError> {
+    pub fn rename_group(&mut self, old: &str, new: &str) -> Result<GroupRenameOutcome, StoreError> {
         let old = normalized_group(old);
         let new = normalized_group(new);
         if new.is_empty() {
@@ -4231,7 +4313,7 @@ impl Store {
             params![new, old],
         )?;
 
-        self.conn.execute(
+        let moved_subs = self.conn.execute(
             "UPDATE subscriptions SET grp = ?1 WHERE grp = ?2",
             params![new, old],
         )?;
@@ -4244,7 +4326,10 @@ impl Store {
                     .execute("DELETE FROM meta WHERE key = ?1", params![old_key])?;
             }
         }
-        Ok(changed)
+        Ok(GroupRenameOutcome {
+            rows: changed,
+            subscriptions: moved_subs,
+        })
     }
 
     pub fn move_to_group(&mut self, ids: &[String], group: &str) -> Result<usize, StoreError> {
@@ -4288,6 +4373,19 @@ impl Store {
                 format!("Group \"{name}\" still holds {remaining} row(s); move them first"),
             )]));
         }
+        let subscriptions: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM subscriptions WHERE grp = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        if subscriptions > 0 {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "group",
+                format!(
+                    "Group \"{name}\" still holds {subscriptions} subscription(s); remove or regroup them first"
+                ),
+            )]));
+        }
         Ok(())
     }
 
@@ -4329,10 +4427,14 @@ impl Store {
     pub fn remove_duplicates_in_group(
         &mut self,
         group: &str,
+        skip: &HashSet<String>,
     ) -> Result<Vec<ProxyConfig>, StoreError> {
         let dupes = self.duplicate_rows_in_group(group)?;
         let mut removed = Vec::with_capacity(dupes.len());
         for row in dupes {
+            if skip.contains(&row.id) {
+                continue;
+            }
             if self.remove(&row.id)? {
                 removed.push(row);
             }
@@ -4357,10 +4459,14 @@ impl Store {
     pub fn remove_unavailable_in_group(
         &mut self,
         group: &str,
+        skip: &HashSet<String>,
     ) -> Result<Vec<ProxyConfig>, StoreError> {
         let dead = self.unavailable_rows_in_group(group)?;
         let mut removed = Vec::with_capacity(dead.len());
         for row in dead {
+            if skip.contains(&row.id) {
+                continue;
+            }
             if self.remove(&row.id)? {
                 removed.push(row);
             }
@@ -4376,10 +4482,17 @@ impl Store {
             .collect())
     }
 
-    pub fn remove_invalid_in_group(&mut self, group: &str) -> Result<Vec<ProxyConfig>, StoreError> {
+    pub fn remove_invalid_in_group(
+        &mut self,
+        group: &str,
+        skip: &HashSet<String>,
+    ) -> Result<Vec<ProxyConfig>, StoreError> {
         let bad = self.invalid_rows_in_group(group)?;
         let mut removed = Vec::with_capacity(bad.len());
         for row in bad {
+            if skip.contains(&row.id) {
+                continue;
+            }
             if self.remove(&row.id)? {
                 removed.push(row);
             }
@@ -6264,6 +6377,14 @@ impl Store {
         let mut sealed_sub_urls: Vec<String> = Vec::with_capacity(sub_rows.len());
         for sub in &sub_rows {
             if sub.url.trim_start().starts_with(crate::dpapi::MARKER) {
+                Self::unseal_or_fail(&sub.url).map_err(|error| {
+                    let what = if sub.label.trim().is_empty() {
+                        format!("subscription {}", sub.id)
+                    } else {
+                        format!("subscription \"{}\"", sub.label)
+                    };
+                    invalid(format!("{what} has an unsealable url ({error})"))
+                })?;
                 sealed_sub_urls.push(sub.url.clone());
             } else {
                 sealed_sub_urls.push(Self::seal_or_fail(&sub.url)?);
@@ -6560,8 +6681,10 @@ impl Store {
         latency_ms: Option<u64>,
         error: Option<&str>,
     ) -> Result<(), String> {
-        if kind != "url-test" && kind != "tcp-ping" {
-            return Err(format!("bad health kind '{kind}' (want url-test|tcp-ping)"));
+        if kind != "url-test" && kind != "tcp-ping" && kind != "speed-test" {
+            return Err(format!(
+                "bad health kind '{kind}' (want url-test|tcp-ping|speed-test)"
+            ));
         }
         match (latency_ms, error) {
             (Some(_), None) | (None, Some(_)) => Ok(()),
@@ -7092,7 +7215,9 @@ mod tests {
         let mut c = valid_input("C");
         c.group = "g2".to_string();
         store.add_batch(vec![a, b, c]).expect("adds work");
-        assert_eq!(store.rename_group("g1", "team").expect("rename works"), 2);
+        let renamed = store.rename_group("g1", "team").expect("rename works");
+        assert_eq!(renamed.rows, 2);
+        assert_eq!(renamed.subscriptions, 0);
         let groups: std::collections::HashMap<String, usize> = store
             .group_counts()
             .expect("counts work")
@@ -7101,12 +7226,10 @@ mod tests {
         assert_eq!(groups.get("team"), Some(&2));
         assert_eq!(groups.get("g2"), Some(&1));
         assert!(!groups.contains_key("g1"));
-        assert_eq!(
-            store
-                .rename_group("missing", "x")
-                .expect("missing renames zero"),
-            0
-        );
+        let missing = store
+            .rename_group("missing", "x")
+            .expect("missing renames zero");
+        assert_eq!(missing, GroupRenameOutcome::default());
         let error = store
             .rename_group("team", "   ")
             .expect_err("empty rename must fail");
@@ -7218,6 +7341,207 @@ mod tests {
             .delete_group("empty-label")
             .expect("empty group deletes clean");
         assert_eq!(store.list().expect("list works").len(), 1);
+    }
+
+    #[test]
+    fn bug14_delete_group_refuses_while_subscriptions_remain() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "news");
+        let error = store
+            .delete_group("news")
+            .expect_err("sub-only delete refuses");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error}");
+        };
+        assert!(
+            fields
+                .iter()
+                .any(|e| e.message.contains("1 subscription(s)")),
+            "refusal names the subscription count: {fields:?}"
+        );
+        assert_eq!(
+            store
+                .get_subscription(&sub.id)
+                .expect("get works")
+                .expect("sub kept")
+                .group,
+            "news",
+            "refused delete leaves the subscription"
+        );
+
+        let mut a = valid_input("A");
+        a.group = "news".to_string();
+        store.add(a).expect("add works");
+        assert!(
+            store.delete_group("news").is_err(),
+            "mixed group (row + subscription) refuses"
+        );
+
+        store
+            .delete_group("empty-label")
+            .expect("truly empty group deletes clean");
+        assert_eq!(store.list().expect("list works").len(), 1);
+    }
+
+    #[test]
+    fn bug19_rename_group_counts_subscriptions() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "news");
+        let outcome = store.rename_group("news", "feed").expect("rename works");
+        assert_eq!(
+            outcome,
+            GroupRenameOutcome {
+                rows: 0,
+                subscriptions: 1
+            },
+            "sub-only rename reports the moved subscription"
+        );
+        let moved = store
+            .get_subscription(&sub.id)
+            .expect("get works")
+            .expect("sub kept");
+        assert_eq!(moved.group, "feed", "subscription follows rename");
+
+        let mut a = valid_input("A");
+        a.group = "feed".to_string();
+        store.add(a).expect("add works");
+        let mixed = store
+            .rename_group("feed", "team")
+            .expect("mixed rename works");
+        assert_eq!(
+            mixed,
+            GroupRenameOutcome {
+                rows: 1,
+                subscriptions: 1
+            }
+        );
+    }
+
+    #[test]
+    fn bug23_restore_rejects_unsealable_sealed_subscription_url() {
+        use base64::Engine as _;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sealed = crate::dpapi::seal_params("https://example.com/feed.txt").expect("seal works");
+        let good = format!(
+            r#"{{"outbounds":[],"library":[],"subscriptions":[{{"id":"1","label":"Good","url":"{sealed}"}}],"tombstones":[],"route_presets":[],"meta":{{}}}}"#
+        );
+        store
+            .restore_library_json(&good)
+            .expect("valid sealed url restores");
+        let subs = store.list_subscriptions().expect("list works");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].url, "https://example.com/feed.txt", "round-trips");
+
+        let foreign = format!(
+            "dpapi1:{}",
+            base64::engine::general_purpose::STANDARD.encode([0xabu8; 64])
+        );
+        let bad = format!(
+            r#"{{"outbounds":[],"library":[],"subscriptions":[{{"id":"2","label":"Nightly","url":"{foreign}"}}],"tombstones":[],"route_presets":[],"meta":{{}}}}"#
+        );
+        let error = store
+            .restore_library_json(&bad)
+            .expect_err("foreign sealed url refuses");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error}");
+        };
+        assert!(
+            fields.iter().any(|e| e.message.contains("Nightly")),
+            "refusal names the subscription: {fields:?}"
+        );
+        assert_eq!(
+            store.list_subscriptions().expect("list works").len(),
+            1,
+            "failed restore writes nothing"
+        );
+    }
+
+    #[test]
+    fn bug24_tombstone_backfill_unseals_stored_url() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "news");
+        let stored: String = store
+            .conn
+            .query_row(
+                "SELECT url FROM subscriptions WHERE id = ?1",
+                rusqlite::params![sub.id.parse::<i64>().expect("id parses")],
+                |r| r.get(0),
+            )
+            .expect("stored url reads");
+        assert!(
+            stored.trim_start().starts_with(crate::dpapi::MARKER),
+            "v6 stores the url sealed"
+        );
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO subscription_tombstones
+                   (subscription_id, identity_key, subscription_url, rotation_core)
+                 VALUES (?1, 'k', NULL, NULL)",
+                rusqlite::params![sub.id],
+            )
+            .expect("null-url tombstone plants");
+        store.create_schema().expect("re-run backfills");
+
+        let backfilled: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT subscription_url FROM subscription_tombstones WHERE identity_key = 'k'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("backfilled url reads");
+        assert_eq!(
+            backfilled.as_deref(),
+            Some(sub.url.as_str()),
+            "backfill unseals the url for URL-keyed matching"
+        );
+        let matched: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM subscription_tombstones
+                 WHERE subscription_id = ?1 OR subscription_url = ?2",
+                rusqlite::params!["99999", sub.url],
+                |r| r.get(0),
+            )
+            .expect("match query runs");
+        assert_eq!(matched, 1, "tombstone matching hits by unsealed url");
+    }
+
+    #[test]
+    fn bug24_foreign_sealed_url_skips_backfill_without_aborting() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "news");
+        store
+            .conn
+            .execute(
+                "UPDATE subscriptions SET url = 'dpapi1:!!!' WHERE id = ?1",
+                rusqlite::params![sub.id.parse::<i64>().expect("id parses")],
+            )
+            .expect("foreign seal planted");
+        store
+            .conn
+            .execute(
+                "INSERT INTO subscription_tombstones
+                   (subscription_id, identity_key, subscription_url, rotation_core)
+                 VALUES (?1, 'foreign', NULL, NULL)",
+                rusqlite::params![sub.id],
+            )
+            .expect("null-url tombstone plants");
+
+        store
+            .create_schema()
+            .expect("an unreadable url never aborts schema setup");
+        let backfilled: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT subscription_url FROM subscription_tombstones WHERE identity_key = 'foreign'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("tombstone reads");
+        assert!(backfilled.is_none(), "backfill is skipped, url stays NULL");
     }
 
     #[test]
@@ -8589,7 +8913,9 @@ mod tests {
         assert!(confirm.contains("\"g\""), "names scope: {confirm}");
         assert!(confirm.contains('1'), "names count: {confirm}");
         assert!(confirm.contains("A2"), "previews names: {confirm}");
-        let removed = store.remove_duplicates_in_group("g").expect("prune works");
+        let removed = store
+            .remove_duplicates_in_group("g", &std::collections::HashSet::new())
+            .expect("prune works");
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].id, a2.id);
         let kept: Vec<String> = store
@@ -8648,7 +8974,7 @@ mod tests {
         let confirm = prune_unavailable_confirm_text("default", found.len());
         assert!(confirm.contains("\"default\""), "names scope: {confirm}");
         let removed = store
-            .remove_unavailable_in_group("default")
+            .remove_unavailable_in_group("default", &std::collections::HashSet::new())
             .expect("prune works");
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].id, dead.id);
@@ -8706,7 +9032,7 @@ mod tests {
         let confirm = prune_invalid_confirm_text("default", found.len());
         assert!(confirm.contains("\"default\""), "names scope: {confirm}");
         let removed = store
-            .remove_invalid_in_group("default")
+            .remove_invalid_in_group("default", &std::collections::HashSet::new())
             .expect("prune works");
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].id, bad_id);
@@ -10093,6 +10419,78 @@ mod tests {
         store
             .add_subscription("Plain", "http://example.com/sub.txt", "g", true)
             .expect("http add allowed");
+    }
+
+    #[test]
+    fn bug03_short_form_ip_literals_classify_as_internal() {
+        for host in [
+            "127.1",
+            "0x7f000001",
+            "2130706433",
+            "0177.0.0.1",
+            "127.0.0.1",
+            "0x7f.0.0.1",
+            "localhost",
+            "app.localhost",
+            "0.0.0.0",
+            "169.254.9.9",
+            "10.1.2.3",
+            "192.168.0.9",
+            "172.31.255.1",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(is_internal_host(host), "internal: {host}");
+        }
+        for host in [
+            "8.8.8.8",
+            "93.184.216.34",
+            "example.com",
+            "beef.example",
+            "172.32.0.1",
+            "192.169.0.1",
+        ] {
+            assert!(!is_internal_host(host), "public: {host}");
+        }
+    }
+
+    #[test]
+    fn bug03_short_form_literal_urls_rejected_at_storage() {
+        for url in [
+            "http://127.1:8080/x",
+            "http://2130706433/x",
+            "http://0x7f000001/x",
+            "http://0177.0.0.1/x",
+            "https://127.1/x",
+        ] {
+            assert!(
+                Store::validated_subscription_url(url).is_err(),
+                "rejected: {url}"
+            );
+        }
+        for url in [
+            "https://8.8.8.8/x",
+            "https://example.com/x",
+            "http://example.com/x",
+        ] {
+            assert!(
+                Store::validated_subscription_url(url).is_ok(),
+                "accepted: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn bug03_subscription_url_host_unwraps_brackets_and_userinfo() {
+        assert_eq!(
+            subscription_url_host("https://user:pw@[::1]:8443/x").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(
+            subscription_url_host("https://example.com:443/x").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(subscription_url_host("ftp://example.com/x"), None);
     }
 
     #[test]
@@ -13931,6 +14329,73 @@ mod tests {
     }
 
     #[test]
+    fn bug22_rejected_restore_leaves_no_restore_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-bug22store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        Store::open_file(&path).expect("live opens");
+
+        let error = Store::restore_library_file(&path, "not-json", now_unix())
+            .expect_err("garbage payload rejected");
+        assert!(
+            matches!(error, StoreError::Invalid(_)),
+            "Invalid, got {error}"
+        );
+
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir works")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".restore-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no restore temp next to the db, got {leftovers:?}"
+        );
+        Store::open_file(&path).expect("live db still opens");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bug22_restore_temp_cleanup_removes_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-bug22tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let tmp = dir.join(".library.db.restore-999-1-0");
+        let keep = dir.join("keep.txt");
+        std::fs::write(&tmp, "db").expect("tmp written");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            std::fs::write(sibling_sidecar(&tmp, suffix), "sidecar").expect("sidecar written");
+        }
+        std::fs::write(&keep, "keep").expect("bystander written");
+
+        Store::remove_restore_temp(&tmp);
+
+        assert!(!tmp.exists(), "restore temp removed");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !sibling_sidecar(&tmp, suffix).exists(),
+                "sidecar {suffix} removed"
+            );
+        }
+        assert!(keep.exists(), "unrelated file kept");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn export_skips_row_with_bad_synced_params() {
         let mut store = Store::open_in_memory().expect("in-memory store opens");
         let good = store.add(valid_input("Good")).expect("add works");
@@ -13971,7 +14436,8 @@ mod tests {
         assert_eq!(
             store
                 .rename_group("  g1  ", "  team  ")
-                .expect("padded rename works"),
+                .expect("padded rename works")
+                .rows,
             1,
             "old and new both trim"
         );
