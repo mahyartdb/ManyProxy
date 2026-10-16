@@ -38,7 +38,6 @@ Name and window title: ManyProxy (single branding seam, `APP_TITLE`). Voice: hon
 
 - `README.md`, including the claim → code map table (audit anchor for toolbar, defaults, formats, toasts, subscriptions, endpoints, health, export, missing-binary/LAN/no-mutation behavior).
 - `QUICKSTART-RUN.md` scenarios A–D: manual live-egress and snapshot-diff verification procedure.
-- `assets/screenshots/library.png`, `add-dialog.png`, `import-dialog.png`, `subscriptions-dialog.png` — live captures on the one-line-rows build (retaken 2026-10-15 on the seeded `*.example.com` demo library; row-columns visible: leading check-chips, upstream column, no meta/badge lines).
 - Test suite: 804 unit tests including `assert_no_system_mutation` scans and import-grammar coverage.
 - Absences future work must not fabricate: no testimonials, customers, benchmarks, pricing, or licensing claims exist.
 

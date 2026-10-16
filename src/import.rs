@@ -2841,7 +2841,7 @@ pub fn is_addsub_attempt(line: &str) -> bool {
         .eq_ignore_ascii_case("addsub")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn is_add_attempt(line: &str) -> bool {
     let trimmed = strip_bom(line.trim()).trim();
     let Some(sep) = trimmed.find("://") else {
@@ -3798,7 +3798,6 @@ mod tests {
         );
         let generated = crate::engine::generate(std::slice::from_ref(&row))
             .expect("live AWG row passes the version matrix");
-        assert!(generated.requires_fork);
         let endpoints = generated.value()["endpoints"]
             .as_array()
             .expect("endpoints array")

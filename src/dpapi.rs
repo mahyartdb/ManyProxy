@@ -183,7 +183,7 @@ thread_local! {
     static FAIL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn set_fail_for_test(fail: bool) {
     FAIL_FOR_TEST.with(|flag| flag.set(fail));
 }
