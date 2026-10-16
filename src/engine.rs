@@ -140,11 +140,11 @@ pub fn custom_config_listens(document: &serde_json::Value) -> Vec<(String, u16)>
             .and_then(serde_json::Value::as_u64)
             .filter(|port| (1..=65_535).contains(port))
             .map(|port| port as u16);
-        let bind = node
-            .get("listen")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        if let (Some(bind), Some(port)) = (bind, port) {
+        let bind = match node.get("listen").and_then(serde_json::Value::as_str) {
+            Some(text) if !text.trim().is_empty() => text.to_string(),
+            _ => WILDCARD_LISTEN.to_string(),
+        };
+        if let Some(port) = port {
             out.push((bind, port));
         }
     }
@@ -169,6 +169,8 @@ fn clash_target_from_served(core: &str, json: &str) -> Option<ClashTarget> {
         secret,
     })
 }
+
+const WILDCARD_LISTEN: &str = "0.0.0.0";
 
 pub const XRAY_BRIDGE_PORT_START: u16 = 11801;
 pub const XRAY_BRIDGE_PORT_END: u16 = 11999;
@@ -1005,16 +1007,19 @@ fn params_object(
         })
 }
 
-fn json_port_valid(value: &serde_json::Value) -> bool {
+fn json_port_from_value(value: &serde_json::Value) -> Option<u16> {
     match value {
         serde_json::Value::Number(number) => number
             .as_u64()
-            .is_some_and(|port| (1..=65_535).contains(&port)),
-        serde_json::Value::String(text) => {
-            text.trim().parse::<u16>().ok().is_some_and(|port| port > 0)
-        }
-        _ => false,
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port > 0),
+        serde_json::Value::String(text) => text.trim().parse::<u16>().ok().filter(|port| *port > 0),
+        _ => None,
     }
+}
+
+fn json_port_valid(value: &serde_json::Value) -> bool {
+    json_port_from_value(value).is_some()
 }
 
 fn str_field<'a>(
@@ -1523,10 +1528,11 @@ pub fn generate_xray_config(egresses: &[XrayEgress]) -> Result<GeneratedXrayConf
                     field: "server",
                 })?;
             check_egress_not_loopback(&egress.owner, server, "xray egress")?;
-            let server_port = match egress.params.get("server_port") {
-                Some(serde_json::Value::Number(number)) => number.as_u64().unwrap_or(0) as u16,
-                _ => 0,
-            };
+            let server_port = egress
+                .params
+                .get("server_port")
+                .and_then(json_port_from_value)
+                .unwrap_or(0);
             let uuid = egress
                 .params
                 .get("uuid")
@@ -1820,6 +1826,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
 
     let mut extras: Vec<ProxyConfig> = Vec::new();
     let mut replacements: Vec<(OwningCore, String)> = Vec::new();
+    let mut replacement_owner: Vec<(OwningCore, String)> = Vec::new();
     let mut bridge_keys: Vec<String> = Vec::new();
     for config in configs {
         let params = params_object(config)?;
@@ -1847,6 +1854,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                 });
             }
             replacements.push((core, document.to_string()));
+            replacement_owner.push((core, config.name.clone()));
         } else if is_xray_protocol(&config.protocol) || vless_needs_xray(&config.protocol, &params)
         {
             check_wrong_layer(&config.name, &config.protocol, &params)?;
@@ -2008,6 +2016,24 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
                     egress_tag: format!("{}-hop-{index}", xray_egress_tag(&config.id)),
                 });
             }
+        }
+    }
+
+    for (core, name) in &replacement_owner {
+        let siblings = match core {
+            OwningCore::Stock => main_rows.len(),
+            OwningCore::Fork => fork_rows.len(),
+            OwningCore::Xray => egresses.len(),
+        };
+        if siblings > 0 {
+            return Err(EngineError::BadCustom {
+                name: name.clone(),
+                field: "core".to_string(),
+                detail: format!(
+                    "custom config for {} also claims {siblings} row(s); stop or move them",
+                    core.as_str()
+                ),
+            });
         }
     }
 
@@ -2705,6 +2731,7 @@ fn reject_unknown_params(
     canonical: &str,
     params: &serde_json::Map<String, serde_json::Value>,
     allowed: &[&str],
+    tolerate_near_miss: bool,
 ) -> Result<(), EngineError> {
     let mut keys: Vec<&String> = params.keys().collect();
     keys.sort();
@@ -2713,6 +2740,12 @@ fn reject_unknown_params(
             continue;
         }
         if allowed.contains(&key.as_str()) || DIAL_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        // vless/vmess/trojan tolerate near-miss keys (the typo hint warns) so a
+        // legitimate schema the importer accepts is never a hard failure; strict
+        // protocols keep the pre-existing hard rejection.
+        if tolerate_near_miss && suggest_param_key(key).is_some() {
             continue;
         }
         return Err(bad_option(
@@ -3019,6 +3052,30 @@ fn translate_outbound(
             apply_transport(name, params)?;
 
             apply_mux(name, params)?;
+
+            let allowed: &[&str] = if canonical == "vless" {
+                // `password`/`token` are importer credential keys the library tolerates
+                // on vless rows; every other key must map to a sing-box 1.14.2 field.
+                &[
+                    "uuid",
+                    "flow",
+                    "tls",
+                    "transport",
+                    "multiplex",
+                    "packet_encoding",
+                    "password",
+                    "token",
+                ]
+            } else {
+                &[
+                    "password",
+                    "tls",
+                    "transport",
+                    "multiplex",
+                    "packet_encoding",
+                ]
+            };
+            reject_unknown_params(name, canonical, params, allowed, true)?;
         }
         "vmess" => {
             if params.get("tls").is_some_and(|tls| tls.is_boolean()) {
@@ -3101,6 +3158,23 @@ fn translate_outbound(
             apply_transport(name, params)?;
 
             apply_mux(name, params)?;
+
+            reject_unknown_params(
+                name,
+                "vmess",
+                params,
+                &[
+                    "uuid",
+                    "alter_id",
+                    "security",
+                    "tls",
+                    "transport",
+                    "multiplex",
+                    "packet_encoding",
+                    "encryption",
+                ],
+                true,
+            )?;
         }
         "tuic" | "hysteria" | "anytls" => {
             apply_tls(name, params, &server, true, true)?;
@@ -3215,6 +3289,7 @@ fn translate_outbound(
                         "heartbeat",
                         "tls",
                     ],
+                    false,
                 )?;
             }
         }
@@ -3343,6 +3418,7 @@ fn translate_outbound(
                     "realm",
                     "tls",
                 ],
+                false,
             )?;
         }
         "socks" => {
@@ -3383,6 +3459,7 @@ fn translate_outbound(
                 "socks",
                 params,
                 &["username", "password", "network", "udp_over_tcp"],
+                false,
             )?;
         }
         "http" => {
@@ -3432,6 +3509,7 @@ fn translate_outbound(
                 "http",
                 params,
                 &["username", "password", "path", "headers", "tls"],
+                false,
             )?;
         }
         "naive" => {
@@ -3483,6 +3561,7 @@ fn translate_outbound(
                     "quic",
                     "quic_congestion_control",
                 ],
+                false,
             )?;
         }
         "snell" => {
@@ -3540,6 +3619,7 @@ fn translate_outbound(
                     "obfs_host",
                     "mode",
                 ],
+                false,
             )?;
         }
         "shadowtls" => {
@@ -3584,7 +3664,13 @@ fn translate_outbound(
                 }
             }
             drop_foreign_flats(params, &["version", "password", "tls"]);
-            reject_unknown_params(name, "shadowtls", params, &["version", "password", "tls"])?;
+            reject_unknown_params(
+                name,
+                "shadowtls",
+                params,
+                &["version", "password", "tls"],
+                false,
+            )?;
         }
         "ssh" => {
             if params.get("user").is_none() {
@@ -4968,7 +5054,7 @@ pub struct AutoRestartConfig {
 impl Default for AutoRestartConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_retries: 3,
             base_backoff_secs: 5,
         }
@@ -5242,7 +5328,9 @@ fn push_pipe_line(buffer: &Arc<Mutex<(u64, VecDeque<String>)>>, expected_gen: u6
         }
         Err(poison) => {
             let mut slot = poison.into_inner();
-            slot.0 = expected_gen;
+            if slot.0 != expected_gen {
+                return;
+            }
             if !slot.1.back().is_some_and(|last| last == LOG_POISON_NOTICE) {
                 if slot.1.len() >= LOG_PIPE_BUFFER {
                     slot.1.pop_front();
@@ -5423,10 +5511,10 @@ impl EngineBackend for RealEngineBackend {
             .arg("check")
             .arg("-c")
             .arg(&path)
-            .output()
-            .map_err(|error| format!("engine check could not run ({error})"))?;
-
+            .output();
         self.remove_config_file();
+        let output = output.map_err(|error| format!("engine check could not run ({error})"))?;
+
         if output.status.success() {
             Ok(())
         } else {
@@ -5716,6 +5804,8 @@ pub struct EngineController {
 
     crashed: HashSet<String>,
 
+    pending_crash: Option<String>,
+
     totals_stale: bool,
 
     auto_restart: AutoRestartConfig,
@@ -5787,6 +5877,7 @@ impl EngineController {
             clash: Vec::new(),
             generation: 0,
             crashed: HashSet::new(),
+            pending_crash: None,
             totals_stale: false,
             auto_restart: AutoRestartConfig::default(),
             restart_attempts: 0,
@@ -5856,6 +5947,7 @@ impl EngineController {
             clash: Vec::new(),
             generation: 0,
             crashed: HashSet::new(),
+            pending_crash: None,
             totals_stale: false,
             auto_restart: AutoRestartConfig::default(),
             restart_attempts: 0,
@@ -5974,7 +6066,6 @@ impl EngineController {
             .collect()
     }
 
-    #[cfg(test)]
     pub fn set_auto_restart(&mut self, config: AutoRestartConfig) {
         if !config.enabled {
             self.restart_attempts = 0;
@@ -5983,7 +6074,6 @@ impl EngineController {
         self.auto_restart = config;
     }
 
-    #[cfg(test)]
     pub fn auto_restart(&self) -> &AutoRestartConfig {
         &self.auto_restart
     }
@@ -5991,6 +6081,20 @@ impl EngineController {
     #[cfg(test)]
     pub fn restart_attempts(&self) -> u32 {
         self.restart_attempts
+    }
+
+    /// The most recent crash cause, retained until a notification or restart
+    /// handles it so a later `reload` can still surface it after the tick drained
+    /// the backend's one-shot exit event.
+    pub fn pending_crash(&self) -> Option<String> {
+        if self.active.is_empty() {
+            return None;
+        }
+        self.pending_crash.clone()
+    }
+
+    pub fn clear_pending_crash(&mut self) {
+        self.pending_crash = None;
     }
 
     pub fn auto_restart_due(&self, now: Instant) -> bool {
@@ -6018,10 +6122,27 @@ impl EngineController {
     }
 
     pub fn note_restart_success(&mut self) {
-        self.restart_attempts = 0;
-        self.last_restart_attempt = None;
         self.crashed.clear();
+        self.pending_crash = None;
         self.totals_stale = false;
+    }
+
+    /// Resets the retry budget only once a shard has stayed continuously up for
+    /// at least `base_backoff_secs` after its last restart attempt. A successful
+    /// `apply()` only proves a spawn, so a core that crashes again immediately
+    /// keeps its attempts and the backoff escalates until `max_retries`.
+    pub fn settle_restart_budget(&mut self, now: Instant) {
+        if self.restart_attempts == 0 || !self.crashed.is_empty() {
+            return;
+        }
+        let steady = Duration::from_secs(self.auto_restart.base_backoff_secs.max(1));
+        if self
+            .last_restart_attempt
+            .is_some_and(|last| now.saturating_duration_since(last) >= steady)
+        {
+            self.restart_attempts = 0;
+            self.last_restart_attempt = None;
+        }
     }
 
     pub fn restart_crashed(&mut self) -> Result<(), EngineError> {
@@ -6069,6 +6190,56 @@ impl EngineController {
                     self.served_extra[index] = None;
                 }
             }
+        }
+    }
+
+    fn shard_of_row_exists(&self, shard: &str) -> bool {
+        self.active
+            .iter()
+            .any(|row| self.shard_of_row(row) == shard)
+    }
+
+    fn shard_backend_running(&self, shard: &str) -> bool {
+        if let Some(id) = shard.strip_prefix("extra-") {
+            let extra_ids: Vec<&String> = self
+                .active
+                .iter()
+                .filter(|row| is_extra_core_protocol(&row.protocol))
+                .map(|row| &row.id)
+                .collect();
+            let index = extra_ids
+                .iter()
+                .position(|known| known.as_str() == id)
+                .or_else(|| id.parse::<usize>().ok());
+            return index
+                .and_then(|index| self.extra_backends.get(index))
+                .is_some_and(|slot| slot.is_running());
+        }
+        match shard {
+            "stock" => self.backend.is_running(),
+            "fork" => self.fork_backend.is_running(),
+            "xray" => self.xray_backend.is_running(),
+            _ => false,
+        }
+    }
+
+    /// Drops crash state for shards that a successful `apply()` has resolved:
+    /// either the core is serving again, or no active row targets it anymore.
+    fn reap_recovered_crashes(&mut self) {
+        if self.crashed.is_empty() {
+            return;
+        }
+        let recovered: Vec<String> = self
+            .crashed
+            .iter()
+            .filter(|shard| !self.shard_of_row_exists(shard) || self.shard_backend_running(shard))
+            .cloned()
+            .collect();
+        for shard in recovered {
+            self.crashed.remove(&shard);
+        }
+        if self.crashed.is_empty() {
+            self.pending_crash = None;
         }
     }
 
@@ -6369,6 +6540,10 @@ impl EngineController {
             self.clear_clash_secrets();
             self.status = EngineStatus::Stopped;
             self.last_config_json = None;
+            self.crashed.clear();
+            self.pending_crash = None;
+            self.restart_attempts = 0;
+            self.last_restart_attempt = None;
             return Ok(());
         }
 
@@ -6898,6 +7073,7 @@ impl EngineController {
 
         self.sync_clash_from_served();
         self.last_error = None;
+        self.reap_recovered_crashes();
         Ok(())
     }
 
@@ -6951,6 +7127,7 @@ impl EngineController {
             cause: cause.clone(),
         };
         self.last_error = Some(format!("engine crashed ({cause})"));
+        self.pending_crash = Some(Self::crash_detail(&crashes));
         crashes
     }
 
@@ -6963,19 +7140,8 @@ impl EngineController {
     }
 
     pub fn poll(&mut self) -> Option<String> {
-        let crashes = self.poll_shards();
-        if crashes.is_empty() || self.active.is_empty() {
-            return None;
-        }
-        Some(if crashes.len() == 1 {
-            crashes.into_iter().next().expect("one crash").1
-        } else {
-            crashes
-                .iter()
-                .map(|(shard, cause)| format!("{shard}: {cause}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
+        self.poll_shards();
+        self.pending_crash()
     }
 
     pub fn drain_log_lines(&mut self) -> Vec<String> {
@@ -7361,6 +7527,70 @@ mod tests {
             served_listen_ports("not json").is_empty(),
             "garbage fails open"
         );
+    }
+
+    #[test]
+    fn ticket36_missing_or_blank_listen_defaults_to_wildcard() {
+        let doc = serde_json::json!({
+            "inbounds": [
+                {"type": "mixed", "tag": "in-1", "listen_port": 10901},
+                {"type": "mixed", "tag": "in-2", "listen": "", "listen_port": 10902},
+                {"type": "mixed", "tag": "in-3", "listen": "   ", "listen_port": 10903},
+                {"type": "mixed", "tag": "in-4", "listen": "127.0.0.1", "listen_port": 10904},
+                {"type": "mixed", "tag": "no-port"},
+            ],
+        });
+        assert_eq!(
+            custom_config_listens(&doc),
+            vec![
+                ("0.0.0.0".to_string(), 10901),
+                ("0.0.0.0".to_string(), 10902),
+                ("0.0.0.0".to_string(), 10903),
+                ("127.0.0.1".to_string(), 10904),
+            ]
+        );
+    }
+
+    #[test]
+    fn ticket36_wildcard_custom_listen_still_conflicts_same_bind() {
+        let row = fixture(
+            "7",
+            "CustomA",
+            "custom-config",
+            json!({
+                "core": "stock",
+                "config": {
+                    "outbounds": [{"type": "direct", "tag": "direct"}],
+                    "inbounds": [{"type": "mixed", "tag": "in-x", "listen_port": 10991}],
+                }
+            }),
+            "127.0.0.1",
+            10801,
+        );
+        let second = fixture(
+            "8",
+            "CustomB",
+            "custom-config",
+            json!({
+                "core": "fork",
+                "config": {
+                    "outbounds": [{"type": "direct", "tag": "direct"}],
+                    "inbounds": [{"type": "mixed", "tag": "in-y", "listen_port": 10991}],
+                }
+            }),
+            "127.0.0.1",
+            10802,
+        );
+        let rows = vec![row, second];
+        let error = validate_activation(&rows).expect_err("shared wildcard port conflicts");
+        assert!(
+            matches!(error, EngineError::PortConflict { .. }),
+            "got {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("CustomA"), "names both: {text}");
+        assert!(text.contains("CustomB"), "names both: {text}");
+        assert!(text.contains("10991"), "names port: {text}");
     }
 
     #[test]
@@ -7756,11 +7986,17 @@ mod tests {
         handle.inject_crash("signal: segmentation fault");
         assert_eq!(
             controller.poll().as_deref(),
-            Some("signal: segmentation fault")
+            Some("stock: signal: segmentation fault")
         );
         assert!(matches!(controller.status(), EngineStatus::Crashed { .. }));
         assert!(controller.status_text().contains("segmentation fault"));
-        assert!(controller.poll().is_none(), "cause reported once");
+        assert_eq!(
+            controller.poll().as_deref(),
+            Some("stock: signal: segmentation fault"),
+            "cause stays pending until handled"
+        );
+        controller.clear_pending_crash();
+        assert!(controller.poll().is_none(), "cleared after handling");
     }
 
     #[test]
@@ -7782,10 +8018,11 @@ mod tests {
         stock.inject_crash("signal: segmentation fault");
         assert_eq!(
             controller.poll().as_deref(),
-            Some("signal: segmentation fault"),
+            Some("stock: signal: segmentation fault"),
             "exit noted once"
         );
-        assert!(controller.poll().is_none(), "cause reported once");
+        controller.clear_pending_crash();
+        assert!(controller.poll().is_none(), "cleared after handling");
         assert!(
             controller.drain_log_lines().is_empty(),
             "pipe closed cleanly, no panic"
@@ -7838,6 +8075,27 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.as_str() == "after poison"),
             "reader keeps serving, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn log_pipe_poison_respects_reader_generation() {
+        let buffer = Arc::new(Mutex::new((1u64, VecDeque::new())));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = buffer.lock().expect("first lock works");
+            panic!("poison the log lock");
+        }));
+        push_pipe_line(&buffer, 0, "stale reader line".to_string());
+        push_pipe_line(&buffer, 1, "fresh reader line".to_string());
+        let slot = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
+        let lines: Vec<&String> = slot.1.iter().collect();
+        assert!(
+            !lines.iter().any(|line| line.contains("stale reader line")),
+            "stale reader must not inject through the poison path, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("fresh reader line")),
+            "fresh reader still appends, got {lines:?}"
         );
     }
 
@@ -9014,8 +9272,74 @@ mod tests {
     }
 
     #[test]
+    fn bug13_xray_string_server_port_generates_port() {
+        let row = fixture(
+            "1",
+            "XrayStr",
+            "xray",
+            json!({"server": "198.51.100.9", "server_port": "443", "uuid": T08_UUID}),
+            "127.0.0.1",
+            10802,
+        );
+        let plan = validate_activation(std::slice::from_ref(&row)).expect("string port validates");
+        let sidecar = generate_xray_config(&plan.egresses).expect("sidecar generates");
+        let xray = sidecar.value();
+        let egress = xray["outbounds"]
+            .as_array()
+            .expect("outbounds array")
+            .iter()
+            .find(|node| node["tag"] == json!(xray_egress_tag("1")))
+            .expect("egress present");
+        assert_eq!(
+            egress["settings"]["vnext"][0]["port"],
+            json!(443),
+            "string server_port normalized to a number: {egress}"
+        );
+    }
+
+    #[test]
+    fn bug13_xray_garbage_server_port_fails_validation() {
+        let row = fixture(
+            "1",
+            "XrayBad",
+            "xray",
+            json!({"server": "198.51.100.9", "server_port": "not-a-port", "uuid": T08_UUID}),
+            "127.0.0.1",
+            10802,
+        );
+        let error = validate_activation(std::slice::from_ref(&row))
+            .expect_err("garbage string port must fail before generation");
+        let text = error.to_string();
+        assert!(
+            matches!(error, EngineError::BadCustom { .. }),
+            "typed, got {text}"
+        );
+        assert!(text.contains("server_port"), "names the field: {text}");
+        assert!(text.contains("XrayBad"), "names the row: {text}");
+    }
+
+    #[test]
     fn bridge_count_mismatch_fails_start_with_signature() {
         let error = validate_bridge_counts(1, 0, 1, "test").expect_err("skew fails");
+        assert!(matches!(error, EngineError::XrayBridgeMismatch { .. }));
+        assert!(
+            error.to_string().contains(XRAY_BRIDGE_COUNT_SIGNATURE),
+            "signature, got {error}"
+        );
+
+        let ghost = XrayEgress {
+            owner: "Ghost".to_string(),
+            params: serde_json::Map::new(),
+            xray_shaped: false,
+            bridge_port: 19001,
+            bridge_key: "ghost".to_string(),
+            main_tag: "ghost-main".to_string(),
+            ingress_tag: "ghost-in".to_string(),
+            egress_tag: "ghost-out".to_string(),
+        };
+        let pointerless = serde_json::json!({"outbounds": []}).to_string();
+        let error = validate_bridges_present(&pointerless, std::slice::from_ref(&ghost))
+            .expect_err("a missing bridge pointer fails");
         assert!(matches!(error, EngineError::XrayBridgeMismatch { .. }));
         assert!(
             error.to_string().contains(XRAY_BRIDGE_COUNT_SIGNATURE),
@@ -9037,15 +9361,15 @@ mod tests {
         controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
         let error = controller
             .start_all(&rows)
-            .expect_err("dropped pointer breaks the bridge");
+            .expect_err("a stock replacement cannot shadow the xray bridge row");
         let text = error.to_string();
         assert!(
-            matches!(error, EngineError::XrayBridgeMismatch { .. }),
-            "typed, got {text}"
+            matches!(error, EngineError::BadCustom { .. }),
+            "the shadow is rejected before bridging, got {text}"
         );
         assert!(
-            text.contains(XRAY_BRIDGE_COUNT_SIGNATURE),
-            "signature, got {text}"
+            text.contains("1 row(s)"),
+            "counts the shadowed rows, got {text}"
         );
         assert!(!stock.is_running(), "stock never started");
         assert!(!xray.is_running(), "xray never started");
@@ -9160,6 +9484,61 @@ mod tests {
             .start_one(&second)
             .expect_err("second stock replacement fails");
         assert!(error.to_string().contains("\"core\""), "got {error}");
+    }
+
+    #[test]
+    fn bug08_custom_full_config_rejects_same_core_siblings() {
+        let stock = fixture(
+            "1",
+            "Alpha",
+            "shadowsocks",
+            ss_params("pass1"),
+            "127.0.0.1",
+            10801,
+        );
+        let custom_stock = fixture(
+            "7",
+            "CustomStock",
+            "custom-config",
+            json!({"core": "stock",
+                   "config": {"outbounds": [{"type": "direct", "tag": "direct"}]}}),
+            "127.0.0.1",
+            10807,
+        );
+        let error = validate_activation(&[stock.clone(), custom_stock.clone()])
+            .expect_err("stock replacement shadowing a sibling row fails");
+        let text = error.to_string();
+        assert!(
+            matches!(error, EngineError::BadCustom { .. }),
+            "typed: {text}"
+        );
+        assert!(text.contains("stock"), "names the core: {text}");
+        assert!(text.contains("1 row(s)"), "counts the siblings: {text}");
+        assert!(
+            text.contains("stop or move"),
+            "tells the user what to do: {text}"
+        );
+
+        let plan = validate_activation(std::slice::from_ref(&custom_stock))
+            .expect("a sibling-free replacement still plans");
+        assert_eq!(plan.replacements.len(), 1);
+
+        let custom_fork = fixture(
+            "8",
+            "CustomFork",
+            "custom-config",
+            json!({"core": "fork",
+                   "config": {"outbounds": [{"type": "direct", "tag": "direct"}]}}),
+            "127.0.0.1",
+            10808,
+        );
+        validate_activation(&[stock.clone(), custom_fork])
+            .expect("a stock row never shadows a fork replacement");
+
+        let xray = xray_fixture("2", "XrayOne", 10802);
+        let error = validate_activation(&[xray, custom_stock])
+            .expect_err("a stock replacement would shadow an xray bridge row");
+        assert!(error.to_string().contains("row(s)"), "got {error}");
     }
 
     #[test]
@@ -9506,6 +9885,41 @@ mod tests {
     }
 
     #[test]
+    fn bug22_check_spawn_failure_removes_temp_config() {
+        let bogus = std::env::temp_dir().join(format!(
+            "manyproxy-bug22-bogus-{}-{}.exe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&bogus, "not a real executable").expect("bogus binary written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&bogus).expect("meta").permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&bogus, perms);
+        }
+
+        let mut real = RealEngineBackend::new();
+        real.pin_binary(bogus.clone());
+        let path = real.config_path.clone();
+        assert!(
+            real.check_config("{\"password\": \"hunter2\"}").is_err(),
+            "spawning a bogus binary fails"
+        );
+        assert!(
+            !path.exists(),
+            "failed check left no secret-bearing temp config: {}",
+            path.display()
+        );
+
+        let _ = std::fs::remove_file(&bogus);
+    }
+
+    #[test]
     fn t23_crash_names_shard_keeps_siblings() {
         let (mut controller, stock, _fork, xray, _extra) = EngineController::fake_quartet();
         controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
@@ -9530,7 +9944,9 @@ mod tests {
         assert_eq!(shards[0].1, "signal: killed");
         assert!(stock.is_running(), "sibling keeps running");
         assert!(!xray.is_running(), "failed shard is down");
-        assert!(controller.poll().is_none(), "cause reported once");
+        assert!(controller.poll().is_some(), "cause stays pending");
+        controller.clear_pending_crash();
+        assert!(controller.poll().is_none(), "cleared after handling");
         assert!(matches!(controller.status(), EngineStatus::Crashed { .. }));
 
         stock.inject_crash("signal: segmentation fault");
@@ -9545,7 +9961,8 @@ mod tests {
         assert!(cause.contains("killed"), "got {cause}");
         assert!(cause.contains("stock"), "shard-named: {cause}");
         assert!(cause.contains("xray"), "shard-named: {cause}");
-        assert!(controller.poll().is_none(), "causes reported once");
+        controller.clear_pending_crash();
+        assert!(controller.poll().is_none(), "causes cleared after handling");
     }
 
     #[test]
@@ -10791,7 +11208,33 @@ Active Connections\r
     }
 
     #[test]
-    fn t41_auto_restart_opt_in_backoff_bounds() {
+    fn t41_manual_reapply_clears_crash_state() {
+        let (mut controller, stock) = EngineController::fake();
+        let rows = three_standard();
+        controller.start_all(&rows).expect("starts");
+        stock.inject_crash("boom");
+        assert!(!controller.poll_shards().is_empty());
+        assert_eq!(controller.crashed_shards(), vec!["stock".to_string()]);
+        assert!(controller.pending_crash().is_some(), "cause retained");
+
+        controller.start_one(&rows[0]).expect("manual re-apply");
+        assert!(
+            controller.crashed_shards().is_empty(),
+            "manual apply clears crash state"
+        );
+        assert!(controller.pending_crash().is_none(), "cause spent");
+
+        stock.inject_crash("boom again");
+        assert!(!controller.poll_shards().is_empty());
+        controller.stop_one(&rows[0].id);
+        assert!(
+            controller.crashed_shards().is_empty(),
+            "stopping the crashed rows clears crash state"
+        );
+    }
+
+    #[test]
+    fn t41_auto_restart_backoff_bounds() {
         use std::time::{Duration, Instant};
         assert_eq!(auto_restart_backoff_secs(5, 0), 5);
         assert_eq!(auto_restart_backoff_secs(5, 1), 10);
@@ -10804,15 +11247,17 @@ Active Connections\r
         assert!(!controller.poll_shards().is_empty());
         let now = Instant::now();
 
-        assert!(!controller.auto_restart_due(now));
-        assert!(!controller.auto_restart().enabled);
+        assert!(
+            controller.auto_restart().enabled,
+            "auto-restart is on by default"
+        );
+        assert!(controller.auto_restart_due(now), "first attempt immediate");
 
         controller.set_auto_restart(AutoRestartConfig {
             enabled: true,
             max_retries: 2,
             base_backoff_secs: 5,
         });
-        assert!(controller.auto_restart_due(now), "first attempt immediate");
         controller.note_auto_restart_attempt(now);
         assert_eq!(controller.restart_attempts(), 1);
         assert!(!controller.auto_restart_due(now + Duration::from_secs(9)));
@@ -10822,11 +11267,114 @@ Active Connections\r
             !controller.auto_restart_due(now + Duration::from_secs(10_000)),
             "retry bound holds"
         );
+        controller.set_auto_restart(AutoRestartConfig {
+            enabled: false,
+            max_retries: 3,
+            base_backoff_secs: 5,
+        });
+        assert!(!controller.auto_restart().enabled);
+        assert_eq!(controller.restart_attempts(), 0, "disable resets");
+        assert!(!controller.auto_restart_due(now), "disabled: nothing due");
         controller.note_restart_success();
         assert_eq!(controller.restart_attempts(), 0);
-        assert!(!controller.auto_restart_due(now), "recovered: nothing due");
-        controller.set_auto_restart(AutoRestartConfig::default());
-        assert_eq!(controller.restart_attempts(), 0, "disable resets");
+    }
+
+    #[test]
+    fn t41_auto_restart_budget_bounds_persistent_crash_loop() {
+        use std::time::{Duration, Instant};
+        let (mut controller, stock) = EngineController::fake();
+        controller.start_all(&three_standard()).expect("starts");
+        controller.set_auto_restart(AutoRestartConfig {
+            enabled: true,
+            max_retries: 2,
+            base_backoff_secs: 5,
+        });
+        let mut now = Instant::now();
+        stock.inject_crash("boom");
+        assert!(!controller.poll_shards().is_empty());
+        stock.fail_check("still failing to start");
+
+        assert!(controller.auto_restart_due(now), "first attempt immediate");
+        controller.note_auto_restart_attempt(now);
+        assert!(controller.restart_crashed().is_err(), "spawn fails");
+        assert_eq!(
+            controller.restart_attempts(),
+            1,
+            "a failed spawn keeps the attempt"
+        );
+
+        assert!(
+            !controller.auto_restart_due(now + Duration::from_secs(9)),
+            "backoff holds after a failed spawn"
+        );
+        now += Duration::from_secs(10);
+        assert!(
+            controller.auto_restart_due(now),
+            "second attempt after backoff"
+        );
+        controller.note_auto_restart_attempt(now);
+        assert!(controller.restart_crashed().is_err(), "spawn still fails");
+        assert_eq!(controller.restart_attempts(), 2);
+
+        assert!(
+            !controller.auto_restart_due(now + Duration::from_secs(100_000)),
+            "retry budget is exhausted, no further auto attempts"
+        );
+        assert!(
+            controller.pending_crash().is_some(),
+            "the crash notification path still holds the cause"
+        );
+
+        stock.clear_failures();
+        controller
+            .restart_crashed()
+            .expect("a manual restart still recovers");
+        assert!(
+            controller.crashed_shards().is_empty(),
+            "manual recovery clears crash state"
+        );
+    }
+
+    #[test]
+    fn t41_auto_restart_budget_resets_only_after_steady_up() {
+        use std::time::{Duration, Instant};
+        let (mut controller, stock) = EngineController::fake();
+        controller.start_all(&three_standard()).expect("starts");
+        controller.set_auto_restart(AutoRestartConfig {
+            enabled: true,
+            max_retries: 3,
+            base_backoff_secs: 5,
+        });
+        let now = Instant::now();
+        stock.inject_crash("boom");
+        assert!(!controller.poll_shards().is_empty());
+        controller.note_auto_restart_attempt(now);
+        controller.restart_crashed().expect("spawn ok");
+        assert_eq!(
+            controller.restart_attempts(),
+            1,
+            "a successful spawn alone does not reset the budget"
+        );
+
+        controller.settle_restart_budget(now + Duration::from_secs(4));
+        assert_eq!(
+            controller.restart_attempts(),
+            1,
+            "below the steady-up threshold: budget held"
+        );
+        controller.settle_restart_budget(now + Duration::from_secs(5));
+        assert_eq!(
+            controller.restart_attempts(),
+            0,
+            "steady up resets the budget"
+        );
+
+        stock.inject_crash("boom again");
+        assert!(!controller.poll_shards().is_empty());
+        assert!(
+            controller.auto_restart_due(now + Duration::from_secs(6)),
+            "a fresh budget restarts immediately"
+        );
     }
 
     #[test]
