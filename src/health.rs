@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::{inbound_tag, outbound_tag};
-use crate::store::{now_unix, HealthSnapshot, ProxyConfig};
+use crate::store::{now_unix, HealthHistoryEntry, HealthSnapshot, ProxyConfig};
 
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 
@@ -19,10 +19,63 @@ pub const GROUP_TEST_CONCURRENCY: usize = 10;
 pub const URL_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SPEED_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn probe_host() -> String {
-    split_http_url(DEFAULT_TEST_URL)
+/// Host of a test `url`, path/query trimmed. Empty when the URL has no host.
+pub fn probe_host_for(url: &str) -> String {
+    split_http_url(url)
         .map(|(_, host)| host.to_string())
         .unwrap_or_default()
+}
+
+/// The set of probe endpoints whose own traffic must not be counted as row
+/// usage. Destinations match by host name, or by a resolved address once
+/// [`ProbeExclusions::resolve_ips`] has run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeExclusions {
+    pub hosts: Vec<String>,
+    pub ips: Vec<std::net::IpAddr>,
+}
+
+impl ProbeExclusions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add the probe host named by `url`. Blank/invalid URLs and hosts already
+    /// present are ignored. Returns true when a new host was added.
+    pub fn push_url(&mut self, url: &str) -> bool {
+        let host = normalize_probe_host(&probe_host_for(url));
+        if host.is_empty() || self.hosts.contains(&host) {
+            return false;
+        }
+        self.hosts.push(host);
+        true
+    }
+
+    pub fn add_resolved_ip(&mut self, ip: std::net::IpAddr) {
+        if !self.ips.contains(&ip) {
+            self.ips.push(ip);
+        }
+    }
+
+    /// Resolve every host to its addresses so entries carrying a bare IP are
+    /// matched too. Blocking; call from a worker thread. Failed resolves add
+    /// nothing, mirroring the default-host behavior.
+    pub fn resolve_ips(&mut self) {
+        let mut resolved = Vec::new();
+        for host in &self.hosts {
+            resolved.extend(resolve_probe_ips(host));
+        }
+        for ip in resolved {
+            self.add_resolved_ip(ip);
+        }
+    }
+
+    /// True when `dest` is one of the excluded probe endpoints.
+    pub fn excludes(&self, dest: &str) -> bool {
+        self.hosts
+            .iter()
+            .any(|host| is_probe_destination_with_ips(dest, host, &self.ips))
+    }
 }
 
 const MAX_SAMPLES: usize = 10_000;
@@ -32,6 +85,7 @@ const MAX_LOG_RECORDS: usize = 5_000;
 pub enum HealthKind {
     UrlTest,
     TcpPing,
+    SpeedTest,
 }
 
 impl HealthKind {
@@ -39,6 +93,17 @@ impl HealthKind {
         match self {
             HealthKind::UrlTest => "url-test",
             HealthKind::TcpPing => "tcp-ping",
+            HealthKind::SpeedTest => "speed-test",
+        }
+    }
+
+    /// Map a persisted kind string back to a kind. Unknown/legacy values stay
+    /// url-test so old rows keep their meaning.
+    pub fn from_persisted(kind: &str) -> HealthKind {
+        match kind {
+            "tcp-ping" => HealthKind::TcpPing,
+            "speed-test" => HealthKind::SpeedTest,
+            _ => HealthKind::UrlTest,
         }
     }
 }
@@ -1011,6 +1076,16 @@ pub fn format_bytes(n: u64) -> String {
     }
 }
 
+/// Render a whole-transfer duration for speed samples. Deliberately not
+/// `{ms}ms`: a speed sample measures a download, not a latency.
+pub fn format_transfer_duration(ms: u64) -> String {
+    if ms >= 1_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
 pub fn truncate(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
@@ -1026,6 +1101,18 @@ pub fn sparkline_latencies(samples: &[(i64, Option<u64>)], limit: usize) -> Vec<
         latencies = latencies.split_off(latencies.len() - limit.max(1));
     }
     latencies
+}
+
+/// Latency series for the url-test sparkline: the url-test and tcp-ping history
+/// mixed as before, minus speed-test durations so they never masquerade as
+/// latency.
+pub fn url_test_sparkline(entries: &[HealthHistoryEntry], limit: usize) -> Vec<u64> {
+    let samples: Vec<(i64, Option<u64>)> = entries
+        .iter()
+        .filter(|entry| entry.kind != HealthKind::SpeedTest.as_str())
+        .map(|entry| (entry.at, entry.latency_ms))
+        .collect();
+    sparkline_latencies(&samples, limit)
 }
 
 #[cfg(test)]
@@ -1500,7 +1587,7 @@ pub struct HealthStore {
     samples: VecDeque<HealthSample>,
 
     latest_any: HashMap<String, HealthSample>,
-    latest_kind: HashMap<String, [Option<HealthSample>; 2]>,
+    latest_kind: HashMap<String, [Option<HealthSample>; 3]>,
     traffic: HashMap<String, TrafficStats>,
 
     data_traffic: HashMap<String, (u64, u64)>,
@@ -1519,13 +1606,14 @@ impl HealthStore {
         let id = sample.config_id.clone();
         self.samples.push_back(sample.clone());
         self.latest_any.insert(id.clone(), sample.clone());
-        self.latest_kind.entry(id).or_insert([None, None])[slot] = Some(sample);
+        self.latest_kind.entry(id).or_insert([None, None, None])[slot] = Some(sample);
     }
 
     fn kind_slot(kind: HealthKind) -> usize {
         match kind {
             HealthKind::UrlTest => 0,
             HealthKind::TcpPing => 1,
+            HealthKind::SpeedTest => 2,
         }
     }
 
@@ -1602,7 +1690,7 @@ impl HealthStore {
                 .insert(sample.config_id.clone(), sample.clone());
             self.latest_kind
                 .entry(sample.config_id.clone())
-                .or_insert([None, None])[Self::kind_slot(sample.kind)] = Some(sample.clone());
+                .or_insert([None, None, None])[Self::kind_slot(sample.kind)] = Some(sample.clone());
         }
     }
 
@@ -1621,11 +1709,7 @@ impl HealthStore {
 
     pub fn hydrate(&mut self, snapshots: &[HealthSnapshot]) {
         for snapshot in snapshots {
-            let kind = if snapshot.kind == HealthKind::TcpPing.as_str() {
-                HealthKind::TcpPing
-            } else {
-                HealthKind::UrlTest
-            };
+            let kind = HealthKind::from_persisted(&snapshot.kind);
             self.push_sample(HealthSample {
                 config_id: snapshot.config_id.clone(),
                 at: snapshot.at,
@@ -1754,7 +1838,7 @@ impl HealthStore {
             RowHealth {
                 state: RowState::Unknown,
                 ..
-            } => String::new(),
+            } => self.speed_summary(config_id).unwrap_or_default(),
             RowHealth {
                 state: RowState::Live,
                 latency_ms: Some(ms),
@@ -1780,6 +1864,7 @@ impl HealthStore {
             .latest_of(config_id, HealthKind::TcpPing)
             .and_then(|sample| sample.latency_ms);
         let traffic = self.traffic_text(config_id);
+        let speed = self.speed_summary(config_id);
         match self.status(config_id) {
             RowHealth {
                 state: RowState::Unknown,
@@ -1798,13 +1883,19 @@ impl HealthStore {
                 if let Some(ping) = ping_ms {
                     parts.push(format!("ping {ping}ms"));
                 }
+                if let Some(speed) = speed {
+                    parts.push(format!("speed {speed}"));
+                }
                 format!("health: {} · {traffic}", parts.join(" · "))
             }
             RowHealth {
                 state: RowState::Live,
                 latency_ms: None,
                 ..
-            } => format!("health: live · {traffic}"),
+            } => match speed {
+                Some(speed) => format!("health: live · speed {speed} · {traffic}"),
+                None => format!("health: live · {traffic}"),
+            },
             RowHealth {
                 state: RowState::Dead,
                 cause: Some(cause),
@@ -1841,10 +1932,20 @@ impl HealthStore {
         self.push_sample(HealthSample {
             config_id: outcome.config_id.clone(),
             at,
-            kind: HealthKind::UrlTest,
+            kind: HealthKind::SpeedTest,
             latency_ms: outcome.latency_ms,
             error: outcome.error.clone(),
         });
+    }
+
+    /// Duration of the latest successful speed sample, rendered as a transfer
+    /// duration (e.g. `2.7s`) rather than a latency. None without one.
+    pub fn speed_summary(&self, config_id: &str) -> Option<String> {
+        let sample = self.latest_of(config_id, HealthKind::SpeedTest)?;
+        if sample.error.is_some() {
+            return None;
+        }
+        sample.latency_ms.map(format_transfer_duration)
     }
 }
 
@@ -1996,6 +2097,7 @@ fn tag_matches_bounded(line: &str, tag: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct LogStore {
     records: VecDeque<LogRecord>,
+    push_seq: u64,
 }
 
 impl LogStore {
@@ -2014,6 +2116,7 @@ impl LogStore {
     }
 
     fn push(&mut self, record: LogRecord) {
+        self.push_seq = self.push_seq.wrapping_add(1);
         if self.records.len() >= MAX_LOG_RECORDS {
             if let Some(position) = self
                 .records
@@ -2026,6 +2129,12 @@ impl LogStore {
             }
         }
         self.records.push_back(record);
+    }
+
+    /// Monotonic count of records pushed, so a tail view can notice new output
+    /// even when the capped ring keeps `all().len()` pinned at `MAX_LOG_RECORDS`.
+    pub fn push_seq(&self) -> u64 {
+        self.push_seq
     }
 
     pub fn for_config(&self, config_id: &str) -> Vec<&LogRecord> {
@@ -2167,6 +2276,58 @@ fn is_secret_value_end(c: char) -> bool {
     c != ' ' && c != '\t' && is_value_end(c)
 }
 
+fn is_cred_local_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%' | '+')
+}
+
+fn is_cred_terminator(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | ',' | ';' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '&'
+        )
+}
+
+/// End index of a scheme-less `user:pass@host` credential starting at `start`, or `None`.
+fn scheme_less_credential_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut separator = None;
+    for (offset, c) in chars[start..].iter().enumerate() {
+        let index = start + offset;
+        match *c {
+            '@' => {
+                let separator = separator?;
+                if separator == start || index == separator + 1 {
+                    return None;
+                }
+                if separator + 2 < chars.len()
+                    && chars[separator + 1] == '/'
+                    && chars[separator + 2] == '/'
+                {
+                    return None;
+                }
+                return matches!(chars.get(index + 1), Some(c) if c.is_ascii_alphanumeric() || *c == '[')
+                    .then_some(index);
+            }
+            ':' if separator.is_none() => separator = Some(index),
+            c if is_cred_terminator(c) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn starts_auth_scheme(chars: &[char], start: usize) -> bool {
+    if start >= chars.len() {
+        return false;
+    }
+    let end = chars[start..]
+        .iter()
+        .position(|c| !is_token_char(*c))
+        .map_or(chars.len(), |offset| start + offset);
+    let word: String = chars[start..end].iter().collect();
+    matches!(word.to_ascii_lowercase().as_str(), "bearer" | "basic")
+}
+
 pub fn redact_secrets(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
@@ -2184,23 +2345,31 @@ pub fn redact_secrets(line: &str) -> String {
             {
                 end += 1;
             }
-            let mut at = None;
-            for (k, ch) in chars.iter().enumerate().take(end).skip(j) {
-                if matches!(*ch, '/' | '?' | '#') {
-                    break;
-                }
-                if *ch == '@' {
-                    at = Some(k);
-                }
-            }
+            let at = chars[j..end]
+                .iter()
+                .rposition(|c| *c == '@')
+                .map(|position| j + position);
             if let Some(at) = at {
-                out.push_str("***@");
-                i = at + 1;
-                continue;
+                let userinfo: String = chars[j..at].iter().collect();
+                let shaped = userinfo.contains(':')
+                    || (!userinfo.chars().any(|c| matches!(c, '/' | '?' | '#'))
+                        && is_bare_secret(&userinfo));
+                if shaped {
+                    out.push_str("***@");
+                    i = at + 1;
+                    continue;
+                }
             }
 
             i += 3;
             continue;
+        }
+        if is_cred_local_char(chars[i]) && (i == 0 || !is_cred_local_char(chars[i - 1])) {
+            if let Some(at) = scheme_less_credential_end(&chars, i) {
+                out.push_str("***@");
+                i = at + 1;
+                continue;
+            }
         }
         if is_token_char(chars[i])
             && (i == 0 || (!is_token_char(chars[i - 1]) && chars[i - 1] != '.'))
@@ -2223,10 +2392,11 @@ pub fn redact_secrets(line: &str) -> String {
                     "bearer" | "basic"
                 );
                 if k < chars.len() && (chars[k] == '=' || chars[k] == ':') {
-                    while j <= k {
-                        out.push(chars[j]);
-                        j += 1;
+                    while i <= k {
+                        out.push(chars[i]);
+                        i += 1;
                     }
+                    j = i;
                     while j < chars.len()
                         && (chars[j] == ' ' || chars[j] == '"' || chars[j] == '\'')
                     {
@@ -2234,8 +2404,22 @@ pub fn redact_secrets(line: &str) -> String {
                         j += 1;
                     }
                     out.push_str("***");
-                    while j < chars.len() && !is_secret_value_end(chars[j]) {
-                        j += 1;
+                    let mut probe = j;
+                    while probe < chars.len() && (chars[probe] == ' ' || chars[probe] == '\t') {
+                        probe += 1;
+                    }
+                    if starts_auth_scheme(&chars, probe) {
+                        j = probe;
+                        while j < chars.len() && is_token_char(chars[j]) {
+                            j += 1;
+                        }
+                        while j < chars.len() && !is_secret_value_end(chars[j]) {
+                            j += 1;
+                        }
+                    } else {
+                        while j < chars.len() && !is_value_end(chars[j]) {
+                            j += 1;
+                        }
                     }
 
                     if j < chars.len() && (chars[j] == '"' || chars[j] == '\'') {
@@ -2246,10 +2430,11 @@ pub fn redact_secrets(line: &str) -> String {
                     continue;
                 }
                 if bearer && k < chars.len() && !is_value_end(chars[k]) {
-                    while j < k {
-                        out.push(chars[j]);
-                        j += 1;
+                    while i < k {
+                        out.push(chars[i]);
+                        i += 1;
                     }
+                    j = i;
                     out.push_str("***");
                     while j < chars.len() && !is_value_end(chars[j]) {
                         j += 1;
@@ -2727,7 +2912,22 @@ mod tests {
             TrafficStats::default(),
             "no usage credit"
         );
-        assert_eq!(store.status("1").latency_ms, Some(42), "sample recorded");
+        assert_eq!(
+            store
+                .latest_of("1", HealthKind::SpeedTest)
+                .and_then(|sample| sample.latency_ms),
+            Some(42),
+            "speed duration kept in its own slot"
+        );
+        assert_eq!(
+            store.status("1").state,
+            RowState::Unknown,
+            "a speed sample never sets row health"
+        );
+        assert!(
+            store.latest_of("1", HealthKind::UrlTest).is_none(),
+            "the url-test slot stays empty"
+        );
 
         assert_eq!(
             SpeedtestMode::from_label("upload"),
@@ -3033,6 +3233,13 @@ mod tests {
                 latency_ms: Some(5),
                 error: None,
             },
+            HealthSnapshot {
+                config_id: "4".to_string(),
+                at: 1_700_000_003,
+                kind: "speed-test".to_string(),
+                latency_ms: Some(2700),
+                error: None,
+            },
         ];
         let mut store = HealthStore::default();
         store.hydrate(&snapshots);
@@ -3061,6 +3268,19 @@ mod tests {
             Some(&"2".to_string())
         );
 
+        assert_eq!(
+            store.latest("4").map(|sample| sample.kind),
+            Some(HealthKind::SpeedTest),
+            "a persisted speed-test kind hydrates into its own slot"
+        );
+        assert_eq!(store.status("4").state, RowState::Unknown);
+        assert_eq!(
+            store.row_summary("4"),
+            "2.7s",
+            "the health column shows the transfer duration, never a latency"
+        );
+        assert_eq!(store.speed_summary("4").as_deref(), Some("2.7s"));
+
         assert_eq!(store.traffic("1"), TrafficStats::default());
         assert_eq!(store.status("missing").state, RowState::Unknown);
     }
@@ -3069,6 +3289,12 @@ mod tests {
     fn tcp_ping_records_timing_per_endpoint() {
         assert_eq!(HealthKind::UrlTest.as_str(), "url-test");
         assert_eq!(HealthKind::TcpPing.as_str(), "tcp-ping");
+        assert_eq!(HealthKind::SpeedTest.as_str(), "speed-test");
+        assert_eq!(
+            HealthKind::from_persisted("speed-test"),
+            HealthKind::SpeedTest
+        );
+        assert_eq!(HealthKind::from_persisted("mystery"), HealthKind::UrlTest);
         let configs = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
         let (prober, handle) = FakeHealthProber::shared();
         handle.script_latency("1", 7);
@@ -3538,6 +3764,66 @@ mod tests {
     }
 
     #[test]
+    fn redact_secrets_preserves_keys_and_trailing_text() {
+        for (raw, expected) in [
+            ("password=hunter2", "password=***"),
+            ("password = hunter2", "password = ***"),
+            ("password=hunter2 with spaces", "password=*** with spaces"),
+            ("\"password\": \"hunter2\"", "\"password\": \"***\""),
+            (
+                "{\"user\":{\"password\":\"hunter2\"}}",
+                "{\"user\":{\"password\":\"***\"}}",
+            ),
+            ("token: abc123", "token: ***"),
+            ("Authorization: Bearer abc123def", "Authorization: ***"),
+            ("Bearer abc123def", "Bearer ***"),
+        ] {
+            assert_eq!(redact_secrets(raw), expected, "shape for {raw}");
+        }
+    }
+
+    #[test]
+    fn redact_secrets_covers_schemeless_and_pathed_url_credentials() {
+        let active = vec![fixture("1", "Alpha", "vless", "127.0.0.1", 10801)];
+        let tags = LogTagIndex::build(&active);
+        let mut logs = LogStore::default();
+        for raw in [
+            "https://user:pa/ss@host:8443/path",
+            "https://user:pa?ss@host:8443/path",
+            "https://user:pa#ss@host:8443/path",
+            "dial outbound user:hunter2@host.example.com:443 failed",
+            "INFO [1234] inbound/vless[x]: user:password@example.com connected",
+        ] {
+            logs.push_raw(raw, &tags);
+        }
+        let messages: Vec<&str> = logs
+            .all()
+            .iter()
+            .map(|record| record.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "https://***@host:8443/path",
+                "https://***@host:8443/path",
+                "https://***@host:8443/path",
+                "dial outbound ***@host.example.com:443 failed",
+                "INFO [1234] inbound/vless[x]: ***@example.com connected",
+            ]
+        );
+    }
+
+    #[test]
+    fn redact_secrets_keeps_plain_emails_in_prose() {
+        for benign in [
+            "contact me at bob@example.com",
+            "warn out-1: mail alice.smith@example.org bounced",
+        ] {
+            assert_eq!(redact_secrets(benign), benign, "email preserved: {benign}");
+        }
+    }
+
+    #[test]
     fn a7_redaction_contract_holds_in_both_owners() {
         const UUID: &str = "11111111-2222-4333-8444-555555555555";
         const PASSWORD: &str = "hunter2-hunter2-hunter2-99";
@@ -3725,6 +4011,135 @@ mod tests {
 
         let hostname_only = attribute_entries(&entries[4..], probe);
         assert_eq!(hostname_only.get("7"), Some(&(1000, 100)));
+    }
+
+    #[test]
+    fn bug18_exclusion_set_covers_default_global_and_overrides() {
+        let mut exclusions = ProbeExclusions::new();
+        assert!(exclusions.push_url(DEFAULT_TEST_URL));
+        assert!(
+            !exclusions.push_url("http://WWW.GSTATIC.COM:8080/other"),
+            "same host after normalization is not re-added"
+        );
+        assert!(exclusions.push_url("http://203.0.113.9/health"));
+        assert!(exclusions.push_url("https://speed.example:8443/generate_204?q=1"));
+        assert!(!exclusions.push_url(""));
+        assert!(!exclusions.push_url("notaurl"));
+        assert_eq!(
+            exclusions.hosts,
+            vec![
+                "www.gstatic.com".to_string(),
+                "203.0.113.9".to_string(),
+                "speed.example".to_string(),
+            ]
+        );
+
+        assert!(exclusions.excludes("www.gstatic.com:443"));
+        assert!(exclusions.excludes("WWW.GSTATIC.COM."));
+        assert!(
+            exclusions.excludes("203.0.113.9:80"),
+            "bare-IP host matches"
+        );
+        assert!(exclusions.excludes("SPEED.EXAMPLE"));
+        assert!(!exclusions.excludes("example.com"));
+        assert!(!exclusions.excludes(""));
+
+        let mut with_ip = ProbeExclusions::new();
+        assert!(with_ip.push_url("http://probe.example/generate_204"));
+        assert!(
+            !with_ip.excludes("93.184.216.34"),
+            "no address resolved yet"
+        );
+        with_ip.add_resolved_ip("93.184.216.34".parse().expect("ip parses"));
+        assert!(with_ip.excludes("93.184.216.34:443"));
+        assert!(with_ip.excludes("93.184.216.34"));
+
+        let mut numeric = ProbeExclusions::new();
+        assert!(numeric.push_url("http://93.184.216.34/generate_204"));
+        numeric.resolve_ips();
+        assert!(
+            numeric.excludes("93.184.216.34"),
+            "numeric resolve is local"
+        );
+    }
+
+    #[test]
+    fn bug21_speed_sample_is_a_duration_not_row_latency() {
+        let mut store = HealthStore::default();
+        let slow = SpeedtestOutcome {
+            config_id: "1".to_string(),
+            mode: SpeedtestMode::Download,
+            latency_ms: Some(2700),
+            mbps: Some(24.0),
+            error: None,
+        };
+        store.record_speed_sample(&slow, now_unix());
+        assert_eq!(
+            store.status("1").state,
+            RowState::Unknown,
+            "a slow 8 MiB download is not a dead row"
+        );
+        assert_eq!(
+            store.row_summary("1"),
+            "2.7s",
+            "a transfer duration, not a fake latency"
+        );
+        assert_eq!(store.speed_summary("1").as_deref(), Some("2.7s"));
+
+        let failed = SpeedtestOutcome {
+            config_id: "2".to_string(),
+            mode: SpeedtestMode::Upload,
+            latency_ms: None,
+            mbps: None,
+            error: Some("speed test failed for \"Beta\": dial refused".to_string()),
+        };
+        store.record_speed_sample(&failed, now_unix());
+        assert_eq!(
+            store.status("2").state,
+            RowState::Unknown,
+            "a failed speedtest never marks the row dead"
+        );
+        assert_eq!(
+            store.speed_summary("2"),
+            None,
+            "failed speeds are not shown"
+        );
+        assert_eq!(
+            store.row_summary("2"),
+            "",
+            "a failed speedtest leaves the health column blank, never dead"
+        );
+
+        assert_eq!(format_transfer_duration(2700), "2.7s");
+        assert_eq!(format_transfer_duration(250), "250ms");
+    }
+
+    #[test]
+    fn bug21_url_sparkline_drops_speed_samples() {
+        fn entry(kind: &str, at: i64, ms: u64) -> HealthHistoryEntry {
+            HealthHistoryEntry {
+                config_id: "1".to_string(),
+                at,
+                kind: kind.to_string(),
+                latency_ms: Some(ms),
+                error: None,
+            }
+        }
+        let entries = vec![
+            entry("url-test", 10, 40),
+            entry("speed-test", 20, 2700),
+            entry("url-test", 30, 55),
+            entry("tcp-ping", 40, 7),
+        ];
+        assert_eq!(
+            url_test_sparkline(&entries, 120),
+            vec![40, 55, 7],
+            "tcp-ping history stays; only speed-test samples drop"
+        );
+        assert_eq!(
+            url_test_sparkline(&[entry("speed-test", 1, 9000)], 120),
+            Vec::<u64>::new()
+        );
     }
 
     #[test]
@@ -4175,10 +4590,14 @@ mod tests {
     fn t47_latest_health_index_matches_scan() {
         let mut store = HealthStore::default();
         let mut model: Vec<HealthSample> = Vec::new();
-        let kinds = [HealthKind::UrlTest, HealthKind::TcpPing];
+        let kinds = [
+            HealthKind::UrlTest,
+            HealthKind::TcpPing,
+            HealthKind::SpeedTest,
+        ];
         for i in 0..600 {
             let config = format!("cfg{}", i % 3);
-            let kind = kinds[(i / 3) % 2];
+            let kind = kinds[(i / 3) % kinds.len()];
             let sample = HealthSample {
                 config_id: config.clone(),
                 at: 1_700_000_000 + i as i64,
