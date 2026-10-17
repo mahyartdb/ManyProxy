@@ -24423,6 +24423,45 @@ mod tests {
     }
 
     #[test]
+    fn t55_app_version_is_plain_semver() {
+        // T-05: the Cargo version must stay a plain `major.minor.patch`
+        // semver — the `-beta.1` prerelease suffix lives on the release
+        // tag, and main.rs:184 must keep deriving this from the manifest.
+        let src = std::fs::read_to_string(file!()).expect("src/main.rs readable");
+        let definition = src
+            .lines()
+            .find(|line| line.contains("const APP_VERSION"))
+            .expect("main.rs defines APP_VERSION");
+        assert!(
+            definition.contains("env!(\"CARGO_PKG_VERSION\")"),
+            "APP_VERSION must derive from CARGO_PKG_VERSION, got {definition:?}"
+        );
+        assert_eq!(
+            crate::APP_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            "APP_VERSION rides the manifest version"
+        );
+        let version = crate::APP_VERSION;
+        assert!(!version.starts_with('v'), "no tag-style prefix: {version}");
+        assert!(
+            !version.contains('-') && !version.contains('+'),
+            "plain semver only — prerelease/build suffixes belong to the release tag: {version}"
+        );
+        let components: Vec<&str> = version.split('.').collect();
+        assert_eq!(
+            components.len(),
+            3,
+            "APP_VERSION must be major.minor.patch, got {version}"
+        );
+        for (position, component) in components.iter().enumerate() {
+            assert!(
+                !component.is_empty() && component.bytes().all(|b| b.is_ascii_digit()),
+                "APP_VERSION component {position} must be a non-empty number, got {component:?} in {version}"
+            );
+        }
+    }
+
+    #[test]
     fn close_confirm_names_running_rows() {
         assert_eq!(crate::close_confirm_description(&[]), None);
         let text = crate::close_confirm_description(&["alpha".to_string(), "beta".to_string()])

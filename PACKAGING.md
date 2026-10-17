@@ -8,9 +8,9 @@ name, path, and search-order claim below is verified against `src/`
 ## 1. Version + binary-name source (read-only)
 
 - Package name and version come from `Cargo.toml` (READ ONLY, owned by
-  feature work): `name = "manyproxy"`, `version = "0.1.0"`
+  feature work): `name = "manyproxy"`, `version = "0.0.1"`
   (`Cargo.toml:1-4`). Verified via `cargo metadata --no-deps`
-  (reports `manyproxy 0.1.0`; no build was run).
+  (reports `manyproxy 0.0.1`; no build was run).
 - The release exe is therefore `manyproxy.exe` on Windows
   (cargo names the exe after the package; no `[[bin]]` rename exists
   in `Cargo.toml`).
