@@ -2231,40 +2231,11 @@ fn preset_rules_for(
     };
     let mut out = Vec::with_capacity(stored.len());
     for (index, rule) in stored.iter().enumerate() {
-        let obj = rule
-            .as_object()
-            .ok_or_else(|| bad(format!("rule {index}: must be a JSON object")))?;
-        let action = obj
-            .get("action")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| bad(format!("rule {index}: field \"action\" is required")))?;
-
-        if action == "warp" || action == "warp-bypass" {
-            return Err(bad(format!(
-                "rule {index}: action \"{action}\" is not servable (warp needs an endpoint design — no sing-box outbound to point at; use \"route\", \"proxy\", \"direct\", or \"reject\")"
-            )));
-        }
-        if !crate::preset::VALID_PRESET_ACTIONS.contains(&action) {
-            return Err(bad(format!(
-                "rule {index}: field \"action\" must be one of {}",
-                crate::preset::VALID_PRESET_ACTIONS.join(", ")
-            )));
-        }
-
-        let route_like = action == "route" || action == "proxy";
-        if route_like {
-            if let Some(outbound) = obj.get("outbound") {
-                if !outbound.is_string() {
-                    return Err(bad(format!(
-                        "rule {index}: field \"outbound\" must be a string"
-                    )));
-                }
-            }
-        } else if obj.contains_key("outbound") {
-            return Err(bad(format!(
-                "rule {index}: field \"outbound\" needs action \"route\""
-            )));
-        }
+        let checked = crate::preset::check_preset_rule(index, rule)
+            .map_err(|failure| bad(format!("rule {}: {}", failure.index, failure.detail)))?;
+        let obj = checked.obj;
+        let action = checked.action;
+        let route_like = crate::preset::action_carries_outbound(action);
         let mut merged = obj.clone();
 
         merged.insert(
@@ -4277,9 +4248,18 @@ fn validate_structure(document: &serde_json::Value) -> Result<(), EngineError> {
                     return Err(invalid(&format!("rule references unknown \"{outbound}\"")));
                 }
             }
-            Some("direct") | Some("reject") => {
+            Some("route-options") => {
+                if let Some(outbound) = outbound {
+                    if !exits.contains(outbound) {
+                        return Err(invalid(&format!("rule references unknown \"{outbound}\"")));
+                    }
+                }
+            }
+            Some("direct") | Some("reject") | Some("sniff") | Some("resolve") => {
                 if outbound.is_some() {
-                    return Err(invalid("rule with direct/reject action carries outbound"));
+                    return Err(invalid(
+                        "rule with direct/reject/sniff/resolve action carries outbound",
+                    ));
                 }
             }
             Some("block") => {
@@ -12863,6 +12843,218 @@ Active Connections\r
         assert!(
             text.contains("endpoint"),
             "names the missing endpoint design: {text}"
+        );
+    }
+
+    fn t58_generate_rules(rules: Vec<serde_json::Value>) -> GeneratedConfig {
+        let mut map = HashMap::new();
+        map.insert("p1".to_string(), rules);
+        let row = t37_row_with_preset();
+        generate_with_presets(std::slice::from_ref(&row), &map).expect("generates")
+    }
+
+    #[test]
+    fn t58_emission_serves_each_action_verbatim() {
+        let in_tag = inbound_tag("1");
+        let out_tag = outbound_tag("1");
+
+        let generated = t58_generate_rules(vec![json!({"action": "sniff"})]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2, "sniff rule + isolation, got {rules:?}");
+        assert_eq!(
+            rules[0]["action"],
+            json!("sniff"),
+            "sniff is served verbatim"
+        );
+        assert_eq!(
+            rules[0]["inbound"],
+            json!([in_tag]),
+            "still scoped to the row"
+        );
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("outbound"),
+            "no outbound synthesized for sniff, got {rules:?}"
+        );
+        assert_eq!(
+            rules[1]["outbound"],
+            json!(out_tag),
+            "isolation follows presets"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "resolve", "server": "dns-local", "strategy": "prefer_ipv4",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules[0]["action"], json!("resolve"));
+        assert_eq!(rules[0]["server"], json!("dns-local"));
+        assert_eq!(rules[0]["strategy"], json!("prefer_ipv4"));
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("outbound"),
+            "resolve never routes, got {rules:?}"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route-options", "override_address": "192.0.2.53", "override_port": 53,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["action"],
+            json!("route-options"),
+            "served verbatim"
+        );
+        assert_eq!(rules[0]["override_address"], json!("192.0.2.53"));
+        assert_eq!(rules[0]["override_port"], json!(53));
+        assert_eq!(
+            rules[0]["outbound"],
+            json!(out_tag),
+            "route-options joins the outbound-carrying set"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route-options", "outbound": "direct",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["outbound"],
+            json!("direct"),
+            "known direct exit is kept"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "reject", "method": "drop", "no_drop": true,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules[0]["action"], json!("reject"));
+        assert_eq!(rules[0]["method"], json!("drop"));
+        assert_eq!(rules[0]["no_drop"], json!(true));
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "block", "method": "reply",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["action"],
+            json!("reject"),
+            "block serves as reject"
+        );
+        assert_eq!(
+            rules[0]["method"],
+            json!("reply"),
+            "reject method flows through the merge"
+        );
+    }
+
+    #[test]
+    fn t58_route_options_unknown_exit_stays_loud() {
+        let bad = |rules: Vec<serde_json::Value>| {
+            let mut map = HashMap::new();
+            map.insert("p1".to_string(), rules);
+            let row = t37_row_with_preset();
+            generate_with_presets(std::slice::from_ref(&row), &map)
+                .expect_err("unknown exit must fail loudly")
+        };
+        for action in ["route", "route-options"] {
+            let error = bad(vec![
+                json!({"action": action, "outbound": "some-other-row"}),
+            ]);
+            let text = error.to_string();
+            assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+            assert!(text.contains("names an unknown exit"), "{text}");
+        }
+    }
+
+    #[test]
+    fn t58_live_throne_country_profile_check() {
+        if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
+            return;
+        }
+        // Throne-country-style profile in Throne doc shape: sniff opener,
+        // private-range direct rules, country-suffix direct list, catch-all
+        // route. Throne's own profiles open with a leading DNS rule; that
+        // action is a non-concept here, so the proof profile carries none.
+        let profile = r#"{
+            "kind": "throne-route-profile",
+            "v": 1,
+            "name": "throne-country",
+            "rules": [
+                {"action": "sniff"},
+                {"action": "direct", "source_ip_is_private": true},
+                {"action": "direct", "ip_is_private": true},
+                {"action": "direct", "domain_suffix": ["cn"]},
+                {"action": "route"}
+            ]
+        }"#;
+        let parsed = crate::preset::parse_preset_json(profile, "throne-country")
+            .expect("PROBE profile parses at intake");
+        let mut map = HashMap::new();
+        map.insert("p1".to_string(), parsed.rules);
+        let row = t37_row_with_preset();
+        let generated = generate_with_presets(std::slice::from_ref(&row), &map)
+            .expect("PROBE profile: generates");
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules.len(),
+            6,
+            "5 preset rules + 1 isolation, got {rules:?}"
+        );
+        assert_eq!(rules[0]["action"], json!("sniff"), "sniff opener served");
+        assert_eq!(
+            rules[1]["source_ip_is_private"],
+            json!(true),
+            "private source range goes direct"
+        );
+        assert_eq!(
+            rules[2]["ip_is_private"],
+            json!(true),
+            "private IP goes direct"
+        );
+        assert_eq!(
+            rules[3]["domain_suffix"],
+            json!(["cn"]),
+            "country suffix goes direct"
+        );
+        assert_eq!(
+            rules[4]["outbound"],
+            json!(outbound_tag("1")),
+            "catch-all routes to the row's outbound"
+        );
+        let binary = std::env::var("MANYPROXY_SINGBOX_BIN").map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    PathBuf::from("target/debug/sing-box.exe")
+                } else {
+                    PathBuf::from("target/debug/sing-box")
+                }
+            },
+            PathBuf::from,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "manyproxy-t58-live-profile-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, &generated.json).expect("temp config writes");
+        let output = std::process::Command::new(&binary)
+            .arg("check")
+            .arg("-c")
+            .arg(&path)
+            .output()
+            .expect("check runs");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            output.status.success(),
+            "PROBE profile: sing-box check EXIT 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

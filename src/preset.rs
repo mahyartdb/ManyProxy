@@ -3,7 +3,16 @@ use serde_json::Value;
 
 pub const MAX_PRESET_NAME_CHARS: usize = 256;
 
-pub const VALID_PRESET_ACTIONS: &[&str] = &["route", "proxy", "direct", "block", "reject"];
+pub const VALID_PRESET_ACTIONS: &[&str] = &[
+    "route",
+    "proxy",
+    "direct",
+    "block",
+    "reject",
+    "sniff",
+    "resolve",
+    "route-options",
+];
 
 pub fn served_action(action: &str) -> &str {
     if action == "block" {
@@ -13,6 +22,13 @@ pub fn served_action(action: &str) -> &str {
     } else {
         action
     }
+}
+
+/// Actions whose rules may carry an `outbound` exit tag; the engine maps a
+/// missing `outbound` to the row's outbound and rejects unknown exits at
+/// emission. Shared by intake validation and config generation.
+pub(crate) fn action_carries_outbound(action: &str) -> bool {
+    action == "route" || action == "proxy" || action == "route-options"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,43 +119,112 @@ fn bad_rule(index: usize, detail: impl Into<String>) -> PresetError {
 
 pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
     for (index, rule) in rules.iter().enumerate() {
-        let obj = rule
-            .as_object()
-            .ok_or_else(|| bad_rule(index, "must be a JSON object"))?;
-        let action = obj
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| bad_rule(index, "field \"action\" is required"))?;
-
-        if action == "warp" || action == "warp-bypass" {
-            return Err(bad_rule(
-                index,
-                format!(
-                    "field \"action\" \"{action}\" is not servable (warp needs an endpoint design — no sing-box outbound to point at; use \"route\", \"proxy\", \"direct\", or \"reject\")"
-                ),
-            ));
-        }
-        if !VALID_PRESET_ACTIONS.contains(&action) {
-            return Err(bad_rule(
-                index,
-                format!(
-                    "field \"action\" must be one of {}",
-                    VALID_PRESET_ACTIONS.join(", ")
-                ),
-            ));
-        }
-
-        if action == "route" || action == "proxy" {
-            if let Some(outbound) = obj.get("outbound") {
-                if !outbound.is_string() {
-                    return Err(bad_rule(index, "field \"outbound\" must be a string"));
-                }
-            }
-        } else if obj.contains_key("outbound") {
-            return Err(bad_rule(index, "field \"outbound\" needs action \"route\""));
-        }
+        check_preset_rule(index, rule)
+            .map_err(|failure| bad_rule(failure.index, failure.detail))?;
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RuleCheckFailure {
+    pub index: usize,
+    pub detail: String,
+}
+
+/// A rule that passed the shared structural checks; both the intake validator
+/// and the engine's emission gate consume it so the per-action rule tables can
+/// never drift apart.
+pub(crate) struct CheckedRule<'a> {
+    pub obj: &'a serde_json::Map<String, Value>,
+    pub action: &'a str,
+}
+
+pub(crate) fn check_preset_rule(
+    index: usize,
+    rule: &Value,
+) -> Result<CheckedRule<'_>, RuleCheckFailure> {
+    let fail = |detail: String| RuleCheckFailure { index, detail };
+    let Some(obj) = rule.as_object() else {
+        return Err(fail("must be a JSON object".to_string()));
+    };
+    let Some(action) = obj.get("action").and_then(Value::as_str) else {
+        return Err(fail("field \"action\" is required".to_string()));
+    };
+
+    if action == "warp" || action == "warp-bypass" {
+        return Err(fail(format!(
+            "field \"action\" \"{action}\" is not servable (warp needs an endpoint design — no sing-box outbound to point at; use \"route\", \"proxy\", \"direct\", or \"reject\")"
+        )));
+    }
+    if !VALID_PRESET_ACTIONS.contains(&action) {
+        return Err(fail(format!(
+            "field \"action\" must be one of {}",
+            VALID_PRESET_ACTIONS.join(", ")
+        )));
+    }
+
+    if action_carries_outbound(action) {
+        if let Some(outbound) = obj.get("outbound") {
+            if !outbound.is_string() {
+                return Err(fail("field \"outbound\" must be a string".to_string()));
+            }
+        }
+    } else if obj.contains_key("outbound") {
+        return Err(fail(
+            "field \"outbound\" needs action \"route\"".to_string(),
+        ));
+    }
+
+    match action {
+        "resolve" => {
+            for field in ["server", "strategy"] {
+                if let Some(value) = obj.get(field) {
+                    if !value.is_string() {
+                        return Err(fail(format!("field \"{field}\" must be a string")));
+                    }
+                }
+            }
+        }
+        "route-options" => {
+            if let Some(value) = obj.get("override_address") {
+                if !value.is_string() {
+                    return Err(fail(
+                        "field \"override_address\" must be a string".to_string(),
+                    ));
+                }
+            }
+            if let Some(value) = obj.get("override_port") {
+                if !value
+                    .as_u64()
+                    .is_some_and(|port| port <= u64::from(u16::MAX))
+                {
+                    return Err(fail(
+                        "field \"override_port\" must be a u16 port (0-65535)".to_string(),
+                    ));
+                }
+            }
+        }
+        "reject" | "block" => {
+            if let Some(method) = obj.get("method") {
+                if !method
+                    .as_str()
+                    .is_some_and(|m| matches!(m, "drop" | "reply" | "default"))
+                {
+                    return Err(fail(
+                        "field \"method\" must be one of drop, reply, default".to_string(),
+                    ));
+                }
+            }
+            if let Some(no_drop) = obj.get("no_drop") {
+                if !no_drop.is_boolean() {
+                    return Err(fail("field \"no_drop\" must be a boolean".to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(CheckedRule { obj, action })
 }
 
 fn preset_name_from(obj: &serde_json::Map<String, Value>) -> Option<String> {
@@ -530,7 +615,7 @@ pub fn set_rule_action(rule: &mut Value, action: &str) -> Result<(), PresetError
         .as_object_mut()
         .ok_or_else(|| bad_rule(0, "must be a JSON object"))?;
     obj.insert("action".to_string(), Value::String(action.to_string()));
-    if action != "route" && action != "proxy" {
+    if !action_carries_outbound(action) {
         obj.remove("outbound");
     }
     validate_preset_rules(std::slice::from_ref(rule))
@@ -639,7 +724,7 @@ mod tests {
 
     #[test]
     fn bad_action_names_index_and_field() {
-        let error = parse_preset_json(r#"{"name":"x","rules":[{"action":"sniff"}]}"#, "")
+        let error = parse_preset_json(r#"{"name":"x","rules":[{"action":"nope"}]}"#, "")
             .expect_err("bad action fails");
         assert_eq!(error.kind, PresetErrorKind::BadRule);
         assert!(error.message.contains("rule 0"), "{error}");
@@ -981,5 +1066,182 @@ mod tests {
             ),
             vec!["Action", "Network", "Other"]
         );
+    }
+
+    #[test]
+    fn t58_intake_accepts_new_actions() {
+        for action in ["sniff", "resolve", "route-options"] {
+            validate_preset_rules(&[serde_json::json!({ "action": action })])
+                .unwrap_or_else(|error| panic!("{action} validates at intake: {error}"));
+            assert_eq!(
+                served_action(action),
+                action,
+                "{action} is its own sing-box action"
+            );
+        }
+        let rules = vec![
+            serde_json::json!({"action": "sniff", "domain": ["example.com"]}),
+            serde_json::json!({"action": "resolve", "server": "dns-local", "strategy": "prefer_ipv4"}),
+            serde_json::json!({"action": "route-options", "override_address": "192.0.2.53", "override_port": 53, "outbound": "some-tag"}),
+            serde_json::json!({"action": "reject", "method": "drop", "no_drop": true}),
+        ];
+        let text = serde_json::to_string(&serde_json::json!({
+            "kind": "throne-route-profile",
+            "v": 1,
+            "name": "throne-profile",
+            "rules": rules,
+        }))
+        .expect("profile serializes");
+        let parsed = parse_preset_json(&text, "").expect("Throne-shaped profile imports");
+        assert_eq!(parsed.name, "throne-profile");
+        assert_eq!(
+            parsed.rules, rules,
+            "rules survive the parse byte round-trip"
+        );
+        let link = preset_share_link("throne-profile", &rules);
+        let shared = decode_route_link(&link).expect("share link round-trips");
+        assert_eq!(shared.rules, rules, "share-link round-trip is verbatim");
+        let error = validate_preset_rules(&[serde_json::json!({
+            "action": "sniff", "outbound": "some-tag",
+        })])
+        .unwrap_err();
+        assert!(error.message.contains("\"outbound\""), "{error}");
+    }
+
+    #[test]
+    fn t58_reject_method_and_no_drop_round_trip() {
+        for method in ["drop", "reply", "default"] {
+            validate_preset_rules(&[serde_json::json!({"action": "reject", "method": method})])
+                .expect("method validates at intake");
+        }
+        validate_preset_rules(&[serde_json::json!({
+            "action": "reject", "no_drop": true,
+        })])
+        .expect("no_drop alone validates");
+        validate_preset_rules(&[serde_json::json!({
+            "action": "block", "method": "reply", "no_drop": false,
+        })])
+        .expect("Throne block spelling keeps the same reject keys");
+        for bad_method in [serde_json::json!("fallback"), serde_json::json!(3)] {
+            let error = validate_preset_rules(&[serde_json::json!({
+                "action": "reject", "method": bad_method,
+            })])
+            .unwrap_err();
+            assert_eq!(error.kind, PresetErrorKind::BadRule, "{error}");
+            assert!(error.message.contains("\"method\""), "{error}");
+            assert!(error.message.contains("drop"), "{error}");
+        }
+        let error = validate_preset_rules(&[serde_json::json!({
+            "action": "reject", "no_drop": "yes",
+        })])
+        .unwrap_err();
+        assert!(error.message.contains("\"no_drop\""), "{error}");
+        let rules = vec![
+            serde_json::json!({"action": "reject", "method": "drop", "no_drop": true}),
+            serde_json::json!({"action": "block", "method": "reply"}),
+        ];
+        let link = preset_share_link("reject-mix", &rules);
+        let parsed = decode_route_link(&link).expect("share link decodes");
+        assert_eq!(
+            parsed.rules, rules,
+            "method/no_drop survive round-trip verbatim"
+        );
+    }
+
+    #[test]
+    fn t58_route_options_override_fields_validate() {
+        validate_preset_rules(&[serde_json::json!({"action": "route-options"})])
+            .expect("bare route-options validates");
+        validate_preset_rules(&[serde_json::json!({
+            "action": "route-options",
+            "override_address": "192.0.2.53",
+            "override_port": 8443,
+        })])
+        .expect("override fields validate");
+        validate_preset_rules(&[serde_json::json!({
+            "action": "route-options", "outbound": "some-tag",
+        })])
+        .expect("outbound optional at intake; the exit gate is emission");
+        validate_preset_rules(&[serde_json::json!({
+            "action": "route-options", "override_port": 65535,
+        })])
+        .expect("65535 is the u16 ceiling");
+        for bad_rule in [
+            serde_json::json!({"action": "route-options", "override_address": 53}),
+            serde_json::json!({"action": "route-options", "override_port": 65536}),
+            serde_json::json!({"action": "route-options", "override_port": -1}),
+            serde_json::json!({"action": "route-options", "override_port": "8443"}),
+            serde_json::json!({"action": "route-options", "override_port": 8443.5}),
+        ] {
+            let error = validate_preset_rules(&[bad_rule]).unwrap_err();
+            assert_eq!(error.kind, PresetErrorKind::BadRule, "{error}");
+            assert!(
+                error.message.contains("\"override_"),
+                "names the override field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn t58_resolve_server_strategy_pass_through() {
+        validate_preset_rules(&[serde_json::json!({
+            "action": "resolve", "server": "dns-local", "strategy": "prefer_ipv4",
+        })])
+        .expect("resolve attrs validate");
+        validate_preset_rules(&[serde_json::json!({"action": "resolve"})])
+            .expect("bare resolve validates");
+        let error = validate_preset_rules(&[serde_json::json!({
+            "action": "resolve", "strategy": 4,
+        })])
+        .unwrap_err();
+        assert!(error.message.contains("\"strategy\""), "{error}");
+        let error = validate_preset_rules(&[serde_json::json!({
+            "action": "resolve", "server": ["x"],
+        })])
+        .unwrap_err();
+        assert!(error.message.contains("\"server\""), "{error}");
+        let error = validate_preset_rules(&[serde_json::json!({
+            "action": "resolve", "outbound": "some-tag",
+        })])
+        .unwrap_err();
+        assert!(error.message.contains("\"outbound\""), "{error}");
+    }
+
+    #[test]
+    fn t58_no_hijack_concept_no_mapping_no_guidance() {
+        // The Throne DNS-mapping rule action is a non-concept here: nothing
+        // registers, maps, or names it, so presets carrying it trip the
+        // existing generic unknown-action intake error.
+        let banned_action: String = ["hijack", "-dns"].concat();
+        assert_eq!(
+            VALID_PRESET_ACTIONS,
+            &[
+                "route",
+                "proxy",
+                "direct",
+                "block",
+                "reject",
+                "sniff",
+                "resolve",
+                "route-options",
+            ][..],
+            "the action list stays exactly the ticket's list"
+        );
+        assert!(!VALID_PRESET_ACTIONS.contains(&banned_action.as_str()));
+        let text = format!(r#"{{"name":"x","rules":[{{"action":"{banned_action}"}}]}}"#);
+        let error = parse_preset_json(&text, "").expect_err("unknown action fails intake");
+        assert_eq!(error.kind, PresetErrorKind::BadRule, "{error}");
+        assert!(error.message.contains("rule 0"), "{error}");
+        assert!(error.message.contains("\"action\""), "{error}");
+        assert!(error.message.contains("must be one of"), "{error}");
+        for known in VALID_PRESET_ACTIONS {
+            assert!(error.message.contains(known), "{error}");
+        }
+        for source in [include_str!("preset.rs"), include_str!("engine.rs")] {
+            assert!(
+                !source.contains(&banned_action),
+                "no new code path names the banned DNS action"
+            );
+        }
     }
 }
