@@ -3360,6 +3360,21 @@ fn sibling_sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
+pub(crate) const DATA_DIR_NAME: &str = "data";
+
+pub(crate) fn app_data_dir_in(app_dir: Option<&Path>) -> PathBuf {
+    match app_dir {
+        Some(dir) => dir.join(DATA_DIR_NAME),
+        // Unresolvable app dir (edge dev cases): stay cwd-relative — the
+        // AppData and home-dot defaults are banned, never read, never recreated.
+        None => PathBuf::from(DATA_DIR_NAME),
+    }
+}
+
+pub(crate) fn app_data_dir() -> PathBuf {
+    app_data_dir_in(crate::engine::current_app_dir().as_deref())
+}
+
 static NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn unique_name_suffix(ts: i64) -> String {
@@ -3500,12 +3515,7 @@ impl Store {
                 return PathBuf::from(path);
             }
         }
-        #[cfg(windows)]
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("ManyProxy").join("library.db");
-        }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".manyproxy").join("library.db")
+        app_data_dir().join("library.db")
     }
 
     fn open_with_path(conn: Connection, db_path: Option<PathBuf>) -> Result<Self, StoreError> {
@@ -14684,5 +14694,200 @@ mod tests {
         let padded = parse_port_field("  abc  ").expect_err("padded word rejects");
         assert_eq!(padded.field, "port");
         assert_eq!(padded.message, "port must be 1-65535, got 'abc'");
+    }
+
+    fn t52_temp_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp root works");
+        dir
+    }
+
+    #[test]
+    fn t52_default_path_is_exe_relative_data() {
+        let path = Store::default_path();
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("library.db"),
+            "db file name unchanged, got {path:?}"
+        );
+        let exe_dir = std::env::current_exe()
+            .expect("test exe resolves")
+            .parent()
+            .map(Path::to_path_buf)
+            .expect("exe dir resolves");
+        assert_eq!(
+            path.parent().map(Path::to_path_buf),
+            Some(app_data_dir()),
+            "db default is the shared app-data helper"
+        );
+        assert_eq!(
+            app_data_dir(),
+            exe_dir.join(DATA_DIR_NAME),
+            "data folder sits beside the exe, never elsewhere"
+        );
+
+        let base = t52_temp_root("t52apps");
+        let a = base.join("install-a");
+        let b = base.join("install-b");
+        assert_eq!(
+            app_data_dir_in(Some(&a))
+                .file_name()
+                .map(|n| n.to_os_string()),
+            Some(std::ffi::OsString::from(DATA_DIR_NAME)),
+            "every app dir gets a data subfolder"
+        );
+        assert_ne!(
+            app_data_dir_in(Some(&a)),
+            app_data_dir_in(Some(&b)),
+            "two app dirs yield independent defaults"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn t52_export_and_logs_defaults_inside_data() {
+        let data = app_data_dir();
+        assert_eq!(
+            Store::default_export_path(),
+            data.join("manyproxy-export.json"),
+            "export default derives into the data folder"
+        );
+        assert_eq!(
+            Store::default_logs_path(),
+            data.join("manyproxy-logs.txt"),
+            "logs default derives into the data folder"
+        );
+        assert_eq!(
+            Store::default_export_path().parent().map(Path::to_path_buf),
+            Store::default_path().parent().map(Path::to_path_buf),
+            "export and db share one parent"
+        );
+        assert_eq!(
+            Store::default_logs_path().parent().map(Path::to_path_buf),
+            Store::default_path().parent().map(Path::to_path_buf),
+            "logs and db share one parent"
+        );
+    }
+
+    #[test]
+    fn t52_backup_and_quarantine_beside_db() {
+        let base = t52_temp_root("t52backup");
+        let data = app_data_dir_in(Some(&base));
+        let db = data.join("library.db");
+        std::fs::create_dir_all(&data).expect("data dir works");
+        std::fs::write(&db, b"this is not sqlite at all").expect("garbage writes");
+
+        let error = match Store::open_file(&db) {
+            Ok(_) => panic!("corrupt open must fail"),
+            Err(err) => err,
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("corrupt") || text.contains("integrity"),
+            "loud failure at the new location, got {text}"
+        );
+
+        let kept: Vec<_> = std::fs::read_dir(&data)
+            .expect("data dir reads")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "quarantine lands beside the db, got {kept:?}"
+        );
+
+        let store = Store::open_file(&db).expect("fresh db opens after quarantine");
+        drop(store);
+        let backup = Store::backup_db_file(&db, 12345).expect("backup works");
+        assert_eq!(
+            backup.parent().map(Path::to_path_buf),
+            Some(data.clone()),
+            "backup lands beside the db"
+        );
+        assert!(
+            backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("library.db.bak-")),
+            "backup file name is the .bak sibling, got {backup:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn t52_fresh_default_store_at_exe_relative_data() {
+        let base = t52_temp_root("t52fresh");
+        let data = app_data_dir_in(Some(&base));
+        let db = data.join("library.db");
+        assert!(!data.exists(), "fresh install starts without a data folder");
+
+        let payload = {
+            let mut store = Store::open_file(&db).expect("first open creates the data folder");
+            assert!(data.exists(), "<appdir> data folder created on first use");
+            store.add(valid_input("t52-fresh")).expect("row seeds");
+            store.export_library_json().expect("export works")
+        };
+        let reopened = Store::open_file(&db).expect("second open works");
+        let rows = reopened.list().expect("list works");
+        assert_eq!(rows.len(), 1, "open twice keeps the library, no migration");
+        assert_eq!(rows[0].name, "t52-fresh", "row survives the reopen");
+
+        let mut dry = Store::open_in_memory().expect("in-memory opens");
+        dry.restore_library_json(&payload)
+            .expect("restore round trip works");
+        let restored = dry.list().expect("restored list works");
+        assert_eq!(restored.len(), 1, "row survives export/restore in memory");
+        assert_eq!(restored[0].name, "t52-fresh", "restored row intact");
+
+        let other = t52_temp_root("t52fresh-second");
+        let other_db = app_data_dir_in(Some(&other)).join("library.db");
+        let fresh = Store::open_file(&other_db).expect("second app dir opens");
+        assert!(
+            fresh.list().expect("fresh list works").is_empty(),
+            "another app dir starts a new library, nothing carried over"
+        );
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn t52_no_default_paths_reference_appdata() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Needles are assembled at runtime so this guard never matches its own source.
+        let appdata = ["APP", "DATA"].concat();
+        let dot = '.';
+        let legacy_home = format!("{dot}{}{}", "many", "proxy");
+
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("src dir reads") {
+            let path = entry.expect("entry reads").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let text = std::fs::read_to_string(&path).expect("source reads");
+            if text.contains(&appdata) {
+                offenders.push(format!("{name}: {appdata}"));
+            }
+            if text.contains(&legacy_home) {
+                offenders.push(format!("{name}: {legacy_home}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "default storage must never reference the legacy homes, got {offenders:?}"
+        );
     }
 }

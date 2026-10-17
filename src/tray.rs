@@ -411,6 +411,32 @@ mod tests {
             db.starts_with(&folder),
             "folder contains the db path ({db} vs {folder})"
         );
+        assert_eq!(
+            std::path::Path::new(&folder)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .as_deref(),
+            Some(crate::store::DATA_DIR_NAME),
+            "folder is the app-relative data dir"
+        );
+    }
+
+    #[test]
+    fn t52_tray_config_folder_cascades() {
+        let folder = config_folder();
+        let data = crate::store::app_data_dir();
+        assert_eq!(
+            folder,
+            data.display().to_string(),
+            "open-config copies the app-relative data folder"
+        );
+        assert_eq!(
+            std::path::Path::new(&folder)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .as_deref(),
+            Some(crate::store::DATA_DIR_NAME)
+        );
     }
 
     #[test]

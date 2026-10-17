@@ -45140,6 +45140,14 @@ mod tests {
         });
         assert_eq!(clip, crate::tray::config_folder(), "config folder copies");
         assert!(!clip.is_empty(), "folder never empty");
+        assert_eq!(
+            std::path::Path::new(&clip)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .as_deref(),
+            Some(crate::store::DATA_DIR_NAME),
+            "copied config folder is the app-relative data dir"
+        );
     }
 
     fn restore_seed(name: &str, bind: &str, port: &str) -> NewConfig {

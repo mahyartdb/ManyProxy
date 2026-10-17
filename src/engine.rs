@@ -4337,7 +4337,7 @@ pub fn engine_binary_file_name() -> String {
     }
 }
 
-fn current_app_dir() -> Option<PathBuf> {
+pub(crate) fn current_app_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
