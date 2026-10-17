@@ -1,0 +1,244 @@
+name: release
+
+# CI-CONSENT NOTE (sidecar fetch discipline)
+# This WORKFLOW downloads the three pinned sidecar binaries on the
+# MAINTAINER'S BEHALF — it is the *packaging step* loading shipped files from
+# their official upstream release URLs, executed by CI acting as the
+# maintainer (per AGENTS.md this is the user publishing, not silent
+# downloads). ManyProxy-the-app itself keeps the never-download /
+# never-PATH constraints untouched (assert_no_system_mutation family stays
+# green; the app has zero download capability). No tokens beyond the default
+# GITHUB_TOKEN are used; every sidecar URL below is a public constant.
+#
+# PIN DISCIPLINE (each pin verified at ticket T-03 execution time)
+# - sing-box 1.14.2 — SagerNet's official release asset (zip). Same version
+#   as .github/workflows/live.yml:29-31 pins; workflows cannot share env
+#   across files, so the value is duplicated here with this comment as the
+#   cross-link. SagerNet publishes no checksum asset for that release, so the
+#   identity check is the binary reporting the pinned version (the same
+#   check live.yml performs).
+# - sing-box-awg (AmneziaWG+XHTTP fork — research: .planning/research/
+#   02-amnezia-xray.md) — the fork's own release page is the upstream for
+#   this binary: Leadaxe/sing-box-lx, tag v1.14.3-lx.21, asset
+#   sing-box-1.14.3-lx.21-windows-amd64.zip, which the SAME release covers
+#   with a SHA256SUMS manifest (verified at ticket time: the windows-amd64
+#   zip line exists and is checked below; anything else fails the job loudly
+#   rather than substituting a mirror).
+# - xray 26.3.27 — XTLS/Xray-core official release, asset Xray-windows-64.zip
+#   with a `.dgst` checksum sidecar on the same release (SHA2-256 line checked
+#   below; missing or mismatching checksum = loud failure, no substitution).
+#
+# ARM64 note: the runner matrix is single-arch on purpose — the windows-arm64
+# row is ticket T-04, not this workflow.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Rehearsal tag for bundle/file naming (builds and verifies only; no release is created)"
+        required: false
+        default: "v0.0.0-test.1"
+
+permissions:
+  contents: write
+
+env:
+  SINGBOX_VERSION: "1.14.2"
+  SINGBOX_URL: "https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-windows-amd64.zip"
+  AWG_FORK_VERSION: "1.14.3-lx.21"
+  AWG_FORK_URL: "https://github.com/Leadaxe/sing-box-lx/releases/download/v1.14.3-lx.21/sing-box-1.14.3-lx.21-windows-amd64.zip"
+  AWG_FORK_SUMS_URL: "https://github.com/Leadaxe/sing-box-lx/releases/download/v1.14.3-lx.21/SHA256SUMS"
+  XRAY_VERSION: "26.3.27"
+  XRAY_URL: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip"
+  XRAY_DGST_URL: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip.dgst"
+
+jobs:
+  windows-amd64:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve bundle version from tag
+        shell: pwsh
+        run: |
+          # Tag push: use the pushed tag. Rehearsal dispatch: use the input tag.
+          $ref = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
+          "TAG=$ref" >> $env:GITHUB_ENV
+          "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
+
+      - name: Build (release, locked)
+        shell: pwsh
+        run: |
+          # MANYPROXY_GIT_HASH is stamped by build.rs (best-effort `git rev-parse`),
+          # so a tag-pushed build carries the tagged commit's hash naturally.
+          cargo build --release --locked
+
+      - name: Fetch pinned sing-box (print URL, download, verify)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:SINGBOX_VERSION
+          $url = $env:SINGBOX_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: sing-box $version | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("sing-box pin unverifiable: pinned URL $url returned a zip without sing-box.exe (no mirror substitution allowed; failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "sing-box version output: $probe"
+          if ($probe -notmatch [regex]::Escape($version)) {
+            throw ("sing-box pin unverifiable: downloaded binary reported `"$probe`", expected version $version (URL was $url; no mirror substitution allowed)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box.exe" -Force
+
+      - name: Fetch pinned sing-box-awg fork (print URL, download, verify against upstream SHA256SUMS)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:AWG_FORK_VERSION
+          $url = $env:AWG_FORK_URL
+          $zip = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-amd64.zip"
+          $dir = "$env:RUNNER_TEMP\sing-box-awg-$version-windows-amd64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: sing-box-awg (Leadaxe/sing-box-lx fork) $version | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          # Verify against the SAME release's own SHA256SUMS manifest.
+          $sums = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:AWG_FORK_SUMS_URL -UseBasicParsing).Content)
+          $line = ($sums -split "`r?`n") | Where-Object { $_.EndsWith("  sing-box-$version-windows-amd64.zip") } | Select-Object -First 1
+          if (-not $line) {
+            throw ("sing-box-awg pin unverifiable: upstream SHA256SUMS ($env:AWG_FORK_SUMS_URL) has no line for sing-box-$version-windows-amd64.zip (failing loudly; no mirror substitution allowed)")
+          }
+          $expected = ($line -split " " | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
+          $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw ("sing-box-awg pin unverifiable: downloaded zip sha256 $actual does not match the upstream SHA256SUMS line $expected (failing loudly; no mirror substitution allowed)")
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("sing-box-awg pin unverifiable: pinned URL $url returned a zip without sing-box.exe (failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "sing-box-awg version output: $probe"
+          # Identity has already been proven by the checksum above; the version
+          # probe is print evidence (fork version spellings may vary per build).
+          if ([string]::IsNullOrWhiteSpace($probe)) {
+            throw ("sing-box-awg pin unverifiable: pinned binary produced no version output (failing loudly)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\sing-box-awg.exe" -Force
+
+      - name: Fetch pinned xray (print URL, download, verify against upstream .dgst checksum)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:XRAY_VERSION
+          $url = $env:XRAY_URL
+          $zip = "$env:RUNNER_TEMP\Xray-windows-64-$version.zip"
+          $dir = "$env:RUNNER_TEMP\xray-$version-windows-amd64"
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\bins" | Out-Null
+          Write-Output "Pin: xray $version | URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          # Verify against the SAME release's .dgst sidecar (SHA2-256= line).
+          $dgst = [Text.Encoding]::UTF8.GetString((Invoke-WebRequest -Uri $env:XRAY_DGST_URL -UseBasicParsing).Content)
+          $line = ($dgst -split "`r?`n") | Where-Object { $_ -match "^SHA2-256=" } | Select-Object -First 1
+          if (-not $line) {
+            throw ("xray pin unverifiable: upstream .dgst ($env:XRAY_DGST_URL) has no SHA2-256= line (failing loudly; no mirror substitution allowed)")
+          }
+          if ($line -notmatch "^SHA2-256=\s*([0-9a-fA-F]+)") {
+            throw ("xray pin unverifiable: upstream .dgst SHA2-256= line is not parseable hex: `"$line`" (failing loudly; no mirror substitution allowed)")
+          }
+          $expected = $Matches[1].ToLowerInvariant()
+          $actual = ((Get-FileHash -Path $zip -Algorithm SHA256).Hash).ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw ("xray pin unverifiable: downloaded zip sha256 $actual does not match the upstream .dgst SHA2-256= line $expected (failing loudly; no mirror substitution allowed)")
+          }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter "xray.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw ("xray pin unverifiable: pinned URL $url returned a zip without xray.exe (failing loudly)")
+          }
+          $probe = (& $exe.FullName version) -join " "
+          Write-Output "xray version output: $probe"
+          if ([string]::IsNullOrWhiteSpace($probe)) {
+            throw ("xray pin unverifiable: pinned binary produced no version output (failing loudly)")
+          }
+          Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\xray.exe" -Force
+
+      - name: Assemble bundle (exactly five files) and guard the layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "manyproxy-v$env:VER-windows-amd64"
+          $zip = "manyproxy-v$env:VER-windows-amd64.zip"
+          if ($env:TAG -notmatch "^v") {
+            throw ("bundle naming guard: tag `"$env:TAG`" must match v* (naming convention requires it for release assets)")
+          }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path "target\release\manyproxy.exe" -Destination "$stage\manyproxy.exe" -Force
+          Copy-Item -Path "THIRD-PARTY-NOTICES.md" -Destination "$stage\THIRD-PARTY-NOTICES.md" -Force
+          foreach ($bin in "sing-box.exe", "sing-box-awg.exe", "xray.exe") {
+            Copy-Item -Path "$env:RUNNER_TEMP\bins\$bin" -Destination "$stage\$bin" -Force
+          }
+          $expectedFiles = @(
+            "THIRD-PARTY-NOTICES.md", "manyproxy.exe", "sing-box.exe", "sing-box-awg.exe", "xray.exe"
+          ) | Sort-Object
+          $actualFiles = (Get-ChildItem -Path $stage -File | Sort-Object -Property Name).Name
+          if ((@($actualFiles) -join "`n") -ne (@($expectedFiles) -join "`n")) {
+            throw ("bundle layout guard: staging must contain EXACTLY the five bundle files; found: " + (@($actualFiles) -join ", "))
+          }
+          Write-Output ("Staged exactly the five bundle files: " + (@($actualFiles) -join ", "))
+          Compress-Archive -Path $stage -DestinationPath $zip
+          # SHA256SUMS.txt: the zip + each staged binary (no signature this beta —
+          # hashes are the honesty floor).
+          $hashItems = @($zip, "$stage\manyproxy.exe", "$stage\sing-box.exe", "$stage\sing-box-awg.exe", "$stage\xray.exe")
+          $hashes = $hashItems | ForEach-Object {
+            "{0}  {1}" -f ((Get-FileHash -Path $_ -Algorithm SHA256).Hash).ToLowerInvariant(), (Split-Path $_ -Leaf)
+          }
+          Set-Content -Path "SHA256SUMS.txt" -Value $hashes -Encoding utf8NoBOM
+          Write-Output "SHA256SUMS.txt:"
+          Write-Output (Get-Content -Path "SHA256SUMS.txt")
+
+      - name: Upload bundle as build artifact (rehearsal runs deliver here)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "manyproxy-${{ env.VER }}-windows-amd64"
+          path: |
+            manyproxy-v${{ env.VER }}-windows-amd64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create the GitHub release (tag pushes only; rehearsals skip this)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "manyproxy-v$env:VER-windows-amd64.zip"
+          $prereleaseFlag = @()
+          if ($env:TAG -match "-") { $prereleaseFlag += "--prerelease" }
+          $notes = @"
+          ManyProxy $env:TAG — first beta for the windows-amd64 portable bundle.
+
+          - Unzip anywhere; `manyproxy.exe` + the three sidecar engines sit beside it; no installer, no admin needed (loopback defaults).
+          - Sidecar pins shipped as-is: sing-box $env:SINGBOX_VERSION (SagerNet), sing-box-awg $env:AWG_FORK_VERSION (Leadaxe/sing-box-lx AmneziaWG fork), xray $env:XRAY_VERSION (XTLS/Xray-core).
+          - ``SHA256SUMS.txt`` covers the zip and the four binaries (the beta has no code-signing story; hashes are the honesty floor).
+          - No auto-update: the app never downloads or replaces executables. Updating = replacing the folder by hand. Data lives in ``data\`` beside the exe; deleting the folder uninstalls cleanly.
+          "@
+          Set-Content -Path "release-notes.md" -Value $notes -Encoding utf8NoBOM
+          gh release create $env:TAG $zip "SHA256SUMS.txt" `
+            --title "ManyProxy $env:TAG (windows-amd64)" `
+            --notes-file "release-notes.md" `
+            --generate-notes `
+            @prereleaseFlag

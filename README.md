@@ -14,7 +14,7 @@ Route-profile importers: `throne://route` links are accepted into the presets ma
 
 ## Install / run
 
-Windows 10/11 64-bit (v1 platform).
+Windows 10/11 64-bit (v1 platform). Download the ZIP from [GitHub Releases](https://github.com/QMahyar/ManyProxy/releases) — each release ships `manyproxy-v<tag>-windows-amd64.zip` plus `SHA256SUMS.txt`; unzip anywhere and run `manyproxy.exe` (sidecar binaries and `data\` live beside it).
 
 1. Put the app exe plus sidecar binaries **in the same folder** (portable or installed, either works as long as they sit together): `sing-box`, `sing-box-awg` (AmneziaWG/Noise/XHTTP rows only), `xray` (Xray-only VLESS bridge only), plus at most one user-supplied extra-core executable (app dir only). Resolution is app-dir ONLY, never `PATH` (ticket 23, `resolve_*_binary_in`, `src/engine.rs`). Verified by `missing_binaries_state_never_downloads`.
 2. Run: `cargo run` (dev) or launch the built exe. No admin needed for default (loopback) use; no registry keys, services, or drivers (`PACKAGING-NOTES.md`).
