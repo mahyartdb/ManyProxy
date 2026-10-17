@@ -9273,6 +9273,14 @@ async fn resolve_subscription_addresses(
     rx.await.unwrap_or_default()
 }
 
+/// Every outbound fetch-layer request carries `User-Agent: ManyProxy/<APP_VERSION>`.
+/// A static, per-release identifier with zero device identity: Throne's
+/// `x-hwid`/`x-device-*` header family is device fingerprinting, and this
+/// function must never gain any hostname/MAC/ID component.
+pub(crate) fn user_agent_header() -> String {
+    format!("ManyProxy/{}", APP_VERSION)
+}
+
 async fn fetch_subscription_body(
     client: Arc<dyn HttpClient>,
     url: &str,
@@ -9299,6 +9307,7 @@ async fn fetch_subscription_body(
         }
         let request = http_client::http::Request::builder()
             .uri(current.as_str())
+            .header("user-agent", user_agent_header())
             .follow_redirects(http_client::RedirectPolicy::NoFollow)
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .body(AsyncBody::empty())
@@ -9737,6 +9746,7 @@ pub async fn fetch_release_feed(
         }
         let request = http_client::http::Request::builder()
             .uri(current.as_str())
+            .header("user-agent", user_agent_header())
             .follow_redirects(http_client::RedirectPolicy::NoFollow)
             .timeout(std::time::Duration::from_secs(UPDATE_FEED_TIMEOUT_SECS))
             .body(AsyncBody::empty())
@@ -47173,6 +47183,156 @@ mod tests {
             view.read_with(cx, |view, _| view.store.update_feed_url()),
             Some("http://mirror.example/feed.json".to_string())
         );
+    }
+
+    // T-07: the outbound fetch layer identifies itself as exactly
+    // `ManyProxy/<version>` on every request of every hop, and never sends
+    // any device-identification header (Throne's x-hwid / x-device-*
+    // family is banned capability — pinned here, not merely documented).
+
+    fn t57_expected_user_agent() -> String {
+        format!("ManyProxy/{}", crate::APP_VERSION)
+    }
+
+    fn t57_assert_user_agent_on_every_capture(log: &[Vec<(String, String)>]) {
+        assert!(
+            !log.is_empty(),
+            "at least one outgoing request must have been captured"
+        );
+        for (hop, headers) in log.iter().enumerate() {
+            let user_agents: Vec<String> = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| value.clone())
+                .collect();
+            assert!(
+                user_agents.len() == 1,
+                "every request carries exactly one user-agent, hop {hop} sent {user_agents:?}"
+            );
+            assert_eq!(
+                user_agents[0],
+                t57_expected_user_agent(),
+                "hop {hop} announces exactly ManyProxy/<version>"
+            );
+        }
+    }
+
+    fn t57_assert_no_device_identifier_headers(log: &[Vec<(String, String)>]) {
+        for (hop, headers) in log.iter().enumerate() {
+            for (name, _) in headers {
+                let lowered = name.to_ascii_lowercase();
+                assert!(
+                    !lowered.contains("hwid"),
+                    "no hwid-named header may ride outbound fetches, hop {hop} sent {name:?}"
+                );
+                assert!(
+                    !lowered.starts_with("x-device"),
+                    "no x-device header may ride outbound fetches, hop {hop} sent {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t57_user_agent_header_on_subscription_fetch() {
+        assert_eq!(
+            crate::user_agent_header(),
+            t57_expected_user_agent(),
+            "the production helper builds the same static identity"
+        );
+        // subscription-style URL with a redirect: the header rides the
+        // builder on every hop of the manual No-Follow loop
+        let (client, fetched, header_log) = t56_recording_feed_client(|uri| {
+            if uri == "https://example.com/sub.txt" {
+                t48_response(302, Some("https://cdn.example.com/sub.txt"), "")
+            } else {
+                t48_response(200, None, "sub-body")
+            }
+        });
+        let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+            t48_public_resolver,
+        ))
+        .expect("subscription body fetches");
+        assert_eq!(downloaded.body, "sub-body");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec![
+                "https://example.com/sub.txt".to_string(),
+                "https://cdn.example.com/sub.txt".to_string(),
+            ],
+            "both hops went out"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+    }
+
+    #[test]
+    fn t57_user_agent_header_on_remote_preset_fetch() {
+        // remote presets refresh through the shared fetch_subscription_body
+        // helper (start_preset_refresh), so this exercises the exact builder
+        // that path owns — a preset-style URL, single non-redirect request
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(200, None, "preset-body"));
+        let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://relay.example.com/presets/throne.json",
+            t48_public_resolver,
+        ))
+        .expect("preset body fetches");
+        assert_eq!(downloaded.body, "preset-body");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec!["https://relay.example.com/presets/throne.json".to_string()],
+            "the preset request went out once"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+    }
+
+    #[test]
+    fn t57_no_device_identifier_headers_anywhere() {
+        // positive match on the UA and a negative match on the hwid/
+        // x-device family across the entire fetch layer: subscription
+        // bodies, remote presets (same helper), and the release feed
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(200, None, "sub-body"));
+        let downloaded = futures::executor::block_on(crate::fetch_subscription_body(
+            client,
+            "https://example.com/sub.txt",
+            t48_public_resolver,
+        ))
+        .expect("subscription fetch works");
+        assert_eq!(downloaded.body, "sub-body");
+        assert_eq!(
+            fetched.lock().expect("read works").len(),
+            1,
+            "the subscription entry point recorded one request"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+        t57_assert_no_device_identifier_headers(&header_log.lock().expect("read works"));
+
+        let (client, fetched, header_log) = t56_recording_feed_client(|_| {
+            t48_response(
+                200,
+                None,
+                r#"{"tag_name":"v0.0.1","prerelease":false,"html_url":"https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.1"}"#,
+            )
+        });
+        let release = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            crate::UPDATE_FEED_URL_DEFAULT,
+            t56_public_resolver,
+        ))
+        .expect("release feed fetches and parses")
+        .expect("the latest endpoint holds one eligible release");
+        assert_eq!(release.tag_name, "v0.0.1");
+        assert_eq!(
+            fetched.lock().expect("read works").len(),
+            1,
+            "the release-feed entry point recorded one request"
+        );
+        t57_assert_user_agent_on_every_capture(&header_log.lock().expect("read works"));
+        t57_assert_no_device_identifier_headers(&header_log.lock().expect("read works"));
     }
 
     fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {
