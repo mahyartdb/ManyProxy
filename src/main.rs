@@ -8955,6 +8955,22 @@ fn normalize_test_url(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Same fetch policy as subscriptions — validated at save time, before any
+/// update check ever runs: https-only allow, plaintext http warns, internal
+/// hosts are refused outright.
+fn normalize_update_feed_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("feed URL must not be empty".to_string());
+    }
+    match store::subscription_fetch_policy(trimmed) {
+        store::SubscriptionFetchPolicy::Allow | store::SubscriptionFetchPolicy::Warn { .. } => {
+            Ok(trimmed.to_string())
+        }
+        store::SubscriptionFetchPolicy::Block { reason } => Err(reason.to_string()),
+    }
+}
+
 fn effective_probe_url(row_override: Option<&str>, global: Option<&str>) -> String {
     row_override
         .filter(|url| !url.trim().is_empty())
@@ -9375,6 +9391,463 @@ fn fetch_redirect_location(
         .to_str()
         .ok()?;
     resolve_fetch_redirect(current_url, location)
+}
+
+pub const UPDATE_FEED_URL_DEFAULT: &str =
+    "https://api.github.com/repos/QMahyar/ManyProxy/releases/latest";
+
+/// T-06: the update check is a passive JSON GET — 10 s timeout, one MiB cap,
+/// at most five hand-followed hops. It reads the feed and nothing else;
+/// release assets are never fetched, hashed, or executed by the app.
+const UPDATE_FEED_TIMEOUT_SECS: u64 = 10;
+
+const UPDATE_FEED_MAX_REDIRECTS: usize = store::SUBSCRIPTION_MAX_REDIRECTS;
+
+const UPDATE_FEED_MAX_BYTES: usize = 1024 * 1024;
+
+pub const UPDATE_FEED_EMPTY_MESSAGE: &str = "No releases published yet.";
+
+/// One release entry read out of the JSON feed. The app keeps parsed
+/// metadata only — assets are never touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedRelease {
+    pub tag_name: String,
+    pub prerelease: bool,
+    pub html_url: Option<String>,
+    pub release_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseCompare {
+    UpToDate,
+    Newer,
+    Older,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemverIdent {
+    Numeric(u64),
+    Alnum(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTag {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub idents: Vec<SemverIdent>,
+}
+
+/// Strips the leading `v`, splits `major.minor.patch` from the optional
+/// `-prerelease` suffix, and ignores `+build` metadata per semver rule 10.
+pub fn parse_release_tag(tag: &str) -> Option<ParsedTag> {
+    let trimmed = tag.trim();
+    let no_v = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let no_build = no_v.split('+').next().unwrap_or(no_v);
+    let (core, suffix) = match no_build.split_once('-') {
+        Some((core, suffix)) => (core, suffix),
+        None => (no_build, ""),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if suffix.is_empty() {
+        if no_build.contains('-') {
+            return None;
+        }
+        return Some(ParsedTag {
+            major,
+            minor,
+            patch,
+            idents: Vec::new(),
+        });
+    }
+    let mut idents = Vec::new();
+    for ident in suffix.split('.') {
+        if ident.is_empty() {
+            return None;
+        }
+        if ident.bytes().all(|b| b.is_ascii_digit()) {
+            idents.push(SemverIdent::Numeric(ident.parse::<u64>().ok()?));
+        } else {
+            idents.push(SemverIdent::Alnum(ident.to_string()));
+        }
+    }
+    Some(ParsedTag {
+        major,
+        minor,
+        patch,
+        idents,
+    })
+}
+
+/// Compares two parsed tags. Equal triples rank the plain release above its
+/// own prereleases (rule 10); two prerelease tag sets compare per rule 11
+/// (numeric < alphanumeric, larger set outranks the smaller).
+pub fn compare_parsed_tags(a: &ParsedTag, b: &ParsedTag) -> std::cmp::Ordering {
+    let triple = (a.major, a.minor, a.patch).cmp(&(b.major, b.minor, b.patch));
+    if triple != std::cmp::Ordering::Equal {
+        return triple;
+    }
+    match (a.idents.is_empty(), b.idents.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => compare_pre_identifiers(&a.idents, &b.idents),
+    }
+}
+
+fn compare_pre_identifiers(a: &[SemverIdent], b: &[SemverIdent]) -> std::cmp::Ordering {
+    for (left, right) in a.iter().zip(b.iter()) {
+        let ordering = match (left, right) {
+            (SemverIdent::Numeric(left), SemverIdent::Numeric(right)) => left.cmp(right),
+            (SemverIdent::Numeric(_), SemverIdent::Alnum(_)) => std::cmp::Ordering::Less,
+            (SemverIdent::Alnum(_), SemverIdent::Numeric(_)) => std::cmp::Ordering::Greater,
+            (SemverIdent::Alnum(left), SemverIdent::Alnum(right)) => left.cmp(right),
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+pub fn compare_release_to_running(tag_name: &str, running: &str) -> ReleaseCompare {
+    let Some(candidate) = parse_release_tag(tag_name) else {
+        return ReleaseCompare::UpToDate;
+    };
+    let Some(current) = parse_release_tag(running) else {
+        return ReleaseCompare::UpToDate;
+    };
+    match compare_parsed_tags(&candidate, &current) {
+        std::cmp::Ordering::Greater => ReleaseCompare::Newer,
+        std::cmp::Ordering::Less => ReleaseCompare::Older,
+        std::cmp::Ordering::Equal => ReleaseCompare::UpToDate,
+    }
+}
+
+/// The running binary only sees prerelease tags when it itself carries a
+/// prerelease suffix (the brief: `APP_VERSION` rides the channel).
+fn running_is_prerelease(running: &str) -> bool {
+    running.contains('-')
+}
+
+fn newest_tag_among(entries: &[FetchedRelease], allow_prerelease: bool) -> Option<FetchedRelease> {
+    let mut best: Option<(ParsedTag, &FetchedRelease)> = None;
+    for entry in entries {
+        if entry.prerelease && !allow_prerelease {
+            continue;
+        }
+        let Some(parsed) = parse_release_tag(&entry.tag_name) else {
+            continue;
+        };
+        let replace = match &best {
+            Some((top, _)) => compare_parsed_tags(&parsed, top) == std::cmp::Ordering::Greater,
+            None => true,
+        };
+        if replace {
+            best = Some((parsed, entry));
+        }
+    }
+    best.map(|(_, entry)| entry.clone())
+}
+
+fn json_str_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|field| field.as_str())
+        .map(str::to_string)
+}
+
+fn release_entry(value: &serde_json::Value) -> Option<FetchedRelease> {
+    if !value.is_object() {
+        return None;
+    }
+    Some(FetchedRelease {
+        tag_name: json_str_field(value, "tag_name")?,
+        prerelease: value
+            .get("prerelease")
+            .and_then(|field| field.as_bool())
+            .unwrap_or(false),
+        html_url: json_str_field(value, "html_url"),
+        release_name: json_str_field(value, "name"),
+    })
+}
+
+/// Parses the feed body. `Ok(None)` means nothing a compare can act on —
+/// everything published is prerelease-only while the running build is stable,
+/// or no release carries a comparable tag. HTTP 404 stays with the fetch fn.
+pub fn parse_release_feed(
+    body: &str,
+    list_endpoint: bool,
+    running: &str,
+) -> Result<Option<FetchedRelease>, String> {
+    const MALFORMED: &str = "update feed is not valid JSON";
+    let value: serde_json::Value =
+        serde_json::from_str(body.trim()).map_err(|_| MALFORMED.to_string())?;
+    let allow_prerelease = running_is_prerelease(running);
+    if list_endpoint {
+        let entries = value.as_array().ok_or_else(|| MALFORMED.to_string())?;
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if let Some(release) = release_entry(entry) {
+                candidates.push(release);
+            }
+        }
+        Ok(newest_tag_among(&candidates, allow_prerelease))
+    } else {
+        let feed = release_entry(&value).ok_or_else(|| MALFORMED.to_string())?;
+        if feed.prerelease && !allow_prerelease {
+            return Ok(None);
+        }
+        if parse_release_tag(&feed.tag_name).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(feed))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCheckOutcome {
+    UpToDate,
+    NoReleases,
+    Newer(FetchedRelease),
+}
+
+/// Darkens the feed result into a dialog outcome: 404 is the exact
+/// "No releases published yet." state (not an error class), a filtered
+/// release set is up-to-date, and every other failure is a plain error.
+pub fn update_check_outcome(
+    fetched: Result<Option<FetchedRelease>, String>,
+) -> Result<UpdateCheckOutcome, String> {
+    match fetched {
+        Ok(Some(release)) => {
+            let candidate = compare_release_to_running(&release.tag_name, APP_VERSION);
+            Ok(match candidate {
+                ReleaseCompare::Newer => UpdateCheckOutcome::Newer(release),
+                ReleaseCompare::UpToDate | ReleaseCompare::Older => UpdateCheckOutcome::UpToDate,
+            })
+        }
+        Ok(None) => Ok(UpdateCheckOutcome::UpToDate),
+        Err(why) if why == UPDATE_FEED_EMPTY_MESSAGE => Ok(UpdateCheckOutcome::NoReleases),
+        Err(why) => Err(why),
+    }
+}
+
+/// (message element id, message text, optional release title, optional https
+/// releases page) — the single source the dialog renders from, so tests pin
+/// the exact strings without pulling them out of a painted frame.
+fn update_check_presentation(
+    outcome: &UpdateCheckOutcome,
+    running: &str,
+) -> (&'static str, String, Option<String>, Option<String>) {
+    match outcome {
+        UpdateCheckOutcome::UpToDate => (
+            "update-up-to-date",
+            format!("ManyProxy {running} is up to date."),
+            None,
+            None,
+        ),
+        UpdateCheckOutcome::NoReleases => (
+            "update-no-releases",
+            UPDATE_FEED_EMPTY_MESSAGE.to_string(),
+            None,
+            None,
+        ),
+        UpdateCheckOutcome::Newer(release) => {
+            let tag = release.tag_name.trim().to_string();
+            let name = release
+                .release_name
+                .clone()
+                .filter(|name| !name.trim().is_empty() && name.trim() != tag);
+            let url = release
+                .html_url
+                .clone()
+                .filter(|value| value.trim().starts_with("https://"));
+            (
+                "update-new-version",
+                format!("New version available: {tag} (running {running})"),
+                name,
+                url,
+            )
+        }
+    }
+}
+
+/// Stable binaries stay on `releases/latest`; a prerelease build rides the
+/// releases list so prerelease tags become visible (the channel rule).
+pub fn effective_update_feed_url(override_url: Option<&str>, running: &str) -> String {
+    if let Some(url) = override_url.filter(|value| !value.trim().is_empty()) {
+        return url.trim().to_string();
+    }
+    let default = UPDATE_FEED_URL_DEFAULT.trim();
+    if running_is_prerelease(running) {
+        if let Some(prefix) = default.strip_suffix("/releases/latest") {
+            return format!("{prefix}/releases");
+        }
+    }
+    default.to_string()
+}
+
+/// A feed URL targets the releases *list* when the path (sans query or
+/// fragment) ends in a `releases` segment — GitHub exposes
+/// `/repos/<owner>/<repo>/releases` (list) vs `/releases/latest` (single).
+fn is_releases_list_url(url: &str) -> bool {
+    let path = url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    path.rsplit('/').next().unwrap_or("") == "releases"
+}
+
+/// Fetches the JSON-only release feed through the subscription fetch policy —
+/// the same SSRF guards (https-only allow, plaintext http warns, internal
+/// hosts never fetched), redirects followed by hand.
+pub async fn fetch_release_feed(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+    resolver: SubscriptionHostResolver,
+) -> Result<Option<FetchedRelease>, String> {
+    use futures::AsyncReadExt as _;
+    const MAX_BYTES: usize = UPDATE_FEED_MAX_BYTES;
+    let list_endpoint = is_releases_list_url(url);
+    let mut current = url.trim().to_string();
+    for _ in 0..=UPDATE_FEED_MAX_REDIRECTS {
+        if let store::SubscriptionFetchPolicy::Block { reason } =
+            store::subscription_fetch_policy(&current)
+        {
+            return Err(reason.to_string());
+        }
+        if let Some(host) = store::subscription_url_host(&current) {
+            let resolved = resolve_subscription_addresses(host, resolver).await;
+            if let store::SubscriptionFetchPolicy::Block { reason } =
+                store::subscription_fetch_policy_resolved(&current, &resolved)
+            {
+                return Err(reason.to_string());
+            }
+        }
+        let request = http_client::http::Request::builder()
+            .uri(current.as_str())
+            .follow_redirects(http_client::RedirectPolicy::NoFollow)
+            .timeout(std::time::Duration::from_secs(UPDATE_FEED_TIMEOUT_SECS))
+            .body(AsyncBody::empty())
+            .map_err(|_| "update feed request failed".to_string())?;
+        let mut response = client
+            .send(request)
+            .await
+            .map_err(|_| "update feed fetch failed".to_string())?;
+        if is_fetch_redirect(response.status()) {
+            match fetch_redirect_location(response.headers(), &current) {
+                Some(next) => {
+                    current = next;
+                    continue;
+                }
+                None => return Err("update feed fetch failed (bad redirect)".to_string()),
+            }
+        }
+        if response.status().as_u16() == 404 {
+            // No releases published and still-private repos both land here.
+            return Err(UPDATE_FEED_EMPTY_MESSAGE.to_string());
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "update feed fetch failed (status {})",
+                response.status().as_u16()
+            ));
+        }
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65_536];
+        loop {
+            let n = response
+                .body_mut()
+                .read(&mut chunk)
+                .await
+                .map_err(|_| "update feed fetch failed".to_string())?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > MAX_BYTES {
+                return Err("update feed body too large".to_string());
+            }
+        }
+        let body =
+            String::from_utf8(buf).map_err(|_| "update feed body is not UTF-8".to_string())?;
+        return parse_release_feed(&body, list_endpoint, APP_VERSION);
+    }
+    Err("update feed fetch failed (too many redirects)".to_string())
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        lp_operation: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show_cmd: i32,
+    ) -> isize;
+}
+
+/// Opens the releases page in the user's own browser on their explicit
+/// click — https-only, no prefetch, no app-initiated navigation.
+fn open_release_in_browser(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Err("only https release pages can open in a browser".to_string());
+    }
+    open_url_shell_execute(trimmed)
+}
+
+#[cfg(windows)]
+fn open_url_shell_execute(url: &str) -> Result<(), String> {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt as _;
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(once(0))
+            .collect()
+    }
+    let operation = wide("open");
+    let file = wide(url);
+    let instance = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    if instance > 32 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot open the browser to {url} (shell returned {instance})"
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn open_url_shell_execute(_url: &str) -> Result<(), String> {
+    Err("opening the release page needs the Windows shell (ManyProxy is Windows-only)".to_string())
 }
 
 pub const INTERVAL_PRESETS: &[i64] = &[0, 3_600, 21_600, 43_200, 86_400, 604_800];
@@ -11229,6 +11702,8 @@ struct AppView {
     probe_url_in_flight: bool,
     probe_ping_in_flight: bool,
 
+    update_check_in_flight: bool,
+
     probe_stop: Arc<AtomicBool>,
 
     group_test_in_flight: bool,
@@ -11402,6 +11877,8 @@ impl AppView {
             inflight_refreshes: HashSet::new(),
             probe_url_in_flight: false,
             probe_ping_in_flight: false,
+
+            update_check_in_flight: false,
             probe_stop: Arc::new(AtomicBool::new(false)),
             group_test_in_flight: false,
             speedtest_mode: SpeedtestMode::Download,
@@ -12190,6 +12667,72 @@ impl AppView {
                 Err(reason) => {
                     window.push_notification(
                         Notification::error(format!("Invalid test URL: {reason}")),
+                        cx,
+                    );
+                    false
+                }
+            }
+        }
+    }
+
+    fn commit_update_feed_url(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            match self.store.clear_update_feed_url() {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(format!(
+                            "Feed URL cleared — updates check {UPDATE_FEED_URL_DEFAULT}"
+                        )),
+                        cx,
+                    );
+                    true
+                }
+                Err(error) => {
+                    self.report_save_error(error, window, cx);
+                    false
+                }
+            }
+        } else {
+            match normalize_update_feed_url(trimmed) {
+                Ok(url) => {
+                    let shown = redact_subscription_url(&url);
+                    match self.store.set_update_feed_url(&url) {
+                        Ok(()) => {
+                            if matches!(
+                                store::subscription_fetch_policy(trimmed),
+                                store::SubscriptionFetchPolicy::Warn { .. }
+                            ) {
+                                window.push_notification(
+                                    Notification::warning(format!(
+                                        "Feed URL set over plaintext http — prefer https: {shown}"
+                                    )),
+                                    cx,
+                                );
+                            } else {
+                                window.push_notification(
+                                    Notification::success(format!(
+                                        "Feed URL set — updates check {shown}"
+                                    )),
+                                    cx,
+                                );
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            self.report_save_error(error, window, cx);
+                            false
+                        }
+                    }
+                }
+                Err(reason) => {
+                    window.push_notification(
+                        Notification::error(format!("Invalid feed URL: {reason}")),
                         cx,
                     );
                     false
@@ -13451,6 +13994,14 @@ impl AppView {
         });
         let test_url_reader = test_url_state.clone();
         let test_url_view = view.clone();
+        let current_feed_url = self.store.update_feed_url().unwrap_or_default();
+        let feed_url_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format!("Default: {UPDATE_FEED_URL_DEFAULT}"))
+                .default_value(current_feed_url)
+        });
+        let feed_url_reader = feed_url_state.clone();
+        let feed_url_view = view.clone();
         let db_path = Store::default_path().display().to_string();
         let export_path = Store::default_export_path().display().to_string();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
@@ -13482,6 +14033,8 @@ impl AppView {
             let skip_delete_on = *skip_delete_state.borrow();
             let save_reader = test_url_reader.clone();
             let save_view = test_url_view.clone();
+            let feed_reader = feed_url_reader.clone();
+            let feed_view = feed_url_view.clone();
             let copy_db_view = test_url_view.clone();
             let db_path_for_copy = db_path.clone();
             let copy_export_view = test_url_view.clone();
@@ -13609,6 +14162,41 @@ impl AppView {
                                     let url = save_reader.read(cx).value().to_string();
                                     save_view.update(cx, |view, cx| {
                                         view.commit_test_url(&url, window, cx);
+                                    });
+                                }),
+                        )
+
+
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("settings-section-update")
+                                .test_support()
+                                .text_sm()
+                                .child("Update check"),
+                        )
+                        .child(dialog_field(
+                            "field-settings-update-feed",
+                            "Update feed URL (blank = default)",
+                            feed_url_reader.clone(),
+                        ))
+                        .child(
+                            div()
+                                .id("settings-update-feed-note")
+                                .test_support()
+                                .child(format!(
+                                    "Checking GETs this JSON feed (10s timeout, ≤5 redirects, \
+                                     1 MiB cap) and compares tags; nothing downloads or runs. \
+                                     Default: {UPDATE_FEED_URL_DEFAULT}"
+                                )),
+                        )
+                        .child(
+                            Button::new("settings-save-update-feed")
+                                .label("Save feed URL")
+                                .on_click(move |_, window, cx| {
+                                    let url = feed_reader.read(cx).value().to_string();
+                                    feed_view.update(cx, |view, cx| {
+                                        view.commit_update_feed_url(&url, window, cx);
                                     });
                                 }),
                         )
@@ -14229,6 +14817,7 @@ impl AppView {
 
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sidecars = self.sidecar_presence.clone();
+        let about_view = cx.entity();
         let body = about_body(
             APP_VERSION,
             GIT_HASH,
@@ -14236,12 +14825,162 @@ impl AppView {
             &Store::default_path().display().to_string(),
             &Store::default_export_path().display().to_string(),
         );
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            alert
-                .button_props(DialogButtonProps::default().ok_text("Close"))
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let check_view = about_view.clone();
+            dialog
                 .title(format!("About {APP_TITLE}"))
-                .description(body.clone())
-                .on_ok(|_, _, _| true)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("about-body")
+                                .test_support()
+                                .text_sm()
+                                .child(body.clone()),
+                        )
+                        .child(
+                            Button::new("about-check-for-updates")
+                                .small()
+                                .label("Check for updates")
+                                .tooltip("Fetch the release feed once (JSON only — nothing downloads or runs)")
+                                .on_click(move |_, window, cx| {
+                                    window.close_all_dialogs(cx);
+                                    check_view.update(cx, |view, cx| {
+                                        view.check_for_updates(window, cx);
+                                    });
+                                }),
+                        ),
+                )
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "about-dialog-ok",
+                    "about-dialog-cancel",
+                    "Close",
+                    Rc::new(|_, _| true),
+                ))
+        });
+    }
+
+    /// One update check per click: GET the JSON feed once, then surface the
+    /// compare result. Nothing auto-checks at startup or in the background —
+    /// the ticket forbids it (checking ≠ updating; nothing is ever fetched
+    /// besides this one JSON read).
+    fn check_for_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_check_in_flight {
+            window.push_notification(Notification::info("An update check is already running"), cx);
+            return;
+        }
+        let configured = self
+            .store
+            .update_feed_url()
+            .filter(|value| !value.trim().is_empty());
+        let feed_url = effective_update_feed_url(configured.as_deref(), APP_VERSION);
+        self.update_check_in_flight = true;
+        let client = cx.http_client();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let fetched = fetch_release_feed(client, &feed_url, resolve_subscription_host).await;
+            cx.update(|cx| {
+                if let Some(handle) = cx.active_window() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.finish_update_check(fetched, window, cx);
+                        });
+                    });
+                } else {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.finish_update_check_no_window(fetched, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_update_check(
+        &mut self,
+        fetched: Result<Option<FetchedRelease>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_check_in_flight = false;
+        cx.notify();
+        match update_check_outcome(fetched) {
+            Ok(outcome) => self.open_update_check_dialog(outcome, window, cx),
+            Err(why) => {
+                // every remaining failure is a plain error notification; the
+                // strings carry no URL or body echoes, only the fixed cause
+                window.push_notification(
+                    Notification::error(format!("Update check failed: {why}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn finish_update_check_no_window(
+        &mut self,
+        _fetched: Result<Option<FetchedRelease>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_check_in_flight = false;
+        cx.notify();
+    }
+
+    fn open_update_check_dialog(
+        &mut self,
+        outcome: UpdateCheckOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (id, message, release_name, release_url) =
+            update_check_presentation(&outcome, APP_VERSION);
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let mut body = div().flex().flex_col().gap_1();
+            body = body.child(
+                div()
+                    .id(id.to_string())
+                    .test_support()
+                    .text_sm()
+                    .child(message.clone()),
+            );
+            if let Some(name) = release_name.clone() {
+                body = body.child(
+                    div()
+                        .id("update-release-name")
+                        .test_support()
+                        .text_sm()
+                        .child(name),
+                );
+            }
+            if let Some(url) = release_url.clone() {
+                body = body.child(
+                    Button::new("update-open-releases")
+                        .small()
+                        .label("Open releases in browser")
+                        .tooltip(format!(
+                            "Opens {url} in your own browser — the app downloads nothing"
+                        ))
+                        .on_click(move |_, window, cx| {
+                            if let Err(why) = open_release_in_browser(&url) {
+                                window.push_notification(Notification::error(why), cx);
+                            }
+                        }),
+                );
+            }
+            dialog
+                .title("Check for updates")
+                .child(body)
+                .button_props(DialogButtonProps::default())
+                .footer(dialog_footer(
+                    "update-dialog-ok",
+                    "update-dialog-cancel",
+                    "Close",
+                    Rc::new(|_, _| true),
+                ))
         });
     }
 
@@ -24093,6 +24832,25 @@ impl AppView {
                                 move |_, window, cx| {
                                     view.update(cx, |view, cx| {
                                         view.stop_group_tests(window, cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::element(|_, _| {
+                                topbar_menu_row(
+                                    "check-for-updates",
+                                    "Check for updates",
+                                    "Check for updates",
+                                    "Fetch the release feed once (JSON only — nothing downloads or runs)",
+                                    None,
+                                )
+                            })
+                            .on_click({
+                                let view = tools_view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.check_for_updates(window, cx);
                                     });
                                 }
                             }),
@@ -45936,6 +46694,485 @@ mod tests {
         ))
         .expect_err("location-less redirect fails");
         assert!(error.contains("bad redirect"), "loud cause, got {error}");
+    }
+
+    type T56HeaderLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+    fn t56_recording_feed_client(
+        handler: impl Fn(String) -> gpui_kit::http_client::http::Response<gpui_kit::http_client::AsyncBody>
+            + Send
+            + Sync
+            + 'static,
+    ) -> (
+        std::sync::Arc<dyn gpui_kit::http_client::HttpClient>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        T56HeaderLog,
+    ) {
+        use gpui_kit::http_client::FakeHttpClient;
+        let handler = std::sync::Arc::new(handler);
+        let uris = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let header_log: T56HeaderLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = uris.clone();
+        let seen_headers = header_log.clone();
+        let client = FakeHttpClient::create(move |req| {
+            let seen = seen.clone();
+            let seen_headers = seen_headers.clone();
+            let handler = handler.clone();
+            let uri = req.uri().to_string();
+            let headers = req
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            async move {
+                seen.lock().expect("record works").push(uri.clone());
+                seen_headers.lock().expect("record works").push(headers);
+                Ok(handler(uri))
+            }
+        });
+        (client, uris, header_log)
+    }
+
+    fn t56_release_json(tag: &str, prerelease: bool, html_url: &str, name: &str) -> String {
+        format!(
+            r#"{{"tag_name":"{tag}","prerelease":{prerelease},"html_url":"{html_url}","name":"{name}"}}"#
+        )
+    }
+
+    fn t56_public_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        Ok(vec!["93.184.216.34".parse().expect("ip parses")])
+    }
+
+    fn t56_no_hwid_header(log: &[Vec<(String, String)>]) -> bool {
+        log.iter()
+            .flatten()
+            .all(|(name, _)| !name.to_ascii_lowercase().contains("hwid"))
+    }
+
+    #[test]
+    fn t56_feed_fetch_policy_blocks_internal_hosts() {
+        // a literal loopback feed is refused before any byte moves
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(200, None, "must never fetch"));
+        let error = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            "https://127.0.0.1/updates/releases/latest",
+            t56_public_resolver,
+        ))
+        .expect_err("loopback feed blocked");
+        assert!(error.contains("internal"), "SSRF cause, got {error}");
+        assert!(
+            fetched.lock().expect("read works").is_empty(),
+            "blocked before any network"
+        );
+        assert!(t56_no_hwid_header(&header_log.lock().expect("read works")));
+
+        // a redirect back into a private address dies without fetching the hop
+        let (client, fetched, _) = t56_recording_feed_client(|uri| {
+            if uri.ends_with("/releases/latest") {
+                t48_response(302, Some("http://192.168.0.5/evil"), "")
+            } else {
+                t48_response(200, None, "must never fetch")
+            }
+        });
+        let error = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            "https://example.com/updates/releases/latest",
+            t56_public_resolver,
+        ))
+        .expect_err("private redirect blocked");
+        assert!(error.contains("internal"), "rebind cause, got {error}");
+        assert_eq!(
+            fetched.lock().expect("read works").len(),
+            1,
+            "only the announced feed hop ever happened"
+        );
+
+        // the same policy refuses non-http(s) feeds outright
+        let (client, fetched, _) =
+            t56_recording_feed_client(|_| t48_response(200, None, "must never fetch"));
+        let error = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            "ftp://example.com/feed.json",
+            t56_public_resolver,
+        ))
+        .expect_err("non-http(s) feed blocked");
+        assert!(error.contains("http(s)"), "scheme cause, got {error}");
+        assert!(
+            fetched.lock().expect("read works").is_empty(),
+            "blocked before any network"
+        );
+    }
+
+    #[test]
+    fn t56_semver_compare_matrix() {
+        use crate::{compare_release_to_running, ReleaseCompare};
+        // equal tags and their v-aliases stay put
+        assert_eq!(
+            compare_release_to_running("0.0.1", "0.0.1"),
+            ReleaseCompare::UpToDate
+        );
+        assert_eq!(
+            compare_release_to_running("v0.0.1", "0.0.1"),
+            ReleaseCompare::UpToDate
+        );
+        // newer stable, with or without the v prefix
+        assert_eq!(
+            compare_release_to_running("0.0.2", "0.0.1"),
+            ReleaseCompare::Newer
+        );
+        assert_eq!(
+            compare_release_to_running("v0.0.2", "0.0.1"),
+            ReleaseCompare::Newer
+        );
+        assert_eq!(
+            compare_release_to_running("1.0.0", "0.9.9"),
+            ReleaseCompare::Newer
+        );
+        // older releases are ignored
+        assert_eq!(
+            compare_release_to_running("0.0.0", "0.0.1"),
+            ReleaseCompare::Older
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.1", "0.0.2"),
+            ReleaseCompare::Older
+        );
+        // rule 10: a plain release outranks its own prerelease
+        assert_eq!(
+            compare_release_to_running("0.0.2-beta.1", "0.0.2"),
+            ReleaseCompare::Older
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.2", "0.0.2-beta.1"),
+            ReleaseCompare::Newer
+        );
+        // rule 11: prerelease identifiers order numerically and lexically
+        assert_eq!(
+            compare_release_to_running("0.0.2-beta.2", "0.0.2-beta.1"),
+            ReleaseCompare::Newer
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.2-alpha", "0.0.2-beta"),
+            ReleaseCompare::Older
+        );
+        assert_eq!(
+            compare_release_to_running("0.0.2-beta", "0.0.2-beta.1"),
+            ReleaseCompare::Older
+        );
+        // unparseable tags never alarm
+        assert_eq!(
+            compare_release_to_running("nickname-of-my-cat", "0.0.1"),
+            ReleaseCompare::UpToDate
+        );
+    }
+
+    #[test]
+    fn t56_404_renders_no_releases_message() {
+        // fetch half: 404 maps to the exact no-releases text and nothing else
+        let (client, fetched, header_log) =
+            t56_recording_feed_client(|_| t48_response(404, None, "{\"message\":\"Not Found\"}"));
+        let feed_url = crate::effective_update_feed_url(None, crate::APP_VERSION);
+        assert_eq!(feed_url, crate::UPDATE_FEED_URL_DEFAULT);
+        let why = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            &feed_url,
+            t56_public_resolver,
+        ))
+        .expect_err("404 maps to the no-releases text");
+        assert_eq!(why, crate::UPDATE_FEED_EMPTY_MESSAGE);
+        assert_eq!(why, "No releases published yet.");
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec![feed_url.clone()],
+            "the request targets the feed URL only"
+        );
+        assert!(
+            t56_no_hwid_header(&header_log.lock().expect("read works")),
+            "no hardware id headers ride the update check"
+        );
+
+        // outcome half: the empty feed is a dialog state, not an error class
+        let outcome = crate::update_check_outcome(Err(why.clone()))
+            .expect("empty feed never surfaces as an error");
+        assert_eq!(
+            outcome,
+            crate::UpdateCheckOutcome::NoReleases,
+            "404 renders exactly the no-releases state"
+        );
+
+        // malformed body: loud plain-error detail, never a body or URL echo
+        let (client, fetched, _) =
+            t56_recording_feed_client(|_| t48_response(200, None, "<html>nope</html>"));
+        let malformed = futures::executor::block_on(crate::fetch_release_feed(
+            client,
+            &feed_url,
+            t56_public_resolver,
+        ))
+        .expect_err("malformed feed rejected");
+        assert_eq!(malformed, "update feed is not valid JSON");
+        assert_eq!(fetched.lock().expect("read works").len(), 1);
+        let failed = crate::update_check_outcome(Err(malformed))
+            .expect_err("malformed feeds keep failing loudly");
+        assert_eq!(failed, "update feed is not valid JSON");
+    }
+
+    #[gpui_kit::test]
+    fn t56_no_releases_dialog_and_malformed_error_toast(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_update_check(
+                    Err(crate::UPDATE_FEED_EMPTY_MESSAGE.to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "an empty feed renders the dialog"
+        );
+        assert_painted(cx, "update-no-releases");
+        assert_absent(cx, "update-open-releases".to_string());
+        assert_eq!(notification_count(cx), 0, "404 is not an error toast class");
+
+        // a malformed feed is the sibling edge: plain error toast, no dialog
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_update_check(
+                    Err("update feed is not valid JSON".to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "malformed feed never opens the dialog"
+        );
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "malformed feed is a plain error toast"
+        );
+    }
+
+    #[test]
+    fn t56_prerelease_visibility_follows_app_channel() {
+        // stable builds stay on the single `releases/latest` endpoint
+        assert_eq!(
+            crate::effective_update_feed_url(None, "0.0.1"),
+            crate::UPDATE_FEED_URL_DEFAULT
+        );
+        // a prerelease build switches to the releases list endpoint
+        assert_eq!(
+            crate::effective_update_feed_url(None, "0.1.0-beta.1"),
+            "https://api.github.com/repos/QMahyar/ManyProxy/releases"
+        );
+        // an explicit Settings override wins verbatim on either channel
+        assert_eq!(
+            crate::effective_update_feed_url(Some(" https://mirror.example/feed "), "0.0.1"),
+            "https://mirror.example/feed"
+        );
+
+        let list = format!(
+            "[{},{}]",
+            t56_release_json(
+                "v0.0.3-beta.1",
+                true,
+                "https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.3-beta.1",
+                "Beta one",
+            ),
+            t56_release_json(
+                "v0.0.2",
+                false,
+                "https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.2",
+                "Stable build",
+            ),
+        );
+
+        // a prerelease binary sees the newest prerelease tag
+        let picked = crate::parse_release_feed(&list, true, "0.1.0-beta.1")
+            .expect("list feed parses")
+            .expect("prerelease channel surfaces prereleases");
+        assert_eq!(picked.tag_name, "v0.0.3-beta.1");
+        assert!(picked.prerelease);
+
+        // a stable binary ignores prereleases and picks the newest stable
+        let picked = crate::parse_release_feed(&list, true, "0.0.1")
+            .expect("list feed parses")
+            .expect("stable channel still finds the stable release");
+        assert_eq!(picked.tag_name, "v0.0.2");
+
+        // prerelease-only feed with a stable running version is up-to-date
+        let only_prerelease = r#"[{"tag_name":"v0.0.3-beta.1","prerelease":true,"html_url":"https://github.com/QMahyar/ManyProxy/releases/tag/v0.0.3-beta.1"}]"#;
+        assert_eq!(
+            crate::parse_release_feed(only_prerelease, true, crate::APP_VERSION).expect("parses"),
+            None,
+            "nothing eligible means up-to-date, never an alarm"
+        );
+        assert_eq!(
+            crate::parse_release_feed("[]", true, crate::APP_VERSION).expect("parses"),
+            None
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t56_dialog_reports_new_version_with_browser_link(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        let release = crate::FetchedRelease {
+            tag_name: "v999.0.1".to_string(),
+            prerelease: false,
+            html_url: Some(
+                "https://github.com/QMahyar/ManyProxy/releases/tag/v999.0.1".to_string(),
+            ),
+            release_name: Some("ManyProxy v999.0.1".to_string()),
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_update_check_dialog(
+                    crate::UpdateCheckOutcome::Newer(release),
+                    window,
+                    cx,
+                );
+            });
+        });
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "update dialog opens"
+        );
+        assert_painted(cx, "update-new-version");
+        assert_painted(cx, "update-release-name");
+        assert_painted(cx, "update-open-releases");
+
+        // the same compare drives the exact message strings
+        let outcome = crate::update_check_outcome(Ok(Some(crate::FetchedRelease {
+            tag_name: "v999.0.1".to_string(),
+            prerelease: false,
+            html_url: None,
+            release_name: None,
+        })))
+        .expect("newer tag compares");
+        let (id, message, name, url) =
+            crate::update_check_presentation(&outcome, crate::APP_VERSION);
+        assert_eq!(id, "update-new-version");
+        assert_eq!(
+            message,
+            format!(
+                "New version available: v999.0.1 (running {})",
+                crate::APP_VERSION
+            )
+        );
+        assert_eq!(
+            name, None,
+            "a release title equal to the tag is not repeated"
+        );
+        assert_eq!(url, None, "a missing page never buys the browser button");
+
+        // up-to-date renders its own fixed copy, without any link button
+        let (id, message, name, url) = crate::update_check_presentation(
+            &crate::UpdateCheckOutcome::UpToDate,
+            crate::APP_VERSION,
+        );
+        assert_eq!(id, "update-up-to-date");
+        assert_eq!(
+            message,
+            format!("ManyProxy {} is up to date.", crate::APP_VERSION)
+        );
+        assert_eq!(name, None);
+        assert_eq!(url, None);
+    }
+
+    #[gpui_kit::test]
+    fn t56_settings_feed_url_round_trip_and_validation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        // store-level round trip: blank = default, override = verbatim trimmed
+        assert_eq!(store.update_feed_url(), None, "no feed override by default");
+        store
+            .set_update_feed_url(" https://mirror.example/feed ")
+            .expect("override saves");
+        assert_eq!(
+            store.update_feed_url(),
+            Some("https://mirror.example/feed".to_string())
+        );
+        store
+            .clear_update_feed_url()
+            .expect("clear restores default");
+        assert_eq!(store.update_feed_url(), None);
+
+        // view-level commit path mirrors the test-URL field's save pattern
+        let (view, cx) = mount_view(store, cx);
+        let ok = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("https://mirror.example/feed.json", window, cx)
+            })
+        });
+        assert!(ok, "valid override saves");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            Some("https://mirror.example/feed.json".to_string())
+        );
+
+        // an internal host is refused at save time, before any check runs
+        let toasts = notification_count(cx);
+        let blocked = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("https://127.0.0.1/feed.json", window, cx)
+            })
+        });
+        assert!(!blocked, "internal host refused");
+        assert_eq!(
+            notification_count(cx),
+            toasts + 1,
+            "the refusal surfaces the field error"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            Some("https://mirror.example/feed.json".to_string()),
+            "a refused URL never overwrites the working override"
+        );
+
+        // a blank field clears the override back to the default feed
+        let cleared = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("   ", window, cx)
+            })
+        });
+        assert!(cleared, "blank clears");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            None
+        );
+
+        // plaintext http applies per the same fetch policy (warn, not refuse)
+        let http_ok = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_update_feed_url("http://mirror.example/feed.json", window, cx)
+            })
+        });
+        assert!(http_ok, "plaintext http only warns");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.update_feed_url()),
+            Some("http://mirror.example/feed.json".to_string())
+        );
     }
 
     fn assert_within_frame(cx: &mut VisualTestContext, id: &str) {

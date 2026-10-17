@@ -14,11 +14,13 @@ name, path, and search-order claim below is verified against `src/`
 - The release exe is therefore `manyproxy.exe` on Windows
   (cargo names the exe after the package; no `[[bin]]` rename exists
   in `Cargo.toml`).
-- No in-app version string is derived from the package version:
-  `src/` contains zero uses of `CARGO_PKG_VERSION` / `env!("CARGO...")`
-  (grep-verified). So the version stamp for a release is the
-  `Cargo.toml [package] version` value plus the git commit hash —
-  record both in the release notes by hand.
+- The in-app version string does derive from the package version:
+  `src/main.rs` defines `APP_VERSION = env!("CARGO_PKG_VERSION")`
+  (`src/main.rs:184`, pinned by the `t55_app_version_is_plain_semver`
+  test), and the About dialog prints it next to the stamped git hash.
+  So the in-app version always matches the `Cargo.toml [package]
+  version`; still record the version and the git commit hash in the
+  release notes by hand when packaging.
 
 ## 2. Portable layout
 
@@ -113,8 +115,10 @@ binary fails fast here instead of serving exotic rows badly.
 6. Publish SHA-256 hashes for `manyproxy.exe` + each shipped sidecar
    (unsigned-binary AV/SmartScreen expectations per
    `PACKAGING-NOTES.md`: sign when a cert exists, never pack/obfuscate).
-7. Record `Cargo.toml` version + git hash in the release notes (see
-   section 1: no in-app version string exists to do this automatically).
+7. Record `Cargo.toml` version + git hash in the release notes (the
+   in-app About text already derives the version via `APP_VERSION` and
+   prints the build hash; the notes restating both keeps the shipped
+   package self-describing).
 
 ## 6. Non-goals (reaffirmed, not changed)
 

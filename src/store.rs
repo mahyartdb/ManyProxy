@@ -6937,6 +6937,27 @@ impl Store {
         Ok(())
     }
 
+    pub const META_UPDATE_FEED_URL: &str = "update_feed_url";
+
+    pub fn update_feed_url(&self) -> Option<String> {
+        match self.get_meta(Self::META_UPDATE_FEED_URL) {
+            Ok(Some(url)) if !url.trim().is_empty() => Some(url),
+            _ => None,
+        }
+    }
+
+    pub fn set_update_feed_url(&mut self, url: &str) -> Result<(), StoreError> {
+        self.set_meta(Self::META_UPDATE_FEED_URL, url.trim())
+    }
+
+    pub fn clear_update_feed_url(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::META_UPDATE_FEED_URL],
+        )?;
+        Ok(())
+    }
+
     pub const META_APPEARANCE: &str = "appearance";
 
     pub fn appearance(&self) -> String {
