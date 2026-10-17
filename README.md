@@ -2,6 +2,16 @@
 
 Local-only proxy library: store configs, import share links, refresh subscriptions, and serve each config on its own `127.0.0.1:<port>` endpoint (SOCKS5 + HTTP). No system proxy, TUN, DNS, or routing changes — ever.
 
+## Design posture
+
+- **Portable folder (ZIP):** ManyProxy ships and runs as a single self-contained folder. No AppData, no Program Files, no installers; engines and data live beside the exe and the folder can be moved anywhere.
+- **App-dir only:** sidecar binary lookup never consults `PATH` and never downloads binaries.
+- **Opt-in only:** autostart (HKCU Run) and session restore are opt-in; no auto-update that replaces binaries.
+- **Secrets sealed:** DPAPI-sealed secrets at rest; redacted logs/URLs/labels; clipboard carries `bind:port` only.
+- **Supported matrix:** supported now — windows-amd64 (`windows-arm64` lands gated via T-04); tracked-aspiration (not supported) — linux/macOS via the port epic (`EPIC-linux-macos-port.md`).
+
+Route-profile importers: `throne://route` links are accepted into the presets manager; unknown actions fail loudly at intake.
+
 ## Install / run
 
 Windows 10/11 64-bit (v1 platform).

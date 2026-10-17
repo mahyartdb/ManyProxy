@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Windows 10/11-only Rust GPUI desktop app (single crate, edition 2021). No workspace, no `opencode.json` — `formatter:true` equivalent is `cargo fmt`.
+Windows 10/11 GPUI desktop app (single crate, edition 2021). Supported now: windows-amd64 (windows-arm64 lands gated via T-04). Tracked-aspiration (not supported): linux/macOS via the port epic in EPIC-linux-macos-port.md. No workspace, no `opencode.json` — `formatter:true` equivalent is `cargo fmt`.
 
 ## Commands (pwsh, repo root)
 
@@ -12,7 +12,7 @@ Windows 10/11-only Rust GPUI desktop app (single crate, edition 2021). No worksp
 
 ## Architecture
 
-- Entry: `src/main.rs` (~950 KB monolith — all UI/dialogs/ticks/shortcuts). Do not split it speculatively.
+- Entry: `src/main.rs` (47,353 lines, ~1.7 MB monolith — all UI/dialogs/ticks/shortcuts; re-measure before citing). Do not split it speculatively.
 - `src/store.rs` — SQLite library, auto ports primary `10801–10999` + spillover `18081–18380`, export/restore, `MANYPROXY_DB` / `MANYPROXY_EXPORT` overrides.
 - `src/engine.rs` — sidecar config generate + `check` + spawn/restart; binary lookup is app-dir ONLY, never `PATH`.
 - `src/import.rs` — share-link/file/clipboard grammar pack (vless/vmess/trojan/ss/hysteria/tuic/wg/awg/socks/http/anytls/naive/throne/sing-box/Xray/SIP008/Clash YAML/WG `.conf`).
@@ -27,3 +27,11 @@ Windows 10/11-only Rust GPUI desktop app (single crate, edition 2021). No worksp
 - Sidecars (`sing-box`, `sing-box-awg`, `xray`, max one extra-core exe) must sit next to the app exe; never consult `PATH`, never download.
 - Secrets: DPAPI at rest, redacted logs/URLs/labels, clipboard carries `bind:port` only. Export is explicit-confirm JSON with verbatim plaintext warning; cancel writes nothing.
 - Tests are hermetic: TEMP files only, isolated `MANYPROXY_DB`, no spawning real sidecars unless the live gates above are set.
+
+### Hard rules (settled)
+
+- **Portability (ZIP):** ManyProxy ships and runs as a single self-contained folder (ZIP). No AppData, no Program Files, no installers. Engines and data live beside the exe; the folder can be moved anywhere. Binary lookup is app-dir only; no silent downloads.
+- **No-migration:** beta app, no users — no user-data migration path ever. Legacy stores (e.g. `%APPDATA%\ManyProxy\library.db`) are never read or copied. Fresh installs only. `MANYPROXY_DB` / `MANYPROXY_EXPORT` / `MANYPROXY_LOGS` env overrides remain as test/escape hatch.
+- **Secrets-across-OS:** plaintext banned on every OS. Windows = DPAPI user-scope `dpapi1:` exactly as today (zero behavior change); future non-Windows backends (Keychain / Secret Service via keyring) behind the same sealed-container semantics; off-Windows builds fail loudly rather than store plaintext.
+- **DNS-mapping action (non-concept):** presets containing Throne's DNS-mapping action reach the existing generic unknown-action intake error and are not special-cased. No machinery is built, named, mapped, or documented.
+- **Supported matrix:** supported now: windows-amd64 (`windows-arm64` lands gated via T-04). Tracked-aspiration (not supported): linux/macOS via the port epic (`EPIC-linux-macos-port.md`). ManyProxy stays Windows 10/11-only for beta.
