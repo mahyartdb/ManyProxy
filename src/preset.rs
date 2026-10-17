@@ -117,6 +117,87 @@ fn bad_rule(index: usize, detail: impl Into<String>) -> PresetError {
     )
 }
 
+/// sing-box `"a:b"` port-range shape: two u16 parts around a single colon,
+/// low end first.
+fn is_port_range_shape(text: &str) -> bool {
+    let lo = text
+        .split(':')
+        .next()
+        .and_then(|part| part.parse::<u16>().ok());
+    let Some(lo) = lo else {
+        return false;
+    };
+    let rest = match text.split_once(':') {
+        Some((_, rest)) => rest,
+        None => return false,
+    };
+    match rest.split_once(':') {
+        None => rest.parse::<u16>().is_ok_and(|hi| lo <= hi),
+        Some(_) => false,
+    }
+}
+
+/// Light Throne-spirit shape checks for matcher attributes that any rule may
+/// carry. A `false` here means the rule is malformed, not that the merge
+/// meaning changes: valid shapes pass through emission untouched.
+fn check_rule_matcher_shapes(
+    obj: &serde_json::Map<String, Value>,
+    fail: &dyn Fn(String) -> RuleCheckFailure,
+) -> Result<(), RuleCheckFailure> {
+    if let Some(value) = obj.get("source_ip_cidr") {
+        let ok = value.is_string()
+            || value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string));
+        if !ok {
+            return Err(fail(
+                "field \"source_ip_cidr\" must be a string or a list of strings".to_string(),
+            ));
+        }
+    }
+    if let Some(value) = obj.get("source_port") {
+        let ok = value
+            .as_u64()
+            .is_some_and(|port| port <= u64::from(u16::MAX))
+            || value
+                .as_str()
+                .is_some_and(|text| text.parse::<u16>().is_ok());
+        if !ok {
+            return Err(fail(
+                "field \"source_port\" must be a u16 port (0-65535) or a numeric-string"
+                    .to_string(),
+            ));
+        }
+    }
+    if let Some(value) = obj.get("source_port_range") {
+        if !value.as_str().is_some_and(is_port_range_shape) {
+            return Err(fail(
+                "field \"source_port_range\" must be an \"a:b\" port-range string".to_string(),
+            ));
+        }
+    }
+    if let Some(value) = obj.get("ip_version") {
+        if !value.as_u64().is_some_and(|v| v == 4 || v == 6) {
+            return Err(fail(
+                "field \"ip_version\" must be an integer 4 or 6".to_string(),
+            ));
+        }
+    }
+    if let Some(value) = obj.get("invert") {
+        if !value.is_boolean() {
+            return Err(fail("field \"invert\" must be a boolean".to_string()));
+        }
+    }
+    if let Some(value) = obj.get("process_path_regex") {
+        if !value.is_string() {
+            return Err(fail(
+                "field \"process_path_regex\" must be a string".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
     for (index, rule) in rules.iter().enumerate() {
         check_preset_rule(index, rule)
@@ -223,6 +304,8 @@ pub(crate) fn check_preset_rule(
         }
         _ => {}
     }
+
+    check_rule_matcher_shapes(obj, &fail)?;
 
     Ok(CheckedRule { obj, action })
 }
@@ -640,6 +723,13 @@ pub fn rule_attribute_tabs(rule: &Value) -> Vec<&'static str> {
         ("process_path", "Process"),
         ("network", "Network"),
         ("protocol", "Network"),
+        ("ip_version", "IP"),
+        ("process_path_regex", "Process"),
+        ("invert", "Invert"),
+        ("source_ip_cidr", "Source"),
+        ("source_ip_is_private", "Source"),
+        ("source_port", "Source"),
+        ("source_port_range", "Source"),
     ];
     for (_, tab) in GROUPS {
         if GROUPS
@@ -1243,5 +1333,242 @@ mod tests {
                 "no new code path names the banned DNS action"
             );
         }
+    }
+
+    #[test]
+    fn t59_tabs_surface_source_group() {
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({
+                "action": "route",
+                "source_ip_cidr": ["10.0.0.0/8"],
+                "source_ip_is_private": true,
+                "source_port": 8080,
+                "source_port_range": "1000:2000",
+            })),
+            vec!["Action", "Source"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({
+                "action": "direct",
+                "domain_suffix": ["cn"],
+                "source_ip_is_private": true,
+            })),
+            vec!["Action", "Domain", "Source"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({
+                "action": "direct",
+                "ip_is_private": true,
+                "source_port": 8080,
+            })),
+            vec!["Action", "IP", "Source"]
+        );
+    }
+
+    #[test]
+    fn t59_tabs_surface_invert_ip_version_process_regex() {
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({
+                "action": "route",
+                "ip_version": 6,
+                "process_path_regex": "Throne",
+                "invert": true,
+            })),
+            vec!["Action", "IP", "Process", "Invert"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({"action": "direct", "invert": true})),
+            vec!["Action", "Invert"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({"action": "direct", "ip_version": 4})),
+            vec!["Action", "IP"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(
+                &serde_json::json!({"action": "direct", "process_path_regex": "x"})
+            ),
+            vec!["Action", "Process"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({
+                "action": "direct",
+                "invert": true,
+                "source_port": 80,
+            })),
+            vec!["Action", "Invert", "Source"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({
+                "action": "block",
+                "custom_key": 1,
+                "invert": false,
+            })),
+            vec!["Action", "Invert", "Other"],
+            "unknown keys still land on Other; the new keys no longer do"
+        );
+    }
+
+    #[test]
+    fn t59_validation_shape_checks() {
+        for good in [
+            serde_json::json!({"action": "route", "source_ip_cidr": "10.0.0.0/8"}),
+            serde_json::json!({"action": "route", "source_ip_cidr": ["10.0.0.0/8", "127.0.0.1/32"]}),
+            serde_json::json!({"action": "route", "source_ip_is_private": true}),
+            serde_json::json!({"action": "direct", "source_port": 10808}),
+            serde_json::json!({"action": "direct", "source_port": "0"}),
+            serde_json::json!({"action": "direct", "source_port": "65535"}),
+            serde_json::json!({"action": "direct", "source_port": 65535}),
+            serde_json::json!({"action": "block", "source_port_range": "1000:2000"}),
+            serde_json::json!({"action": "block", "source_port_range": "8080:8080"}),
+            serde_json::json!({"action": "sniff", "ip_version": 4}),
+            serde_json::json!({"action": "sniff", "ip_version": 6}),
+            serde_json::json!({"action": "direct", "invert": false}),
+            serde_json::json!({"action": "route", "invert": true, "source_port": 443}),
+            serde_json::json!({"action": "reject", "process_path_regex": "mstsc\\.exe$"}),
+        ] {
+            validate_preset_rules(std::slice::from_ref(&good))
+                .unwrap_or_else(|error| panic!("valid shape rejected: {error}: {good}"));
+        }
+
+        for (field, bad_rule) in [
+            (
+                "source_ip_cidr",
+                serde_json::json!({"action": "direct", "source_ip_cidr": 7}),
+            ),
+            (
+                "source_ip_cidr",
+                serde_json::json!({"action": "direct", "source_ip_cidr": ["10.0.0.0/8", 7]}),
+            ),
+            (
+                "source_ip_cidr",
+                serde_json::json!({"action": "direct", "source_ip_cidr": true}),
+            ),
+            (
+                "source_port",
+                serde_json::json!({"action": "direct", "source_port": 70000}),
+            ),
+            (
+                "source_port",
+                serde_json::json!({"action": "direct", "source_port": -1}),
+            ),
+            (
+                "source_port",
+                serde_json::json!({"action": "direct", "source_port": "70000"}),
+            ),
+            (
+                "source_port",
+                serde_json::json!({"action": "direct", "source_port": "8443.5"}),
+            ),
+            (
+                "source_port",
+                serde_json::json!({"action": "direct", "source_port": true}),
+            ),
+            (
+                "source_port",
+                serde_json::json!({"action": "direct", "source_port": [80]}),
+            ),
+            (
+                "source_port_range",
+                serde_json::json!({"action": "direct", "source_port_range": "80"}),
+            ),
+            (
+                "source_port_range",
+                serde_json::json!({"action": "direct", "source_port_range": "70000:1"}),
+            ),
+            (
+                "source_port_range",
+                serde_json::json!({"action": "direct", "source_port_range": "a:b"}),
+            ),
+            (
+                "source_port_range",
+                serde_json::json!({"action": "direct", "source_port_range": "8080:8080:8080"}),
+            ),
+            (
+                "source_port_range",
+                serde_json::json!({"action": "direct", "source_port_range": "2000:1000"}),
+            ),
+            (
+                "source_port_range",
+                serde_json::json!({"action": "direct", "source_port_range": 8000}),
+            ),
+            (
+                "source_port_range",
+                serde_json::json!({"action": "direct", "source_port_range": ["1000:2000"]}),
+            ),
+            (
+                "ip_version",
+                serde_json::json!({"action": "direct", "ip_version": 5}),
+            ),
+            (
+                "ip_version",
+                serde_json::json!({"action": "direct", "ip_version": "6"}),
+            ),
+            (
+                "ip_version",
+                serde_json::json!({"action": "direct", "ip_version": [6]}),
+            ),
+            (
+                "invert",
+                serde_json::json!({"action": "direct", "invert": "yes"}),
+            ),
+            (
+                "invert",
+                serde_json::json!({"action": "direct", "invert": 1}),
+            ),
+            (
+                "process_path_regex",
+                serde_json::json!({"action": "direct", "process_path_regex": 7}),
+            ),
+            (
+                "process_path_regex",
+                serde_json::json!({"action": "direct", "process_path_regex": ["x"]}),
+            ),
+        ] {
+            let error = validate_preset_rules(std::slice::from_ref(&bad_rule)).unwrap_err();
+            assert_eq!(error.kind, PresetErrorKind::BadRule, "{error}");
+            assert!(error.message.contains("rule 0"), "{error}");
+            assert!(
+                error.message.contains(&format!("\"{field}\"")),
+                "names {field}: {error}"
+            );
+        }
+
+        let error = validate_preset_rules(&[
+            serde_json::json!({"action": "direct"}),
+            serde_json::json!({
+                "action": "direct",
+                "source_port": 70000,
+                "source_port_range": "8080",
+                "invert": "no",
+            }),
+        ])
+        .unwrap_err();
+        assert!(
+            error.message.contains("rule 1"),
+            "index stays named: {error}"
+        );
+
+        let rules = vec![
+            serde_json::json!({
+                "action": "route",
+                "source_ip_cidr": ["10.0.0.0/8", "127.0.0.0/8"],
+                "source_port": 8443,
+                "source_port_range": "1000:2000",
+            }),
+            serde_json::json!({
+                "action": "direct",
+                "source_ip_is_private": true,
+                "ip_version": 6,
+                "invert": true,
+                "process_path_regex": "mstsc\\.exe$",
+            }),
+        ];
+        let link = preset_share_link("t59", &rules);
+        let parsed = decode_route_link(&link).expect("share link decodes");
+        assert_eq!(
+            parsed.rules, rules,
+            "source/invert/ip_version/regex survive the share-link round-trip verbatim"
+        );
     }
 }

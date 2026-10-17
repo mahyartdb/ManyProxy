@@ -10539,6 +10539,42 @@ enum PresetRulesOp {
     Add,
 }
 
+/// T-09 attribute fold keys, rendered per rule as JSON-shape fields. The
+/// rules JSON box stays the single editing surface; no per-key input state.
+const PRESET_FOLD_KEYS: &[(&str, &str)] = &[
+    ("source_ip_cidr", "Source CIDR"),
+    ("source_ip_is_private", "Source is private"),
+    ("source_port", "Source port"),
+    ("source_port_range", "Source port range"),
+    ("ip_version", "IP version"),
+    ("invert", "Invert"),
+    ("process_path_regex", "Process path regex"),
+];
+
+fn preset_rule_attribute_folds(
+    preset_id: &str,
+    index: usize,
+    rule: &serde_json::Value,
+) -> Vec<AnyElement> {
+    PRESET_FOLD_KEYS
+        .iter()
+        .filter_map(|(key, label)| {
+            let value = rule.get(*key)?;
+            Some(
+                div()
+                    .id(format!("preset-rule-fold-{preset_id}-{index}-{key}"))
+                    .test_support()
+                    .text_sm()
+                    .child(format!(
+                        "{label}: {}",
+                        serde_json::to_string(value).unwrap_or_default()
+                    ))
+                    .into_any_element(),
+            )
+        })
+        .collect()
+}
+
 fn preset_advanced_section(
     view: Entity<AppView>,
     preset: &store::RoutePreset,
@@ -10617,6 +10653,9 @@ fn preset_advanced_section(
                         }),
                 ),
         );
+        for fold in preset_rule_attribute_folds(&preset.id, index, rule) {
+            section = section.child(fold);
+        }
     }
     let add_view = view.clone();
     section.child(
@@ -45735,6 +45774,65 @@ mod tests {
         let rules: Vec<serde_json::Value> = serde_json::from_str(&text).expect("box stays JSON");
         assert_eq!(rules.len(), 2, "add appends");
         assert_eq!(rules[1]["action"], serde_json::json!("direct"));
+    }
+
+    #[gpui_kit::test]
+    fn t59_editor_folds_render_new_keys(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .create_preset(
+                "t59-folds",
+                "paste",
+                None,
+                &[
+                    serde_json::json!({
+                        "action": "route",
+                        "source_ip_cidr": ["10.0.0.0/8"],
+                        "source_port": 8080,
+                    }),
+                    serde_json::json!({
+                        "action": "direct",
+                        "source_ip_is_private": true,
+                        "source_port_range": "1000:2000",
+                        "ip_version": 6,
+                        "invert": true,
+                        "process_path_regex": "thm\\.exe$",
+                    }),
+                    serde_json::json!({"action": "direct"}),
+                ],
+            )
+            .expect("preset seeds");
+        let fold_id =
+            |index: usize, key: &str| format!("preset-rule-fold-{}-{index}-{key}", preset.id);
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx);
+            });
+        });
+        paint_dialog_open(cx);
+        for (index, key) in [
+            (0, "source_ip_cidr"),
+            (0, "source_port"),
+            (1, "source_ip_is_private"),
+            (1, "source_port_range"),
+            (1, "ip_version"),
+            (1, "invert"),
+            (1, "process_path_regex"),
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(fold_id(index, key)).is_some()),
+                "fold row {index}/{key} renders in the preset edit dialog"
+            );
+        }
+        for key in ["source_ip_cidr", "invert"] {
+            assert!(
+                cx.update(|window, _| window.try_find(fold_id(2, key)).is_none()),
+                "bare rule renders no {key} fold"
+            );
+        }
     }
 
     #[gpui_kit::test]

@@ -12951,6 +12951,67 @@ Active Connections\r
     }
 
     #[test]
+    fn t59_emission_passes_new_attributes_verbatim() {
+        let in_tag = inbound_tag("1");
+        let out_tag = outbound_tag("1");
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route",
+            "source_ip_cidr": ["10.0.0.0/8", "127.0.0.0/8"],
+            "invert": true,
+            "process_path_regex": "mstsc\\.exe$",
+            "source_port": 10808,
+            "source_port_range": "1000:2000",
+            "ip_version": 6,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2, "route rule + isolation, got {rules:?}");
+        assert_eq!(
+            rules[0]["source_ip_cidr"],
+            json!(["10.0.0.0/8", "127.0.0.0/8"]),
+            "source cidr rides the clone verbatim"
+        );
+        assert_eq!(rules[0]["invert"], json!(true));
+        assert_eq!(rules[0]["process_path_regex"], json!("mstsc\\.exe$"));
+        assert_eq!(rules[0]["source_port"], json!(10808));
+        assert_eq!(rules[0]["source_port_range"], json!("1000:2000"));
+        assert_eq!(rules[0]["ip_version"], json!(6));
+        assert_eq!(
+            rules[0]["inbound"],
+            json!([in_tag]),
+            "still scoped to the row"
+        );
+        assert_eq!(
+            rules[0]["outbound"],
+            json!(out_tag),
+            "route exit is synthesized around the new attributes"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "direct",
+            "source_ip_is_private": true,
+            "source_port": "9090",
+            "source_ip_cidr": "127.0.0.0/8",
+            "custom_attr": 7,
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules[0]["source_ip_is_private"], json!(true));
+        assert_eq!(rules[0]["source_port"], json!("9090"));
+        assert_eq!(rules[0]["source_ip_cidr"], json!("127.0.0.0/8"));
+        assert_eq!(
+            rules[0]["custom_attr"],
+            json!(7),
+            "unknown attributes stay tolerated at emission too"
+        );
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("outbound"),
+            "direct never grows an outbound, got {rules:?}"
+        );
+    }
+
+    #[test]
     fn t58_route_options_unknown_exit_stays_loud() {
         let bad = |rules: Vec<serde_json::Value>| {
             let mut map = HashMap::new();
