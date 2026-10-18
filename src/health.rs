@@ -1717,7 +1717,9 @@ impl HealthStore {
     }
 
     pub fn record_outcome(&mut self, outcome: &TestOutcome) {
-        self.push_sample(outcome.sample.clone());
+        if !outcome_is_neutral(outcome) {
+            self.push_sample(outcome.sample.clone());
+        }
         if let Some(success) = &outcome.success {
             let entry = self
                 .traffic
@@ -1986,6 +1988,18 @@ impl HealthStore {
         }
         sample.latency_ms.map(format_transfer_duration)
     }
+}
+
+/// True when a probe outcome must not rewrite the sample ring: a zero-latency
+/// live report (a cold listener's zero reading) or an error-only report whose
+/// cause classifies as local (the probe's own listen/bind aborted, not the
+/// row). Dns/Egress causes and every other shape stay decisive and overwrite,
+/// and traffic accounting is not subject to this gate.
+pub fn outcome_is_neutral(outcome: &TestOutcome) -> bool {
+    if let Some(cause) = &outcome.sample.error {
+        return classify_health_cause(cause) == HealthCause::Local;
+    }
+    outcome.sample.latency_ms == Some(0)
 }
 
 /// Health readout cap for the tray Select-exit dialog's monitor section.
@@ -5289,5 +5303,278 @@ mod tests {
             best_rows_monitor_lines("Home", &[], &edge).is_none(),
             "empty group hides the section"
         );
+    }
+
+    fn t66_url(config_id: &str, at: i64, latency: Option<u64>, error: Option<&str>) -> TestOutcome {
+        TestOutcome {
+            success: None,
+            sample: HealthSample {
+                config_id: config_id.to_string(),
+                at,
+                kind: HealthKind::UrlTest,
+                latency_ms: latency,
+                error: error.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn t66_outcome_is_neutral_matrix() {
+        let probe =
+            |latency: Option<u64>, error: Option<&str>| t66_url("row", now_unix(), latency, error);
+
+        // Zero-latency live reports are neutral (Throne: 0 → keep previous).
+        assert!(outcome_is_neutral(&probe(Some(0), None)));
+        assert!(
+            outcome_is_neutral(&probe(
+                None,
+                Some("url test failed for \"B\": bad local port (port 0 serves nothing)")
+            )),
+            "zero latency reads beside its cause"
+        );
+
+        // Local instrument failures are neutral — the local-abort family maps
+        // through classify_health_cause with no new string matching.
+        for cause in [
+            "url test failed for \"A\": bind permission denied",
+            "preflight says: LAN confirm required",
+            "port 18501 is inside the reserved clash-controller range",
+            "url test failed for \"B\": bad local port (port 0 serves nothing)",
+        ] {
+            assert!(
+                outcome_is_neutral(&probe(None, Some(cause))),
+                "local abort stays neutral: {cause}"
+            );
+        }
+
+        // Decisive errors overwrite.
+        for cause in [
+            "cannot resolve endpoint bad.invalid:443",
+            "no such host",
+            "dial 203.0.113.7:8388: connection refused",
+            "upstream reset by peer",
+            "url test timed out",
+            "url test failed for \"C\": probe panicked",
+            "unsupported protocol \"dial-up\" for \"C\" (no health probe for this protocol yet)",
+        ] {
+            assert!(
+                !outcome_is_neutral(&probe(None, Some(cause))),
+                "decisive error overwrites: {cause}"
+            );
+            assert!(
+                !outcome_is_neutral(&probe(Some(0), Some(cause))),
+                "an error colors the whole sample: {cause}"
+            );
+        }
+
+        // Every live reading overwrites, and so do shapes the ring already
+        // accepts today (latency>0, and the bare None/None live shape).
+        assert!(!outcome_is_neutral(&probe(Some(1), None)));
+        assert!(!outcome_is_neutral(&probe(None, None)));
+    }
+
+    #[test]
+    fn t66_zero_latency_keeps_previous_sample() {
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("row", 1, Some(90), None));
+
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "row".to_string(),
+                at: 2,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(0),
+                error: None,
+            },
+            success: Some(ProbeSuccess {
+                latency_ms: 0,
+                bytes_rx: 2048,
+                bytes_tx: 512,
+            }),
+        });
+
+        // The ring's previous honest sample stays latest; status() unchanged.
+        let status = store.status("row");
+        assert!(matches!(status.state, RowState::Live));
+        assert_eq!(status.latency_ms, Some(90));
+        assert_eq!(status.cause_kind, None);
+        assert_eq!(store.row_summary("row"), "90ms");
+        let previous = store.latest("row").expect("ring keeps a sample");
+        assert_eq!(previous.at, 1, "the zero reading never became latest");
+        assert_eq!(store.samples.len(), 1, "no sample pushed");
+
+        // Traffic accounting keeps accruing regardless of the gate.
+        let stats = store.traffic("row");
+        assert_eq!(stats.rx_bytes, 2048);
+        assert_eq!(stats.tx_bytes, 512);
+        assert_eq!(stats.probes, 1);
+    }
+
+    #[test]
+    fn t66_aborted_group_probe_does_not_overwrite() {
+        use std::sync::atomic::Ordering;
+
+        let configs: Vec<ProxyConfig> = (0..102)
+            .map(|i| {
+                fixture(
+                    &i.to_string(),
+                    &format!("Row{i}"),
+                    "vless",
+                    "127.0.0.1",
+                    10801,
+                )
+            })
+            .collect();
+        let total = configs.len();
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_failure("0", "dial refused");
+
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("0", 1, Some(55), None));
+        store.record_outcome(&t66_url("100", 1, Some(88), None));
+        store.record_outcome(&t66_url("101", 1, Some(88), None));
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress: Vec<(usize, usize)> = Vec::new();
+        let outcomes = test_group(
+            &configs,
+            DEFAULT_TEST_URL,
+            &prober,
+            &stop,
+            |done, done_total| {
+                progress.push((done, done_total));
+                if done == GROUP_TEST_BATCH_SIZE && done_total == total {
+                    stop.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        // The stop lands between chunks: queued rows are never probed, so an
+        // aborted run pushes no samples for them.
+        assert_eq!(outcomes.len(), GROUP_TEST_BATCH_SIZE, "one chunk completed");
+        assert_eq!(
+            progress,
+            vec![(GROUP_TEST_BATCH_SIZE, total)],
+            "abort lands between chunks"
+        );
+        assert!(handle.calls_for("100").is_empty(), "queued row unprobed");
+        assert!(handle.calls_for("101").is_empty(), "queued row unprobed");
+
+        for outcome in &outcomes {
+            store.record_outcome(outcome);
+        }
+
+        // The already-completed probes' outcomes stand.
+        let dead = store.status("0");
+        assert!(matches!(dead.state, RowState::Dead));
+        assert!(
+            dead.cause.as_deref().unwrap_or("").contains("dial refused"),
+            "decisive record stands: {:?}",
+            dead.cause
+        );
+        assert_eq!(
+            store.row_summary("3"),
+            "42ms",
+            "completed probe still overwrote its row"
+        );
+
+        // Rows still queued at stop time keep their previous outcomes.
+        for id in ["100", "101"] {
+            assert!(matches!(store.status(id).state, RowState::Live), "{id}");
+            assert_eq!(store.row_summary(id), "88ms", "keep-previous stands: {id}");
+            assert_eq!(
+                store.latest(id).expect("ring entry kept").at,
+                1,
+                "no overwrite after stop: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn t66_decisive_dead_still_overwrites() {
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("dns", 1, Some(70), None));
+        store.record_outcome(&t66_url("egress", 1, Some(70), None));
+
+        store.record_outcome(&t66_url(
+            "dns",
+            3,
+            None,
+            Some("url test failed for \"A\": cannot resolve endpoint bad.invalid:443"),
+        ));
+        let dns = store.status("dns");
+        assert!(
+            matches!(dns.state, RowState::Dead),
+            "dns failure overwrites"
+        );
+        assert_eq!(dns.cause_kind, Some(HealthCause::Dns));
+        assert_eq!(store.latest("dns").expect("ring advanced").at, 3);
+
+        store.record_outcome(&t66_url(
+            "egress",
+            3,
+            None,
+            Some("dial 203.0.113.7:8388: connection refused"),
+        ));
+        let egress = store.status("egress");
+        assert!(matches!(egress.state, RowState::Dead));
+        assert_eq!(egress.cause_kind, Some(HealthCause::Egress));
+        assert_eq!(store.latest("egress").expect("ring advanced").at, 3);
+
+        // A decisive dead also lands on a row the ring knows nothing about.
+        store.record_outcome(&t66_url("fresh", 3, None, Some("url test timed out")));
+        assert!(matches!(store.status("fresh").state, RowState::Dead));
+        assert_eq!(store.row_summary("fresh"), "dead");
+
+        // Contrast — a local abort is neutral: the previous outcome keeps.
+        store.record_outcome(&t66_url("kept", 1, Some(64), None));
+        store.record_outcome(&t66_url(
+            "kept",
+            2,
+            None,
+            Some("url test failed for \"K\": bind permission denied"),
+        ));
+        let kept = store.status("kept");
+        assert!(
+            matches!(kept.state, RowState::Live),
+            "a local abort is neutral"
+        );
+        assert_eq!(kept.latency_ms, Some(64));
+        assert_eq!(store.latest("kept").expect("ring kept").at, 1);
+    }
+
+    #[test]
+    fn t66_live_result_still_overwrites() {
+        let mut store = HealthStore::default();
+        store.record_outcome(&t66_url("row", 1, None, Some("url test timed out")));
+        assert!(matches!(store.status("row").state, RowState::Dead));
+
+        store.record_outcome(&TestOutcome {
+            sample: HealthSample {
+                config_id: "row".to_string(),
+                at: 2,
+                kind: HealthKind::UrlTest,
+                latency_ms: Some(123),
+                error: None,
+            },
+            success: Some(ProbeSuccess {
+                latency_ms: 123,
+                bytes_rx: 96,
+                bytes_tx: 16,
+            }),
+        });
+        let live = store.status("row");
+        assert!(matches!(live.state, RowState::Live), "live overwrites dead");
+        assert_eq!(live.latency_ms, Some(123));
+        assert_eq!(live.cause, None);
+        assert_eq!(store.row_summary("row"), "123ms");
+        assert_eq!(store.latest("row").expect("ring advanced").at, 2);
+
+        // A later live reading also refreshes a previous live sample.
+        store.record_outcome(&t66_url("row", 3, Some(97), None));
+        let refreshed = store.status("row");
+        assert!(matches!(refreshed.state, RowState::Live));
+        assert_eq!(refreshed.latency_ms, Some(97));
+        assert_eq!(store.row_summary("row"), "97ms");
     }
 }

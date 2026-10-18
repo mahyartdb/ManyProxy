@@ -67,11 +67,12 @@ use engine::{
     EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
-    format_speed_result, ping_all, redact_secrets, resolve_hostname, sparkline_caption_tone,
-    speed_group, test_all, test_group, truncate, url_test_sparkline, HealthKind, HealthProber,
-    HealthStore, LatencyTone, LogLevel, LogStore, LogTagIndex, ProbeExclusions, RealHealthProber,
-    SpeedtestConfig, SpeedtestMode, SpeedtestOutcome, TestOutcome, TrafficSeenMap,
-    DEFAULT_TEST_URL, RESOLVE_IP_URL, RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
+    format_speed_result, outcome_is_neutral, ping_all, redact_secrets, resolve_hostname,
+    sparkline_caption_tone, speed_group, test_all, test_group, truncate, url_test_sparkline,
+    HealthKind, HealthProber, HealthStore, LatencyTone, LogLevel, LogStore, LogTagIndex,
+    ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode, SpeedtestOutcome,
+    TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL, RESOLVE_TIMEOUT,
+    SPEED_TEST_TIMEOUT,
 };
 use import::{
     classify_open_with, commit_batch, effective_hint_for_text, format_import_failures,
@@ -15621,6 +15622,11 @@ impl AppView {
         let mut snapshots = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
             self.health_store.record_outcome(outcome);
+            if outcome_is_neutral(outcome) {
+                // A neutral probe never became a health sample; keeping it out
+                // of the snapshots stops hydrate from reviving it as latest.
+                continue;
+            }
             snapshots.push(HealthSnapshot {
                 config_id: outcome.sample.config_id.clone(),
                 at: outcome.sample.at,
