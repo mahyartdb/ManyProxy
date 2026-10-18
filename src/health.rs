@@ -1949,6 +1949,68 @@ impl HealthStore {
     }
 }
 
+/// Health readout cap for the tray Select-exit dialog's monitor section.
+pub const BEST_ROWS_MONITOR_TOP_N: usize = 5;
+
+/// Rank rows best-first by their latest health sample: live rows with a known
+/// latency first, fastest first; live rows without a latency next; rows with
+/// no url/ping sample after those; dead rows last. Equal ranks keep the
+/// caller's order, so unknown/dead/no-sample bundles render in a stable,
+/// deterministic order. A pure view of existing samples — nothing is probed,
+/// re-sampled, or restarted, and group-test stop flags stay untouched.
+pub fn best_rows_by_health<'a>(
+    rows: &'a [ProxyConfig],
+    health: &HealthStore,
+) -> Vec<&'a ProxyConfig> {
+    let mut ordered: Vec<&'a ProxyConfig> = rows.iter().collect();
+    ordered.sort_by_key(|row| {
+        let row_health = health.status(&row.id);
+        match row_health.state {
+            RowState::Live => (0u8, row_health.latency_ms.unwrap_or(u64::MAX)),
+            RowState::Unknown => (1u8, 0u64),
+            RowState::Dead => (2u8, 0u64),
+        }
+    });
+    ordered
+}
+
+/// Read-only monitor lines for the tray Select-exit dialog, computed per
+/// open: a `Best by health in {group}:` header plus the top five rows ranked
+/// by [`best_rows_by_health`], rendered as `N) {name} ({row_summary})` with
+/// `(stale)` appended the way row traffic text marks staleness. `None`
+/// without rows — the caller hides the section, leaving no empty block.
+/// Names and health summaries only, the data row text already shows; no
+/// secrets, params, or URLs ever enter the strings.
+pub fn best_rows_monitor_lines(
+    group: &str,
+    rows: &[ProxyConfig],
+    health: &HealthStore,
+) -> Option<(String, Vec<String>)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let lines = best_rows_by_health(rows, health)
+        .into_iter()
+        .take(BEST_ROWS_MONITOR_TOP_N)
+        .enumerate()
+        .map(|(index, row)| {
+            let stale = if health.is_stale(&row.id) {
+                " (stale)"
+            } else {
+                ""
+            };
+            let summary = health.row_summary(&row.id).trim().to_string();
+            let summary = if summary.is_empty() {
+                "no probes this session".to_string()
+            } else {
+                summary
+            };
+            format!("{}) {} ({summary}){stale}", index + 1, row.name)
+        })
+        .collect();
+    Some((format!("Best by health in {group}:"), lines))
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatencyTone {
@@ -4896,5 +4958,125 @@ mod tests {
     #[test]
     fn resolve_probe_ips_unresolvable_is_empty() {
         assert!(resolve_probe_ips("no-such-host.invalid").is_empty());
+    }
+
+    #[test]
+    fn t64_best_rows_ordering_live_wins_wrong_dead_last() {
+        let rows = vec![
+            fixture("1", "Fast", "vless", "127.0.0.1", 10801),
+            fixture("2", "Slow", "vless", "127.0.0.1", 10802),
+            fixture("3", "FastTwin", "vless", "127.0.0.1", 10803),
+            fixture("4", "Regressed", "vless", "127.0.0.1", 10804),
+            fixture("5", "PingOnly", "vless", "127.0.0.1", 10805),
+            fixture("6", "NoSample", "vless", "127.0.0.1", 10806),
+            fixture("7", "Dead", "vless", "127.0.0.1", 10807),
+        ];
+        let url = |id: &str, at: i64, latency: Option<u64>, error: Option<&str>| -> TestOutcome {
+            TestOutcome {
+                success: None,
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at,
+                    kind: HealthKind::UrlTest,
+                    latency_ms: latency,
+                    error: error.map(str::to_string),
+                },
+            }
+        };
+        let ping = |id: &str, at: i64, latency: u64| -> TestOutcome {
+            TestOutcome {
+                success: None,
+                sample: HealthSample {
+                    config_id: id.to_string(),
+                    at,
+                    kind: HealthKind::TcpPing,
+                    latency_ms: Some(latency),
+                    error: None,
+                },
+            }
+        };
+        let mut store = HealthStore::default();
+        for probe in [
+            url("1", 1, Some(45), None),
+            url("2", 1, Some(220), None),
+            url("3", 1, Some(45), None),
+            url("4", 1, Some(45), None),
+            url("4", 3, Some(999), None),
+            ping("5", 1, 30),
+            url(
+                "7",
+                1,
+                None,
+                Some("dial 203.0.113.7:8388: connection refused"),
+            ),
+        ] {
+            store.record_outcome(&probe);
+        }
+
+        let ranked = |rows: &[ProxyConfig]| {
+            best_rows_by_health(rows, &store)
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ranked(&rows),
+            vec!["5", "1", "3", "2", "4", "6", "7"],
+            "latency ascending on the LATEST sample (Regressed keeps its 999 not its old 45), \
+             equal 45ms ties keep input order, no-sample then dead last"
+        );
+        let reversed: Vec<ProxyConfig> = rows.iter().rev().cloned().collect();
+        assert_eq!(
+            ranked(&reversed),
+            vec!["5", "3", "1", "2", "4", "6", "7"],
+            "equal-latency ties follow input order; the live > unknown > dead tiers never flip"
+        );
+        assert!(
+            best_rows_by_health(&[], &store).is_empty(),
+            "empty group ranks to empty"
+        );
+        assert_eq!(ranked(&rows[6..7]), vec!["7"], "a lone row stays itself");
+
+        let (title, lines) = best_rows_monitor_lines("Home", &rows, &store).expect("lines exist");
+        assert_eq!(title, "Best by health in Home:");
+        assert_eq!(
+            lines,
+            vec![
+                "1) PingOnly (30ms)".to_string(),
+                "2) Fast (45ms)".to_string(),
+                "3) FastTwin (45ms)".to_string(),
+                "4) Slow (220ms)".to_string(),
+                "5) Regressed (999ms)".to_string(),
+            ],
+            "top five capped: NoSample (no probes) and Dead fall out of the cap"
+        );
+
+        let edge_rows = vec![
+            fixture("s1", "Ghost", "vless", "127.0.0.1", 10811),
+            fixture("s2", "Down", "vless", "127.0.0.1", 10812),
+        ];
+        let mut edge = HealthStore::default();
+        edge.mark_stale("s1");
+        edge.record_outcome(&url(
+            "s2",
+            1,
+            None,
+            Some("dial 203.0.113.7:8388: connection refused"),
+        ));
+        let (edge_title, edge_lines) =
+            best_rows_monitor_lines("Home", &edge_rows, &edge).expect("edge lines exist");
+        assert_eq!(edge_title, "Best by health in Home:");
+        assert_eq!(
+            edge_lines,
+            vec![
+                "1) Ghost (no probes this session) (stale)".to_string(),
+                "2) Down (dead)".to_string(),
+            ],
+            "unknown sorts before dead in input order, stale suffix matches row text"
+        );
+        assert!(
+            best_rows_monitor_lines("Home", &[], &edge).is_none(),
+            "empty group hides the section"
+        );
     }
 }

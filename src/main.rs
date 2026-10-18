@@ -21013,12 +21013,51 @@ impl AppView {
                 Vec::new()
             }
         };
+        // Read-only monitor, computed once per open: rows of the selected
+        // row's group, ranked by their latest health samples. No probing, no
+        // sampling, no persistence — purely the ordering view of what the
+        // session already knows.
+        let monitor = {
+            let group_rows: Vec<ProxyConfig> = self
+                .store
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| row.group == config.group)
+                .collect();
+            crate::health::best_rows_monitor_lines(&config.group, &group_rows, &self.health_store)
+        };
         let commit: DialogCommit = Rc::new(|_, _| true);
         let commit_key = commit.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let mut body = div().flex().flex_col().gap_2();
+            if let Some((monitor_title, monitor_lines)) = &monitor {
+                let mut section = div()
+                    .id("preset-attach-monitor")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("preset-attach-monitor-title")
+                            .test_support()
+                            .text_sm()
+                            .child(monitor_title.clone()),
+                    );
+                for (index, line) in monitor_lines.iter().enumerate() {
+                    section = section.child(
+                        div()
+                            .id(format!("preset-attach-monitor-{index}"))
+                            .test_support()
+                            .text_sm()
+                            .child(line.clone()),
+                    );
+                }
+                body = body.child(section);
+            }
             if !presets.is_empty() {
                 body = body.child(
                     div()
@@ -47008,6 +47047,408 @@ mod tests {
             "the attach dialog compiles the serving exits list"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    fn t64_seed_in_group(name: &str, group: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: group.to_string(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn t64_dialog_monitor_section_renders_top_five(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let names = [
+            "Fast",
+            "Slow",
+            "FastTwin",
+            "Regressed",
+            "Idle",
+            "NoSample",
+            "Dead",
+        ];
+        for (index, name) in names.iter().enumerate() {
+            store
+                .add(t64_seed_in_group(
+                    name,
+                    "Work",
+                    &format!("1081{}", index + 1),
+                ))
+                .expect("seed works");
+        }
+        let id_of = {
+            let rows = store.list().expect("rows read");
+            move |name: &str| {
+                rows.iter()
+                    .find(|row| row.name == name)
+                    .map(|row| row.id.clone())
+                    .expect("seeded row id")
+            }
+        };
+        let (view, cx) = mount_view(store, cx);
+        let url = |id: String, at: i64, latency: Option<u64>, error: Option<&str>| -> TestOutcome {
+            TestOutcome {
+                success: None,
+                sample: HealthSample {
+                    config_id: id,
+                    at,
+                    kind: HealthKind::UrlTest,
+                    latency_ms: latency,
+                    error: error.map(str::to_string),
+                },
+            }
+        };
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                for outcome in [
+                    url(id_of("Fast"), 1, Some(45), None),
+                    url(id_of("Slow"), 1, Some(220), None),
+                    url(id_of("FastTwin"), 1, Some(45), None),
+                    url(id_of("Regressed"), 1, Some(45), None),
+                    url(id_of("Regressed"), 3, Some(999), None),
+                    url(id_of("Dead"), 1, None, Some("dial refused")),
+                ] {
+                    view.health_store.record_outcome(&outcome);
+                }
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(gpui_kit::component::IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(crate::tray::TrayAction::SelectExit, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "tray Select-exit opens the attach dialog"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_some()),
+            "the monitor section renders"
+        );
+        for index in 0..5 {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-attach-monitor-{index}"))
+                    .is_some()),
+                "entry {index} renders"
+            );
+        }
+        for index in [5, 6] {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-attach-monitor-{index}"))
+                    .is_none()),
+                "cap holds: entry {index} absent"
+            );
+        }
+        let (title, lines) = view.read_with(cx, |view, _| {
+            let rows = view
+                .store
+                .list()
+                .expect("rows read")
+                .into_iter()
+                .filter(|row| row.group == "Work")
+                .collect::<Vec<_>>();
+            crate::health::best_rows_monitor_lines("Work", &rows, &view.health_store)
+                .expect("monitor lines for the group")
+        });
+        assert_eq!(title, "Best by health in Work:");
+        assert_eq!(
+            lines,
+            vec![
+                "1) Fast (45ms)".to_string(),
+                "2) FastTwin (45ms)".to_string(),
+                "3) Slow (220ms)".to_string(),
+                "4) Regressed (999ms)".to_string(),
+                "5) Idle (no probes this session)".to_string(),
+            ],
+            "top five by latest health: 45-tie stable, 220 next, Regressed keeps its LATEST 999, \
+             then the first no-sample row; the second no-sample row and the dead row fall past the cap"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t64_dialog_monitor_hidden_for_empty_group(cx: &mut TestAppContext) {
+        use crate::ProxyConfig;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let only = store
+            .add(t64_seed_in_group("Only", "Work", "10811"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        let phantom = ProxyConfig {
+            id: "nobody".to_string(),
+            name: "Ghost".to_string(),
+            protocol: "vless".to_string(),
+            params: "{}".to_string(),
+            group: "Nobody".to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 10998,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_attach_dialog(phantom.clone(), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "dialog still opens for a group with no rows"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_none()),
+            "empty group hides the monitor entirely — no empty-space glitch"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let config = view.row_config(&only.id).expect("row reads");
+                view.open_preset_attach_dialog(config, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_some()),
+            "a single-row group still shows the monitor"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor-0").is_some()),
+            "the one entry renders"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor-1").is_none()),
+            "nothing follows the single row"
+        );
+        let (title, lines) = view.read_with(cx, |view, _| {
+            let rows = view.store.list().expect("rows read");
+            let group = rows
+                .first()
+                .map(|row| row.group.clone())
+                .unwrap_or_default();
+            crate::health::best_rows_monitor_lines(&group, &rows, &view.health_store)
+                .expect("monitor lines")
+        });
+        assert_eq!(title, "Best by health in Work:");
+        assert_eq!(
+            lines,
+            vec!["1) Only (no probes this session)".to_string()],
+            "all-unknown shape renders sanely"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t64_no_switching_behavior_added(cx: &mut TestAppContext) {
+        use crate::health::{HealthKind, HealthSample, TestOutcome};
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let live = store
+            .add(t64_seed_in_group("Live45", "Work", "10811"))
+            .expect("seed works");
+        store
+            .add(t64_seed_in_group("NoSample", "Work", "10812"))
+            .expect("seed works");
+        let down = store
+            .add(t64_seed_in_group("Down", "Work", "10813"))
+            .expect("seed works");
+        let preset = store
+            .create_preset(
+                "Base",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "direct"})],
+            )
+            .expect("preset seeds");
+        let other = store
+            .create_preset(
+                "Other",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "proxy", "name": "Live45"})],
+            )
+            .expect("preset seeds");
+        store
+            .set_config_preset(&live.id, Some(&preset.id))
+            .expect("attach works");
+        let before_rows = store.list().expect("rows read");
+        let before_presets = store.list_presets().expect("presets read");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.health_store.record_outcome(&TestOutcome {
+                    success: None,
+                    sample: HealthSample {
+                        config_id: live.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: Some(45),
+                        error: None,
+                    },
+                });
+                view.health_store.record_outcome(&TestOutcome {
+                    success: None,
+                    sample: HealthSample {
+                        config_id: down.id.clone(),
+                        at: 1,
+                        kind: HealthKind::UrlTest,
+                        latency_ms: None,
+                        error: Some("dial refused".to_string()),
+                    },
+                });
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(gpui_kit::component::IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_tray_action(crate::tray::TrayAction::SelectExit, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor").is_some()),
+            "the monitor renders for the selected row's group"
+        );
+        for index in 0..3 {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-attach-monitor-{index}"))
+                    .is_some()),
+                "entry {index} of three renders"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-monitor-3").is_none()),
+            "exactly three entries — capped, nothing extra"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-attach-{}", other.id))
+                .is_some()),
+            "the Attach button for the unattached preset is untouched"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-detach").is_some()),
+            "the Detach button is untouched"
+        );
+        let (
+            (monitor_title, monitor_lines),
+            after_rows,
+            after_presets,
+            engine_idle,
+            still_attached,
+        ) = view.read_with(cx, |view, _| {
+            let rows = view.store.list().expect("rows read");
+            let group = rows
+                .first()
+                .map(|row| row.group.clone())
+                .unwrap_or_default();
+            let filtered = rows
+                .iter()
+                .filter(|row| row.group == group)
+                .cloned()
+                .collect::<Vec<_>>();
+            let monitor =
+                crate::health::best_rows_monitor_lines(&group, &filtered, &view.health_store)
+                    .expect("monitor lines");
+            let attached = view
+                .row_config(&live.id)
+                .and_then(|row| row.preset_id.clone())
+                .is_some();
+            (
+                monitor,
+                rows,
+                view.store.list_presets().expect("presets read"),
+                view.engine.running_ids().is_empty(),
+                attached,
+            )
+        });
+        assert_eq!(monitor_title, "Best by health in Work:");
+        assert_eq!(
+            monitor_lines,
+            vec![
+                "1) Live45 (45ms)".to_string(),
+                "2) NoSample (no probes this session)".to_string(),
+                "3) Down (dead)".to_string(),
+            ],
+            "monitor text is exactly names + row summaries — display-only, nothing added"
+        );
+        for line in &monitor_lines {
+            assert!(!line.contains("vless"), "protocol stays out: {line}");
+            assert!(
+                !line.contains("198.51.100.9"),
+                "params/server addresses stay out: {line}"
+            );
+            assert!(!line.contains("uuid"), "params stay out: {line}");
+            assert!(!line.contains("out-"), "outbound tags stay out: {line}");
+        }
+        assert_eq!(
+            after_rows, before_rows,
+            "library state untouched by the dialog"
+        );
+        assert_eq!(
+            after_presets, before_presets,
+            "presets untouched by the dialog"
+        );
+        assert!(
+            engine_idle,
+            "engine stands still — no outbound was switched"
+        );
+        assert!(still_attached, "the attachment survives dialog open");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        let (after_close_rows, after_close_presets) = view.read_with(cx, |view, _| {
+            (
+                view.store.list().expect("rows read"),
+                view.store.list_presets().expect("presets read"),
+            )
+        });
+        assert_eq!(
+            after_close_rows, before_rows,
+            "library still untouched after closing"
+        );
+        assert_eq!(
+            after_close_presets, before_presets,
+            "presets still untouched after closing"
+        );
     }
 
     #[gpui_kit::test]
