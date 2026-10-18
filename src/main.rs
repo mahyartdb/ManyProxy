@@ -10415,13 +10415,29 @@ fn preset_delete_confirm_description(name: &str, attached: &[String]) -> String 
 }
 
 #[derive(Clone)]
+/// T-11 simple-rules boxes (write-once authoring sugar over the same stored
+/// rules): the rules JSON view stays the single source of truth — box text
+/// expands into the structured rules on save and round-trips nowhere.
 struct PresetForm {
     name: Entity<InputState>,
     rules: Entity<TextareaState>,
+    simple_direct: Entity<TextareaState>,
+    simple_block: Entity<TextareaState>,
+    simple_proxy: Entity<TextareaState>,
 }
 
 impl PresetForm {
     fn restored(window: &mut Window, cx: &mut Context<AppView>, name: &str, rules: &str) -> Self {
+        Self::restored_with_boxes(window, cx, name, rules, &SimpleRuleBoxes::default())
+    }
+
+    fn restored_with_boxes(
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+        name: &str,
+        rules: &str,
+        boxes: &SimpleRuleBoxes,
+    ) -> Self {
         Self {
             name: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -10433,10 +10449,95 @@ impl PresetForm {
                     .placeholder("Optional rules JSON (preset object or rules array)")
                     .default_value(rules.to_string())
             }),
+            simple_direct: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("domain:example.com, suffix:cn — one rule per line")
+                    .default_value(boxes.direct.clone())
+            }),
+            simple_block: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("keyword:ads, processName:updater.exe")
+                    .default_value(boxes.block.clone())
+            }),
+            simple_proxy: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("ruleset:streaming, domain:netflix.com")
+                    .default_value(boxes.proxy.clone())
+            }),
         }
     }
 
-    fn element(self, _cx: &App) -> impl IntoElement {
+    fn element(self, cx: &App) -> impl IntoElement {
+        use crate::preset::SimpleRulesBox;
+        let mut simple = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .id("preset-simple-rules")
+                    .test_support()
+                    .text_sm()
+                    .child("Simple rules"),
+            )
+            .child(
+                div()
+                    .id("preset-simple-help")
+                    .test_support()
+                    .text_sm()
+                    .child(
+                        "One rule per line: tokens domain:/suffix:/keyword:/regex:/ruleset:/ip:/processName:/processPath: separated by commas or spaces; blank and # lines are skipped. ruleset: names require a staged rule set (T-12) only after that ticket — unstaged sets fail loud at config generation.",
+                    ),
+            );
+        for (r#box, state) in [
+            (SimpleRulesBox::Direct, &self.simple_direct),
+            (SimpleRulesBox::Block, &self.simple_block),
+            (SimpleRulesBox::Proxy, &self.simple_proxy),
+        ] {
+            simple = simple
+                .child(
+                    div()
+                        .id(format!("preset-simple-label-{}", r#box.action()))
+                        .test_support()
+                        .text_sm()
+                        .child(r#box.label()),
+                )
+                .child(
+                    div()
+                        .id(format!("field-preset-simple-{}", r#box.action()))
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Textarea::new(state).h(px(56.))),
+                );
+        }
+        let invalid_lines = simple_rules_invalid_rows(&self, cx);
+        if !invalid_lines.is_empty() {
+            let mut fold = div()
+                .id("preset-simple-invalid-lines")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .id("preset-simple-invalid-header")
+                        .test_support()
+                        .text_sm()
+                        .child("Invalid lines"),
+                );
+            for (index, (r#box, line)) in invalid_lines.into_iter().enumerate() {
+                fold = fold.child(
+                    div()
+                        .id(format!("preset-simple-invalid-{index}"))
+                        .test_support()
+                        .text_sm()
+                        .child(format!("{} box: {}", r#box.label(), line)),
+                );
+            }
+            simple = simple.child(fold);
+        }
         div()
             .flex()
             .flex_col()
@@ -10452,7 +10553,63 @@ impl PresetForm {
                     .child(Label::new("Rules JSON (optional)"))
                     .child(Textarea::new(&self.rules).h(px(120.))),
             )
+            .child(simple)
     }
+}
+
+/// T-11: a snapshot of the three simple-rules boxes read from a form at
+/// commit time. Empty boxes contribute nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SimpleRuleBoxes {
+    direct: String,
+    block: String,
+    proxy: String,
+}
+
+impl SimpleRuleBoxes {
+    fn from_form(form: &PresetForm, cx: &App) -> Self {
+        Self {
+            direct: form.simple_direct.read(cx).value().to_string(),
+            block: form.simple_block.read(cx).value().to_string(),
+            proxy: form.simple_proxy.read(cx).value().to_string(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.direct.trim().is_empty()
+            && self.block.trim().is_empty()
+            && self.proxy.trim().is_empty()
+    }
+}
+
+/// The invalid lines the current parse of the three boxes produces; the
+/// fold always mirrors the text as typed and exists for this session only —
+/// nothing is persisted. Cheap: the parser is pure and small inputs are the
+/// norm.
+fn simple_rules_invalid_rows(
+    form: &PresetForm,
+    cx: &App,
+) -> Vec<(crate::preset::SimpleRulesBox, String)> {
+    use crate::preset::SimpleRulesBox;
+    let mut rows = Vec::new();
+    for (r#box, state) in [
+        (SimpleRulesBox::Direct, &form.simple_direct),
+        (SimpleRulesBox::Block, &form.simple_block),
+        (SimpleRulesBox::Proxy, &form.simple_proxy),
+    ] {
+        let text = state.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let parsed = crate::preset::parse_simple_rules(r#box, r#box.action(), &text);
+        rows.extend(
+            parsed
+                .invalid
+                .into_iter()
+                .map(|line| (r#box, line.to_string())),
+        );
+    }
+    rows
 }
 
 fn preset_row(
@@ -19165,17 +19322,18 @@ impl AppView {
         None
     }
 
-    fn commit_preset_create(
+    fn commit_preset_create_with_boxes(
         &mut self,
         name: String,
         rules_text: String,
+        boxes: SimpleRuleBoxes,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if name.trim().is_empty() && rules_text.trim().is_empty() {
+        if name.trim().is_empty() && rules_text.trim().is_empty() && boxes.is_empty() {
             return true;
         }
-        let rules = if rules_text.trim().is_empty() {
+        let mut rules = if rules_text.trim().is_empty() {
             Vec::new()
         } else {
             match crate::preset::parse_preset_json(&rules_text, &name) {
@@ -19186,6 +19344,10 @@ impl AppView {
                 }
             }
         };
+        match AppView::expand_simple_rule_boxes(&boxes, window, cx) {
+            Ok(mut expanded) => rules.append(&mut expanded),
+            Err(()) => return false,
+        }
         let create_name = if name.trim().is_empty() {
             window.push_notification(
                 Notification::error("Invalid routing preset: preset needs a name"),
@@ -19212,6 +19374,49 @@ impl AppView {
                 false
             }
         }
+    }
+
+    /// T-11: expand the simple-rules boxes into structured rules, appending
+    /// them to the hand-built rules. Any invalid line blocks the save loud:
+    /// nothing is dropped, corrected, or stored, and the boxes keep their
+    /// text for the editor's "Invalid lines" fold. The expanded rules flow
+    /// through the store's own `validate_preset_rules` gate unchanged — no
+    /// new intake errors here.
+    fn expand_simple_rule_boxes(
+        boxes: &SimpleRuleBoxes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<serde_json::Value>, ()> {
+        let mut rules: Vec<serde_json::Value> = Vec::new();
+        let mut invalid: Vec<String> = Vec::new();
+        for (r#box, text) in [
+            (crate::preset::SimpleRulesBox::Direct, boxes.direct.as_str()),
+            (crate::preset::SimpleRulesBox::Block, boxes.block.as_str()),
+            (crate::preset::SimpleRulesBox::Proxy, boxes.proxy.as_str()),
+        ] {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let parsed = crate::preset::parse_simple_rules(r#box, r#box.action(), text);
+            invalid.extend(
+                parsed
+                    .invalid
+                    .into_iter()
+                    .map(|line| format!("{} box: {}", r#box.label(), line)),
+            );
+            rules.extend(parsed.rules);
+        }
+        if invalid.is_empty() {
+            return Ok(rules);
+        }
+        window.push_notification(
+            Notification::error(format!(
+                "Invalid simple-rules lines block saving — fix or remove them (shown under \"Invalid lines\"): {}",
+                invalid.join(" | ")
+            )),
+            cx,
+        );
+        Err(())
     }
 
     fn commit_preset_create_structured(
@@ -19434,6 +19639,9 @@ impl AppView {
         });
     }
 
+    /// Compat entry for contract tests that only exercise the rules JSON
+    /// layer (empty boxes expand to nothing).
+    #[cfg(test)]
     fn commit_preset_edit(
         &mut self,
         id: &str,
@@ -19442,7 +19650,26 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let rules = if rules_text.trim().is_empty() {
+        self.commit_preset_edit_with_boxes(
+            id,
+            name,
+            rules_text,
+            SimpleRuleBoxes::default(),
+            window,
+            cx,
+        )
+    }
+
+    fn commit_preset_edit_with_boxes(
+        &mut self,
+        id: &str,
+        name: String,
+        rules_text: String,
+        boxes: SimpleRuleBoxes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut rules = if rules_text.trim().is_empty() {
             Vec::new()
         } else {
             match crate::preset::parse_preset_json(&rules_text, &name) {
@@ -19453,6 +19680,10 @@ impl AppView {
                 }
             }
         };
+        match AppView::expand_simple_rule_boxes(&boxes, window, cx) {
+            Ok(mut expanded) => rules.append(&mut expanded),
+            Err(()) => return false,
+        }
         let renamed = match self.store.rename_preset(id, &name) {
             Ok(preset) => preset,
             Err(StoreError::NotFound(_)) => {
@@ -19674,8 +19905,9 @@ impl AppView {
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let name = reader.name.read(cx).value().to_string();
             let rules = reader.rules.read(cx).value().to_string();
+            let boxes = SimpleRuleBoxes::from_form(&reader, cx);
             view.update(cx, |view, cx| {
-                view.commit_preset_edit(&id, name, rules, window, cx)
+                view.commit_preset_edit_with_boxes(&id, name, rules, boxes, window, cx)
             })
         });
         let commit_key = commit.clone();
@@ -20049,17 +20281,18 @@ impl AppView {
     }
 
     fn open_presets_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_presets_dialog_restored("", "", window, cx);
+        self.open_presets_dialog_restored("", "", &SimpleRuleBoxes::default(), window, cx);
     }
 
     fn open_presets_dialog_restored(
         &mut self,
         name: &str,
         rules: &str,
+        boxes: &SimpleRuleBoxes,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = PresetForm::restored(window, cx, name, rules);
+        let form = PresetForm::restored_with_boxes(window, cx, name, rules, boxes);
         self.preset_form = Some(form.clone());
         let view = cx.entity();
         let reader = form.clone();
@@ -20096,11 +20329,12 @@ impl AppView {
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let name = reader.name.read(cx).value().to_string();
             let rules = reader.rules.read(cx).value().to_string();
-            if name.trim().is_empty() && rules.trim().is_empty() {
+            let boxes = SimpleRuleBoxes::from_form(&reader, cx);
+            if name.trim().is_empty() && rules.trim().is_empty() && boxes.is_empty() {
                 return true;
             }
             commit_view.update(cx, |view, cx| {
-                view.commit_preset_create(name, rules, window, cx)
+                view.commit_preset_create_with_boxes(name, rules, boxes, window, cx)
             })
         });
         let commit_key = commit.clone();
@@ -20193,8 +20427,9 @@ impl AppView {
         };
         let name = form.name.read(cx).value().to_string();
         let rules = form.rules.read(cx).value().to_string();
+        let boxes = SimpleRuleBoxes::from_form(form, cx);
         window.close_all_dialogs(cx);
-        self.open_presets_dialog_restored(&name, &rules, window, cx);
+        self.open_presets_dialog_restored(&name, &rules, &boxes, window, cx);
     }
 
     fn open_preset_attach_dialog(
@@ -46212,6 +46447,221 @@ mod tests {
             "the attach dialog compiles the serving exits list"
         );
         cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t61_panel_renders_three_boxes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let preset = store
+            .create_preset("t61-panel", "manual", None, &[])
+            .expect("preset seeds");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-rules").is_some()),
+            "the Simple rules fold renders in the edit dialog"
+        );
+        for action in ["direct", "block", "proxy"] {
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("preset-simple-label-{action}"))
+                    .is_some()),
+                "the {action} guideline row renders"
+            );
+            assert!(
+                cx.update(|window, _| window
+                    .try_find(format!("field-preset-simple-{action}"))
+                    .is_some()),
+                "the {action} box renders"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-help").is_some()),
+            "the box help text renders (ruleset: needs staged T-12 sets)"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-invalid-lines").is_none()),
+            "boxes start clean: no invalid fold"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // The manager dialog carries the same fold: every PresetForm surface
+        // offers the boxes.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "preset-simple-rules",
+            "preset-simple-label-direct",
+            "field-preset-simple-direct",
+            "preset-simple-label-block",
+            "field-preset-simple-block",
+            "preset-simple-label-proxy",
+            "field-preset-simple-proxy",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "manager dialog renders {id}"
+            );
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t61_save_appends_box_rules(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = view.preset_form.clone().expect("manager stashes its form");
+                form.name.update(cx, |state, cx| {
+                    state.set_value("t61-mix", window, cx);
+                });
+                form.rules.update(cx, |state, cx| {
+                    state.set_value(
+                        r#"[{"action":"direct","domain":["a.example"]}]"#.to_string(),
+                        window,
+                        cx,
+                    );
+                });
+                form.simple_direct.update(cx, |state, cx| {
+                    state.set_value("domain:b.example, suffix:c.example".to_string(), window, cx);
+                });
+                form.simple_block.update(cx, |state, cx| {
+                    state.set_value("# ports aside\nkeyword:ads".to_string(), window, cx);
+                });
+                form.simple_proxy.update(cx, |state, cx| {
+                    state.set_value("ruleset:streaming\nip:1.1.1.1/32".to_string(), window, cx);
+                });
+            });
+        });
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("presets-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        let presets = view.read_with(cx, |view, _| view.store.list_presets().expect("list works"));
+        assert_eq!(presets.len(), 1, "one preset created from both layers");
+        let rules = view.read_with(cx, |view, _| {
+            view.store
+                .get_preset(&presets[0].id)
+                .expect("get works")
+                .expect("preset there")
+                .rules()
+                .expect("rules decode")
+        });
+        assert_eq!(
+            rules.len(),
+            5,
+            "JSON rule + direct line + block line + two proxy lines"
+        );
+        assert_eq!(
+            rules[0],
+            serde_json::json!({"action": "direct", "domain": ["a.example"]}),
+            "the structured JSON layer stays verbatim"
+        );
+        assert_eq!(
+            rules[1],
+            serde_json::json!({
+                "action": "direct",
+                "domain": ["b.example"],
+                "domain_suffix": ["c.example"],
+            }),
+            "the direct line merges into one rule"
+        );
+        assert_eq!(
+            rules[2],
+            serde_json::json!({"action": "block", "domain_keyword": ["ads"]}),
+            "comments skip; the block line stamps its Throne spelling"
+        );
+        assert_eq!(
+            rules[3],
+            serde_json::json!({"action": "proxy", "rule_set": ["streaming"]}),
+            "ruleset: becomes a rule_set ref"
+        );
+        assert_eq!(
+            rules[4],
+            serde_json::json!({"action": "proxy", "ip_cidr": ["1.1.1.1/32"]}),
+            "one rule per proxy line"
+        );
+        assert_eq!(notification_count(cx), before + 1, "one honest toast");
+    }
+
+    #[gpui_kit::test]
+    fn t61_invalid_lines_block_save(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let form = view.preset_form.clone().expect("manager stashes its form");
+                form.name.update(cx, |state, cx| {
+                    state.set_value("t61-broken", window, cx);
+                });
+                form.simple_direct.update(cx, |state, cx| {
+                    state.set_value("domain:ok.example\nwarp:maybe".to_string(), window, cx);
+                });
+            });
+        });
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            window.click("presets-dialog-ok", cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "invalid box lines keep the dialog open"
+        );
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-invalid-lines").is_some()),
+            "the invalid fold mirrors the parse that blocked the save"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("preset-simple-invalid-0").is_some()),
+            "the raw line renders under the fold"
+        );
+        let presets = view.read_with(cx, |view, _| view.store.list_presets().expect("list works"));
+        assert!(presets.is_empty(), "nothing saved while lines are invalid");
+        assert!(
+            notification_count(cx) > before,
+            "the failure is loud, not silent"
+        );
+        let kept = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.preset_form
+                    .clone()
+                    .expect("form kept while the dialog stays open")
+                    .simple_direct
+                    .read(cx)
+                    .value()
+                    .to_string()
+            })
+        });
+        assert_eq!(
+            kept, "domain:ok.example\nwarp:maybe",
+            "invalid lines survive verbatim in the box for this session"
+        );
     }
 
     #[gpui_kit::test]

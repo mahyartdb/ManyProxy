@@ -804,6 +804,121 @@ pub fn preset_exit_suggestions(serving_tags: &[String]) -> Vec<String> {
     out
 }
 
+/// T-11: the simple-rules boxes. Borrowing Throne's line-grammar parser, not
+/// its four-box layout: only the three servable boxes exist here (Throne's
+/// warp-bypass box targets actions this app never serves and is skipped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimpleRulesBox {
+    Direct,
+    Block,
+    Proxy,
+}
+
+impl SimpleRulesBox {
+    /// The action each box stamps onto the rules it parses: the Throne
+    /// spellings — `block` normalizes to `reject` and `proxy` to `route` at
+    /// emission via `served_action`, never at parse time.
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Block => "block",
+            Self::Proxy => "proxy",
+        }
+    }
+
+    /// Editor label for the box, matching its action's guideline meaning.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "Direct",
+            Self::Block => "Block",
+            Self::Proxy => "Proxy",
+        }
+    }
+}
+
+/// T-11 parse output. Invalid lines are retained verbatim — the editor shows
+/// them under its "Invalid lines" fold; they are never dropped, auto-corrected,
+/// or merged into the rules JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimpleRulesParse {
+    pub rules: Vec<Value>,
+    pub invalid: Vec<String>,
+}
+
+/// Throne's exact token spellings, each mapped to the rule key it expands to.
+/// Everything the grammar accepts lives in this one table; nothing DNS- or
+/// geo-flavored may ever join it.
+const SIMPLE_RULE_TOKENS: &[(&str, &str)] = &[
+    ("domain", "domain"),
+    ("suffix", "domain_suffix"),
+    ("keyword", "domain_keyword"),
+    ("regex", "domain_regex"),
+    ("ruleset", "rule_set"),
+    ("ip", "ip_cidr"),
+    ("processName", "process_name"),
+    ("processPath", "process_path"),
+];
+
+/// T-11 pure line parser: one Throne-style rule per line, expanded into a
+/// single structured rule stamped with `action`. `box` is reserved in Rust,
+/// so the first parameter is spelled `r#box`; it must agree with `action`
+/// (the caller derives both the same way). Output flows through the shared
+/// validation pipeline unchanged — no new intake errors are introduced here.
+pub fn parse_simple_rules(r#box: SimpleRulesBox, action: &str, text: &str) -> SimpleRulesParse {
+    let action = action.trim();
+    debug_assert_eq!(
+        action,
+        r#box.action(),
+        "simple-rules box {:?} stamps {:?}, not {:?}",
+        r#box,
+        r#box.action(),
+        action,
+    );
+    let mut out = SimpleRulesParse::default();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match simple_rules_line(action, trimmed) {
+            Some(rule) => out.rules.push(rule),
+            None => out.invalid.push(line.to_string()),
+        }
+    }
+    out
+}
+
+/// One Throne-style line: comma/space separated `token:value` pairs merged
+/// into one rule. `None` for an invalid line — unknown token, a token without
+/// its `:value`, or no tokens at all (a separator-only line is junk, never a
+/// catch-all rule).
+fn simple_rules_line(action: &str, line: &str) -> Option<Value> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("action".to_string(), Value::String(action.to_string()));
+    for token in line
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|token| !token.is_empty())
+    {
+        let (name, value) = token.split_once(':')?;
+        if value.is_empty() {
+            return None;
+        }
+        let (_, key) = SIMPLE_RULE_TOKENS
+            .iter()
+            .find(|(known, _)| *known == name)?;
+        let entry = obj
+            .entry(key.to_string())
+            .or_insert(Value::Array(Vec::new()));
+        if let Value::Array(items) = entry {
+            items.push(Value::String(value.to_string()));
+        }
+    }
+    if obj.len() == 1 {
+        return None;
+    }
+    Some(Value::Object(obj))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1729,5 +1844,162 @@ mod tests {
             .is_ok(),
             "a capped-length name validates"
         );
+    }
+
+    #[test]
+    fn t61_simple_rules_token_matrix() {
+        // Throne's exact token spellings, one documented key each. The matrix
+        // mirrors the token table in code — any drift on either side is the
+        // grammar changing and must be deliberate.
+        for (token, key, value) in [
+            ("domain:example.org", "domain", "example.org"),
+            ("suffix:example.org", "domain_suffix", "example.org"),
+            ("keyword:example", "domain_keyword", "example"),
+            ("regex:example\\.org$", "domain_regex", "example\\.org$"),
+            ("ruleset:streaming-set", "rule_set", "streaming-set"),
+            ("ip:192.0.2.1/32", "ip_cidr", "192.0.2.1/32"),
+            ("processName:mstsc.exe", "process_name", "mstsc.exe"),
+            (
+                "processPath:C:\\apps\\x.exe",
+                "process_path",
+                "C:\\apps\\x.exe",
+            ),
+        ] {
+            let parsed = parse_simple_rules(SimpleRulesBox::Direct, "direct", token);
+            let expected = serde_json::json!({"action": "direct", (key): [value]});
+            assert_eq!(
+                parsed.rules,
+                vec![expected],
+                "{token} expands to its documented key"
+            );
+            assert!(parsed.invalid.is_empty(), "{token} parses clean");
+        }
+    }
+
+    #[test]
+    fn t61_multi_token_line_merges() {
+        // One rule per line with every token merged into it; comment and
+        // blank lines skipped; comma/space separators interchangeable; CRLF
+        // trimmed.
+        let text = concat!(
+            "# shared block list\n",
+            "\n",
+            "domain:example.com, suffix:cn keyword:you\n",
+            "domain:bing.com\n",
+            "domain:a.example\tregex:^ads\\.\n",
+        );
+        let parsed = parse_simple_rules(SimpleRulesBox::Block, "block", text);
+        assert_eq!(
+            parsed.rules,
+            vec![
+                serde_json::json!({
+                    "action": "block",
+                    "domain": ["example.com"],
+                    "domain_suffix": ["cn"],
+                    "domain_keyword": ["you"],
+                }),
+                serde_json::json!({"action": "block", "domain": ["bing.com"]}),
+                serde_json::json!({
+                    "action": "block",
+                    "domain": ["a.example"],
+                    "domain_regex": ["^ads\\."],
+                }),
+            ],
+            "each line is one merged rule"
+        );
+        assert!(parsed.invalid.is_empty(), "{parsed:?}");
+        let repeated = parse_simple_rules(
+            SimpleRulesBox::Proxy,
+            "proxy",
+            "domain:one.example domain:two.example",
+        );
+        assert_eq!(
+            repeated.rules,
+            vec![serde_json::json!({
+                "action": "proxy",
+                "domain": ["one.example", "two.example"],
+            })],
+            "repeated tokens merge into one matcher array"
+        );
+        let crlf = parse_simple_rules(
+            SimpleRulesBox::Direct,
+            "direct",
+            "domain:x.example\r\nip:1.1.1.1/32",
+        );
+        assert_eq!(crlf.rules.len(), 2, "CRLF splits lines cleanly");
+    }
+
+    #[test]
+    fn t61_invalid_lines_retained_not_dropped() {
+        // Unknown tokens, empty values, missing colons, junk separators, and
+        // wrong casings all survive verbatim in the invalid list; nothing
+        // becomes a rule and nothing is auto-corrected.
+        let bad_lines = [
+            "geosite:ads",
+            "warp:everything",
+            "domain:",
+            "processName:",
+            "no-token-at-all",
+            ":rooted",
+            "Domain:cn",
+            "PROCESSNAME:chrome.exe",
+            ",,",
+            "ip:  ,",
+        ];
+        let joined = bad_lines.join("\n");
+        let parsed = parse_simple_rules(SimpleRulesBox::Direct, "direct", &joined);
+        assert_eq!(parsed.invalid, bad_lines, "invalid lines survive verbatim");
+        assert!(
+            parsed.rules.is_empty(),
+            "no catch-all or partial rule leaks from bad lines"
+        );
+        // One bad token poisons its whole line: valid siblings on it never
+        // land as rules while the raw line is kept for the editor's fold.
+        let mixed = "domain:good.example,geosite:bad";
+        let parsed = parse_simple_rules(SimpleRulesBox::Block, "block", mixed);
+        assert_eq!(parsed.invalid, vec![mixed.to_string()]);
+        assert!(parsed.rules.is_empty());
+    }
+
+    #[test]
+    fn t61_ruleset_token_maps_to_rule_set_ref() {
+        // The rule carries rule_set:["name"]; intake stays tolerant until
+        // T-12 wires the staging path (single source of validation truth
+        // unchanged for T-11).
+        let parsed = parse_simple_rules(SimpleRulesBox::Direct, "direct", "ruleset:my-set");
+        assert_eq!(
+            parsed.rules,
+            vec![serde_json::json!({"action": "direct", "rule_set": ["my-set"]})]
+        );
+        assert!(parsed.invalid.is_empty());
+        validate_preset_rules(&parsed.rules).expect("rule_set refs validate at intake");
+        let staged = parse_simple_rules(SimpleRulesBox::Proxy, "proxy", "ruleset:streaming-set");
+        validate_preset_rules(&staged.rules).expect("proxy box ruleset ref validates");
+    }
+
+    #[test]
+    fn t61_box_actions_normalize() {
+        // Each box stamps its Throne spelling; the T-08 vocabulary validates
+        // the output unchanged and `served_action` does the emission
+        // normalization (block→reject, proxy→route).
+        for (r#box, action, served) in [
+            (SimpleRulesBox::Direct, "direct", "direct"),
+            (SimpleRulesBox::Block, "block", "reject"),
+            (SimpleRulesBox::Proxy, "proxy", "route"),
+        ] {
+            let parsed = parse_simple_rules(r#box, action, "domain:example.com, suffix:cn");
+            assert_eq!(
+                parsed
+                    .rules
+                    .first()
+                    .and_then(|rule| rule.get("action"))
+                    .and_then(Value::as_str),
+                Some(action),
+                "the box stamps its Throne spelling, not the sing-box one"
+            );
+            validate_preset_rules(&parsed.rules)
+                .expect("box rules pass the shared validation pipeline");
+            assert_eq!(served_action(action), served, "{action} serves as {served}");
+        }
     }
 }
