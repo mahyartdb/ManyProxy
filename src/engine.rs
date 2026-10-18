@@ -325,7 +325,7 @@ fn tagged(prefix: &str, id: &str) -> String {
     format!("{prefix}-{}", sanitize_tag(id))
 }
 
-fn sanitize_tag(raw: &str) -> String {
+pub(crate) fn sanitize_tag(raw: &str) -> String {
     raw.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
@@ -2176,9 +2176,14 @@ pub fn generate(configs: &[ProxyConfig]) -> Result<GeneratedConfig, EngineError>
     generate_with_presets(configs, &HashMap::new())
 }
 
-pub fn generate_with_presets(
+/// T-12 variant: like `generate_with_presets`, but staged `.srs` rule sets are
+/// resolvable by name (absolute file paths, cached beside the app). Preset
+/// rules carrying `rule_set` references fail loud when a name is not in the
+/// map or its file vanished from disk — never skip, never substitute.
+pub fn generate_with_rule_sets(
     configs: &[ProxyConfig],
     presets: &HashMap<String, Vec<serde_json::Value>>,
+    rule_set_files: &HashMap<String, PathBuf>,
 ) -> Result<GeneratedConfig, EngineError> {
     if configs.is_empty() {
         return Err(EngineError::NoActiveConfigs);
@@ -2208,7 +2213,76 @@ pub fn generate_with_presets(
         .map(|row| row.port)
         .collect();
     let bridges = assign_bridge_ports(&keys, &taken_ports)?;
-    build_main_config(configs, &bridges, presets)
+    build_main_config(configs, &bridges, presets, rule_set_files)
+}
+
+/// Test-only alias of `generate_with_rule_sets` with no staged rule sets: any
+/// preset carrying `rule_set` references fails loud — the "unstaged sets fail
+/// loud" contract T-11 promised in its help text. Production code calls
+/// `generate_with_rule_sets` with the actual staged map.
+#[cfg(test)]
+pub fn generate_with_presets(
+    configs: &[ProxyConfig],
+    presets: &HashMap<String, Vec<serde_json::Value>>,
+) -> Result<GeneratedConfig, EngineError> {
+    generate_with_rule_sets(configs, presets, &HashMap::new())
+}
+
+/// Per-config-build rule-set staging state: the staged name→file map synced
+/// from the store, plus the entries accumulated for `route.rule_set`. One
+/// instance per config build, shared across every preset's rules so identical
+/// references stay deduped.
+struct RuleSetStage<'a> {
+    files: &'a HashMap<String, PathBuf>,
+    tags: HashMap<String, String>,
+    entries: Vec<serde_json::Value>,
+}
+
+impl<'a> RuleSetStage<'a> {
+    fn new(files: &'a HashMap<String, PathBuf>) -> Self {
+        Self {
+            files,
+            tags: HashMap::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Resolves `name` to the `rs-<sanitized>` tag, emitting its
+    /// `route.rule_set` entry on first use. Missing staged file at configgen →
+    /// loud detail naming the set and the path: never skip, never substitute.
+    fn resolve(&mut self, name: &str, rule_index: usize) -> Result<String, String> {
+        if let Some(tag) = self.tags.get(name) {
+            return Ok(tag.clone());
+        }
+        let path = match self.files.get(name) {
+            Some(path) => path.clone(),
+            None => crate::store::staged_rule_set_path(&crate::store::rule_set_file_name(name)),
+        };
+        if !path.is_file() {
+            return Err(format!(
+                "rule {rule_index}: field \"rule_set\" names staged set \"{name}\" whose staged file is missing: {} — re-download it under Rule sets",
+                path.display()
+            ));
+        }
+        let tag = format!("rs-{}", sanitize_tag(name));
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.get("tag").and_then(serde_json::Value::as_str) == Some(tag.as_str()))
+        {
+            return Err(format!(
+                "rule {rule_index}: staged set \"{name}\" sanitizes to tag \"{tag}\" that another staged set already uses — rename one"
+            ));
+        }
+        self.entries.push(serde_json::json!({
+            "type": "local",
+            "tag": tag,
+            "format": "binary",
+            "path": path.display().to_string(),
+        }));
+        self.tags.insert(name.to_string(), tag.clone());
+        Ok(tag)
+    }
 }
 
 fn preset_rules_for(
@@ -2216,6 +2290,7 @@ fn preset_rules_for(
     serving_tag: &str,
     inbound_tag: &str,
     presets: &HashMap<String, Vec<serde_json::Value>>,
+    staged: &mut RuleSetStage,
 ) -> Result<Vec<serde_json::Value>, EngineError> {
     let bad = |detail: String| EngineError::BadPreset {
         name: config.name.clone(),
@@ -2240,6 +2315,21 @@ fn preset_rules_for(
         // Rule names are an authoring artifact (Throne shares per-rule
         // labels); they stay out of the generated config.
         merged.remove("name");
+
+        // T-12: references fold from staged names to `rs-*` tags during the
+        // merge — `route.rule_set` entries carry the absolute staged paths,
+        // rules reference the tags.
+        if let Some(serde_json::Value::Array(names)) = merged.get("rule_set") {
+            let mut tags = Vec::with_capacity(names.len());
+            for name in names {
+                let name = name.as_str().ok_or_else(|| {
+                    bad("rule's \"rule_set\" must be a list of staged set names".to_string())
+                })?;
+                let tag = staged.resolve(name, index).map_err(bad)?;
+                tags.push(serde_json::Value::String(tag));
+            }
+            merged.insert("rule_set".to_string(), serde_json::Value::Array(tags));
+        }
 
         merged.insert(
             "action".to_string(),
@@ -4070,6 +4160,7 @@ fn build_main_config(
     configs: &[ProxyConfig],
     bridges: &HashMap<String, u16>,
     presets: &HashMap<String, Vec<serde_json::Value>>,
+    rule_set_files: &HashMap<String, PathBuf>,
 ) -> Result<GeneratedConfig, EngineError> {
     if configs.is_empty() {
         return Err(EngineError::NoActiveConfigs);
@@ -4078,6 +4169,7 @@ fn build_main_config(
     let mut outbounds: Vec<serde_json::Value> = Vec::with_capacity(configs.len() + 1);
     let mut endpoints = Vec::new();
     let mut rules = Vec::with_capacity(configs.len());
+    let mut staged = RuleSetStage::new(rule_set_files);
 
     for config in configs {
         let in_tag = inbound_tag(&config.id);
@@ -4099,7 +4191,9 @@ fn build_main_config(
                 "listen_port": config.port,
             }));
 
-            for preset_rule in preset_rules_for(config, &built.serving_tag, &in_tag, presets)? {
+            for preset_rule in
+                preset_rules_for(config, &built.serving_tag, &in_tag, presets, &mut staged)?
+            {
                 rules.push(preset_rule);
             }
             rules.push(serde_json::json!({
@@ -4122,7 +4216,7 @@ fn build_main_config(
             "listen_port": config.port,
         }));
 
-        for preset_rule in preset_rules_for(config, &out_tag, &in_tag, presets)? {
+        for preset_rule in preset_rules_for(config, &out_tag, &in_tag, presets, &mut staged)? {
             rules.push(preset_rule);
         }
         rules.push(serde_json::json!({
@@ -4133,12 +4227,27 @@ fn build_main_config(
     }
     outbounds.push(serde_json::json!({"type": "direct", "tag": "direct"}));
 
+    let mut route = serde_json::Map::new();
+    route.insert("rules".to_string(), serde_json::Value::Array(rules));
+    route.insert(
+        "final".to_string(),
+        serde_json::Value::String("direct".to_string()),
+    );
+    // T-12: only when a preset rule references staged sets, `route.rule_set`
+    // appears — local entries only, paths pointing at the staging location.
+    if !staged.entries.is_empty() {
+        route.insert(
+            "rule_set".to_string(),
+            serde_json::Value::Array(staged.entries.clone()),
+        );
+    }
+
     let document = serde_json::json!({
         "log": {"level": "warn"},
         "inbounds": inbounds,
         "outbounds": outbounds,
         "endpoints": endpoints,
-        "route": {"rules": rules, "final": "direct"},
+        "route": route,
     });
     validate_structure(&document)?;
     Ok(GeneratedConfig {
@@ -5776,6 +5885,11 @@ pub struct EngineController {
     served_extra: Vec<Option<String>>,
 
     preset_rules: HashMap<String, Vec<serde_json::Value>>,
+
+    /// T-12 staged `.srs` name → absolute staged file path, synced from the
+    /// store like `preset_rules`; config generation resolves references
+    /// against it and fails loud on missing files.
+    rule_set_files: HashMap<String, PathBuf>,
     active: Vec<ProxyConfig>,
     status: EngineStatus,
     last_error: Option<String>,
@@ -5853,6 +5967,7 @@ impl EngineController {
             served: [None, None, None],
             served_extra: vec![None],
             preset_rules: HashMap::new(),
+            rule_set_files: HashMap::new(),
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -5923,6 +6038,7 @@ impl EngineController {
             served: [None, None, None],
             served_extra: vec![None],
             preset_rules: HashMap::new(),
+            rule_set_files: HashMap::new(),
             active: Vec::new(),
             status: EngineStatus::Stopped,
             last_error: None,
@@ -5972,6 +6088,12 @@ impl EngineController {
 
     pub fn set_preset_rules(&mut self, presets: HashMap<String, Vec<serde_json::Value>>) {
         self.preset_rules = presets;
+    }
+
+    /// T-12: staged rule-set name → file path map, re-derived at sync time so
+    /// a moved app folder re-points at the right staged files.
+    pub fn set_rule_set_files(&mut self, files: HashMap<String, PathBuf>) {
+        self.rule_set_files = files;
     }
 
     #[cfg(test)]
@@ -6609,18 +6731,23 @@ impl EngineController {
             Some(json) => Some(json),
             None if plan.main_rows.is_empty() => None,
             None => Some(
-                build_main_config(&plan.main_rows, &plan_bridges, &self.preset_rules)
-                    .inspect_err(|error| {
-                        self.last_error = Some(error.to_string());
-                    })?
-                    .json,
+                build_main_config(
+                    &plan.main_rows,
+                    &plan_bridges,
+                    &self.preset_rules,
+                    &self.rule_set_files,
+                )
+                .inspect_err(|error| {
+                    self.last_error = Some(error.to_string());
+                })?
+                .json,
             ),
         };
         let mut fork_gen: Option<String> = match replacement(OwningCore::Fork) {
             Some(json) => Some(json),
             None if plan.fork_rows.is_empty() => None,
             None => Some(
-                generate_with_presets(&plan.fork_rows, &self.preset_rules)
+                generate_with_rule_sets(&plan.fork_rows, &self.preset_rules, &self.rule_set_files)
                     .inspect_err(|error| {
                         self.last_error = Some(error.to_string());
                     })?
@@ -13332,6 +13459,294 @@ Active Connections\r
         assert!(
             backend.drain_log_lines().is_empty(),
             "stop drops stale lines with the sidecar"
+        );
+    }
+
+    fn t62_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        dir
+    }
+
+    /// Stages bytes the same way the confirmed download flow does: a file at
+    /// the name-derived staged path (the engine resolves it via the staged
+    /// map — never from disk globs).
+    fn t62_stage(dir: &Path, name: &str, files: &mut HashMap<String, PathBuf>) -> PathBuf {
+        let file = dir.join(crate::store::rule_set_file_name(name));
+        std::fs::write(&file, format!("staged:{name}")).expect("staged bytes write");
+        files.insert(name.to_string(), file.clone());
+        file
+    }
+
+    #[test]
+    fn t62_emission_local_rule_set_entries() {
+        let dir = t62_temp_dir("t62emit");
+        let mut files = HashMap::new();
+        let song = t62_stage(&dir, "Song", &mut files);
+        let other = t62_stage(&dir, "Other", &mut files);
+
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![
+                json!({"action": "route", "rule_set": ["Song"]}),
+                json!({"action": "direct", "rule_set": ["Song", "Other"]}),
+                json!({"action": "block", "rule_set": ["Song"], "port": [25]}),
+            ],
+        );
+        let row = t37_row_with_preset();
+        let generated = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect("staged map generates");
+        let value = generated.value();
+
+        // One entry per distinct staged set, local + binary + absolute staged
+        // path, deduped across every rule in the build.
+        let entries = value["route"]["rule_set"].as_array().expect("emitted");
+        assert_eq!(
+            entries.len(),
+            2,
+            "Song dedupes, Other joins once: {entries:?}"
+        );
+        assert_eq!(entries[0]["type"], json!("local"), "{entries:?}");
+        assert_eq!(entries[0]["tag"], json!("rs-Song"));
+        assert_eq!(entries[0]["format"], json!("binary"));
+        assert_eq!(
+            entries[0]["path"],
+            json!(song.display().to_string()),
+            "the sidecar points at the staged file, never a remote URL"
+        );
+        assert_eq!(entries[1]["tag"], json!("rs-Other"));
+        assert_eq!(entries[1]["path"], json!(other.display().to_string()));
+
+        // Rules reference the rs-* tags; matchers and scoping stay intact.
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 4, "3 preset rules + 1 isolation");
+        assert_eq!(rules[0]["rule_set"], json!(["rs-Song"]));
+        assert_eq!(rules[1]["rule_set"], json!(["rs-Song", "rs-Other"]));
+        assert_eq!(rules[2]["rule_set"], json!(["rs-Song"]));
+        let in_tag = inbound_tag(&row.id);
+        let out_tag = outbound_tag(&row.id);
+        assert_eq!(rules[0]["outbound"], json!(out_tag));
+        // "block" serves as reject — a reject rule carries no outbound exit;
+        // the port matcher and rule_set reference stay scoped.
+        assert_eq!(rules[2]["action"], json!("reject"));
+        assert!(
+            rules[2].get("outbound").is_none(),
+            "reject has no exit: {}",
+            rules[2]
+        );
+        assert_eq!(rules[2]["port"], json!([25]));
+        assert_eq!(rules[3]["outbound"], json!(out_tag), "the isolation route");
+        for rule in rules.iter() {
+            assert_eq!(rule["inbound"], json!([in_tag]), "{rule}");
+        }
+
+        // A build whose preset rules carry no rule_set keeps `route.rule_set`
+        // absent: the key exists only when staged sets are actually used.
+        let plain = three_standard();
+        let mut empty_file_map = HashMap::new();
+        empty_file_map.insert("Song".to_string(), song);
+        let generated =
+            generate_with_rule_sets(&plain, &HashMap::new(), &empty_file_map).expect("generates");
+        assert!(
+            generated.value()["route"].get("rule_set").is_none(),
+            "the route stays clean without rule_set references"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t62_missing_rule_set_fails_loud() {
+        let dir = t62_temp_dir("t62missing");
+
+        // Staged by name in the map, but the file vanished from disk: loud
+        // BadPreset naming the set and the path, never skip, never substitute.
+        let vanished = dir.join("Ghost.srs");
+        let mut files = HashMap::new();
+        files.insert("Ghost".to_string(), vanished.clone());
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "route", "rule_set": ["Ghost"]})],
+        );
+        let row = t37_row_with_preset();
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect_err("vanished staged file must fail");
+        let text = error.to_string();
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+        assert!(text.contains("Ghost"), "names the set: {text}");
+        assert!(
+            text.contains(vanished.display().to_string().as_str()),
+            "names the missing staged path: {text}"
+        );
+        assert!(
+            text.contains("re-download"),
+            "points at the staging surface: {text}"
+        );
+
+        // A reference with no staged name at all resolves through the same
+        // staging grammar and fails just as loud.
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &HashMap::new())
+            .expect_err("unlisted name must fail");
+        let text = error.to_string();
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+        assert!(text.contains("Ghost"), "{text}");
+        assert!(text.contains("missing"), "{text}");
+
+        // Two distinct staged names that sanitize to one tag collide — the
+        // mapping stays one set per tag, loud.
+        let mut files = HashMap::new();
+        let first = t62_stage(&dir, "a b", &mut files);
+        let second = t62_stage(&dir, "a-b", &mut files);
+        assert_eq!(
+            first, second,
+            "distinct names in one sanitize bucket share a file — that is the collision"
+        );
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "direct", "rule_set": ["a b", "a-b"]})],
+        );
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect_err("tag collision must fail");
+        let text = error.to_string();
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+        assert!(text.contains("rs-a-b"), "{text}");
+        assert!(text.contains("rename"), "{text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t62_no_remote_rule_set_emission_ever() {
+        // Q4a: Option B is dead — the sidecar never fetches. Whatever the
+        // staging state, a generated config can never gain a remote entry and
+        // an unresolvable reference fails the build instead of substituting.
+        let dir = t62_temp_dir("t62remote");
+        let mut files = HashMap::new();
+        t62_stage(&dir, "Song", &mut files);
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "route", "rule_set": ["Song"]})],
+        );
+        let row = t37_row_with_preset();
+        let generated = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect("generates");
+        let value = generated.value();
+        for entry in value["route"]["rule_set"].as_array().expect("entries") {
+            assert_eq!(
+                entry["type"],
+                json!("local"),
+                "only local entries exist: {entry}"
+            );
+        }
+        assert!(
+            !value.to_string().contains("\"type\":\"remote\""),
+            "no generated config ever contains a remote rule_set entry: {}",
+            generated.json
+        );
+
+        // Nothing to resolve → the build fails loud; there is no remote-type
+        // fallback path that would emit anything.
+        let error = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &HashMap::new())
+            .expect_err("unresolvable must fail");
+        assert!(matches!(error, EngineError::BadPreset { .. }), "{error}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t62_live_srs_rule_set_preset_check() {
+        if std::env::var("MANYPROXY_LIVE_CHECK").unwrap_or_default() != "1" {
+            return;
+        }
+        let binary = std::env::var("MANYPROXY_SINGBOX_BIN").map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    PathBuf::from("target/debug/sing-box.exe")
+                } else {
+                    PathBuf::from("target/debug/sing-box")
+                }
+            },
+            PathBuf::from,
+        );
+
+        // Proof-time compile with the pinned binary (outside the app: it
+        // models the maintainer-hosted artifact; the app fetch is the only
+        // in-app path and stays behind the per-download confirm).
+        let dir = t62_temp_dir("t62live");
+        let source = dir.join("source.json");
+        std::fs::write(
+            &source,
+            r#"{"version":1,"rules":[{"ip_cidr":["10.0.0.0/8"],"outbound":"direct"}]}"#,
+        )
+        .expect("source set writes");
+        let staged = dir.join(crate::store::rule_set_file_name("living-set"));
+        let compiled = std::process::Command::new(&binary)
+            .arg("rule-set")
+            .arg("compile")
+            .arg("--output")
+            .arg(&staged)
+            .arg(&source)
+            .output()
+            .expect("the pinned binary compiles rule sets");
+        assert!(
+            compiled.status.success(),
+            "PROBE compile: {} stderr: {}",
+            compiled.status,
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        assert!(staged.is_file(), "the compiled .srs stages locally");
+        std::fs::remove_file(&source).ok();
+
+        // The staged file rides the app's own staging grammar (name → staged
+        // file name), synced into the engine exactly like main.rs does.
+        let mut files = HashMap::new();
+        files.insert("living-set".to_string(), staged.clone());
+        let mut presets = HashMap::new();
+        presets.insert(
+            "p1".to_string(),
+            vec![json!({"action": "route", "rule_set": ["living-set"]})],
+        );
+        let row = t37_row_with_preset();
+        let generated = generate_with_rule_sets(std::slice::from_ref(&row), &presets, &files)
+            .expect("PROBE srs: generates");
+        let value = generated.value();
+        let entries = value["route"]["rule_set"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["type"], json!("local"));
+        assert_eq!(entries[0]["tag"], json!("rs-living-set"));
+        assert_eq!(
+            entries[0]["path"],
+            json!(staged.display().to_string()),
+            "the sidecar loads the app-staged bytes"
+        );
+        assert_eq!(
+            value["route"]["rules"][0]["rule_set"],
+            json!(["rs-living-set"])
+        );
+
+        let path = dir.join("generated.json");
+        std::fs::write(&path, &generated.json).expect("temp config writes");
+        let output = std::process::Command::new(&binary)
+            .arg("check")
+            .arg("-c")
+            .arg(&path)
+            .output()
+            .expect("check runs");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            output.status.success(),
+            "PROBE srs: sing-box check EXIT 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

@@ -13,7 +13,7 @@ Windows 10/11 GPUI desktop app (single crate, edition 2021). Supported now: wind
 ## Architecture
 
 - Entry: `src/main.rs` (49,274 lines, ~1.7 MB monolith — all UI/dialogs/ticks/shortcuts; re-measure before citing). Do not split it speculatively.
-- `src/store.rs` — SQLite library, auto ports primary `10801–10999` + spillover `18081–18380`, export/restore, `MANYPROXY_DB` / `MANYPROXY_EXPORT` overrides.
+- `src/store.rs` — SQLite library, auto ports primary `10801–10999` + spillover `18081–18380`, export/restore, `MANYPROXY_DB` / `MANYPROXY_EXPORT` / `MANYPROXY_RULE_SETS_DIR` overrides.
 - `src/engine.rs` — sidecar config generate + `check` + spawn/restart; binary lookup is app-dir ONLY, never `PATH`.
 - `src/import.rs` — share-link/file/clipboard grammar pack (vless/vmess/trojan/ss/hysteria/tuic/wg/awg/socks/http/anytls/naive/throne/sing-box/Xray/SIP008/Clash YAML/WG `.conf`).
 - `src/health.rs` — URL test + TCP ping against `DEFAULT_TEST_URL`, session-only logs with secret redaction; `MANYPROXY_LOGS` overrides visible-logs path.

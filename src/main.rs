@@ -10,6 +10,7 @@ mod tray;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -1804,6 +1805,7 @@ fn footer_commit_label(dialog: &str) -> &'static str {
         "export" => "Export",
         "bulk-move" => "Move",
         "group-rename" => "Rename",
+        "rule-set-add-dialog" => "Add",
         "share" => "Copy link",
         _ => "Close",
     }
@@ -9252,40 +9254,32 @@ pub struct FetchedSubscription {
     pub userinfo: Option<store::SubscriptionQuota>,
 }
 
-type SubscriptionHostResolver = fn(&str) -> Result<Vec<std::net::IpAddr>, String>;
-
-fn resolve_subscription_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
-    use std::net::ToSocketAddrs as _;
-    (host, 0u16)
-        .to_socket_addrs()
-        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-        .map_err(|_| "subscription host does not resolve".to_string())
+/// T-12: everything one confirmed `.srs` download needs, resolved when the
+/// user clicks **Download** on the per-file confirm dialog. The type is
+/// constructed only in the confirm handler — staging a download without the
+/// on-screen explicit confirm is not expressible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSetDownloadGrant {
+    pub name: String,
+    pub file_name: String,
+    pub url: String,
+    pub dir: PathBuf,
 }
 
-async fn resolve_subscription_addresses(
-    host: String,
-    resolver: SubscriptionHostResolver,
-) -> Vec<std::net::IpAddr> {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(resolver(&host).unwrap_or_default());
-    });
-    rx.await.unwrap_or_default()
+/// Shared T-08 subscription fetch pipeline: policy gates before any network at
+/// every hop, `ManyProxy/<version>` UA, no-follow redirect loop, 20 s timeout,
+/// 8 MiB cap. T-12's `.srs` staging fetch routes through this exact pipeline so
+/// rule-set downloads get byte-identical transport policy (parity is literal).
+struct FetchedHttp {
+    body: Vec<u8>,
+    userinfo: Option<store::SubscriptionQuota>,
 }
 
-/// Every outbound fetch-layer request carries `User-Agent: ManyProxy/<APP_VERSION>`.
-/// A static, per-release identifier with zero device identity: Throne's
-/// `x-hwid`/`x-device-*` header family is device fingerprinting, and this
-/// function must never gain any hostname/MAC/ID component.
-pub(crate) fn user_agent_header() -> String {
-    format!("ManyProxy/{}", APP_VERSION)
-}
-
-async fn fetch_subscription_body(
+async fn fetch_http_body(
     client: Arc<dyn HttpClient>,
     url: &str,
     resolver: SubscriptionHostResolver,
-) -> Result<FetchedSubscription, String> {
+) -> Result<FetchedHttp, String> {
     use futures::AsyncReadExt as _;
     const MAX_BYTES: usize = store::SUBSCRIPTION_MAX_BYTES;
     const TIMEOUT_SECS: u64 = store::SUBSCRIPTION_TIMEOUT_SECS;
@@ -9353,11 +9347,65 @@ async fn fetch_subscription_body(
                 return Err("subscription body too large".to_string());
             }
         }
-        return String::from_utf8(buf)
-            .map(|body| FetchedSubscription { body, userinfo })
-            .map_err(|_| "subscription body is not UTF-8".to_string());
+        return Ok(FetchedHttp {
+            body: buf,
+            userinfo,
+        });
     }
     Err("subscription fetch failed (too many redirects)".to_string())
+}
+
+async fn fetch_subscription_body(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+    resolver: SubscriptionHostResolver,
+) -> Result<FetchedSubscription, String> {
+    let fetched = fetch_http_body(client, url, resolver).await?;
+    String::from_utf8(fetched.body)
+        .map(|body| FetchedSubscription {
+            body,
+            userinfo: fetched.userinfo,
+        })
+        .map_err(|_| "subscription body is not UTF-8".to_string())
+}
+
+/// T-12: the confirmed rule-set download rides the same pipeline; `.srs` is
+/// binary, so the body stays bytes (never UTF-8-validated like subscriptions).
+async fn fetch_rule_set_body(
+    client: Arc<dyn HttpClient>,
+    url: &str,
+    resolver: SubscriptionHostResolver,
+) -> Result<Vec<u8>, String> {
+    Ok(fetch_http_body(client, url, resolver).await?.body)
+}
+
+type SubscriptionHostResolver = fn(&str) -> Result<Vec<std::net::IpAddr>, String>;
+
+fn resolve_subscription_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    use std::net::ToSocketAddrs as _;
+    (host, 0u16)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .map_err(|_| "subscription host does not resolve".to_string())
+}
+
+async fn resolve_subscription_addresses(
+    host: String,
+    resolver: SubscriptionHostResolver,
+) -> Vec<std::net::IpAddr> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(resolver(&host).unwrap_or_default());
+    });
+    rx.await.unwrap_or_default()
+}
+
+/// Every outbound fetch-layer request carries `User-Agent: ManyProxy/<APP_VERSION>`.
+/// A static, per-release identifier with zero device identity: Throne's
+/// `x-hwid`/`x-device-*` header family is device fingerprinting, and this
+/// function must never gain any hostname/MAC/ID component.
+pub(crate) fn user_agent_header() -> String {
+    format!("ManyProxy/{}", APP_VERSION)
 }
 
 fn is_fetch_redirect(status: http_client::http::StatusCode) -> bool {
@@ -10486,7 +10534,7 @@ impl PresetForm {
                     .test_support()
                     .text_sm()
                     .child(
-                        "One rule per line: tokens domain:/suffix:/keyword:/regex:/ruleset:/ip:/processName:/processPath: separated by commas or spaces; blank and # lines are skipped. ruleset: names require a staged rule set (T-12) only after that ticket — unstaged sets fail loud at config generation.",
+                        "One rule per line: tokens domain:/suffix:/keyword:/regex:/ruleset:/ip:/processName:/processPath: separated by commas or spaces; blank and # lines are skipped. ruleset: names require a staged rule set (Rule sets section) — unstaged sets fail loud when the preset attaches and at config generation.",
                     ),
             );
         for (r#box, state) in [
@@ -10716,6 +10764,69 @@ enum PresetRulesOp {
     CycleAction(usize),
     Remove(usize),
     Add,
+}
+
+/// T-12: one staged rule set, listed under the presets manager's "Rule sets"
+/// sub-list: `{name, url, bytes, downloaded_at, used_by presets}`.
+fn rule_set_summary(row: &store::RuleSetRow, used_by: &[String]) -> String {
+    let mut parts = vec![
+        crate::import::redact_link(&row.url),
+        format_bytes(row.bytes),
+        format_last_refresh(Some(row.downloaded_at), now_unix()),
+    ];
+    if !used_by.is_empty() {
+        parts.push(format!("used by {}", used_by.join(", ")));
+    }
+    parts.join(" · ")
+}
+
+fn rule_set_row(
+    view: Entity<AppView>,
+    row: store::RuleSetRow,
+    used_by: Vec<String>,
+) -> impl IntoElement {
+    let redownload_view = view.clone();
+    let redownload_row = row.clone();
+    let remove_view = view.clone();
+    let remove_id = row.id.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(Label::new(format!("{} · {}", row.name, row.file_name)))
+        .child(Label::new(rule_set_summary(&row, &used_by)))
+        .child(
+            Button::new(format!("rule-set-redownload-{}", row.id))
+                .label("Re-Download")
+                .tooltip("Confirm the download again; bytes are overwritten")
+                .on_click(move |_, window, cx| {
+                    let row = redownload_row.clone();
+                    redownload_view.update(cx, |view, cx| {
+                        view.open_rule_set_download_confirm(
+                            RuleSetDownloadGrant {
+                                name: row.name.clone(),
+                                file_name: row.file_name.clone(),
+                                url: row.url.clone(),
+                                dir: crate::store::rule_sets_dir(),
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+        )
+        .child(
+            Button::new(format!("rule-set-remove-{}", row.id))
+                .label("Remove")
+                .tooltip("Removes the staged file; blocked while presets use the set")
+                .on_click(move |_, window, cx| {
+                    let id = remove_id.clone();
+                    remove_view.update(cx, |view, cx| {
+                        view.commit_rule_set_remove(&id, window, cx);
+                    });
+                }),
+        )
 }
 
 /// T-09 attribute fold keys, rendered per rule as JSON-shape fields. The
@@ -11986,6 +12097,10 @@ struct AppView {
 
     preset_form: Option<PresetForm>,
 
+    /// T-12: one confirmed rule-set download at a time; the explicit per-file
+    /// confirm never batches.
+    rule_set_download_in_flight: bool,
+
     import_parse_in_flight: bool,
 
     import_parse_epoch: u64,
@@ -12156,6 +12271,7 @@ impl AppView {
             speedtest_mode: SpeedtestMode::Download,
             subs_form: None,
             preset_form: None,
+            rule_set_download_in_flight: false,
             import_parse_in_flight: false,
             import_parse_epoch: 0,
             import_cancel_epoch: None,
@@ -19222,10 +19338,10 @@ impl AppView {
         match self.store.preset_rules_map() {
             Ok(map) => {
                 self.engine.set_preset_rules(map);
-                Ok(())
             }
-            Err(error) => Err(format!("cannot load routing presets: {error}")),
+            Err(error) => return Err(format!("cannot load routing presets: {error}")),
         }
+        self.sync_rule_sets_to_engine()
     }
 
     fn try_preset_commit(
@@ -20280,6 +20396,388 @@ impl AppView {
         }
     }
 
+    // ——— T-12: .srs rule-set staging (explicit confirm-per-download only) ——
+
+    fn sync_rule_sets_to_engine(&mut self) -> Result<(), String> {
+        let dir = crate::store::rule_sets_dir();
+        let files: HashMap<String, PathBuf> = self
+            .store
+            .list_rule_sets()
+            .map_err(|error| format!("cannot load rule sets: {error}"))?
+            .into_iter()
+            .map(|row| (row.name, dir.join(row.file_name)))
+            .collect();
+        self.engine.set_rule_set_files(files);
+        Ok(())
+    }
+
+    fn open_rule_set_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name_state = cx.new(|cx| InputState::new(window, cx).placeholder("Rule set name"));
+        let url_state =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://host.example/set.srs"));
+        let view = cx.entity();
+        let name_reader = name_state.clone();
+        let url_reader = url_state.clone();
+        let commit_view = view.clone();
+        let commit: DialogCommit = Rc::new(move |window, cx| {
+            let name = name_reader.read(cx).value().to_string();
+            let url = url_reader.read(cx).value().to_string();
+            if name.trim().is_empty() && url.trim().is_empty() {
+                return true;
+            }
+            commit_view.update(cx, |view, cx| {
+                view.begin_rule_set_download(name, url, window, cx)
+            })
+        });
+        let commit_key = commit.clone();
+        let commit_click = commit.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let commit_key = commit_key.clone();
+            let commit_click = commit_click.clone();
+            dialog
+                .title("Add rule set by URL")
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(dialog_field(
+                            "field-rule-set-name",
+                            "Name",
+                            name_state.clone(),
+                        ))
+                        .child(dialog_field(
+                            "field-rule-set-url",
+                            "Rule set URL",
+                            url_state.clone(),
+                        ))
+                        .child(Label::new(
+                            "The download runs only after you confirm it below — each download is one explicit confirmation",
+                        )),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| commit_key(window, cx)),
+                )
+                .footer(dialog_footer(
+                    "rule-set-add-dialog-ok",
+                    "rule-set-add-dialog-cancel",
+                    footer_commit_label("rule-set-add-dialog"),
+                    commit_click,
+                ))
+        });
+    }
+
+    /// The Add-by-URL commit: validate the name, run the same policy gate as
+    /// subscriptions (internal hosts block, plaintext http warn at the
+    /// confirm), allocate a collision-free staged name, then request the
+    /// explicit confirm. Nothing is fetched here.
+    fn begin_rule_set_download(
+        &mut self,
+        name: String,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let name = match crate::store::Store::validated_rule_set_name(&name) {
+            Ok(name) => name,
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+                return false;
+            }
+        };
+        match store::subscription_fetch_policy(url.trim()) {
+            store::SubscriptionFetchPolicy::Block { reason } => {
+                window.push_notification(
+                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    cx,
+                );
+                return false;
+            }
+            store::SubscriptionFetchPolicy::Warn { .. } | store::SubscriptionFetchPolicy::Allow => {
+            }
+        }
+        let dir = crate::store::rule_sets_dir();
+        let taken: HashSet<String> = match self.store.list_rule_sets() {
+            Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    cx,
+                );
+                return false;
+            }
+        };
+        let mut candidate = name.clone();
+        let mut suffix = 1;
+        loop {
+            let file_name = crate::store::rule_set_file_name(&candidate);
+            if !taken.contains(&candidate) && !dir.join(&file_name).exists() {
+                let grant = RuleSetDownloadGrant {
+                    name: candidate,
+                    file_name,
+                    url: url.trim().to_string(),
+                    dir,
+                };
+                self.open_rule_set_download_confirm(grant, window, cx);
+                return true;
+            }
+            suffix += 1;
+            if suffix > 100 {
+                break;
+            }
+            candidate = format!("{name}-{suffix}");
+        }
+        window.push_notification(
+            Notification::error(format!(
+                "no free staging name for \"{name}\" — remove stale rule sets first"
+            )),
+            cx,
+        );
+        false
+    }
+
+    /// The exact one-confirmation-per-download callout. Blocked URLs never get
+    /// here; http warns through the same policy verdicts subscriptions use.
+    fn open_rule_set_download_confirm(
+        &mut self,
+        grant: RuleSetDownloadGrant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match store::subscription_fetch_policy(grant.url.trim()) {
+            store::SubscriptionFetchPolicy::Block { reason } => {
+                window.push_notification(
+                    Notification::error(format!("Invalid rule set URL: {reason}")),
+                    cx,
+                );
+                return;
+            }
+            store::SubscriptionFetchPolicy::Warn { reason } => {
+                window.push_notification(Notification::warning(reason.to_string()), cx);
+            }
+            store::SubscriptionFetchPolicy::Allow => {}
+        }
+        let view = cx.entity();
+        let warn = match store::subscription_fetch_policy(grant.url.trim()) {
+            store::SubscriptionFetchPolicy::Warn { reason } => format!("\n{reason}"),
+            _ => String::new(),
+        };
+        let overwrites = grant.dir.join(&grant.file_name).exists();
+        let description = format!(
+            "Download this rule set? {}\n{}\
+             Staged file: {}\\{}",
+            grant.url,
+            warn,
+            grant.dir.display(),
+            grant.file_name,
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let grant = grant.clone();
+            let view = view.clone();
+            let description = description.clone();
+            let mut props = DialogButtonProps::default()
+                .show_cancel(true)
+                .ok_text("Download");
+            if overwrites {
+                props = props.ok_variant(ButtonVariant::Danger);
+            }
+            alert
+                .confirm()
+                .button_props(props)
+                .title("Download rule set?")
+                .description(description)
+                .on_ok(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.start_rule_set_download(grant.clone(), window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Reached only from the confirm dialog's Download click. Fetches through
+    /// the shared subscription pipeline, then stages bytes + row.
+    fn start_rule_set_download(
+        &mut self,
+        grant: RuleSetDownloadGrant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rule_set_download_in_flight {
+            window.push_notification(
+                Notification::warning("A rule set download is already in flight — wait for it"),
+                cx,
+            );
+            return;
+        }
+        self.rule_set_download_in_flight = true;
+        let client = cx.http_client();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            let fetched = fetch_rule_set_body(client, &grant.url, resolve_subscription_host).await;
+            cx.update(|cx| {
+                if let Some(handle) = cx.active_window() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.finish_rule_set_download(&grant, fetched, window, cx);
+                        });
+                    });
+                } else {
+                    let _ = weak.update(cx, |view, cx| {
+                        view.finish_rule_set_download_no_window(&grant, fetched, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Post-download staging shared by both finish variants: write the staged
+    /// bytes, then record the row (or refresh the identical row on re-download).
+    fn stage_rule_set_bytes(
+        &mut self,
+        grant: &RuleSetDownloadGrant,
+        bytes: Vec<u8>,
+    ) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&grant.dir)
+            .map_err(|error| format!("cannot create {}: {error}", grant.dir.display()))?;
+        let path = grant.dir.join(&grant.file_name);
+        std::fs::write(&path, &bytes)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        let existing = self
+            .store
+            .list_rule_sets()
+            .ok()
+            .and_then(|rows| rows.into_iter().find(|row| row.name == grant.name));
+        let recorded = match existing {
+            Some(row) => self
+                .store
+                .touch_rule_set(&row.id, &grant.url, bytes.len() as u64),
+            None => self
+                .store
+                .create_rule_set(&grant.name, &grant.url, bytes.len() as u64),
+        };
+        if let Err(error) = recorded {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.to_string());
+        }
+        self.sync_presets_to_engine()?;
+        Ok(path)
+    }
+
+    fn finish_rule_set_download(
+        &mut self,
+        grant: &RuleSetDownloadGrant,
+        fetched: Result<Vec<u8>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.rule_set_download_in_flight = false;
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                window.push_notification(
+                    Notification::error(format!(
+                        "Cannot download rule set \"{}\" ({}): {reason}",
+                        grant.name,
+                        crate::import::redact_link(&grant.url),
+                    )),
+                    cx,
+                );
+                return false;
+            }
+        };
+        let bytes_len = bytes.len();
+        match self.stage_rule_set_bytes(grant, bytes) {
+            Ok(path) => {
+                window.push_notification(
+                    Notification::success(format!(
+                        "Rule set \"{}\" staged ({} bytes) — {}",
+                        grant.name,
+                        bytes_len,
+                        crate::health::truncate(&path.display().to_string(), 160),
+                    )),
+                    cx,
+                );
+                self.reload(window, cx);
+                self.reopen_presets_if_open(window, cx);
+                true
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!(
+                        "Cannot stage rule set \"{}\" ({}): {error}",
+                        grant.name,
+                        crate::import::redact_link(&grant.url),
+                    )),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    fn finish_rule_set_download_no_window(
+        &mut self,
+        grant: &RuleSetDownloadGrant,
+        fetched: Result<Vec<u8>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.rule_set_download_in_flight = false;
+        if let Ok(bytes) = fetched {
+            if self.stage_rule_set_bytes(grant, bytes).is_ok() {
+                self.reload_quiet(cx);
+            }
+        }
+    }
+
+    /// Remove: blocked while any preset references the set (loud inline), the
+    /// file delete lands right after the row so no orphan cache bytes survive.
+    fn commit_rule_set_remove(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.store.get_rule_set(id).ok().flatten();
+        let Some(row) = existing else {
+            window.push_notification(Notification::warning("Already removed"), cx);
+            return;
+        };
+        match self.store.delete_rule_set(id) {
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+            }
+            Ok(None) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Ok(Some(file_name)) => {
+                let path = crate::store::staged_rule_set_path(&file_name);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        window.push_notification(
+                            Notification::success(format!(
+                                "Rule set \"{}\" removed (staged file deleted)",
+                                row.name
+                            )),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        window.push_notification(
+                            Notification::error(format!(
+                                "Rule set \"{}\" removed, but the staged file could not be deleted: {} ({error}) — delete it manually",
+                                row.name,
+                                path.display()
+                            )),
+                            cx,
+                        );
+                    }
+                }
+                let _ = self.sync_presets_to_engine();
+                self.reload(window, cx);
+                self.reopen_presets_if_open(window, cx);
+            }
+        }
+    }
+
     fn open_presets_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_presets_dialog_restored("", "", &SimpleRuleBoxes::default(), window, cx);
     }
@@ -20325,6 +20823,29 @@ impl AppView {
                     .push(format!("\"{}\"", row.name));
             }
         }
+        let rule_sets = match self.store.list_rule_sets() {
+            Ok(rule_sets) => rule_sets,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot load rule sets: {error}")),
+                    cx,
+                );
+                Vec::new()
+            }
+        };
+        let mut rule_set_used: HashMap<String, Vec<String>> = HashMap::new();
+        for preset in &presets {
+            if let Ok(names) = self.store.rule_sets_in_use(&preset.id) {
+                for name in names {
+                    rule_set_used
+                        .entry(name)
+                        .or_default()
+                        .push(preset.name.clone());
+                }
+            }
+        }
+        let rule_set_view = view.clone();
+        let rule_set_add_view = view.clone();
         let commit_view = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let name = reader.name.read(cx).value().to_string();
@@ -20356,6 +20877,46 @@ impl AppView {
                     preset.clone(),
                     attached.get(&preset.id).cloned().unwrap_or_default(),
                 ));
+            }
+
+            // T-12: the Rule sets sub-list — explicit confirm-per-download
+            // staging lives here, never anywhere else.
+            body = body.child(
+                div()
+                    .id("rule-sets-section-title")
+                    .test_support()
+                    .text_sm()
+                    .child("Rule sets"),
+            );
+            if rule_sets.is_empty() {
+                body = body.child(Label::new(
+                    "No rule sets staged — Add by URL downloads an .srs file into data\\rule-sets after you confirm each download",
+                ));
+            }
+            for rule_set in &rule_sets {
+                body = body.child(rule_set_row(
+                    rule_set_view.clone(),
+                    rule_set.clone(),
+                    rule_set_used
+                        .get(&rule_set.name)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+            }
+            {
+                let value = rule_set_add_view.clone();
+                body = body.child(
+                    div().flex().flex_row().items_center().gap_2().child(
+                        Button::new("rule-set-add")
+                            .label("Add by URL")
+                            .tooltip("Download an .srs rule set from an https URL (you confirm each download)")
+                            .on_click(move |_, window, cx| {
+                                value.update(cx, |view, cx| {
+                                    view.open_rule_set_add_dialog(window, cx);
+                                });
+                            }),
+                    ),
+                );
             }
 
 
@@ -49719,6 +50280,290 @@ mod tests {
             view.read_with(cx, |view, _| view.log_filter.clone()),
             "",
             "commit-on-Apply is unchanged"
+        );
+    }
+
+    /// Serializes the one test that stages real rule-set files: locks the
+    /// process-global `MANYPROXY_RULE_SETS_DIR` override to a test staging
+    /// root for the guard's lifetime and clears it on drop.
+    fn t62_rule_sets_env(dir: &std::path::Path) -> T62RuleSetsEnvGuard {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lease = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("MANYPROXY_RULE_SETS_DIR", dir);
+        T62RuleSetsEnvGuard { _lease: lease }
+    }
+
+    struct T62RuleSetsEnvGuard {
+        _lease: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for T62RuleSetsEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("MANYPROXY_RULE_SETS_DIR");
+        }
+    }
+
+    fn t62_staged_rows(
+        view: &Entity<AppView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<crate::store::RuleSetRow> {
+        view.read_with(cx, |view, _| {
+            view.store.list_rule_sets().expect("list works")
+        })
+    }
+
+    /// Runs the Add-by-URL commit (the add dialog's only meaningful action)
+    /// and reports whether the gate let the flow through to the confirm.
+    fn t62_begin(
+        view: &Entity<AppView>,
+        cx: &mut VisualTestContext,
+        name: &str,
+        url: &str,
+    ) -> bool {
+        let outcome = Rc::new(RefCell::new(false));
+        let recorded = outcome.clone();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                recorded.replace(view.begin_rule_set_download(
+                    name.to_string(),
+                    url.to_string(),
+                    window,
+                    cx,
+                ));
+            });
+        });
+        let value = *outcome.borrow();
+        value
+    }
+
+    #[gpui_kit::test]
+    fn t62_rule_set_download_requires_explicit_confirm(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t62confirm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("staging temp works");
+        let _env = t62_rule_sets_env(&dir);
+        assert_eq!(
+            crate::store::rule_sets_dir(),
+            dir,
+            "the override routes staging into the test root"
+        );
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+
+        // 1. An internal URL is refused wherever the gate runs — and it never
+        //    reaches the confirm, so nothing can be fetched silently.
+        assert!(
+            !t62_begin(&view, cx, "t62-set", "http://127.0.0.1/ads.srs"),
+            "the add flow reports the policy block instead of confirming"
+        );
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "a blocked URL never opens the Download confirm"
+        );
+        assert!(
+            t62_staged_rows(&view, cx).is_empty(),
+            "no staged row from a refused gate"
+        );
+        assert!(
+            !dir.join("t62-set.srs").exists(),
+            "no staged file without a confirmed download"
+        );
+
+        // 2. Plaintext http is a warning, not a block: the gate proceeds to
+        //    the confirm, exactly like subscription policy.
+        assert!(
+            t62_begin(&view, cx, "t62-set", "http://rule-sets.example.com/t62.srs"),
+            "plaintext http warns but does not block"
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the warn path still goes through the explicit confirm"
+        );
+        assert!(t62_staged_rows(&view, cx).is_empty(), "warn stages nothing");
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // 3. A real https URL: the confirm offers itself BEFORE any fetch;
+        //    closing it stages nothing, and a second identical request must
+        //    re-offer its own confirmation (no batch, no reuse).
+        let url = "https://rule-sets.example.com/t62.srs";
+        assert!(
+            t62_begin(&view, cx, "t62-set", url),
+            "the gate passes and offers the confirm"
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the confirm dialog is up"
+        );
+        assert!(
+            t62_staged_rows(&view, cx).is_empty(),
+            "staging starts only on the confirm, never at gate time"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "closing the confirm leaves nothing in flight"
+        );
+        assert!(t62_staged_rows(&view, cx).is_empty(), "cancel never stages");
+        cx.run_until_parked();
+        assert!(
+            t62_begin(&view, cx, "t62-set", url),
+            "the re-request re-offers the confirm"
+        );
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the second confirm is its own explicit step"
+        );
+        assert!(
+            t62_staged_rows(&view, cx).is_empty(),
+            "two requests, still zero rows: confirms do not batch"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // 4. The confirmed side. The confirm's Download click runs
+        //    start_rule_set_download → fetch_rule_set_body (policy-proven by
+        //    the parity test) → finish; the fetch is faked here so this test
+        //    covers staging exactly, with fixed bytes.
+        let staged_bytes = vec![0x52, 0x53, 0x31, 0x01, 0x02, 0x03, 0xFF, 0x04];
+        let grant = crate::RuleSetDownloadGrant {
+            name: "t62-set".to_string(),
+            file_name: crate::store::rule_set_file_name("t62-set"),
+            url: url.to_string(),
+            dir: dir.clone(),
+        };
+        assert_eq!(grant.file_name, "t62-set.srs");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_rule_set_download(&grant, Ok(staged_bytes.clone()), window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        let staged = t62_staged_rows(&view, cx);
+        assert_eq!(staged.len(), 1, "exactly the confirmed set stages");
+        assert_eq!(staged[0].name, "t62-set");
+        assert_eq!(staged[0].file_name, "t62-set.srs");
+        assert_eq!(staged[0].url, url);
+        assert_eq!(staged[0].bytes, staged_bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(dir.join("t62-set.srs")).expect("staged file reads"),
+            staged_bytes,
+            "the staged bytes are the fetched bytes, verbatim"
+        );
+
+        // The staged catalog renders in the manager's Rule sets section with
+        // per-row Re-Download/Remove actions.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "rule-sets-section-title".to_string(),
+            "rule-set-add".to_string(),
+            format!("rule-set-redownload-{}", staged[0].id),
+            format!("rule-set-remove-{}", staged[0].id),
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.clone()).is_some()),
+                "the manager renders {id}"
+            );
+        }
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[test]
+    fn t62_rule_set_fetch_policy_parity_internal_blocked() {
+        // The .srs download rides the same pipeline as subscriptions:
+        // identical policy verdicts, byte-level parity of errors, and zero
+        // requests for blocked targets.
+        use gpui_kit::http_client::AsyncBody;
+
+        // Direct internal URL and rebind-via-resolver both block pre-fetch.
+        for (target, resolver) in [
+            (
+                "http://127.0.0.1/ads.srs",
+                t48_public_resolver as crate::SubscriptionHostResolver,
+            ),
+            ("https://rebind.example.com/ads.srs", t48_internal_resolver),
+        ] {
+            let (client, fetched) = t48_recording_client(|_| {
+                gpui_kit::http_client::http::Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from("must never be reached"))
+                    .expect("response builds")
+            });
+            let subscription = futures::executor::block_on(crate::fetch_subscription_body(
+                client.clone(),
+                target,
+                resolver,
+            ))
+            .expect_err("subscriptions block internal targets");
+            let rule_set = futures::executor::block_on(crate::fetch_rule_set_body(
+                client.clone(),
+                target,
+                resolver,
+            ))
+            .expect_err("rule sets block internal targets the same way");
+            assert_eq!(
+                rule_set, subscription,
+                "one shared policy surface, byte-identical verdicts"
+            );
+            assert!(subscription.contains("internal"), "{subscription}");
+            assert!(
+                fetched.lock().expect("read works").is_empty(),
+                "the gate runs before any request leaves"
+            );
+        }
+
+        // Success parity: the rule-set path keeps raw bytes (a compiled .srs
+        // is binary) where the subscription wrapper refuses non-UTF-8 — both
+        // read the exact same body through the shared pipeline.
+        let raw: Vec<u8> = vec![0x52, 0x53, 0x31, 0xFF, 0x00, 0x7F];
+        let body = raw.clone();
+        let (client, fetched) = t48_recording_client(move |_| {
+            gpui_kit::http_client::http::Response::builder()
+                .status(200)
+                .body(AsyncBody::from(body.clone()))
+                .expect("response builds")
+        });
+        let rule_set = futures::executor::block_on(crate::fetch_rule_set_body(
+            client.clone(),
+            "https://rule-sets.example.com/ads.srs",
+            t48_public_resolver,
+        ))
+        .expect("binary body passes the rule-set fetch");
+        assert_eq!(rule_set, raw, "raw bytes out, modulo nothing");
+        let subscription = futures::executor::block_on(crate::fetch_subscription_body(
+            client.clone(),
+            "https://rule-sets.example.com/ads.srs",
+            t48_public_resolver,
+        ))
+        .expect_err("the same body is not UTF-8");
+        assert!(
+            subscription.contains("not UTF-8"),
+            "subscriptions keep their UTF-8 contract: {subscription}"
+        );
+        assert_eq!(
+            *fetched.lock().expect("read works"),
+            vec![
+                "https://rule-sets.example.com/ads.srs".to_string(),
+                "https://rule-sets.example.com/ads.srs".to_string(),
+            ],
+            "both flows request the confirmed URL exactly once"
         );
     }
 }

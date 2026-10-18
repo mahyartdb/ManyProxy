@@ -227,7 +227,86 @@ fn check_rule_matcher_shapes(
             ));
         }
     }
+    if let Some(value) = obj.get("rule_set") {
+        let ok = value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string));
+        if !ok {
+            return Err(fail(
+                "field \"rule_set\" must be a list of staged set names".to_string(),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Ordered unique `rule_set` names referenced by a rule list — the staging
+/// surface's reference grammar: names, nothing else.
+pub fn collect_rule_set_refs(rules: &[Value]) -> Vec<String> {
+    let mut refs = Vec::new();
+    for rule in rules {
+        let Some(Value::Array(names)) = rule.get("rule_set") else {
+            continue;
+        };
+        for name in names {
+            if let Some(name) = name.as_str().map(str::trim) {
+                if !name.is_empty() && !refs.iter().any(|seen| seen == name) {
+                    refs.push(name.to_string());
+                }
+            }
+        }
+    }
+    refs
+}
+
+fn unstaged_rule_set_message(name: &str) -> String {
+    format!(
+        "rule set \"{name}\" is not staged — add it under Rule sets before this preset can be used"
+    )
+}
+
+/// T-12 attachment-time validation: rule references must name a staged set.
+/// Intake stays tolerant (T-11 anchor); this gate runs when rules attach to a
+/// proxy row (store) and again at config generation (engine) — same loudness
+/// taste as unknown exits, never silent.
+pub fn validate_rule_set_refs_staged(
+    rules: &[Value],
+    staged: &std::collections::BTreeSet<String>,
+) -> Result<(), PresetError> {
+    for (index, rule) in rules.iter().enumerate() {
+        let Some(Value::Array(names)) = rule.get("rule_set") else {
+            continue;
+        };
+        for name in names {
+            let Some(name) = name.as_str() else {
+                return Err(bad_rule(
+                    index,
+                    "field \"rule_set\" must be a list of staged set names",
+                ));
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(bad_rule(
+                    index,
+                    "field \"rule_set\" must not carry an empty set name",
+                ));
+            }
+            if !staged.contains(name) {
+                return Err(bad_rule(index, unstaged_rule_set_message(name)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The loud Remove-guard text: the set goes nowhere while presets still
+/// reference it, and the message names them.
+pub fn rule_set_in_use_message(name: &str, presets: &[String]) -> String {
+    format!(
+        "rule set \"{name}\" is used by {} preset(s): {} — detach it from those presets first",
+        presets.len(),
+        presets.join(", ")
+    )
 }
 
 pub fn validate_preset_rules(rules: &[Value]) -> Result<(), PresetError> {
@@ -768,6 +847,7 @@ pub fn rule_attribute_tabs(rule: &Value) -> Vec<&'static str> {
         ("source_ip_is_private", "Source"),
         ("source_port", "Source"),
         ("source_port_range", "Source"),
+        ("rule_set", "Rule set"),
     ];
     for (_, tab) in GROUPS {
         if GROUPS
@@ -2001,5 +2081,95 @@ mod tests {
                 .expect("box rules pass the shared validation pipeline");
             assert_eq!(served_action(action), served, "{action} serves as {served}");
         }
+    }
+
+    #[test]
+    fn t62_rule_set_shape_tabs_refs_and_staged_gate() {
+        // T-12: `rule_set` joins the known attributes — its own tab, a
+        // list-of-names shape. Intake stays tolerant about whether a name is
+        // staged; the staged gate is store (attach) + engine (configgen).
+        let named = serde_json::json!({"action": "direct", "rule_set": ["ads", "streaming"]});
+        assert_eq!(
+            rule_attribute_tabs(&named),
+            vec!["Action", "Rule set"],
+            "rule_set surfaces its own tab, never Other"
+        );
+        validate_preset_rules(std::slice::from_ref(&named)).expect("list-of-names shape is valid");
+
+        for bad in [
+            serde_json::json!({"action": "direct", "rule_set": "ads"}),
+            serde_json::json!({"action": "direct", "rule_set": ["ads", 7]}),
+            serde_json::json!({"action": "direct", "rule_set": 5}),
+        ] {
+            let error = validate_preset_rules(std::slice::from_ref(&bad)).unwrap_err();
+            assert_eq!(error.kind, PresetErrorKind::BadRule, "{error}");
+            assert!(error.message.contains("rule 0"), "{error}");
+            assert!(error.message.contains("\"rule_set\""), "{error}");
+            assert!(
+                error.message.contains("list of staged set names"),
+                "the shape message names the staging grammar: {error}"
+            );
+        }
+
+        // References collect in first-seen order, deduped — the Remove guard
+        // and the attach surface read the same list.
+        let rules = vec![
+            serde_json::json!({"action": "route", "rule_set": ["b", "a"]}),
+            serde_json::json!({"action": "proxy", "ip_cidr": ["10.0.0.0/8"]}),
+            serde_json::json!({"action": "direct", "rule_set": ["a"]}),
+        ];
+        assert_eq!(
+            collect_rule_set_refs(&rules),
+            vec!["b".to_string(), "a".to_string()],
+            "refs collect first-seen and deduped"
+        );
+        assert!(collect_rule_set_refs(&[serde_json::json!({"action": "direct"})]).is_empty());
+
+        // The staged gate: unlisted name is loud, staged name passes, malformed
+        // and empty names fail the same way the shape check does.
+        let staged: std::collections::BTreeSet<String> =
+            ["b"].iter().map(|n| n.to_string()).collect();
+        let error = validate_rule_set_refs_staged(&rules, &staged).unwrap_err();
+        assert!(
+            error.message.contains(&unstaged_rule_set_message("a")),
+            "names the missing set: {error}"
+        );
+        validate_rule_set_refs_staged(
+            &[serde_json::json!({"action": "route", "rule_set": ["b"]})],
+            &staged,
+        )
+        .expect("every ref staged passes");
+        let error = validate_rule_set_refs_staged(
+            &[serde_json::json!({"action": "direct", "rule_set": [7]})],
+            &staged,
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("rule 0") && error.message.contains("\"rule_set\""),
+            "{error}"
+        );
+        let error = validate_rule_set_refs_staged(
+            &[serde_json::json!({"action": "direct", "rule_set": [" "]})],
+            &staged,
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("must not carry an empty set name"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn t62_remove_guard_message_names_detachment() {
+        let many: Vec<String> = ["Work", "Travel"].into_iter().map(str::to_string).collect();
+        assert_eq!(
+            rule_set_in_use_message("ads", &many),
+            "rule set \"ads\" is used by 2 preset(s): Work, Travel — detach it from those presets first"
+        );
+        let single = vec!["Detach first".to_string()];
+        assert_eq!(
+            rule_set_in_use_message("solo", &single),
+            "rule set \"solo\" is used by 1 preset(s): Detach first — detach it from those presets first"
+        );
     }
 }

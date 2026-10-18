@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
@@ -762,10 +762,39 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
     })
 }
 
+fn map_rule_set_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuleSetRow> {
+    let id: i64 = row.get(0)?;
+    let bytes: i64 = row.get(4)?;
+    Ok(RuleSetRow {
+        id: id.to_string(),
+        name: row.get(1)?,
+        url: row.get(2)?,
+        file_name: row.get(3)?,
+        bytes: bytes.max(0) as u64,
+        downloaded_at: row.get(5)?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantinedRow {
     pub id: String,
     pub cause: String,
+}
+
+/// T-12: one staged rule set. `file_name` mirrors the sanitized name
+/// (`data\rule-sets\<file_name>`); rows never hold the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleSetRow {
+    pub id: String,
+    pub name: String,
+
+    pub url: String,
+
+    pub file_name: String,
+
+    pub bytes: u64,
+
+    pub downloaded_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3381,6 +3410,73 @@ pub(crate) fn app_data_dir() -> PathBuf {
     app_data_dir_in(crate::engine::current_app_dir().as_deref())
 }
 
+pub(crate) const RULE_SETS_DIR_NAME: &str = "rule-sets";
+
+/// T-12: staged `.srs` rule sets live beside the app under `data\rule-sets\`
+/// (same T-02 family as the library DB): the folder ships inside the portable
+/// ZIP and the sidecar path points at app-dir files only.
+pub(crate) fn rule_sets_dir_in(app_dir: Option<&Path>) -> PathBuf {
+    app_data_dir_in(app_dir).join(RULE_SETS_DIR_NAME)
+}
+
+pub(crate) fn rule_sets_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MANYPROXY_RULE_SETS_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    rule_sets_dir_in(crate::engine::current_app_dir().as_deref())
+}
+
+/// The staged file for a rule-set name: name sanitized with the same grammar
+/// the engine uses for tags (`sanitize_tag`), so the emission path derived
+/// from a rule reference lands exactly on the file staging wrote.
+pub(crate) fn rule_set_file_stem(name: &str) -> String {
+    crate::engine::sanitize_tag(name.trim())
+}
+
+pub(crate) fn rule_set_file_name(name: &str) -> String {
+    format!("{}.srs", rule_set_file_stem(name))
+}
+
+pub(crate) fn staged_rule_set_path(file_name: &str) -> PathBuf {
+    rule_sets_dir().join(file_name)
+}
+
+/// A tag-sanitizing name can still land on a reserved Windows device name
+/// ("con", "nul", …); such a file cannot be created, so staging rejects it
+/// loudly at name validation instead of failing at first download.
+fn windows_reserved_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
+
+/// Keeps `<appdir>\data\rule-sets\<stem>.srs` far away from MAX_PATH trouble.
+pub(crate) const RULE_SET_STEM_MAX_CHARS: usize = 80;
+
 static NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn unique_name_suffix(ts: i64) -> String {
@@ -3819,6 +3915,14 @@ impl Store {
              CREATE TABLE IF NOT EXISTS meta (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL DEFAULT ''
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS rule_sets (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               name TEXT NOT NULL UNIQUE,
+               url TEXT NOT NULL,
+               file_name TEXT NOT NULL UNIQUE,
+               bytes INTEGER NOT NULL,
+               downloaded_at INTEGER NOT NULL
              ) STRICT;",
         )?;
 
@@ -4558,10 +4662,9 @@ impl Store {
             Ok(rowid) => rowid,
             Err(_) => return Err(StoreError::NotFound(config_id.to_string())),
         };
-        let tx = self.conn.transaction()?;
         if let Some(preset) = preset_id {
             let rowid_preset: i64 = preset.parse().unwrap_or(-1);
-            let rule_count: i64 = tx.query_row(
+            let rule_count: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM route_presets WHERE id = ?1",
                 params![rowid_preset],
                 |row| row.get(0),
@@ -4570,7 +4673,7 @@ impl Store {
                 return Err(StoreError::NotFound(preset.to_string()));
             }
 
-            let rules_json: String = tx.query_row(
+            let rules_json: String = self.conn.query_row(
                 "SELECT rules_json FROM route_presets WHERE id = ?1",
                 params![rowid_preset],
                 |row| row.get(0),
@@ -4585,7 +4688,25 @@ impl Store {
                     "preset has no rules yet — refresh it before attaching",
                 )]));
             }
+
+            // T-12 attachment-time validation: every `rule_set` reference must
+            // name a staged set at the moment the preset attaches to a row.
+            // Same loudness taste as unknown exits — loud here, loud again at
+            // config generation, never silent.
+            let staged = self.staged_rule_set_names()?;
+            let rules: Vec<serde_json::Value> =
+                serde_json::from_str::<serde_json::Value>(&rules_json)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default();
+            if let Err(error) = crate::preset::validate_rule_set_refs_staged(&rules, &staged) {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "preset",
+                    error.message,
+                )]));
+            }
         }
+        let tx = self.conn.transaction()?;
         let changed = tx.execute(
             "UPDATE proxy_configs SET preset_id = ?1 WHERE id = ?2",
             params![preset_id, rowid],
@@ -4939,6 +5060,177 @@ impl Store {
         Ok(rows)
     }
 
+    /// T-12: staged `.srs` rule-set catalog rows. The binary file is cache
+    /// state under `data\rule-sets\` (never DPAPI-sealed — a compiled rule
+    /// catalog carries no credentials, like a subscription body); this table
+    /// only tracks what was staged, from where, and when.
+    pub fn list_rule_sets(&self) -> Result<Vec<RuleSetRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, url, file_name, bytes, downloaded_at
+             FROM rule_sets ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], map_rule_set_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_rule_set(&self, id: &str) -> Result<Option<RuleSetRow>, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Ok(None),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, url, file_name, bytes, downloaded_at
+             FROM rule_sets WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![rowid], map_rule_set_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Records a freshly downloaded `.srs` back as a row. The file itself is
+    /// written by the confirmed download flow (`main.rs`) BEFORE this call;
+    /// `file_name` mirrors the sanitized name so the engine derivation
+    /// (`crate::store::rule_set_file_name`) and the table agree.
+    pub fn create_rule_set(
+        &self,
+        name: &str,
+        url: &str,
+        bytes: u64,
+    ) -> Result<RuleSetRow, StoreError> {
+        let name = Self::validated_rule_set_name(name)?;
+        let url = url.trim().to_string();
+        if bytes > SUBSCRIPTION_MAX_BYTES as u64 {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "bytes",
+                format!(
+                    "rule set is {} bytes — the staging cap is {SUBSCRIPTION_MAX_BYTES} bytes",
+                    bytes
+                ),
+            )]));
+        }
+        let file_name = rule_set_file_name(&name);
+        match self.conn.execute(
+            "INSERT INTO rule_sets (name, url, file_name, bytes, downloaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, url, file_name, bytes as i64, now_unix()],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                return Err(StoreError::Invalid(vec![FieldError::new(
+                    "name",
+                    format!("rule set \"{name}\" is already staged"),
+                )]));
+            }
+            Err(error) => return Err(StoreError::Sql(error)),
+        }
+        let id = self.conn.last_insert_rowid();
+        self.get_rule_set(&id.to_string())?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Explicit re-Download on the same entry: bytes/URL are refreshed, the
+    /// file overwrite itself is the user-confirmed step done by the flow.
+    pub fn touch_rule_set(
+        &self,
+        id: &str,
+        url: &str,
+        bytes: u64,
+    ) -> Result<RuleSetRow, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        if bytes > SUBSCRIPTION_MAX_BYTES as u64 {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "bytes",
+                format!(
+                    "rule set is {} bytes — the staging cap is {SUBSCRIPTION_MAX_BYTES} bytes",
+                    bytes
+                ),
+            )]));
+        }
+        let changed = self.conn.execute(
+            "UPDATE rule_sets SET url = ?1, bytes = ?2, downloaded_at = ?3 WHERE id = ?4",
+            params![url.trim(), bytes as i64, now_unix(), rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_rule_set(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// Rule sets a preset's rules currently reference (the ticket-named
+    /// `rule_sets_in_use(preset_id)` helper). Used by the Remove guard and the
+    /// list's "used by" column.
+    pub fn rule_sets_in_use(&self, preset_id: &str) -> Result<Vec<String>, StoreError> {
+        let Some(preset) = self.get_preset(preset_id)? else {
+            return Ok(Vec::new());
+        };
+        let rules = preset.rules().map_err(|message| {
+            StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )))
+        })?;
+        Ok(crate::preset::collect_rule_set_refs(&rules))
+    }
+
+    /// Presets whose rules reference the given rule set by name. Remove is
+    /// blocked while this is non-empty: used sets must be detached first, so
+    /// removal never leaves naming rules silently pointing at nothing.
+    pub fn rule_set_used_by(&self, name: &str) -> Result<Vec<String>, StoreError> {
+        let mut used = Vec::new();
+        for preset in self.list_presets()? {
+            if self
+                .rule_sets_in_use(&preset.id)?
+                .iter()
+                .any(|set| set == name)
+            {
+                used.push(preset.name);
+            }
+        }
+        Ok(used)
+    }
+
+    /// Removes the row once nothing references it. Returns the staged
+    /// `file_name` so the caller deletes the cache file (no silent orphans:
+    /// the flow unlinks it right after, and a failed unlink is loud).
+    pub fn delete_rule_set(&self, id: &str) -> Result<Option<String>, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let Some(row) = self.get_rule_set(id)? else {
+            return Ok(None);
+        };
+        let used = self.rule_set_used_by(&row.name)?;
+        if !used.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "rule set",
+                crate::preset::rule_set_in_use_message(&row.name, &used),
+            )]));
+        }
+        self.conn
+            .execute("DELETE FROM rule_sets WHERE id = ?1", params![rowid])?;
+        Ok(Some(row.file_name))
+    }
+
+    /// Names currently staged — the attachment-time source of truth for the
+    /// `rule_set` reference check in `set_config_preset` below.
+    fn staged_rule_set_names(&self) -> Result<BTreeSet<String>, StoreError> {
+        let mut names = BTreeSet::new();
+        for row in self.list_rule_sets()? {
+            names.insert(row.name);
+        }
+        Ok(names)
+    }
+
     fn validated_preset_name(raw: &str) -> Result<String, StoreError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -4949,6 +5241,43 @@ impl Store {
         }
 
         Ok(crate::preset::cap_name(trimmed.to_string()))
+    }
+
+    /// T-12 staging name validation: the name is both the row label and (via
+    /// `rule_set_file_name`) the staged file base, so it must survive the tag
+    /// sanitizer with at least one letter/digit left.
+    pub(crate) fn validated_rule_set_name(raw: &str) -> Result<String, StoreError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                "rule set name must not be empty",
+            )]));
+        }
+        let stem = rule_set_file_stem(trimmed);
+        if !stem.chars().any(|c| c.is_ascii_alphanumeric()) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                "rule set name must contain a letter or digit",
+            )]));
+        }
+        if windows_reserved_stem(&stem) {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                format!(
+                    "rule set name \"{trimmed}\" sanitizes to the reserved Windows device name \"{stem}\" — pick another name"
+                ),
+            )]));
+        }
+        if stem.len() > RULE_SET_STEM_MAX_CHARS {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "name",
+                format!(
+                    "rule set name must sanitize to at most {RULE_SET_STEM_MAX_CHARS} file-name characters"
+                ),
+            )]));
+        }
+        Ok(trimmed.to_string())
     }
 
     fn validated_preset_source(raw: &str) -> String {
@@ -15085,5 +15414,247 @@ mod tests {
             offenders.is_empty(),
             "default storage must never reference the legacy homes, got {offenders:?}"
         );
+    }
+
+    #[test]
+    fn t62_rule_set_staged_under_data_rule_sets() {
+        // The staging root is the T-02 family: `<appdir>\data\rule-sets\`,
+        // derived from the same app-dir helper as the DB — nothing else.
+        let base = t52_temp_root("t62staged");
+        let app = base.join("install");
+        assert_eq!(
+            rule_sets_dir_in(Some(&app)),
+            app.join(DATA_DIR_NAME).join(RULE_SETS_DIR_NAME),
+            "rule sets stage under the command data folder"
+        );
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(store.list_rule_sets().expect("list works").is_empty());
+
+        let row = store
+            .create_rule_set("Block Ads", "https://s.example.com/z.srs", 512)
+            .expect("stage records");
+        assert_eq!(row.name, "Block Ads");
+        assert_eq!(row.url, "https://s.example.com/z.srs");
+        assert_eq!(
+            row.file_name,
+            crate::store::rule_set_file_name("Block Ads"),
+            "the file name mirrors the sanitized name the engine derives"
+        );
+        assert_eq!(row.file_name, "Block-Ads.srs");
+        assert_eq!(row.bytes, 512);
+        assert!(row.downloaded_at > 0);
+
+        // The same entry again is the UNIQUE guard: overwriting happens only
+        // through the confirmed re-Download flow (touch), never at intake.
+        let error = store
+            .create_rule_set("Block Ads", "https://s.example.com/z.srs", 512)
+            .expect_err("duplicate name is refused");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error:?}");
+        };
+        assert!(
+            fields.iter().any(|e| e.message.contains("already staged")),
+            "{fields:?}"
+        );
+
+        // Re-download refreshes bytes/URL and shifts downloaded_at forward.
+        let first_touched = row.downloaded_at;
+        let touched = store
+            .touch_rule_set(&row.id, "https://mirror.example.com/z.srs", 640)
+            .expect("touch refreshes");
+        assert_eq!(touched.bytes, 640);
+        assert_eq!(touched.url, "https://mirror.example.com/z.srs");
+        assert!(touched.downloaded_at >= first_touched);
+
+        let error = store
+            .create_rule_set(
+                "Too much",
+                "https://s.example.com/z.srs",
+                (SUBSCRIPTION_MAX_BYTES + 1) as u64,
+            )
+            .expect_err("over-cap refuse");
+        assert!(error.to_string().contains("staging cap"), "{error}");
+
+        // Name validation: the name doubles as the staged file base, so a
+        // name must survive the tag sanitizer with a letter/digit, never be a
+        // Windows device name, and stay bounded.
+        for (bad, cause) in [
+            ("   ", "empty"),
+            ("///", "no letter or digit"),
+            ("名", "no letter or digit"),
+            ("con", "reserved Windows device name"),
+        ] {
+            let error = store
+                .create_rule_set(bad, "https://s.example.com/z.srs", 10)
+                .expect_err("this name must not stage");
+            let StoreError::Invalid(fields) = error else {
+                panic!("expected Invalid for {bad}, got {error:?}");
+            };
+            let field = fields.first().expect("field error present");
+            match cause {
+                "empty" => assert_eq!(field.message, "rule set name must not be empty"),
+                "no letter or digit" => assert_eq!(
+                    field.message, "rule set name must contain a letter or digit",
+                    "raw name {bad} sanitizes to no usable stem"
+                ),
+                "reserved Windows device name" => {
+                    let message = field.message.clone();
+                    assert!(
+                        message.contains("reserved"),
+                        "device-name refusal: {message}"
+                    );
+                }
+                other => panic!("unknown cause {other}"),
+            }
+        }
+
+        // An unused row deletes clean and hands back the file name so the flow
+        // can unlink the cache bytes (no silent orphan cache survives).
+        let file_name = store
+            .delete_rule_set(&row.id)
+            .expect("delete works")
+            .expect("the staged file name comes back");
+        assert_eq!(file_name, "Block-Ads.srs");
+        assert!(store.list_rule_sets().expect("list works").is_empty());
+        assert_eq!(
+            store.delete_rule_set(&row.id).expect("ghost delete"),
+            None,
+            "deleting twice is a no-op, not an error"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn t62_rule_set_used_guard_blocks_remove() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(valid_input("Row")).expect("row seeds");
+        let ads = store
+            .create_rule_set("ads", "https://s.example.com/ads.srs", 11)
+            .expect("stage records");
+        let preset = store
+            .create_preset(
+                "t62-guard",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "proxy", "rule_set": ["ads"]})],
+            )
+            .expect("preset seeds");
+        store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works — the set is staged");
+        assert_eq!(
+            store.rule_sets_in_use(&preset.id).expect("in-use works"),
+            vec!["ads".to_string()],
+            "the helper names the sets a preset references"
+        );
+        assert_eq!(
+            store.rule_set_used_by("ads").expect("used-by works"),
+            vec![preset.name.clone()],
+            "the guard names every preset still using the set"
+        );
+        assert!(store.rule_set_used_by("none").expect("works").is_empty());
+
+        // Remove is blocked while the preset still references the set — the
+        // inline error names both the count and the preset names.
+        let error = store
+            .delete_rule_set(&ads.id)
+            .expect_err("used set refuses removal");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error:?}");
+        };
+        assert!(
+            fields.iter().any(|e| {
+                e.message
+                    == crate::preset::rule_set_in_use_message(
+                        "ads",
+                        std::slice::from_ref(&preset.name),
+                    )
+            }),
+            "{fields:?}"
+        );
+        assert!(store.get_rule_set(&ads.id).expect("get works").is_some());
+
+        // Detaching frees removal — and the detach surface is the preset's
+        // rules, not the row link: the guard counts rule_set references that
+        // presets still name.
+        store
+            .set_preset_rules(
+                &preset.id,
+                &[serde_json::json!({"action": "proxy", "ip_cidr": ["10.0.0.0/8"]})],
+            )
+            .expect("rule rewrite works");
+        assert!(store
+            .rule_sets_in_use(&preset.id)
+            .expect("works")
+            .is_empty());
+        let file_name = store
+            .delete_rule_set(&ads.id)
+            .expect("delete works")
+            .expect("file name comes back");
+        assert_eq!(file_name, "ads.srs", "the file name can be unlinked");
+        assert!(store.list_rule_sets().expect("list works").is_empty());
+    }
+
+    #[test]
+    fn t62_attach_rejects_unstaged_rule_set() {
+        // Attachment-time validation is at the row attach (not preset save):
+        // the T-61 anchor saves a `ruleset:` ref unstaged — saving stays
+        // tolerant, attaching to a row is where the loud name check lives.
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store.add(valid_input("Row")).expect("row seeds");
+        let preset = store
+            .create_preset(
+                "t62-attach",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "proxy", "rule_set": ["ghost-set"]})],
+            )
+            .expect("preset save stays tolerant");
+        store
+            .create_preset("plain", "manual", None, &[])
+            .expect("empty preset seeds");
+        let error = store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect_err("unstaged ref must fail the attach");
+        let StoreError::Invalid(fields) = error else {
+            panic!("expected Invalid, got {error:?}");
+        };
+        let unstaged = fields
+            .iter()
+            .any(|e| e.message.contains("\"ghost-set\"") && e.message.contains("is not staged"));
+        assert!(unstaged, "names the missing set: {fields:?}");
+        assert!(
+            store
+                .get(&row.id)
+                .expect("get works")
+                .expect("kept")
+                .preset_id
+                .is_none(),
+            "a refused attach leaves the row unattached"
+        );
+
+        // Staging the named set clears the gate.
+        store
+            .create_rule_set("ghost-set", "https://s.example.com/g.srs", 5)
+            .expect("stage records");
+        let attached = store
+            .set_config_preset(&row.id, Some(&preset.id))
+            .expect("attach works once the set is staged");
+        assert_eq!(attached.preset_id.as_deref(), Some(preset.id.as_str()));
+
+        // And attach refuses a named-but-empty reference too.
+        let empty = store
+            .create_preset(
+                "t62-blank",
+                "manual",
+                None,
+                &[serde_json::json!({"action": "direct", "rule_set": [" "]})],
+            )
+            .expect("tolerant save");
+        let error = store
+            .set_config_preset(&row.id, Some(&empty.id))
+            .expect_err("blank ref must fail");
+        assert!(error.to_string().contains("empty set name"), "{error}");
     }
 }
