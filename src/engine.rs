@@ -1410,6 +1410,79 @@ pub fn validate_chain_nodes(
     Ok(hops)
 }
 
+/// T-13: transition-order validation for user-built chains, one call over
+/// every chain the apply path is about to plan. The core walk must stay
+/// sing-box → xray → sing-box — the bridge shape every xray hop gives the
+/// walk — so an xray hop never sits directly beside another non-standard
+/// core hop, at most one extra-core hop exists per chain, and an autoselector
+/// slot never returns (store.rs `chain_hop_rejection` refuses them at slot
+/// insert; this re-checks what reaches this layer as defense-in-depth).
+/// Pure: touches no config, sidecar, or OS state.
+pub fn validate_chain_transition_order(chains: &[(&str, &[ChainHop])]) -> Result<(), EngineError> {
+    for (name, hops) in chains {
+        for pair in hops.windows(2) {
+            let (earlier, later) = (&pair[0], &pair[1]);
+            let pattern = match (earlier.kind, later.kind) {
+                (ChainHopKind::Xray, ChainHopKind::Xray) => Some("two consecutive xray hops"),
+                (ChainHopKind::Xray, ChainHopKind::Extra | ChainHopKind::Custom) => {
+                    Some("an xray hop followed by an extra/custom hop")
+                }
+                (ChainHopKind::Extra | ChainHopKind::Custom, ChainHopKind::Xray) => {
+                    Some("an extra/custom hop directly ahead of an xray hop")
+                }
+                _ => None,
+            };
+            let Some(pattern) = pattern else {
+                continue;
+            };
+            return Err(EngineError::ChainViolation {
+                name: (*name).to_string(),
+                detail: format!(
+                    "{} → {}: {pattern} — chain hop sequence must stay sing-box → xray → sing-box",
+                    earlier.label, later.label
+                ),
+            });
+        }
+        let extra_positions: Vec<&str> = hops
+            .iter()
+            .filter(|hop| hop.kind == ChainHopKind::Extra)
+            .map(|hop| hop.label.as_str())
+            .collect();
+        if extra_positions.len() > 1 {
+            return Err(EngineError::ChainViolation {
+                name: (*name).to_string(),
+                detail: format!(
+                    "{} — at most one extracore hop per chain",
+                    extra_positions.join(" + ")
+                ),
+            });
+        }
+        for hop in hops.iter() {
+            if hop.kind != ChainHopKind::Standard {
+                continue;
+            }
+            let Some(node) = hop.node.as_ref() else {
+                continue;
+            };
+            let autoselector = node
+                .get("type")
+                .or_else(|| node.get("protocol"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|marker| marker.trim().eq_ignore_ascii_case("autoselector"));
+            if autoselector {
+                return Err(EngineError::ChainViolation {
+                    name: (*name).to_string(),
+                    detail: format!(
+                        "{} is an autoselector hop — chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)",
+                        hop.label
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn xray_ingress_tag(id: &str) -> String {
     format!("x-in-{}", sanitize_tag(id))
 }
@@ -1901,6 +1974,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
     let main_ids: HashSet<&str> = main_rows.iter().map(|row| row.id.as_str()).collect();
     let by_id: HashMap<&str, &ProxyConfig> =
         configs.iter().map(|row| (row.id.as_str(), row)).collect();
+    let mut chain_transitions: Vec<(&str, Vec<ChainHop>)> = Vec::new();
     for config in configs {
         if !is_chain_protocol(&config.protocol) {
             continue;
@@ -1909,6 +1983,7 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
         let hops = validate_chain_nodes(&config.name, &params, &|id| {
             by_id.get(id).map(|row| row.protocol.clone())
         })?;
+        chain_transitions.push((config.name.as_str(), hops.clone()));
         for (index, hop) in hops.iter().enumerate() {
             if let Some(id) = hop.ref_id.as_deref() {
                 if !main_ids.contains(id) {
@@ -1956,6 +2031,12 @@ pub fn validate_activation(configs: &[ProxyConfig]) -> Result<ActivationPlan, En
             }
         }
     }
+
+    let chain_views: Vec<(&str, &[ChainHop])> = chain_transitions
+        .iter()
+        .map(|(name, hops)| (*name, hops.as_slice()))
+        .collect();
+    validate_chain_transition_order(&chain_views)?;
 
     let taken_ports: HashSet<u16> = configs
         .iter()
@@ -9951,6 +10032,290 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    fn t63_hop(kind: ChainHopKind, label: &str) -> ChainHop {
+        ChainHop {
+            kind,
+            ref_id: None,
+            node: None,
+            label: label.to_string(),
+        }
+    }
+
+    fn t63_ordering_rejected(name: &str, hops: &[ChainHop]) -> String {
+        let chains = [(name, hops)];
+        let error = validate_chain_transition_order(&chains).expect_err("ordering fails");
+        assert!(matches!(error, EngineError::ChainViolation { .. }));
+        let text = error.to_string();
+        assert!(text.contains(CHAIN_EGRESS_RULE), "family wrap: {text}");
+        assert!(text.contains(name), "names chain: {text}");
+        assert!(
+            text.contains("chain hop sequence must stay sing-box → xray → sing-box"),
+            "pattern phrase: {text}"
+        );
+        text
+    }
+
+    #[test]
+    fn t63_transition_order_accepts_sing_xray_sing() {
+        let cases: Vec<(&str, Vec<ChainHop>)> = vec![
+            (
+                "SingXray",
+                vec![
+                    t63_hop(ChainHopKind::Standard, "node 1"),
+                    t63_hop(ChainHopKind::Xray, "node 2"),
+                ],
+            ),
+            (
+                "SingSingXray",
+                vec![
+                    t63_hop(ChainHopKind::Standard, "node 1"),
+                    t63_hop(ChainHopKind::Standard, "node 2"),
+                    t63_hop(ChainHopKind::Xray, "node 3"),
+                ],
+            ),
+            ("XrayOnly", vec![t63_hop(ChainHopKind::Xray, "node 1")]),
+            (
+                "AllSing",
+                vec![
+                    t63_hop(ChainHopKind::Standard, "node 1"),
+                    t63_hop(ChainHopKind::Standard, "node 2"),
+                ],
+            ),
+        ];
+        let views: Vec<(&str, &[ChainHop])> = cases
+            .iter()
+            .map(|(name, hops)| (*name, hops.as_slice()))
+            .collect();
+        validate_chain_transition_order(&views).expect("sing → xray → sing walk stays valid");
+
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            xray_fixture("2", "XrayOne", 10802),
+            chain_fixture("8", "ChainAX", json!(["1", "2"]), 10808),
+        ];
+        let plan = validate_activation(&rows).expect("xray-last stays the accepted walk");
+        assert_eq!(plan.egresses.len(), 1, "xray hop keeps its row's leg");
+    }
+
+    #[test]
+    fn t63_rejects_consecutive_extra_core_hops() {
+        let extra_first = t63_hop(ChainHopKind::Extra, "node 1");
+        let std_mid = t63_hop(ChainHopKind::Standard, "node 2");
+        let extra_last = t63_hop(ChainHopKind::Extra, "node 3");
+        let shapes: Vec<(&str, Vec<ChainHop>)> = vec![
+            (
+                "AdjacentExtras",
+                vec![extra_first.clone(), extra_last.clone()],
+            ),
+            ("SpreadExtras", vec![extra_first, std_mid, extra_last]),
+        ];
+        for (name, hops) in &shapes {
+            let chains = [(*name, hops.as_slice())];
+            let error = validate_chain_transition_order(&chains)
+                .expect_err("a second extra-core hop fails");
+            assert!(matches!(error, EngineError::ChainViolation { .. }));
+            let text = error.to_string();
+            assert!(text.contains(CHAIN_EGRESS_RULE), "family wrap: {text}");
+            assert!(text.contains(name), "names chain: {text}");
+            assert!(
+                text.contains("at most one extracore hop per chain"),
+                "family rule: {text}"
+            );
+            assert!(text.contains("node 1"), "names first hop: {text}");
+            assert!(text.contains("node 3"), "names last hop: {text}");
+        }
+    }
+
+    #[test]
+    fn t63_rejects_xray_custom_xray_shapes() {
+        let text = t63_ordering_rejected(
+            "ConsecutiveXray",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Xray, "node 2"),
+            ],
+        );
+        assert!(
+            text.contains("two consecutive xray hops"),
+            "pattern: {text}"
+        );
+        let text = t63_ordering_rejected(
+            "XrayThenExtra",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Extra, "node 2"),
+            ],
+        );
+        assert!(
+            text.contains("an xray hop followed by an extra/custom hop"),
+            "pattern: {text}"
+        );
+        t63_ordering_rejected(
+            "XrayThenCustom",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Custom, "node 2"),
+            ],
+        );
+        t63_ordering_rejected(
+            "ExtraThenXray",
+            &[
+                t63_hop(ChainHopKind::Extra, "node 1"),
+                t63_hop(ChainHopKind::Xray, "node 2"),
+            ],
+        );
+        t63_ordering_rejected(
+            "CustomThenXray",
+            &[
+                t63_hop(ChainHopKind::Custom, "node 1"),
+                t63_hop(ChainHopKind::Xray, "node 2"),
+            ],
+        );
+        t63_ordering_rejected(
+            "XrayCustomXray",
+            &[
+                t63_hop(ChainHopKind::Xray, "node 1"),
+                t63_hop(ChainHopKind::Custom, "node 2"),
+                t63_hop(ChainHopKind::Xray, "node 3"),
+            ],
+        );
+    }
+
+    #[test]
+    fn t63_rejects_selector_slot() {
+        let autoselector = ChainHop {
+            kind: ChainHopKind::Standard,
+            ref_id: None,
+            node: Some(
+                json!({"type": "autoselector"})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            ),
+            label: "node 2".to_string(),
+        };
+        let slots = [t63_hop(ChainHopKind::Standard, "node 1"), autoselector];
+        let chains = [("AutoSelect", slots.as_slice())];
+        let error = validate_chain_transition_order(&chains).expect_err("autoselector slot fails");
+        assert!(matches!(error, EngineError::ChainViolation { .. }));
+        let text = error.to_string();
+        assert!(text.contains(CHAIN_EGRESS_RULE), "family wrap: {text}");
+        assert!(text.contains("AutoSelect"), "names chain: {text}");
+        assert!(
+            text.contains(
+                "chain hops cannot take an autoselector (v1 chains are flat — pick a concrete row)"
+            ),
+            "family text: {text}"
+        );
+        assert!(text.contains("node 2"), "names slot: {text}");
+
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            chain_fixture("8", "AutoChain", json!([{"type": "autoselector"}]), 10808),
+        ];
+        let error = validate_activation(&rows).expect_err("apply path rejects the slot");
+        assert!(matches!(error, EngineError::ChainViolation { .. }));
+        let text = error.to_string();
+        assert!(
+            text.contains("chain hops cannot take an autoselector"),
+            "family error through the apply path: {text}"
+        );
+    }
+
+    #[test]
+    fn t63_valid_chains_byte_identical_after_validation() {
+        let ref_rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            fixture("2", "Beta", "vless", vless_params(), "127.0.0.1", 10802),
+            chain_fixture("8", "ChainAB", json!(["1", "2"]), 10808),
+        ];
+        let xray_rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            xray_fixture("2", "XrayOne", 10802),
+            chain_fixture("8", "ChainAX", json!(["1", "2"]), 10808),
+        ];
+        let inline_rows = vec![chain_fixture(
+            "8",
+            "ChainInline",
+            json!([{"type": "vless", "server": "198.51.100.9", "server_port": 443}]),
+            10808,
+        )];
+        validate_chain_transition_order(&[(
+            "ChainAX",
+            [
+                t63_hop(ChainHopKind::Standard, "node 1"),
+                ChainHop {
+                    kind: ChainHopKind::Xray,
+                    ref_id: Some("2".to_string()),
+                    node: None,
+                    label: "node 2 (\"2\")".to_string(),
+                },
+            ]
+            .as_slice(),
+        )])
+        .expect("today's xray-last chain stays the accepted transition");
+        validate_chain_transition_order(&[(
+            "ChainInline",
+            [ChainHop {
+                kind: ChainHopKind::Standard,
+                ref_id: None,
+                node: Some(
+                    json!({"type": "vless", "server": "198.51.100.9", "server_port": 443})
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+                label: "node 1".to_string(),
+            }]
+            .as_slice(),
+        )])
+        .expect("today's inline standard chain stays valid");
+
+        assert_eq!(
+            generate(&ref_rows).expect("ref chain generates").json,
+            r#"{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in-1","listen":"127.0.0.1","listen_port":10801},{"type":"mixed","tag":"in-2","listen":"127.0.0.1","listen_port":10802},{"type":"mixed","tag":"in-8","listen":"127.0.0.1","listen_port":10808}],"outbounds":[{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-1"},{"type":"vless","server":"198.51.100.9","server_port":443,"uuid":"11111111-2222-4333-8444-555555555555","tls":{"enabled":true,"server_name":"198.51.100.9"},"tag":"out-2"},{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-8-hop-0","detour":"out-8-hop-1"},{"type":"vless","server":"198.51.100.9","server_port":443,"uuid":"11111111-2222-4333-8444-555555555555","tls":{"enabled":true,"server_name":"198.51.100.9"},"tag":"out-8-hop-1"},{"type":"direct","tag":"direct"}],"endpoints":[],"route":{"rules":[{"inbound":["in-1"],"action":"route","outbound":"out-1"},{"inbound":["in-2"],"action":"route","outbound":"out-2"},{"inbound":["in-8"],"action":"route","outbound":"out-8-hop-0"}],"final":"direct"}}"#,
+            "today's stock ref chain bytes"
+        );
+        assert_eq!(
+            generate(&xray_rows).expect("xray chain generates").json,
+            r#"{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in-1","listen":"127.0.0.1","listen_port":10801},{"type":"mixed","tag":"in-2","listen":"127.0.0.1","listen_port":10802},{"type":"mixed","tag":"in-8","listen":"127.0.0.1","listen_port":10808}],"outbounds":[{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-1"},{"type":"socks","tag":"out-2","server":"127.0.0.1","server_port":11801,"version":"5"},{"type":"shadowsocks","server":"203.0.113.7","server_port":8388,"method":"aes-128-gcm","password":"pass1","tag":"out-8-hop-0","detour":"out-8-hop-1"},{"type":"socks","tag":"out-8-hop-1","server":"127.0.0.1","server_port":11801,"version":"5"},{"type":"direct","tag":"direct"}],"endpoints":[],"route":{"rules":[{"inbound":["in-1"],"action":"route","outbound":"out-1"},{"inbound":["in-2"],"action":"route","outbound":"out-2"},{"inbound":["in-8"],"action":"route","outbound":"out-8-hop-0"}],"final":"direct"}}"#,
+            "today's xray-last chain bytes"
+        );
+        assert_eq!(
+            generate(&inline_rows).expect("inline chain generates").json,
+            r#"{"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in-8","listen":"127.0.0.1","listen_port":10808}],"outbounds":[{"type":"vless","server":"198.51.100.9","server_port":443,"tag":"out-8-hop-0"},{"type":"direct","tag":"direct"}],"endpoints":[],"route":{"rules":[{"inbound":["in-8"],"action":"route","outbound":"out-8-hop-0"}],"final":"direct"}}"#,
+            "today's inline standard chain bytes"
+        );
     }
 
     #[test]
