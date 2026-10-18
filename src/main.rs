@@ -113,6 +113,7 @@ actions!(
         StartSelected,
         StopSelected,
         TestSelected,
+        StopTesting,
         ClearChecked,
         EditSelected,
         DeleteSelected,
@@ -152,6 +153,7 @@ pub fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("ctrl-k", OpenPalette, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-u", CopyUrls, Some(APP_KEY_CONTEXT)),
         KeyBinding::new("ctrl-r", UpdateCurrentGroup, Some(APP_KEY_CONTEXT)),
+        KeyBinding::new("ctrl-.", StopTesting, Some(APP_KEY_CONTEXT)),
     ]);
 }
 
@@ -197,6 +199,7 @@ pub const SHORTCUT_LINES: &[(&str, &str)] = &[
     ("Start selected", "F5"),
     ("Stop selected", "Shift-F5"),
     ("Test selected", "Ctrl-T"),
+    ("Stop Testing", "Ctrl-."),
     ("Edit selected", "Ctrl-E"),
     ("Delete selected", "Delete"),
     ("Focus search", "Ctrl-F"),
@@ -25077,6 +25080,12 @@ impl AppView {
                 }
                 view.test_selected_health(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &StopTesting, window, cx| {
+                if overlay_open(window, cx) {
+                    return;
+                }
+                view.stop_group_tests(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &ClearChecked, window, cx| {
                 view.clear_checked_unless_dialog(window, cx);
             }))
@@ -25930,9 +25939,9 @@ impl AppView {
                                 topbar_menu_row(
                                     "stop-testing",
                                     "Stop Testing",
-                                    "Stop Testing",
+                                    "Stop Testing (Ctrl-.)",
                                     "Stop the running group test",
-                                    None,
+                                    Some(("ctrl-.", "(Ctrl-.)", "Ctrl-.")),
                                 )
                             })
                             .on_click({
@@ -35139,7 +35148,7 @@ mod tests {
                     ("out-ip-selected", "Resolve Out-IP selected"),
                     ("out-ip-group", "Resolve Out-IP group"),
                     ("resolve-domain-group", "Resolve domain group"),
-                    ("stop-testing", "Stop Testing"),
+                    ("stop-testing", "Stop Testing (Ctrl-.)"),
                     ("show-security", "Show security"),
                     ("sort-type-security", "Sort Type|Security"),
                     ("open-palette", "Command palette (Ctrl-K)"),
@@ -49962,6 +49971,7 @@ mod tests {
             ("Start selected", "F5"),
             ("Stop selected", "Shift-F5"),
             ("Test selected", "Ctrl-T"),
+            ("Stop Testing", "Ctrl-."),
             ("Edit selected", "Ctrl-E"),
             ("Delete selected", "Delete"),
             ("Focus search", "Ctrl-F"),
@@ -50165,6 +50175,105 @@ mod tests {
                 .bulk_label()),
             "1 checked (of 1 visible)",
             "arrows keep the checks"
+        );
+    }
+
+    #[test]
+    fn t67_shortcut_lines_lists_stop_testing_key() {
+        assert!(
+            crate::SHORTCUT_LINES.contains(&("Stop Testing", "Ctrl-.")),
+            "SHORTCUT_LINES lists Stop Testing: Ctrl-."
+        );
+        assert_eq!(
+            crate::SHORTCUT_LINES
+                .iter()
+                .filter(|(action, _)| *action == "Stop Testing")
+                .count(),
+            1,
+            "exactly one Stop Testing line"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t67_ctrl_period_stops_group_test(cx: &mut TestAppContext) {
+        use gpui_kit::Keystroke;
+        use std::sync::atomic::Ordering;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+
+        let focus = view.read_with(cx, |view, _| view.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let press = |cx: &mut VisualTestContext, key: &str| {
+            let keystroke = Keystroke::parse(key).expect("test keystroke parses");
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            });
+        };
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.probe_stop.store(false, Ordering::SeqCst);
+            });
+        });
+        let before = notification_count(cx);
+        press(cx, "ctrl-.");
+        cx.run_until_parked();
+        let idle_flipped = view.read_with(cx, |view, _| view.probe_stop.load(Ordering::SeqCst));
+        assert!(!idle_flipped, "idle press leaves the stop flag untouched");
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "idle press reports through the existing no-op toast"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Ctrl-. stays dialog-free"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.group_test_in_flight = true;
+                view.probe_stop.store(false, Ordering::SeqCst);
+            });
+        });
+        let before = notification_count(cx);
+        press(cx, "ctrl-.");
+        cx.run_until_parked();
+        let flipped = view.read_with(cx, |view, _| view.probe_stop.load(Ordering::SeqCst));
+        assert!(
+            flipped,
+            "Ctrl-. flips probe_stop exactly like the Tools menu item"
+        );
+        assert_eq!(notification_count(cx), before + 1, "stopping toasts once");
+    }
+
+    #[gpui_kit::test]
+    fn t67_menu_item_shows_key_hint(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (_view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.click("tools-menu", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let label = cx.update(|window, _| {
+            window
+                .try_find("stop-testing".to_string())
+                .unwrap_or_else(|| panic!("stop-testing renders in the tools menu"))
+                .label()
+                .map(str::to_string)
+        });
+        assert_eq!(
+            label.as_deref(),
+            Some("Stop Testing (Ctrl-.)"),
+            "Tools ▸ Stop Testing announces the Ctrl-. hint like the Shift-F5 sibling"
         );
     }
 
