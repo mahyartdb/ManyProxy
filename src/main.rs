@@ -67,11 +67,11 @@ use engine::{
     EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
-    format_speed_result, ping_all, redact_secrets, resolve_hostname, speed_group, test_all,
-    test_group, truncate, url_test_sparkline, HealthKind, HealthProber, HealthStore, LogLevel,
-    LogStore, LogTagIndex, ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode,
-    SpeedtestOutcome, TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL,
-    RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
+    format_speed_result, ping_all, redact_secrets, resolve_hostname, sparkline_caption_tone,
+    speed_group, test_all, test_group, truncate, url_test_sparkline, HealthKind, HealthProber,
+    HealthStore, LatencyTone, LogLevel, LogStore, LogTagIndex, ProbeExclusions, RealHealthProber,
+    SpeedtestConfig, SpeedtestMode, SpeedtestOutcome, TestOutcome, TrafficSeenMap,
+    DEFAULT_TEST_URL, RESOLVE_IP_URL, RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
 };
 use import::{
     classify_open_with, commit_batch, effective_hint_for_text, format_import_failures,
@@ -375,6 +375,8 @@ struct LibraryDelegate {
 
     health: HashMap<String, String>,
 
+    health_tone: HashMap<String, LatencyTone>,
+
     running: HashSet<String>,
 
     crashed: HashSet<String>,
@@ -602,6 +604,7 @@ impl LibraryDelegate {
             query: String::new(),
             selected: None,
             health: HashMap::new(),
+            health_tone: HashMap::new(),
             running: HashSet::new(),
             crashed: HashSet::new(),
             traffic: HashMap::new(),
@@ -1011,6 +1014,10 @@ impl LibraryDelegate {
         self.apply_filter();
     }
 
+    fn set_health_tone(&mut self, health_tone: HashMap<String, LatencyTone>) {
+        self.health_tone = health_tone;
+    }
+
     fn set_running(&mut self, ids: Vec<String>) {
         self.running = ids.into_iter().collect();
         self.refresh_search_words();
@@ -1232,11 +1239,12 @@ impl ListDelegate for LibraryDelegate {
             health.as_deref(),
             self.crashed.contains(&row.id),
         );
-        let badge_color = match tone {
-            ServingTone::Failed => cx.theme().danger,
-            ServingTone::Serving => cx.theme().success,
-            ServingTone::Stopped => cx.theme().muted_foreground,
-        };
+        let probe_tone = self
+            .health_tone
+            .get(&row.id)
+            .copied()
+            .unwrap_or(LatencyTone::Unknown);
+        let health_text_color = health_tone_color(probe_tone, cx);
         let lamp_color = match tone {
             ServingTone::Failed => cx.theme().danger,
             ServingTone::Serving => cx.theme().success,
@@ -1330,7 +1338,7 @@ impl ListDelegate for LibraryDelegate {
                         .flex_shrink_0()
                         .truncate()
                         .text_sm()
-                        .text_color(badge_color)
+                        .text_color(health_text_color)
                         .tooltip({
                             let tip = tip.clone();
                             move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
@@ -8409,6 +8417,21 @@ fn lamp_access_label(tone: ServingTone, name: &str) -> String {
     }
 }
 
+/// Theme color for a probe's LatencyTone: Throne §F.1 bands map green /
+/// yellow / red with the 100/300 boundaries, a failed probe reads a darker
+/// red than a plain poor latency, and an untested/no-sample row keeps the
+/// neutral muted tone. Colors only — no probe, classification, or cutoff
+/// change rides along.
+fn health_tone_color(tone: LatencyTone, cx: &App) -> Hsla {
+    match tone {
+        LatencyTone::Fast => cx.theme().success,
+        LatencyTone::Slow => cx.theme().warning,
+        LatencyTone::Poor => cx.theme().danger,
+        LatencyTone::Failed => cx.theme().danger.blend(hsla(0., 0., 0., 0.35)),
+        LatencyTone::Unknown => cx.theme().muted_foreground,
+    }
+}
+
 fn check_chip_tip(position: usize, total: usize) -> String {
     format!("Checked {position} of {total} — bulk action target")
 }
@@ -12413,6 +12436,7 @@ impl AppView {
             self.poll_engine();
         }
         let health = self.health_map();
+        let health_tones = self.health_tones();
         let running = self.engine.running_ids();
 
         self.snapshot_running_set(&running);
@@ -12436,6 +12460,8 @@ impl AppView {
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
             state.delegate_mut().set_health(health);
+
+            state.delegate_mut().set_health_tone(health_tones);
 
             state.delegate_mut().set_running(running);
 
@@ -15567,6 +15593,15 @@ impl AppView {
             }
         }
         map
+    }
+
+    fn health_tones(&self) -> HashMap<String, LatencyTone> {
+        self.engine
+            .running_ids()
+            .iter()
+            .filter(|id| !self.health_store.row_summary(id).trim().is_empty())
+            .map(|id| (id.clone(), self.health_store.health_tone(id)))
+            .collect()
     }
 
     fn health_counts(&self) -> (usize, usize) {
@@ -22054,17 +22089,19 @@ impl AppView {
         }
     }
 
-    fn history_line(&self, config_id: &str) -> AnyElement {
+    fn history_line(&self, config_id: &str, cx: &App) -> AnyElement {
         let since = now_unix().saturating_sub(90 * 86_400);
         let entries = match self.store.load_health_history(config_id, Some(since)) {
             Ok(entries) => entries,
             Err(_) => return div().child("history unavailable").into_any_element(),
         };
         let latencies = url_test_sparkline(&entries, 120);
+        let caption_tone = sparkline_caption_tone(&entries);
         if latencies.len() < 2 {
             return div()
                 .id("config-history-empty")
                 .test_support()
+                .text_color(health_tone_color(caption_tone, cx))
                 .child(match latencies.len() {
                     1 => format!("1 probe recorded — no trend yet ({})", latencies[0]),
                     _ => "no health history yet — press Test to record a probe".to_string(),
@@ -22078,7 +22115,11 @@ impl AppView {
             .flex_row()
             .items_center()
             .gap_2()
-            .child(format!("{} samples · latest {}ms", latencies.len(), latest))
+            .child(
+                div()
+                    .text_color(health_tone_color(caption_tone, cx))
+                    .child(format!("{} samples · latest {}ms", latencies.len(), latest)),
+            )
             .child(Self::latency_sparkline(&latencies))
             .into_any_element()
     }
@@ -22342,15 +22383,15 @@ impl AppView {
 
     fn render_inspector_health(
         &self,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
         config: &ProxyConfig,
     ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(self.render_detail_health(config))
-            .child(self.render_detail_history(config))
+            .child(self.render_detail_health(cx, config))
+            .child(self.render_detail_history(cx, config))
     }
 
     fn render_inspector_presets(
@@ -22985,12 +23026,14 @@ impl AppView {
             .child(value_row)
     }
 
-    fn render_detail_health(&self, config: &ProxyConfig) -> impl IntoElement {
+    fn render_detail_health(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
+        let tone = self.health_store.health_tone(&config.id);
         div().id("config-health").test_support().child(
-            GroupBox::new()
-                .title("Health")
-                .gap_1()
-                .child(self.health_store.detail_line(&config.id).into_any_element()),
+            GroupBox::new().title("Health").gap_1().child(
+                div()
+                    .text_color(health_tone_color(tone, cx))
+                    .child(self.health_store.detail_line(&config.id).into_any_element()),
+            ),
         )
     }
 
@@ -23021,12 +23064,12 @@ impl AppView {
         )
     }
 
-    fn render_detail_history(&self, config: &ProxyConfig) -> impl IntoElement {
+    fn render_detail_history(&self, cx: &App, config: &ProxyConfig) -> impl IntoElement {
         div().id("config-history").test_support().child(
             GroupBox::new()
                 .title("History")
                 .gap_1()
-                .child(self.history_line(&config.id)),
+                .child(self.history_line(&config.id, cx)),
         )
     }
 
@@ -51006,5 +51049,273 @@ mod tests {
             ],
             "both flows request the confirmed URL exactly once"
         );
+    }
+
+    fn t65_seed(name: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: "travel".to_string(),
+            bind_ip: "127.0.0.1".to_string(),
+            port: port.to_string(),
+        }
+    }
+
+    fn t65_mount_with_failed_probe<'a>(
+        cx: &'a mut TestAppContext,
+        ports: [&str; 3],
+    ) -> (
+        Entity<AppView>,
+        &'a mut VisualTestContext,
+        String,
+        String,
+        crate::store::ProxyConfig,
+    ) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+        use gpui_kit::component::IndexPath;
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let failed = store.add(t65_seed("Alpha", ports[0])).expect("seed works");
+        let untested = store.add(t65_seed("Beta", ports[1])).expect("seed works");
+        let gamma = store.add(t65_seed("Gamma", ports[2])).expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                let (prober, handle) = FakeHealthProber::shared();
+                handle.script_failure(&failed.id, "upstream refused");
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+            });
+        });
+        let selected = view.read_with(cx, |view, cx| {
+            view.selected_config(cx).map(|config| config.id)
+        });
+        assert_eq!(
+            selected.as_deref(),
+            Some(failed.id.as_str()),
+            "row 0 selects the failed probe's row for a targeted test"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.test_selected_health(window, cx));
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        (view, cx, failed.id, untested.id, gamma)
+    }
+
+    #[gpui_kit::test]
+    fn t65_failed_tone_distinct_from_unknown_in_row_text(cx: &mut TestAppContext) {
+        use crate::health::{LatencyTone, SpeedtestMode, SpeedtestOutcome};
+        use crate::health_tone_color;
+        use crate::store::now_unix;
+        use gpui_kit::component::ActiveTheme as _;
+
+        cx.update(gpui_kit::init);
+        let (view, cx, failed, untested, gamma) =
+            t65_mount_with_failed_probe(cx, ["10881", "10882", "10883"]);
+
+        assert!(
+            view.read_with(cx, |view, _| view.health_store.row_summary(&failed))
+                .contains("dead"),
+            "the failed probe keeps its cause text"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.health_tone(&failed)),
+            LatencyTone::Failed,
+            "a failed probe tones its row Failed"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.health_tone(&untested)),
+            LatencyTone::Unknown,
+            "an untested row keeps the neutral tone"
+        );
+
+        let delegate_tones = view.read_with(cx, |view, cx| {
+            view.libraries.read(cx).delegate().health_tone.clone()
+        });
+        assert_eq!(
+            delegate_tones.get(&failed),
+            Some(&LatencyTone::Failed),
+            "the row health map carries the Failed tone for the failed row"
+        );
+        assert_eq!(
+            delegate_tones.get(&untested),
+            None,
+            "the untested row renders without a probe tone, so it stays neutral"
+        );
+        assert_painted(cx, &format!("row-health-{failed}"));
+        assert_painted(cx, &format!("row-health-{untested}"));
+
+        cx.update(|_, cx| {
+            assert_ne!(
+                health_tone_color(LatencyTone::Failed, cx),
+                health_tone_color(LatencyTone::Unknown, cx),
+                "the failed probe renders darker than the neutral unknown tone"
+            );
+            assert_eq!(
+                health_tone_color(LatencyTone::Fast, cx),
+                cx.theme().success,
+                "the fast band keeps the success color"
+            );
+            assert_eq!(
+                health_tone_color(LatencyTone::Slow, cx),
+                cx.theme().warning,
+                "the slow band keeps the warning color"
+            );
+            assert_eq!(
+                health_tone_color(LatencyTone::Poor, cx),
+                cx.theme().danger,
+                "the poor band keeps the danger color"
+            );
+            let failed_color = health_tone_color(LatencyTone::Failed, cx);
+            let poor_color = health_tone_color(LatencyTone::Poor, cx);
+            assert!(
+                failed_color.l < poor_color.l,
+                "the failed tone darkens the poor band: {failed_color:?} vs {poor_color:?}"
+            );
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.health_store.record_speed_sample(
+                    &SpeedtestOutcome {
+                        config_id: gamma.id.clone(),
+                        mode: SpeedtestMode::Download,
+                        latency_ms: Some(2700),
+                        mbps: Some(24.0),
+                        error: None,
+                    },
+                    now_unix(),
+                );
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reload(window, cx));
+        });
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.row_summary(&gamma.id)),
+            "2.7s",
+            "the speed summary text stays a duration"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.health_store.health_tone(&gamma.id)),
+            LatencyTone::Unknown,
+            "a speed-only summary tone stays neutral"
+        );
+        let (failed_row_tone, gamma_row_tone) = view.read_with(cx, |view, cx| {
+            let delegate = view.libraries.read(cx).delegate();
+            (
+                delegate.health_tone.get(&failed).copied(),
+                delegate.health_tone.get(&gamma.id).copied(),
+            )
+        });
+        assert_eq!(failed_row_tone, Some(LatencyTone::Failed));
+        assert_ne!(
+            failed_row_tone, gamma_row_tone,
+            "a failed probe tones the speed-summary-rendering row text distinctly"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t65_failed_tone_distinct_in_health_tab_detail(cx: &mut TestAppContext) {
+        use crate::health::{sparkline_caption_tone, LatencyTone};
+        use crate::health_tone_color;
+        use crate::store::HealthHistoryEntry;
+        use gpui_kit::point;
+
+        cx.update(gpui_kit::init);
+        let (view, cx, failed, untested, _gamma) =
+            t65_mount_with_failed_probe(cx, ["10891", "10892", "10893"]);
+
+        let (failed_tone, untested_tone) = view.read_with(cx, |view, _| {
+            (
+                view.health_store.health_tone(&failed),
+                view.health_store.health_tone(&untested),
+            )
+        });
+        assert_eq!(failed_tone, LatencyTone::Failed);
+        assert_eq!(untested_tone, LatencyTone::Unknown);
+        let (failed_detail, untested_detail) = view.read_with(cx, |view, _| {
+            (
+                view.health_store.detail_line(&failed),
+                view.health_store.detail_line(&untested),
+            )
+        });
+        assert!(
+            failed_detail.contains("upstream refused"),
+            "the failed detail line keeps its cause text: {failed_detail}"
+        );
+        assert!(
+            untested_detail.contains("never tested"),
+            "the untested detail line keeps its no-probe text: {untested_detail}"
+        );
+        cx.update(|_, cx| {
+            assert_ne!(
+                health_tone_color(failed_tone, cx),
+                health_tone_color(untested_tone, cx),
+                "failed and untested tones render distinctly on the Health tab"
+            );
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector_tab = crate::InspectorTab::Health;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_painted(cx, "config-health");
+        assert_painted(cx, "config-history");
+        assert_painted(cx, "config-history-empty");
+
+        let caption = |at: i64, latency: Option<u64>, error: Option<&str>| HealthHistoryEntry {
+            config_id: "row".to_string(),
+            at,
+            kind: "url-test".to_string(),
+            latency_ms: latency,
+            error: error.map(|cause| cause.to_string()),
+        };
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, Some(90), None)]),
+            LatencyTone::Fast,
+            "one fast probe tones its caption green"
+        );
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, None, Some("upstream refused"))]),
+            LatencyTone::Failed,
+            "one failed probe tones its caption Failed, not neutral"
+        );
+        assert_eq!(sparkline_caption_tone(&[]), LatencyTone::Unknown);
     }
 }

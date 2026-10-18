@@ -1115,6 +1115,28 @@ pub fn url_test_sparkline(entries: &[HealthHistoryEntry], limit: usize) -> Vec<u
     sparkline_latencies(&samples, limit)
 }
 
+/// Tone for the sparkline caption, decided by the newest persisted url/ping
+/// entry: an error reads [`LatencyTone::Failed`], a latency picks its Throne
+/// band, and an empty history stays neutral `Unknown`. Speed-test durations
+/// are skipped exactly like [`url_test_sparkline`] skips them, so a download
+/// time can never pick a latency band; ties on `at` keep the later entry.
+pub fn sparkline_caption_tone(entries: &[HealthHistoryEntry]) -> LatencyTone {
+    let mut newest: Option<&HealthHistoryEntry> = None;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind != HealthKind::SpeedTest.as_str())
+    {
+        if newest.is_none_or(|current| entry.at >= current.at) {
+            newest = Some(entry);
+        }
+    }
+    match newest {
+        Some(entry) if entry.error.is_some() => LatencyTone::Failed,
+        Some(entry) => latency_tone(entry.latency_ms),
+        None => LatencyTone::Unknown,
+    }
+}
+
 #[cfg(test)]
 pub fn parse_clash_totals(body: &str) -> Result<(u64, u64), String> {
     let value: serde_json::Value =
@@ -1909,6 +1931,23 @@ impl HealthStore {
         }
     }
 
+    /// Presentation-tone of the latest samples: a dead verdict (the newest
+    /// url/ping sample carries an error, no live latency) reads
+    /// [`LatencyTone::Failed`]; a live latency picks its Throne band via
+    /// [`latency_tone`]; everything else — untested rows, speed-only
+    /// summaries, live rows without a latency — stays neutral `Unknown`.
+    /// Pure view of stored samples: no probing is scheduled and no
+    /// classification changes.
+    pub fn health_tone(&self, config_id: &str) -> LatencyTone {
+        match self.status(config_id) {
+            RowHealth {
+                state: RowState::Dead,
+                ..
+            } => LatencyTone::Failed,
+            RowHealth { latency_ms, .. } => latency_tone(latency_ms),
+        }
+    }
+
     pub fn counts(&self, ids: &[String]) -> (usize, usize) {
         let mut live = 0;
         let mut dead = 0;
@@ -2011,22 +2050,30 @@ pub fn best_rows_monitor_lines(
     Some((format!("Best by health in {group}:"), lines))
 }
 
-#[cfg(test)]
+/// Presentation-only latency band for probe readouts: Throne-style `<=100 ms`
+/// green, `<=300 ms` yellow, past that red; a failed probe (latest sample
+/// carries an error) reads darker than a plain poor latency; a row without a
+/// probe stays neutral. Pure presentation — bands never gate probing,
+/// pruning, re-sampling, or classification (`classify_health_cause`
+/// untouched), and a slow-but-alive sample keeps its place in the series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatencyTone {
     Unknown,
+    Failed,
     Fast,
     Slow,
     Poor,
 }
 
-#[cfg(test)]
+/// Map a probed latency onto the Throne §F.1 bands: `None` stays
+/// [`LatencyTone::Unknown`]; the 100 ms and 300 ms boundaries are inclusive
+/// (`<=100` green, `<=300` yellow, `>300` red).
 pub fn latency_tone(latency_ms: Option<u64>) -> LatencyTone {
     match latency_ms {
         None => LatencyTone::Unknown,
-        Some(ms) if ms < 500 => LatencyTone::Fast,
-        Some(ms) if ms < 1500 => LatencyTone::Slow,
-        _ => LatencyTone::Poor,
+        Some(ms) if ms <= 100 => LatencyTone::Fast,
+        Some(ms) if ms <= 300 => LatencyTone::Slow,
+        Some(_) => LatencyTone::Poor,
     }
 }
 
@@ -2827,6 +2874,171 @@ mod tests {
     }
 
     #[test]
+    fn t65_latency_bands_100_300_matrix() {
+        assert_eq!(
+            latency_tone(None),
+            LatencyTone::Unknown,
+            "no latency stays neutral"
+        );
+        assert_eq!(latency_tone(Some(0)), LatencyTone::Fast);
+        assert_eq!(latency_tone(Some(99)), LatencyTone::Fast);
+        assert_eq!(
+            latency_tone(Some(100)),
+            LatencyTone::Fast,
+            "100 boundary inclusive"
+        );
+        assert_eq!(
+            latency_tone(Some(101)),
+            LatencyTone::Slow,
+            "one past 100 turns yellow"
+        );
+        assert_eq!(latency_tone(Some(299)), LatencyTone::Slow);
+        assert_eq!(
+            latency_tone(Some(300)),
+            LatencyTone::Slow,
+            "300 boundary inclusive"
+        );
+        assert_eq!(
+            latency_tone(Some(301)),
+            LatencyTone::Poor,
+            "one past 300 turns red"
+        );
+        assert_eq!(latency_tone(Some(u64::MAX)), LatencyTone::Poor);
+
+        let mut store = HealthStore::default();
+        let url_sample = |at: i64, latency: Option<u64>, error: Option<&str>| HealthSample {
+            config_id: "row".to_string(),
+            at,
+            kind: HealthKind::UrlTest,
+            latency_ms: latency,
+            error: error.map(|cause| cause.to_string()),
+        };
+        let record = |store: &mut HealthStore, sample: HealthSample| {
+            store.record_outcome(&TestOutcome {
+                sample,
+                success: None,
+            });
+        };
+
+        record(&mut store, url_sample(1, Some(250), None));
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Slow,
+            "250 ms sits in yellow"
+        );
+
+        record(&mut store, url_sample(2, Some(100), None));
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Fast,
+            "boundary stays green"
+        );
+
+        record(&mut store, url_sample(3, Some(301), None));
+        assert_eq!(store.health_tone("row"), LatencyTone::Poor, "301 turns red");
+
+        assert_eq!(
+            store.health_tone("never-probed"),
+            LatencyTone::Unknown,
+            "an unprobed row keeps the neutral tone"
+        );
+
+        record(&mut store, url_sample(4, None, Some("upstream refused")));
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Failed,
+            "an error-only sample reads Failed, not a latency band"
+        );
+
+        record(
+            &mut store,
+            url_sample(5, Some(90), Some("upstream refused")),
+        );
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Failed,
+            "the error wins over a latency in the same sample"
+        );
+
+        record(&mut store, url_sample(6, None, None));
+        assert_eq!(store.status("row").state, RowState::Live);
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Unknown,
+            "live without a latency stays neutral"
+        );
+
+        let speedy = TestOutcome {
+            sample: HealthSample {
+                config_id: "speedy".to_string(),
+                at: 1,
+                kind: HealthKind::SpeedTest,
+                latency_ms: Some(2700),
+                error: Some("dial refused".to_string()),
+            },
+            success: None,
+        };
+        store.record_outcome(&speedy);
+        assert_eq!(
+            store.status("speedy").state,
+            RowState::Unknown,
+            "a speed sample never classifies the row"
+        );
+        assert_eq!(
+            store.health_tone("speedy"),
+            LatencyTone::Unknown,
+            "a failed speed summary stays distinct from a failed probe"
+        );
+        assert_eq!(
+            store.health_tone("row"),
+            LatencyTone::Unknown,
+            "the url row keeps its verdict beside the speed sample"
+        );
+
+        let caption = |at: i64, latency: Option<u64>, error: Option<&str>| HealthHistoryEntry {
+            config_id: "row".to_string(),
+            at,
+            kind: "url-test".to_string(),
+            latency_ms: latency,
+            error: error.map(|cause| cause.to_string()),
+        };
+        assert_eq!(sparkline_caption_tone(&[]), LatencyTone::Unknown);
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, Some(300), None)]),
+            LatencyTone::Slow,
+            "the caption bands by its newest latency"
+        );
+        assert_eq!(
+            sparkline_caption_tone(&[
+                caption(1, Some(90), None),
+                caption(2, None, Some("port in use")),
+            ]),
+            LatencyTone::Failed,
+            "a failed newest entry darkens the caption"
+        );
+        assert_eq!(
+            sparkline_caption_tone(&[
+                caption(1, None, Some("port in use")),
+                caption(2, Some(90), None),
+            ]),
+            LatencyTone::Fast,
+            "a later success clears the failed tone"
+        );
+        let duration_caption = HealthHistoryEntry {
+            config_id: "row".to_string(),
+            at: 2,
+            kind: "speed-test".to_string(),
+            latency_ms: Some(5000),
+            error: None,
+        };
+        assert_eq!(
+            sparkline_caption_tone(&[caption(1, Some(90), None), duration_caption]),
+            LatencyTone::Fast,
+            "speed durations never pick a latency band for the caption"
+        );
+    }
+
+    #[test]
     fn t09_test_group_chunks_with_progress() {
         let configs: Vec<ProxyConfig> = (0..205)
             .map(|i| {
@@ -2864,10 +3076,9 @@ mod tests {
 
         assert_eq!(latency_tone(None), LatencyTone::Unknown);
         assert_eq!(latency_tone(Some(33)), LatencyTone::Fast);
-        assert_eq!(latency_tone(Some(499)), LatencyTone::Fast);
-        assert_eq!(latency_tone(Some(500)), LatencyTone::Slow);
-        assert_eq!(latency_tone(Some(1499)), LatencyTone::Slow);
-        assert_eq!(latency_tone(Some(1500)), LatencyTone::Poor);
+        assert_eq!(latency_tone(Some(299)), LatencyTone::Slow);
+        assert_eq!(latency_tone(Some(500)), LatencyTone::Poor);
+        assert_eq!(latency_tone(Some(1499)), LatencyTone::Poor);
     }
 
     #[test]
