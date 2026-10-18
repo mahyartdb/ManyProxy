@@ -2237,6 +2237,9 @@ fn preset_rules_for(
         let action = checked.action;
         let route_like = crate::preset::action_carries_outbound(action);
         let mut merged = obj.clone();
+        // Rule names are an authoring artifact (Throne shares per-rule
+        // labels); they stay out of the generated config.
+        merged.remove("name");
 
         merged.insert(
             "action".to_string(),
@@ -13027,6 +13030,97 @@ Active Connections\r
             let text = error.to_string();
             assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
             assert!(text.contains("names an unknown exit"), "{text}");
+        }
+    }
+
+    #[test]
+    fn t60_rule_names_scrubbed_from_emission() {
+        let in_tag = inbound_tag("1");
+        let out_tag = outbound_tag("1");
+        let generated = t58_generate_rules(vec![
+            json!({
+                "action": "route", "name": "Office exit",
+                "domain": ["example.com"],
+            }),
+            json!({
+                "action": "direct", "name": "Local LAN",
+                "ip_cidr": ["10.0.0.0/8"],
+            }),
+            json!({"action": "block", "name": "Mail ports", "port": [25]}),
+            json!({"action": "sniff", "name": "Sniff opener"}),
+        ]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules.len(),
+            5,
+            "4 named preset rules + 1 isolation, got {rules:?}"
+        );
+        for (index, rule) in rules.iter().enumerate() {
+            assert!(
+                !rule.as_object().expect("rule object").contains_key("name"),
+                "rule {index} never carries its authoring name into config: {rule}"
+            );
+        }
+        assert_eq!(rules[0]["action"], json!("route"));
+        assert_eq!(
+            rules[0]["domain"],
+            json!(["example.com"]),
+            "matchers survive"
+        );
+        assert_eq!(
+            rules[0]["outbound"],
+            json!(out_tag),
+            "route exit still synthesized"
+        );
+        assert_eq!(rules[1]["action"], json!("direct"));
+        assert_eq!(rules[2]["action"], json!("reject"), "block normalizes");
+        assert_eq!(rules[3]["action"], json!("sniff"));
+        assert!(
+            rules.iter().all(|rule| rule["inbound"] == json!([in_tag])),
+            "every emitted rule stays scoped to the row"
+        );
+        assert_eq!(
+            rules[4]["outbound"],
+            json!(out_tag),
+            "isolation rule unchanged"
+        );
+
+        let generated = t58_generate_rules(vec![json!({
+            "action": "route", "name": "Direct exit", "outbound": "direct",
+        })]);
+        let value = generated.value();
+        let rules = value["route"]["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules[0]["outbound"],
+            json!("direct"),
+            "an explicit known exit is kept"
+        );
+        assert!(
+            !rules[0].as_object().unwrap().contains_key("name"),
+            "the name still never reaches config"
+        );
+    }
+
+    #[test]
+    fn t60_unknown_exit_emission_stays_loud() {
+        for action in ["route", "proxy", "route-options"] {
+            let mut map = HashMap::new();
+            map.insert(
+                "p1".to_string(),
+                vec![json!({"action": action, "name": "Named hop", "outbound": "some-other-row"})],
+            );
+            let row = t37_row_with_preset();
+            let error = generate_with_presets(std::slice::from_ref(&row), &map)
+                .expect_err("unknown exit must stay loud");
+            let text = error.to_string();
+            assert!(matches!(error, EngineError::BadPreset { .. }), "{text}");
+            assert!(text.contains("rule 0"), "{text}");
+            assert!(text.contains("names an unknown exit"), "{text}");
+            assert!(
+                !text.contains("Named hop"),
+                "the authoring label stays out of the failure: {text}"
+            );
         }
     }
 

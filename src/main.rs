@@ -10467,6 +10467,9 @@ fn preset_row(
         .gap_2()
         .child(Label::new(preset.name.clone()))
         .child(preset_row_summary(&preset, &attached));
+    if preset.locked {
+        row = row.child(Label::new("Locked"));
+    }
     if preset.source == "url" && preset.source_url.is_some() {
         let refresh_view = view.clone();
         let refresh_id = preset.id.clone();
@@ -10485,8 +10488,27 @@ fn preset_row(
     let remove_id = preset.id.clone();
     let edit_view = view.clone();
     let edit_preset = preset.clone();
+    let lock_view = view.clone();
+    let lock_id = preset.id.clone();
+    let lock_next = !preset.locked;
     let export_view = view.clone();
     let export_preset = preset.clone();
+    row = row.child(
+        Button::new(format!("preset-lock-{}", preset.id))
+            .label(if preset.locked { "Unlock" } else { "Lock" })
+            .tooltip(if preset.locked {
+                "Allow modifications again (the rules gain an editor)"
+            } else {
+                "Prevent modifications: the rules stay byte-stable; attach/detach unaffected"
+            })
+            .on_click(move |_, window, cx| {
+                let id = lock_id.clone();
+                let locked = lock_next;
+                lock_view.update(cx, |view, cx| {
+                    view.commit_preset_lock(&id, locked, window, cx);
+                });
+            }),
+    );
     row = row.child(
         Button::new(format!("preset-export-{}", preset.id))
             .label("Export link")
@@ -10578,7 +10600,8 @@ fn preset_rule_attribute_folds(
 fn preset_advanced_section(
     view: Entity<AppView>,
     preset: &store::RoutePreset,
-    form: PresetForm,
+    form: Option<PresetForm>,
+    exits: &[String],
 ) -> impl IntoElement {
     let mut section = div().flex().flex_col().gap_1().child(
         div()
@@ -10599,27 +10622,59 @@ fn preset_advanced_section(
             );
         }
     };
+    let locked = preset.locked;
     for (index, rule) in rules.iter().enumerate() {
         let action = rule
             .get("action")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("?");
         let tabs = crate::preset::rule_attribute_tabs(rule).join(" · ");
-        let cycle_view = view.clone();
-        let cycle_form = form.clone();
-        let remove_view = view.clone();
-        let remove_form = form.clone();
-        section = section.child(
+        let name = rule
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty());
+        let label = match name {
+            Some(name) => format!("Rule {index} — \"{name}\" — {action} · {tabs}"),
+            None => format!("Rule {index} — {action} · {tabs}"),
+        };
+        let mut row = div().flex().flex_row().items_center().gap_2().child(
             div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
+                .id(format!("preset-rule-name-{}-{index}", preset.id))
+                .test_support()
+                .text_sm()
+                .child(label),
+        );
+        if crate::preset::action_carries_outbound(action) {
+            let outbound_text = match rule.get("outbound").and_then(serde_json::Value::as_str) {
+                Some(tag) => format!("Outbound: {tag}"),
+                None => "Outbound: serving row".to_string(),
+            };
+            row = row.child(
+                div()
+                    .id(format!("preset-rule-outbound-{}-{index}", preset.id))
+                    .test_support()
+                    .text_sm()
+                    .child(outbound_text),
+            );
+            if !locked {
+                row = row.child(
                     div()
+                        .id(format!("preset-rule-exits-{}-{index}", preset.id))
+                        .test_support()
                         .text_sm()
-                        .child(format!("Rule {index} — {action} · {tabs}")),
-                )
+                        .child(format!(
+                            "Exits: {}",
+                            crate::preset::preset_exit_suggestions(exits).join(" · ")
+                        )),
+                );
+            }
+        }
+        if let Some(form) = &form {
+            let cycle_view = view.clone();
+            let cycle_form = form.clone();
+            let remove_view = view.clone();
+            let remove_form = form.clone();
+            row = row
                 .child(
                     Button::new(format!("preset-rule-action-{}-{index}", preset.id))
                         .small()
@@ -10651,24 +10706,35 @@ fn preset_advanced_section(
                                 );
                             });
                         }),
-                ),
-        );
+                );
+        }
+        section = section.child(row);
         for fold in preset_rule_attribute_folds(&preset.id, index, rule) {
             section = section.child(fold);
         }
     }
-    let add_view = view.clone();
-    section.child(
-        Button::new(format!("preset-rule-add-{}", preset.id))
-            .small()
-            .label("Add rule")
-            .tooltip("Append a fresh direct rule to the rules box")
-            .on_click(move |_, window, cx| {
-                add_view.update(cx, |_, cx| {
-                    AppView::rewrite_preset_rules_box(&form, &PresetRulesOp::Add, window, cx);
-                });
-            }),
-    )
+    match form {
+        Some(form) => {
+            let add_view = view.clone();
+            section.child(
+                Button::new(format!("preset-rule-add-{}", preset.id))
+                    .small()
+                    .label("Add rule")
+                    .tooltip("Append a fresh direct rule to the rules box")
+                    .on_click(move |_, window, cx| {
+                        add_view.update(cx, |_, cx| {
+                            AppView::rewrite_preset_rules_box(
+                                &form,
+                                &PresetRulesOp::Add,
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+            )
+        }
+        None => section,
+    }
 }
 
 fn spawn_tick(
@@ -19494,6 +19560,38 @@ impl AppView {
         }
     }
 
+    /// T-10 prevent-modifications lock. The toggle is the owner's positive
+    /// action (no confirm dialog); it protects the rules, never the attach
+    /// relationship.
+    fn commit_preset_lock(
+        &mut self,
+        id: &str,
+        locked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.store.set_preset_locked(id, locked) {
+            Ok(_) => {
+                self.reload(window, cx);
+                if locked {
+                    window.push_notification(
+                        Notification::success("Routing preset locked — import a copy to modify"),
+                        cx,
+                    );
+                } else {
+                    window.push_notification(Notification::success("Routing preset unlocked"), cx);
+                }
+            }
+            Err(StoreError::NotFound(_)) => {
+                window.push_notification(Notification::warning("Already removed"), cx);
+            }
+            Err(error) => {
+                self.report_save_error(error, window, cx);
+            }
+        }
+        self.reopen_presets_if_open(window, cx);
+    }
+
     fn open_preset_edit_dialog(
         &mut self,
         preset: store::RoutePreset,
@@ -19504,14 +19602,75 @@ impl AppView {
             .rules()
             .map(|rules| serde_json::Value::Array(rules).to_string())
             .unwrap_or_default();
+        let title = format!("Edit preset {}", preset.name);
+        if preset.locked {
+            // T-10: a locked preset renders a readonly editor — view-only
+            // rows, no inputs, no save/copy-edit path.
+            let id = preset.id.clone();
+            let name = preset.name.clone();
+            let json_text = rules_text;
+            let advanced_view = cx.entity();
+            window.open_dialog(cx, move |dialog: Dialog, _, _| {
+                dialog
+                    .title(title.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(format!("preset-locked-hint-{id}"))
+                                    .test_support()
+                                    .text_sm()
+                                    .child("Locked — import a copy to modify"),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("preset-locked-name-{id}"))
+                                    .test_support()
+                                    .text_sm()
+                                    .child(format!("Name: {name}")),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("preset-locked-json-{id}"))
+                                    .test_support()
+                                    .text_sm()
+                                    .child(json_text.clone()),
+                            )
+                            .child(preset_advanced_section(
+                                advanced_view.clone(),
+                                &preset,
+                                None,
+                                &[],
+                            )),
+                    )
+                    .button_props(DialogButtonProps::default())
+                    .footer(dialog_footer(
+                        "preset-locked-close",
+                        "preset-locked-close",
+                        "Close",
+                        Rc::new(|_, _| true),
+                    ))
+            });
+            return;
+        }
+        let exits: Vec<String> = self
+            .store
+            .preset_attachments(&preset.id)
+            .unwrap_or_default()
+            .iter()
+            .map(|row| crate::engine::outbound_tag(&row.id))
+            .collect();
         let form = PresetForm::restored(window, cx, &preset.name, &rules_text);
         let view = cx.entity();
         let reader = form.clone();
         let id = preset.id.clone();
-        let title = format!("Edit preset {}", preset.name);
         let builder_view = view.clone();
         let builder_preset = preset.clone();
         let builder_form = form.clone();
+        let builder_exits = exits.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let name = reader.name.read(cx).value().to_string();
             let rules = reader.rules.read(cx).value().to_string();
@@ -19529,7 +19688,8 @@ impl AppView {
                 .child(preset_advanced_section(
                     builder_view.clone(),
                     &builder_preset,
-                    builder_form.clone(),
+                    Some(builder_form.clone()),
+                    builder_exits.as_slice(),
                 ))
                 .button_props(
                     DialogButtonProps::default()
@@ -20063,6 +20223,21 @@ impl AppView {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             let mut body = div().flex().flex_col().gap_2();
+            if !presets.is_empty() {
+                body = body.child(
+                    div()
+                        .id("preset-attach-exits")
+                        .test_support()
+                        .text_sm()
+                        .child(format!(
+                            "Route exits for \"{config_name}\": {}",
+                            crate::preset::preset_exit_suggestions(&[crate::engine::outbound_tag(
+                                &config_id
+                            )])
+                            .join(" · ")
+                        )),
+                );
+            }
             if presets.is_empty() {
                 body = body.child(
                     "No routing presets yet — import one first (throne://route link or preset JSON)",
@@ -45020,6 +45195,7 @@ mod tests {
             description: None,
             is_builtin: false,
             last_used_at: None,
+            locked: false,
         };
         let summary = preset_row_summary(&preset, &["\"Row\"".to_string()]);
         assert!(summary.contains("ads"), "{summary}");
@@ -45833,6 +46009,209 @@ mod tests {
                 "bare rule renders no {key} fold"
             );
         }
+    }
+
+    #[gpui_kit::test]
+    fn t60_locked_preset_renders_readonly(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let rules = vec![
+            serde_json::json!({
+                "action": "route", "name": "Office exit",
+                "domain": ["example.com"],
+                "source_ip_cidr": ["10.0.0.0/8"],
+            }),
+            serde_json::json!({"action": "direct", "name": "Local"}),
+        ];
+        let preset = store
+            .create_preset("locked-one", "manual", None, &rules)
+            .expect("preset seeds");
+        let pid = preset.id.clone();
+        store.set_preset_locked(&pid, true).expect("lock seeds");
+        // Re-read so the snapshot carries the locked flag, the way the
+        // store-fed flow always opens the dialog.
+        let preset = store
+            .get_preset(&pid)
+            .expect("read works")
+            .expect("preset kept");
+        let (view, cx) = mount_view(store, cx);
+
+        // The manager row offers the explicit toggle...
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_presets_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find(format!("preset-lock-{pid}")).is_some()),
+            "manager row offers the lock toggle"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // ...and the editor renders readonly for a locked preset.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-locked-hint-{pid}"))
+                .is_some()),
+            "the lock hint renders"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-name-{pid}-0"))
+                .is_some()),
+            "named rules still render their label column"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-outbound-{pid}-0"))
+                .is_some()),
+            "route rules still show their outbound line"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-fold-{pid}-0-source_ip_cidr"))
+                .is_some()),
+            "attribute folds render view-only"
+        );
+        for absent in [
+            format!("preset-rule-action-{pid}-0"),
+            format!("preset-rule-delete-{pid}-0"),
+            format!("preset-rule-add-{pid}"),
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(absent.clone()).is_none()),
+                "locked editor renders no {absent}"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("preset-edit-ok").is_none()),
+            "locked editor renders no save path"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        // The same explicit toggle unlocks; the editor gains its editing
+        // surface back.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_preset_lock(&pid, false, window, cx)
+            });
+        });
+        let fresh = view.read_with(cx, |view, _| {
+            view.store
+                .get_preset(&pid)
+                .expect("read works")
+                .expect("preset kept")
+        });
+        assert!(!fresh.locked, "unlock persists");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(fresh, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-edit-ok").is_some()),
+            "unlocked editor restores the save path"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-action-{pid}-0"))
+                .is_some()),
+            "unlocked editor cycles actions again"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+    }
+
+    #[gpui_kit::test]
+    fn t60_completion_lists_valid_exits_only(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // Pure surface: `direct` first, serving tags after, deduped — exactly
+        // the values the engine accepts, nothing invented.
+        assert_eq!(
+            crate::preset::preset_exit_suggestions(&[]),
+            vec!["direct".to_string()]
+        );
+        let tags = [
+            "out-2".to_string(),
+            "out-1".to_string(),
+            "out-2".to_string(),
+            String::new(),
+            "direct".to_string(),
+        ];
+        assert_eq!(
+            crate::preset::preset_exit_suggestions(&tags),
+            vec![
+                "direct".to_string(),
+                "out-2".to_string(),
+                "out-1".to_string(),
+            ],
+            "dedup keeps direct first; empty and repeated tags drop"
+        );
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(tick12_seed("Alpha", "10871"))
+            .expect("seed works");
+        let preset = store
+            .create_preset(
+                "exits",
+                "manual",
+                None,
+                &[
+                    serde_json::json!({"action": "route", "name": "Office exit"}),
+                    serde_json::json!({"action": "direct"}),
+                ],
+            )
+            .expect("preset seeds");
+        let pid = preset.id.clone();
+        store
+            .set_config_preset(&row.id, Some(&pid))
+            .expect("attach works");
+        let (view, cx) = mount_view(store, cx);
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_preset_edit_dialog(preset.clone(), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-exits-{pid}-0"))
+                .is_some()),
+            "route rules offer the exits suggestions"
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find(format!("preset-rule-exits-{pid}-1"))
+                .is_none()),
+            "non-route rules offer none"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let config = view.row_config(&row.id).expect("row reads");
+                view.open_preset_attach_dialog(config, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        assert!(
+            cx.update(|window, _| window.try_find("preset-attach-exits").is_some()),
+            "the attach dialog compiles the serving exits list"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
     }
 
     #[gpui_kit::test]

@@ -723,6 +723,10 @@ pub struct RoutePreset {
     pub is_builtin: bool,
 
     pub last_used_at: Option<i64>,
+
+    /// Prevent-modifications lock: protects the *rules* (readonly editor),
+    /// never the attach relationship.
+    pub locked: bool,
 }
 
 impl RoutePreset {
@@ -743,6 +747,7 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
     let description: Option<String> = row.get(6).ok().flatten();
     let is_builtin: Option<i64> = row.get(7).ok();
     let last_used_at: Option<i64> = row.get(8).ok().flatten();
+    let locked: Option<i64> = row.get(9).ok();
     Ok(RoutePreset {
         id: id.to_string(),
         name: row.get(1)?,
@@ -753,6 +758,7 @@ fn map_preset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutePreset> {
         description,
         is_builtin: is_builtin.unwrap_or(0) != 0,
         last_used_at,
+        locked: locked.unwrap_or(0) != 0,
     })
 }
 
@@ -3807,7 +3813,8 @@ impl Store {
                 updated_at INTEGER,
                 description TEXT,
                 is_builtin INTEGER NOT NULL DEFAULT 0,
-                last_used_at INTEGER
+                last_used_at INTEGER,
+                locked INTEGER NOT NULL DEFAULT 0
               ) STRICT;
              CREATE TABLE IF NOT EXISTS meta (
                key TEXT PRIMARY KEY,
@@ -3843,6 +3850,7 @@ impl Store {
         self.ensure_column("route_presets", "description", "TEXT")?;
         self.ensure_column("route_presets", "is_builtin", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("route_presets", "last_used_at", "INTEGER")?;
+        self.ensure_column("route_presets", "locked", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("subscription_tombstones", "subscription_url", "TEXT")?;
         self.ensure_column("subscription_tombstones", "rotation_core", "TEXT")?;
 
@@ -4649,9 +4657,14 @@ impl Store {
         rules: &[serde_json::Value],
     ) -> Result<RoutePreset, StoreError> {
         let name = Self::validated_preset_name(name)?;
-        Self::check_preset_rules(rules)?;
+        let rules = {
+            let mut rules = rules.to_vec();
+            crate::preset::cap_rule_names(&mut rules);
+            rules
+        };
+        Self::check_preset_rules(&rules)?;
         let source = Self::validated_preset_source(source);
-        let rules_json = serde_json::Value::Array(rules.to_vec()).to_string();
+        let rules_json = serde_json::Value::Array(rules).to_string();
         let now = now_unix();
         match self.conn.execute(
             "INSERT INTO route_presets (name, source, source_url, rules_json, updated_at)
@@ -4703,15 +4716,40 @@ impl Store {
         id: &str,
         rules: &[serde_json::Value],
     ) -> Result<RoutePreset, StoreError> {
-        Self::check_preset_rules(rules)?;
+        let rules = {
+            let mut rules = rules.to_vec();
+            crate::preset::cap_rule_names(&mut rules);
+            rules
+        };
+        Self::check_preset_rules(&rules)?;
+
         let rowid: i64 = match id.parse() {
             Ok(rowid) => rowid,
             Err(_) => return Err(StoreError::NotFound(id.to_string())),
         };
-        let rules_json = serde_json::Value::Array(rules.to_vec()).to_string();
+        let rules_json = serde_json::Value::Array(rules).to_string();
         let changed = self.conn.execute(
             "UPDATE route_presets SET rules_json = ?1, updated_at = ?2 WHERE id = ?3",
             params![rules_json, now_unix(), rowid],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(id.to_string()));
+        }
+        self.get_preset(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))
+    }
+
+    /// T-10 prevent-modifications lock. An additive-column toggle: locking
+    /// protects the preset's rules (the editor renders readonly), never the
+    /// attach relationship — attach/detach are unaffected.
+    pub fn set_preset_locked(&mut self, id: &str, locked: bool) -> Result<RoutePreset, StoreError> {
+        let rowid: i64 = match id.parse() {
+            Ok(rowid) => rowid,
+            Err(_) => return Err(StoreError::NotFound(id.to_string())),
+        };
+        let changed = self.conn.execute(
+            "UPDATE route_presets SET locked = ?1 WHERE id = ?2",
+            params![locked as i64, rowid],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(id.to_string()));
@@ -4804,7 +4842,7 @@ impl Store {
     pub fn list_presets(&self) -> Result<Vec<RoutePreset>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, source, source_url, rules_json, updated_at,
-                    description, is_builtin, last_used_at
+                    description, is_builtin, last_used_at, locked
              FROM route_presets ORDER BY id",
         )?;
         let rows = stmt
@@ -4820,7 +4858,7 @@ impl Store {
         };
         let mut stmt = self.conn.prepare(
             "SELECT id, name, source, source_url, rules_json, updated_at,
-                    description, is_builtin, last_used_at
+                    description, is_builtin, last_used_at, locked
              FROM route_presets WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rowid], map_preset_row)?;
@@ -5950,6 +5988,7 @@ impl Store {
                         "description": p.description,
                         "is_builtin": p.is_builtin,
                         "last_used_at": p.last_used_at,
+                        "locked": p.locked,
                     })
                 })
                 .collect();
@@ -6293,6 +6332,7 @@ impl Store {
             description: Option<String>,
             is_builtin: bool,
             last_used_at: Option<i64>,
+            locked: bool,
         }
         let mut preset_rows: Vec<PresetRow> = Vec::with_capacity(presets_json.len());
         for (index, entry) in presets_json.iter().enumerate() {
@@ -6338,6 +6378,10 @@ impl Store {
                 last_used_at: entry
                     .get("last_used_at")
                     .and_then(serde_json::Value::as_i64),
+                locked: entry
+                    .get("locked")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             });
         }
 
@@ -6417,8 +6461,8 @@ impl Store {
             tx.execute(
                 "INSERT INTO route_presets
                    (id, name, source, source_url, rules_json, updated_at,
-                    description, is_builtin, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    description, is_builtin, last_used_at, locked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     preset.id,
                     preset.name,
@@ -6429,6 +6473,7 @@ impl Store {
                     preset.description,
                     preset.is_builtin as i64,
                     preset.last_used_at,
+                    preset.locked as i64,
                 ],
             )?;
         }
@@ -13658,6 +13703,7 @@ mod tests {
             ("route_presets", "description"),
             ("route_presets", "is_builtin"),
             ("route_presets", "last_used_at"),
+            ("route_presets", "locked"),
             ("subscription_tombstones", "subscription_url"),
         ] {
             assert!(
@@ -14645,6 +14691,135 @@ mod tests {
         assert!(
             store.rename_preset("999999", "ghost").is_err(),
             "ghost rename fails"
+        );
+    }
+
+    #[test]
+    fn t60_preset_locked_column_round_trip() {
+        let dir = t52_temp_root("t60locked");
+        let path = dir.join("library.db");
+        let preset_id = {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            let preset = store
+                .create_preset(
+                    "t60-locked",
+                    "manual",
+                    None,
+                    &[serde_json::json!({"action": "direct"})],
+                )
+                .expect("preset seeds");
+            assert!(
+                !preset.locked,
+                "presets start unlocked (no auto-lock on import)"
+            );
+            let locked = store
+                .set_preset_locked(&preset.id, true)
+                .expect("lock works");
+            assert!(locked.locked, "toggle locks in memory");
+            assert!(
+                store
+                    .column_exists("route_presets", "locked")
+                    .expect("probe works"),
+                "additive ensure_column added route_presets.locked"
+            );
+            preset.id.clone()
+        };
+        // The lock survives a restart (column round trip), and attaching a
+        // locked preset is allowed: the lock protects the rules, never the
+        // attach relationship.
+        {
+            let mut store = Store::open_file(&path).expect("reopen works");
+            let preset = store
+                .get_preset(&preset_id)
+                .expect("read works")
+                .expect("preset kept");
+            assert!(preset.locked, "locked persists across restarts");
+            let row = store.add(valid_input("Target")).expect("row seeds");
+            let attached = store
+                .set_config_preset(&row.id, Some(&preset_id))
+                .expect("attach works");
+            assert_eq!(
+                attached.preset_id.as_deref(),
+                Some(preset_id.as_str()),
+                "locked presets attach"
+            );
+            let detached = store
+                .set_config_preset(&row.id, None)
+                .expect("detach works");
+            assert!(detached.preset_id.is_none(), "locked presets detach");
+        }
+        // Export carries the lock as plain additive state...
+        let source_store = Store::open_file(&path).expect("source store opens");
+        let exported = source_store.export_library_json().expect("export works");
+        assert!(exported.contains("\"locked\":true"), "{exported}");
+        // ...and restore keeps it without touching the source file.
+        {
+            let mut store = Store::open_in_memory().expect("in-memory store opens");
+            store
+                .restore_library_json(&exported)
+                .expect("restore works");
+            let restored = store
+                .get_preset(&preset_id)
+                .expect("read works")
+                .expect("preset restored");
+            assert!(restored.locked, "restore keeps the lock");
+            let unlocked = store
+                .set_preset_locked(&preset_id, false)
+                .expect("unlock works");
+            assert!(!unlocked.locked, "toggle unlocks");
+        }
+        let preset = source_store
+            .get_preset(&preset_id)
+            .expect("read works")
+            .expect("preset kept");
+        assert!(preset.locked, "the source file was never touched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t60_store_caps_rule_names() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        // create_preset condenses over-long rule names with the cap_name
+        // taste; short names stay byte-exact.
+        let preset = store
+            .create_preset(
+                "t60-caps",
+                "manual",
+                None,
+                &[
+                    serde_json::json!({"action": "route", "name": "a".repeat(300)}),
+                    serde_json::json!({"action": "direct", "name": "Office exit"}),
+                ],
+            )
+            .expect("preset seeds");
+        let rules = preset.rules().expect("rules decode");
+        let long = rules[0]["name"].as_str().expect("name stays a string");
+        assert_eq!(
+            long.chars().count(),
+            crate::preset::MAX_RULE_NAME_CHARS,
+            "stored name capped to 128 chars"
+        );
+        assert!(long.starts_with(&"a".repeat(100)), "{long}");
+        assert_eq!(
+            rules[1]["name"],
+            serde_json::json!("Office exit"),
+            "short name byte-exact"
+        );
+        let set = store
+            .set_preset_rules(
+                &preset.id,
+                &[serde_json::json!({"action": "direct", "name": "b".repeat(300)})],
+            )
+            .expect("set works");
+        let rules = set.rules().expect("rules decode");
+        assert_eq!(
+            rules[0]["name"]
+                .as_str()
+                .expect("name stays a string")
+                .chars()
+                .count(),
+            crate::preset::MAX_RULE_NAME_CHARS,
+            "set_preset_rules caps too"
         );
     }
 

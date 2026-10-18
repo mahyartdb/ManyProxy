@@ -3,6 +3,11 @@ use serde_json::Value;
 
 pub const MAX_PRESET_NAME_CHARS: usize = 256;
 
+/// Per-rule `name` labels are authoring artifacts like preset names: capped
+/// with the same condensation taste (`cap_name`) at a tighter bound. Applied
+/// where rules enter the store; share links and the rules JSON stay verbatim.
+pub const MAX_RULE_NAME_CHARS: usize = 128;
+
 pub const VALID_PRESET_ACTIONS: &[&str] = &[
     "route",
     "proxy",
@@ -107,6 +112,33 @@ pub(crate) fn cap_name(name: String) -> String {
         truncated
     } else {
         name
+    }
+}
+
+pub(crate) fn cap_rule_name(name: &str) -> String {
+    if name.chars().count() <= MAX_RULE_NAME_CHARS {
+        return name.to_string();
+    }
+    let suffix = format!("-{:016x}", fnv1a_64(name));
+    let keep = MAX_RULE_NAME_CHARS.saturating_sub(suffix.len());
+    let mut truncated: String = name.chars().take(keep).collect();
+    truncated.push_str(&suffix);
+    truncated
+}
+
+/// Condense any over-long per-rule `name` labels in place, so everything the
+/// store holds stays within `MAX_RULE_NAME_CHARS` and the editor renders a
+/// legible label column.
+pub(crate) fn cap_rule_names(rules: &mut [serde_json::Value]) {
+    for rule in rules {
+        let Some(obj) = rule.as_object_mut() else {
+            continue;
+        };
+        let Some(name) = obj.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let capped = cap_rule_name(name);
+        obj.insert("name".to_string(), Value::String(capped));
     }
 }
 
@@ -254,6 +286,12 @@ pub(crate) fn check_preset_rule(
         return Err(fail(
             "field \"outbound\" needs action \"route\"".to_string(),
         ));
+    }
+
+    if let Some(name) = obj.get("name") {
+        if !name.is_string() {
+            return Err(fail("field \"name\" must be a string".to_string()));
+        }
     }
 
     match action {
@@ -741,11 +779,29 @@ pub fn rule_attribute_tabs(rule: &Value) -> Vec<&'static str> {
         }
     }
     if obj.keys().any(|key| {
-        key != "action" && key != "outbound" && !GROUPS.iter().any(|(known, _)| known == key)
+        key != "action"
+            && key != "outbound"
+            && key != "name"
+            && !GROUPS.iter().any(|(known, _)| known == key)
     }) {
         tabs.push("Other");
     }
     tabs
+}
+
+/// Valid `outbound` exit values for outbound-carrying rules, mirroring the
+/// engine's gate in `preset_rules_for`: `direct` plus one entry per serving
+/// row's outbound tag. Nothing invented — unknown values remain typeable but
+/// fail loud at emission.
+pub fn preset_exit_suggestions(serving_tags: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(1 + serving_tags.len());
+    out.push("direct".to_string());
+    for tag in serving_tags {
+        if !tag.is_empty() && tag != "direct" && !out.iter().any(|known| known == tag) {
+            out.push(tag.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1569,6 +1625,109 @@ mod tests {
         assert_eq!(
             parsed.rules, rules,
             "source/invert/ip_version/regex survive the share-link round-trip verbatim"
+        );
+    }
+
+    #[test]
+    fn t60_rule_name_round_trips_share_link() {
+        let rules = vec![
+            serde_json::json!({
+                "action": "route", "name": "Office exit",
+                "domain": ["example.com"], "outbound": "some-tag",
+            }),
+            serde_json::json!({
+                "action": "direct", "name": "Local LAN",
+                "ip_cidr": ["192.168.0.0/16"],
+            }),
+            serde_json::json!({"action": "block", "name": "Mail ports", "port": [25]}),
+        ];
+        let link = preset_share_link("named", &rules);
+        let parsed = decode_route_link(&link).expect("share link decodes");
+        assert_eq!(parsed.name, "named");
+        assert_eq!(
+            parsed.rules, rules,
+            "per-rule names survive the share-link round-trip byte-exact"
+        );
+
+        let envelope = serde_json::to_string(&serde_json::json!({
+            "kind": "throne-route-profile",
+            "v": 1,
+            "name": "named",
+            "rules": rules,
+        }))
+        .expect("profile serializes");
+        let parsed = parse_preset_json(&envelope, "").expect("object profile parses");
+        assert_eq!(
+            parsed.rules, rules,
+            "object intake keeps per-rule names verbatim"
+        );
+
+        for bad in [
+            serde_json::json!({"action": "direct", "name": 7}),
+            serde_json::json!({"action": "direct", "name": ["a"]}),
+            serde_json::json!({"action": "route", "outbound": "t", "name": true}),
+        ] {
+            let error = validate_preset_rules(std::slice::from_ref(&bad))
+                .expect_err("non-string name fails intake");
+            assert_eq!(error.kind, PresetErrorKind::BadRule, "{error}");
+            assert!(error.message.contains("rule 0"), "{error}");
+            assert!(error.message.contains("\"name\""), "{error}");
+        }
+
+        // Surfaced in the label column, so a rule name is a structural key:
+        // it never lands on the Other tab the way unknown keys do.
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({"action": "direct", "name": "n"})),
+            vec!["Action"]
+        );
+        assert_eq!(
+            rule_attribute_tabs(&serde_json::json!({
+                "action": "direct", "name": "n", "custom": 1,
+            })),
+            vec!["Action", "Other"],
+            "unknown keys still land on Other; the name key no longer does"
+        );
+    }
+
+    #[test]
+    fn t60_rule_names_capped_for_storage() {
+        // The same condensation taste as preset names, at the 128-char bound:
+        // short names pass through untouched, long ones keep a hash suffix so
+        // distinct prefixes stay distinct.
+        assert_eq!(cap_rule_name("Office exit"), "Office exit");
+        let long = "a".repeat(200);
+        let capped = cap_rule_name(&long);
+        assert_eq!(capped.chars().count(), MAX_RULE_NAME_CHARS);
+        assert!(capped.starts_with(&"a".repeat(100)), "{capped}");
+        let other = cap_rule_name(&format!("{}b", "a".repeat(199)));
+        assert_ne!(capped, other, "prefix collision avoided");
+        let multi = "名".repeat(160);
+        let capped_multi = cap_rule_name(&multi);
+        assert_eq!(capped_multi.chars().count(), MAX_RULE_NAME_CHARS);
+        // Capping counts characters, not bytes: a 128-byte cut would keep
+        // only 42 CJK chars, while a char cut keeps all 128 minus the
+        // 17-char hash suffix.
+        let kept = capped_multi.chars().take_while(|c| *c == '名').count();
+        assert_eq!(kept, MAX_RULE_NAME_CHARS - 17, "caps by chars, not bytes");
+
+        let mut rules = vec![
+            serde_json::json!({"action": "direct", "name": long}),
+            serde_json::json!({"action": "direct"}),
+        ];
+        cap_rule_names(&mut rules);
+        let capped_in_place = rules[0]["name"].as_str().expect("name stays a string");
+        assert_eq!(capped_in_place.chars().count(), MAX_RULE_NAME_CHARS);
+        assert!(
+            rules[1].as_object().unwrap().get("name").is_none(),
+            "rules without a name keep no name"
+        );
+
+        assert!(
+            validate_preset_rules(&[
+                serde_json::json!({"action": "direct", "name": "x".repeat(MAX_RULE_NAME_CHARS)}),
+            ])
+            .is_ok(),
+            "a capped-length name validates"
         );
     }
 }
