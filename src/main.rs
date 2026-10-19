@@ -598,6 +598,79 @@ fn search_hosts(params: &str) -> (String, String) {
     (server, address)
 }
 
+/// T-23: the port facet of the search grammar — one `port=` token per query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortPredicate {
+    lo: u16,
+    hi: u16,
+}
+
+impl PortPredicate {
+    fn matches(self, port: u16) -> bool {
+        port >= self.lo && port <= self.hi
+    }
+
+    /// Canonical form shown in the status-bar filter text.
+    fn label(self) -> String {
+        format!("port: {}..{}", self.lo, self.hi)
+    }
+}
+
+/// Parse a single `port=` token: `port=N`, `port=N:M`, `port=N:` or `port=:M`.
+/// Returns `None` for anything else — including the malformed forms (`port=`,
+/// `port=x`, `port=5:1`, `port=:`, out-of-`u16` values) which stay literal
+/// substring text instead of raising an error state.
+fn parse_port_predicate(token: &str) -> Option<PortPredicate> {
+    let (key, value) = token.split_once('=')?;
+    if !key.eq_ignore_ascii_case("port") {
+        return None;
+    }
+    let (lo, hi) = match value.split_once(':') {
+        // port=N — exact port.
+        None => {
+            let exact = value.parse::<u16>().ok()?;
+            (exact, exact)
+        }
+        // port=N: — open-ended range up to the last u16.
+        Some((lo_raw, "")) => (lo_raw.parse::<u16>().ok()?, u16::MAX),
+        // port=:M — open-ended range from zero.
+        Some(("", hi_raw)) => (0, hi_raw.parse::<u16>().ok()?),
+        // port=N:M — inclusive range, reversed bounds are malformed.
+        Some((lo_raw, hi_raw)) => {
+            let lo = lo_raw.parse::<u16>().ok()?;
+            let hi = hi_raw.parse::<u16>().ok()?;
+            if lo > hi {
+                return None;
+            }
+            (lo, hi)
+        }
+    };
+    Some(PortPredicate { lo, hi })
+}
+
+/// Split a query into its single `port=` predicate (if any) and the remaining
+/// substring text. The text part is token-rejoined, so `port=10801 group: api`
+/// keeps matching the blob for `group: api`. A second `port=` token is left in
+/// the text part — it then degrades to a literal substring (documented above).
+fn split_port_query(query: &str) -> (Option<PortPredicate>, String) {
+    let mut predicate = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for token in query.split_whitespace() {
+        if predicate.is_none() {
+            if let Some(parsed) = parse_port_predicate(token) {
+                predicate = Some(parsed);
+                continue;
+            }
+        }
+        kept.push(token);
+    }
+    if predicate.is_none() {
+        // No port token: keep today's query bytes untouched.
+        return (None, query.to_string());
+    }
+    (predicate, kept.join(" "))
+}
+
 impl LibraryDelegate {
     fn new() -> Self {
         Self {
@@ -805,11 +878,21 @@ impl LibraryDelegate {
 
     fn apply_filter(&mut self) {
         let selected_id = self.selected_row().map(|row| row.id.clone());
-        let lowered = self.query.trim().to_lowercase();
+        let (port, text) = split_port_query(self.query.trim());
+        let lowered = text.to_lowercase();
         let mut visible = Vec::new();
         for (index, blob) in self.search_index.iter().enumerate() {
             if !blob.matches_lowered(&lowered) {
                 continue;
+            }
+            if let Some(predicate) = port {
+                let in_range = self
+                    .rows
+                    .get(index)
+                    .is_some_and(|row| predicate.matches(row.port));
+                if !in_range {
+                    continue;
+                }
             }
             if !self.row_matches_facets(index) {
                 continue;
@@ -868,7 +951,14 @@ impl LibraryDelegate {
         }
         let query = self.query.trim();
         if !query.is_empty() {
-            parts.push(format!("search: \"{query}\""));
+            let (port, text) = split_port_query(query);
+            if let Some(predicate) = port {
+                parts.push(predicate.label());
+            }
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(format!("search: \"{text}\""));
+            }
         }
         parts.join(" · ")
     }
@@ -8602,6 +8692,11 @@ fn start_all_partial_message(started: usize, failed_names: &[String]) -> String 
 
 const SEARCH_PLACEHOLDER: &str = "Search configurations";
 
+/// T-23: the one hint that the `port=` grammar exists — a tooltip on the search
+/// box, because the pinned placeholder is too narrow to carry it.
+const SEARCH_HINT: &str =
+    "port=N or port=N:M filters by listen port (port=10801, port=10800:10900, port=10801:, port=:10900)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RowColumns {
     upstream: bool,
@@ -12311,10 +12406,16 @@ impl AppView {
                 .searchable(false)
                 .selectable(true)
         });
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(SEARCH_PLACEHOLDER));
+        let last_query = store.library_last_query().unwrap_or_default();
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(SEARCH_PLACEHOLDER)
+                .default_value(last_query.clone())
+        });
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_row_columns(row_columns);
+            state.delegate_mut().query = last_query;
             list_cx.notify();
         });
 
@@ -12434,6 +12535,7 @@ impl AppView {
                         return;
                     }
                     let query = emitter.read(cx).value().to_string();
+                    view.remember_library_query(&query);
                     view.libraries.update(cx, |state, list_cx| {
                         let delegate = state.delegate_mut();
                         delegate.query = query;
@@ -24225,13 +24327,27 @@ impl AppView {
 
     fn sync_search_box(view: &Entity<Self>, text: &str, window: &mut Window, cx: &mut App) {
         view.update(cx, |view, cx| {
+            view.remember_library_query(text);
             view.search_input.update(cx, |input, cx| {
                 input.set_value(text.to_string(), window, cx);
             });
         });
     }
 
+    /// T-23: keep the last-filter memory in step with the query. `set_value`
+    /// never emits `InputEvent::Change`, so the clear paths call this directly.
+    /// A blank query clears the key rather than storing one, and a write hiccup
+    /// only costs the memory — the live filter is unaffected.
+    fn remember_library_query(&mut self, query: &str) {
+        let _ = if query.trim().is_empty() {
+            self.store.clear_library_last_query()
+        } else {
+            self.store.set_library_last_query(query)
+        };
+    }
+
     fn clear_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_library_query("");
         self.search_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
@@ -24339,6 +24455,7 @@ impl AppView {
                     .test_support()
                     .flex_1()
                     .min_w(px(140.))
+                    .tooltip(|_, cx| cx.new(|_| Tooltip::new(SEARCH_HINT)).into())
                     .child(
                         Input::new(&self.search_input)
                             .small()
@@ -37037,6 +37154,414 @@ mod tests {
                 .collect();
             assert_eq!(cached, expected, "index/full parity for {query:?}");
         }
+    }
+
+    fn t73_port_row(
+        id: &str,
+        name: &str,
+        protocol: &str,
+        group: &str,
+        port: u16,
+    ) -> crate::store::ProxyConfig {
+        crate::store::ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            params: r#"{"server":"t73.example.com","server_port":443}"#.to_string(),
+            group: group.to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn t73_visible_ports(delegate: &crate::LibraryDelegate) -> Vec<u16> {
+        delegate
+            .visible
+            .iter()
+            .map(|&index| delegate.rows[index].port)
+            .collect()
+    }
+
+    fn t73_filtered(rows: Vec<crate::store::ProxyConfig>, query: &str) -> (Vec<u16>, String) {
+        let mut delegate = crate::LibraryDelegate::new();
+        delegate.set_rows(rows);
+        delegate.query = query.to_string();
+        delegate.apply_filter();
+        (t73_visible_ports(&delegate), delegate.active_filter_text())
+    }
+
+    fn t73_rows() -> Vec<crate::store::ProxyConfig> {
+        vec![
+            t73_port_row("a", "Alpha", "vless", "g1", 10801),
+            t73_port_row("b", "Beta", "vless", "g1", 10802),
+            t73_port_row("c", "Gamma", "vmess", "g2", 10910),
+            t73_port_row("d", "Delta", "trojan", "g2", 20000),
+        ]
+    }
+
+    #[test]
+    fn t73_port_filter_exact_and_ranges() {
+        use crate::PortPredicate;
+
+        assert_eq!(
+            crate::parse_port_predicate("port=10801:10910"),
+            Some(PortPredicate {
+                lo: 10801,
+                hi: 10910
+            }),
+            "range token parses"
+        );
+        assert_eq!(
+            crate::parse_port_predicate("port=10801"),
+            Some(PortPredicate {
+                lo: 10801,
+                hi: 10801
+            }),
+            "exact token is a one-wide range"
+        );
+
+        let (exact, text) = t73_filtered(t73_rows(), "port=10801");
+        assert_eq!(exact, vec![10801], "exact port matches only that port");
+        assert_eq!(text, "port: 10801..10801", "canonical filter text");
+
+        let (range, text) = t73_filtered(t73_rows(), "port=10801:10910");
+        assert_eq!(range, vec![10801, 10802, 10910], "range is inclusive");
+        assert_eq!(text, "port: 10801..10910", "canonical range text");
+
+        let (case_insensitive, _) = t73_filtered(t73_rows(), "PORT=10802");
+        assert_eq!(
+            case_insensitive,
+            vec![10802],
+            "port key is case-insensitive"
+        );
+
+        let (reversed, text) = t73_filtered(t73_rows(), "port=10910:10801");
+        assert!(
+            reversed.is_empty(),
+            "reversed bounds never behave as a range"
+        );
+        assert_eq!(
+            text, "search: \"port=10910:10801\"",
+            "reversed bounds stay literal text"
+        );
+
+        let (as_text, _) = t73_filtered(t73_rows(), "1080");
+        assert_eq!(
+            as_text,
+            vec![10801, 10802],
+            "bare digits keep today's substring behavior"
+        );
+    }
+
+    #[test]
+    fn t73_port_filter_open_ended_forms() {
+        let (open_top, text) = t73_filtered(t73_rows(), "port=10801:");
+        assert_eq!(open_top, vec![10801, 10802, 10910, 20000], "N..=65535");
+        assert_eq!(text, "port: 10801..65535", "open top renders the ceiling");
+
+        let (open_bottom, text) = t73_filtered(t73_rows(), "port=:10802");
+        assert_eq!(open_bottom, vec![10801, 10802], "0..=M");
+        assert_eq!(text, "port: 0..10802", "open bottom renders the floor");
+
+        let (everything, _) = t73_filtered(t73_rows(), "port=0:");
+        assert_eq!(
+            everything,
+            vec![10801, 10802, 10910, 20000],
+            "0: spans every u16 port"
+        );
+
+        let (ceiling, _) = t73_filtered(t73_rows(), "port=65535:");
+        assert!(ceiling.is_empty(), "65535: is a valid empty range");
+    }
+
+    #[test]
+    fn t73_malformed_port_token_renders_literal() {
+        use crate::LibraryDelegate;
+
+        for token in [
+            "port=",
+            "port=x",
+            "port=:",
+            "port=5:1",
+            "port=65536",
+            "port=10801-10802",
+            "port",
+        ] {
+            assert_eq!(
+                crate::parse_port_predicate(token),
+                None,
+                "{token:?} is not a port predicate"
+            );
+        }
+
+        let rows = vec![
+            t73_port_row("a", "Alpha", "vless", "g1", 10801),
+            t73_port_row("b", "port=x", "vless", "g1", 10803),
+            t73_port_row("c", "port=5:1", "vless", "g1", 10804),
+        ];
+
+        let (hits, text) = t73_filtered(rows.clone(), "port=x");
+        assert_eq!(
+            hits,
+            vec![10803],
+            "port=x matches the row literally named port=x, not by port"
+        );
+        assert_eq!(
+            text, "search: \"port=x\"",
+            "a malformed token keeps today's filter phrasing"
+        );
+
+        let (reversed, _) = t73_filtered(rows.clone(), "port=5:1");
+        assert_eq!(
+            reversed,
+            vec![10804],
+            "a reversed range is literal text, not an error"
+        );
+
+        let (prefix, _) = t73_filtered(rows.clone(), "port=");
+        assert_eq!(
+            prefix,
+            vec![10803, 10804],
+            "port= is a literal substring of both names"
+        );
+
+        let (nonsense, _) = t73_filtered(rows.clone(), "port=:");
+        assert!(nonsense.is_empty(), "port=: neither parses nor matches");
+
+        let (overflow, _) = t73_filtered(rows.clone(), "port=65536");
+        assert!(
+            overflow.is_empty(),
+            "out-of-u16 value is literal, not a panic"
+        );
+
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(rows);
+        delegate.query = "port=".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            delegate.query, "port=",
+            "the query string itself is never rewritten"
+        );
+    }
+
+    #[test]
+    fn t73_port_composes_with_facets() {
+        use crate::{FacetStatus, LibraryDelegate};
+
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t73_port_row("1", "Alpha", "vless", "g1", 10801),
+            t73_port_row("2", "Alpha Two", "vless", "g2", 10802),
+            t73_port_row("3", "Beta", "vmess", "g1", 10803),
+        ]);
+        delegate.query = "port=10801:10803 alpha".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            t73_visible_ports(&delegate),
+            vec![10801, 10802],
+            "the text part keeps today's substring behavior inside the range"
+        );
+
+        delegate.set_facet_group(Some("g1".to_string()));
+        assert_eq!(
+            t73_visible_ports(&delegate),
+            vec![10801],
+            "group facet ANDs with the port predicate"
+        );
+        delegate.set_facet_group(Some("g2".to_string()));
+        assert_eq!(t73_visible_ports(&delegate), vec![10802]);
+        delegate.set_facet_group(None);
+
+        delegate.set_facet_protocol(Some("vmess".to_string()));
+        assert!(
+            t73_visible_ports(&delegate).is_empty(),
+            "protocol facet ANDs too — no vmess row matches the text part"
+        );
+        delegate.set_facet_protocol(None);
+
+        delegate.query = "port=10801:10803".to_string();
+        delegate.apply_filter();
+        delegate.set_running(vec!["1".to_string()]);
+        delegate.set_facet_status(Some(FacetStatus::Running));
+        assert_eq!(t73_visible_ports(&delegate), vec![10801]);
+        delegate.set_facet_status(Some(FacetStatus::Stopped));
+        assert_eq!(t73_visible_ports(&delegate), vec![10802, 10803]);
+        delegate.set_facet_status(None);
+
+        delegate.query = "port=10801:10803 port=99999".to_string();
+        delegate.apply_filter();
+        assert!(
+            t73_visible_ports(&delegate).is_empty(),
+            "a second port= token degrades to literal text (pinned)"
+        );
+
+        delegate.query = "port=10801:10803".to_string();
+        delegate.apply_filter();
+        let mut unsorted = t73_visible_ports(&delegate);
+        delegate.set_type_security_sort(true);
+        let mut sorted = t73_visible_ports(&delegate);
+        unsorted.sort_unstable();
+        sorted.sort_unstable();
+        assert_eq!(
+            unsorted, sorted,
+            "the type/security sort only reorders what the filter kept"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t73_last_query_meta_restores_on_launch(cx: &mut TestAppContext) {
+        use gpui_kit::Focusable as _;
+
+        cx.update(gpui_kit::init);
+        // Fixed name (no PID suffix): the delete below runs before any
+        // connection exists, so it self-heals the previous run's leftovers;
+        // a PID suffix made the final delete fail while the view still held
+        // the connection and accumulated one run's files per suite pass.
+        let path = std::env::temp_dir().join("manyproxy-t73-last-query.db");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(
+                store.library_last_query(),
+                None,
+                "a fresh store remembers nothing"
+            );
+            store
+                .set_library_last_query("port=10801")
+                .expect("memory writes");
+            assert_eq!(
+                store.library_last_query().as_deref(),
+                Some("port=10801"),
+                "memory round-trips"
+            );
+            store.clear_library_last_query().expect("clear writes");
+            assert_eq!(store.library_last_query(), None, "cleared reads as absent");
+            store
+                .set_library_last_query("   ")
+                .expect("blank write is accepted");
+            assert_eq!(
+                store
+                    .get_meta(Store::META_LIBRARY_LAST_QUERY)
+                    .expect("meta read"),
+                None,
+                "a blank query never leaves a meta row behind"
+            );
+            store
+                .add(facet_seed("Alpha", "vless", "travel", "10801"))
+                .expect("seed works");
+            store
+                .add(facet_seed("Beta", "vless", "travel", "10802"))
+                .expect("seed works");
+        }
+
+        let store = Store::open_file(&path).expect("reopen works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .search_input
+                .read(cx)
+                .value()
+                .to_string()),
+            "",
+            "empty default opens with an empty search field"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .store
+                .get_meta(Store::META_LIBRARY_LAST_QUERY)
+                .expect("meta read")),
+            None,
+            "the empty default writes no meta row"
+        );
+
+        // Type through the real input: `set_value` emits no Change event, so
+        // keystrokes are the honest way to exercise the persistence path.
+        let handle = view.read_with(cx, |view, cx| view.search_input.read(cx).focus_handle(cx));
+        cx.update(|window, cx| {
+            window.focus(&handle, cx);
+        });
+        cx.simulate_input("port=10801");
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (typed_query, typed_ports) = view.read_with(cx, |view, cx| {
+            let delegate = view.libraries.read(cx).delegate();
+            (delegate.query.clone(), t73_visible_ports(delegate))
+        });
+        assert_eq!(
+            typed_query, "port=10801",
+            "typed query reaches the delegate"
+        );
+        assert_eq!(typed_ports, vec![10801], "typed port filter applies");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.library_last_query())
+                .as_deref(),
+            Some("port=10801"),
+            "typing remembers the query"
+        );
+
+        drop(view);
+        let store = Store::open_file(&path).expect("restart reopen works");
+        assert_eq!(
+            store.library_last_query().as_deref(),
+            Some("port=10801"),
+            "the memory survives a clean restart"
+        );
+        let (restarted, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (input_value, restored_query, restored_ports) = restarted.read_with(cx, |view, cx| {
+            let delegate = view.libraries.read(cx).delegate();
+            (
+                view.search_input.read(cx).value().to_string(),
+                delegate.query.clone(),
+                t73_visible_ports(delegate),
+            )
+        });
+        assert_eq!(
+            input_value, "port=10801",
+            "the search field opens holding the last filter"
+        );
+        assert_eq!(restored_query, "port=10801", "the delegate adopts it");
+        assert_eq!(
+            restored_ports,
+            vec![10801],
+            "the last filter is applied on launch"
+        );
+
+        cx.update(|window, cx| {
+            window.click("clear-search", cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        let (cleared_query, cleared_memory) = restarted.read_with(cx, |view, cx| {
+            (
+                view.libraries.read(cx).delegate().query.clone(),
+                view.store
+                    .get_meta(Store::META_LIBRARY_LAST_QUERY)
+                    .expect("meta read"),
+            )
+        });
+        assert_eq!(
+            cleared_query,
+            String::new(),
+            "clear search empties the query"
+        );
+        assert_eq!(
+            cleared_memory, None,
+            "clear search clears the visible memory too"
+        );
+        // Drop the view (and its store connection) before deleting so the
+        // final cleanup actually succeeds on Windows.
+        drop(restarted);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

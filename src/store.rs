@@ -7658,6 +7658,34 @@ impl Store {
         self.set_meta(Self::META_LIBRARY_COLUMNS, value.trim())
     }
 
+    pub const META_LIBRARY_LAST_QUERY: &str = "library_last_query";
+
+    /// T-23: the library search query string of the previous session. A missing
+    /// or whitespace-only value reads as "no remembered filter".
+    pub fn library_last_query(&self) -> Option<String> {
+        match self.get_meta(Self::META_LIBRARY_LAST_QUERY) {
+            Ok(Some(value)) if !value.trim().is_empty() => Some(value),
+            _ => None,
+        }
+    }
+
+    /// T-23: remembering an empty query clears the key instead of storing a
+    /// blank one, so an untouched search field never writes a meta row.
+    pub fn set_library_last_query(&mut self, value: &str) -> Result<(), StoreError> {
+        if value.trim().is_empty() {
+            return self.clear_library_last_query();
+        }
+        self.set_meta(Self::META_LIBRARY_LAST_QUERY, value.trim())
+    }
+
+    pub fn clear_library_last_query(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            params![Self::META_LIBRARY_LAST_QUERY],
+        )?;
+        Ok(())
+    }
+
     pub const CONN_COLUMNS: [(&str, u32); 5] = [
         ("destination", 220),
         ("exit", 180),
