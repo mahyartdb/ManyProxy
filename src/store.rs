@@ -2988,6 +2988,12 @@ pub struct RefreshOutcome {
     pub conflicts: usize,
 
     pub in_use: usize,
+    /// Row labels collected exactly where the counts increment; every entry is
+    /// a display label — never params or URL fragments.
+    pub added_names: Vec<String>,
+    pub updated_names: Vec<String>,
+    pub removed_names: Vec<String>,
+    pub kept_in_use_names: Vec<String>,
     pub failures: Vec<crate::import::ImportFailure>,
     pub error: Option<String>,
 }
@@ -5800,6 +5806,7 @@ impl Store {
                                 key: key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         }
                     }
                     Some(base) => {
@@ -5816,12 +5823,14 @@ impl Store {
                                 key: key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         } else {
                             if follow_group {
                                 ops.push(Op::GroupFollow {
                                     id: view.row.id.clone(),
                                 });
                                 outcome.updated += 1;
+                                outcome.updated_names.push(view.row.name.clone());
                             }
                             if upstream_changed && user_changed {
                                 outcome.conflicts += 1;
@@ -5841,6 +5850,7 @@ impl Store {
                         params: config.params.clone(),
                     });
                     outcome.added += 1;
+                    outcome.added_names.push(view.row.name.clone());
                 } else {
                     outcome.duplicates += 1;
                 }
@@ -5859,6 +5869,7 @@ impl Store {
                         params: config.params.clone(),
                     });
                     outcome.added += 1;
+                    outcome.added_names.push(view.row.name.clone());
                 } else {
                     outcome.duplicates += 1;
                 }
@@ -5888,6 +5899,7 @@ impl Store {
             }
             if running.contains(view.row.id.as_str()) {
                 outcome.in_use += 1;
+                outcome.kept_in_use_names.push(view.row.name.clone());
                 continue;
             }
             let mut paired = false;
@@ -5908,6 +5920,7 @@ impl Store {
                                 key: candidate_key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         }
                         paired = true;
                         break;
@@ -5931,6 +5944,7 @@ impl Store {
                                 key: candidate_key.clone(),
                             });
                             outcome.updated += 1;
+                            outcome.updated_names.push(view.row.name.clone());
                         }
                         paired = true;
                         break;
@@ -5943,6 +5957,7 @@ impl Store {
                 });
                 deleted_ids.push(view.row.id.clone());
                 outcome.removed += 1;
+                outcome.removed_names.push(view.row.name.clone());
             }
         }
 
@@ -5973,6 +5988,7 @@ impl Store {
                         port,
                     });
                     outcome.added += 1;
+                    outcome.added_names.push(config.name.clone());
                 }
                 None => {
                     outcome.failures.push(crate::import::ImportFailure {
@@ -8802,6 +8818,92 @@ mod tests {
         assert_eq!(outcome.in_use, 0);
         assert_eq!(outcome.removed, 1, "stopped row deletes");
         assert_eq!(store.list().expect("list works").len(), 1);
+    }
+
+    #[test]
+    fn t70_outcome_named_lists_match_counts() {
+        use std::collections::HashSet;
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = add_sub(&mut store, "travel");
+
+        let outcome = store
+            .refresh_with_body(&sub.id, &sub_body_two(), 100)
+            .expect("refresh works");
+        assert_eq!(outcome.added, 2);
+        let mut added = outcome.added_names.clone();
+        added.sort();
+        assert_eq!(
+            added,
+            vec!["one".to_string(), "two".to_string()],
+            "inserts name their rows"
+        );
+        assert_eq!(outcome.updated_names.len(), outcome.updated);
+        assert_eq!(outcome.removed_names.len(), outcome.removed);
+        assert_eq!(outcome.kept_in_use_names.len(), outcome.in_use);
+
+        let host_move =
+            format!("vless://{SUB_UUID}@c.example.com:443#one\ntrojan://pw@b.example.com:443#two");
+        let outcome = store
+            .refresh_with_body(&sub.id, &host_move, 200)
+            .expect("refresh works");
+        assert_eq!(outcome.updated, 1, "host move counts updated");
+        assert_eq!(
+            outcome.updated_names,
+            vec!["one".to_string()],
+            "updates name their rows"
+        );
+        assert_eq!(outcome.added_names.len(), outcome.added);
+        assert_eq!(outcome.removed_names.len(), outcome.removed);
+        assert_eq!(outcome.kept_in_use_names.len(), outcome.in_use);
+
+        let outcome = store
+            .refresh_with_body(&sub.id, &host_move, 250)
+            .expect("refresh works");
+        assert_eq!(outcome.updated, 0, "same nodes, only order moves");
+        assert!(
+            outcome.added_names.is_empty()
+                && outcome.updated_names.is_empty()
+                && outcome.removed_names.is_empty()
+                && outcome.kept_in_use_names.is_empty(),
+            "no churn, no names"
+        );
+
+        let one_id = store
+            .list()
+            .expect("list works")
+            .into_iter()
+            .find(|row| row.name == "one")
+            .expect("seeded member one")
+            .id;
+        let running: HashSet<String> = [one_id].into_iter().collect();
+        let outcome = store
+            .refresh_with_body_running(
+                &sub.id,
+                "trojan://pw3@c.example.com:443#three",
+                300,
+                &running,
+            )
+            .expect("refresh works");
+        assert_eq!(outcome.in_use, 1);
+        assert_eq!(
+            outcome.kept_in_use_names,
+            vec!["one".to_string()],
+            "running rows land in the kept list"
+        );
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.removed_names, vec!["two".to_string()]);
+        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.added_names, vec!["three".to_string()]);
+        assert_eq!(outcome.updated, 0);
+        assert!(outcome.updated_names.is_empty());
+        assert_eq!(
+            outcome.added_names.len(),
+            outcome.added,
+            "lists match counts as a property"
+        );
+        assert_eq!(outcome.updated_names.len(), outcome.updated);
+        assert_eq!(outcome.removed_names.len(), outcome.removed);
+        assert_eq!(outcome.kept_in_use_names.len(), outcome.in_use);
     }
 
     #[test]

@@ -8746,6 +8746,10 @@ fn refresh_summary_text(
     failures: usize,
     conflicts: usize,
     in_use: usize,
+    added_names: &[String],
+    updated_names: &[String],
+    removed_names: &[String],
+    kept_in_use_names: &[String],
 ) -> (bool, String) {
     let mut summary =
         format!("{label}: [+]Added {added} / [~]Updated {updated} / [-]Deleted {removed}");
@@ -8764,7 +8768,71 @@ fn refresh_summary_text(
     if conflicts > 0 {
         summary.push_str(&format!(" · {conflicts} conflict(s) — your edits kept"));
     }
+    if let Some(report) =
+        refresh_named_report_block(added_names, updated_names, removed_names, kept_in_use_names)
+    {
+        summary.push('\n');
+        summary.push_str(&report);
+    }
     (failures > 0 || conflicts > 0, summary)
+}
+
+/// Cap on names rendered per report section; overflow folds into a
+/// "+ N more…" line. Data beyond the cap still exists in the payload.
+const REFRESH_REPORT_NAME_CAP: usize = 12;
+
+/// Named identity block under the count line: `Added N profiles: [+] name /
+/// Updated N profiles: [~] name / Deleted N profile: [-] name / Still in use,
+/// so kept: [=] name`. Sections with zero rows are omitted; `None` when every
+/// list is empty (count-only summary).
+fn refresh_named_report_block(
+    added_names: &[String],
+    updated_names: &[String],
+    removed_names: &[String],
+    kept_in_use_names: &[String],
+) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+    for (verb, marker, names) in [
+        ("Added", "[+]", added_names),
+        ("Updated", "[~]", updated_names),
+        ("Deleted", "[-]", removed_names),
+    ] {
+        if names.is_empty() {
+            continue;
+        }
+        let noun = if names.len() == 1 {
+            "profile"
+        } else {
+            "profiles"
+        };
+        let mut section = format!("{verb} {} {noun}:", names.len());
+        for name in names.iter().take(REFRESH_REPORT_NAME_CAP) {
+            section.push_str(&format!("\n{marker} {name}"));
+        }
+        let overflow = names.len().saturating_sub(REFRESH_REPORT_NAME_CAP);
+        if overflow > 0 {
+            section.push_str(&format!("\n+ {overflow} more…"));
+        }
+        sections.push(section);
+    }
+    if !kept_in_use_names.is_empty() {
+        let mut section = "Still in use, so kept:".to_string();
+        for name in kept_in_use_names.iter().take(REFRESH_REPORT_NAME_CAP) {
+            section.push_str(&format!("\n[=] {name}"));
+        }
+        let overflow = kept_in_use_names
+            .len()
+            .saturating_sub(REFRESH_REPORT_NAME_CAP);
+        if overflow > 0 {
+            section.push_str(&format!("\n+ {overflow} more…"));
+        }
+        sections.push(section);
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
 }
 
 fn restore_done_message(outcome: &RestoreOutcome) -> String {
@@ -12132,8 +12200,16 @@ struct AppView {
     refresh_batch_failed: usize,
     refresh_batch_conflicts: usize,
     refresh_batch_in_use: usize,
+    refresh_batch_added_names: Vec<String>,
+    refresh_batch_updated_names: Vec<String>,
+    refresh_batch_removed_names: Vec<String>,
+    refresh_batch_in_use_names: Vec<String>,
     refresh_generation: u64,
     inflight_refreshes: HashSet<String>,
+    /// T-20: refreshes whose completion carries the named `[+]/[~]/[-]/[=]`
+    /// report — set for manual origins only, so due-tick refreshes finish
+    /// count-only.
+    inflight_named_refreshes: HashSet<String>,
 
     probe_url_in_flight: bool,
     probe_ping_in_flight: bool,
@@ -12317,8 +12393,13 @@ impl AppView {
             refresh_batch_failed: 0,
             refresh_batch_conflicts: 0,
             refresh_batch_in_use: 0,
+            refresh_batch_added_names: Vec::new(),
+            refresh_batch_updated_names: Vec::new(),
+            refresh_batch_removed_names: Vec::new(),
+            refresh_batch_in_use_names: Vec::new(),
             refresh_generation: 0,
             inflight_refreshes: HashSet::new(),
+            inflight_named_refreshes: HashSet::new(),
             probe_url_in_flight: false,
             probe_ping_in_flight: false,
 
@@ -19107,7 +19188,7 @@ impl AppView {
                         cx,
                     ),
                 }
-                self.start_subscription_refresh(sub, cx);
+                self.start_subscription_refresh(sub, true, cx);
                 true
             }
             Err(error) => {
@@ -19188,6 +19269,10 @@ impl AppView {
         failed: usize,
         conflicts: usize,
         in_use: usize,
+        added_names: &[String],
+        updated_names: &[String],
+        removed_names: &[String],
+        kept_in_use_names: &[String],
     ) -> bool {
         if !self.refresh_batch_members.remove(sub_id) {
             return false;
@@ -19198,6 +19283,14 @@ impl AppView {
         self.refresh_batch_failed += failed;
         self.refresh_batch_conflicts += conflicts;
         self.refresh_batch_in_use += in_use;
+        self.refresh_batch_added_names
+            .extend(added_names.iter().cloned());
+        self.refresh_batch_updated_names
+            .extend(updated_names.iter().cloned());
+        self.refresh_batch_removed_names
+            .extend(removed_names.iter().cloned());
+        self.refresh_batch_in_use_names
+            .extend(kept_in_use_names.iter().cloned());
         self.refresh_batch_members.is_empty()
     }
 
@@ -19219,7 +19312,9 @@ impl AppView {
     }
 
     fn close_batch_slot(&mut self, sub_id: &str, window: &mut Window, cx: &mut App) {
-        if self.is_batch_member(sub_id) && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0) {
+        if self.is_batch_member(sub_id)
+            && self.accumulate_batch_member(sub_id, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[])
+        {
             self.flush_refresh_batch(window, cx);
         }
     }
@@ -19239,18 +19334,41 @@ impl AppView {
         failed: usize,
         conflicts: usize,
         in_use: usize,
+        added_names: &[String],
+        updated_names: &[String],
+        removed_names: &[String],
+        kept_in_use_names: &[String],
         window: &mut Window,
         cx: &mut App,
     ) {
         if self.is_batch_member(sub_id) {
-            if self
-                .accumulate_batch_member(sub_id, added, updated, removed, failed, conflicts, in_use)
-            {
+            if self.accumulate_batch_member(
+                sub_id,
+                added,
+                updated,
+                removed,
+                failed,
+                conflicts,
+                in_use,
+                added_names,
+                updated_names,
+                removed_names,
+                kept_in_use_names,
+            ) {
                 self.flush_refresh_batch(window, cx);
             }
         } else {
             window.push_notification(notice, cx);
         }
+    }
+
+    fn take_batch_name_lists(&mut self) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        (
+            std::mem::take(&mut self.refresh_batch_added_names),
+            std::mem::take(&mut self.refresh_batch_updated_names),
+            std::mem::take(&mut self.refresh_batch_removed_names),
+            std::mem::take(&mut self.refresh_batch_in_use_names),
+        )
     }
 
     fn take_batch_counts(&mut self) -> (usize, usize, usize, usize, usize, usize, usize) {
@@ -19262,16 +19380,31 @@ impl AppView {
         let failed = std::mem::take(&mut self.refresh_batch_failed);
         let conflicts = std::mem::take(&mut self.refresh_batch_conflicts);
         let in_use = std::mem::take(&mut self.refresh_batch_in_use);
+        self.refresh_batch_added_names.clear();
+        self.refresh_batch_updated_names.clear();
+        self.refresh_batch_removed_names.clear();
+        self.refresh_batch_in_use_names.clear();
         (total, added, updated, removed, failed, conflicts, in_use)
     }
 
     fn flush_refresh_batch(&mut self, window: &mut Window, cx: &mut App) {
+        let (added_names, updated_names, removed_names, kept_in_use_names) =
+            self.take_batch_name_lists();
         let (total, added, updated, removed, failed, conflicts, in_use) = self.take_batch_counts();
-        let (warn, text) =
+        let (warn, mut text) =
             coalesced_refresh_message(total, added, updated, removed, failed, conflicts, in_use)
                 .unwrap_or((false, String::new()));
         if text.is_empty() {
             return;
+        }
+        if let Some(report) = refresh_named_report_block(
+            &added_names,
+            &updated_names,
+            &removed_names,
+            &kept_in_use_names,
+        ) {
+            text.push('\n');
+            text.push_str(&report);
         }
         window.push_notification(
             if warn {
@@ -19293,7 +19426,7 @@ impl AppView {
             self.refresh_batch_total = self.refresh_batch_total.saturating_sub(1);
         }
         let started = match self.store.get_subscription(sub_id) {
-            Ok(Some(sub)) => self.start_subscription_refresh(sub, cx),
+            Ok(Some(sub)) => self.start_subscription_refresh(sub, true, cx),
             Ok(None) => {
                 window.push_notification(Notification::warning("Already removed"), cx);
                 false
@@ -19354,10 +19487,14 @@ impl AppView {
     fn start_subscription_refresh(
         &mut self,
         sub: ProxySubscription,
+        named: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.note_refresh_started(&sub.id) {
             return false;
+        }
+        if named {
+            self.inflight_named_refreshes.insert(sub.id.clone());
         }
         let client = cx.http_client();
         let weak = cx.entity().downgrade();
@@ -19397,6 +19534,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.inflight_refreshes.remove(sub_id);
+        let named = self.inflight_named_refreshes.remove(sub_id);
 
         match self.store.get_subscription(sub_id) {
             Ok(None) => {
@@ -19419,6 +19557,10 @@ impl AppView {
                     1,
                     0,
                     0,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
                     window,
                     cx,
                 );
@@ -19449,12 +19591,28 @@ impl AppView {
                                 1,
                                 0,
                                 0,
+                                &[],
+                                &[],
+                                &[],
+                                &[],
                                 window,
                                 cx,
                             );
                         } else {
                             let _ = self.store.set_subscription_quota(sub_id, fetched.userinfo);
                             let failed = outcome.failures.len();
+                            let (added_names, updated_names, removed_names, kept_in_use_names) =
+                                if named {
+                                    (
+                                        outcome.added_names.as_slice(),
+                                        outcome.updated_names.as_slice(),
+                                        outcome.removed_names.as_slice(),
+                                        outcome.kept_in_use_names.as_slice(),
+                                    )
+                                } else {
+                                    let empty: &[String] = &[];
+                                    (empty, empty, empty, empty)
+                                };
                             let (warn, summary) = refresh_summary_text(
                                 label,
                                 outcome.added,
@@ -19465,6 +19623,10 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                             );
 
                             if warn {
@@ -19488,6 +19650,10 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                                 window,
                                 cx,
                             );
@@ -19510,6 +19676,10 @@ impl AppView {
                                 1,
                                 0,
                                 0,
+                                &[],
+                                &[],
+                                &[],
+                                &[],
                                 window,
                                 cx,
                             );
@@ -19532,6 +19702,10 @@ impl AppView {
                         1,
                         0,
                         0,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
                         window,
                         cx,
                     );
@@ -19553,6 +19727,10 @@ impl AppView {
                         1,
                         0,
                         0,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
                         window,
                         cx,
                     );
@@ -19570,6 +19748,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.inflight_refreshes.remove(sub_id);
+        let named = self.inflight_named_refreshes.remove(sub_id);
 
         let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
         match fetched {
@@ -19594,8 +19773,32 @@ impl AppView {
                             self.push_refresh_log(&format!(
                                 "error subscription refresh \"{label}\": refresh failed ({error})"
                             ));
-                            self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                            self.accumulate_batch_member(
+                                sub_id,
+                                0,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                &[],
+                                &[],
+                                &[],
+                                &[],
+                            );
                         } else {
+                            let (added_names, updated_names, removed_names, kept_in_use_names) =
+                                if named {
+                                    (
+                                        outcome.added_names.as_slice(),
+                                        outcome.updated_names.as_slice(),
+                                        outcome.removed_names.as_slice(),
+                                        outcome.kept_in_use_names.as_slice(),
+                                    )
+                                } else {
+                                    let empty: &[String] = &[];
+                                    (empty, empty, empty, empty)
+                                };
                             let (warn, summary) = refresh_summary_text(
                                 &label,
                                 outcome.added,
@@ -19606,6 +19809,10 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                             );
                             if warn {
                                 self.push_refresh_log(&format!(
@@ -19622,17 +19829,21 @@ impl AppView {
                                 failed,
                                 outcome.conflicts,
                                 outcome.in_use,
+                                added_names,
+                                updated_names,
+                                removed_names,
+                                kept_in_use_names,
                             );
                         }
                     }
                     Err(_) => {
-                        self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                        self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0, &[], &[], &[], &[]);
                     }
                 }
             }
             Err(error) => {
                 let _ = self.store.record_subscription_error(sub_id, &error);
-                self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0);
+                self.accumulate_batch_member(sub_id, 0, 0, 0, 1, 0, 0, &[], &[], &[], &[]);
             }
         }
         if self.refresh_batch_members.is_empty() {
@@ -21864,7 +22075,7 @@ impl AppView {
 
     fn refresh_due_on_startup(&mut self, cx: &mut Context<Self>) {
         for sub in self.due_subscriptions() {
-            self.start_subscription_refresh(sub, cx);
+            self.start_subscription_refresh(sub, false, cx);
         }
     }
 
@@ -21921,7 +22132,7 @@ impl AppView {
         self.begin_refresh_batch(&ids);
         let mut started = 0;
         for sub in due {
-            if self.start_subscription_refresh(sub, cx) {
+            if self.start_subscription_refresh(sub, true, cx) {
                 started += 1;
             }
         }
@@ -21953,7 +22164,7 @@ impl AppView {
         self.begin_refresh_batch(&ids);
         let mut started = 0;
         for sub in subs {
-            if self.start_subscription_refresh(sub, cx) {
+            if self.start_subscription_refresh(sub, true, cx) {
                 started += 1;
             }
         }
@@ -22048,7 +22259,7 @@ impl AppView {
 
                         for id in &ids {
                             if let Ok(Some(sub)) = view.store.get_subscription(id) {
-                                view.start_subscription_refresh(sub, cx);
+                                view.start_subscription_refresh(sub, true, cx);
                             }
                         }
                         view.reopen_subscriptions_if_open(window, cx);
@@ -22112,7 +22323,7 @@ impl AppView {
         self.begin_refresh_batch(&ids);
         let mut started = 0;
         for sub in due {
-            if self.start_subscription_refresh(sub, cx) {
+            if self.start_subscription_refresh(sub, false, cx) {
                 started += 1;
             }
         }
@@ -33881,7 +34092,8 @@ mod tests {
             "explicit refresh still sees One"
         );
 
-        let (_, summary) = refresh_summary_text(&one_label, 1, 0, 0, 0, 0, 0, 0, 0);
+        let (_, summary) =
+            refresh_summary_text(&one_label, 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
         assert!(
             summary.starts_with("One:"),
             "outcome names its sub: {summary}"
@@ -40763,7 +40975,7 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
-                    !view.accumulate_batch_member(&a, 1, 0, 0, 0, 0, 0),
+                    !view.accumulate_batch_member(&a, 1, 0, 0, 0, 0, 0, &[], &[], &[], &[]),
                     "first of two keeps the batch open"
                 );
             });
@@ -40790,7 +41002,7 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, _| {
                 assert!(
-                    view.accumulate_batch_member(&b, 0, 0, 0, 0, 0, 0),
+                    view.accumulate_batch_member(&b, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]),
                     "last member closes the batch"
                 );
                 view.inflight_refreshes.remove(&b);
@@ -43136,13 +43348,14 @@ mod tests {
     #[test]
     fn t08_still_in_use_counts_in_single_and_coalesced_copy() {
         use crate::{coalesced_refresh_message, refresh_summary_text};
-        let (warn, text) = refresh_summary_text("Nightly", 0, 0, 1, 0, 0, 0, 0, 1);
+        let (warn, text) =
+            refresh_summary_text("Nightly", 0, 0, 1, 0, 0, 0, 0, 1, &[], &[], &[], &[]);
         assert!(!warn);
         assert!(text.contains("[=] Still in use 1"), "{text}");
         let (warn, text) = coalesced_refresh_message(2, 0, 0, 1, 0, 0, 1).expect("batch reports");
         assert!(!warn);
         assert!(text.contains("[=] Still in use 1"), "{text}");
-        let (_, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0);
+        let (_, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
         assert!(!text.contains("[=]"), "quiet when nothing serves: {text}");
     }
 
@@ -44013,13 +44226,15 @@ mod tests {
     #[test]
     fn refresh_summary_text_names_conflicts() {
         use crate::refresh_summary_text;
-        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0);
+        let (warn, text) =
+            refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
         assert!(!warn);
         assert!(
             text.contains("Nightly") && text.contains("[+]Added 1"),
             "{text}"
         );
-        let (warn, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 2, 0);
+        let (warn, text) =
+            refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 2, 0, &[], &[], &[], &[]);
         assert!(warn, "conflicts warn: {text}");
         assert!(
             text.contains('2') && text.contains("conflict"),
@@ -44028,6 +44243,214 @@ mod tests {
         assert!(
             text.contains("your edits kept"),
             "kept, not reverted: {text}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t70_named_report_renders_markers_and_kept_line(cx: &mut TestAppContext) {
+        use crate::refresh_summary_text;
+        let (warn, text) = refresh_summary_text(
+            "Nightly",
+            3,
+            2,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            &["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            &["node-x".to_string(), "node-y".to_string()],
+            &["old-node".to_string()],
+            &["ws-relay".to_string()],
+        );
+        assert!(!warn);
+        assert_eq!(
+            text,
+            "Nightly: [+]Added 3 / [~]Updated 2 / [-]Deleted 1 / [=] Still in use 1\n\
+             Added 3 profiles:\n\
+             [+] alpha\n\
+             [+] beta\n\
+             [+] gamma\n\
+             Updated 2 profiles:\n\
+             [~] node-x\n\
+             [~] node-y\n\
+             Deleted 1 profile:\n\
+             [-] old-node\n\
+             Still in use, so kept:\n\
+             [=] ws-relay"
+        );
+
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let sub = store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "g", true)
+            .expect("seed works");
+        let sub_id = sub.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.inflight_named_refreshes.insert(sub_id.clone());
+                view.finish_subscription_refresh(
+                    &sub_id,
+                    "Nightly",
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                            .to_string(),
+                        userinfo: None,
+                    }),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "manual refresh pops once");
+        let lines = view.read_with(cx, |view, _| {
+            view.logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            lines.iter().any(|line| line
+                == "subscription refresh Nightly: [+]Added 1 / [~]Updated 0 / [-]Deleted 0\n\
+                    Added 1 profile:\n\
+                    [+] one"),
+            "manual summary carries the named report: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn t70_report_caps_at_twelve_names_with_more_line() {
+        use crate::refresh_summary_text;
+        let names: Vec<String> = (0..15).map(|index| format!("node-{index:02}")).collect();
+        let (_, text) = refresh_summary_text(
+            "Nightly",
+            15,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            names.as_slice(),
+            &[],
+            &[],
+            &[],
+        );
+        let report = text
+            .split_once('\n')
+            .map(|(_, rest)| rest.to_string())
+            .expect("named report block present");
+        assert_eq!(
+            report.matches("[+] node").count(),
+            12,
+            "cap renders twelve: {report}"
+        );
+        assert!(report.contains("[+] node-11"), "last rendered: {report}");
+        assert!(
+            !report.contains("[+] node-12"),
+            "cap hides the rest: {report}"
+        );
+        assert!(report.ends_with("+ 3 more…"), "overflow marker: {report}");
+    }
+
+    #[gpui_kit::test]
+    fn t70_auto_refresh_keeps_count_only_text(cx: &mut TestAppContext) {
+        use crate::refresh_summary_text;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add_subscription("Alpha", "https://example.com/alpha.txt", "g1", true)
+            .expect("seed works");
+        let beta = store
+            .add_subscription("Beta", "https://example.com/beta.txt", "g2", true)
+            .expect("seed works");
+        let alpha_id = alpha.id.clone();
+        let beta_id = beta.id.clone();
+        let (view, cx) = mount_view(store, cx);
+
+        let (warn, text) =
+            refresh_summary_text("Nightly", 0, 0, 1, 0, 0, 0, 0, 1, &[], &[], &[], &[]);
+        assert!(!warn);
+        assert_eq!(
+            text,
+            "Nightly: [+]Added 0 / [~]Updated 0 / [-]Deleted 1 / [=] Still in use 1"
+        );
+        let (_, text) = refresh_summary_text("Nightly", 1, 0, 0, 0, 0, 0, 0, 0, &[], &[], &[], &[]);
+        assert_eq!(text, "Nightly: [+]Added 1 / [~]Updated 0 / [-]Deleted 0");
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.begin_refresh_batch(std::slice::from_ref(&alpha_id));
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_subscription_refresh(
+                    &alpha_id,
+                    "Alpha",
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@a.example.com:443#one"
+                            .to_string(),
+                        userinfo: None,
+                    }),
+                    999,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 1, "one batch, one count-only toast");
+        assert!(
+            view.read_with(cx, |view, _| view.refresh_batch_added_names.is_empty()),
+            "auto refresh never aggregates names"
+        );
+        let lines = view.read_with(cx, |view, _| {
+            view.logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            lines.iter().all(|line| !line.contains("profiles:")),
+            "auto refresh stays count-only: {lines:?}"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.inflight_named_refreshes.insert(beta_id.clone());
+                view.finish_subscription_refresh(
+                    &beta_id,
+                    "Beta",
+                    Ok(crate::FetchedSubscription {
+                        body: "vless://11111111-2222-4333-8444-555555555555@b.example.org:443#one"
+                            .to_string(),
+                        userinfo: None,
+                    }),
+                    1000,
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert_eq!(notification_count(cx), 2, "manual twin pops once");
+        let lines = view.read_with(cx, |view, _| {
+            view.logs
+                .all()
+                .iter()
+                .map(|record| record.message.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("\nAdded 1 profile:\n[+] one")),
+            "manual refresh carries the named report: {lines:?}"
         );
     }
 
