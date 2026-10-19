@@ -2404,8 +2404,15 @@ pub fn is_library_export(text: &str) -> bool {
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(serde_json::Value::Object(map)) => {
-            matches!(map.get("library"), Some(serde_json::Value::Array(_)))
-                && matches!(map.get("subscriptions"), Some(serde_json::Value::Array(_)))
+            // T-22: a T-22 envelope identifies a full export on its own; the
+            // section check below stays for pre-envelope payloads.
+            let enveloped = map
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|schema| schema == crate::store::LIBRARY_EXPORT_SCHEMA);
+            enveloped
+                || (matches!(map.get("library"), Some(serde_json::Value::Array(_)))
+                    && matches!(map.get("subscriptions"), Some(serde_json::Value::Array(_))))
         }
         _ => false,
     }
@@ -3803,6 +3810,44 @@ mod tests {
         assert!(
             !is_library_export("{\"library\": {}, \"subscriptions\": []}"),
             "non-array library stays import"
+        );
+    }
+
+    #[test]
+    fn t72_is_library_export_recognizes_envelope() {
+        use crate::store::{export_payload_full, seal_library_export};
+        let payload = export_payload_full(&[], &[], &[]);
+        let enveloped = {
+            let value: serde_json::Value = serde_json::from_str(&payload).expect("payload parses");
+            seal_library_export(&value)
+        };
+        assert!(
+            enveloped.starts_with("{\"schema\":\"manyproxy-library\""),
+            "envelope leads the export: {enveloped}"
+        );
+        assert!(
+            is_library_export(&enveloped),
+            "enveloped export routes to restore"
+        );
+        assert!(
+            is_library_export(&format!("\u{FEFF}{enveloped}")),
+            "BOM-tolerant intake"
+        );
+        assert!(
+            is_library_export(
+                "{\"schema\":\"manyproxy-library\",\"schema_version\":1,\"library\":[],\"subscriptions\":[]}"
+            ),
+            "the envelope first key alone identifies a full export"
+        );
+        assert!(
+            is_library_export(
+                "{\"outbounds\":[],\"library\":[],\"subscriptions\":[],\"tombstones\":[]}"
+            ),
+            "envelope-free payloads still route, idempotently"
+        );
+        assert!(
+            !is_library_export("{\"schema\":\"thrn-archive\",\"library\":[]}"),
+            "foreign schema without sections stays import"
         );
     }
 

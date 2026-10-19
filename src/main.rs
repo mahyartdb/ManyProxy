@@ -17751,11 +17751,12 @@ impl AppView {
                         .ok_variant(ButtonVariant::Danger),
                 )
                 .title("Restore library")
-                .description(
+                .description(format!(
                     "This replaces the current library with the exported backup \
                      (row ids, groups, enabled flags, subscriptions, and deletions \
-                     are restored exactly).",
-                )
+                     are restored exactly). {}",
+                    crate::store::RESTORE_REQUIRES_CLAUSE
+                ))
                 .on_ok(move |_, window, cx| {
                     view.update(cx, |view, cx| {
                         view.commit_library_restore(&payload, window, cx)
@@ -31230,6 +31231,25 @@ mod tests {
         let view = stash.borrow().clone().expect("AppView stashed");
 
         assert_eq!(export_confirm_description(), export_warning_text());
+
+        let clause = crate::store::RESTORE_REQUIRES_CLAUSE;
+        assert_eq!(
+            clause,
+            "Restore requires a matching ManyProxy export (schema manyproxy-library, version 1)."
+        );
+        assert!(
+            export_warning_text().contains(clause),
+            "export warning carries the restore-requirement clause: {}",
+            export_warning_text()
+        );
+        assert!(
+            export_warning_text().starts_with(
+                "Export carries private keys, tokens, and passwords in plaintext. \
+                 Anyone with this file can use your proxies — store it somewhere safe."
+            ),
+            "the original warning text stays byte-identical: {}",
+            export_warning_text()
+        );
 
         cx.simulate_resize(size(px(1000.), px(700.)));
         cx.update(|window, cx| {
@@ -51050,9 +51070,9 @@ mod tests {
             }
         }
         let mut store = Store::open_in_memory().expect("re-open works");
-        store
-            .restore_library_json(&value.to_string())
-            .expect("restore works");
+        // T-22: the hand-edited fixture is re-sealed so its checksum matches.
+        let edited = crate::store::seal_library_export(&value);
+        store.restore_library_json(&edited).expect("restore works");
         // Dead snapshots live only in the source store — export/restore
         // carries the library, not health state — so seed them on the
         // restored store the sweep will consume.

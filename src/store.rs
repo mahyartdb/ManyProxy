@@ -387,6 +387,139 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+/// T-22: export envelope identity. A future build reads these two fields to
+/// decide whether an export is ingestible instead of deep-failing inside
+/// restore. The format stays explicit-confirm JSON.
+pub const LIBRARY_EXPORT_SCHEMA: &str = "manyproxy-library";
+pub const LIBRARY_SCHEMA_VERSION: i64 = 1;
+
+const LIBRARY_ENVELOPE_KEYS: [&str; 4] = ["schema", "schema_version", "created", "checksum"];
+
+/// T-22: the envelope keys are metadata, not payload, so the checksum covers
+/// the payload object without them. Rebuilt key by key because `serde_json`'s
+/// `preserve_order` feature is live in this build (gpui-kit pulls it in) and
+/// `Map::remove` there is a swap-remove that would reshuffle the payload.
+fn envelope_free_payload(obj: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let payload = obj
+        .iter()
+        .filter(|(key, _)| !LIBRARY_ENVELOPE_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    serde_json::Value::Object(payload)
+}
+
+/// T-22: canonical form of a payload — object keys sorted at every level, so
+/// the checksum does not depend on key order or whitespace. `serde_json` is
+/// *not* order-stable here (`preserve_order` is active), so the payload is
+/// canonicalized explicitly instead of trusting its serializer.
+fn canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            out.push('{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String((*key).clone()).to_string());
+                out.push(':');
+                canonical_json(&map[key.as_str()], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// T-22: FNV-1a 64 over the canonical payload bytes, rendered as 16 hex digits.
+/// An integrity cue, not a crypto claim — same constitution as the cap-name
+/// hash in `preset.rs`.
+fn export_checksum(payload: &serde_json::Value) -> String {
+    let mut text = String::new();
+    canonical_json(payload, &mut text);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// T-22: seal a payload object. The envelope keys lead the JSON so intake can
+/// recognize an export by its first field, and the checksum is computed after
+/// the payload is materialized. Sealing is idempotent: envelope keys already
+/// present are replaced rather than folded into the payload.
+pub fn seal_library_export(payload: &serde_json::Value) -> String {
+    let payload = match payload.as_object() {
+        Some(obj) => envelope_free_payload(obj),
+        None => payload.clone(),
+    };
+    let checksum = export_checksum(&payload);
+    let payload_text = payload.to_string();
+    let body = payload_text
+        .strip_prefix('{')
+        .unwrap_or(payload_text.as_str());
+    format!(
+        "{{\"schema\":\"{LIBRARY_EXPORT_SCHEMA}\",\"schema_version\":{LIBRARY_SCHEMA_VERSION},\
+         \"created\":{},\"checksum\":\"{checksum}\",{body}",
+        now_unix()
+    )
+}
+
+fn envelope_refusal(message: String) -> StoreError {
+    StoreError::Invalid(vec![FieldError::new("export", message)])
+}
+
+/// T-22: pre-write envelope negotiation for a parsed export object. A payload
+/// with no `schema` is a pre-T-22 export and passes through exactly as today
+/// (backward-compat tolerance). A present `schema` must match,
+/// `schema_version` must be ≤ current, and a present `checksum` must match the
+/// payload bytes. Every refusal is returned before any write.
+fn negotiate_library_envelope(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let Some(schema) = obj.get("schema").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    if schema != LIBRARY_EXPORT_SCHEMA {
+        return Err(envelope_refusal(format!(
+            "library export schema not supported (got \"{schema}\", supported {LIBRARY_EXPORT_SCHEMA})"
+        )));
+    }
+    if let Some(raw_version) = obj.get("schema_version") {
+        let version = raw_version.as_i64().ok_or_else(|| {
+            envelope_refusal(format!(
+                "library export schema not supported (schema_version is not a number, supported ≤{LIBRARY_SCHEMA_VERSION})"
+            ))
+        })?;
+        if version > LIBRARY_SCHEMA_VERSION {
+            return Err(envelope_refusal(format!(
+                "library export schema not supported (got version {version}, supported ≤{LIBRARY_SCHEMA_VERSION})"
+            )));
+        }
+    }
+    if let Some(stored) = obj.get("checksum").and_then(serde_json::Value::as_str) {
+        let computed = export_checksum(&envelope_free_payload(obj));
+        if stored != computed {
+            return Err(envelope_refusal(format!(
+                "library export checksum mismatch (envelope {stored}, payload {computed})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn export_payload_full(
     configs: &[ProxyConfig],
     subscriptions: &[Subscription],
@@ -449,13 +582,13 @@ pub fn export_payload_full(
             })
         })
         .collect();
-    serde_json::json!({
+    let payload = serde_json::json!({
         "outbounds": outbounds,
         "library": library,
         "subscriptions": subs,
         "tombstones": tombs,
-    })
-    .to_string()
+    });
+    seal_library_export(&payload)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,8 +799,12 @@ pub fn compare_type_security(a: &ProxyConfig, b: &ProxyConfig) -> std::cmp::Orde
         })
 }
 
+/// T-22: the one clause both the export warning and the restore confirm carry.
+pub const RESTORE_REQUIRES_CLAUSE: &str =
+    "Restore requires a matching ManyProxy export (schema manyproxy-library, version 1).";
+
 pub fn export_warning_text() -> &'static str {
-    "Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe."
+    "Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe. Restore requires a matching ManyProxy export (schema manyproxy-library, version 1)."
 }
 
 pub fn export_confirm_description() -> &'static str {
@@ -6309,8 +6446,14 @@ impl Store {
                 );
             }
         }
-        let mut value: serde_json::Value = serde_json::from_str(base_payload)
+        let parsed: serde_json::Value = serde_json::from_str(base_payload)
             .map_err(|error| Self::schema_error(format!("export serialization broke ({error})")))?;
+        // T-22: the base payload arrives sealed; enrichment mutates it, so the
+        // envelope is stripped here and re-sealed (fresh checksum) at the end.
+        let mut value = match parsed {
+            serde_json::Value::Object(obj) => envelope_free_payload(&obj),
+            other => other,
+        };
         if let Some(entries) = value.get_mut("library").and_then(|v| v.as_array_mut()) {
             let good_ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
             entries.retain(|e| {
@@ -6403,7 +6546,7 @@ impl Store {
                 obj.insert("tombstones".to_string(), serde_json::Value::Array(enriched));
             }
         }
-        Ok(value.to_string())
+        Ok(seal_library_export(&value))
     }
 
     pub fn commit_export(
@@ -6459,6 +6602,10 @@ impl Store {
         let obj = value
             .as_object()
             .ok_or_else(|| invalid("top level must be an object".to_string()))?;
+        // T-22: envelope negotiation sits between parse and the write pipeline
+        // (parse → negotiate → dry-run → backup → swap), so every refusal here
+        // leaves the library and any backup untouched.
+        negotiate_library_envelope(obj)?;
         let library = obj
             .get("library")
             .and_then(|v| v.as_array())
@@ -7740,6 +7887,13 @@ mod tests {
             bind_ip: String::new(),
             port: String::new(),
         }
+    }
+
+    /// T-22: byte-identity assertions compare the payload, because the
+    /// envelope's `created` stamp is wall-clock at export time.
+    fn payload_without_envelope(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).expect("export parses");
+        envelope_free_payload(value.as_object().expect("export is an object")).to_string()
     }
 
     #[test]
@@ -9344,7 +9498,8 @@ mod tests {
             .export_library_json_with_quarantine()
             .expect("quarantine export works");
         assert_eq!(
-            payload, quarantined_payload,
+            payload_without_envelope(&payload),
+            payload_without_envelope(&quarantined_payload),
             "single pipeline: both exports agree"
         );
         assert!(skipped.is_empty(), "nothing to skip when empty");
@@ -9362,8 +9517,8 @@ mod tests {
             }
         );
         assert_eq!(
-            restored.export_library_json().expect("re-export works"),
-            payload,
+            payload_without_envelope(&restored.export_library_json().expect("re-export works")),
+            payload_without_envelope(&payload),
             "empty round-trip is byte-identical"
         );
     }
@@ -10595,8 +10750,8 @@ mod tests {
             }
         );
         assert_eq!(
-            second.export_library_json().expect("re-export works"),
-            payload,
+            payload_without_envelope(&second.export_library_json().expect("re-export works")),
+            payload_without_envelope(&payload),
             "restore is byte-identical"
         );
         let kept = second.get(&keeper.id).expect("get works").expect("kept");
@@ -10617,6 +10772,217 @@ mod tests {
         assert_eq!(refresh.added, 0);
         assert_eq!(refresh.skipped, 1);
         assert_eq!(second.list().expect("list works").len(), 1);
+    }
+
+    #[test]
+    fn t72_export_envelope_fields_present() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        export_seed(&mut store);
+        let payload = store.export_library_json().expect("export works");
+
+        assert!(
+            payload
+                .starts_with("{\"schema\":\"manyproxy-library\",\"schema_version\":1,\"created\":"),
+            "envelope keys lead the payload: {payload}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("export parses");
+        assert_eq!(value["schema"], "manyproxy-library");
+        assert_eq!(value["schema_version"], 1);
+        let created = value["created"].as_i64().expect("created is unix seconds");
+        assert!(
+            created > 1_600_000_000,
+            "created is a real stamp, got {created}"
+        );
+        let checksum = value["checksum"].as_str().expect("checksum is a string");
+        assert_eq!(checksum.len(), 16, "fnv-1a 64 as hex, got {checksum}");
+        assert!(
+            checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "checksum is hex, got {checksum}"
+        );
+        for key in ["outbounds", "library", "subscriptions", "tombstones"] {
+            assert!(value.get(key).is_some(), "payload key {key} survives");
+        }
+        let after_envelope = payload
+            .split_once("\"checksum\":\"")
+            .expect("checksum key present")
+            .1
+            .split_once("\",")
+            .expect("checksum value ends")
+            .1;
+        assert!(
+            after_envelope.starts_with("\"outbounds\":["),
+            "payload keys follow the envelope in the documented order: {after_envelope}"
+        );
+        assert_eq!(
+            checksum,
+            export_checksum(&envelope_free_payload(
+                value.as_object().expect("export is an object")
+            )),
+            "checksum covers the envelope-free payload bytes"
+        );
+    }
+
+    #[test]
+    fn t72_restore_accepts_enveloped_export() {
+        let mut source = Store::open_in_memory().expect("source opens");
+        export_seed(&mut source);
+        let payload = source.export_library_json().expect("export works");
+        assert!(payload.contains("manyproxy-library"), "export is enveloped");
+
+        let mut target = Store::open_in_memory().expect("target opens");
+        let outcome = target
+            .restore_library_json(&payload)
+            .expect("enveloped restore works");
+        assert_eq!(outcome.configs, 3, "all seeded rows restore");
+        assert_eq!(outcome.subscriptions, 1);
+        assert_eq!(
+            payload_without_envelope(&target.export_library_json().expect("re-export works")),
+            payload_without_envelope(&payload),
+            "payload survives the enveloped round trip"
+        );
+    }
+
+    #[test]
+    fn t72_checksum_mismatch_refuses_without_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t72sum-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        let tampered = {
+            let mut source = Store::open_in_memory().expect("source opens");
+            source.add(valid_input("Work")).expect("row seeds");
+            source
+                .export_library_json()
+                .expect("export works")
+                .replace("\"Work\"", "\"W0rk\"")
+        };
+        {
+            let mut live = Store::open_file(&path).expect("live opens");
+            live.add(valid_input("Live")).expect("live seeds");
+        }
+        let before = std::fs::read(&path).expect("live bytes");
+        let entries_before = std::fs::read_dir(&dir).expect("dir reads").count();
+
+        let error = Store::restore_library_file(&path, &tampered, now_unix())
+            .expect_err("tampered export refuses");
+        assert!(
+            error.to_string().contains("checksum mismatch"),
+            "refusal names the mismatch: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("live bytes"),
+            before,
+            "live database untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir reads").count(),
+            entries_before,
+            "no backup and no swap temp written"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t72_version_mismatch_refuses_without_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "manyproxy-t72ver-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir works");
+        let path = dir.join("library.db");
+        let enveloped = {
+            let mut source = Store::open_in_memory().expect("source opens");
+            source.add(valid_input("Work")).expect("row seeds");
+            source.export_library_json().expect("export works")
+        };
+        {
+            let mut live = Store::open_file(&path).expect("live opens");
+            live.add(valid_input("Live")).expect("live seeds");
+        }
+        let before = std::fs::read(&path).expect("live bytes");
+        let entries_before = std::fs::read_dir(&dir).expect("dir reads").count();
+
+        let future = enveloped.replace("\"schema_version\":1", "\"schema_version\":2");
+        let error = Store::restore_library_file(&path, &future, now_unix())
+            .expect_err("future schema version refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("library export schema not supported"),
+            "typed refusal: {text}"
+        );
+        assert!(
+            text.contains("supported ≤1"),
+            "names the supported version: {text}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("live bytes"),
+            before,
+            "live database untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir reads").count(),
+            entries_before,
+            "no backup and no swap temp written"
+        );
+
+        let foreign = enveloped.replace(
+            "\"schema\":\"manyproxy-library\"",
+            "\"schema\":\"thrn-archive\"",
+        );
+        let error = Store::restore_library_file(&path, &foreign, now_unix())
+            .expect_err("foreign schema refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("library export schema not supported"),
+            "foreign schema refuses loudly: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("live bytes"),
+            before,
+            "still untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir reads").count(),
+            entries_before,
+            "still no writes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t72_legacy_unenveloped_export_still_restores() {
+        let mut source = Store::open_in_memory().expect("source opens");
+        export_seed(&mut source);
+        let payload = source.export_library_json().expect("export works");
+        let legacy = payload_without_envelope(&payload);
+        assert!(
+            !legacy.contains("\"schema\""),
+            "legacy payload carries no envelope: {legacy}"
+        );
+
+        let mut target = Store::open_in_memory().expect("target opens");
+        let outcome = target
+            .restore_library_json(&legacy)
+            .expect("legacy export restores as today");
+        assert_eq!(outcome.configs, 3);
+        assert_eq!(outcome.subscriptions, 1);
+        assert!(
+            target
+                .restore_library_json("{\"library\": [], \"subscriptions\": []}")
+                .is_ok(),
+            "hand-written pre-envelope payloads still restore"
+        );
     }
 
     #[test]
