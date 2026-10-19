@@ -12059,6 +12059,14 @@ impl ConnRow {
     }
 }
 
+/// The only two Connections-tab cells that click-to-copy: the destination cell
+/// and the per-row exit endpoint (`bind:port`). Indexed by painted row order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnCopyTarget {
+    Dest(usize),
+    Endpoint(usize),
+}
+
 fn build_conn_rows(
     snapshot: &[(String, crate::health::ClashConn)],
     deltas: &HashMap<String, (u64, u64)>,
@@ -12368,6 +12376,10 @@ struct AppView {
 
     conn_sort_desc: bool,
 
+    conn_copied: Option<ConnCopyTarget>,
+
+    conn_copied_generation: u64,
+
     last_traffic_poll_at: i64,
 
     log_exclude: String,
@@ -12554,6 +12566,8 @@ impl AppView {
             conn_delta: HashMap::new(),
             conn_selected_only: true,
             conn_sort_desc: true,
+            conn_copied: None,
+            conn_copied_generation: 0,
             last_traffic_poll_at: 0,
             palette: None,
             traffic_period: store::TrafficPeriod::Day,
@@ -22737,6 +22751,9 @@ impl AppView {
 
     const MOTION_FAST_MS: u64 = 150;
 
+    /// How long a `Copied!` transient marker stays painted after a cell click.
+    const CONN_COPIED_TOOLTIP_MS: u64 = 1500;
+
     fn motion_fast_duration(cx: &App) -> Duration {
         if cx.reduce_motion() {
             Duration::ZERO
@@ -23080,13 +23097,55 @@ impl AppView {
         })
     }
 
-    fn copy_connection_dest(&mut self, dest: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Writes the cell value to the clipboard (bind:port-safe display strings
+    /// only). Returns `false` without touching the clipboard for an empty value.
+    fn copy_connection_dest(
+        &mut self,
+        dest: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if dest.is_empty() {
             window.push_notification(Notification::warning("No destination to copy"), cx);
-            return;
+            return false;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(dest.to_string()));
-        window.push_notification(Notification::success(format!("Copied {dest}")), cx);
+        true
+    }
+
+    /// Click-to-copy for a Connections cell: clipboard write plus a transient
+    /// inline `Copied!` marker anchored at the clicked cell. Repeat clicks reuse
+    /// the generation guard so the newest marker survives its full window.
+    fn copy_conn_cell(
+        &mut self,
+        target: ConnCopyTarget,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.copy_connection_dest(value, window, cx) {
+            return;
+        }
+        self.conn_copied = Some(target);
+        self.conn_copied_generation = self.conn_copied_generation.wrapping_add(1);
+        let generation = self.conn_copied_generation;
+        cx.notify();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_entity, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(Self::CONN_COPIED_TOOLTIP_MS))
+                .await;
+            cx.update(|cx| {
+                weak.update(cx, |view, cx| {
+                    if view.conn_copied_generation == generation {
+                        view.conn_copied = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+        })
+        .detach();
     }
 
     fn render_inspector_logs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -23322,41 +23381,95 @@ impl AppView {
             for (ix, row) in rows.iter().enumerate() {
                 let (name, bind, protocol) = conn_exit_of(&library, row.row_id.as_deref());
                 let dest = row.dest.clone();
-                let dest_label = if dest.is_empty() {
+                let dest_display = if dest.is_empty() {
                     "(no destination)".to_string()
                 } else {
                     redact_secrets(&dest)
                 };
-                pane = pane.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .id(format!("conn-col-dest-{ix}"))
-                                .test_support()
-                                .w(px(dest_width_px))
-                                .overflow_hidden()
-                                .child(
-                                    Button::new(format!("conn-copy-{ix}"))
-                                        .small()
-                                        .label(dest_label)
-                                        .tooltip("Copy destination")
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            view.copy_connection_dest(&dest, window, cx);
-                                        })),
-                                ),
-                        )
-                        .child(div().text_sm().child(format!(
-                            "{} · {} · {} · ↓{} ↑{} · Δ{}",
-                            name,
-                            bind,
-                            protocol,
-                            format_bytes(row.rx_bytes),
-                            format_bytes(row.tx_bytes),
-                            format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
-                        ))),
-                );
+                // Copy the displayed string; an empty dest has no hostname to copy.
+                let dest_value = if dest.is_empty() {
+                    String::new()
+                } else {
+                    dest_display.clone()
+                };
+                let mut dest_cell = div()
+                    .id(format!("conn-col-dest-{ix}"))
+                    .test_support()
+                    .w(px(dest_width_px))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        Button::new(format!("conn-copy-{ix}"))
+                            .small()
+                            .label(dest_display)
+                            .tooltip("Copy destination")
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.copy_conn_cell(
+                                    ConnCopyTarget::Dest(ix),
+                                    &dest_value,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    );
+                if self.conn_copied == Some(ConnCopyTarget::Dest(ix)) {
+                    dest_cell = dest_cell.child(
+                        div()
+                            .id(format!("conn-copied-dest-{ix}"))
+                            .test_support()
+                            .text_sm()
+                            .child("Copied!"),
+                    );
+                }
+
+                // The endpoint cell copies the row's active `bind:port` contact
+                // verbatim; unclaimed rows (no exit) stay non-copyable.
+                let endpoint_value = bind.clone();
+                let endpoint_claimed = row.row_id.is_some();
+                let mut endpoint_button = Button::new(format!("conn-endpoint-{ix}"))
+                    .small()
+                    .label(bind);
+                if endpoint_claimed {
+                    endpoint_button =
+                        endpoint_button
+                            .tooltip("Copy endpoint")
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.copy_conn_cell(
+                                    ConnCopyTarget::Endpoint(ix),
+                                    &endpoint_value,
+                                    window,
+                                    cx,
+                                );
+                            }));
+                }
+                let mut meta = div()
+                    .id(format!("conn-meta-{ix}"))
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .child(name)
+                    .child("·")
+                    .child(endpoint_button);
+                if self.conn_copied == Some(ConnCopyTarget::Endpoint(ix)) {
+                    meta = meta.child(
+                        div()
+                            .id(format!("conn-copied-endpoint-{ix}"))
+                            .test_support()
+                            .child("Copied!"),
+                    );
+                }
+                meta = meta.child(format!(
+                    "· {protocol} · ↓{} ↑{} · Δ{}",
+                    format_bytes(row.rx_bytes),
+                    format_bytes(row.tx_bytes),
+                    format_bytes(row.delta_rx.saturating_add(row.delta_tx)),
+                ));
+
+                pane = pane.child(div().flex().flex_col().child(dest_cell).child(meta));
             }
         }
         pane
@@ -32374,6 +32487,238 @@ mod tests {
             );
         }
         server.join().expect("stub drains");
+    }
+
+    /// Tall enough that the seeded Connections row lands inside the detail
+    /// viewport (the default 1000x700 frame clips it below the fold).
+    fn t74_paint(cx: &mut VisualTestContext) {
+        cx.simulate_resize(size(px(1400.), px(1200.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+    }
+
+    /// T-24 hermetic Connections pane: one claimed exit row, seeded snapshot,
+    /// no engines and no network, ready for click simulation.
+    fn t74_conn_setup<'a>(
+        cx: &'a mut TestAppContext,
+        dest: &str,
+    ) -> (Entity<AppView>, &'a mut VisualTestContext, String) {
+        use crate::health::ClashConn;
+        use gpui_kit::component::IndexPath;
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(tick12_seed("Alpha", "10856"))
+            .expect("seed works");
+        let row_id = alpha.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.conn_snapshot = vec![(
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-0".to_string(),
+                        row_id: Some(row_id.clone()),
+                        rx_bytes: 1000,
+                        tx_bytes: 50,
+                        dest: dest.to_string(),
+                    },
+                )];
+                view.conn_delta = std::collections::HashMap::new();
+                view.inspector_tab = crate::InspectorTab::Connections;
+                view.conn_selected_only = false;
+                view.conn_sort_desc = true;
+                view.libraries.update(cx, |state, list_cx| {
+                    state.delegate_mut().selected = Some(IndexPath::new(0));
+                    list_cx.notify();
+                });
+                cx.notify();
+            });
+        });
+        t74_paint(cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.scroll(
+                "config-detail-body",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-140.))),
+                cx,
+            );
+        });
+        t74_paint(cx);
+        cx.run_until_parked();
+        let endpoint = view.read_with(cx, |view, cx| {
+            let rows = view.libraries.read(cx).delegate().rows.clone();
+            let selected = view.selected_config(cx).map(|config| config.id);
+            let built = crate::build_conn_rows(
+                &view.conn_snapshot,
+                &view.conn_delta,
+                selected.as_deref(),
+                view.conn_selected_only,
+                view.conn_sort_desc,
+            );
+            crate::conn_exit_of(&rows, built[0].row_id.as_deref()).1
+        });
+        (view, cx, endpoint)
+    }
+
+    #[gpui_kit::test]
+    fn t74_click_dest_copies_exact_string(cx: &mut TestAppContext) {
+        let dest = "flow-0.example.com";
+        let (_view, cx, _endpoint) = t74_conn_setup(cx, dest);
+        assert_painted(cx, "config-connections");
+        assert_painted(cx, "conn-copy-0");
+
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            clip, dest,
+            "dest cell copies the displayed dest string exactly: {clip}"
+        );
+        for canary in [
+            "11111111",
+            "198.51.100.9",
+            "uuid",
+            "password",
+            "server_port",
+        ] {
+            assert!(
+                !clip.contains(canary),
+                "dest copy carries the display value only, found {canary}: {clip}"
+            );
+        }
+
+        // Repeat click copies again (idempotent; no state jam).
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        let clip_again = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            clip_again, dest,
+            "repeat click re-copies the dest: {clip_again}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t74_click_endpoint_copies_endpoint_only(cx: &mut TestAppContext) {
+        let dest = "flow-0.example.com";
+        let (_view, cx, endpoint) = t74_conn_setup(cx, dest);
+        assert_painted(cx, "conn-endpoint-0");
+
+        cx.update(|window, cx| {
+            window.click("conn-endpoint-0", cx);
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            clip, endpoint,
+            "endpoint cell copies the row's bind:port contact only: {clip}"
+        );
+        assert!(
+            clip.contains(':'),
+            "endpoint stays bind:port shaped: {clip}"
+        );
+        assert_ne!(clip, dest, "endpoint copy never carries the destination");
+        for canary in [dest, "11111111", "198.51.100.9", "uuid", "password"] {
+            assert!(
+                !clip.contains(canary),
+                "endpoint copy excludes every other value, found {canary}: {clip}"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    fn t74_copied_tooltip_transient_clears(cx: &mut TestAppContext) {
+        let (_view, cx, _endpoint) = t74_conn_setup(cx, "flow-0.example.com");
+        assert_eq!(
+            AppView::CONN_COPIED_TOOLTIP_MS,
+            1500,
+            "the Copied! marker window is ~1.5s"
+        );
+        assert_absent(cx, "conn-copied-dest-0".to_string());
+
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        t74_paint(cx);
+        assert_painted(cx, "conn-copied-dest-0");
+
+        // Still painted just before the window elapses; a tick runs no timer yet.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(
+                AppView::CONN_COPIED_TOOLTIP_MS - 200,
+            ));
+        let _ = cx.executor().tick();
+        t74_paint(cx);
+        assert_painted(cx, "conn-copied-dest-0");
+
+        // Past the window it auto-dismisses with no further interaction.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        t74_paint(cx);
+        assert_absent(cx, "conn-copied-dest-0".to_string());
+    }
+
+    #[gpui_kit::test]
+    fn t74_other_cells_not_click_copyable(cx: &mut TestAppContext) {
+        let (_view, cx, _endpoint) = t74_conn_setup(cx, "flow-0.example.com");
+        assert_painted(cx, "conn-copy-0");
+        assert_painted(cx, "conn-endpoint-0");
+        assert_painted(cx, "conn-meta-0");
+
+        // The name · protocol · traffic cell has no copy handler: clicking it
+        // leaves the clipboard untouched and lights no marker.
+        let meta = cx
+            .update(|window, _| window.try_find("conn-meta-0".to_string()))
+            .expect("meta cell renders");
+        let bounds = meta.bounds();
+        cx.update(|window, cx| {
+            window.click_at(
+                "conn-meta-0",
+                gpui_kit::point(px(2.), bounds.size.height * 0.5),
+                cx,
+            );
+        });
+        let clip = cx.update(|_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert!(
+            clip.is_empty(),
+            "clicking a non-target cell copies nothing: {clip}"
+        );
+        assert_absent(cx, "conn-copied-dest-0".to_string());
+        assert_absent(cx, "conn-copied-endpoint-0".to_string());
+
+        // A dest click lights only the dest marker, never the endpoint's.
+        cx.update(|window, cx| {
+            window.click("conn-copy-0", cx);
+        });
+        t74_paint(cx);
+        assert_painted(cx, "conn-copied-dest-0");
+        assert_absent(cx, "conn-copied-endpoint-0".to_string());
     }
 
     #[gpui_kit::test]
