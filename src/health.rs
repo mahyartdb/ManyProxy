@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::{inbound_tag, outbound_tag};
+use crate::engine::{inbound_tag, outbound_tag, params_declare_mux};
 use crate::store::{now_unix, HealthHistoryEntry, HealthSnapshot, ProxyConfig};
 
 pub const DEFAULT_TEST_URL: &str = "http://www.gstatic.com/generate_204";
@@ -866,9 +866,55 @@ pub fn test_group(
     stop: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Vec<TestOutcome> {
-    run_group(configs, stop, &mut on_progress, |chunk| {
+    use std::sync::atomic::Ordering;
+
+    let total = configs.len();
+    let first = run_group(configs, stop, &mut on_progress, |chunk| {
         test_all_stoppable(chunk, url, prober, stop)
-    })
+    });
+    // T-18 mux warm-up: rows whose params declare multiplex pay the mux
+    // cold-chain inside their first probe, so that reading sits at the worst
+    // case. The first pass never becomes an outcome below; every mux row that
+    // came back live runs one second URL test through the same staged runner
+    // (same batch size, poll interval and concurrency cap, same stop flag)
+    // and only its sample is returned. Failures and dead results stand
+    // unretried; rows the params do not mark muxed keep exactly one probe.
+    let mut first_by_id: HashMap<String, TestOutcome> = first
+        .into_iter()
+        .map(|outcome| (outcome.sample.config_id.clone(), outcome))
+        .collect();
+    let mut recorded: Vec<TestOutcome> = Vec::with_capacity(total);
+    let mut warm: Vec<ProxyConfig> = Vec::new();
+    for config in configs {
+        let first_outcome = first_by_id.remove(&config.id);
+        let warmed = params_declare_mux(&config.params)
+            && first_outcome.as_ref().is_some_and(|outcome| {
+                outcome.sample.latency_ms.is_some_and(|latency| latency > 0)
+            });
+        if warmed {
+            // First pass retired as the warm-up; the second pass refills the
+            // row's sample from the runner below.
+            warm.push(config.clone());
+        } else if let Some(outcome) = first_outcome {
+            recorded.push(outcome);
+        }
+    }
+    if !warm.is_empty() && !stop.load(Ordering::SeqCst) {
+        let measured = recorded.len();
+        let seconds = run_group(
+            &warm,
+            stop,
+            &mut |done, _| {
+                // Keep the runner's done/total shape: rows measured so far across
+                // the whole group, warm-up passes excluded just like their
+                // samples.
+                on_progress(measured.saturating_add(done).min(total), total);
+            },
+            |chunk| test_all_stoppable(chunk, url, prober, stop),
+        );
+        recorded.extend(seconds);
+    }
+    recorded
 }
 
 #[cfg(test)]
@@ -3173,6 +3219,221 @@ mod tests {
         for outcome in &outcomes {
             assert_eq!(test_result_string(outcome), "9ms");
         }
+    }
+
+    fn mux_fixture(id: &str, name: &str, bind: &str, port: u16) -> ProxyConfig {
+        let mut config = fixture(id, name, "vless", bind, port);
+        config.params = r#"{"mux": "on"}"#.to_string();
+        config
+    }
+
+    #[test]
+    fn t68_mux_rows_get_second_probe_only_live_first() {
+        let configs = vec![
+            mux_fixture("m1", "Warmable", "127.0.0.1", 10801),
+            mux_fixture("m2", "DeadStands", "127.0.0.1", 10802),
+            fixture("p1", "Plain", "vless", "127.0.0.1", 10803),
+        ];
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_latency("m1", 33);
+        handle.script_failure("m2", "upstream refused");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |_, _| {});
+
+        assert_eq!(handle.calls_for("m1").len(), 2, "live mux row probes twice");
+        assert_eq!(
+            handle.calls_for("m2").len(),
+            1,
+            "decisive first-pass failure stands unretried"
+        );
+        assert_eq!(handle.calls_for("p1").len(), 1, "non-mux row probes once");
+        for call in handle.calls_for("m1") {
+            assert_eq!(
+                call.kind,
+                HealthKind::UrlTest,
+                "the second pass is a url test"
+            );
+            assert_eq!(call.bind, "127.0.0.1");
+            assert_eq!(call.url, DEFAULT_TEST_URL);
+        }
+
+        let mut store = HealthStore::default();
+        for outcome in &outcomes {
+            store.record_outcome(outcome);
+        }
+        assert_eq!(
+            outcomes.len(),
+            configs.len(),
+            "one recorded outcome per row"
+        );
+        assert_eq!(store.row_summary("m1"), "33ms", "the recorded mux sample");
+        assert_eq!(
+            store.row_summary("m2"),
+            "dead",
+            "the failed first pass is not retried"
+        );
+        assert!(matches!(store.status("m1").state, RowState::Live));
+        assert!(matches!(store.status("m2").state, RowState::Dead));
+    }
+
+    #[test]
+    fn t68_recorded_sample_is_second_pass() {
+        struct WarmSequence {
+            calls: Mutex<HashMap<String, usize>>,
+        }
+        impl HealthProber for WarmSequence {
+            fn url_test(
+                &self,
+                config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+                _url: &str,
+            ) -> Result<ProbeSuccess, String> {
+                let mut calls = self.calls.lock().unwrap();
+                let count = calls.entry(config.id.clone()).or_insert(0);
+                *count += 1;
+                Ok(ProbeSuccess {
+                    latency_ms: if *count == 1 { 111 } else { 222 },
+                    bytes_rx: 10,
+                    bytes_tx: 20,
+                })
+            }
+            fn tcp_ping(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+            ) -> Result<ProbeSuccess, String> {
+                unreachable!("url path only");
+            }
+        }
+
+        let configs = vec![mux_fixture("m", "Warmable", "127.0.0.1", 10801)];
+        let prober = WarmSequence {
+            calls: Mutex::new(HashMap::new()),
+        };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |_, _| {});
+
+        assert_eq!(outcomes.len(), 1, "the first sample never lands");
+        let outcome = &outcomes[0];
+        assert_eq!(outcome.sample.config_id, "m");
+        assert_eq!(
+            outcome.sample.latency_ms,
+            Some(222),
+            "the recorded sample is the second pass"
+        );
+        assert!(outcome.sample.error.is_none());
+
+        let mut store = HealthStore::default();
+        store.record_outcome(outcome);
+        assert_eq!(store.row_summary("m"), "222ms");
+        // The warm-up probe's bucket is dropped whole: only the second
+        // pass's ProbeSuccess reaches the traffic ledger.
+        let stats = store.traffic("m");
+        assert_eq!(stats.probes, 1);
+        assert_eq!(stats.rx_bytes, 10);
+        assert_eq!(stats.tx_bytes, 20);
+        assert_eq!(
+            *prober.calls.lock().unwrap().get("m").expect("probed"),
+            2,
+            "the warm-up pass still runs"
+        );
+    }
+
+    #[test]
+    fn t68_non_mux_single_probe_unchanged() {
+        let mut off = fixture("off", "MuxOff", "vless", "127.0.0.1", 10801);
+        off.params = r#"{"mux": "off"}"#.to_string();
+        let mut blank = fixture("blank", "MuxBlank", "vless", "127.0.0.1", 10802);
+        blank.params = r#"{"mux": "   "}"#.to_string();
+        let mut plain = fixture("plain", "Plain", "vmess", "127.0.0.1", 10803);
+        plain.params = r#"{}"#.to_string();
+
+        let (prober, handle) = FakeHealthProber::shared();
+        handle.script_latency("plain", 55);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = Vec::new();
+        let configs = vec![off, blank, plain];
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |done, total| {
+            progress.push((done, total));
+        });
+
+        for id in ["off", "blank", "plain"] {
+            assert_eq!(handle.calls_for(id).len(), 1, "{id} probes exactly once");
+        }
+        assert_eq!(outcomes.len(), 3, "one recorded outcome per row");
+        let mut store = HealthStore::default();
+        for outcome in &outcomes {
+            store.record_outcome(outcome);
+        }
+        // The single passes' own samples stand, unmodified by warm-up logic.
+        for (id, latency) in [("off", 42), ("blank", 42), ("plain", 55)] {
+            assert_eq!(
+                store.row_summary(id),
+                format!("{latency}ms"),
+                "{id} keeps its single-pass sample"
+            );
+        }
+        assert_eq!(
+            progress,
+            vec![(3, 3)],
+            "progress shape matches the bare runner"
+        );
+    }
+
+    #[test]
+    fn t68_stop_before_second_pass_prevents_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StopOnFirst {
+            stop: Arc<AtomicBool>,
+            calls: Mutex<usize>,
+        }
+        impl HealthProber for StopOnFirst {
+            fn url_test(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+                _url: &str,
+            ) -> Result<ProbeSuccess, String> {
+                *self.calls.lock().unwrap() += 1;
+                self.stop.store(true, Ordering::SeqCst);
+                Ok(ProbeSuccess {
+                    latency_ms: 9,
+                    bytes_rx: 0,
+                    bytes_tx: 0,
+                })
+            }
+            fn tcp_ping(
+                &self,
+                _config: &ProxyConfig,
+                _bind: &str,
+                _port: u16,
+            ) -> Result<ProbeSuccess, String> {
+                unreachable!("url path only");
+            }
+        }
+
+        // The stop flips during the mux row's first pass: the second pass
+        // must never start, and the warm-up sample stays out of the record
+        // set entirely — a stop can leave a mux row unmeasured, never
+        // warm-up-measured.
+        let configs = vec![mux_fixture("m", "Warmable", "127.0.0.1", 10801)];
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prober = StopOnFirst {
+            stop: stop.clone(),
+            calls: Mutex::new(0),
+        };
+        let outcomes = test_group(&configs, DEFAULT_TEST_URL, &prober, &stop, |_, _| {});
+
+        assert_eq!(
+            *prober.calls.lock().unwrap(),
+            1,
+            "one warm-up URL test, no second probe after the stop"
+        );
+        assert!(outcomes.is_empty(), "the stopped run records no mux sample");
     }
 
     #[test]

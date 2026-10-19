@@ -3076,6 +3076,26 @@ fn apply_transport(
     Ok(())
 }
 
+/// Whether the stored params declare multiplex — the exact params-key rule
+/// [`apply_mux`] consumes, so UI/health consumers cannot drift from what the
+/// generated config really says. Gated by the `mux` key: only a string value
+/// counts, a trimmed `"on"` (any ASCII case) enables the row, `"off"` keeps it
+/// disabled, blank or non-string values declare nothing, and any other
+/// spelling fails config generation in `apply_mux`. Malformed or non-object
+/// JSON — which `params_object` balks at — never declares.
+pub fn params_declare_mux(params_raw: &str) -> bool {
+    let Ok(serde_json::Value::Object(params)) =
+        serde_json::from_str::<serde_json::Value>(params_raw)
+    else {
+        return false;
+    };
+    let Some(serde_json::Value::String(mode)) = params.get("mux") else {
+        return false;
+    };
+    let mode = mode.trim();
+    !mode.is_empty() && mode.eq_ignore_ascii_case("on")
+}
+
 fn apply_mux(
     name: &str,
     params: &mut serde_json::Map<String, serde_json::Value>,
@@ -12260,6 +12280,154 @@ Active Connections\r
             node.get("brutal_enable").is_none(),
             "brutal flat dropped: {node}"
         );
+    }
+
+    #[test]
+    fn t68_params_declare_mux_matches_engine_logic() {
+        // Divergence-proofing: `params_declare_mux` and the engine's own
+        // params-key mux logic (`apply_mux` via `generate`) must agree on the
+        // same fixtures the t02 multiplex emission tests pin — `mux:"on"` on
+        // the four mux-capable protocol shapes, then the default / off /
+        // junk vless controls. One shared rule; drift is a bug because
+        // health.rs probes exactly what this function claims is muxed.
+        fn engine_multiplex(
+            protocol: &str,
+            params: serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            let row = fixture("9", "Muxed", protocol, params, "127.0.0.1", 10809);
+            let generated = generate(std::slice::from_ref(&row)).expect("params generate");
+            let value = generated.value();
+            let node = value["outbounds"]
+                .as_array()
+                .expect("outbounds")
+                .iter()
+                .find(|node| node["type"] == json!(protocol))
+                .unwrap_or_else(|| panic!("{protocol} egress present"));
+            node.get("multiplex").cloned()
+        }
+        let on = |mut params: serde_json::Value| {
+            let obj = params.as_object_mut().expect("object");
+            obj.insert("mux".to_string(), json!("on"));
+            obj.insert("brutal_enable".to_string(), json!(true));
+            obj.insert("brutal_up_mbps".to_string(), json!(100));
+            obj.insert("brutal_down_mbps".to_string(), json!(50));
+            params
+        };
+        for (protocol, base) in [
+            ("vless", vless_params()),
+            (
+                "trojan",
+                json!({"type": "trojan", "server": "198.51.100.9", "server_port": 443,
+                       "password": "secret"}),
+            ),
+            (
+                "vmess",
+                json!({"type": "vmess", "server": "198.51.100.9", "server_port": 443,
+                       "uuid": "11111111-2222-4333-8444-555555555555"}),
+            ),
+            ("shadowsocks", ss_params("pass1")),
+        ] {
+            let params = on(base);
+            assert!(
+                params_declare_mux(&params.to_string()),
+                "{protocol} declares the mux:\"on\" shape"
+            );
+            assert_eq!(
+                engine_multiplex(protocol, params),
+                Some(json!({"enabled": true})),
+                "{protocol} engine parity on mux:\"on\""
+            );
+        }
+
+        for spelling in ["on", "  on  ", "ON", "On"] {
+            let mut params = vless_params();
+            params
+                .as_object_mut()
+                .expect("object")
+                .insert("mux".to_string(), json!(spelling));
+            assert!(
+                params_declare_mux(&params.to_string()),
+                "{spelling:?} declares mux like the engine's trimmed compare"
+            );
+            assert_eq!(
+                engine_multiplex("vless", params),
+                Some(json!({"enabled": true})),
+                "engine emits enabled for {spelling:?}"
+            );
+        }
+        for spelling in ["off", "OFF"] {
+            let mut params = vless_params();
+            params
+                .as_object_mut()
+                .expect("object")
+                .insert("mux".to_string(), json!(spelling));
+            assert!(
+                !params_declare_mux(&params.to_string()),
+                "{spelling:?} says nothing to warm: the row multiplexes off"
+            );
+            assert_eq!(
+                engine_multiplex("vless", params),
+                Some(json!({"enabled": false})),
+                "engine emits disabled for {spelling:?}"
+            );
+        }
+        let mut blank = vless_params();
+        blank
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("   "));
+        assert!(
+            !params_declare_mux(&blank.to_string()),
+            "blank declares nothing, like the engine's empty default"
+        );
+        assert_eq!(
+            engine_multiplex("vless", blank),
+            None,
+            "engine emits no multiplex key for blank"
+        );
+        assert!(
+            !params_declare_mux(&vless_params().to_string()),
+            "the default shape declares nothing"
+        );
+
+        // Junk `mux` values fail config generation and declare nothing here.
+        let mut junk = vless_params();
+        junk.as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!("sometimes"));
+        assert!(
+            !params_declare_mux(&junk.to_string()),
+            "junk never counts as muxed"
+        );
+        let junk_row = fixture("9", "Junk", "vless", junk, "127.0.0.1", 10809);
+        assert!(
+            generate(std::slice::from_ref(&junk_row)).is_err(),
+            "engine rejects the junk spelling outright"
+        );
+
+        // Non-string `mux` values are dropped exactly like `take_flat` does.
+        let mut not_string = vless_params();
+        not_string
+            .as_object_mut()
+            .expect("object")
+            .insert("mux".to_string(), json!(true));
+        assert!(
+            !params_declare_mux(&not_string.to_string()),
+            "a bool mux value declares nothing"
+        );
+        assert_eq!(
+            engine_multiplex("vless", not_string),
+            None,
+            "engine drops the non-string mux key"
+        );
+
+        // Raw params the engine's params_object cannot parse never declare.
+        for raw in ["", "   ", "null", "[]", "{{{"] {
+            assert!(
+                !params_declare_mux(raw),
+                "unparseable params never declare mux: {raw:?}"
+            );
+        }
     }
 
     #[test]
