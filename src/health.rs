@@ -1204,6 +1204,60 @@ pub struct ClashConn {
     pub tx_bytes: u64,
 
     pub dest: String,
+
+    /// `metadata.network` as the core reported it (`"tcp"`/`"udp"`, blank when
+    /// absent). Kept raw so the counter classifier owns the one normalization.
+    pub network: String,
+}
+
+/// T-25: transport bucket for one snapshot row. `Other` still counts as active;
+/// it just cannot claim a TCP or UDP slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnProto {
+    Tcp,
+    Udp,
+    Other,
+}
+
+/// T-25: `N active · M TCP · K UDP` derived from clash snapshot rows. Counts
+/// only — no row content reaches the status bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnCounts {
+    pub active: usize,
+    pub tcp: usize,
+    pub udp: usize,
+}
+
+impl ConnCounts {
+    /// Pure classifier over one row's `metadata.network`.
+    pub fn proto_of(network: &str) -> ConnProto {
+        match network.trim().to_ascii_lowercase().as_str() {
+            "tcp" => ConnProto::Tcp,
+            "udp" => ConnProto::Udp,
+            _ => ConnProto::Other,
+        }
+    }
+
+    /// Aggregate across every row the poll merged, whatever core produced it.
+    pub fn from_conns<'a>(conns: impl IntoIterator<Item = &'a ClashConn>) -> Self {
+        let mut counts = Self::default();
+        for conn in conns {
+            counts.active = counts.active.saturating_add(1);
+            match Self::proto_of(&conn.network) {
+                ConnProto::Tcp => counts.tcp = counts.tcp.saturating_add(1),
+                ConnProto::Udp => counts.udp = counts.udp.saturating_add(1),
+                ConnProto::Other => {}
+            }
+        }
+        counts
+    }
+
+    pub fn status_text(&self) -> String {
+        format!(
+            "{} active · {} TCP · {} UDP",
+            self.active, self.tcp, self.udp
+        )
+    }
 }
 
 pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
@@ -1224,6 +1278,10 @@ pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
         let meta = item.get("metadata");
         let inbound = meta
             .and_then(|m| m.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let network = meta
+            .and_then(|m| m.get("network"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         let dest = meta
@@ -1252,6 +1310,7 @@ pub fn parse_clash_entries(body: &str) -> Result<Vec<ClashConn>, String> {
             rx_bytes: rx,
             tx_bytes: tx,
             dest: dest.to_string(),
+            network: network.to_string(),
         });
     }
     Ok(out)
@@ -4130,6 +4189,72 @@ mod tests {
     }
 
     #[test]
+    fn t75_conn_counts_from_snapshot_rows() {
+        let body = r#"{"connections":[
+            {"chains":["direct"],"download":2877275,"id":"a99cac52","metadata":{"destinationIP":"127.0.0.1","destinationPort":"19097","host":"","network":"tcp","sourceIP":"127.0.0.1","sourcePort":"51241","type":"mixed/in-7"},"rule":"final","upload":89},
+            {"chains":["direct"],"download":500,"id":"dns-1","metadata":{"destinationIP":"1.1.1.1","destinationPort":"53","host":"","network":"udp","sourceIP":"127.0.0.1","sourcePort":"51242","type":"mixed/in-7"},"rule":"final","upload":60},
+            {"chains":["direct"],"download":70,"id":"quic-1","metadata":{"destinationIP":"203.0.113.9","destinationPort":"443","host":"cdn.example.com","network":"quic","sourceIP":"127.0.0.1","sourcePort":"51243","type":"mixed/in-8"},"rule":"final","upload":5},
+            {"chains":["direct"],"download":10,"id":"no-net","metadata":{"destinationIP":"203.0.113.10","destinationPort":"443","host":"x.example.com","sourceIP":"127.0.0.1","sourcePort":"51244","type":"mixed/in-8"},"rule":"final","upload":1}
+        ],"downloadTotal":2877855,"uploadTotal":155}"#;
+        let rows = crate::health::parse_clash_entries(body).expect("entries parse");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].network, "tcp");
+        assert_eq!(rows[1].network, "udp");
+        assert_eq!(rows[2].network, "quic");
+        assert_eq!(rows[3].network, "", "missing network stays blank");
+        let counts = crate::health::ConnCounts::from_conns(rows.iter());
+        assert_eq!(
+            counts,
+            crate::health::ConnCounts {
+                active: 4,
+                tcp: 1,
+                udp: 1
+            }
+        );
+        assert_eq!(counts.status_text(), "4 active · 1 TCP · 1 UDP");
+    }
+
+    #[test]
+    fn t75_conn_counts_tcp_udp_split() {
+        use crate::health::{ConnCounts, ConnProto};
+        assert_eq!(ConnCounts::proto_of("tcp"), ConnProto::Tcp);
+        assert_eq!(ConnCounts::proto_of(" TCP "), ConnProto::Tcp);
+        assert_eq!(ConnCounts::proto_of("udp"), ConnProto::Udp);
+        assert_eq!(ConnCounts::proto_of(""), ConnProto::Other);
+        assert_eq!(ConnCounts::proto_of("sctp"), ConnProto::Other);
+
+        let conn = |id: &str, network: &str| ClashConn {
+            id: id.to_string(),
+            row_id: Some("7".to_string()),
+            rx_bytes: 1,
+            tx_bytes: 1,
+            dest: "example.com".to_string(),
+            network: network.to_string(),
+        };
+        let rows = [
+            conn("a", "tcp"),
+            conn("b", "tcp"),
+            conn("c", "udp"),
+            conn("d", ""),
+            conn("e", "quic"),
+        ];
+        let counts = ConnCounts::from_conns(rows.iter());
+        assert_eq!(
+            counts,
+            ConnCounts {
+                active: 5,
+                tcp: 2,
+                udp: 1
+            },
+            "unknown/blank networks stay active-only"
+        );
+        assert_eq!(
+            ConnCounts::from_conns(std::iter::empty()).status_text(),
+            "0 active · 0 TCP · 0 UDP"
+        );
+    }
+
+    #[test]
     fn logs_filter_to_config_and_redact_secrets() {
         let active = vec![
             fixture("1", "Alpha", "vless", "127.0.0.1", 10801),
@@ -4541,6 +4666,7 @@ mod tests {
                 rx_bytes: rx,
                 tx_bytes: tx,
                 dest: dest.to_string(),
+                network: "tcp".to_string(),
             }
         }
         let probe = "www.gstatic.com";

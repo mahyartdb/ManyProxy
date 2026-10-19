@@ -12370,6 +12370,10 @@ struct AppView {
 
     conn_snapshot: Vec<(String, crate::health::ClashConn)>,
 
+    /// T-25: counts derived from `conn_snapshot` on the traffic tick, so the
+    /// status bar never walks the snapshot per frame.
+    conn_counts: crate::health::ConnCounts,
+
     conn_delta: HashMap<String, (u64, u64)>,
 
     conn_selected_only: bool,
@@ -12563,6 +12567,7 @@ impl AppView {
             row_columns,
             inspector_tab: InspectorTab::Details,
             conn_snapshot: Vec::new(),
+            conn_counts: crate::health::ConnCounts::default(),
             conn_delta: HashMap::new(),
             conn_selected_only: true,
             conn_sort_desc: true,
@@ -15854,6 +15859,16 @@ impl AppView {
         } else {
             format!("health: {live} live · {dead} dead")
         }
+    }
+
+    /// T-25: `N active · M TCP · K UDP` from the last merged clash snapshot.
+    /// Hidden while no core runs — there is no collection to report, and zeros
+    /// would read as a measured idle instead of "nothing is being polled".
+    fn conn_counter_text(&self) -> Option<String> {
+        if self.engine.running_count() == 0 {
+            return None;
+        }
+        Some(self.conn_counts.status_text())
     }
 
     fn record_and_persist(&mut self, outcomes: &[TestOutcome]) {
@@ -22634,6 +22649,8 @@ impl AppView {
             .sweep(now, &ok_cores, &seen, &live_cores);
 
         self.conn_snapshot = snapshot;
+        self.conn_counts =
+            crate::health::ConnCounts::from_conns(self.conn_snapshot.iter().map(|(_, conn)| conn));
         self.conn_delta = conn_deltas;
         self.last_traffic_poll_at = now;
         let mut updated = 0;
@@ -24369,6 +24386,20 @@ impl AppView {
                     .truncate()
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(ports)
+            });
+        }
+
+        if let Some(counters) = self.conn_counter_text() {
+            center = center.child(Separator::vertical()).child({
+                let tip = counters.clone();
+                div()
+                    .id("conn-counters")
+                    .test_support()
+                    .min_w_0()
+                    .max_w(px(180.))
+                    .truncate()
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                    .child(counters)
             });
         }
         let mut right = div()
@@ -32526,6 +32557,7 @@ mod tests {
                         rx_bytes: 1000,
                         tx_bytes: 50,
                         dest: dest.to_string(),
+                        network: "tcp".to_string(),
                     },
                 )];
                 view.conn_delta = std::collections::HashMap::new();
@@ -32719,6 +32751,161 @@ mod tests {
         t74_paint(cx);
         assert_painted(cx, "conn-copied-dest-0");
         assert_absent(cx, "conn-copied-endpoint-0".to_string());
+    }
+
+    /// T-25 hermetic status-bar proof: a fake engine serves one row (no
+    /// binaries, no network) while the poll-result merge seeds a two-core
+    /// snapshot, so the counter line renders exactly what the snapshot holds.
+    #[gpui_kit::test]
+    fn t75_status_bar_renders_counter_line(cx: &mut TestAppContext) {
+        use crate::engine::{ClashTarget, EngineController};
+        use crate::health::{ClashConn, ProbeExclusions};
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10971"))
+            .expect("seed works");
+        let row_id = alpha.id.clone();
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _handle) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.engine.running_count() > 0),
+            "fake core runs without a sidecar"
+        );
+
+        let conn = |id: &str, network: &str| ClashConn {
+            id: id.to_string(),
+            row_id: Some(row_id.clone()),
+            rx_bytes: 100,
+            tx_bytes: 10,
+            dest: "flow.example.com".to_string(),
+            network: network.to_string(),
+        };
+        let results = vec![
+            (
+                ClashTarget {
+                    core: "stock".to_string(),
+                    port: 19090,
+                    secret: "s3cret".to_string(),
+                },
+                Ok(vec![conn("a", "tcp"), conn("b", "udp")]),
+            ),
+            (
+                ClashTarget {
+                    core: "fork".to_string(),
+                    port: 19091,
+                    secret: "s3cret".to_string(),
+                },
+                Ok(vec![conn("c", "tcp"), conn("d", "")]),
+            ),
+        ];
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_traffic_results(results, &ProbeExclusions::new(), cx);
+            });
+        });
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.conn_counter_text()),
+            Some("4 active · 2 TCP · 1 UDP".to_string()),
+            "counts merge both core snapshots; blank network stays active-only"
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert_painted(cx, "conn-counters");
+        assert_painted(cx, "status-center");
+
+        // The region's min-width/truncate/tooltip pattern keeps the segment in
+        // the bar at the minimum frame instead of dropping it.
+        cx.simulate_resize(size(px(880.), px(620.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        let bounds = cx
+            .update(|window, _| window.try_find("conn-counters".to_string()))
+            .expect("counter segment survives the minimum width")
+            .bounds();
+        assert!(
+            bounds.size.width > px(0.),
+            "narrow window truncates, never zero-width: {bounds:?}"
+        );
+        assert!(
+            bounds.origin.x + bounds.size.width <= px(880.) + px(1.),
+            "counter segment stays inside the minimum frame: {bounds:?}"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_traffic_results(Vec::new(), &ProbeExclusions::new(), cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.conn_counter_text()),
+            Some("0 active · 0 TCP · 0 UDP".to_string()),
+            "running but idle still reports zeros"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t75_counter_hidden_when_no_running_cores(cx: &mut TestAppContext) {
+        use crate::health::{ClashConn, ConnCounts};
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Alpha", "10972"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                // A stale snapshot must not leak numbers once every core stops.
+                view.conn_snapshot = vec![(
+                    "stock".to_string(),
+                    ClashConn {
+                        id: "conn-0".to_string(),
+                        row_id: None,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        dest: "flow.example.com".to_string(),
+                        network: "tcp".to_string(),
+                    },
+                )];
+                view.conn_counts = ConnCounts {
+                    active: 1,
+                    tcp: 1,
+                    udp: 0,
+                };
+                cx.notify();
+            });
+        });
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.conn_counter_text()),
+            None,
+            "no running cores = no counter line"
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert_absent(cx, "conn-counters".to_string());
+        assert_painted(cx, "status-center");
     }
 
     #[gpui_kit::test]
