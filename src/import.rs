@@ -3108,17 +3108,28 @@ pub fn import_subscription_body(body: &str) -> BatchResult {
         return BatchResult::fail(0, ImportErrorKind::Empty, "nothing to import");
     }
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return match serde_json::from_str::<serde_json::Value>(trimmed) {
-            Ok(value) => import_json_value(&value),
-
-            Err(_) => BatchResult::fail(0, ImportErrorKind::InvalidJson, "invalid JSON"),
-        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return import_json_value(&value);
+        }
+        if looks_like_wg_conf(trimmed) {
+            return import_wg_conf(trimmed, "wireguard");
+        }
+        let has_wg_candidate = trimmed.lines().any(|raw_line| {
+            let line = raw_line.trim();
+            !line.is_empty() && !line.contains("://") && is_wg_section_line(line)
+        });
+        if !has_wg_candidate {
+            return BatchResult::fail(0, ImportErrorKind::InvalidJson, "invalid JSON");
+        }
     }
     if looks_like_wg_conf(trimmed) {
         return import_wg_conf(trimmed, "wireguard");
     }
     if has_clash_proxies(trimmed) {
         return import_clash_proxies(trimmed);
+    }
+    if let Some(mixed) = merge_wg_segments(trimmed) {
+        return mixed;
     }
     let lines: Vec<&str> = trimmed
         .lines()
@@ -3207,6 +3218,113 @@ pub fn import_subscription_body(body: &str) -> BatchResult {
             _ => import_text(body),
         },
     }
+}
+
+fn is_wg_section_line(line: &str) -> bool {
+    match line
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(name) => {
+            name.trim().eq_ignore_ascii_case("interface")
+                || name.trim().eq_ignore_ascii_case("peer")
+        }
+        None => false,
+    }
+}
+
+fn line_absorbs_into_wg_run(line: &str) -> bool {
+    if line.contains("://") || line.starts_with('{') {
+        return false;
+    }
+    line.starts_with('[') || line.starts_with('#') || line.starts_with(';') || line.contains('=')
+}
+
+fn merge_wg_segments(trimmed: &str) -> Option<BatchResult> {
+    let opens_wg_somewhere = trimmed.lines().any(|raw_line| {
+        let line = raw_line.trim();
+        !line.is_empty() && !line.contains("://") && is_wg_section_line(line)
+    });
+    if !opens_wg_somewhere {
+        return None;
+    }
+    enum Segment {
+        Wg(String),
+        Text(String),
+    }
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut text_run = String::new();
+    let mut wg_run = String::new();
+    let mut in_wg = false;
+    fn flush_wg(segments: &mut Vec<Segment>, wg_run: &mut String, in_wg: &mut bool) {
+        if *in_wg {
+            segments.push(Segment::Wg(std::mem::take(wg_run)));
+            *in_wg = false;
+        }
+    }
+    for raw_line in trimmed.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if in_wg {
+                wg_run.push('\n');
+            }
+            continue;
+        }
+        if !in_wg && !line.contains("://") && is_wg_section_line(line) {
+            if !text_run.trim().is_empty() {
+                segments.push(Segment::Text(std::mem::take(&mut text_run)));
+            }
+            wg_run.push_str(line);
+            in_wg = true;
+            continue;
+        }
+        if in_wg && line_absorbs_into_wg_run(line) {
+            wg_run.push('\n');
+            wg_run.push_str(line);
+        } else {
+            flush_wg(&mut segments, &mut wg_run, &mut in_wg);
+            text_run.push_str(line);
+            text_run.push('\n');
+        }
+    }
+    flush_wg(&mut segments, &mut wg_run, &mut in_wg);
+    if !text_run.trim().is_empty() {
+        segments.push(Segment::Text(std::mem::take(&mut text_run)));
+    }
+    if !segments
+        .iter()
+        .any(|segment| matches!(segment, Segment::Wg(_)))
+    {
+        return None;
+    }
+    let mut out = BatchResult::default();
+    let mut index = 0usize;
+    for segment in segments {
+        match segment {
+            Segment::Wg(text) => {
+                let sub = import_wg_conf(&text, "wireguard");
+                let produced = sub.configs.len() + sub.failures.len();
+                for mut failure in sub.failures {
+                    failure.index += index;
+                    out.failures.push(failure);
+                }
+                out.configs.extend(sub.configs);
+                index += produced.max(1);
+            }
+            Segment::Text(text) => {
+                let sub = import_text(&text);
+                let produced = sub.configs.len() + sub.failures.len();
+                for mut failure in sub.failures {
+                    failure.index += index;
+                    out.failures.push(failure);
+                }
+                out.configs.extend(sub.configs);
+                index += produced;
+            }
+        }
+    }
+    dedupe_names(&mut out.configs);
+    Some(out)
 }
 
 fn is_proxies_header(line: &str) -> bool {
@@ -6563,5 +6681,280 @@ mod tests {
         assert!(out.configs.is_empty(), "configs: {:?}", out.configs);
         assert_eq!(out.failures.len(), 1);
         assert_eq!(out.failures[0].code, ImportErrorKind::InvalidJson);
+    }
+
+    const T71_WG_CONF: &str = "[Interface]\nPrivateKey = wgprivkey\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = wgpubkey\nEndpoint = 203.0.113.1:51820\nAllowedIPs = 0.0.0.0/0\n";
+
+    #[test]
+    fn t71_json_fragment_imports_std_b64() {
+        let json_obj = serde_json::json!({
+            "type": "vless", "tag": "j-tag",
+            "server": "a.example.com", "server_port": 443, "uuid": UUID,
+        });
+        let body = format!("json://{}#line-name", b64(&json_obj.to_string()));
+        let out = import_subscription_body(&body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].protocol, "vless");
+        assert_eq!(out.configs[0].host, "a.example.com");
+        assert_eq!(out.configs[0].port, 443);
+        assert_eq!(
+            out.configs[0].name, "line-name",
+            "fragment wins over the tag"
+        );
+        assert_eq!(params_of(&out.configs[0])["uuid"], UUID);
+
+        let bare = format!("json://{}", b64(&json_obj.to_string()));
+        let out = import_subscription_body(&bare);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(
+            out.configs[0].name, "j-tag",
+            "tag survives without fragment"
+        );
+    }
+
+    #[test]
+    fn t71_json_fragment_imports_urlsafe_b64() {
+        let json_obj = serde_json::json!({
+            "type": "vless", "tag": "qq\u{00FF}",
+            "server": "u.example.com", "server_port": 443, "uuid": UUID,
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE.encode(json_obj.to_string());
+        assert!(
+            payload.contains('-') || payload.contains('_'),
+            "fixture uses the urlsafe alphabet: {payload}"
+        );
+        let body = format!("json://{}#url-name", payload);
+        let out = import_subscription_body(&body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 1);
+        assert_eq!(out.configs[0].name, "url-name");
+        assert_eq!(out.configs[0].host, "u.example.com");
+
+        let link_obj = serde_json::json!({
+            "type": "vless", "tag": "j-tag",
+            "server": "u.example.com", "server_port": 443, "uuid": UUID,
+        });
+        let body = format!(
+            "vless://{UUID}@a.example.com:443#link-one\njson://{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(link_obj.to_string())
+        );
+        let out = import_subscription_body(&body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 2, "link and fragment coexist");
+        assert!(out.configs.iter().any(|c| c.name == "j-tag"));
+        assert!(out.configs.iter().any(|c| c.name == "link-one"));
+    }
+
+    #[test]
+    fn t71_json_fragment_failure_reports_line_index() {
+        let body = format!(
+            "vless://{UUID}@a.example.com:443#good-one\njson://!!!#broken\nvless://{UUID}@b.example.com:443#good-two",
+        );
+        let out = import_subscription_body(&body);
+        assert_eq!(out.configs.len(), 2, "other lines still import");
+        assert_eq!(out.failures.len(), 1, "never silent: {:?}", out.failures);
+        assert_eq!(out.failures[0].index, 1, "line 2 (0-based item index)");
+        assert_eq!(out.failures[0].code, ImportErrorKind::BadBase64);
+        assert!(
+            !out.failures[0].label.contains("!!!"),
+            "label redacts: {}",
+            out.failures[0].label
+        );
+        assert!(
+            !out.failures[0].reason.contains("!!!"),
+            "reason no secret echo: {}",
+            out.failures[0].reason
+        );
+    }
+
+    #[test]
+    fn t71_wg_ini_in_body_imports_one_row_per_block() {
+        let block_two = "\n[Interface]\nPrivateKey = wgprivkey2\nAddress = 10.0.1.2/32\n\n[Peer]\nPublicKey = wgpubkey2\nEndpoint = 203.0.113.2:51821\n";
+        let body = format!(
+            "{}\nvless://{UUID}@a.example.com:443#link-one{}",
+            T71_WG_CONF, block_two
+        );
+        let out = import_subscription_body(&body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(out.configs.len(), 3, "one row per INI block plus the link");
+        let wg_rows: Vec<&ImportedConfig> = out
+            .configs
+            .iter()
+            .filter(|c| c.protocol == "wireguard")
+            .collect();
+        assert_eq!(wg_rows.len(), 2);
+        assert!(
+            out.configs
+                .iter()
+                .any(|c| c.protocol == "vless" && c.name == "link-one"),
+            "vless link row lands amid WG blocks"
+        );
+        let endpoints: Vec<String> = wg_rows
+            .iter()
+            .map(|c| {
+                params_of(c)["server"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()]
+        );
+        let keys: Vec<String> = wg_rows
+            .iter()
+            .map(|c| {
+                params_of(c)["private_key"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["wgprivkey".to_string(), "wgprivkey2".to_string()]
+        );
+        let names: Vec<&str> = wg_rows.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names[0], "wireguard-p1");
+        assert_eq!(names[1], "wireguard-p1-2", "dedupe keeps names distinct");
+    }
+
+    #[test]
+    fn t71_wg_ini_file_vs_body_params_parity() {
+        let file_out = import_file_content("wg-vpn.conf", T71_WG_CONF);
+        assert!(
+            file_out.failures.is_empty(),
+            "failures: {:?}",
+            file_out.failures
+        );
+        assert_eq!(file_out.configs.len(), 1);
+        assert_eq!(file_out.configs[0].protocol, "wireguard");
+        assert_eq!(
+            file_out.configs[0].name, "wg-vpn-p1",
+            "files name by file stem"
+        );
+        let file_params = serde_json::from_str::<serde_json::Value>(&file_out.configs[0].params)
+            .expect("params are json");
+        assert_eq!(file_params["type"], "wireguard");
+        assert_eq!(file_params["private_key"], "wgprivkey");
+        assert_eq!(file_params["public_key"], "wgpubkey");
+        assert_eq!(file_params["server"], "203.0.113.1");
+
+        let body_out = import_subscription_body(T71_WG_CONF);
+        assert!(
+            body_out.failures.is_empty(),
+            "failures: {:?}",
+            body_out.failures
+        );
+        assert_eq!(body_out.configs.len(), 1);
+        assert_eq!(body_out.configs[0].protocol, "wireguard");
+        assert_eq!(
+            body_out.configs[0].name, "wireguard-p1",
+            "bodies have no stem, keep the wireguard-stem naming"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body_out.configs[0].params)
+                .expect("params are json"),
+            file_params,
+            "import-level params identical"
+        );
+
+        let mut file_store = Store::open_in_memory().expect("store opens");
+        let file_down = {
+            let file_batch = import_file_content("wg-vpn.conf", T71_WG_CONF);
+            crate::dpapi::set_fail_for_test(true);
+            let down = commit_batch(&mut file_store, file_batch, "default");
+            crate::dpapi::set_fail_for_test(false);
+            down
+        };
+        let error = file_down.expect_err("DPAPI-down file commit aborts");
+        assert!(
+            matches!(error, crate::store::StoreError::Crypto { .. }),
+            "distinct crypto variant, got {error:?}"
+        );
+        assert!(error.to_string().contains("dpapi"), "loud dpapi cause");
+        assert!(
+            file_store.list().expect("list works").is_empty(),
+            "aborted file commit leaves no rows"
+        );
+
+        let file_batch = import_file_content("wg-vpn.conf", T71_WG_CONF);
+        let outcome =
+            commit_batch(&mut file_store, file_batch, "default").expect("file commit works");
+        assert_eq!(outcome.imported, 1);
+        assert_eq!(outcome.failures.len(), 0);
+        let file_rows = file_store.list().expect("list works");
+        assert_eq!(file_rows.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&file_rows[0].params)
+                .expect("params are json"),
+            file_params,
+            "file import lands through the dpapi1: sealed pipeline, read back identical"
+        );
+
+        let mut body_store = Store::open_in_memory().expect("store opens");
+        let sub = body_store
+            .add_subscription("Nightly", "https://example.com/sub.txt", "default", true)
+            .expect("subscription adds");
+        let body_down = {
+            crate::dpapi::set_fail_for_test(true);
+            let down = body_store.refresh_with_body(&sub.id, T71_WG_CONF, 100);
+            crate::dpapi::set_fail_for_test(false);
+            down
+        };
+        let error = body_down.expect_err("DPAPI-down body refresh aborts");
+        assert!(
+            matches!(error, crate::store::StoreError::Crypto { .. }),
+            "distinct crypto variant, got {error:?}"
+        );
+        assert!(error.to_string().contains("dpapi"), "loud dpapi cause");
+        assert!(
+            body_store.list().expect("list works").is_empty(),
+            "aborted body refresh leaves no rows"
+        );
+
+        let outcome = body_store
+            .refresh_with_body(&sub.id, T71_WG_CONF, 200)
+            .expect("refresh works");
+        assert_eq!(outcome.failures.len(), 0);
+        let body_rows = body_store.list().expect("list works");
+        assert_eq!(body_rows.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body_rows[0].params)
+                .expect("params are json"),
+            file_params,
+            "body import lands through the same dpapi1: pipeline as files"
+        );
+    }
+
+    #[test]
+    fn t71_mixed_body_processes_all_segments() {
+        let json_obj = serde_json::json!({
+            "type": "vless", "tag": "json-row",
+            "server": "j.example.com", "server_port": 443, "uuid": UUID,
+        });
+        let body = format!(
+            "json://{}#json-name\n{}\ntrojan://trojanpw@t.example.com:443#trojan-row",
+            b64(&json_obj.to_string()),
+            T71_WG_CONF
+        );
+        let out = import_subscription_body(&body);
+        assert!(out.failures.is_empty(), "failures: {:?}", out.failures);
+        assert_eq!(
+            out.configs.len(),
+            3,
+            "every segment lands: {:?}",
+            out.configs
+        );
+        assert_eq!(out.configs[0].protocol, "vless");
+        assert_eq!(out.configs[0].name, "json-name");
+        assert_eq!(params_of(&out.configs[0])["server"], "j.example.com");
+        assert_eq!(out.configs[1].protocol, "wireguard");
+        assert_eq!(out.configs[1].name, "wireguard-p1");
+        assert_eq!(params_of(&out.configs[1])["private_key"], "wgprivkey");
+        assert_eq!(out.configs[2].protocol, "trojan");
+        assert_eq!(out.configs[2].name, "trojan-row");
     }
 }
