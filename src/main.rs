@@ -96,12 +96,12 @@ use store::{
     is_virtual_protocol, now_unix, pristine_template_rewrite, protocol_params_template, proxy_urls,
     prune_duplicates_confirm_text, prune_invalid_confirm_text, prune_unavailable_confirm_text,
     rewrite_server_to_ip, row_security_label, row_server_hostname, validate_extra_params,
-    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, ChainHopSlot, ConfigPatch,
-    DialFold, ExtraFold, GroupPruneKind, HealthSnapshot, HttpFold, HysteriaFold, MuxFold,
-    NaiveFold, NewConfig, ProxyConfig, RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold,
-    SshFold, Store, StoreError, Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold,
-    TransportFold, TuicFold, WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP,
-    DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, AutoClearGroupConfig,
+    ChainHopSlot, ConfigPatch, DialFold, ExtraFold, GroupPruneKind, HealthSnapshot, HttpFold,
+    HysteriaFold, MuxFold, NaiveFold, NewConfig, ProxyConfig, RestoreOutcome, ShadowTlsFold,
+    SnellFold, SocksFold, SshFold, Store, StoreError, Subscription as ProxySubscription,
+    TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold, WireguardFold, XrayFold, DEFAULT_BIND,
+    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 actions!(
@@ -8260,6 +8260,29 @@ fn group_test_summary_toast(
     }
 }
 
+/// T-19: the toggle-on confirm's own acknowledgment text, exactly the ticket
+/// wording; skip-delete-confirm can never substitute for it.
+fn auto_clear_opt_in_note(group: &str) -> String {
+    format!(
+        "Unavailable rows in \"{group}\" will be removed automatically after group tests pass \
+         with dead rows. Running rows and the row being edited are never removed."
+    )
+}
+
+/// T-19: one summary per sweep; always plural "rows", the kept-reason list is
+/// named only when not empty, in canonical running → editing → in-flight
+/// batch order.
+fn auto_clear_summary_toast(group: &str, removed: usize, kept: &[String]) -> String {
+    if kept.is_empty() {
+        format!("Auto-cleared {removed} unavailable rows in \"{group}\"")
+    } else {
+        format!(
+            "Auto-cleared {removed} unavailable rows in \"{group}\" (kept: {})",
+            kept.join(", ")
+        )
+    }
+}
+
 fn speed_test_summary_toast(
     scope: &str,
     mode: SpeedtestMode,
@@ -10326,6 +10349,7 @@ struct GroupRowView {
     kind: String,
     quota: Option<String>,
     skip: bool,
+    auto_clear: bool,
     sub_ids: Vec<String>,
 }
 
@@ -10333,6 +10357,7 @@ fn group_row_views(
     counts: &[(String, usize)],
     subs: &[ProxySubscription],
     skip: &dyn Fn(&str) -> bool,
+    auto_clear: &dyn Fn(&str) -> bool,
     now: i64,
 ) -> Vec<GroupRowView> {
     use std::collections::BTreeMap;
@@ -10376,6 +10401,7 @@ fn group_row_views(
                 kind,
                 quota,
                 skip: skipped,
+                auto_clear: auto_clear(name),
                 sub_ids: feeding.iter().map(|sub| sub.id.clone()).collect(),
             }
         })
@@ -12124,6 +12150,10 @@ struct AppView {
 
     preset_form: Option<PresetForm>,
 
+    /// T-19: the row whose ConfigForm edit dialog is open, while it is open —
+    /// auto-clear never removes the row under edit.
+    edit_form_open: Option<String>,
+
     /// T-12: one confirmed rule-set download at a time; the explicit per-file
     /// confirm never batches.
     rule_set_download_in_flight: bool,
@@ -12298,6 +12328,7 @@ impl AppView {
             speedtest_mode: SpeedtestMode::Download,
             subs_form: None,
             preset_form: None,
+            edit_form_open: None,
             rule_set_download_in_flight: false,
             import_parse_in_flight: false,
             import_parse_epoch: 0,
@@ -12396,6 +12427,11 @@ impl AppView {
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.notify_engine_crash(window, cx);
+        // T-19: an edit dialog that left no dialog active anywhere is gone —
+        // stop protecting its row from auto-clear.
+        if self.edit_form_open.is_some() && !window.has_active_dialog(cx) {
+            self.edit_form_open = None;
+        }
         if let Err(error) = self.reload_inner_no_poll(cx) {
             window.push_notification(Notification::error(db_list_error_message(&error)), cx);
         }
@@ -13237,6 +13273,8 @@ impl AppView {
             return false;
         }
         if self.commit_row_test_url(id, raw_url, window, cx) {
+            // T-19: the edit committed — release the row-under-edit protection.
+            self.edit_form_open = None;
             return true;
         }
         *form_error.borrow_mut() = Some((
@@ -15763,22 +15801,44 @@ impl AppView {
                     view.prober = prober;
                     view.group_test_in_flight = false;
                     view.record_and_persist(&outcomes);
+                    // T-19: the sweep's outcomes are already persisted by
+                    // record_and_persist, so auto-clear consumes them through
+                    // the same snapshots the manual prune reads — no second
+                    // probe pass lives anywhere.
+                    let cleared = view.auto_clear_after_sweep(&group);
                     let (live, dead) = view.health_counts();
-                    (live, dead)
+                    (live, dead, cleared)
                 });
-                let Ok((live, dead)) = recorded else {
+                let Ok((live, dead, auto_cleared)) = recorded else {
                     return;
                 };
                 let Some(view) = weak.upgrade() else {
                     return;
                 };
                 let message = group_test_summary_toast(&group, count, live, dead, stopped);
+                let auto_text = auto_cleared
+                    .as_ref()
+                    .map(|(removed, kept)| auto_clear_summary_toast(&group, *removed, kept));
+                let auto_success = auto_cleared
+                    .as_ref()
+                    .is_some_and(|(removed, _)| *removed > 0);
                 if let Some(handle) = window {
                     if handle
                         .update(cx, |_, window, cx| {
                             view.update(cx, |view, cx| {
                                 view.reload(window, cx);
                                 window.push_notification(Notification::success(message), cx);
+                                // T-19: exactly ONE auto-clear summary per
+                                // sweep — success when rows went, info when
+                                // every candidate was protected.
+                                if let Some(auto_text) = auto_text {
+                                    let auto = if auto_success {
+                                        Notification::success(auto_text)
+                                    } else {
+                                        Notification::info(auto_text)
+                                    };
+                                    window.push_notification(auto, cx);
+                                }
                             });
                         })
                         .is_ok()
@@ -16568,6 +16628,199 @@ impl AppView {
                 cx,
             );
         }
+    }
+
+    /// T-19: end-of-group-test-sweep application. Runs after the sweep has
+    /// persisted its outcomes, so candidates come from the same health
+    /// snapshots the manual "Unavailable" prune reads — no second probe. The
+    /// ticket's protected classes (running, row under edit, in-flight refresh
+    /// batch) are excluded at the candidate-filter level; removal goes through
+    /// the shared removal pipeline. Returns one (removed, kept-reasons) pair
+    /// when a summary is warranted.
+    fn auto_clear_after_sweep(&mut self, group: &str) -> Option<(usize, Vec<String>)> {
+        if !self.store.auto_clear_enabled(group) {
+            return None;
+        }
+        let dead = match self.store.unavailable_rows_in_group(group) {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("auto-clear read failed: {error}");
+                return None;
+            }
+        };
+        if dead.is_empty() {
+            return None;
+        }
+        let editing = self.edit_form_open.clone();
+        let batch_members = self.refresh_batch_members.clone();
+        let running: HashSet<String> = self.engine.running_ids().into_iter().collect();
+        let mut skip = HashSet::new();
+        let mut reasons_seen: HashSet<&'static str> = HashSet::new();
+        for row in dead {
+            let reason = if running.contains(&row.id) {
+                Some("running")
+            } else if editing.as_deref() == Some(row.id.as_str()) {
+                Some("editing")
+            } else if row
+                .subscription_id
+                .as_deref()
+                .is_some_and(|subscription| batch_members.contains(subscription))
+            {
+                Some("in-flight batch")
+            } else {
+                None
+            };
+            if let Some(name) = reason {
+                skip.insert(row.id.clone());
+                reasons_seen.insert(name);
+            }
+        }
+        let removed = match self.store.remove_unavailable_in_group(group, &skip) {
+            Ok(rows) => rows.len(),
+            Err(error) => {
+                eprintln!("auto-clear removal failed: {error}");
+                return None;
+            }
+        };
+        let kept: Vec<String> = ["running", "editing", "in-flight batch"]
+            .iter()
+            .filter(|reason| reasons_seen.contains(**reason))
+            .map(|reason| (*reason).to_string())
+            .collect();
+        if removed == 0 && kept.is_empty() {
+            return None;
+        }
+        Some((removed, kept))
+    }
+
+    /// T-19: only this confirm's ACK enables the flag — the note is
+    /// auto-clear's own, and the store rejects any enable without note_seen.
+    fn commit_auto_clear_opt_in(
+        &mut self,
+        group: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let config = AutoClearGroupConfig {
+            enabled: true,
+            on_date: now_unix(),
+            note_seen: true,
+        };
+        match self.store.set_auto_clear_group(group, config) {
+            Ok(()) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Auto-clear unavailable enabled for \"{group}\""
+                    )),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot enable auto-clear: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn commit_auto_clear_off(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (on_date, note_seen) = match self.store.auto_clear_group(group) {
+            Some(config) => (config.on_date, config.note_seen),
+            None => (0, false),
+        };
+        let config = AutoClearGroupConfig {
+            enabled: false,
+            on_date,
+            note_seen,
+        };
+        match self.store.set_auto_clear_group(group, config) {
+            Ok(()) => {
+                self.reload(window, cx);
+                window.push_notification(
+                    Notification::success(format!(
+                        "Auto-clear unavailable disabled for \"{group}\""
+                    )),
+                    cx,
+                );
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot disable auto-clear: {error}")),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// T-19: toggling auto-clear on opens this note once per group; the sheet
+    /// origin re-opens the sheet on every exit so the switch re-reads the
+    /// store, the facet origin just lets the window redraw revert visuals.
+    fn open_auto_clear_opt_in_confirm(
+        &mut self,
+        group: &str,
+        from_groups_sheet: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let group = group.to_string();
+        let title = format!("Enable auto-clear in group \"{group}\"?");
+        let description = auto_clear_opt_in_note(&group);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let group = group.clone();
+            let description = description.clone();
+            alert
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text("Enable"),
+                )
+                .title(title.clone())
+                .description(description.clone())
+                .on_ok({
+                    let view = view.clone();
+                    let group = group.clone();
+                    move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.commit_auto_clear_opt_in(&group, window, cx);
+                            if from_groups_sheet {
+                                window.close_all_dialogs(cx);
+                                view.open_groups_dialog(window, cx);
+                            }
+                        });
+                        !from_groups_sheet
+                    }
+                })
+                .on_cancel({
+                    let view = view.clone();
+                    move |_, window, cx| {
+                        if !from_groups_sheet {
+                            return true;
+                        }
+                        view.update(cx, |exposed, cx| {
+                            window.close_all_dialogs(cx);
+                            exposed.open_groups_dialog(window, cx);
+                        });
+                        false
+                    }
+                })
+                .on_close({
+                    let view = view.clone();
+                    move |_, window, cx| {
+                        if !from_groups_sheet {
+                            return;
+                        }
+                        view.update(cx, |exposed, cx| {
+                            window.close_all_dialogs(cx);
+                            exposed.open_groups_dialog(window, cx);
+                        });
+                    }
+                })
+        });
     }
 
     fn health_store_prune_group(&mut self, group: &str) {
@@ -17768,6 +18021,10 @@ impl AppView {
         );
         let view = cx.entity();
         let id = config.id.clone();
+        // T-19: protecting the row under edit from auto-clear starts here and
+        // ends with one of the dialog's exits (commit success, footer Cancel,
+        // Esc close) plus the reload guard for anything that slips past.
+        self.edit_form_open = Some(id.clone());
         let title = format!("Edit {}", config.name);
 
         let form_error: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
@@ -17792,6 +18049,7 @@ impl AppView {
 
         let snapshot = config.clone();
         let element_view = view.clone();
+        let track_source = view.clone();
         let commit: DialogCommit = Rc::new(move |window, cx| {
             let patch = reader.as_patch_vs(cx, &snapshot);
             let url = reader.test_url.read(cx).value().to_string();
@@ -17820,6 +18078,12 @@ impl AppView {
             dialog
                 .title(title.clone())
                 .overlay_closable(false)
+                .on_close({
+                    let track_view = track_source.clone();
+                    move |_, _, cx| {
+                        track_view.update(cx, |view, _| view.edit_form_open = None);
+                    }
+                })
                 .child(form.clone().element(
                     element_view.clone(),
                     cx,
@@ -17833,12 +18097,36 @@ impl AppView {
                         .show_cancel(true)
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
-                .footer(dialog_footer(
-                    "edit-dialog-ok",
-                    "edit-dialog-cancel",
-                    footer_commit_label("edit"),
-                    commit_click,
-                ))
+                .footer(
+                    // T-19: the shared footer closes with close_all_dialogs and
+                    // would leave edit_form_open set; the Cancel click must
+                    // release the row-under-edit protection itself.
+                    DialogFooter::new()
+                        .child(
+                            Button::new("edit-dialog-cancel")
+                                .small()
+                                .label("Cancel")
+                                .on_click({
+                                    let track_view = track_source.clone();
+                                    move |_, window, cx| {
+                                        track_view.update(cx, |view, _| {
+                                            view.edit_form_open = None;
+                                        });
+                                        window.close_all_dialogs(cx);
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("edit-dialog-ok")
+                                .small()
+                                .label(footer_commit_label("edit"))
+                                .on_click(move |_, window, cx| {
+                                    if commit_click(window, cx) {
+                                        window.close_all_dialogs(cx);
+                                    }
+                                }),
+                        ),
+                )
         });
     }
 
@@ -23787,6 +24075,14 @@ impl AppView {
     ) -> impl IntoElement {
         self.sync_facet_pickers(window, cx);
         let has_facets = self.libraries.read(cx).delegate().facets_active();
+        // T-19: the facet area carries the same per-group opt-in switch for
+        // the focused group; has no group to protect by design.
+        let facet_group_now = self.libraries.read(cx).delegate().facet_group.clone();
+        let facet_auto_clear = facet_group_now
+            .as_deref()
+            .map(|group| self.store.auto_clear_enabled(group))
+            .unwrap_or(false);
+        let facet_auto_view = cx.entity();
 
         let (group_tip, protocol_tip, status_tip) = {
             let libraries = self.libraries.read(cx);
@@ -23883,6 +24179,50 @@ impl AppView {
                         view.open_groups_dialog(window, cx);
                     })),
             )
+            .child(match facet_group_now {
+                Some(group) => {
+                    let slug = slugify_group_id(&group);
+                    div()
+                        .id(format!("facet-auto-clear-{slug}"))
+                        .test_support()
+                        .child(
+                            Switch::new(format!("facet-auto-clear-switch-{slug}"))
+                                .checked(facet_auto_clear)
+                                .label("Auto-clear unavailable")
+                                .tooltip(
+                                    "Opt-in per group: after this group's URL test ends, its \
+                                     unavailable rows are removed automatically. Running rows \
+                                     and the row being edited are never removed; enabling asks \
+                                     its own confirmation.",
+                                )
+                                .accessibility_label(format!(
+                                    "Auto-clear unavailable rows in group \"{group}\" after group tests"
+                                ))
+                                .on_change({
+                                    let facet_auto_view = facet_auto_view.clone();
+                                    move |next: &bool, window, cx| {
+                                        let view = facet_auto_view.clone();
+                                        if *next {
+                                            view.update(cx, |view, cx| {
+                                                view.open_auto_clear_opt_in_confirm(
+                                                    &group, false, window, cx,
+                                                )
+                                            });
+                                        } else {
+                                            view.update(cx, |view, cx| {
+                                                view.commit_auto_clear_off(&group, window, cx)
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
+                        .into_any_element()
+                }
+                None => div()
+                    .id("facet-auto-clear-idle")
+                    .test_support()
+                    .into_any_element(),
+            })
             .child(if has_facets {
                 Button::new("clear-facets")
                     .small()
@@ -24579,8 +24919,18 @@ impl AppView {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        // T-19: auto-clear opt-ins snapshot at sheet open; every toggle
+        // re-opens this sheet so the switch always reads the store.
+        let auto_flagged: HashSet<String> =
+            self.store.auto_clear_enabled_groups().into_iter().collect();
 
-        let rows = group_row_views(&counts, &subs, &|group| flagged.contains(group), now_unix());
+        let rows = group_row_views(
+            &counts,
+            &subs,
+            &|group| flagged.contains(group),
+            &|group| auto_flagged.contains(group),
+            now_unix(),
+        );
         let commit: DialogCommit = Rc::new(|_, _| true);
 
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
@@ -24689,8 +25039,6 @@ impl AppView {
                     );
                 }
                 buttons = buttons.child(
-
-
                     Button::new(format!("group-delete-{slug}"))
                         .label("Delete")
                         .on_click(move |_, window, cx| {
@@ -24701,12 +25049,48 @@ impl AppView {
                         }),
                 );
 
+                // T-19: the sheet render is a snapshot; the toggle never writes
+                // silently — enable opens this switch's own confirm note, and
+                // both handlers re-open the sheet to re-read the store.
+                let auto_view = view.clone();
+                let auto_group = row.name.clone();
+                let auto_switch = Switch::new(format!("group-auto-clear-{slug}"))
+                    .checked(row.auto_clear)
+                    .label("Auto-clear unavailable")
+                    .tooltip(
+                        "Opt-in per group: after this group's URL test ends, its unavailable \
+                         rows are removed automatically. Running rows and the row being edited \
+                         are never removed; enabling asks its own confirmation.",
+                    )
+                    .accessibility_label(format!(
+                        "Auto-clear unavailable rows in group \"{}\" after group tests",
+                        row.name
+                    ))
+                    .on_change(move |next: &bool, window, cx| {
+                        let group = auto_group.clone();
+                        let view = auto_view.clone();
+                        if *next {
+                            view.update(cx, |view, cx| {
+                                view.open_auto_clear_opt_in_confirm(&group, true, window, cx)
+                            });
+                        } else {
+                            view.update(cx, |view, cx| {
+                                view.commit_auto_clear_off(&group, window, cx)
+                            });
+                        }
+                    });
 
                 let mut column = div()
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(buttons)
+                    .child(
+                        div()
+                            .id(format!("group-auto-clear-{slug}"))
+                            .test_support()
+                            .child(auto_switch),
+                    )
                     .child(
                         div()
                             .id(format!("group-kind-{slug}"))
@@ -26245,7 +26629,7 @@ mod tests {
     use std::rc::Rc;
 
     use crate::engine::AutoRestartConfig;
-    use crate::store::{NewConfig, Store};
+    use crate::store::{AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError};
     use crate::AppView;
     use gpui_kit::component::dialog::Dialog;
     use gpui_kit::component::{Root, WindowExt};
@@ -42921,6 +43305,7 @@ mod tests {
             &counts,
             &subs,
             &|group| store.group_skip_refresh(group),
+            &|_| false,
             now,
         );
         assert_eq!(rows.len(), 3, "union of row groups + fed groups");
@@ -50175,6 +50560,332 @@ mod tests {
                 .bulk_label()),
             "1 checked (of 1 visible)",
             "arrows keep the checks"
+        );
+    }
+
+    fn t19_auto_clear_seed(name: &str, port: &str, group: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: "{\"type\":\"vless\",\"server\":\"198.51.100.9\",\"server_port\":443,\
+                \"uuid\":\"11111111-2222-4333-8444-555555555555\",\"encryption\":\"none\",\
+                \"security\":\"tls\",\"sni\":\"198.51.100.9\",\"network\":\"tcp\"}"
+                .to_string(),
+            group: group.to_string(),
+            bind_ip: String::new(),
+            port: port.to_string(),
+        }
+    }
+
+    fn t19_dead_snapshot(id: &str, error: &str) -> HealthSnapshot {
+        HealthSnapshot {
+            config_id: id.to_string(),
+            at: 1,
+            kind: "url-test".to_string(),
+            latency_ms: None,
+            error: Some(error.to_string()),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn t69_sweep_clears_only_dead_excluding_running_and_editing(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let live = store
+            .add(t19_auto_clear_seed("Live", "10931", "g"))
+            .expect("add live works");
+        let failing = store
+            .add(t19_auto_clear_seed("Fail", "10932", "g"))
+            .expect("add fail works");
+        let guarded = store
+            .add(t19_auto_clear_seed("Guarded", "10933", "g"))
+            .expect("add guarded works");
+        let followed = store
+            .add(t19_auto_clear_seed("Followed", "10934", "g"))
+            .expect("add followed works");
+        let free = store
+            .add(t19_auto_clear_seed("Free", "10935", "g"))
+            .expect("add free works");
+
+        // Followed belongs to a subscription: stamp it as such through the
+        // export/restore fidelity path so the row-level batch exclusion has a
+        // real subscription to see.
+        let payload = store.export_library_json().expect("export works");
+        let mut value: serde_json::Value = serde_json::from_str(&payload).expect("payload parses");
+        for entry in value
+            .get_mut("library")
+            .and_then(|v| v.as_array_mut())
+            .into_iter()
+            .flatten()
+        {
+            if entry.get("id").and_then(serde_json::Value::as_str) == Some(followed.id.as_str()) {
+                entry["subscription_id"] = serde_json::Value::String("sub-e".to_string());
+            }
+        }
+        let mut store = Store::open_in_memory().expect("re-open works");
+        store
+            .restore_library_json(&value.to_string())
+            .expect("restore works");
+        // Dead snapshots live only in the source store — export/restore
+        // carries the library, not health state — so seed them on the
+        // restored store the sweep will consume.
+        for id in [&guarded.id, &followed.id, &free.id] {
+            store
+                .save_health_snapshot(&t19_dead_snapshot(id, "upstream refused"))
+                .expect("dead snapshot works");
+        }
+        store
+            .set_auto_clear_group(
+                "g",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 5,
+                    note_seen: true,
+                },
+            )
+            .expect("flag enables");
+
+        let (view, cx) = mount_view(store, cx);
+
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+                view.refresh_batch_members.insert("sub-e".to_string());
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().set_facet_group(Some("g".to_string()));
+                });
+                view.start_row(&live.id, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&failing.id, window, cx));
+        });
+        cx.run_until_parked();
+        // Simulate the edit dialog for Guarded being open while the sweep
+        // runs: opened after the starts above (commit_start_selected's
+        // reload drops a stale marker before the dialog truly opened).
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.edit_form_open = Some(guarded.id.clone());
+            });
+        });
+        let running = view.read_with(cx, |view, _| view.engine.running_ids());
+        assert!(
+            running.contains(&live.id) && running.contains(&failing.id),
+            "Live and Fail run while Guarded/Followed/Free stay stopped: {running:?}"
+        );
+        handle.script_latency(&live.id, 21);
+        handle.script_failure(&failing.id, "upstream refused");
+
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.test_group_health(window, cx));
+        });
+        cx.run_until_parked();
+
+        let names: Vec<String> = view.read_with(cx, |view, _| {
+            view.store
+                .list()
+                .expect("list works")
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        });
+        assert!(
+            !names.contains(&"Free".to_string())
+                && names.contains(&"Live".to_string())
+                && names.contains(&"Fail".to_string())
+                && names.contains(&"Guarded".to_string())
+                && names.contains(&"Followed".to_string()),
+            "auto-clear removed exactly the unprotected dead row: {names:?}"
+        );
+        assert_eq!(
+            notification_count(cx),
+            before + 2,
+            "sweep summary plus ONE auto-clear summary, nothing else"
+        );
+    }
+
+    #[test]
+    fn t69_summary_notification_names_count_and_kept() {
+        use crate::auto_clear_summary_toast;
+
+        // Exact ticket wording: count always named, always plural "rows",
+        // kept reasons named only when non-empty, canonical order.
+        assert_eq!(
+            auto_clear_summary_toast("g", 1, &["running".to_string(), "editing".to_string()],),
+            "Auto-cleared 1 unavailable rows in \"g\" (kept: running, editing)",
+        );
+        assert_eq!(
+            auto_clear_summary_toast(
+                "g",
+                2,
+                &[
+                    "running".to_string(),
+                    "editing".to_string(),
+                    "in-flight batch".to_string(),
+                ],
+            ),
+            "Auto-cleared 2 unavailable rows in \"g\" (kept: running, editing, \
+             in-flight batch)",
+        );
+        assert_eq!(
+            auto_clear_summary_toast("g", 3, &[]),
+            "Auto-cleared 3 unavailable rows in \"g\"",
+            "nothing kept: no kept clause",
+        );
+        assert_eq!(
+            auto_clear_summary_toast("g", 0, &["editing".to_string()]),
+            "Auto-cleared 0 unavailable rows in \"g\" (kept: editing)",
+            "all candidates protected: count names the zero",
+        );
+        assert_eq!(
+            auto_clear_summary_toast("travel", 1, &["running".to_string()]),
+            "Auto-cleared 1 unavailable rows in \"travel\" (kept: running)",
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t69_skip_delete_confirm_is_not_a_bypass(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::health::FakeHealthProber;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.set_skip_delete_confirm(true).expect("skip set");
+        let live = store
+            .add(t19_auto_clear_seed("Live", "10941", "g"))
+            .expect("add live works");
+        let stray = store
+            .add(t19_auto_clear_seed("Stray", "10942", "g"))
+            .expect("add stray works");
+        store
+            .save_health_snapshot(&t19_dead_snapshot(&stray.id, "upstream refused"))
+            .expect("dead snapshot works");
+        // Meta AUTO_CLEAR_GROUPS deliberately absent: skip-delete-confirm must
+        // never arm the sweep auto-clear by itself.
+
+        let (view, cx) = mount_view(store, cx);
+        let (prober, handle) = FakeHealthProber::shared();
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+                view.prober = Box::new(prober);
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&live.id, window, cx));
+        });
+        cx.run_until_parked();
+        handle.script_latency(&live.id, 21);
+
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |state, _| {
+                    state.delegate_mut().set_facet_group(Some("g".to_string()));
+                });
+                view.test_group_health(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "sweep summary only — no auto-clear notice without the opt-in"
+        );
+        let names: Vec<String> = view.read_with(cx, |view, _| {
+            view.store
+                .list()
+                .expect("list works")
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        });
+        assert!(
+            names.contains(&"Stray".to_string()),
+            "skip-delete-confirm removed nothing: {names:?}"
+        );
+
+        // And the data-layer note gate still refuses with skip-delete-confirm
+        // on: acknowledgment, not bypass.
+        let refused = cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store
+                    .set_auto_clear_group(
+                        "g",
+                        AutoClearGroupConfig {
+                            enabled: true,
+                            on_date: 1,
+                            note_seen: false,
+                        },
+                    )
+                    .is_err()
+            })
+        });
+        assert!(
+            refused,
+            "enable without note_seen stays an error while skip-delete-confirm is set"
+        );
+    }
+
+    #[test]
+    fn t69_optin_confirm_note_required() {
+        use crate::auto_clear_opt_in_note;
+
+        // The toggle-on dialog posts this exact ticket wording as its own ACK;
+        // skip-delete-confirm never replaces it.
+        assert_eq!(
+            auto_clear_opt_in_note("g"),
+            "Unavailable rows in \"g\" will be removed automatically after group tests pass \
+             with dead rows. Running rows and the row being edited are never removed.",
+        );
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let refused = store.set_auto_clear_group(
+            "g",
+            AutoClearGroupConfig {
+                enabled: true,
+                on_date: 5,
+                note_seen: false,
+            },
+        );
+        assert!(
+            matches!(refused, Err(StoreError::Invalid(_))),
+            "enable without the note ACK is an Invalid error"
+        );
+        assert!(
+            !store.auto_clear_enabled("g"),
+            "refused enable leaves the flag off"
+        );
+        store
+            .set_auto_clear_group(
+                "g",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 5,
+                    note_seen: true,
+                },
+            )
+            .expect("note ACK enables");
+        assert!(
+            store.auto_clear_enabled("g"),
+            "confirmed opt-in arms the flag"
         );
     }
 

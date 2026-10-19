@@ -480,6 +480,17 @@ fn map_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthSnapshot>
     })
 }
 
+/// T-19: per-group opt-in for auto-clear-unavailable. Groups are free-text
+/// field values (no groups table) and rename_group remaps them, so the flags
+/// live in one JSON meta map keyed by normalized group name and
+/// rename_group migrates its keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoClearGroupConfig {
+    pub enabled: bool,
+    pub on_date: i64,
+    pub note_seen: bool,
+}
+
 pub fn parse_port_field(raw: &str) -> Result<Option<u16>, FieldError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
@@ -4447,6 +4458,14 @@ impl Store {
                 self.conn
                     .execute("DELETE FROM meta WHERE key = ?1", params![old_key])?;
             }
+            // T-19: the auto-clear flag follows the renamed group; when the
+            // new name already carries its own entry it wins, and the stale
+            // old key never lingers.
+            let mut auto_clear_groups = self.auto_clear_groups_map();
+            if let Some(migrated) = auto_clear_groups.remove(&old) {
+                auto_clear_groups.entry(new.clone()).or_insert(migrated);
+                self.auto_clear_groups_write(&auto_clear_groups)?;
+            }
         }
         Ok(GroupRenameOutcome {
             rows: changed,
@@ -7242,6 +7261,103 @@ impl Store {
         }
     }
 
+    pub const META_AUTO_CLEAR_GROUPS: &str = "auto_clear_groups";
+
+    /// T-19: normalized group name → opt-in config; absent or malformed meta
+    /// reads as off everywhere.
+    fn auto_clear_groups_map(&self) -> BTreeMap<String, AutoClearGroupConfig> {
+        match self.get_meta(Self::META_AUTO_CLEAR_GROUPS) {
+            Ok(Some(raw)) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .filter_map(|(group, entry)| {
+                            Some((
+                                group,
+                                AutoClearGroupConfig {
+                                    enabled: entry.get("enabled")?.as_bool()?,
+                                    on_date: entry.get("on_date")?.as_i64()?,
+                                    note_seen: entry.get("note_seen")?.as_bool()?,
+                                },
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    fn auto_clear_groups_write(
+        &mut self,
+        map: &BTreeMap<String, AutoClearGroupConfig>,
+    ) -> Result<(), StoreError> {
+        let entries: serde_json::Map<String, serde_json::Value> = map
+            .iter()
+            .map(|(group, config)| {
+                (
+                    group.clone(),
+                    serde_json::json!({
+                        "enabled": config.enabled,
+                        "on_date": config.on_date,
+                        "note_seen": config.note_seen,
+                    }),
+                )
+            })
+            .collect();
+        self.set_meta(
+            Self::META_AUTO_CLEAR_GROUPS,
+            &serde_json::Value::Object(entries).to_string(),
+        )
+    }
+
+    pub fn auto_clear_group(&self, group: &str) -> Option<AutoClearGroupConfig> {
+        self.auto_clear_groups_map()
+            .get(&normalized_group(group))
+            .cloned()
+    }
+
+    pub fn auto_clear_enabled(&self, group: &str) -> bool {
+        self.auto_clear_groups_map()
+            .get(&normalized_group(group))
+            .is_some_and(|config| config.enabled)
+    }
+
+    pub fn auto_clear_enabled_groups(&self) -> Vec<String> {
+        self.auto_clear_groups_map()
+            .into_iter()
+            .filter(|(_, config)| config.enabled)
+            .map(|(group, _)| group)
+            .collect()
+    }
+
+    /// Enabling without `note_seen` is rejected here — skip-delete-confirm
+    /// cannot act as a bypass for auto-clear's own acknowledgment.
+    pub fn set_auto_clear_group(
+        &mut self,
+        group: &str,
+        config: AutoClearGroupConfig,
+    ) -> Result<(), StoreError> {
+        let group = normalized_group(group);
+        if group.is_empty() {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "group",
+                "Group name cannot be empty",
+            )]));
+        }
+        if config.enabled && !config.note_seen {
+            return Err(StoreError::Invalid(vec![FieldError::new(
+                "auto_clear",
+                "auto-clear opt-in note not confirmed",
+            )]));
+        }
+        let mut map = self.auto_clear_groups_map();
+        map.insert(group, config);
+        self.auto_clear_groups_write(&map)
+    }
+
     pub fn save_running_snapshot(&mut self, ids: &[String]) -> Result<(), StoreError> {
         let known: HashSet<String> = {
             let mut stmt = self.conn.prepare("SELECT id FROM proxy_configs")?;
@@ -7693,6 +7809,179 @@ mod tests {
             other.group_skip_refresh("team"),
             "skip flag survives export/restore"
         );
+    }
+
+    #[test]
+    fn t69_auto_clear_groups_meta_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert!(!store.auto_clear_enabled("travel"), "absent meta is off");
+        assert!(store.auto_clear_enabled_groups().is_empty());
+        assert_eq!(store.auto_clear_group("travel"), None);
+
+        // Enabling without the note ACK never reaches the meta map.
+        let error = store
+            .set_auto_clear_group(
+                "travel",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 111,
+                    note_seen: false,
+                },
+            )
+            .expect_err("note_seen=false cannot enable");
+        assert!(
+            error.to_string().contains("opt-in note"),
+            "guard names the note, got {error}"
+        );
+        assert_eq!(store.auto_clear_group("travel"), None);
+
+        // The confirmed opt-in persists; lookups trim the key like every
+        // other group-level op.
+        store
+            .set_auto_clear_group(
+                "  travel  ",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 222,
+                    note_seen: true,
+                },
+            )
+            .expect("confirmed opt-in writes");
+        assert!(store.auto_clear_enabled("travel"));
+        assert_eq!(
+            store.auto_clear_enabled_groups(),
+            vec!["travel".to_string()]
+        );
+
+        // Toggling off keeps the entry (and its audit fields) so the rename
+        // migration carries extinguished flags too.
+        store
+            .set_auto_clear_group(
+                "travel",
+                AutoClearGroupConfig {
+                    enabled: false,
+                    on_date: 222,
+                    note_seen: true,
+                },
+            )
+            .expect("off writes");
+        assert!(!store.auto_clear_enabled("travel"));
+        assert!(store.auto_clear_group("travel").is_some());
+
+        store
+            .set_auto_clear_group(
+                "travel",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 333,
+                    note_seen: true,
+                },
+            )
+            .expect("re-enable writes");
+        let empty = store
+            .set_auto_clear_group(
+                " ",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 1,
+                    note_seen: true,
+                },
+            )
+            .expect_err("blank group name rejected");
+        let StoreError::Invalid(fields) = empty else {
+            panic!("expected Invalid for blank group")
+        };
+        assert!(fields.iter().any(|e| e.field == "group"));
+
+        // Malformed or incomplete JSON means off, never enabled.
+        store
+            .set_meta(Store::META_AUTO_CLEAR_GROUPS, "not-json")
+            .expect("meta overwrite works");
+        assert!(!store.auto_clear_enabled("travel"));
+        assert!(store.auto_clear_enabled_groups().is_empty());
+        assert_eq!(store.auto_clear_group("travel"), None);
+        store
+            .set_meta(
+                Store::META_AUTO_CLEAR_GROUPS,
+                r#"{"travel": {"enabled": true, "on_date": 5}}"#,
+            )
+            .expect("meta overwrite works");
+        assert!(
+            !store.auto_clear_enabled("travel"),
+            "entries missing note_seen never enable"
+        );
+    }
+
+    #[test]
+    fn t69_group_rename_carries_flag() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .set_auto_clear_group(
+                "alpha",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 10,
+                    note_seen: true,
+                },
+            )
+            .expect("enable alpha");
+        store.rename_group("alpha", "beta").expect("rename works");
+        assert!(!store.auto_clear_enabled("alpha"), "old label unflagged");
+        assert!(store.auto_clear_enabled("beta"), "flag follows rename");
+        let config = store.auto_clear_group("beta").expect("entry moved");
+        assert_eq!(config.on_date, 10, "opt-in date rides along");
+        assert!(config.note_seen, "note ACK rides along");
+
+        // Extinguished flags migrate too, so no stale key lingers and the
+        // opt-in history survives the rename.
+        store
+            .set_auto_clear_group(
+                "beta",
+                AutoClearGroupConfig {
+                    enabled: false,
+                    on_date: 10,
+                    note_seen: true,
+                },
+            )
+            .expect("disable keeps entry");
+        store.rename_group("beta", "gamma").expect("rename works");
+        assert!(
+            store.auto_clear_group("gamma").is_some(),
+            "off entry carries too"
+        );
+        assert!(!store.auto_clear_enabled("gamma"));
+        assert_eq!(store.auto_clear_group("beta"), None);
+
+        // When both names already carry entries the target's own wins and the
+        // stale source key is dropped outright.
+        store
+            .set_auto_clear_group(
+                "delta",
+                AutoClearGroupConfig {
+                    enabled: false,
+                    on_date: 7,
+                    note_seen: true,
+                },
+            )
+            .expect("delta off entry");
+        store
+            .set_auto_clear_group(
+                "epsilon",
+                AutoClearGroupConfig {
+                    enabled: true,
+                    on_date: 9,
+                    note_seen: true,
+                },
+            )
+            .expect("epsilon on entry");
+        store
+            .rename_group("delta", "epsilon")
+            .expect("merge rename works");
+        let kept = store
+            .auto_clear_group("epsilon")
+            .expect("target entry kept");
+        assert!(kept.enabled && kept.on_date == 9, "target's own entry wins");
+        assert!(!store.auto_clear_enabled("delta"), "source key dropped");
     }
 
     #[test]
