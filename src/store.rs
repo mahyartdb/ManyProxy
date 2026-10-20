@@ -3789,6 +3789,74 @@ fn unique_name_suffix(ts: i64) -> String {
     format!("{ts}-{}-{n}", std::process::id())
 }
 
+/// T-32: the persisted window rectangle in gpui logical points — the payload
+/// behind [`Store::META_GEOMETRY`]. Absent or corrupt meta reads as `None`, so
+/// the caller keeps its own default rectangle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl WindowGeometry {
+    /// T-32: the same minimums `app_window_options` hands the window, kept
+    /// here so a restored rectangle can never seed a window below them.
+    pub const MIN_WIDTH: f32 = 880.;
+    pub const MIN_HEIGHT: f32 = 620.;
+
+    /// T-32: the sane position box — anything further out is clamped rather
+    /// than dropped, so even a hand-edited row lands somewhere visible.
+    pub const POSITION_MIN: f32 = -999.;
+    pub const POSITION_MAX: f32 = 9999.;
+
+    /// T-32: the persistence clamp. Non-finite input reads as no geometry at
+    /// all; size bottoms out at the window minimums and position at the box.
+    pub fn clamped(self) -> Option<Self> {
+        if ![self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return None;
+        }
+        Some(Self {
+            x: self.x.clamp(Self::POSITION_MIN, Self::POSITION_MAX),
+            y: self.y.clamp(Self::POSITION_MIN, Self::POSITION_MAX),
+            width: self.width.max(Self::MIN_WIDTH),
+            height: self.height.max(Self::MIN_HEIGHT),
+        })
+    }
+
+    /// Canonical meta payload: `{"x":320,"y":180,"width":1280,"height":900}`.
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+            self.x, self.y, self.width, self.height
+        )
+    }
+
+    /// Tolerant read: anything that is not a complete numeric object, or that
+    /// cannot be made sane, reads as no geometry.
+    pub fn from_json(raw: &str) -> Option<Self> {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str(raw.trim()) else {
+            return None;
+        };
+        let number = |key: &str| {
+            map.get(key)
+                .and_then(|value| value.as_f64())
+                .map(|value| value as f32)
+        };
+        Self {
+            x: number("x")?,
+            y: number("y")?,
+            width: number("width")?,
+            height: number("height")?,
+        }
+        .clamped()
+    }
+}
+
 pub struct Store {
     conn: Connection,
 
@@ -3835,6 +3903,22 @@ impl Store {
     pub fn set_query_only_for_test(&self) -> Result<(), StoreError> {
         self.conn.execute_batch("PRAGMA query_only = ON;")?;
         Ok(())
+    }
+
+    /// T-32: read-only peek at one meta value for startup, before the real
+    /// store opens. Never creates, migrates, or quarantines anything — any
+    /// problem (missing file, corrupt library, locked database) reads as
+    /// `None`, leaving the app's own open path fully in charge of recovery.
+    pub fn peek_meta_readonly(path: &Path, key: &str) -> Option<String> {
+        if !path.exists() {
+            return None;
+        }
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags).ok()?;
+        let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = ?1").ok()?;
+        stmt.query_row(params![key], |row| row.get::<_, String>(0))
+            .ok()
     }
 
     pub fn open_file(path: &Path) -> Result<Self, StoreError> {
@@ -7875,6 +7959,26 @@ impl Store {
             Self::META_LOG_MAX_LINES,
             &crate::health::clamp_log_max_lines(cap).to_string(),
         )
+    }
+
+    /// T-32: the last clean-exit window rectangle, additive beside the other
+    /// meta keys. Absent or corrupt reads as `None` — the pre-feature default.
+    pub const META_GEOMETRY: &str = "geometry";
+
+    pub fn window_geometry(&self) -> Option<WindowGeometry> {
+        match self.get_meta(Self::META_GEOMETRY) {
+            Ok(Some(raw)) => WindowGeometry::from_json(&raw),
+            _ => None,
+        }
+    }
+
+    /// T-32: stores the clamped rectangle; a geometry that cannot be made sane
+    /// writes nothing, so the next launch keeps the previous or default shape.
+    pub fn set_window_geometry(&mut self, geometry: WindowGeometry) -> Result<(), StoreError> {
+        match geometry.clamped() {
+            Some(sane) => self.set_meta(Self::META_GEOMETRY, &sane.to_json()),
+            None => Ok(()),
+        }
     }
 
     pub const CONN_COLUMNS: [(&str, u32); 5] = [
@@ -16796,5 +16900,139 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// T-32: the window rectangle rides the meta family as
+    /// `{x,y,width,height}` logical points; an absent key writes nothing.
+    #[test]
+    fn t82_geometry_meta_round_trip() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "absent meta reads as no geometry"
+        );
+        assert_eq!(
+            store.get_meta(Store::META_GEOMETRY).expect("meta read"),
+            None,
+            "the default writes no meta row"
+        );
+
+        let geometry = WindowGeometry {
+            x: 320.,
+            y: 180.,
+            width: 1280.,
+            height: 900.,
+        };
+        store
+            .set_window_geometry(geometry)
+            .expect("geometry writes");
+        assert_eq!(
+            store.window_geometry(),
+            Some(geometry),
+            "geometry round-trips"
+        );
+        assert_eq!(
+            store.window_geometry().expect("geometry reads").to_json(),
+            r#"{"x":320,"y":180,"width":1280,"height":900}"#,
+            "the payload is the plain JSON rectangle"
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t82-geometry-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(store.window_geometry(), None, "a fresh file store defaults");
+            store
+                .set_window_geometry(geometry)
+                .expect("geometry writes");
+        }
+        let store = Store::open_file(&path).expect("reopen works");
+        assert_eq!(
+            store.window_geometry(),
+            Some(geometry),
+            "geometry survives a restart"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// T-32: width/height never read back below the 880×620 window minimum and
+    /// x/y land inside the -999..9999 sane box, whichever side wrote the row.
+    #[test]
+    fn t82_geometry_clamps_respect_mins() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+
+        let tiny_far_away = WindowGeometry {
+            x: -50_000.,
+            y: 42_000.,
+            width: 100.,
+            height: 50.,
+        };
+        store
+            .set_window_geometry(tiny_far_away)
+            .expect("geometry writes");
+        assert_eq!(
+            store.window_geometry(),
+            Some(WindowGeometry {
+                x: WindowGeometry::POSITION_MIN,
+                y: WindowGeometry::POSITION_MAX,
+                width: WindowGeometry::MIN_WIDTH,
+                height: WindowGeometry::MIN_HEIGHT,
+            }),
+            "the setter clamps before writing"
+        );
+
+        store
+            .set_meta(
+                Store::META_GEOMETRY,
+                r#"{"x":-99999,"y":99999,"width":10,"height":10}"#,
+            )
+            .expect("hand-edited row writes");
+        assert_eq!(
+            store.window_geometry(),
+            Some(WindowGeometry {
+                x: WindowGeometry::POSITION_MIN,
+                y: WindowGeometry::POSITION_MAX,
+                width: WindowGeometry::MIN_WIDTH,
+                height: WindowGeometry::MIN_HEIGHT,
+            }),
+            "the getter clamps a row that bypassed the setter"
+        );
+
+        store
+            .set_meta(Store::META_GEOMETRY, r#"{"x":0,"y":0,"width":1280}"#)
+            .expect("partial row writes");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "a partial rectangle reads as no geometry"
+        );
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![Store::META_GEOMETRY],
+            )
+            .expect("meta row clears");
+        store
+            .set_window_geometry(WindowGeometry {
+                x: f32::NAN,
+                y: 0.,
+                width: 1280.,
+                height: 900.,
+            })
+            .expect("a non-finite write is refused, not stored");
+        assert_eq!(
+            store.get_meta(Store::META_GEOMETRY).expect("meta read"),
+            None,
+            "a non-finite rectangle leaves no row behind"
+        );
     }
 }

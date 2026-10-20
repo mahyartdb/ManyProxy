@@ -103,7 +103,8 @@ use store::{
     HysteriaFold, LibrarySort, LibrarySortKey, MuxFold, NaiveFold, NewConfig, ProxyConfig,
     RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SortDirection, SshFold, Store, StoreError,
     Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
-    WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    WindowGeometry, WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL,
+    VALID_PROTOCOLS,
 };
 
 actions!(
@@ -190,18 +191,39 @@ pub fn window_title_text(running: usize) -> String {
     format!("{APP_TITLE}{}", running_title_suffix(running))
 }
 
-fn app_window_options() -> WindowOptions {
+fn app_window_options(geometry: Option<WindowGeometry>) -> WindowOptions {
     let mut options = TitleBar::window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some(APP_TITLE.into());
     }
 
-    options.window_bounds = Some(WindowBounds::Windowed(Bounds::new(
-        point(px(0.), px(0.)),
-        size(px(1000.), px(700.)),
-    )));
-    options.window_min_size = Some(size(px(880.), px(620.)));
+    // T-32: a sane stored rectangle seeds the window; absent, corrupt, or
+    // non-finite meta keeps today's fixed 1000×700 at (0, 0) — first run.
+    let bounds = geometry.and_then(WindowGeometry::clamped).map_or_else(
+        || Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(700.))),
+        |geometry| {
+            Bounds::new(
+                point(px(geometry.x), px(geometry.y)),
+                size(px(geometry.width), px(geometry.height)),
+            )
+        },
+    );
+    options.window_bounds = Some(WindowBounds::Windowed(bounds));
+    options.window_min_size = Some(size(
+        px(WindowGeometry::MIN_WIDTH),
+        px(WindowGeometry::MIN_HEIGHT),
+    ));
     options
+}
+
+/// T-32: the persisted rectangle, read before the window exists — the only
+/// point `app_window_options` can seed `WindowBounds` from. A missing file, an
+/// unreadable store, or an absent/corrupt key all read as `None`, which is
+/// exactly today's startup rectangle.
+fn stored_window_geometry() -> Option<WindowGeometry> {
+    Store::peek_meta_readonly(&Store::default_path(), Store::META_GEOMETRY)
+        .as_deref()
+        .and_then(WindowGeometry::from_json)
 }
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -15275,7 +15297,7 @@ impl AppView {
         close_confirm_description(&self.running_names_for_close())
     }
 
-    fn confirm_close_stop(&mut self) {
+    fn confirm_close_stop(&mut self, window: &Window) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
             for row in &rows {
@@ -15285,7 +15307,29 @@ impl AppView {
             }
         }
         self.snapshot_running_set(&[]);
+        self.save_window_geometry(window);
         self.close_confirmed = true;
+    }
+
+    /// T-32: mirrors the window rectangle into meta on the same orderly-exit
+    /// paths `snapshot_running_set` already uses. A killed process keeps the
+    /// last clean-exit save — the snapshot's own tolerance. Maximized
+    /// rectangles are not persisted (out of scope): the pre-maximize windowed
+    /// rect from the previous clean exit stays current.
+    fn save_window_geometry(&mut self, window: &Window) {
+        if !matches!(window.window_bounds(), WindowBounds::Windowed(_)) {
+            return;
+        }
+        let bounds = window.bounds();
+        let geometry = WindowGeometry {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+        };
+        if let Err(error) = self.store.set_window_geometry(geometry) {
+            eprintln!("window geometry save failed: {error}");
+        }
     }
 
     fn snapshot_running_set(&mut self, running: &[String]) {
@@ -15364,7 +15408,7 @@ impl AppView {
             }
         }
         if actions.contains(&crate::tray::TrayAction::Quit) {
-            self.quit_from_tray();
+            self.quit_from_tray(window);
             return true;
         }
         for action in actions {
@@ -15412,7 +15456,7 @@ impl AppView {
                 self.show_window_from_tray(window, cx);
                 self.copy_config_folder(window, cx);
             }
-            crate::tray::TrayAction::Quit => self.quit_from_tray(),
+            crate::tray::TrayAction::Quit => self.quit_from_tray(window),
         }
     }
 
@@ -15436,7 +15480,7 @@ impl AppView {
         );
     }
 
-    fn quit_from_tray(&mut self) {
+    fn quit_from_tray(&mut self, window: &Window) {
         self.engine.stop_all();
         if let Ok(rows) = self.store.list() {
             for row in &rows {
@@ -15446,6 +15490,7 @@ impl AppView {
             }
         }
         self.snapshot_running_set(&[]);
+        self.save_window_geometry(window);
 
         self.tray = None;
     }
@@ -28302,12 +28347,13 @@ fn main() {
     let launch_intake = std::env::args()
         .skip(1)
         .find_map(|arg| classify_open_with(&arg));
+    let startup_geometry = stored_window_geometry();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
 
         bind_app_keys(cx);
         cx.spawn(async move |cx| {
-            cx.open_window(app_window_options(), |window, cx| {
+            cx.open_window(app_window_options(startup_geometry), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 view.update(cx, |view, cx| {
                     view.refresh_due_on_startup_deferred(cx);
@@ -28381,7 +28427,7 @@ fn main() {
                                     .description(description)
                                     .on_ok(move |_, window, cx| {
                                         confirm_view.update(cx, |view, _| {
-                                            view.confirm_close_stop();
+                                            view.confirm_close_stop(window);
                                         });
                                         window.remove_window();
                                         true
@@ -28405,13 +28451,15 @@ mod tests {
     use std::rc::Rc;
 
     use crate::engine::AutoRestartConfig;
-    use crate::store::{AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError};
+    use crate::store::{
+        AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError, WindowGeometry,
+    };
     use crate::AppView;
     use crate::ExitTraffic;
     use gpui_kit::component::dialog::Dialog;
     use gpui_kit::component::{Root, WindowExt};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{px, size, AppContext, Entity, TestAppContext};
+    use gpui_kit::{point, px, size, AppContext, Entity, TestAppContext};
 
     fn seed_input(name: &str) -> NewConfig {
         NewConfig {
@@ -28426,7 +28474,7 @@ mod tests {
 
     #[test]
     fn window_options_carry_app_title() {
-        let options = crate::app_window_options();
+        let options = crate::app_window_options(None);
         let title = options
             .titlebar
             .expect("titlebar options")
@@ -28437,7 +28485,7 @@ mod tests {
 
     #[test]
     fn window_options_carry_startup_size() {
-        let options = crate::app_window_options();
+        let options = crate::app_window_options(None);
         let bounds = options
             .window_bounds
             .expect("startup window bounds")
@@ -28447,6 +28495,90 @@ mod tests {
         let min = options.window_min_size.expect("startup window minimum");
         assert_eq!(min.width, gpui_kit::px(880.));
         assert_eq!(min.height, gpui_kit::px(620.));
+    }
+
+    /// T-32: a sane stored rectangle seeds the startup window; a stored
+    /// rectangle under the minimums can never seed a smaller window.
+    #[test]
+    fn t82_app_options_seeds_stored_geometry() {
+        let stored = WindowGeometry {
+            x: 240.,
+            y: 120.,
+            width: 1280.,
+            height: 900.,
+        };
+        let options = crate::app_window_options(Some(stored));
+        let bounds = options
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(240.), px(120.)));
+        assert_eq!(bounds.size, size(px(1280.), px(900.)));
+        let min = options.window_min_size.expect("startup window minimum");
+        assert_eq!(min, size(px(880.), px(620.)), "minimums are unchanged");
+
+        let undersized = crate::app_window_options(Some(WindowGeometry {
+            x: 0.,
+            y: 0.,
+            width: 100.,
+            height: 100.,
+        }));
+        let bounds = undersized
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(
+            bounds.size,
+            size(px(880.), px(620.)),
+            "a stored rectangle below the minimums seeds the minimums"
+        );
+    }
+
+    /// T-32: no stored meta — or a corrupt payload — leaves the startup
+    /// rectangle indistinguishable from today's fixed 1000×700 at (0, 0).
+    #[test]
+    fn t82_default_bounds_when_meta_absent_or_corrupt() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+
+        let absent = crate::app_window_options(store.window_geometry());
+        let bounds = absent
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(0.), px(0.)));
+        assert_eq!(bounds.size, size(px(1000.), px(700.)));
+
+        store
+            .set_meta(Store::META_GEOMETRY, "not json at all")
+            .expect("junk writes");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "corrupt JSON reads as absent"
+        );
+        let corrupt = crate::app_window_options(store.window_geometry());
+        let bounds = corrupt
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(0.), px(0.)));
+        assert_eq!(bounds.size, size(px(1000.), px(700.)));
+
+        store
+            .set_meta(Store::META_GEOMETRY, r#"{"x":40,"y":40}"#)
+            .expect("partial payload writes");
+        assert_eq!(
+            store.window_geometry(),
+            None,
+            "a partial rectangle reads as absent"
+        );
+        let partial = crate::app_window_options(store.window_geometry());
+        let bounds = partial
+            .window_bounds
+            .expect("startup window bounds")
+            .get_bounds();
+        assert_eq!(bounds.origin, point(px(0.), px(0.)));
+        assert_eq!(bounds.size, size(px(1000.), px(700.)));
     }
 
     #[test]
@@ -28800,10 +28932,15 @@ mod tests {
         let view = stash.borrow().clone().expect("AppView stashed");
 
         assert_eq!(view.read_with(cx, |view, _| view.close_veto_text()), None);
-        cx.update(|_, cx| {
-            view.update(cx, |view, _| view.confirm_close_stop());
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.confirm_close_stop(window));
         });
         assert!(view.read_with(cx, |view, _| view.close_confirmed));
+        assert!(
+            view.read_with(cx, |view, _| view.store.window_geometry())
+                .is_some(),
+            "confirm-close also persists the window rectangle (T-32)"
+        );
         assert_eq!(view.read_with(cx, |view, _| view.close_veto_text()), None);
     }
 
@@ -51768,10 +51905,32 @@ mod tests {
             vec![row.id.clone()]
         );
 
-        cx.update(|_, cx| {
-            view.update(cx, |view, _| view.quit_from_tray());
+        cx.simulate_resize(size(px(1120.), px(760.)));
+        let live_bounds = cx.update(|window, _| window.bounds());
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
         });
         assert_eq!(view.read_with(cx, |view, _| view.engine.running_count()), 0);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.window_geometry()),
+            Some(
+                WindowGeometry {
+                    x: f32::from(live_bounds.origin.x),
+                    y: f32::from(live_bounds.origin.y),
+                    width: f32::from(live_bounds.size.width),
+                    height: f32::from(live_bounds.size.height),
+                }
+                .clamped()
+                .expect("the harness window has finite bounds")
+            ),
+            "tray quit saves the live rectangle (T-32)"
+        );
+        assert_eq!(
+            f32::from(live_bounds.size.width),
+            1120.,
+            "the simulated resize is what gets saved"
+        );
         assert!(
             view.read_with(cx, |view, _| view.store.load_running_snapshot())
                 .is_empty(),
