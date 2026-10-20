@@ -63,10 +63,10 @@ use gpui_kit::*;
 use qrcodegen::{QrCode, QrCodeEcc};
 
 use engine::{
-    engine_binary_file_name, fork_binary_file_name, lan_confirm_description, lan_confirm_text,
-    lan_exposure_warning, requires_lan_confirm, resolve_engine_binary, resolve_fork_binary,
-    resolve_xray_binary, strip_ansi_codes, xray_binary_file_name, AutoRestartConfig,
-    EngineController, EngineError, LAN_CONFIRM_TITLE,
+    engine_binary_file_name, fork_binary_file_name, is_custom_config_protocol,
+    lan_confirm_description, lan_confirm_text, lan_exposure_warning, requires_lan_confirm,
+    resolve_engine_binary, resolve_fork_binary, resolve_xray_binary, strip_ansi_codes,
+    xray_binary_file_name, AutoRestartConfig, EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
     clamp_log_max_lines, format_speed_result, outcome_is_neutral, ping_all, redact_secrets,
@@ -410,6 +410,83 @@ fn about_body(
     out
 }
 
+/// T-33: one row of the per-row bind picker. The id carries the row so two
+/// rows never register the same option path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindHostChoice {
+    id: String,
+    value: String,
+}
+
+impl SearchableListItem for BindHostChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.value.clone().into()
+    }
+
+    fn value(&self) -> &String {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BindHostChoiceList(Vec<BindHostChoice>);
+
+impl BindHostChoiceList {
+    fn for_row(row_id: &str, hosts: &[String]) -> Self {
+        Self(
+            hosts
+                .iter()
+                .map(|host| BindHostChoice {
+                    id: format!("row-bind-option-{row_id}-{host}"),
+                    value: host.clone(),
+                })
+                .collect(),
+        )
+    }
+}
+
+impl SearchableListDelegate for BindHostChoiceList {
+    type Item = BindHostChoice;
+
+    fn items_count(&self, _section: usize) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&BindHostChoice> {
+        self.0.get(ix.row)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        BindHostChoice: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.0
+            .iter()
+            .position(|choice| choice.value() == value)
+            .map(IndexPath::new)
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &BindHostChoice,
+        _checked: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            div()
+                .id(item.id.clone())
+                .test_support()
+                .child(item.value.clone())
+                .into_any_element(),
+        )
+    }
+}
+
 struct LibraryDelegate {
     rows: Vec<ProxyConfig>,
     search_index: Vec<RowSearchIndex>,
@@ -459,11 +536,28 @@ struct LibraryDelegate {
     endpoint_inputs: HashMap<String, RowEndpointInputs>,
 
     pending_endpoint_commits: Vec<String>,
+
+    /// T-33: the bind-address menu every per-row picker draws from — constants
+    /// first, then the persisted extras. Pushed from the store on reload, so a
+    /// Settings edit reaches every picker on the next paint.
+    bind_hosts: Vec<String>,
 }
 
 struct RowEndpointInputs {
+    /// The draft holder for both control shapes: the free-text field on
+    /// custom-config rows, and the value a pick writes on every other row.
     bind: Entity<InputState>,
     port: Entity<InputState>,
+    /// T-33: the picker for rows whose listen comes from the generated config.
+    /// Custom-config rows never draw it.
+    picker: Entity<SelectState<BindHostChoiceList>>,
+    /// The host list the picker was last built from.
+    picker_hosts: Vec<String>,
+    /// The value the picker was last told to show, so a stable row does not
+    /// re-select on every paint.
+    picker_selected: Option<String>,
+    /// A confirmed pick waiting for the window-aware paint step to apply it.
+    pick_pending: Option<String>,
     _subs: Vec<Subscription>,
     clean_bind: String,
     clean_port: String,
@@ -934,7 +1028,15 @@ impl LibraryDelegate {
             app_view: None,
             endpoint_inputs: HashMap::new(),
             pending_endpoint_commits: Vec::new(),
+            bind_hosts: Store::BIND_HOST_CONSTANTS
+                .iter()
+                .map(|host| host.to_string())
+                .collect(),
         }
+    }
+
+    fn set_bind_hosts(&mut self, hosts: Vec<String>) {
+        self.bind_hosts = hosts;
     }
 
     fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
@@ -993,8 +1095,18 @@ impl LibraryDelegate {
                 .placeholder("auto")
                 .default_value(port_default.to_string())
         });
+        let hosts = self.bind_hosts.clone();
+        let picker = cx.new(|cx| {
+            let choices = BindHostChoiceList::for_row(row_id, &hosts);
+            let selected = choices
+                .0
+                .iter()
+                .position(|choice| choice.value == bind_default)
+                .map(IndexPath::new);
+            SelectState::new(choices, selected, window, cx)
+        });
 
-        let mut subs = Vec::with_capacity(2);
+        let mut subs = Vec::with_capacity(3);
         for state in [&bind, &port] {
             let id = row_id.to_string();
             subs.push(cx.subscribe(
@@ -1013,16 +1125,46 @@ impl LibraryDelegate {
                 },
             ));
         }
+        let pick_id = row_id.to_string();
+        subs.push(cx.subscribe(
+            &picker,
+            move |list: &mut ListState<Self>,
+                  _emitter: Entity<SelectState<BindHostChoiceList>>,
+                  event: &SelectEvent<BindHostChoiceList>,
+                  cx: &mut Context<ListState<Self>>| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                list.delegate_mut().queue_bind_pick(&pick_id, value);
+                cx.notify();
+            },
+        ));
         self.endpoint_inputs.insert(
             row_id.to_string(),
             RowEndpointInputs {
                 bind,
                 port,
+                picker,
+                picker_hosts: hosts,
+                picker_selected: Some(bind_default.to_string()),
+                pick_pending: None,
                 _subs: subs,
                 clean_bind: bind_default.to_string(),
                 clean_port: port_default.to_string(),
             },
         );
+    }
+
+    /// T-33: one confirmed pick — from the picker's Confirm event, or a test
+    /// driving the same seam. The host lands in the bind draft, and the row is
+    /// queued for the ordinary endpoint commit so `save_listen_gate` runs on it.
+    fn queue_bind_pick(&mut self, row_id: &str, host: &str) {
+        if let Some(inputs) = self.endpoint_inputs.get_mut(row_id) {
+            inputs.pick_pending = Some(host.to_string());
+        }
+        if !self.pending_endpoint_commits.iter().any(|id| id == row_id) {
+            self.pending_endpoint_commits.push(row_id.to_string());
+        }
     }
 
     fn sync_row_inputs(
@@ -1033,9 +1175,17 @@ impl LibraryDelegate {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let hosts = self.bind_hosts.clone();
         let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
             return;
         };
+        if let Some(pick) = inputs.pick_pending.take() {
+            if inputs.bind.read(cx).value().as_str() != pick {
+                inputs
+                    .bind
+                    .update(cx, |state, cx| state.set_value(pick.clone(), window, cx));
+            }
+        }
         let bind_current = inputs.bind.read(cx).value().to_string();
         let port_current = inputs.port.read(cx).value().to_string();
         if !inputs.bind.focus_handle(cx).is_focused(window)
@@ -1055,6 +1205,32 @@ impl LibraryDelegate {
                 state.set_value(port_stored.to_string(), window, cx)
             });
             inputs.clean_port = port_stored.to_string();
+        }
+        if inputs.picker_hosts != hosts {
+            inputs.picker_hosts = hosts.clone();
+            inputs.picker_selected = None;
+            let choices = BindHostChoiceList::for_row(row_id, &hosts);
+            inputs
+                .picker
+                .update(cx, |state, cx| state.set_items(choices, window, cx));
+        }
+        // A bind the list no longer holds (a hand-edited row) leaves the picker
+        // empty rather than inventing an entry — the list stays the authority.
+        let current = inputs.bind.read(cx).value().to_string();
+        if inputs.picker_selected.as_deref() != Some(current.as_str())
+            && hosts.iter().any(|host| host == &current)
+        {
+            inputs.picker.update(cx, |state, cx| {
+                state.set_selected_value(&current, window, cx)
+            });
+            inputs.picker_selected = Some(current);
+        } else if !hosts.iter().any(|host| host == &current) && inputs.picker_selected.is_some() {
+            // The selected value left the list: drop the selection so the
+            // picker shows its placeholder instead of a vanished host.
+            inputs
+                .picker
+                .update(cx, |state, cx| state.set_selected_index(None, window, cx));
+            inputs.picker_selected = None;
         }
     }
 
@@ -1108,6 +1284,7 @@ impl LibraryDelegate {
             });
             inputs.clean_bind = row.bind_ip;
             inputs.clean_port = port_stored;
+            inputs.pick_pending = None;
             self.pending_endpoint_commits.retain(|id| id != row_id);
         }
         dirty
@@ -1596,11 +1773,20 @@ impl ListDelegate for LibraryDelegate {
                 });
             }
         }
-        let (bind_state, port_state) = self
+        let (bind_state, port_state, bind_picker) = self
             .endpoint_inputs
             .get(&row_id)
-            .map(|inputs| (inputs.bind.clone(), inputs.port.clone()))
+            .map(|inputs| {
+                (
+                    inputs.bind.clone(),
+                    inputs.port.clone(),
+                    inputs.picker.clone(),
+                )
+            })
             .expect("R3: row editors ensured above");
+        // T-33: custom-config rows stay JSON-governed — their listen comes from
+        // the document, so they keep the free-text bind field (no picker).
+        let custom_config_row = is_custom_config_protocol(&row.protocol);
 
         let item = ListItem::new(format!("library-row-{}", row.id))
             .selected(selected)
@@ -1842,23 +2028,71 @@ impl ListDelegate for LibraryDelegate {
                                 }
                             }
                         }))
-                        .child(
+                        .child(if custom_config_row {
                             div()
                                 .id(format!("row-bind-{row_id}"))
                                 .test_support()
                                 .w(px(118.))
                                 .tooltip({
                                     let tip = format!(
-                                        "Serve bind address for \"{}\" — Enter commits, Esc reverts",
+                                        "Serve bind address for \"{}\" — Enter commits, Esc reverts \
+                                         (custom config: listens come from the JSON)",
                                         row.name
                                     );
                                     move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
                                 })
-                                .child(Input::new(&bind_state).id(format!("row-bind-input-{row_id}")).small().aria_label(format!(
-                                    "Serve bind address for {}",
-                                    row.name
-                                ))),
-                        )
+                                .child(
+                                    Input::new(&bind_state)
+                                        .id(format!("row-bind-input-{row_id}"))
+                                        .small()
+                                        .aria_label(format!("Serve bind address for {}", row.name)),
+                                )
+                                .into_any_element()
+                        } else {
+                            div()
+                                .id(format!("row-bind-{row_id}"))
+                                .test_support()
+                                .w(px(118.))
+                                .tooltip({
+                                    let tip = format!(
+                                        "Serve bind address for \"{}\" — pick one from the address \
+                                         list (Settings → Addresses); port stays free-text",
+                                        row.name
+                                    );
+                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
+                                })
+                                .child(
+                                    Select::new(&bind_picker)
+                                        .id(format!("row-bind-picker-{row_id}"))
+                                        .small()
+                                        .placeholder("pick address")
+                                        .accessibility_label(format!(
+                                            "Serve bind address for {}",
+                                            row.name
+                                        )),
+                                )
+                                .into_any_element()
+                        })
+                        .children((!custom_config_row).then(|| {
+                            let add_app = self.app_view.clone();
+                            let add_tip = format!(
+                                "Add address… — opens Settings → Addresses; the list is the only \
+                                 source for row binds, \"{}\"",
+                                row.name
+                            );
+                            Button::new(format!("row-bind-add-{row_id}"))
+                                .small()
+                                .label("Add…")
+                                .accessibility_label("Add address…")
+                                .tooltip(add_tip)
+                                .on_click(move |_, window, cx| {
+                                    if let Some(app) = add_app.clone() {
+                                        app.update(cx, |view, cx| {
+                                            view.open_settings_dialog(window, cx);
+                                        });
+                                    }
+                                })
+                        }))
                         .child(
                             div()
                                 .id(format!("row-port-{row_id}"))
@@ -9920,6 +10154,14 @@ fn field_error_target(error: &StoreError) -> Option<(&'static str, String)> {
     }
 }
 
+/// T-33: the message a Settings field shows inline — the field's own sentence
+/// when the store named one, otherwise the error's display text.
+fn store_error_text(error: &StoreError) -> String {
+    field_error_target(error)
+        .map(|(_, message)| message)
+        .unwrap_or_else(|| error.to_string())
+}
+
 fn bind_port_collision_warning(
     rows: &[ProxyConfig],
     exclude_id: Option<&str>,
@@ -13394,6 +13636,10 @@ impl AppView {
     }
 
     fn with_store(window: &mut Window, cx: &mut Context<Self>, store: Store) -> Self {
+        let mut store = store;
+        // T-33: the first read seeds the address list once (constants + every
+        // row's current bind); every later read is the stored extras alone.
+        let bind_hosts = store.bind_hosts();
         let libraries = cx.new(|cx| {
             ListState::new(LibraryDelegate::new(), window, cx)
                 .searchable(false)
@@ -13411,6 +13657,7 @@ impl AppView {
             state.delegate_mut().set_row_columns(row_columns);
             state.delegate_mut().set_sort(sort);
             state.delegate_mut().query = last_query;
+            state.delegate_mut().set_bind_hosts(bind_hosts);
             list_cx.notify();
         });
 
@@ -13658,6 +13905,7 @@ impl AppView {
 
     fn reload_inner_impl(&mut self, cx: &mut Context<Self>, poll: bool) -> Result<(), StoreError> {
         let rows = self.store.list()?;
+        let bind_hosts = self.store.bind_hosts();
         self.drain_engine_logs(&rows);
 
         if poll {
@@ -13692,6 +13940,7 @@ impl AppView {
         }
         self.libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_rows(rows);
+            state.delegate_mut().set_bind_hosts(bind_hosts);
             state.delegate_mut().set_health(health);
 
             state.delegate_mut().set_health_tone(health_tones);
@@ -15653,6 +15902,63 @@ impl AppView {
         }
     }
 
+    /// T-33: adds one address to the list the row pickers draw from. The store
+    /// owns validation (IP literals only, no duplicates); the message it returns
+    /// is exactly what the Settings field shows inline.
+    fn commit_add_bind_host(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<String>, String> {
+        match self.store.add_bind_host(raw) {
+            Ok(hosts) => {
+                self.refresh_bind_hosts(cx);
+                window
+                    .push_notification(Notification::success(format!("Added {}", raw.trim())), cx);
+                Ok(hosts)
+            }
+            Err(error) => {
+                let message = store_error_text(&error);
+                window.push_notification(Notification::error(message.clone()), cx);
+                Err(message)
+            }
+        }
+    }
+
+    /// T-33: removes one extra. The store refuses constants and any bind a row
+    /// still uses; that refusal names the blocking row(s) and lands inline.
+    fn commit_remove_bind_host(
+        &mut self,
+        host: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<String>, String> {
+        match self.store.remove_bind_host(host) {
+            Ok(hosts) => {
+                self.refresh_bind_hosts(cx);
+                window.push_notification(Notification::success(format!("Removed {host}")), cx);
+                Ok(hosts)
+            }
+            Err(error) => {
+                let message = store_error_text(&error);
+                window.push_notification(Notification::error(message.clone()), cx);
+                Err(message)
+            }
+        }
+    }
+
+    /// T-33: pushes the current list into every picker at once — a Settings edit
+    /// is visible in all rows on the next paint.
+    fn refresh_bind_hosts(&mut self, cx: &mut Context<Self>) {
+        let hosts = self.store.bind_hosts();
+        self.libraries.update(cx, |list, cx| {
+            list.delegate_mut().set_bind_hosts(hosts);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         let autostart_state = Rc::new(RefCell::new(crate::tray::autostart_enabled()));
@@ -15701,6 +16007,13 @@ impl AppView {
         self.log_cap_input = Some(cap_state.clone());
         let db_path = Store::default_path().display().to_string();
         let export_path = Store::default_export_path().display().to_string();
+        // T-33: the Settings address list is the single authority the row
+        // pickers draw from. The dialog edits these cells; every commit goes
+        // through the store, then the delegate's copied list is refreshed.
+        let bind_hosts_cell = Rc::new(RefCell::new(self.store.bind_hosts()));
+        let bind_host_error_cell: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let bind_host_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 192.168.1.20 or fd00::7"));
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
 
 
@@ -15741,6 +16054,8 @@ impl AppView {
             let clear_traffic_view = test_url_view.clone();
             let clear_health_view = test_url_view.clone();
             let clear_snapshot_view = test_url_view.clone();
+            let bind_hosts_render_cell = bind_hosts_cell.clone();
+            let bind_host_error_render_cell = bind_host_error_cell.clone();
             dialog
                 .title("Settings")
                 .child(
@@ -16240,6 +16555,133 @@ impl AppView {
                                     .collect::<Vec<_>>(),
                             ),
                         )
+                        .child(
+                            div()
+                                .id("settings-section-addresses")
+                                .test_support()
+                                .text_sm()
+                                .child("Addresses"),
+                        )
+                        .child(
+                            div()
+                                .id("settings-addresses-note")
+                                .test_support()
+                                .child(
+                                    "Rows pick their serve address from this list; ports stay \
+                                     free-text. 127.0.0.1 and 0.0.0.0 are built in and cannot be \
+                                     removed. Add IPv4/IPv6 literals only — no hostnames. A host a \
+                                     row still uses cannot be removed.",
+                                ),
+                        )
+                        .child({
+                            let mut list = div().flex().flex_col().gap_1();
+                            for host in bind_hosts_render_cell.borrow().clone() {
+                                let constant =
+                                    Store::BIND_HOST_CONSTANTS.contains(&host.as_str());
+                                let mut host_row = div()
+                                    .id(format!("settings-bind-host-{host}"))
+                                    .test_support()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id(format!("settings-bind-host-value-{host}"))
+                                            .test_support()
+                                            .child(host.clone()),
+                                    );
+                                if constant {
+                                    host_row = host_row.child(
+                                        div()
+                                            .id(format!("settings-bind-host-builtin-{host}"))
+                                            .test_support()
+                                            .child("built in"),
+                                    );
+                                } else {
+                                    let remove_view = view.clone();
+                                    let remove_host = host.clone();
+                                    let remove_cell = bind_hosts_cell.clone();
+                                    let remove_error = bind_host_error_cell.clone();
+                                    host_row = host_row.child(
+                                        Button::new(format!(
+                                            "settings-bind-host-remove-{host}"
+                                        ))
+                                        .small()
+                                        .label("Remove")
+                                        .accessibility_label(format!("Remove {host}"))
+                                        .on_click(move |_, window, cx| {
+                                            let remove_host = remove_host.clone();
+                                            let remove_cell = remove_cell.clone();
+                                            let remove_error = remove_error.clone();
+                                            remove_view.update(cx, |view, cx| {
+                                                match view.commit_remove_bind_host(
+                                                    &remove_host,
+                                                    window,
+                                                    cx,
+                                                ) {
+                                                    Ok(hosts) => {
+                                                        *remove_error.borrow_mut() = None;
+                                                        *remove_cell.borrow_mut() = hosts;
+                                                    }
+                                                    Err(message) => {
+                                                        *remove_error.borrow_mut() =
+                                                            Some(message);
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        }),
+                                    );
+                                }
+                                list = list.child(host_row);
+                            }
+                            list
+                        })
+                        .child(dialog_field(
+                            "field-settings-bind-host",
+                            "Add address (IPv4 or IPv6 literal)",
+                            bind_host_input.clone(),
+                        ))
+                        .child({
+                            let add_view = view.clone();
+                            let add_input = bind_host_input.clone();
+                            let add_cell = bind_hosts_cell.clone();
+                            let add_error = bind_host_error_cell.clone();
+                            Button::new("settings-bind-host-add")
+                                .label("Add address")
+                                .on_click(move |_, window, cx| {
+                                    let raw = add_input.read(cx).value().to_string();
+                                    let add_input = add_input.clone();
+                                    let add_cell = add_cell.clone();
+                                    let add_error = add_error.clone();
+                                    add_view.update(cx, |view, cx| {
+                                        match view.commit_add_bind_host(&raw, window, cx) {
+                                            Ok(hosts) => {
+                                                add_input.update(cx, |state, cx| {
+                                                    state.set_value(String::new(), window, cx)
+                                                });
+                                                *add_error.borrow_mut() = None;
+                                                *add_cell.borrow_mut() = hosts;
+                                            }
+                                            Err(message) => {
+                                                *add_error.borrow_mut() = Some(message);
+                                            }
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                        })
+                        .child({
+                            let error_text = bind_host_error_render_cell
+                                .borrow()
+                                .clone()
+                                .unwrap_or_default();
+                            div()
+                                .id("settings-bind-host-error")
+                                .test_support()
+                                .child(error_text)
+                        })
                         .child(
                             div().id("settings-tray-note").test_support().child(
                                 "Closing the window hides to the tray while endpoints run; \
@@ -47630,9 +48072,11 @@ mod tests {
         }
 
         let (bind_w, port_w) = cx.update(|window, _| {
+            // T-33: generated-config rows bind through the picker; the port
+            // keeps the free-text input.
             let bind = window
-                .try_find(format!("row-bind-input-{}", alpha.id))
-                .expect("bind input renders")
+                .try_find(format!("row-bind-picker-{}", alpha.id))
+                .expect("bind picker renders")
                 .bounds()
                 .size
                 .width;
@@ -47646,7 +48090,7 @@ mod tests {
         });
         assert!(
             bind_w > px(100.) && bind_w < px(136.),
-            "bind field holds its 118px cell, got {bind_w:?}"
+            "bind picker holds its 118px cell, got {bind_w:?}"
         );
         assert!(
             port_w > px(60.) && port_w < px(92.),
@@ -56872,6 +57316,338 @@ mod tests {
         assert!(
             cx.update(|window, _| window.try_find("runtime-stat-9").is_some()),
             "the process summary keeps the ten-line body"
+        );
+    }
+
+    // T-33: the bind picker and the Settings address list.
+
+    fn t83_bind_hosts_of(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Vec<String> {
+        cx.update(|_, cx| view.update(cx, |view, _| view.store.bind_hosts()))
+    }
+
+    fn t83_draft_bind(view: &Entity<AppView>, id: &str, cx: &mut VisualTestContext) -> String {
+        view.read_with(cx, |view, cx| {
+            view.libraries
+                .read(cx)
+                .delegate()
+                .endpoint_draft_texts(id, cx)
+                .expect("row inputs exist")
+                .0
+        })
+    }
+
+    fn t83_pending_pick(view: &Entity<AppView>, id: &str, host: &str, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.libraries.update(cx, |list, cx| {
+                    list.delegate_mut().queue_bind_pick(id, host);
+                    cx.notify();
+                });
+            });
+        });
+        paint_frame(cx);
+    }
+
+    #[gpui_kit::test]
+    fn t83_hostname_rejected_in_list_editor(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Loop", "10951"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+
+        let error = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host("example.com", window, cx)
+                })
+            })
+            .expect_err("a hostname never enters the list");
+        assert_eq!(
+            error,
+            Store::BIND_HOST_LITERAL_ONLY,
+            "the inline error is the field's own sentence"
+        );
+        assert_eq!(
+            t83_bind_hosts_of(&view, cx),
+            vec!["127.0.0.1".to_string(), "0.0.0.0".to_string()],
+            "a rejected add leaves the list untouched"
+        );
+
+        let hosts = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host(" 192.168.1.20 ", window, cx)
+                })
+            })
+            .expect("an IPv4 literal is accepted");
+        assert_eq!(
+            hosts,
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+            ],
+            "the literal lands after the constants"
+        );
+        let duplicate = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host("192.168.1.20", window, cx)
+                })
+            })
+            .expect_err("duplicates are refused");
+        assert!(
+            duplicate.contains("already in the list"),
+            "duplicate refusal reads inline: {duplicate}"
+        );
+        let ipv6 = cx
+            .update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.commit_add_bind_host("FD00:0::7", window, cx)
+                })
+            })
+            .expect("an IPv6 literal is accepted");
+        assert_eq!(
+            ipv6.last().map(String::as_str),
+            Some("fd00::7"),
+            "IPv6 lands canonical"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_settings_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        for id in [
+            "settings-section-addresses",
+            "settings-addresses-note",
+            "settings-bind-host-127.0.0.1",
+            "settings-bind-host-builtin-127.0.0.1",
+            "settings-bind-host-0.0.0.0",
+            "settings-bind-host-builtin-0.0.0.0",
+            "settings-bind-host-192.168.1.20",
+            "settings-bind-host-remove-192.168.1.20",
+            "settings-bind-host-error",
+            "settings-bind-host-add",
+            "field-settings-bind-host",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "the Settings list editor renders {id}"
+            );
+        }
+        assert_absent(cx, "settings-bind-host-remove-127.0.0.1".to_string());
+    }
+
+    #[gpui_kit::test]
+    fn t83_picker_drives_existing_save_gate(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let alpha = store
+            .add(t30_engine_seed("Alpha", "10951"))
+            .expect("seed works");
+        store.add_bind_host("192.168.1.44").expect("extra accepted");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+
+        assert_painted(cx, &format!("row-bind-picker-{}", alpha.id));
+        assert_absent(cx, format!("row-bind-input-{}", alpha.id));
+        assert_painted(cx, &format!("row-bind-add-{}", alpha.id));
+
+        t83_pending_pick(&view, &alpha.id, "192.168.1.44", cx);
+        assert_eq!(
+            t83_draft_bind(&view, &alpha.id, cx),
+            "192.168.1.44",
+            "the pick writes the row's bind draft"
+        );
+        let selected = view.read_with(cx, |view, cx| {
+            let list = view.libraries.read(cx);
+            list.delegate()
+                .endpoint_inputs
+                .get(&alpha.id)
+                .expect("row inputs exist")
+                .picker
+                .read(cx)
+                .selected_value()
+                .cloned()
+        });
+        assert_eq!(
+            selected.as_deref(),
+            Some("192.168.1.44"),
+            "the picker shows the picked host"
+        );
+
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_endpoint(&alpha.id, window, cx)
+            })
+        });
+        assert!(committed, "the ordinary endpoint commit applies the pick");
+        let saved = view
+            .read_with(cx, |view, _| view.store.get(&alpha.id))
+            .expect("store reads")
+            .expect("row survives");
+        assert_eq!(saved.bind_ip, "192.168.1.44");
+        assert_eq!(saved.port, 10951, "the free-text port is untouched");
+
+        // The gate is still the only writer: a draft the picker can never
+        // produce (a hostname) is refused and nothing lands.
+        let before = notification_count(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let list = view.libraries.read(cx).delegate().endpoint_inputs[&alpha.id]
+                    .bind
+                    .clone();
+                list.update(cx, |state, cx| state.set_value("example.com", window, cx));
+            });
+        });
+        let refused = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_row_endpoint(&alpha.id, window, cx)
+            })
+        });
+        assert!(!refused, "save_listen_gate refuses a hostname draft");
+        assert_eq!(
+            notification_count(cx),
+            before + 1,
+            "the refusal toasts the gate's reason"
+        );
+        let kept = view
+            .read_with(cx, |view, _| view.store.get(&alpha.id))
+            .expect("store reads")
+            .expect("row survives");
+        assert_eq!(
+            kept.bind_ip, "192.168.1.44",
+            "the refused draft saves nothing"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t83_lan_confirm_unchanged_for_nonloopback_pick(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let lan = store
+            .add(t30_engine_seed("Lan", "10961"))
+            .expect("seed works");
+        let loopback = store
+            .add(t30_engine_seed("Loop", "10962"))
+            .expect("seed works");
+        store.add_bind_host("192.168.1.44").expect("extra accepted");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        paint_frame(cx);
+
+        t83_pending_pick(&view, &lan.id, "192.168.1.44", cx);
+        let committed = cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_row_endpoint(&lan.id, window, cx))
+        });
+        assert!(committed);
+        let saved = view
+            .read_with(cx, |view, _| view.store.get(&lan.id))
+            .expect("store reads")
+            .expect("row survives");
+        assert_eq!(saved.bind_ip, "192.168.1.44");
+        assert!(
+            crate::engine::requires_lan_confirm(&saved.bind_ip),
+            "a non-loopback pick still asks"
+        );
+        let text = crate::engine::lan_confirm_text(&saved.name, &saved.bind_ip);
+        assert!(
+            text.contains("Lan") && text.contains("192.168.1.44"),
+            "the unchanged confirm text names the row and bind: {text}"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&lan.id, window, cx));
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "Start on a non-loopback bind opens the same LAN confirm"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            0,
+            "nothing starts before the confirm"
+        );
+        cx.update(|window, cx| window.close_all_dialogs(cx));
+
+        assert!(
+            !crate::engine::requires_lan_confirm("127.0.0.1"),
+            "loopback keeps its no-confirm path"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_row(&loopback.id, window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.engine.running_count()),
+            1,
+            "a loopback row starts without a dialog"
+        );
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn t83_custom_config_rows_unaffected(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let params = "{\"inbounds\":[{\"type\":\"mixed\",\"listen\":\"0.0.0.0\",\
+            \"listen_port\":10970}]}";
+        let custom = store
+            .add(NewConfig {
+                name: "Custom".to_string(),
+                protocol: "custom-config".to_string(),
+                params: params.to_string(),
+                group: String::new(),
+                bind_ip: String::new(),
+                port: "10970".to_string(),
+            })
+            .expect("custom-config row seeds");
+        let generated = store
+            .add(t30_engine_seed("Generated", "10971"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        paint_frame(cx);
+
+        assert!(
+            crate::engine::is_custom_config_protocol(&custom.protocol),
+            "the row is JSON-governed"
+        );
+        assert_painted(cx, &format!("row-bind-input-{}", custom.id));
+        assert_absent(cx, format!("row-bind-picker-{}", custom.id));
+        assert_absent(cx, format!("row-bind-add-{}", custom.id));
+        assert_painted(cx, &format!("row-bind-picker-{}", generated.id));
+
+        let listens = crate::engine::custom_config_listens(
+            &serde_json::from_str::<serde_json::Value>(&custom.params).expect("params are JSON"),
+        );
+        assert_eq!(
+            listens,
+            vec![("0.0.0.0".to_string(), 10970)],
+            "the custom listen still comes from the JSON document"
+        );
+
+        // A list edit reaches the generated rows and leaves the custom row's
+        // free-text bind alone.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_add_bind_host("192.168.1.20", window, cx)
+            })
+        })
+        .expect("extra accepted");
+        paint_frame(cx);
+        assert_painted(cx, &format!("row-bind-input-{}", custom.id));
+        assert_absent(cx, format!("row-bind-picker-{}", custom.id));
+        assert_eq!(
+            t83_draft_bind(&view, &custom.id, cx),
+            "127.0.0.1",
+            "the custom row keeps its own bind draft"
         );
     }
 }

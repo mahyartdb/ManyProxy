@@ -1176,6 +1176,55 @@ fn validated_bind(raw: &str, errors: &mut Vec<FieldError>) -> Option<String> {
     }
 }
 
+/// T-33: one canonical literal, or `None` for a hostname/malformed value.
+fn canonical_bind_host(raw: &str) -> Option<String> {
+    raw.trim().parse::<IpAddr>().ok().map(|ip| ip.to_string())
+}
+
+/// T-33: trims a typed value to its canonical literal — the list's only gate.
+fn normalize_bind_host(raw: &str) -> Result<String, StoreError> {
+    canonical_bind_host(raw)
+        .ok_or_else(|| bind_host_error(Store::BIND_HOST_LITERAL_ONLY.to_string()))
+}
+
+fn bind_host_error(message: String) -> StoreError {
+    StoreError::Invalid(vec![FieldError::new("bind_hosts", message)])
+}
+
+fn bind_host_in_use_message(host: &str, rows: &[String]) -> String {
+    let named: Vec<String> = rows.iter().map(|name| format!("\"{name}\"")).collect();
+    format!(
+        "{host} is used by {} — rebind those rows first",
+        named.join(", ")
+    )
+}
+
+/// T-33: stored extras only — constants, duplicates, blanks, and non-literals
+/// are dropped so a hand-edited meta row can never widen what may bind.
+fn sanitized_bind_host_extras(entries: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(host) = canonical_bind_host(&entry) else {
+            continue;
+        };
+        if Store::BIND_HOST_CONSTANTS.contains(&host.as_str()) || out.contains(&host) {
+            continue;
+        }
+        out.push(host);
+    }
+    out
+}
+
+fn decode_bind_host_extras(raw: &str) -> Vec<String> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn canonical_protocol(raw: &str) -> Option<String> {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
@@ -7979,6 +8028,122 @@ impl Store {
             Some(sane) => self.set_meta(Self::META_GEOMETRY, &sane.to_json()),
             None => Ok(()),
         }
+    }
+
+    /// T-33: the bind-address menu the per-row picker draws from — a JSON array
+    /// of user-added host literals. The constants are implicit: they are never
+    /// written here, never removable, and always lead the accessor's result.
+    pub const META_BIND_HOSTS: &str = "bind_hosts";
+
+    /// T-33: the two addresses every list carries, in this order, ahead of the
+    /// user extras. Removing them is impossible by construction.
+    pub const BIND_HOST_CONSTANTS: [&str; 2] = [DEFAULT_BIND, "0.0.0.0"];
+
+    /// T-33: the one reason the list editor refuses a typed value — also the
+    /// inline text the Settings field shows for it.
+    pub const BIND_HOST_LITERAL_ONLY: &str = "addresses only — no hostnames";
+
+    /// T-33: constants first, then the stored extras in insertion order.
+    ///
+    /// Seeding is one-time by construction: only a *missing* meta key seeds, and
+    /// the seed unions the two constants with every row's current `bind_ip`
+    /// before writing the extras. Once the key exists, later rows never widen
+    /// the list — additions go through [`Store::add_bind_host`] alone.
+    pub fn bind_hosts(&mut self) -> Vec<String> {
+        let mut out: Vec<String> = Self::BIND_HOST_CONSTANTS
+            .iter()
+            .map(|host| host.to_string())
+            .collect();
+        out.extend(self.bind_host_extras());
+        out
+    }
+
+    /// T-33: extras only, seeding on a missing key (see [`Store::bind_hosts`]).
+    fn bind_host_extras(&mut self) -> Vec<String> {
+        match self.get_meta(Self::META_BIND_HOSTS) {
+            Ok(Some(raw)) => sanitized_bind_host_extras(decode_bind_host_extras(&raw)),
+            Ok(None) => {
+                let seeded = sanitized_bind_host_extras(self.current_row_binds());
+                let _ = self.write_bind_host_extras(&seeded);
+                seeded
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn current_row_binds(&self) -> Vec<String> {
+        match self.list() {
+            Ok(rows) => rows.into_iter().map(|row| row.bind_ip).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn write_bind_host_extras(&mut self, extras: &[String]) -> Result<(), StoreError> {
+        let value = serde_json::Value::Array(
+            extras
+                .iter()
+                .map(|host| serde_json::Value::from(host.clone()))
+                .collect(),
+        )
+        .to_string();
+        self.set_meta(Self::META_BIND_HOSTS, &value)
+    }
+
+    /// T-33: which binds the library currently uses, as bind → row names. The
+    /// Settings editor consults this before removing an extra.
+    ///
+    /// Literal binds are canonicalized so `FD00:0::7` and `fd00::7` count as the
+    /// same use; anything the store lets through but the list never holds
+    /// (`localhost`) keeps its raw text.
+    pub fn bind_host_usage(&self) -> Result<BTreeMap<String, Vec<String>>, StoreError> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in self.list()? {
+            let bind = row.bind_ip.trim();
+            if bind.is_empty() {
+                continue;
+            }
+            let key = canonical_bind_host(bind).unwrap_or_else(|| bind.to_string());
+            out.entry(key).or_default().push(row.name);
+        }
+        for names in out.values_mut() {
+            names.sort();
+        }
+        Ok(out)
+    }
+
+    /// T-33: appends one validated literal to the extras and returns the whole
+    /// list. Hostnames, malformed literals, and duplicates are refused.
+    pub fn add_bind_host(&mut self, raw: &str) -> Result<Vec<String>, StoreError> {
+        let host = normalize_bind_host(raw)?;
+        let mut extras = self.bind_host_extras();
+        if Self::BIND_HOST_CONSTANTS.contains(&host.as_str()) || extras.contains(&host) {
+            return Err(bind_host_error(format!("{host} is already in the list")));
+        }
+        extras.push(host);
+        self.write_bind_host_extras(&extras)?;
+        Ok(self.bind_hosts())
+    }
+
+    /// T-33: removes one extra. The constants and any bind a row still uses are
+    /// refused; the in-use refusal names the blocking row(s).
+    pub fn remove_bind_host(&mut self, host: &str) -> Result<Vec<String>, StoreError> {
+        let host = host.trim();
+        if Self::BIND_HOST_CONSTANTS
+            .iter()
+            .any(|constant| constant.eq_ignore_ascii_case(host))
+        {
+            return Err(bind_host_error(format!(
+                "{host} is built in and cannot be removed"
+            )));
+        }
+        let host = canonical_bind_host(host).unwrap_or_else(|| host.to_string());
+        if let Some(names) = self.bind_host_usage()?.get(&host) {
+            return Err(bind_host_error(bind_host_in_use_message(&host, names)));
+        }
+        let mut extras = self.bind_host_extras();
+        extras.retain(|entry| entry != &host);
+        self.write_bind_host_extras(&extras)?;
+        Ok(self.bind_hosts())
     }
 
     pub const CONN_COLUMNS: [(&str, u32); 5] = [
@@ -17033,6 +17198,177 @@ mod tests {
             store.get_meta(Store::META_GEOMETRY).expect("meta read"),
             None,
             "a non-finite rectangle leaves no row behind"
+        );
+    }
+
+    // T-33: the bind-address list the per-row picker draws from.
+
+    fn bind_host_seed(name: &str, bind_ip: &str, port: &str) -> NewConfig {
+        NewConfig {
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            params: String::new(),
+            group: String::new(),
+            bind_ip: bind_ip.to_string(),
+            port: port.to_string(),
+        }
+    }
+
+    fn stored_bind_hosts(store: &Store) -> serde_json::Value {
+        let raw = store
+            .get_meta(Store::META_BIND_HOSTS)
+            .expect("meta read")
+            .expect("seed wrote the key");
+        serde_json::from_str(&raw).expect("extras decode")
+    }
+
+    #[test]
+    fn t83_bind_hosts_meta_round_trip_and_seed() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(bind_host_seed("Loop", "127.0.0.1", "10951"))
+            .expect("seed works");
+        store
+            .add(bind_host_seed("Lan", "192.168.1.20", "10952"))
+            .expect("seed works");
+
+        assert_eq!(
+            store.bind_hosts(),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+            ],
+            "constants lead, then every row bind, loopback deduped"
+        );
+        assert_eq!(
+            stored_bind_hosts(&store),
+            serde_json::json!(["192.168.1.20"]),
+            "constants are implicit — only extras are written"
+        );
+
+        store
+            .add(bind_host_seed("Late", "10.9.9.9", "10953"))
+            .expect("add works");
+        assert!(
+            !store.bind_hosts().contains(&"10.9.9.9".to_string()),
+            "seeding happened once; a later row does not widen the list"
+        );
+
+        store.add_bind_host("fd00::7").expect("extra accepted");
+        assert_eq!(
+            store.bind_hosts(),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+                "fd00::7".to_string(),
+            ],
+            "extras keep insertion order after the constants"
+        );
+        assert_eq!(
+            stored_bind_hosts(&store),
+            serde_json::json!(["192.168.1.20", "fd00::7"]),
+            "round trip keeps extras only"
+        );
+
+        store
+            .set_meta(Store::META_BIND_HOSTS, "not json")
+            .expect("meta write works");
+        assert_eq!(
+            store.bind_hosts(),
+            vec!["127.0.0.1".to_string(), "0.0.0.0".to_string()],
+            "a corrupt payload reads as no extras and never re-seeds"
+        );
+    }
+
+    #[test]
+    fn t83_constants_never_removable() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.add_bind_host("192.168.1.20").expect("extra accepted");
+        for constant in Store::BIND_HOST_CONSTANTS {
+            let error = store
+                .remove_bind_host(constant)
+                .expect_err("constants cannot be removed");
+            assert!(
+                error.to_string().contains(constant),
+                "refusal names {constant}: {error}"
+            );
+            let duplicate = store
+                .add_bind_host(constant)
+                .expect_err("constants are already listed");
+            assert!(
+                duplicate.to_string().contains("already in the list"),
+                "duplicate refusal: {duplicate}"
+            );
+        }
+        assert_eq!(
+            store.bind_hosts(),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "192.168.1.20".to_string(),
+            ],
+            "constants stay present and first"
+        );
+        assert_eq!(
+            store.remove_bind_host("192.168.1.20").expect("extra goes"),
+            vec!["127.0.0.1".to_string(), "0.0.0.0".to_string()],
+            "an unused extra removes"
+        );
+    }
+
+    #[test]
+    fn t83_remove_blocked_while_used_by_rows() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(bind_host_seed("Alpha", "127.0.0.1", "10951"))
+            .expect("seed works");
+        store
+            .add(bind_host_seed("Beta", "127.0.0.1", "10952"))
+            .expect("seed works");
+        store
+            .add(bind_host_seed("Gamma", "10.1.2.3", "10953"))
+            .expect("seed works");
+        store.add_bind_host("10.9.9.9").expect("extra accepted");
+
+        assert_eq!(
+            store
+                .bind_host_usage()
+                .expect("usage reads")
+                .get("127.0.0.1")
+                .cloned(),
+            Some(vec!["Alpha".to_string(), "Beta".to_string()]),
+            "the used-hosts query names every row on the bind"
+        );
+
+        let error = store
+            .remove_bind_host("127.0.0.1")
+            .expect_err("constants never remove, even when unused");
+        assert!(error.to_string().contains("built in"), "{error}");
+        let error = store
+            .remove_bind_host("10.1.2.3")
+            .expect_err("a used extra cannot be removed");
+        let text = error.to_string();
+        assert!(
+            text.contains("10.1.2.3") && text.contains("\"Gamma\""),
+            "the refusal names the blocking row: {text}"
+        );
+        assert!(
+            store.bind_hosts().contains(&"10.1.2.3".to_string()),
+            "a refused remove leaves the list untouched"
+        );
+
+        assert_eq!(
+            store
+                .remove_bind_host("10.9.9.9")
+                .expect("unused extra goes"),
+            vec![
+                "127.0.0.1".to_string(),
+                "0.0.0.0".to_string(),
+                "10.1.2.3".to_string(),
+            ],
+            "only the unused extra leaves"
         );
     }
 }
