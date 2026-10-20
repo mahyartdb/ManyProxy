@@ -60,6 +60,7 @@ use gpui_kit::component::{IndexPath, Root, WindowExt};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 use gpui_kit::*;
+use qrcodegen::{QrCode, QrCodeEcc};
 
 use engine::{
     engine_binary_file_name, fork_binary_file_name, lan_confirm_description, lan_confirm_text,
@@ -2161,6 +2162,201 @@ fn footer_commit_label(dialog: &str) -> &'static str {
 }
 
 const SHARE_WARNING: &str = "This link carries the endpoint's credentials — anyone holding it can use it. Prefer Copy URLs for credential-free sharing.";
+
+// ---- T-28: share-dialog QR of the two listener URLs ---------------------
+
+/// Modules of quiet zone baked into every grid — the QR spec's minimum.
+const SHARE_QR_QUIET_ZONE: usize = 4;
+/// Side of one QR plate in the Share dialog. The plate never shrinks; the module
+/// grid scales inside it, so the quiet zone cannot be clipped by a resize.
+const SHARE_QR_PLATE_PX: f32 = 132.;
+
+/// A monochrome QR module grid with its quiet zone baked in, row-major and square.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QrGrid {
+    side: usize,
+    dark: Vec<bool>,
+}
+
+impl QrGrid {
+    fn is_dark(&self, col: usize, row: usize) -> bool {
+        col < self.side && row < self.side && self.dark[row * self.side + col]
+    }
+
+    /// FNV-1a over the row-major module bits: the regression fingerprint for a fixed
+    /// payload, since decoding a rendered QR is out of scope by decision.
+    #[cfg(test)]
+    fn fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for &dark in &self.dark {
+            hash ^= u64::from(dark);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+}
+
+/// Encode one listener URL as a byte-mode QR at least error-correction level M (the ticket
+/// allows L or M; M already fits these URLs in a 33-module grid, quiet zone included,
+/// and tolerates a smudge on a phone screen). The encoder picks the smallest version
+/// that fits, well past the ticket's 255-byte ceiling, and we add the quiet zone.
+fn qr_grid(payload: &str) -> Result<QrGrid, String> {
+    let code = QrCode::encode_binary(payload.as_bytes(), QrCodeEcc::Medium)
+        .map_err(|_| format!("QR payload too long ({} bytes)", payload.len()))?;
+    let inner = code.size() as usize;
+    let side = inner + SHARE_QR_QUIET_ZONE * 2;
+    let mut dark = vec![false; side * side];
+    for row in 0..inner {
+        for col in 0..inner {
+            if code.get_module(col as i32, row as i32) {
+                dark[(row + SHARE_QR_QUIET_ZONE) * side + col + SHARE_QR_QUIET_ZONE] = true;
+            }
+        }
+    }
+    Ok(QrGrid { side, dark })
+}
+
+/// The row's two listener URLs, byte-identical to `proxy_urls`, with their labels.
+fn share_qr_payloads(config: &ProxyConfig) -> [(&'static str, String); 2] {
+    let (socks, http) = proxy_urls(&config.bind_ip, config.port);
+    [("socks", socks), ("http", http)]
+}
+
+/// Where the module grid lands inside a plate box: cell edge plus the grid origin. The
+/// whole grid — quiet zone included — is centered and never exceeds the box, so a
+/// resize cannot clip the quiet zone; whole-pixel cells keep modules square and crisp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QrPlate {
+    cell: f32,
+    x: f32,
+    y: f32,
+    side: usize,
+}
+
+impl QrPlate {
+    fn fit(width: f32, height: f32, side: usize) -> Self {
+        let box_side = width.min(height).max(0.);
+        let raw = box_side / side as f32;
+        let cell = if raw >= 1. { raw.floor() } else { raw };
+        let plate = cell * side as f32;
+        Self {
+            cell,
+            x: ((width - plate) / 2.).max(0.),
+            y: ((height - plate) / 2.).max(0.),
+            side,
+        }
+    }
+
+    fn plate_side(&self) -> f32 {
+        self.cell * self.side as f32
+    }
+
+    fn module_origin(&self, col: usize, row: usize) -> (f32, f32) {
+        (
+            self.x + col as f32 * self.cell,
+            self.y + row as f32 * self.cell,
+        )
+    }
+}
+
+/// Paint the white plate (quiet zone included) and the dark modules on top of it.
+/// Scanners read black-on-white, so the plate keeps that pair in both themes while the
+/// surrounding dialog and the labels stay theme-colored.
+fn paint_share_qr(grid: &QrGrid, plate: QrPlate, window: &mut Window) {
+    let plate_side = px(plate.plate_side());
+    window.paint_quad(fill(
+        Bounds::new(
+            point(px(plate.x), px(plate.y)),
+            size(plate_side, plate_side),
+        ),
+        rgb(0xFFFFFF),
+    ));
+    for row in 0..grid.side {
+        for col in 0..grid.side {
+            if !grid.is_dark(col, row) {
+                continue;
+            }
+            let (x, y) = plate.module_origin(col, row);
+            window.paint_quad(fill(
+                Bounds::new(point(px(x), px(y)), size(px(plate.cell), px(plate.cell))),
+                rgb(0x000000),
+            ));
+        }
+    }
+}
+
+/// One labeled QR plate. The payload that cannot encode (far beyond any listener URL)
+/// degrades to a caption rather than an empty square.
+fn share_qr_block(label: &'static str, url: &str, id: &'static str, cx: &App) -> impl IntoElement {
+    let muted = cx.theme().muted_foreground;
+    let content: AnyElement = match qr_grid(url) {
+        Ok(grid) => {
+            let grid = Rc::new(grid);
+            let side = grid.side;
+            canvas(
+                move |bounds, _, _| {
+                    QrPlate::fit(
+                        bounds.size.width.as_f32(),
+                        bounds.size.height.as_f32(),
+                        side,
+                    )
+                },
+                move |_, plate, window, _| paint_share_qr(&grid, plate, window),
+            )
+            .size_full()
+            .into_any_element()
+        }
+        Err(reason) => div()
+            .text_xs()
+            .text_color(muted)
+            .child(reason)
+            .into_any_element(),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .id(id)
+                .test_support()
+                .w(px(SHARE_QR_PLATE_PX))
+                .h(px(SHARE_QR_PLATE_PX))
+                .flex_shrink_0()
+                .child(content),
+        )
+        .child(
+            div()
+                .id(format!("{id}-label"))
+                .test_support()
+                .text_xs()
+                .text_color(muted)
+                .child(label),
+        )
+}
+
+/// The dialog's QR region: both schemes side by side, one scannable code each.
+fn share_qr_region(payloads: &[(&'static str, String); 2], cx: &App) -> impl IntoElement {
+    div()
+        .id("share-qr-region")
+        .test_support()
+        .flex()
+        .flex_wrap()
+        .gap_3()
+        .child(share_qr_block(
+            payloads[0].0,
+            &payloads[0].1,
+            "share-qr-socks",
+            cx,
+        ))
+        .child(share_qr_block(
+            payloads[1].0,
+            &payloads[1].1,
+            "share-qr-http",
+            cx,
+        ))
+}
 
 fn advanced_settings_button(view: &Entity<AppView>, form: &ConfigForm) -> impl IntoElement {
     let adv_view = view.clone();
@@ -13982,7 +14178,8 @@ impl AppView {
         let commit_key = commit.clone();
         let dialog_link =
             crate::import::share_link_for_config(&config.protocol, &config.name, &config.params);
-        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+        let payloads = share_qr_payloads(&config);
+        window.open_dialog(cx, move |dialog: Dialog, _, cx| {
             let commit_key = commit_key.clone();
             let commit_click = commit.clone();
             dialog
@@ -14004,7 +14201,10 @@ impl AppView {
                                 .test_support()
                                 .text_sm()
                                 .child(dialog_link.clone()),
-                        ),
+                        )
+                        // T-28: the credential-free contact strings, one QR per scheme,
+                        // as a transcription of the same text (never of the share link).
+                        .child(share_qr_region(&payloads, cx)),
                 )
                 .button_props(
                     DialogButtonProps::default()
@@ -54784,6 +54984,319 @@ mod tests {
                 ),
             ),
             "picking a key keeps the direction and persists the pair"
+        );
+    }
+
+    // ---- T-28: share-dialog QR ------------------------------------------
+
+    const T78_KNOWN_PAYLOAD: &str = "socks5://127.0.0.1:10801";
+    /// Pinned fingerprint of the known payload's grid (quiet zone included) at EC M.
+    const T78_KNOWN_FINGERPRINT: u64 = 0xDD10_7000_ADAB_B569;
+
+    fn t78_row(bind_ip: &str, port: u16) -> ProxyConfig {
+        ProxyConfig {
+            id: format!("t78-{port}"),
+            name: "Lan".to_string(),
+            protocol: "vless".to_string(),
+            params: "{}".to_string(),
+            group: String::new(),
+            enabled: true,
+            bind_ip: bind_ip.to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn t78_new(bind_ip: &str, port: &str) -> NewConfig {
+        NewConfig {
+            bind_ip: bind_ip.to_string(),
+            ..tick12_seed("Lan", port)
+        }
+    }
+
+    #[test]
+    fn t78_qr_content_equals_proxy_urls_lines() {
+        use crate::{proxy_urls, qr_grid, share_qr_payloads};
+
+        for (bind_ip, port) in [
+            ("127.0.0.1", 10801u16),
+            ("0.0.0.0", 10899),
+            ("192.168.1.20", 18081),
+            ("::1", 10900),
+            ("2001:db8::1", 18082),
+            ("a-rather-long-listener-hostname.internal.lan", 10805),
+        ] {
+            let row = t78_row(bind_ip, port);
+            let (socks, http) = proxy_urls(bind_ip, port);
+            let payloads = share_qr_payloads(&row);
+
+            assert_eq!(payloads[0].0, "socks", "socks comes first");
+            assert_eq!(payloads[1].0, "http", "http comes second");
+            assert_eq!(payloads[0].1, socks, "socks line is proxy_urls' line");
+            assert_eq!(payloads[1].1, http, "http line is proxy_urls' line");
+
+            for (label, payload) in &payloads {
+                let scheme = if *label == "socks" {
+                    "socks5://"
+                } else {
+                    "http://"
+                };
+                assert!(
+                    payload.starts_with(scheme),
+                    "{label} keeps its scheme: {payload}"
+                );
+                assert!(
+                    !payload.starts_with("manyproxy://"),
+                    "no share link ever reaches a QR: {payload}"
+                );
+                assert!(!payload.contains('@'), "no credentials in a QR: {payload}");
+                assert!(
+                    !payload.contains('?') && !payload.contains('#'),
+                    "no params or fragment in a QR: {payload}"
+                );
+                assert!(
+                    payload.ends_with(&format!(":{port}")),
+                    "{label} carries the listener port: {payload}"
+                );
+                assert!(
+                    qr_grid(payload).is_ok(),
+                    "{label} payload encodes at any listener length: {payload}"
+                );
+            }
+
+            assert_ne!(
+                qr_grid(&payloads[0].1).expect("socks encodes"),
+                qr_grid(&payloads[1].1).expect("http encodes"),
+                "one grid per scheme, never one two-line code"
+            );
+        }
+
+        // Wildcard binds are transcribed literally, exactly like the dialog text.
+        let wildcard = share_qr_payloads(&t78_row("0.0.0.0", 10801));
+        assert_eq!(wildcard[0].1, "socks5://0.0.0.0:10801");
+        assert_eq!(wildcard[1].1, "http://0.0.0.0:10801");
+        // IPv6 keeps its brackets, as proxy_urls writes them.
+        let v6 = share_qr_payloads(&t78_row("::1", 10801));
+        assert_eq!(v6[0].1, "socks5://[::1]:10801");
+        assert_eq!(v6[1].1, "http://[::1]:10801");
+    }
+
+    #[test]
+    fn t78_qr_grid_known_payload_shape() {
+        use crate::{qr_grid, SHARE_QR_QUIET_ZONE};
+
+        let grid = qr_grid(T78_KNOWN_PAYLOAD).expect("known payload encodes");
+        assert_eq!(
+            grid.side, 33,
+            "version 2 at EC M: 25 core modules + a 4-module quiet zone per side"
+        );
+        assert_eq!(
+            grid.fingerprint(),
+            T78_KNOWN_FINGERPRINT,
+            "known payload keeps its exact module grid"
+        );
+
+        let side = grid.side;
+        let quiet = SHARE_QR_QUIET_ZONE;
+        for i in 0..side {
+            for ring in 0..quiet {
+                assert!(!grid.is_dark(i, ring), "top quiet row {ring} is light");
+                assert!(
+                    !grid.is_dark(i, side - 1 - ring),
+                    "bottom quiet row {ring} is light"
+                );
+                assert!(!grid.is_dark(ring, i), "left quiet column {ring} is light");
+                assert!(
+                    !grid.is_dark(side - 1 - ring, i),
+                    "right quiet column {ring} is light"
+                );
+            }
+        }
+
+        // Finder patterns: 7x7 dark ring, light middle ring, 3x3 dark core.
+        for (x, y) in [
+            (quiet, quiet),
+            (side - 1 - quiet - 6, quiet),
+            (quiet, side - 1 - quiet - 6),
+        ] {
+            assert!(grid.is_dark(x, y), "finder corner ({x},{y}) dark");
+            assert!(grid.is_dark(x + 6, y), "finder corner ({x},{y}) dark");
+            assert!(grid.is_dark(x, y + 6), "finder corner ({x},{y}) dark");
+            assert!(grid.is_dark(x + 6, y + 6), "finder corner ({x},{y}) dark");
+            assert!(!grid.is_dark(x + 1, y + 1), "finder ring ({x},{y}) light");
+            assert!(grid.is_dark(x + 2, y + 2), "finder core ({x},{y}) dark");
+            assert!(grid.is_dark(x + 4, y + 4), "finder core ({x},{y}) dark");
+            assert!(!grid.is_dark(x + 5, y + 5), "finder ring ({x},{y}) light");
+        }
+
+        // A longer listener host grows the version instead of failing.
+        let long = format!("socks5://{}.internal.lan:10801", "a".repeat(150));
+        let grown = qr_grid(&long).expect("long listener URL still encodes");
+        assert!(
+            grown.side > side,
+            "version auto-grows for longer payloads: {}",
+            grown.side
+        );
+
+        // The quiet zone is part of the grid, so it is never a separate, clippable band.
+        assert_eq!(
+            grid.dark.len(),
+            side * side,
+            "every module including the quiet zone lives in the grid"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t78_share_dialog_renders_two_qrs(cx: &mut TestAppContext) {
+        use crate::{QrPlate, SHARE_QR_PLATE_PX};
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(t78_new("127.0.0.1", "10802"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_share_for_row(&row.id, window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+
+        let region = cx.update(|window, _| window.find("share-qr-region").bounds());
+        assert!(region.size.width.as_f32() > 0., "the QR region is laid out");
+        let socks = cx.update(|window, _| window.find("share-qr-socks").bounds());
+        let http = cx.update(|window, _| window.find("share-qr-http").bounds());
+        for (label, plate) in [("socks", socks), ("http", http)] {
+            assert!(
+                plate.size.width.as_f32() >= SHARE_QR_PLATE_PX,
+                "{label} plate keeps its minimum size: {}",
+                plate.size.width.as_f32()
+            );
+            assert!(
+                (plate.size.width.as_f32() - plate.size.height.as_f32()).abs() < 0.5,
+                "{label} plate stays square"
+            );
+        }
+        assert_eq!(
+            socks.origin.y, http.origin.y,
+            "both QRs sit on one row, side by side"
+        );
+        assert!(
+            socks.origin.x < http.origin.x,
+            "socks is left of http: {:?} vs {:?}",
+            socks.origin.x,
+            http.origin.x
+        );
+        assert!(
+            cx.update(|window, _| window
+                .try_find("share-qr-socks-label".to_string())
+                .is_some()),
+            "the socks plate is labeled"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("share-qr-http-label".to_string()).is_some()),
+            "the http plate is labeled"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("share-link-text".to_string()).is_some()),
+            "the link text stays"
+        );
+
+        let warning = cx.update(|window, _| window.find("share-warning").bounds());
+        let link = cx.update(|window, _| window.find("share-link-text").bounds());
+        assert!(
+            warning.origin.y < socks.origin.y,
+            "the credential warning stays above the QRs"
+        );
+        assert!(
+            link.origin.y < socks.origin.y,
+            "the QRs sit below the link text"
+        );
+
+        // Resize discipline: the grid (quiet zone included) always fits its plate, the
+        // cell never shrinks as the plate grows, and cells stay whole pixels above 1:1.
+        let mut last_cell = 0.0_f32;
+        for edge in [
+            0.,
+            12.,
+            25.,
+            40.,
+            96.,
+            120.,
+            SHARE_QR_PLATE_PX,
+            160.,
+            240.,
+            400.,
+        ] {
+            let plate = QrPlate::fit(edge, edge, socks_qr_side());
+            assert!(
+                plate.plate_side() <= edge + 0.001,
+                "the whole grid fits at {edge}px: {}",
+                plate.plate_side()
+            );
+            assert!(plate.x >= 0. && plate.y >= 0., "grid origin stays inside");
+            assert!(
+                plate.cell >= last_cell,
+                "cell size is monotone on resize: {} then {}",
+                last_cell,
+                plate.cell
+            );
+            if edge >= plate.side as f32 {
+                assert_eq!(
+                    plate.cell,
+                    plate.cell.floor(),
+                    "whole-pixel cells keep modules crisp"
+                );
+            }
+            last_cell = plate.cell;
+        }
+        assert!(
+            (SHARE_QR_PLATE_PX / socks_qr_side() as f32) >= 3.,
+            "the plate keeps at least a 3 px module for the known grid"
+        );
+    }
+
+    fn socks_qr_side() -> usize {
+        crate::qr_grid(T78_KNOWN_PAYLOAD)
+            .expect("known payload encodes")
+            .side
+    }
+
+    #[test]
+    fn t78_no_scanner_refusal_untouched() {
+        use crate::import::reject_file_bytes;
+
+        let refusal = "image file (paste the link text instead — this build has no image/QR scan)";
+        let images: [&[u8]; 6] = [
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff\xe0",
+            b"GIF87a",
+            b"GIF89a",
+            b"BM",
+            b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+        ];
+        for bytes in images {
+            assert_eq!(
+                reject_file_bytes(bytes),
+                Some(refusal),
+                "the typed scan refusal stays byte-identical"
+            );
+        }
+        assert_eq!(
+            reject_file_bytes(b"vless://11111111-2222-4333-8444-555555555555@a.example.com:443"),
+            None,
+            "text intake still works"
+        );
+
+        // Encode-only: the wrapper has no decode/scan/camera entry point, and a QR of a
+        // share link is out of scope by decision.
+        assert!(crate::qr_grid("socks5://127.0.0.1:10801").is_ok());
+        assert!(
+            crate::qr_grid(&"x".repeat(3_000)).is_err(),
+            "oversized payloads fail closed instead of panicking"
         );
     }
 }

@@ -248,7 +248,7 @@ Subsection 2 was generated in-repo (committed, not built at bundle time) from
 - [`rustls-webpki@0.103.15`](https://crates.io/crates/rustls-webpki/0.103.15)
 - [`untrusted@0.9.0`](https://crates.io/crates/untrusted/0.9.0)
 
-### MIT (209)
+### MIT (210)
 - [`aligned-vec@0.6.4`](https://crates.io/crates/aligned-vec/0.6.4)
 - [`arg_enum_proc_macro@0.3.4`](https://crates.io/crates/arg_enum_proc_macro/0.3.4)
 - [`ashpd@0.13.13`](https://crates.io/crates/ashpd/0.13.13)
@@ -367,6 +367,7 @@ Subsection 2 was generated in-repo (committed, not built at bundle time) from
 - [`precomputed-hash@0.1.1`](https://crates.io/crates/precomputed-hash/0.1.1)
 - [`pulp@0.22.3`](https://crates.io/crates/pulp/0.22.3)
 - [`pulp-wasm-simd-flag@0.1.1`](https://crates.io/crates/pulp-wasm-simd-flag/0.1.1)
+- [`qrcodegen@1.8.0`](https://crates.io/crates/qrcodegen/1.8.0)
 - [`quick-xml@0.41.0`](https://crates.io/crates/quick-xml/0.41.0)
 - [`raw-cpuid@11.6.0`](https://crates.io/crates/raw-cpuid/11.6.0)
 - [`reborrow@0.5.5`](https://crates.io/crates/reborrow/0.5.5)
