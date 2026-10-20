@@ -12566,6 +12566,76 @@ impl ExitTraffic {
     }
 }
 
+/// How many per-exit rows the traffic dialog lists before rolling the tail up.
+const TRAFFIC_TOP_EXITS: usize = 9;
+
+/// One ranking for every place exits are shown: heaviest first, with totals
+/// ties broken by stable identity so the same data always paints identically.
+fn exit_traffic_order(a: &ExitTraffic, b: &ExitTraffic) -> std::cmp::Ordering {
+    b.total()
+        .cmp(&a.total())
+        .then_with(|| a.row_id.cmp(&b.row_id))
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.bind.cmp(&b.bind))
+}
+
+/// What the dialog lists: the top [`TRAFFIC_TOP_EXITS`] exits plus the count
+/// and exact byte totals of every exit ranked below them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrafficExitSplit {
+    top: Vec<ExitTraffic>,
+    other_exits: usize,
+    other_rx: u64,
+    other_tx: u64,
+}
+
+impl TrafficExitSplit {
+    fn other_line(&self) -> Option<String> {
+        (self.other_exits > 0)
+            .then(|| traffic_other_line_text(self.other_exits, self.other_rx, self.other_tx))
+    }
+}
+
+fn traffic_other_line_text(count: usize, rx: u64, tx: u64) -> String {
+    format!(
+        "Other ({count} more · ↓{} ↑{})",
+        format_bytes(rx),
+        format_bytes(tx)
+    )
+}
+
+/// Ranks the exits, keeps the top nine and sums the rest. Recomputed from the
+/// rows handed in, so every period paints its own split and nothing is stored.
+fn traffic_top9_split(exits: &[ExitTraffic]) -> TrafficExitSplit {
+    let mut ranked: Vec<ExitTraffic> = exits.to_vec();
+    ranked.sort_by(exit_traffic_order);
+    let split_at = ranked.len().min(TRAFFIC_TOP_EXITS);
+    let rest = ranked.split_off(split_at);
+    let mut other_rx = 0u64;
+    let mut other_tx = 0u64;
+    for exit in &rest {
+        other_rx = other_rx.saturating_add(exit.rx_bytes);
+        other_tx = other_tx.saturating_add(exit.tx_bytes);
+    }
+    TrafficExitSplit {
+        top: ranked,
+        other_exits: rest.len(),
+        other_rx,
+        other_tx,
+    }
+}
+
+/// Bar denominator taken over every row (never the "Other" aggregate), so the
+/// stacked bars keep truthful proportions once the tail is rolled up.
+fn traffic_bar_max(exits: &[ExitTraffic]) -> u64 {
+    exits
+        .iter()
+        .map(ExitTraffic::total)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn conn_exit_of(rows: &[ProxyConfig], row_id: Option<&str>) -> (String, String, String) {
     match row_id.and_then(|id| rows.iter().find(|row| row.id == id)) {
         Some(row) => (
@@ -12597,7 +12667,7 @@ fn aggregate_exit_traffic(
             })
         })
         .collect();
-    exits.sort_by_key(|exit| std::cmp::Reverse(exit.total()));
+    exits.sort_by(exit_traffic_order);
     exits
 }
 
@@ -15871,12 +15941,8 @@ impl AppView {
         let exits = aggregate_exit_traffic(&rows, &totals);
         let (exit_count, rx, tx) = store::Store::traffic_period_summary(&totals, period);
         let summary = traffic_stats_summary_text(period, exit_count, rx, tx);
-        let max = exits
-            .iter()
-            .map(ExitTraffic::total)
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        let split = traffic_top9_split(&exits);
+        let max = traffic_bar_max(&exits);
         let cycle_view = view.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let cycle_view = cycle_view.clone();
@@ -15916,7 +15982,7 @@ impl AppView {
                         .child("No traffic recorded yet — start an exit and pass data."),
                 );
             }
-            for exit in &exits {
+            for exit in &split.top {
                 body = body.child(
                     div()
                         .id(format!("traffic-stat-{}", exit.row_id))
@@ -15930,6 +15996,15 @@ impl AppView {
                             format_bytes(exit.rx_bytes),
                             format_bytes(exit.tx_bytes),
                         )),
+                );
+            }
+            if let Some(other) = split.other_line() {
+                body = body.child(
+                    div()
+                        .id("traffic-stats-other")
+                        .test_support()
+                        .text_sm()
+                        .child(other),
                 );
             }
             dialog
@@ -27772,6 +27847,7 @@ mod tests {
     use crate::engine::AutoRestartConfig;
     use crate::store::{AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError};
     use crate::AppView;
+    use crate::ExitTraffic;
     use gpui_kit::component::dialog::Dialog;
     use gpui_kit::component::{Root, WindowExt};
     use gpui_kit::test::TestWindowExt;
@@ -55297,6 +55373,287 @@ mod tests {
         assert!(
             crate::qr_grid(&"x".repeat(3_000)).is_err(),
             "oversized payloads fail closed instead of panicking"
+        );
+    }
+
+    // ---- T-29: top-9 exits + Other --------------------------------------
+
+    fn t79_exit(id: &str, name: &str, rx: u64, tx: u64) -> ExitTraffic {
+        ExitTraffic {
+            row_id: id.to_string(),
+            name: name.to_string(),
+            bind: "127.0.0.1:10801".to_string(),
+            rx_bytes: rx,
+            tx_bytes: tx,
+        }
+    }
+
+    #[test]
+    fn t79_top9_other_split_math() {
+        use crate::{traffic_top9_split, TRAFFIC_TOP_EXITS};
+
+        let exits: Vec<ExitTraffic> = (0..12u64)
+            .map(|index| {
+                let rank = 12 - index;
+                t79_exit(
+                    &format!("e{index:02}"),
+                    &format!("Exit {index:02}"),
+                    rank * 1_000,
+                    rank * 10,
+                )
+            })
+            .collect();
+
+        let split = traffic_top9_split(&exits);
+        assert_eq!(TRAFFIC_TOP_EXITS, 9);
+        assert_eq!(split.top.len(), 9, "exactly nine rows stay listed");
+        assert_eq!(split.other_exits, 3, "everything below rank 9 rolls up");
+        assert_eq!(split.other_rx, 6_000, "3 + 2 + 1 KB of the tail");
+        assert_eq!(split.other_tx, 60);
+        for pair in split.top.windows(2) {
+            assert!(
+                pair[0].total() >= pair[1].total(),
+                "listed rows stay heaviest-first"
+            );
+        }
+        let listed_rx: u64 = split.top.iter().map(|exit| exit.rx_bytes).sum();
+        let all_rx: u64 = exits.iter().map(|exit| exit.rx_bytes).sum();
+        assert_eq!(listed_rx + split.other_rx, all_rx, "top 9 + other = all");
+        assert_eq!(
+            split.top.iter().map(|exit| exit.tx_bytes).sum::<u64>() + split.other_tx,
+            exits.iter().map(|exit| exit.tx_bytes).sum::<u64>()
+        );
+
+        // Ties break on row_id, then name/bind — never on insertion order.
+        let tied = vec![
+            t79_exit("b", "Beta", 100, 5),
+            t79_exit("a", "Alpha", 100, 5),
+            t79_exit("c", "Gamma", 100, 5),
+        ];
+        let tied_order = traffic_top9_split(&tied);
+        let order: Vec<&str> = tied_order
+            .top
+            .iter()
+            .map(|exit| exit.row_id.as_str())
+            .collect();
+        assert_eq!(order, ["a", "b", "c"]);
+        let mut reversed = tied.clone();
+        reversed.reverse();
+        assert_eq!(
+            traffic_top9_split(&reversed),
+            traffic_top9_split(&tied),
+            "same data paints the same order"
+        );
+
+        // Nine or fewer: no Other line at all.
+        let nine = traffic_top9_split(&exits[..9]);
+        assert_eq!(nine.top.len(), 9);
+        assert_eq!((nine.other_exits, nine.other_rx, nine.other_tx), (0, 0, 0));
+        assert_eq!(nine.other_line(), None);
+    }
+
+    #[gpui_kit::test]
+    fn t79_top9_renders_without_other_when_few_exits(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut ids = Vec::new();
+        for (index, port) in ["10861", "10862", "10863"].into_iter().enumerate() {
+            let row = store
+                .add(tick12_seed(&format!("Exit {index}"), port))
+                .expect("seed works");
+            ids.push(row.id);
+        }
+        store
+            .add_traffic_batch(&[
+                (ids[0].clone(), 500, 5),
+                (ids[1].clone(), 7_000, 70),
+                (ids[2].clone(), 3_000, 30),
+            ])
+            .expect("traffic persists");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        for id in &ids {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_some()),
+                "three exits keep every row listed"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("traffic-stats-other").is_none()),
+            "no Other line until a tenth exit exists"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn t79_other_line_count_and_bytes_correct(cx: &mut TestAppContext) {
+        use crate::{
+            aggregate_exit_traffic, format_bytes, traffic_bar_max, traffic_other_line_text,
+            traffic_top9_split,
+        };
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let mut seeded: Vec<(String, u64, u64)> = Vec::new();
+        for index in 0..12u64 {
+            let row = store
+                .add(tick12_seed(
+                    &format!("Exit {index:02}"),
+                    &(10_861 + index).to_string(),
+                ))
+                .expect("seed works");
+            let rx = if index == 0 { 100 } else { 51 - index };
+            seeded.push((row.id, rx, 0));
+        }
+        store.add_traffic_batch(&seeded).expect("traffic persists");
+
+        let rows = store.list().expect("rows list");
+        let totals = store.traffic_totals().expect("totals read");
+        let exits = aggregate_exit_traffic(&rows, &totals);
+        let split = traffic_top9_split(&exits);
+        assert_eq!(split.top.len(), 9);
+        assert_eq!(split.other_exits, 3);
+        let all_rx: u64 = exits.iter().map(|exit| exit.rx_bytes).sum();
+        let top_rx: u64 = split.top.iter().map(|exit| exit.rx_bytes).sum();
+        assert_eq!(split.other_rx, all_rx - top_rx, "Other = total − top 9");
+        assert_eq!(split.other_rx, 123, "42 + 41 + 40 bytes are rolled up");
+        assert_eq!(split.other_tx, 0);
+        let expected = traffic_other_line_text(3, 123, 0);
+        assert_eq!(
+            expected,
+            format!(
+                "Other (3 more · ↓{} ↑{})",
+                format_bytes(123),
+                format_bytes(0)
+            )
+        );
+        assert_eq!(split.other_line().as_deref(), Some(expected.as_str()));
+        assert!(
+            !expected.contains("Exit") && !expected.contains("127.0.0.1"),
+            "aggregate line carries count + bytes only: {expected}"
+        );
+        // Bar denominator is the heaviest raw row (100 B), never the 123 B
+        // aggregate: proportions stay computed over all rows, not the roll-up.
+        assert_eq!(traffic_bar_max(&exits), 100);
+        assert!(split.other_rx > traffic_bar_max(&exits));
+
+        let listed: Vec<String> = split.top.iter().map(|exit| exit.row_id.clone()).collect();
+        let rolled: Vec<String> = seeded
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .filter(|id| !listed.contains(id))
+            .collect();
+        assert_eq!(rolled.len(), 3);
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_traffic_stats_dialog(window, cx));
+        });
+        cx.run_until_parked();
+        paint_dialog_open(cx);
+        for id in &listed {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_some()),
+                "top-9 row {id} paints"
+            );
+        }
+        for id in &rolled {
+            assert!(
+                cx.update(|window, _| window.try_find(format!("traffic-stat-{id}")).is_none()),
+                "ranked-below-nine row {id} stays nameless"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("traffic-stats-other").is_some()),
+            "the aggregate line paints after rank 9"
+        );
+    }
+
+    #[test]
+    fn t79_periods_compute_independently() {
+        use crate::store::TrafficPeriod;
+        use crate::traffic_top9_split;
+
+        let dataset = |period: TrafficPeriod, rows: u64| -> Vec<ExitTraffic> {
+            let scale = match period {
+                TrafficPeriod::Day => 1_000u64,
+                TrafficPeriod::Week => 2_000,
+                TrafficPeriod::Month => 3_000,
+                TrafficPeriod::Quarter => 4_000,
+            };
+            (0..rows)
+                .map(|index| {
+                    t79_exit(
+                        &format!("{}-{index:02}", period.label()),
+                        &format!("{} exit {index:02}", period.label()),
+                        (rows - index) * scale,
+                        scale,
+                    )
+                })
+                .collect()
+        };
+
+        let mut others = Vec::new();
+        for period in TrafficPeriod::ALL {
+            let exits = dataset(period, 11);
+            let first = traffic_top9_split(&exits);
+            let second = traffic_top9_split(&exits);
+            assert_eq!(first, second, "{} recomputes identically", period.label());
+            assert_eq!(first.top.len(), 9, "{} keeps nine rows", period.label());
+            assert_eq!(first.other_exits, 2, "{} rolls up two", period.label());
+            let scale = match period {
+                TrafficPeriod::Day => 1_000u64,
+                TrafficPeriod::Week => 2_000,
+                TrafficPeriod::Month => 3_000,
+                TrafficPeriod::Quarter => 4_000,
+            };
+            assert_eq!(first.other_rx, 3 * scale, "{}", period.label());
+            assert_eq!(
+                first.other_tx,
+                2 * scale,
+                "two rolled-up rows carry one scale of tx each ({})",
+                period.label()
+            );
+            let all_rx: u64 = exits.iter().map(|exit| exit.rx_bytes).sum();
+            assert_eq!(
+                first.top.iter().map(|exit| exit.rx_bytes).sum::<u64>() + first.other_rx,
+                all_rx,
+                "{} accounts every byte",
+                period.label()
+            );
+            others.push(first.other_rx);
+        }
+        let mut distinct = others.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        // Honesty note: `Store::traffic_period_summary` ignores `_period` and
+        // traffic lives in all-time `proxy_configs` columns, so the four
+        // periods receive identical data today (the dialog tooltip says
+        // "all-time totals throughout"). The distinct scales here are fixture
+        // inputs; the split itself is a pure per-render fn over whatever rows
+        // each period hands it.
+        assert_eq!(distinct.len(), 4, "each period splits its own data");
+
+        // The gate is per period too: six Day exits need no Other line while
+        // Quarter's eleven do — and Day recomputed later is unchanged.
+        let day_small = traffic_top9_split(&dataset(TrafficPeriod::Day, 6));
+        assert_eq!(day_small.top.len(), 6);
+        assert_eq!(day_small.other_line(), None);
+        assert!(
+            traffic_top9_split(&dataset(TrafficPeriod::Quarter, 11))
+                .other_line()
+                .is_some(),
+            "Quarter still rolls up"
+        );
+        assert_eq!(
+            day_small,
+            traffic_top9_split(&dataset(TrafficPeriod::Day, 6)),
+            "no split state survives a render"
         );
     }
 }
