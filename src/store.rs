@@ -7853,6 +7853,30 @@ impl Store {
         Ok(())
     }
 
+    /// T-31: the kept-log ring cap, additive beside the other meta keys.
+    pub const META_LOG_MAX_LINES: &str = "log_max_lines";
+
+    /// T-31: absent, unparsable, or out-of-window values read as the 5,000-line
+    /// default — the pre-feature shape — and in-window values clamp to
+    /// `500..=50_000`.
+    pub fn log_max_lines(&self) -> usize {
+        match self.get_meta(Self::META_LOG_MAX_LINES) {
+            Ok(Some(raw)) => raw
+                .trim()
+                .parse::<usize>()
+                .map(crate::health::clamp_log_max_lines)
+                .unwrap_or(crate::health::MAX_LOG_RECORDS),
+            _ => crate::health::MAX_LOG_RECORDS,
+        }
+    }
+
+    pub fn set_log_max_lines(&mut self, cap: usize) -> Result<(), StoreError> {
+        self.set_meta(
+            Self::META_LOG_MAX_LINES,
+            &crate::health::clamp_log_max_lines(cap).to_string(),
+        )
+    }
+
     pub const CONN_COLUMNS: [(&str, u32); 5] = [
         ("destination", 220),
         ("exit", 180),
@@ -16706,6 +16730,68 @@ mod tests {
             Some(r#"{"key":"none","direction":"asc"}"#),
             "none persists explicitly instead of clearing the key"
         );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// T-31: `log_max_lines` rides the meta family with a `500..=50_000` window
+    /// and today's 5,000-line default for an absent, corrupt, or reset key.
+    #[test]
+    fn t81_log_caps_round_trip_reset_and_default() {
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        assert_eq!(
+            store.log_max_lines(),
+            crate::health::MAX_LOG_RECORDS,
+            "absent meta reads as today's 5,000-line ring"
+        );
+        assert_eq!(
+            store
+                .get_meta(Store::META_LOG_MAX_LINES)
+                .expect("meta read"),
+            None,
+            "the default writes no meta row"
+        );
+
+        for cap in [500usize, 1_234, 50_000] {
+            store.set_log_max_lines(cap).expect("cap writes");
+            assert_eq!(store.log_max_lines(), cap, "{cap} round-trips");
+        }
+
+        store.set_log_max_lines(1).expect("low cap writes");
+        assert_eq!(store.log_max_lines(), 500, "low caps clamp to 500");
+        store
+            .set_log_max_lines(usize::MAX)
+            .expect("high cap writes");
+        assert_eq!(store.log_max_lines(), 50_000, "high caps clamp to 50,000");
+
+        store
+            .set_meta(Store::META_LOG_MAX_LINES, "not-a-number")
+            .expect("junk writes");
+        assert_eq!(store.log_max_lines(), 5_000, "junk reads as the default");
+
+        store
+            .conn
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![Store::META_LOG_MAX_LINES],
+            )
+            .expect("meta row clears");
+        assert_eq!(store.log_max_lines(), 5_000, "a reset reads as the default");
+
+        let path =
+            std::env::temp_dir().join(format!("manyproxy-t81-cap-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(store.log_max_lines(), 5_000, "a fresh file store defaults");
+            store.set_log_max_lines(777).expect("cap writes");
+        }
+        let store = Store::open_file(&path).expect("reopen works");
+        assert_eq!(store.log_max_lines(), 777, "cap survives a restart");
         drop(store);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

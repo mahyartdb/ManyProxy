@@ -79,7 +79,16 @@ impl ProbeExclusions {
 }
 
 const MAX_SAMPLES: usize = 10_000;
-const MAX_LOG_RECORDS: usize = 5_000;
+/// T-31: the default kept-log ring, unchanged from the pre-feature shape.
+pub const MAX_LOG_RECORDS: usize = 5_000;
+/// T-31: the configurable window the Settings field may name.
+pub const MIN_LOG_MAX_LINES: usize = 500;
+pub const MAX_LOG_MAX_LINES: usize = 50_000;
+
+/// Clamp a requested kept-line cap into the supported window.
+pub fn clamp_log_max_lines(cap: usize) -> usize {
+    cap.clamp(MIN_LOG_MAX_LINES, MAX_LOG_MAX_LINES)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthKind {
@@ -2322,13 +2331,36 @@ fn tag_matches_bounded(line: &str, tag: &str) -> bool {
     false
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LogStore {
     records: VecDeque<LogRecord>,
     push_seq: u64,
+    cap: usize,
+}
+
+impl Default for LogStore {
+    fn default() -> Self {
+        Self::with_capacity(MAX_LOG_RECORDS)
+    }
 }
 
 impl LogStore {
+    /// T-31: build a ring at a caller-chosen cap. The settings path clamps to
+    /// `500..=50_000` before it gets here; zero would degenerate every push
+    /// into an immediate eviction, so the instance floor is one record.
+    pub fn with_capacity(cap: usize) -> LogStore {
+        LogStore {
+            records: VecDeque::new(),
+            push_seq: 0,
+            cap: cap.max(1),
+        }
+    }
+
+    /// T-31: the instance cap this ring evicts at.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
     pub fn push_raw(&mut self, line: &str, tags: &LogTagIndex) {
         let stripped = crate::engine::strip_ansi_codes(line);
         let message = redact_secrets(&stripped);
@@ -2345,7 +2377,7 @@ impl LogStore {
 
     fn push(&mut self, record: LogRecord) {
         self.push_seq = self.push_seq.wrapping_add(1);
-        if self.records.len() >= MAX_LOG_RECORDS {
+        if self.records.len() >= self.cap {
             if let Some(position) = self
                 .records
                 .iter()
@@ -2360,7 +2392,7 @@ impl LogStore {
     }
 
     /// Monotonic count of records pushed, so a tail view can notice new output
-    /// even when the capped ring keeps `all().len()` pinned at `MAX_LOG_RECORDS`.
+    /// even when the capped ring keeps `all().len()` pinned at the instance cap.
     pub fn push_seq(&self) -> u64 {
         self.push_seq
     }
@@ -5257,6 +5289,61 @@ mod tests {
         assert!(
             messages.iter().any(|m| m.contains("crashed")),
             "crash pinned"
+        );
+    }
+
+    /// T-31: the eviction picker keeps crash-cause lines at any configurable
+    /// cap, not just the default ring.
+    #[test]
+    fn t81_crash_cause_lines_protected_at_any_cap() {
+        let tags = LogTagIndex::build(&[]);
+        for cap in [
+            3usize,
+            MIN_LOG_MAX_LINES,
+            MAX_LOG_RECORDS,
+            MAX_LOG_MAX_LINES,
+        ] {
+            let mut logs = LogStore::with_capacity(cap);
+            assert_eq!(logs.cap(), cap, "instance cap keeps {cap}");
+            logs.push_raw("panic: runtime error in sidecar", &tags);
+            logs.push_raw("FATAL: core dumped", &tags);
+            for i in 0..(cap + 40) {
+                logs.push_raw(&format!("info heartbeat {i}"), &tags);
+            }
+            assert_eq!(logs.all().len(), cap, "ring capped at {cap}");
+            let messages: Vec<&str> = logs
+                .all()
+                .iter()
+                .map(|record| record.message.as_str())
+                .collect();
+            assert!(
+                messages.iter().any(|m| m.contains("panic")),
+                "panic pinned at {cap}"
+            );
+            assert!(
+                messages.iter().any(|m| m.contains("FATAL")),
+                "fatal pinned at {cap}"
+            );
+        }
+
+        let mut small = LogStore::with_capacity(MIN_LOG_MAX_LINES);
+        for i in 0..(MIN_LOG_MAX_LINES + 100) {
+            small.push_raw(&format!("info line {i}"), &tags);
+        }
+        assert_eq!(
+            small.all().len(),
+            MIN_LOG_MAX_LINES,
+            "the 500-line choice rings at 500"
+        );
+
+        let mut big = LogStore::with_capacity(MAX_LOG_MAX_LINES);
+        for i in 0..(MAX_LOG_MAX_LINES + 10) {
+            big.push_raw(&format!("info line {i}"), &tags);
+        }
+        assert_eq!(
+            big.all().len(),
+            MAX_LOG_MAX_LINES,
+            "the 50,000-line choice is respected"
         );
     }
 

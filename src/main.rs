@@ -69,12 +69,12 @@ use engine::{
     EngineController, EngineError, LAN_CONFIRM_TITLE,
 };
 use health::{
-    format_speed_result, outcome_is_neutral, ping_all, redact_secrets, resolve_hostname,
-    sparkline_caption_tone, speed_group, test_all, test_group, truncate, url_test_sparkline,
-    HealthKind, HealthProber, HealthStore, LatencyTone, LogLevel, LogStore, LogTagIndex,
-    ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode, SpeedtestOutcome,
-    TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL, RESOLVE_TIMEOUT,
-    SPEED_TEST_TIMEOUT,
+    clamp_log_max_lines, format_speed_result, outcome_is_neutral, ping_all, redact_secrets,
+    resolve_hostname, sparkline_caption_tone, speed_group, test_all, test_group, truncate,
+    url_test_sparkline, HealthKind, HealthProber, HealthStore, LatencyTone, LogLevel, LogStore,
+    LogTagIndex, ProbeExclusions, RealHealthProber, SpeedtestConfig, SpeedtestMode,
+    SpeedtestOutcome, TestOutcome, TrafficSeenMap, DEFAULT_TEST_URL, RESOLVE_IP_URL,
+    RESOLVE_TIMEOUT, SPEED_TEST_TIMEOUT,
 };
 use import::{
     classify_open_with, commit_batch, effective_hint_for_text, format_import_failures,
@@ -1414,6 +1414,36 @@ impl LibraryDelegate {
     }
 }
 
+/// T-31: the tone each level paints in, from the active theme. `Info` keeps the
+/// default text color, `Debug` recedes to muted, `Warn` is the theme amber, and
+/// `Error` the theme danger red; both theme modes resolve these tokens.
+fn log_level_text_color(level: LogLevel, theme: &Theme) -> Hsla {
+    match level {
+        LogLevel::Error => theme.danger,
+        LogLevel::Warn => theme.warning,
+        LogLevel::Info => theme.foreground,
+        LogLevel::Debug => theme.muted_foreground,
+    }
+}
+
+/// T-31: a visible line already carries its parsed level as `[level]`.
+fn log_line_level(line: &str) -> LogLevel {
+    line.strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .and_then(|(label, _)| LogLevel::from_label(label))
+        .unwrap_or(LogLevel::Info)
+}
+
+/// T-31: the Settings "Maximum kept log lines" text to a clamped cap. `None`
+/// means the text is not a whole number.
+fn parse_log_cap(raw: &str) -> Option<usize> {
+    let digits = raw.trim().replace(',', "");
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<usize>().ok().map(clamp_log_max_lines)
+}
+
 struct LogLinesDelegate {
     lines: Vec<String>,
 }
@@ -1437,15 +1467,17 @@ impl ListDelegate for LogLinesDelegate {
         &mut self,
         index: IndexPath,
         _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
+        cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
         let line = self.lines.get(index.row)?.clone();
         let tip = line.clone();
+        let tone = log_level_text_color(log_line_level(&line), cx.theme());
         Some(
             ListItem::new(format!("log-line-{}", index.row)).child(
                 div()
                     .id(format!("log-line-text-{}", index.row))
                     .text_sm()
+                    .text_color(tone)
                     .truncate()
                     .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
                     .child(line),
@@ -13180,6 +13212,7 @@ struct AppView {
     logs_seen: u64,
 
     log_inputs: Option<(Entity<InputState>, Entity<InputState>, Entity<InputState>)>,
+    log_cap_input: Option<Entity<InputState>>,
 
     /// Captured just before a control-driven sheet swap. The live input text
     /// wins over the committed filter fields so typed-but-unapplied text
@@ -13400,6 +13433,7 @@ impl AppView {
         .into_iter()
         .map(|(file, found)| sidecar_presence_line(&file, found))
         .collect::<Vec<_>>();
+        let log_cap = store.log_max_lines();
         let view = Self {
             focus: cx.focus_handle(),
             libraries: libraries.clone(),
@@ -13407,7 +13441,7 @@ impl AppView {
             store,
             engine: EngineController::production(),
             health_store: HealthStore::default(),
-            logs: LogStore::default(),
+            logs: LogStore::with_capacity(log_cap),
             log_filter: String::new(),
             log_exclude: String::new(),
             log_regex: String::new(),
@@ -13417,6 +13451,7 @@ impl AppView {
             logs_seen: 0,
 
             log_inputs: None,
+            log_cap_input: None,
             log_reopen_draft: None,
 
             log_list: None,
@@ -15611,6 +15646,14 @@ impl AppView {
         });
         let feed_url_reader = feed_url_state.clone();
         let feed_url_view = view.clone();
+        let cap_text = self.logs.cap().to_string();
+        let cap_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("500–50,000")
+                .default_value(cap_text)
+        });
+        let cap_reader = cap_state.clone();
+        self.log_cap_input = Some(cap_state.clone());
         let db_path = Store::default_path().display().to_string();
         let export_path = Store::default_export_path().display().to_string();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
@@ -15644,6 +15687,8 @@ impl AppView {
             let save_view = test_url_view.clone();
             let feed_reader = feed_url_reader.clone();
             let feed_view = feed_url_view.clone();
+            let cap_save_view = view.clone();
+            let cap_save_reader = cap_reader.clone();
             let copy_db_view = test_url_view.clone();
             let db_path_for_copy = db_path.clone();
             let copy_export_view = test_url_view.clone();
@@ -15847,6 +15892,30 @@ impl AppView {
                                     "On restarts a crashed core with backoff (up to 3 tries) and \
                                      tells you when it recovers. Default on.",
                                 ),
+                        )
+                        .child(dialog_field(
+                            "field-log-cap",
+                            "Maximum kept log lines",
+                            cap_reader.clone(),
+                        ))
+                        .child(
+                            div()
+                                .id("settings-log-cap-note")
+                                .test_support()
+                                .child(
+                                    "Range 500–50,000 (default 5,000). Saving rebuilds the \
+                                     log ring: lines already recorded are dropped.",
+                                ),
+                        )
+                        .child(
+                            Button::new("settings-save-log-cap")
+                                .label("Save log cap")
+                                .on_click(move |_, window, cx| {
+                                    let raw = cap_save_reader.read(cx).value().to_string();
+                                    cap_save_view.update(cx, |view, cx| {
+                                        view.commit_log_cap(window, &raw, cx);
+                                    });
+                                }),
                         )
 
 
@@ -18460,6 +18529,46 @@ impl AppView {
         self.log_filter = include;
         self.log_exclude = exclude;
         self.log_regex = pattern;
+        cx.notify();
+    }
+
+    /// T-31: persist `log_max_lines` and rebuild the ring at the clamped cap.
+    /// The rebuild preserves nothing: changing the cap mid-session truncates
+    /// every present record for the fresh ring (no partial-growth state), which
+    /// the Settings note beside the field states.
+    fn commit_log_cap(&mut self, window: &mut Window, raw: &str, cx: &mut Context<Self>) {
+        let Some(cap) = parse_log_cap(raw) else {
+            window.push_notification(
+                Notification::warning(format!(
+                    "Maximum kept log lines must be a whole number (500–50,000) — keeping {}",
+                    self.logs.cap()
+                )),
+                cx,
+            );
+            return;
+        };
+        if let Err(error) = self.store.set_log_max_lines(cap) {
+            window.push_notification(
+                Notification::error(format!("Cannot save the log cap: {error}")),
+                cx,
+            );
+            return;
+        }
+        if let Some(input) = self.log_cap_input.clone() {
+            input.update(cx, |state, cx| state.set_value(cap.to_string(), window, cx));
+        }
+        if cap == self.logs.cap() {
+            return;
+        }
+        self.logs = LogStore::with_capacity(cap);
+        self.logs_seen = 0;
+        if let Some(list) = self.log_list.clone() {
+            let lines = self.log_lines(cx);
+            list.update(cx, |state, cx| {
+                state.delegate_mut().lines = lines;
+                cx.notify();
+            });
+        }
         cx.notify();
     }
 
@@ -28478,6 +28587,201 @@ mod tests {
             lines[0].contains("refused"),
             "keeps text, got {:?}",
             lines[0]
+        );
+    }
+
+    /// T-31: every level resolves to its own theme tone, in both theme modes,
+    /// and the visible `[level]` prefix maps back to the ingested level.
+    #[gpui_kit::test]
+    fn t81_log_level_tones_render_all_levels(cx: &mut TestAppContext) {
+        use gpui_kit::component::ThemeMode;
+
+        cx.update(gpui_kit::init);
+        let levels = [
+            crate::LogLevel::Error,
+            crate::LogLevel::Warn,
+            crate::LogLevel::Info,
+            crate::LogLevel::Debug,
+        ];
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            cx.update(|cx| {
+                crate::Theme::change(mode, None, cx);
+                let theme = crate::Theme::global(cx);
+                assert_eq!(theme.mode, mode, "the tone check runs in {mode:?}");
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Error, theme),
+                    theme.danger,
+                    "error paints the theme danger red"
+                );
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Warn, theme),
+                    theme.warning,
+                    "warn paints the theme amber"
+                );
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Info, theme),
+                    theme.foreground,
+                    "info keeps the default text color"
+                );
+                assert_eq!(
+                    crate::log_level_text_color(crate::LogLevel::Debug, theme),
+                    theme.muted_foreground,
+                    "debug recedes to muted"
+                );
+                for (index, left) in levels.iter().enumerate() {
+                    for right in levels.iter().skip(index + 1) {
+                        assert_ne!(
+                            crate::log_level_text_color(*left, theme),
+                            crate::log_level_text_color(*right, theme),
+                            "{left:?} and {right:?} stay distinct in {mode:?}"
+                        );
+                    }
+                }
+            });
+        }
+
+        assert_eq!(
+            crate::log_line_level("[error] dial refused"),
+            crate::LogLevel::Error
+        );
+        assert_eq!(
+            crate::log_line_level("[warn] retry slow"),
+            crate::LogLevel::Warn
+        );
+        assert_eq!(
+            crate::log_line_level("[info] engine started"),
+            crate::LogLevel::Info
+        );
+        assert_eq!(
+            crate::log_line_level("[debug] tick"),
+            crate::LogLevel::Debug
+        );
+        assert_eq!(
+            crate::log_line_level("unprefixed line"),
+            crate::LogLevel::Info,
+            "an unprefixed line keeps the default tone"
+        );
+    }
+
+    /// T-31: filter/exclude/regex/level/tail output is byte-identical at any
+    /// ring cap, `with_store` hydrates the meta cap, and saving a new cap
+    /// rebuilds the ring empty (the documented truncation).
+    #[gpui_kit::test]
+    fn t81_filters_unaffected_by_cap(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store.set_log_max_lines(500).expect("cap writes");
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            500,
+            "with_store hydrates the meta cap"
+        );
+
+        let tags = crate::health::LogTagIndex::default();
+        let source: Vec<String> = (0..400)
+            .map(|i| match i % 4 {
+                0 => format!("error dial {i} refused password=hunter2"),
+                1 => format!("warn retry {i} slow"),
+                2 => format!("debug tick {i}"),
+                _ => format!("info heartbeat {i}"),
+            })
+            .collect();
+
+        let cases = [
+            ("", "", "", None, true),
+            ("dial", "", "", None, true),
+            ("", "slow", "", None, true),
+            ("", "", "refused$", None, false),
+            ("", "", "", Some(crate::LogLevel::Warn), true),
+            ("heartbeat", "", "", Some(crate::LogLevel::Info), false),
+        ];
+        for (filter, exclude, pattern, level, tail) in cases {
+            let mut by_cap = Vec::new();
+            for cap in [500usize, 50_000] {
+                let lines = cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        let mut logs = crate::LogStore::with_capacity(cap);
+                        for line in &source {
+                            logs.push_raw(line, &tags);
+                        }
+                        view.logs = logs;
+                        view.log_filter = filter.to_string();
+                        view.log_exclude = exclude.to_string();
+                        view.log_regex = pattern.to_string();
+                        view.log_level = level;
+                        view.log_tail = tail;
+                        view.visible_log_lines(cx)
+                    })
+                });
+                by_cap.push(lines);
+            }
+            assert_eq!(
+                by_cap[0], by_cap[1],
+                "cap must not change {filter:?}/{exclude:?}/{pattern:?}/{level:?}/{tail}"
+            );
+            assert!(
+                !by_cap[0].iter().any(|line| line.contains("hunter2")),
+                "redaction still decorates only redacted text"
+            );
+        }
+
+        let tail = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut logs = crate::LogStore::with_capacity(500);
+                for line in &source {
+                    logs.push_raw(line, &tags);
+                }
+                view.logs = logs;
+                view.log_filter.clear();
+                view.log_exclude.clear();
+                view.log_regex.clear();
+                view.log_level = None;
+                view.log_tail = true;
+                view.visible_log_lines(cx)
+            })
+        });
+        assert_eq!(tail.len(), 200, "tail keeps the newest 200 lines");
+        assert!(tail
+            .last()
+            .is_some_and(|line| line.contains("heartbeat 399")));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.logs.push_raw("info before cap change", &tags);
+                view.commit_log_cap(window, "50,000", cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            50_000,
+            "a typed save rebuilds the ring at the clamped cap"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.log_max_lines()),
+            50_000,
+            "the new cap persists"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.logs.all().is_empty()),
+            "the fresh ring truncates instead of carrying lines over"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_log_cap(window, "1", cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            500,
+            "saving below the window clamps to 500"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_log_cap(window, "junk", cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.logs.cap()),
+            500,
+            "junk keeps the previous cap"
         );
     }
 
