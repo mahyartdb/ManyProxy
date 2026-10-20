@@ -4507,6 +4507,12 @@ pub trait EngineBackend {
 
     fn is_running(&self) -> bool;
 
+    /// OS pid of the spawned sidecar, when this backend owns one. `None` = not
+    /// running, or a backend that never spawns a child.
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
     fn poll_exit(&mut self) -> Option<String>;
 
     fn drain_log_lines(&mut self) -> Vec<String> {
@@ -5782,6 +5788,10 @@ impl EngineBackend for RealEngineBackend {
         self.child.is_some()
     }
 
+    fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().map(|child| child.id())
+    }
+
     fn poll_exit(&mut self) -> Option<String> {
         let status = match self.child.as_mut()?.try_wait() {
             Ok(Some(status)) => status,
@@ -5844,6 +5854,9 @@ struct FakeState {
     fail_start: Option<String>,
     exited: Option<String>,
     pending_logs: Vec<String>,
+
+    /// T-30: the pid the fake shard pretends to have spawned.
+    pid: Option<u32>,
 }
 
 #[cfg(test)]
@@ -5883,11 +5896,17 @@ impl FakeHandle {
     pub fn inject_crash(&self, cause: &str) {
         let mut state = self.state.borrow_mut();
         state.running = false;
+        state.pid = None;
         state.exited = Some(cause.to_string());
     }
 
     pub fn emit_log(&self, line: &str) {
         self.state.borrow_mut().pending_logs.push(line.to_string());
+    }
+
+    /// T-30: PRETEND this shard's child runs with `pid` (`None` = no child).
+    pub fn set_pid(&self, pid: Option<u32>) {
+        self.state.borrow_mut().pid = pid;
     }
 }
 
@@ -5939,10 +5958,15 @@ impl EngineBackend for FakeEngineBackend {
     fn stop(&mut self) {
         let mut state = self.state.borrow_mut();
         state.running = false;
+        state.pid = None;
     }
 
     fn is_running(&self) -> bool {
         self.state.borrow().running
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.state.borrow().pid
     }
 
     fn poll_exit(&mut self) -> Option<String> {
@@ -7340,6 +7364,33 @@ impl EngineController {
         self.last_error = Some(format!("engine crashed ({cause})"));
         self.pending_crash = Some(Self::crash_detail(&crashes));
         crashes
+    }
+
+    /// T-30: `(shard label, pid)` per shard slot, named exactly like
+    /// [`Self::poll_shards`] — "stock", "fork", "xray", "extra-<row id>" (or
+    /// "extra-<slot>" when no row names it). `None` = that shard has no live
+    /// child. The caller only ever sees pids this controller spawned; nothing
+    /// here enumerates foreign processes.
+    pub fn shard_processes(&self) -> Vec<(String, Option<u32>)> {
+        let mut out = vec![
+            ("stock".to_string(), self.backend.process_id()),
+            ("fork".to_string(), self.fork_backend.process_id()),
+            ("xray".to_string(), self.xray_backend.process_id()),
+        ];
+        let extra_ids: Vec<String> = self
+            .active
+            .iter()
+            .filter(|row| is_extra_core_protocol(&row.protocol))
+            .map(|row| row.id.clone())
+            .collect();
+        for (index, slot) in self.extra_backends.iter().enumerate() {
+            let shard = extra_ids
+                .get(index)
+                .map(|id| format!("extra-{id}"))
+                .unwrap_or_else(|| format!("extra-{index}"));
+            out.push((shard, slot.process_id()));
+        }
+        out
     }
 
     pub fn crash_detail(crashes: &[(String, String)]) -> String {
@@ -14280,6 +14331,83 @@ Active Connections\r
             output.status.success(),
             "PROBE srs: sing-box check EXIT 0, stderr: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn t80_shard_processes_lists_live_pids() {
+        let (mut controller, stock, fork, xray, extra) = EngineController::fake_quartet();
+        controller.set_fork_probe(|| Ok(PathBuf::from("test-fork-bin")));
+        controller.set_xray_probe(|| Ok(PathBuf::from("test-xray-bin")));
+        controller.set_extra_probe(|_| Ok(PathBuf::from("test-extra-exe")));
+
+        assert_eq!(
+            controller.shard_processes(),
+            vec![
+                ("stock".to_string(), None),
+                ("fork".to_string(), None),
+                ("xray".to_string(), None),
+                ("extra-0".to_string(), None),
+            ],
+            "idle slots are named but offer no pid to sample"
+        );
+
+        let rows = vec![
+            fixture(
+                "1",
+                "Alpha",
+                "shadowsocks",
+                ss_params("pass1"),
+                "127.0.0.1",
+                10801,
+            ),
+            noise_fixture("2", "NoiseOne", 10802),
+            xray_fixture("3", "XrayOne", 10803),
+            extra_fixture("4", "SlotA", 10804),
+        ];
+        controller.start_all(&rows).expect("every shard starts");
+        for (handle, pid) in [
+            (&stock, 4101u32),
+            (&fork, 4102),
+            (&xray, 4103),
+            (&extra, 4104),
+        ] {
+            handle.set_pid(Some(pid));
+        }
+
+        assert_eq!(
+            controller.shard_processes(),
+            vec![
+                ("stock".to_string(), Some(4101)),
+                ("fork".to_string(), Some(4102)),
+                ("xray".to_string(), Some(4103)),
+                ("extra-4".to_string(), Some(4104)),
+            ],
+            "one (label, pid) per live shard; extras named by their row id"
+        );
+
+        // The cohort is exactly what poll_shards tracks: the same crash comes
+        // back under the same label, and that shard stops offering a pid.
+        extra.inject_crash("signal: killed");
+        let crashes = controller.poll_shards();
+        assert_eq!(
+            crashes.first().map(|(shard, _)| shard.as_str()),
+            Some("extra-4"),
+            "poll_shards and shard_processes agree on the shard name: {crashes:?}"
+        );
+        let after = controller.shard_processes();
+        assert!(
+            after.contains(&("extra-4".to_string(), None)),
+            "a dead extra shard drops its pid: {after:?}"
+        );
+
+        controller.stop_all();
+        assert!(
+            controller
+                .shard_processes()
+                .iter()
+                .all(|(_, pid)| pid.is_none()),
+            "stopping every shard clears the whole cohort"
         );
     }
 }

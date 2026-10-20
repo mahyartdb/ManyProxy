@@ -10,12 +10,12 @@ mod tray;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::badge::Badge;
@@ -12769,6 +12769,397 @@ impl InspectorTab {
     }
 }
 
+// --- T-30: per-shard CPU/RAM sampling (read-only, own children only) ---------
+//
+// The sidecars are this app's own child processes, so reading their kernel
+// counters is the user's own information: no enumeration, no network, no
+// telemetry. Everything below is bounded by the pid list the controller hands
+// over; nothing here can name a process the app did not spawn.
+
+/// Samples kept per shard, one per engine tick (`ENGINE_POLL_TICK_SECS`), so
+/// the ring spans five minutes of history and never grows.
+const SHARD_SAMPLE_RING: usize = 60;
+
+/// `PROCESS_QUERY_LIMITED_INFORMATION` — the least right that still answers
+/// `GetProcessTimes` / `GetProcessMemoryInfo`.
+#[cfg(all(windows, not(test)))]
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// `OpenProcess` says this when the pid exists but our token may not query it.
+#[cfg(all(windows, not(test)))]
+const ERROR_ACCESS_DENIED: u32 = 5;
+
+/// One tick's raw counters for one shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProcessSample {
+    /// Kernel + user CPU time in 100 ns units (`GetProcessTimes`).
+    cpu_100ns: u64,
+    /// `PROCESS_MEMORY_COUNTERS.WorkingSetSize` in bytes.
+    ram_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleRead {
+    Sampled(ProcessSample),
+    /// Pid is gone (exited, or exited between ticks): drop it silently.
+    Gone,
+    /// The OS refused the handle (permission): say so instead of guessing.
+    Denied,
+}
+
+/// The single seam between the sampler and Win32. Production points it at
+/// [`win32_process_sample`]; tests inject canned readings, so `cargo test`
+/// never opens a process handle.
+type ProcessSampler = Box<dyn Fn(u32) -> SampleRead>;
+
+/// CPU as a percentage of **one core** over `window`: `cpu delta / wall
+/// time`. Both sides are in 100 ns units, so a sidecar that saturates one core
+/// reads 100.0 and a multi-threaded one legitimately reads above it (each
+/// extra core adds 100). `None` when there is no honest number to plot: an
+/// empty window, or a counter that went backwards (a different process
+/// generation took the pid).
+fn cpu_percent_of_one_core(
+    prev_cpu_100ns: u64,
+    now_cpu_100ns: u64,
+    window: Duration,
+) -> Option<f32> {
+    let window_100ns = window.as_nanos() / 100;
+    if window_100ns == 0 {
+        return None;
+    }
+    let delta = now_cpu_100ns.checked_sub(prev_cpu_100ns)?;
+    Some((delta as f64 / window_100ns as f64 * 100.0) as f32)
+}
+
+/// CPU (% of one core) and RAM (MB) series for one shard, oldest first.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ShardRing {
+    cpu: Vec<f32>,
+    ram: Vec<f32>,
+}
+
+fn push_shard_sample(series: &mut Vec<f32>, value: f32) {
+    if series.len() >= SHARD_SAMPLE_RING {
+        series.remove(0);
+    }
+    series.push(value);
+}
+
+/// Fold one tick of readings into the rings.
+///
+/// - labels that are no longer live are evicted (shard died or was renamed);
+/// - a changed pid is a respawn: its ring starts empty, and the old baseline
+///   is gone, so no sample ever mixes two process generations;
+/// - the first sample of a generation only primes the baseline (there is no
+///   delta yet), so charts start on the second tick;
+/// - a gone pid drops the shard's ring without a trace.
+///
+/// Returns the labels whose handle the OS refused on this tick.
+fn fold_shard_samples(
+    rings: &mut BTreeMap<String, ShardRing>,
+    baselines: &mut BTreeMap<String, (u32, ProcessSample, Instant)>,
+    live: &[(String, u32)],
+    sampler: &dyn Fn(u32) -> SampleRead,
+    at: Instant,
+) -> HashSet<String> {
+    rings.retain(|label, _| live.iter().any(|(name, _)| name == label));
+    baselines.retain(|label, _| live.iter().any(|(name, _)| name == label));
+
+    let mut denied = HashSet::new();
+    for (label, pid) in live {
+        let previous = baselines
+            .get(label)
+            .and_then(|(prev_pid, sample, prev_at)| {
+                (*prev_pid == *pid).then_some((*sample, *prev_at))
+            });
+        if baselines.contains_key(label) && previous.is_none() {
+            rings.insert(label.clone(), ShardRing::default());
+            baselines.remove(label);
+        }
+        match sampler(*pid) {
+            SampleRead::Sampled(sample) => {
+                let ring = rings.entry(label.clone()).or_default();
+                if let Some((prev_sample, prev_at)) = previous {
+                    let window = at.saturating_duration_since(prev_at);
+                    if let Some(cpu) =
+                        cpu_percent_of_one_core(prev_sample.cpu_100ns, sample.cpu_100ns, window)
+                    {
+                        push_shard_sample(&mut ring.cpu, cpu);
+                        push_shard_sample(&mut ring.ram, sample.ram_bytes as f32 / 1_048_576.0);
+                    }
+                }
+                baselines.insert(label.clone(), (*pid, sample, at));
+            }
+            SampleRead::Gone => {
+                rings.remove(label);
+                baselines.remove(label);
+            }
+            SampleRead::Denied => {
+                denied.insert(label.clone());
+            }
+        }
+    }
+    denied
+}
+
+const SHARD_NOT_RUNNING: &str = "not running";
+const SHARD_SAMPLING_UNAVAILABLE: &str = "(sampling unavailable)";
+const SHARD_COLLECTING: &str = "collecting first sample";
+
+/// One row of the Runtime-stats per-shard section: either two plottable series
+/// or a caption saying why there is nothing to plot.
+#[derive(Debug, Clone, PartialEq)]
+struct ShardStatRow {
+    label: String,
+    cpu: Vec<f32>,
+    ram: Vec<f32>,
+    caption: Option<&'static str>,
+}
+
+fn shard_stat_rows(
+    shards: &[(String, Option<u32>)],
+    rings: &BTreeMap<String, ShardRing>,
+    denied: &HashSet<String>,
+) -> Vec<ShardStatRow> {
+    shards
+        .iter()
+        .map(|(label, pid)| {
+            let ring = rings.get(label);
+            let caption = if pid.is_none() {
+                Some(SHARD_NOT_RUNNING)
+            } else if denied.contains(label) {
+                Some(SHARD_SAMPLING_UNAVAILABLE)
+            } else if ring.is_none_or(|ring| ring.cpu.len() < 2) {
+                Some(SHARD_COLLECTING)
+            } else {
+                None
+            };
+            ShardStatRow {
+                label: label.clone(),
+                cpu: ring.map(|ring| ring.cpu.clone()).unwrap_or_default(),
+                ram: ring.map(|ring| ring.ram.clone()).unwrap_or_default(),
+                caption,
+            }
+        })
+        .collect()
+}
+
+fn shard_stats_summary(rows: &[ShardStatRow]) -> String {
+    let live = rows
+        .iter()
+        .filter(|row| row.caption != Some(SHARD_NOT_RUNNING))
+        .count();
+    if live == 0 {
+        return "no sidecar running".to_string();
+    }
+    let sampled = rows.iter().filter(|row| row.caption.is_none()).count();
+    let mut summary = format!("{live} live shard(s), {sampled} charted");
+    if rows
+        .iter()
+        .any(|row| row.caption == Some(SHARD_SAMPLING_UNAVAILABLE))
+    {
+        summary.push_str(", sampling unavailable");
+    }
+    summary
+}
+
+/// Sparkline-shaped line for one series: same `LineChart` family and sizing as
+/// the health sparkline, one per series so CPU and RAM never share a scale.
+fn shard_sparkline(series: &[f32]) -> impl IntoElement {
+    struct SeriesPoint {
+        x: String,
+        y: f64,
+    }
+    let points: Vec<SeriesPoint> = series
+        .iter()
+        .enumerate()
+        .map(|(index, value)| SeriesPoint {
+            x: index.to_string(),
+            y: f64::from(*value),
+        })
+        .collect();
+    div().w(px(120.)).h(px(24.)).child(
+        LineChart::new(points)
+            .x(|point: &SeriesPoint| point.x.clone())
+            .y(|point: &SeriesPoint| point.y)
+            .x_axis(false)
+            .grid(false),
+    )
+}
+
+fn shard_stat_row_view(row: &ShardStatRow) -> AnyElement {
+    let mut entry = div()
+        .id(format!("shard-stat-{}", row.label))
+        .test_support()
+        .flex()
+        .flex_col()
+        .gap_1();
+    match row.caption {
+        Some(caption) => {
+            entry = entry.child(
+                div()
+                    .id(format!("shard-caption-{}", row.label))
+                    .test_support()
+                    .text_xs()
+                    .child(format!("{}: {caption}", row.label)),
+            );
+        }
+        None => {
+            let latest_cpu = row.cpu.last().copied().unwrap_or(0.0);
+            let latest_ram = row.ram.last().copied().unwrap_or(0.0);
+            entry = entry
+                .child(
+                    div()
+                        .id(format!("shard-label-{}", row.label))
+                        .test_support()
+                        .text_xs()
+                        .child(format!(
+                            "{} · CPU {latest_cpu:.1}% of one core · RAM {latest_ram:.1} MB",
+                            row.label
+                        )),
+                )
+                .child(
+                    div()
+                        .id(format!("shard-chart-{}", row.label))
+                        .test_support()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(shard_sparkline(&row.cpu))
+                        .child(shard_sparkline(&row.ram)),
+                );
+        }
+    }
+    entry.into_any_element()
+}
+
+/// Read one child's counters. Windows-only, same posture as `dpapi`: raw
+/// `extern "system"` declarations, no crate, and the handle is closed on every
+/// path.
+#[cfg(all(windows, not(test)))]
+mod win32_process {
+    use std::ffi::c_void;
+
+    use super::{
+        ProcessSample, SampleRead, ERROR_ACCESS_DENIED, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    impl FileTime {
+        /// `FILETIME` counts 100 ns ticks in two halves.
+        fn ticks(&self) -> u64 {
+            (u64::from(self.high) << 32) | u64::from(self.low)
+        }
+    }
+
+    /// `PROCESS_MEMORY_COUNTERS` — only `WorkingSetSize` is read; the rest
+    /// keeps the layout the callee fills.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        _page_fault_count: u32,
+        _peak_working_set_size: usize,
+        working_set_size: usize,
+        _quota_peak_paged_pool_usage: usize,
+        _quota_paged_pool_usage: usize,
+        _quota_peak_non_paged_pool_usage: usize,
+        _quota_non_paged_pool_usage: usize,
+        _pagefile_usage: usize,
+        _peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    /// Owns the query handle; dropping it is the only side effect in here.
+    struct OwnedHandle(*mut c_void);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub(super) fn sample(pid: u32) -> SampleRead {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return if GetLastError() == ERROR_ACCESS_DENIED {
+                    SampleRead::Denied
+                } else {
+                    SampleRead::Gone
+                };
+            }
+            let handle = OwnedHandle(handle);
+
+            let mut creation = FileTime::default();
+            let mut exit = FileTime::default();
+            let mut kernel = FileTime::default();
+            let mut user = FileTime::default();
+            if GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+                return SampleRead::Gone;
+            }
+
+            let cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            let mut counters = ProcessMemoryCounters {
+                cb,
+                ..Default::default()
+            };
+            if GetProcessMemoryInfo(handle.0, &mut counters, cb) == 0 {
+                return SampleRead::Gone;
+            }
+
+            SampleRead::Sampled(ProcessSample {
+                cpu_100ns: kernel.ticks().saturating_add(user.ticks()),
+                ram_bytes: counters.working_set_size as u64,
+            })
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn win32_process_sample(pid: u32) -> SampleRead {
+    win32_process::sample(pid)
+}
+
+/// Tests inject their own readings (no handle ever opens under `cargo test`),
+/// and non-Windows builds have no Win32 to ask — both degrade to the caption
+/// instead of pretending a number exists.
+#[cfg(any(test, not(windows)))]
+fn win32_process_sample(_pid: u32) -> SampleRead {
+    SampleRead::Denied
+}
+
 struct AppView {
     focus: FocusHandle,
     libraries: Entity<ListState<LibraryDelegate>>,
@@ -12910,6 +13301,20 @@ struct AppView {
     palette: Option<Entity<CommandState>>,
 
     traffic_period: store::TrafficPeriod,
+
+    /// T-30: per-shard CPU (% of one core) / RAM (MB) rings, keyed by the
+    /// shard label `poll_shards` uses. One entry per live shard, 60 samples.
+    shard_rings: BTreeMap<String, ShardRing>,
+
+    /// T-30: previous raw counters per label — the delta baseline for the next
+    /// engine tick. Dropped with the shard, re-primed on respawn.
+    shard_baselines: BTreeMap<String, (u32, ProcessSample, Instant)>,
+
+    /// T-30: shards whose handle the OS refused on the last tick.
+    shard_denied: HashSet<String>,
+
+    /// T-30: the read-only sampler seam; production reads Win32, tests inject.
+    process_sampler: ProcessSampler,
 
     started_at: std::time::Instant,
 }
@@ -13096,6 +13501,10 @@ impl AppView {
             last_traffic_poll_at: 0,
             palette: None,
             traffic_period: store::TrafficPeriod::Day,
+            shard_rings: BTreeMap::new(),
+            shard_baselines: BTreeMap::new(),
+            shard_denied: HashSet::new(),
+            process_sampler: Box::new(win32_process_sample),
             started_at: std::time::Instant::now(),
         };
         let mut view = view;
@@ -15886,7 +16295,12 @@ impl AppView {
             }
             None => "none selected".to_string(),
         };
-        let lines = vec![
+        let shard_rows = shard_stat_rows(
+            &self.engine.shard_processes(),
+            &self.shard_rings,
+            &self.shard_denied,
+        );
+        let mut lines = vec![
             format!("Uptime: {uptime}"),
             format!("Endpoints: {running} running / {total} stored"),
             format!(
@@ -15907,8 +16321,8 @@ impl AppView {
             format!("Subscriptions: {subs_line}"),
             format!("Database: {db_line}"),
             format!("Selected: {selected_line}"),
-            "Process CPU/RAM: not sampled in this build (phase 2)".to_string(),
         ];
+        lines.push(format!("Processes: {}", shard_stats_summary(&shard_rows)));
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
             let mut body = div().flex().flex_col().gap_1();
             for (ix, line) in lines.iter().enumerate() {
@@ -15919,6 +16333,22 @@ impl AppView {
                         .text_sm()
                         .child(line.clone()),
                 );
+            }
+            body =
+                body.child(
+                    div()
+                        .id("runtime-shard-stats")
+                        .test_support()
+                        .mt_2()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_xs().child(
+                            "Sidecar processes — CPU % of one core, RAM in MB, last 60 ticks",
+                        )),
+                );
+            for row in shard_rows.iter() {
+                body = body.child(shard_stat_row_view(row));
             }
             dialog
                 .title("Runtime stats")
@@ -23044,6 +23474,7 @@ impl AppView {
         }
 
         let cause = self.poll_engine();
+        self.tick_shard_samples();
         self.reload_quiet_no_poll(cx);
         if let Some(notification) = self.service_engine_crash() {
             self.push_engine_notification(notification, cx);
@@ -23061,11 +23492,31 @@ impl AppView {
             return None;
         }
         let detail = self.poll_engine();
+        self.tick_shard_samples();
         self.reload_quiet_no_poll(cx);
         if let Some(notification) = self.service_engine_crash() {
             window.push_notification(notification, cx);
         }
         detail
+    }
+
+    /// T-30: one sampling pass, riding the existing engine tick (no new timer).
+    /// The pid cohort comes from the controller, so only this app's own
+    /// sidecars can ever be opened.
+    fn tick_shard_samples(&mut self) {
+        let live: Vec<(String, u32)> = self
+            .engine
+            .shard_processes()
+            .into_iter()
+            .filter_map(|(label, pid)| pid.map(|pid| (label, pid)))
+            .collect();
+        self.shard_denied = fold_shard_samples(
+            &mut self.shard_rings,
+            &mut self.shard_baselines,
+            &live,
+            self.process_sampler.as_ref(),
+            Instant::now(),
+        );
     }
 
     fn tick_due_subscriptions(&mut self, cx: &mut Context<Self>) -> usize {
@@ -55654,6 +56105,310 @@ mod tests {
             day_small,
             traffic_top9_split(&dataset(TrafficPeriod::Day, 6)),
             "no split state survives a render"
+        );
+    }
+
+    // --- T-30: shard CPU/RAM sampler (pure math, ring, render) ---------------
+
+    fn shard_pair(label: &str, pid: u32) -> (String, u32) {
+        (label.to_string(), pid)
+    }
+
+    fn sampled(cpu_100ns: u64, ram_bytes: u64) -> impl Fn(u32) -> crate::SampleRead {
+        move |_pid| {
+            crate::SampleRead::Sampled(crate::ProcessSample {
+                cpu_100ns,
+                ram_bytes,
+            })
+        }
+    }
+
+    #[test]
+    fn t80_sampler_delta_calculations() {
+        use crate::cpu_percent_of_one_core;
+        use std::time::Duration;
+
+        let window = Duration::from_secs(5);
+        // 5 s of CPU time inside a 5 s window = one full core.
+        let full_core = 5 * 10_000_000;
+        assert_eq!(cpu_percent_of_one_core(0, full_core, window), Some(100.0));
+        assert_eq!(
+            cpu_percent_of_one_core(7, 7 + full_core / 2, window),
+            Some(50.0)
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(7, 7 + full_core * 2, window),
+            Some(200.0),
+            "two busy threads are 200% of one core"
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(1_000, 1_000, window),
+            Some(0.0),
+            "an idle process reads zero, not absent"
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(5_000, 4_000, window),
+            None,
+            "a backwards counter is no sample at all"
+        );
+        assert_eq!(
+            cpu_percent_of_one_core(0, full_core, Duration::ZERO),
+            None,
+            "an empty window has no rate"
+        );
+
+        let odd = cpu_percent_of_one_core(0, 1_234_567, window).expect("odd delta samples");
+        assert!(
+            (odd - 2.469_135_8).abs() < 0.001,
+            "delta / window, got {odd}"
+        );
+        // Same CPU delta over half the wall time doubles the rate: the
+        // normalization is by elapsed wall time, not by tick count.
+        assert_eq!(
+            cpu_percent_of_one_core(0, full_core / 2, Duration::from_millis(2_500)),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn t80_ring_evicts_dead_shards() {
+        use crate::{
+            fold_shard_samples, push_shard_sample, SampleRead, ShardRing, SHARD_SAMPLE_RING,
+        };
+        use std::collections::BTreeMap;
+        use std::time::{Duration, Instant};
+
+        let mut rings: BTreeMap<String, ShardRing> = BTreeMap::new();
+        let mut baselines = BTreeMap::new();
+        let t0 = Instant::now();
+        let read = sampled(12_000_000, 64 * 1_048_576);
+        let live = [shard_pair("stock", 41), shard_pair("fork", 42)];
+
+        for step in 0..3u64 {
+            let at = t0 + Duration::from_secs(5 * step);
+            fold_shard_samples(&mut rings, &mut baselines, &live, &read, at);
+        }
+        assert_eq!(
+            rings["stock"].cpu.len(),
+            2,
+            "the first tick only primes the baseline"
+        );
+        assert_eq!(rings["stock"].ram.len(), 2);
+        assert_eq!(rings["fork"].cpu.len(), 2);
+
+        // fork stops: its label leaves the cohort, so its ring goes with it.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("stock", 41)],
+            &read,
+            t0 + Duration::from_secs(20),
+        );
+        assert!(!rings.contains_key("fork"), "dead shard evicted");
+        assert!(!baselines.contains_key("fork"), "no baseline left behind");
+        assert!(rings.contains_key("stock"), "live shard keeps its history");
+
+        // A rename is the same eviction: the old label disappears, the new one
+        // starts with an empty ring.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("stock", 41), shard_pair("extra-9", 43)],
+            &read,
+            t0 + Duration::from_secs(25),
+        );
+        assert!(rings["extra-9"].cpu.is_empty(), "new label starts clean");
+
+        // A pid the sampler reports gone drops silently.
+        let gone = |_pid: u32| SampleRead::Gone;
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("extra-9", 43)],
+            &gone,
+            t0 + Duration::from_secs(30),
+        );
+        assert!(!rings.contains_key("extra-9"), "gone pid drops silently");
+
+        // A refused handle is named, never plotted.
+        let denied = |_pid: u32| SampleRead::Denied;
+        let refused = fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &[shard_pair("xray", 44)],
+            &denied,
+            t0 + Duration::from_secs(35),
+        );
+        assert!(refused.contains("xray"), "permission failure is named");
+        assert!(!rings.contains_key("xray"), "nothing is plotted for it");
+
+        // The ring caps at 60: the oldest samples fall off the front.
+        let mut ring = ShardRing::default();
+        for step in 0..(SHARD_SAMPLE_RING as i32 + 10) {
+            push_shard_sample(&mut ring.cpu, step as f32);
+            push_shard_sample(&mut ring.ram, 1.0);
+        }
+        assert_eq!(ring.cpu.len(), SHARD_SAMPLE_RING);
+        assert_eq!(ring.ram.len(), SHARD_SAMPLE_RING);
+        assert_eq!(ring.cpu.first().copied(), Some(10.0), "oldest ten evicted");
+        assert_eq!(
+            ring.cpu.last().copied(),
+            Some((SHARD_SAMPLE_RING + 9) as f32)
+        );
+    }
+
+    #[test]
+    fn t80_no_sampling_race_after_restart() {
+        use crate::{fold_shard_samples, ShardRing};
+        use std::collections::BTreeMap;
+        use std::time::{Duration, Instant};
+
+        let mut rings: BTreeMap<String, ShardRing> = BTreeMap::new();
+        let mut baselines = BTreeMap::new();
+        let t0 = Instant::now();
+        let first = [shard_pair("stock", 41)];
+
+        // Generation one: prime at 1 s of CPU, then +1 s over a 5 s window.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &first,
+            &sampled(10_000_000, 100 * 1_048_576),
+            t0,
+        );
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &first,
+            &sampled(20_000_000, 101 * 1_048_576),
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(rings["stock"].cpu, vec![20.0]);
+        assert_eq!(rings["stock"].ram, vec![101.0]);
+
+        // The shard restarts under a new pid whose counter starts near zero.
+        // Its CPU time is far below the old baseline: reusing that baseline
+        // would underflow or fabricate a bogus rate.
+        let second = [shard_pair("stock", 55)];
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(500_000, 30 * 1_048_576),
+            t0 + Duration::from_secs(10),
+        );
+        assert!(
+            rings["stock"].cpu.is_empty() && rings["stock"].ram.is_empty(),
+            "respawn starts a fresh ring, got {:?}",
+            rings["stock"]
+        );
+
+        // The next tick deltas against the new generation only.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(3_000_000, 31 * 1_048_576),
+            t0 + Duration::from_secs(15),
+        );
+        assert_eq!(rings["stock"].cpu, vec![5.0], "2.5 s CPU / 5 s window");
+        assert_eq!(rings["stock"].ram, vec![31.0]);
+
+        // A backwards counter for the same pid can never push a sample, and
+        // the baseline re-primes so the next tick stays sane.
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(100, 31 * 1_048_576),
+            t0 + Duration::from_secs(20),
+        );
+        assert_eq!(rings["stock"].cpu, vec![5.0], "no negative rate");
+        fold_shard_samples(
+            &mut rings,
+            &mut baselines,
+            &second,
+            &sampled(2_500_100, 32 * 1_048_576),
+            t0 + Duration::from_secs(25),
+        );
+        assert_eq!(rings["stock"].cpu, vec![5.0, 5.0]);
+        assert_eq!(rings["stock"].ram, vec![31.0, 32.0]);
+    }
+
+    #[gpui_kit::test]
+    fn t80_runtime_stats_render_per_shard(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::{shard_stat_rows, ShardRing};
+        use std::collections::{BTreeMap, HashSet};
+
+        let mut rings: BTreeMap<String, ShardRing> = BTreeMap::new();
+        rings.insert(
+            "stock".to_string(),
+            ShardRing {
+                cpu: vec![4.5, 6.0],
+                ram: vec![31.0, 33.5],
+            },
+        );
+        let shards = vec![
+            ("stock".to_string(), Some(41)),
+            ("fork".to_string(), None),
+            ("xray".to_string(), Some(43)),
+            ("extra-9".to_string(), Some(44)),
+        ];
+        let denied: HashSet<String> = ["xray".to_string()].into_iter().collect();
+
+        let rows = shard_stat_rows(&shards, &rings, &denied);
+        assert_eq!(rows.len(), 4, "one row per shard slot");
+        assert_eq!(rows[0].label, "stock");
+        assert_eq!(rows[0].cpu, vec![4.5, 6.0], "series follow the shard label");
+        assert_eq!(rows[0].ram, vec![31.0, 33.5]);
+        assert_eq!(rows[0].caption, None, "samples mean charts");
+        assert_eq!(rows[1].caption, Some(crate::SHARD_NOT_RUNNING));
+        assert_eq!(rows[2].caption, Some(crate::SHARD_SAMPLING_UNAVAILABLE));
+        assert_eq!(rows[3].caption, Some(crate::SHARD_COLLECTING));
+        assert_eq!(
+            crate::shard_stats_summary(&rows),
+            "3 live shard(s), 1 charted, sampling unavailable"
+        );
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, stock) = EngineController::fake();
+                stock.set_pid(Some(41));
+                view.engine = engine;
+                view.shard_rings = rings.clone();
+                view.shard_denied = denied.clone();
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_runtime_stats_dialog(window, cx));
+        });
+        paint_dialog_open(cx);
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        for id in [
+            "runtime-shard-stats",
+            "shard-stat-stock",
+            "shard-label-stock",
+            "shard-chart-stock",
+            "shard-caption-fork",
+            "shard-caption-extra-0",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id).is_some()),
+                "{id} paints"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window.try_find("shard-chart-fork").is_none()),
+            "a shard with no samples paints no chart"
+        );
+        assert!(
+            cx.update(|window, _| window.try_find("runtime-stat-9").is_some()),
+            "the process summary keeps the ten-line body"
         );
     }
 }
