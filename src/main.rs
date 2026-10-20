@@ -171,6 +171,23 @@ pub const STARTUP_REFRESH_DEFER_SECS: u64 = 3;
 
 pub const APP_TITLE: &str = "ManyProxy";
 
+/// T-26: the one `· N running` suffix shared by the window title and the tray
+/// tooltip, so the two surfaces can never drift. Empty while nothing runs.
+pub fn running_title_suffix(running: usize) -> String {
+    if running == 0 {
+        String::new()
+    } else {
+        format!(" · {running} running")
+    }
+}
+
+/// T-26: composed window title for a running count — `ManyProxy` at zero,
+/// `ManyProxy · N running` above it. Consumed by the OS window title, the
+/// custom titlebar label, and (through `tray::tray_tooltip`) the tray tooltip.
+pub fn window_title_text(running: usize) -> String {
+    format!("{APP_TITLE}{}", running_title_suffix(running))
+}
+
 fn app_window_options() -> WindowOptions {
     let mut options = TitleBar::window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
@@ -12682,6 +12699,7 @@ impl AppView {
         let running = self.engine.running_ids();
 
         self.snapshot_running_set(&running);
+        self.sync_running_title(running.len(), cx);
         if let Some(tray) = &self.tray {
             tray.set_running(running.len());
         }
@@ -14319,6 +14337,16 @@ impl AppView {
         self.last_snapshot = running.to_vec();
         if let Err(error) = self.store.save_running_snapshot(running) {
             eprintln!("running snapshot failed: {error}");
+        }
+    }
+
+    /// T-26: mirrors the running count into the OS window title on the exact
+    /// cadence the tray tooltip is fed from — no extra poll or timer. The
+    /// custom titlebar label composes the same `window_title_text` at render.
+    fn sync_running_title(&self, running: usize, cx: &mut Context<Self>) {
+        let title = window_title_text(running);
+        if let Some(handle) = cx.active_window() {
+            let _ = handle.update(cx, move |_, window, _| window.set_window_title(&title));
         }
     }
 
@@ -26944,6 +26972,9 @@ impl Render for AppView {
         });
 
         let show_detail = self.config_count(cx) != 0;
+        // T-26: the titlebar label carries the same `· N running` text the OS
+        // title gets, both composed from the one shared helper.
+        let current_title = window_title_text(self.engine.running_count());
         let facet_bar = self.render_facet_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
         let empty_ctas = self.render_empty_ctas(cx);
@@ -26960,7 +26991,7 @@ impl Render for AppView {
         list_pane = list_pane.child(empty_ctas);
 
         self.render_shell(cx)
-            .child(TitleBar::new().child(Label::new(APP_TITLE)))
+            .child(TitleBar::new().child(Label::new(current_title)))
             .child(self.render_toolbar(cx))
             .child(
                 div()
@@ -32906,6 +32937,141 @@ mod tests {
         });
         assert_absent(cx, "conn-counters".to_string());
         assert_painted(cx, "status-center");
+    }
+
+    #[test]
+    fn t76_running_title_suffix_shapes() {
+        use crate::{running_title_suffix, window_title_text, APP_TITLE};
+
+        assert_eq!(running_title_suffix(0), "", "idle contributes no suffix");
+        assert_eq!(running_title_suffix(1), " · 1 running");
+        assert_eq!(running_title_suffix(12), " · 12 running");
+
+        assert_eq!(window_title_text(0), APP_TITLE);
+        assert_eq!(window_title_text(0), "ManyProxy");
+        assert_eq!(window_title_text(3), "ManyProxy · 3 running");
+
+        // Count only: no preset marker, no `[Admin]`-family token, no extra text.
+        for text in [window_title_text(0), window_title_text(7)] {
+            assert!(
+                !text.contains('[') && !text.contains(']'),
+                "no token: {text}"
+            );
+            assert!(
+                !text.to_lowercase().contains("preset"),
+                "no preset marker: {text}"
+            );
+            assert!(
+                text.starts_with(APP_TITLE),
+                "always starts with the base title: {text}"
+            );
+            assert_eq!(
+                text.matches('·').count(),
+                usize::from(text != APP_TITLE),
+                "exactly one separator when running, none at zero: {text}"
+            );
+        }
+    }
+
+    /// T-26: the label the custom titlebar renders and the OS title both come
+    /// from `window_title_text`, fed by the same `ENGINE_POLL_TICK_SECS`
+    /// (`poll_shards`-driven) count the tray tooltip is fed from.
+    #[gpui_kit::test]
+    fn t76_titlebar_label_follows_running_count(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Alpha", "10981"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _handle) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        let label_text = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                crate::window_title_text(view.engine.running_count())
+            })
+        };
+        assert_eq!(label_text(cx), "ManyProxy", "zero running renders plain");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        let running = view.read_with(cx, |view, _| view.engine.running_count());
+        assert!(running > 0, "fake core runs without a sidecar");
+        assert_eq!(
+            label_text(cx),
+            format!("ManyProxy · {running} running"),
+            "the count reaches the label text"
+        );
+
+        // The frame that draws the composed label renders at that title.
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.render_frame(cx);
+        });
+        assert_painted(cx, "main-content");
+        assert_eq!(label_text(cx), format!("ManyProxy · {running} running"));
+
+        cx.update(|_, cx| view.update(cx, |view, _| view.engine.stop_all()));
+        assert_eq!(
+            label_text(cx),
+            "ManyProxy",
+            "stopping all clears the marker"
+        );
+    }
+
+    /// T-26: one helper feeds both surfaces, so the tray tooltip and the
+    /// titlebar label carry the same text at zero and while running.
+    #[gpui_kit::test]
+    fn t76_tray_tooltip_stays_in_sync(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+        use crate::tray::tray_tooltip;
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(t30_engine_seed("Alpha", "10982"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _handle) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        let surfaces = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                let running = view.engine.running_count();
+                (running, crate::window_title_text(running))
+            })
+        };
+        let (running, title) = surfaces(cx);
+        assert_eq!(running, 0);
+        assert_eq!(title, crate::APP_TITLE);
+        assert_eq!(tray_tooltip(running), title, "idle surfaces agree");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.commit_start_all(window, cx));
+        });
+        let (running, title) = surfaces(cx);
+        assert!(running > 0, "fake core runs without a sidecar");
+        assert_eq!(
+            tray_tooltip(running),
+            title,
+            "running surfaces carry the same text"
+        );
+        assert_eq!(title, format!("ManyProxy · {running} running"));
     }
 
     #[gpui_kit::test]

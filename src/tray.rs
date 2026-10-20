@@ -2,8 +2,14 @@ include!(concat!(env!("OUT_DIR"), "/tray_icon_rgba.rs"));
 
 use crate::store::ProxyConfig;
 
+/// T-26: the tray tooltip shares the window title's `· N running` suffix
+/// helper (`crate::running_title_suffix`), so the two surfaces cannot drift.
 pub fn tray_tooltip(running: usize) -> String {
-    format!("ManyProxy · {running} running")
+    format!(
+        "{}{}",
+        crate::APP_TITLE,
+        crate::running_title_suffix(running)
+    )
 }
 
 pub mod menu_id {
@@ -381,7 +387,7 @@ mod tests {
 
     #[test]
     fn tooltip_carries_running_count() {
-        assert_eq!(tray_tooltip(0), "ManyProxy · 0 running");
+        assert_eq!(tray_tooltip(0), "ManyProxy");
         assert_eq!(tray_tooltip(3), "ManyProxy · 3 running");
     }
 
