@@ -365,6 +365,18 @@ fn group_delete_confirm_description(name: &str, count: usize, subscriptions: usi
     )
 }
 
+/// T-34: one session-sourced notice — the previous run left a running
+/// snapshot behind without reaching any clean-exit path.
+const UNCLEAN_EXIT_NOTICE: &str =
+    "Previous run carried running endpoints and did not exit cleanly.";
+
+fn unclean_exit_notice(previous_clean: bool, last_snapshot: &[String]) -> Option<Notification> {
+    if previous_clean || last_snapshot.is_empty() {
+        return None;
+    }
+    Some(Notification::warning(UNCLEAN_EXIT_NOTICE))
+}
+
 fn close_confirm_description(running_names: &[String]) -> Option<String> {
     if running_names.is_empty() {
         return None;
@@ -13637,6 +13649,22 @@ impl AppView {
 
     fn with_store(window: &mut Window, cx: &mut Context<Self>, store: Store) -> Self {
         let mut store = store;
+        // T-34: read the previous session's verdict first, then assume this
+        // session is dirty. The write lands before any restore logic, so a
+        // kill/crash leaves "0" (unclean) for the next boot.
+        let previous_clean_exit = store.last_clean_exit();
+        let last_snapshot = store.load_running_snapshot();
+        if let Err(error) = store.set_last_clean_exit(false) {
+            eprintln!("clean-exit marker reset failed: {error}");
+        }
+        if let Some(notice) = unclean_exit_notice(previous_clean_exit, &last_snapshot) {
+            // The notification layer needs the Root view, which the window only
+            // adopts after this constructor returns: the decision is taken here
+            // at boot, the toast lands on the first frame — once.
+            cx.on_next_frame(window, move |_view, window, cx| {
+                window.push_notification(notice, cx);
+            });
+        }
         // T-33: the first read seeds the address list once (constants + every
         // row's current bind); every later read is the stored extras alone.
         let bind_hosts = store.bind_hosts();
@@ -13683,8 +13711,6 @@ impl AppView {
         );
 
         apply_appearance(&store.appearance(), Some(window), cx);
-
-        let last_snapshot = store.load_running_snapshot();
 
         {
             let our_ports: Vec<u16> = store
@@ -15556,6 +15582,7 @@ impl AppView {
             }
         }
         self.snapshot_running_set(&[]);
+        self.mark_clean_exit();
         self.save_window_geometry(window);
         self.close_confirmed = true;
     }
@@ -15588,6 +15615,14 @@ impl AppView {
         self.last_snapshot = running.to_vec();
         if let Err(error) = self.store.save_running_snapshot(running) {
             eprintln!("running snapshot failed: {error}");
+        }
+    }
+
+    /// T-34: every orderly exit writes the marker right after its snapshot
+    /// clear. A kill/crash never reaches here, so boot's "0" stands.
+    fn mark_clean_exit(&mut self) {
+        if let Err(error) = self.store.set_last_clean_exit(true) {
+            eprintln!("clean-exit marker failed: {error}");
         }
     }
 
@@ -15739,6 +15774,7 @@ impl AppView {
             }
         }
         self.snapshot_running_set(&[]);
+        self.mark_clean_exit();
         self.save_window_geometry(window);
 
         self.tray = None;
@@ -28851,7 +28887,12 @@ fn main() {
                         return false;
                     };
                     match view.read_with(cx, |view, _| view.close_veto_text()) {
-                        None => true,
+                        None => {
+                            // T-34: a plain close with nothing running is an
+                            // orderly exit too — mark it before the window goes.
+                            view.update(cx, |view, _| view.mark_clean_exit());
+                            true
+                        }
                         Some(description) => {
                             let confirm_view = view.clone();
                             window.open_alert_dialog(cx, move |alert, _, _| {
@@ -52385,6 +52426,291 @@ mod tests {
         let quit =
             cx.update(|window, cx| view.update(cx, |view, cx| view.poll_tray_once(window, cx)));
         assert!(!quit, "no tray, no quit, no event drain");
+    }
+
+    /// T-34: every orderly exit path writes `last_clean_exit = "1"`; the boot
+    /// write (`"0"`) is what a kill/crash leaves behind.
+    #[gpui_kit::test]
+    fn t84_clean_quit_flags_last_clean_exit(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Clean quit", "", "10881"))
+            .expect("seed works");
+        assert!(!store.last_clean_exit(), "absent meta reads unclean");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.start_all_engines(window, cx));
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot()),
+            vec![row.id.clone()],
+            "a running set is snapshotted before the exit"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "tray Quit writes the clean marker"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.store
+                    .get_meta(Store::META_LAST_CLEAN_EXIT)
+                    .expect("meta reads")
+            }),
+            Some("1".to_string()),
+            "the marker's on-disk shape is \"1\""
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.store.load_running_snapshot())
+                .is_empty(),
+            "tray Quit still clears the snapshot"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.set_last_clean_exit(false).expect("reset writes")
+            });
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.confirm_close_stop(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "confirm-close-stop writes the clean marker on its own"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.store.set_last_clean_exit(false).expect("reset writes")
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.mark_clean_exit());
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "the zero-rows plain close flips through the same helper its branch calls"
+        );
+    }
+
+    /// T-34: boot reads the previous verdict, then always writes the dirty
+    /// assumption for the session it is starting.
+    #[gpui_kit::test]
+    fn t84_boot_assumes_dirty_until_quits_cleanly(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+
+        let (view, cx) = mount_view(store, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.store
+                    .get_meta(Store::META_LAST_CLEAN_EXIT)
+                    .expect("meta reads")
+            }),
+            Some("0".to_string()),
+            "boot overwrites a clean marker with the dirty assumption"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "only the clean quit turns the session marker back to clean"
+        );
+    }
+
+    /// T-34: an unclean boot that left a running snapshot behind toasts once;
+    /// the toast text is the ticket's exact string.
+    #[gpui_kit::test]
+    fn t84_unclean_boot_with_running_snapshot_toasts_once(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Crashed run", "", "10882"))
+            .expect("seed works");
+        store
+            .save_running_snapshot(std::slice::from_ref(&row.id))
+            .expect("snapshot writes");
+        assert!(
+            !store.last_clean_exit(),
+            "a snapshot without a clean marker is the crash shape"
+        );
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "the unclean boot toasts exactly once"
+        );
+        assert_eq!(
+            crate::UNCLEAN_EXIT_NOTICE,
+            "Previous run carried running endpoints and did not exit cleanly.",
+            "the toast carries the ticket's exact string"
+        );
+
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "the toast is one-shot, not one per frame"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.restore_on_launch(window, cx));
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "restore-on-launch never repeats the toast"
+        );
+    }
+
+    /// T-34: the clean marker suppresses the toast whatever the snapshot
+    /// holds — and that suppression proves the read precedes the boot write.
+    #[gpui_kit::test]
+    fn t84_clean_boot_never_toasts_even_with_snapshot(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let row = store
+            .add(restore_seed("Clean run", "", "10883"))
+            .expect("seed works");
+        store
+            .save_running_snapshot(std::slice::from_ref(&row.id))
+            .expect("snapshot writes");
+        store
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "a clean previous exit never toasts, even with a snapshot"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.store
+                    .get_meta(Store::META_LAST_CLEAN_EXIT)
+                    .expect("meta reads")
+            }),
+            Some("0".to_string()),
+            "the boot read the clean value before writing the dirty one"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.last_snapshot.clone()),
+            vec![row.id.clone()],
+            "snapshot hydration is unchanged by the marker"
+        );
+
+        let mut empty = Store::open_in_memory().expect("in-memory store opens");
+        empty
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+        let (_empty_view, cx2) = mount_view(empty, cx);
+        cx2.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx2),
+            0,
+            "clean boot with an empty snapshot toasts nothing either"
+        );
+    }
+
+    /// T-34: the marker is a meta value; orderly exits create no files.
+    #[gpui_kit::test]
+    fn t84_no_marker_file_ever_written(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        // Fixed name (no PID suffix): the cleanup below runs before any
+        // connection exists, so it self-heals the previous run's leftovers.
+        // A PID suffix made each suite pass leave a fresh directory behind.
+        let dir = std::env::temp_dir().join("manyproxy-t84-marker");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        let names = |dir: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("dir reads")
+                .map(|entry| {
+                    entry
+                        .expect("entry reads")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        let store = Store::open_file(&dir.join("library.db")).expect("file store opens");
+        let before = names(&dir);
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(notification_count(cx), 0, "nothing to report on this boot");
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| view.quit_from_tray(window));
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.store.last_clean_exit()),
+            "the clean quit markers the session"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "a clean quit pushes no notification"
+        );
+
+        let after = names(&dir);
+        assert_eq!(
+            after, before,
+            "the clean quit writes no files beyond the database family"
+        );
+        assert!(
+            after.iter().all(|name| name.starts_with("library.db")),
+            "only the database family exists: {after:?}"
+        );
+        assert!(
+            !after
+                .iter()
+                .any(|name| name.to_ascii_lowercase().contains("marker")),
+            "the rejected running.marker sibling never appears: {after:?}"
+        );
+
+        drop(view);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui_kit::test]

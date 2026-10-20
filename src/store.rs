@@ -7628,6 +7628,10 @@ impl Store {
 
     pub const META_RUNNING_IDS: &str = "running_ids";
 
+    /// T-34: `"1"` only when the previous session reached an orderly exit.
+    /// Boot writes `"0"` before anything else, so a kill/crash leaves `"0"`.
+    pub const META_LAST_CLEAN_EXIT: &str = "last_clean_exit";
+
     pub const META_TEST_URL: &str = "test_url";
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -7830,6 +7834,18 @@ impl Store {
             params![Self::META_RUNNING_IDS],
         )?;
         Ok(())
+    }
+
+    /// T-34: did the previous session quit through an orderly path? An absent
+    /// key (fresh install, legacy store) or any value but `"1"` is unclean.
+    pub fn last_clean_exit(&self) -> bool {
+        self.get_meta(Self::META_LAST_CLEAN_EXIT)
+            .map(|value| value.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    pub fn set_last_clean_exit(&mut self, clean: bool) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LAST_CLEAN_EXIT, if clean { "1" } else { "0" })
     }
 
     pub fn test_url(&self) -> Option<String> {
