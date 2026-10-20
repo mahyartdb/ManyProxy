@@ -9,6 +9,7 @@ mod store;
 mod tray;
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -98,10 +99,10 @@ use store::{
     rewrite_server_to_ip, row_security_label, row_server_hostname, validate_extra_params,
     vmess_cipher_value, vmess_tls_enabled, AmneziaFold, AnytlsFold, AutoClearGroupConfig,
     ChainHopSlot, ConfigPatch, DialFold, ExtraFold, GroupPruneKind, HealthSnapshot, HttpFold,
-    HysteriaFold, MuxFold, NaiveFold, NewConfig, ProxyConfig, RestoreOutcome, ShadowTlsFold,
-    SnellFold, SocksFold, SshFold, Store, StoreError, Subscription as ProxySubscription,
-    TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold, WireguardFold, XrayFold, DEFAULT_BIND,
-    DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
+    HysteriaFold, LibrarySort, LibrarySortKey, MuxFold, NaiveFold, NewConfig, ProxyConfig,
+    RestoreOutcome, ShadowTlsFold, SnellFold, SocksFold, SortDirection, SshFold, Store, StoreError,
+    Subscription as ProxySubscription, TlsForcedFold, TlsOptionalFold, TransportFold, TuicFold,
+    WireguardFold, XrayFold, DEFAULT_BIND, DEFAULT_GROUP, DEFAULT_PROTOCOL, VALID_PROTOCOLS,
 };
 
 actions!(
@@ -415,7 +416,18 @@ struct LibraryDelegate {
 
     show_security: bool,
 
-    type_security_sort: bool,
+    /// T-27: the one sort concept — a key plus a direction, persisted in the
+    /// `library_sort` meta key. Replaces the retired `type_security_sort` bool.
+    sort: LibrarySort,
+
+    /// T-27 mirrors the sort keys read on render. All three are pushed from
+    /// state the app already holds (health store samples, session traffic
+    /// mirror, out-IP resolutions) — the sort never polls.
+    latency: HashMap<String, u64>,
+
+    data_traffic: HashMap<String, (u64, u64)>,
+
+    out_ips: HashMap<String, String>,
 
     row_columns: RowColumns,
 
@@ -688,6 +700,188 @@ fn split_port_query(query: &str) -> (Option<PortPredicate>, String) {
     (predicate, kept.join(" "))
 }
 
+/// T-27: the per-row maps the sort keys read, borrowed for one `apply_filter`
+/// pass. Everything here is a mirror the app already keeps fresh on its normal
+/// ticks, so sorting is a pure render-time computation.
+struct SortContext<'a> {
+    /// Latest successful URL-test sample per row, in milliseconds.
+    latency: &'a HashMap<String, u64>,
+    /// Per-row current (session) data-plane counters, rx then tx.
+    data_traffic: &'a HashMap<String, (u64, u64)>,
+    /// Per-row accumulated counters in the store's counting window, rx then tx.
+    totals: &'a HashMap<String, (u64, u64)>,
+    /// Resolved egress IP per row, as text.
+    out_ips: &'a HashMap<String, String>,
+}
+
+/// T-27: what a header-menu row does — pick a key, or reverse the direction.
+#[derive(Debug, Clone, Copy)]
+enum SortMenuAction {
+    Key(LibrarySortKey),
+    Direction,
+}
+
+impl SortContext<'_> {
+    fn numeric(&self, key: LibrarySortKey, row_id: &str) -> Option<u64> {
+        match key {
+            LibrarySortKey::Latency => self.latency.get(row_id).copied(),
+            LibrarySortKey::Download => self.data_traffic.get(row_id).map(|(rx, _)| *rx),
+            LibrarySortKey::Upload => self.data_traffic.get(row_id).map(|(_, tx)| *tx),
+            LibrarySortKey::TrafficTotal => self
+                .totals
+                .get(row_id)
+                .map(|(rx, tx)| rx.saturating_add(*tx)),
+            LibrarySortKey::TrafficDown => self.totals.get(row_id).map(|(rx, _)| *rx),
+            LibrarySortKey::TrafficUp => self.totals.get(row_id).map(|(_, tx)| *tx),
+            _ => None,
+        }
+    }
+
+    fn out_ip(&self, row_id: &str) -> Option<&str> {
+        self.out_ips
+            .get(row_id)
+            .map(String::as_str)
+            .filter(|text| !text.trim().is_empty())
+    }
+}
+
+/// T-27: the secondary order that keeps unknown/missing values stable across
+/// ticks. Row ids are numeric strings; compare them as numbers so "2" precedes
+/// "10", and fall back to bytes for anything else.
+fn row_id_order(a: &str, b: &str) -> Ordering {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => a.cmp(b),
+    }
+}
+
+/// T-27: one key, one direction. Known values rank by the key (direction
+/// applied); unknown or missing values are pinned last regardless of direction
+/// and ordered by row id among themselves, so a list never jumps between ticks.
+/// `TypeSecurity` carries its own fixed order (the retired toggle) and ignores
+/// the direction; `None` never reaches here.
+fn compare_library_rows(
+    context: &SortContext,
+    sort: LibrarySort,
+    a: &ProxyConfig,
+    b: &ProxyConfig,
+) -> Ordering {
+    if sort.key == LibrarySortKey::TypeSecurity {
+        return compare_type_security(a, b);
+    }
+    let descending = sort.direction == SortDirection::Descending;
+    if sort.key == LibrarySortKey::OutIp {
+        return match (context.out_ip(&a.id), context.out_ip(&b.id)) {
+            (Some(left), Some(right)) => {
+                let order = left.cmp(right);
+                (if descending { order.reverse() } else { order })
+                    .then_with(|| row_id_order(&a.id, &b.id))
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => row_id_order(&a.id, &b.id),
+        };
+    }
+    match (
+        context.numeric(sort.key, &a.id),
+        context.numeric(sort.key, &b.id),
+    ) {
+        (Some(left), Some(right)) => {
+            let order = left.cmp(&right);
+            (if descending { order.reverse() } else { order })
+                .then_with(|| row_id_order(&a.id, &b.id))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => row_id_order(&a.id, &b.id),
+    }
+}
+
+/// T-27: which keys each sortable header offers. The health/status column owns
+/// the probe and identification keys, including the retired toggle's
+/// Type|Security; the traffic column owns the accumulated counters.
+fn sort_header_keys(column: &str) -> &'static [LibrarySortKey] {
+    static HEALTH: [LibrarySortKey; 6] = [
+        LibrarySortKey::None,
+        LibrarySortKey::Latency,
+        LibrarySortKey::Download,
+        LibrarySortKey::Upload,
+        LibrarySortKey::OutIp,
+        LibrarySortKey::TypeSecurity,
+    ];
+    static TRAFFIC: [LibrarySortKey; 4] = [
+        LibrarySortKey::None,
+        LibrarySortKey::TrafficTotal,
+        LibrarySortKey::TrafficDown,
+        LibrarySortKey::TrafficUp,
+    ];
+    match column {
+        "traffic" => &TRAFFIC,
+        _ => &HEALTH,
+    }
+}
+
+fn column_header_label(label: &'static str, width: f32, cx: &App) -> AnyElement {
+    div()
+        .w(px(width))
+        .flex_shrink_0()
+        .truncate()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+        .into_any_element()
+}
+
+/// T-27: a sortable column header — a labeled cell in the header strip that
+/// carries the sort menu on right-click (the same context-menu affordance the
+/// row cards use). The active column shows its direction in the label.
+fn sort_header_cell(
+    column: &'static str,
+    label: &'static str,
+    width: f32,
+    sort: LibrarySort,
+    view: Entity<AppView>,
+    cx: &App,
+) -> AnyElement {
+    let active = sort_header_keys(column).contains(&sort.key);
+    let marker = if active {
+        match sort.key {
+            LibrarySortKey::TypeSecurity => " ·",
+            _ if sort.direction == SortDirection::Descending => " ↓",
+            _ => " ↑",
+        }
+    } else {
+        ""
+    };
+    let tip = if active {
+        format!(
+            "{label} — sorted by {} ({}) — right-click to change",
+            sort.key.label(),
+            sort.direction.label()
+        )
+    } else {
+        format!("{label} — right-click to pick a sort key")
+    };
+    let tooltip_text = tip.clone();
+    div()
+        .id(format!("sort-header-{column}"))
+        .test_support()
+        .w(px(width))
+        .flex_shrink_0()
+        .truncate()
+        .text_sm()
+        .text_color(if active {
+            cx.theme().accent
+        } else {
+            cx.theme().muted_foreground
+        })
+        .aria_label(tip)
+        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tooltip_text.clone())).into())
+        .child(format!("{label}{marker}"))
+        .context_menu(move |menu, _, _| AppView::sort_header_menu(menu, column, sort, &view))
+        .into_any_element()
+}
+
 impl LibraryDelegate {
     fn new() -> Self {
         Self {
@@ -709,7 +903,10 @@ impl LibraryDelegate {
             facet_protocol: None,
             facet_status: None,
             show_security: false,
-            type_security_sort: false,
+            sort: LibrarySort::default(),
+            latency: HashMap::new(),
+            data_traffic: HashMap::new(),
+            out_ips: HashMap::new(),
             row_columns: RowColumns::default(),
             app_view: None,
             endpoint_inputs: HashMap::new(),
@@ -917,8 +1114,22 @@ impl LibraryDelegate {
             visible.push(index);
         }
 
-        if self.type_security_sort {
-            visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
+        if !self.sort.is_none() {
+            if self.sort.key == LibrarySortKey::TypeSecurity {
+                // T-27: the retired toggle's ordering, unchanged — protocol
+                // ascending, then transport security descending, then name.
+                visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
+            } else {
+                let context = SortContext {
+                    latency: &self.latency,
+                    data_traffic: &self.data_traffic,
+                    totals: &self.traffic,
+                    out_ips: &self.out_ips,
+                };
+                visible.sort_by(|&a, &b| {
+                    compare_library_rows(&context, self.sort, &self.rows[a], &self.rows[b])
+                });
+            }
         }
         self.visible = visible;
         self.selected = selected_id.and_then(|id| {
@@ -1055,8 +1266,26 @@ impl LibraryDelegate {
         self.show_security = show;
     }
 
-    fn set_type_security_sort(&mut self, sort: bool) {
-        self.type_security_sort = sort;
+    /// T-27: swap the whole sort model (key + direction) and re-rank what the
+    /// filters kept. The setter never persists — the owner (AppView) writes the
+    /// meta row, matching how the column toggles work.
+    fn set_sort(&mut self, sort: LibrarySort) {
+        self.sort = sort;
+        self.apply_filter();
+    }
+
+    fn set_latency(&mut self, latency: HashMap<String, u64>) {
+        self.latency = latency;
+        self.apply_filter();
+    }
+
+    fn set_data_traffic(&mut self, data_traffic: HashMap<String, (u64, u64)>) {
+        self.data_traffic = data_traffic;
+        self.apply_filter();
+    }
+
+    fn set_out_ips(&mut self, out_ips: HashMap<String, String>) {
+        self.out_ips = out_ips;
         self.apply_filter();
     }
 
@@ -1141,6 +1370,7 @@ impl LibraryDelegate {
 
     fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
         self.traffic = traffic;
+        self.apply_filter();
     }
 
     fn set_search_context(
@@ -12303,6 +12533,10 @@ struct AppView {
 
     expanded_subs: HashSet<String>,
 
+    /// T-27: resolved out-IP text per row id, session-only. The resolution
+    /// action already computes it; keeping it per row is what `out_ip` sorts by.
+    out_ip_by_row: HashMap<String, String>,
+
     traffic_last_seen: TrafficSeenMap,
 
     traffic_tick_in_flight: bool,
@@ -12446,8 +12680,10 @@ impl AppView {
                 .default_value(last_query.clone())
         });
         let row_columns = RowColumns::parse(&store.library_columns_raw().unwrap_or_default());
+        let sort = store.library_sort();
         libraries.update(cx, |state, list_cx| {
             state.delegate_mut().set_row_columns(row_columns);
+            state.delegate_mut().set_sort(sort);
             state.delegate_mut().query = last_query;
             list_cx.notify();
         });
@@ -12514,6 +12750,7 @@ impl AppView {
 
             log_list: None,
             expanded_subs: HashSet::new(),
+            out_ip_by_row: HashMap::new(),
             traffic_last_seen: TrafficSeenMap::default(),
             traffic_tick_in_flight: false,
             traffic_mirror_hydrated: false,
@@ -12696,6 +12933,10 @@ impl AppView {
         }
         let health = self.health_map();
         let health_tones = self.health_tones();
+        // T-27: sort mirrors — pulled from state the ticks already maintain.
+        let latency = self.latency_map(&rows);
+        let data_traffic = self.data_traffic_map(&rows);
+        let out_ips = self.out_ip_by_row.clone();
         let running = self.engine.running_ids();
 
         self.snapshot_running_set(&running);
@@ -12729,6 +12970,9 @@ impl AppView {
                 .delegate_mut()
                 .set_crashed(self.engine.ids_on_crashed_shards());
             state.delegate_mut().set_traffic(traffic);
+            state.delegate_mut().set_latency(latency);
+            state.delegate_mut().set_data_traffic(data_traffic);
+            state.delegate_mut().set_out_ips(out_ips);
             state
                 .delegate_mut()
                 .set_search_context(sub_labels, preset_names);
@@ -15867,6 +16111,37 @@ impl AppView {
         map
     }
 
+    /// T-27: the latest URL-test sample per row, in ms. Dead samples (an error
+    /// with no latency), ping-only evidence and never-tested rows are absent —
+    /// which is what pins them last when `latency` sorts.
+    fn latency_map(&self, rows: &[ProxyConfig]) -> HashMap<String, u64> {
+        let mut map = HashMap::new();
+        for row in rows {
+            let Some(sample) = self.health_store.latest_of(&row.id, HealthKind::UrlTest) else {
+                continue;
+            };
+            if sample.error.is_some() {
+                continue;
+            }
+            if let Some(latency_ms) = sample.latency_ms {
+                map.insert(row.id.clone(), latency_ms);
+            }
+        }
+        map
+    }
+
+    /// T-27: the per-row session traffic mirror the traffic tick already keeps
+    /// (`download`/`upload` sort keys).
+    fn data_traffic_map(&self, rows: &[ProxyConfig]) -> HashMap<String, (u64, u64)> {
+        rows.iter()
+            .filter_map(|row| {
+                self.health_store
+                    .data_traffic(&row.id)
+                    .map(|totals| (row.id.clone(), totals))
+            })
+            .collect()
+    }
+
     fn health_tones(&self) -> HashMap<String, LatencyTone> {
         self.engine
             .running_ids()
@@ -16357,7 +16632,9 @@ impl AppView {
                         }
                         if prober.supports(row) {
                             match prober.out_ip(row, &row.bind_ip, row.port, RESOLVE_IP_URL) {
-                                Ok(ip) => ips.push(ip),
+                                // T-27: keep the row association so the `out_ip`
+                                // sort key has per-row text to compare.
+                                Ok(ip) => ips.push((row.id.clone(), ip)),
                                 Err(cause) => failed.push(format!("\"{}\": {cause}", row.name)),
                             }
                         } else {
@@ -16382,7 +16659,16 @@ impl AppView {
                     return;
                 };
                 let (ips, failed) = resolved;
-                let message = out_ip_summary_toast(&scope, &ips, &failed);
+                let message = out_ip_summary_toast(
+                    &scope,
+                    &ips.iter().map(|(_, ip)| ip.clone()).collect::<Vec<_>>(),
+                    &failed,
+                );
+                view.update(cx, |view, _| {
+                    for (id, ip) in &ips {
+                        view.out_ip_by_row.insert(id.clone(), ip.clone());
+                    }
+                });
                 if let Some(handle) = window {
                     if handle
                         .update(cx, |_, window, cx| {
@@ -17091,20 +17377,53 @@ impl AppView {
         );
     }
 
-    fn toggle_type_security_sort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sort = !self.libraries.read(cx).delegate().type_security_sort;
+    /// T-27: one writer for the sort model — persists the meta row beside
+    /// `library_columns`, mirrors the choice to the list, and says which order
+    /// is live (the retired toggle's notification, now covering every key).
+    fn set_library_sort(
+        &mut self,
+        key: LibrarySortKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let direction = self.libraries.read(cx).delegate().sort.direction;
+        self.commit_library_sort(LibrarySort::new(key, direction), window, cx);
+    }
+
+    fn toggle_library_sort_direction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.libraries.read(cx).delegate().sort;
+        self.commit_library_sort(
+            LibrarySort::new(current.key, current.direction.toggled()),
+            window,
+            cx,
+        );
+    }
+
+    fn commit_library_sort(
+        &mut self,
+        sort: LibrarySort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.libraries.update(cx, |state, list_cx| {
-            state.delegate_mut().set_type_security_sort(sort);
+            state.delegate_mut().set_sort(sort);
             list_cx.notify();
         });
+        if let Err(error) = self.store.set_library_sort(sort) {
+            window.push_notification(
+                Notification::error(format!("Could not save sort: {error}")),
+                cx,
+            );
+        }
         window.push_notification(
-            Notification::info(if sort {
-                "Sort: Type|Security".to_string()
-            } else {
+            Notification::info(if sort.is_none() {
                 "Sort: library order".to_string()
+            } else {
+                format!("Sort: {} · {}", sort.key.label(), sort.direction.label())
             }),
             cx,
         );
+        cx.notify();
     }
 
     fn ping_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -24739,6 +25058,141 @@ impl AppView {
             .into_any_element()
     }
 
+    /// T-27: the library list's column header strip. The visible columns come
+    /// from `library_columns`; the health and traffic cells are sortable and
+    /// carry the picker menu, the rest are labels that keep the strip lined up.
+    fn render_library_column_headers(&self, cx: &mut Context<Self>) -> AnyElement {
+        let columns = self.row_columns;
+        let sort = self.libraries.read(cx).delegate().sort;
+        let has_rows = !self.libraries.read(cx).delegate().rows.is_empty();
+        let view = cx.entity();
+        if !has_rows {
+            // An empty library keeps today's empty-state clean: a header strip
+            // over nothing is noise.
+            return div()
+                .id("library-column-headers")
+                .test_support()
+                .into_any_element();
+        }
+        let mut strip = div()
+            .id("library-column-headers")
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            // The gutter the row cards spend on the serving lamp and checkbox.
+            .child(div().w(px(28.)).flex_shrink_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Name"),
+            );
+        if columns.upstream {
+            strip = strip.child(column_header_label("Upstream", 180., cx));
+        }
+        if columns.health {
+            strip = strip.child(sort_header_cell(
+                "health",
+                "Health",
+                150.,
+                sort,
+                view.clone(),
+                cx,
+            ));
+        }
+        if columns.group {
+            strip = strip.child(column_header_label("Group", 100., cx));
+        }
+        if columns.traffic {
+            strip = strip.child(sort_header_cell("traffic", "Traffic", 120., sort, view, cx));
+        }
+        strip.into_any_element()
+    }
+
+    /// T-27: the header picker — the key list for this column plus the direction
+    /// toggle, with the live choice marked. Item ids are pinned
+    /// (`sort-header-{column}-{key|direction}`) for the UI test.
+    fn sort_header_menu(
+        menu: PopupMenu,
+        column: &'static str,
+        sort: LibrarySort,
+        view: &Entity<AppView>,
+    ) -> PopupMenu {
+        let mut menu = menu;
+        for key in sort_header_keys(column) {
+            let current = *key == sort.key;
+            let label = if current {
+                format!("{} ✓", key.label())
+            } else {
+                key.label().to_string()
+            };
+            let tip = if current {
+                format!("{} — current sort", key.label())
+            } else {
+                format!("Sort by {}", key.label())
+            };
+            menu = menu.item(Self::sort_menu_item(
+                column,
+                key.token(),
+                label,
+                tip,
+                SortMenuAction::Key(*key),
+                view,
+            ));
+        }
+        let next = sort.direction.toggled();
+        menu.item(Self::sort_menu_item(
+            column,
+            "direction",
+            format!("Direction: {} → {}", sort.direction.label(), next.label()),
+            "Reverse the active key (Type | Security keeps its fixed order)".to_string(),
+            SortMenuAction::Direction,
+            view,
+        ))
+    }
+
+    fn sort_menu_item(
+        column: &'static str,
+        id_suffix: &'static str,
+        label: String,
+        tip: String,
+        action: SortMenuAction,
+        view: &Entity<AppView>,
+    ) -> PopupMenuItem {
+        let id = format!("sort-header-{column}-{id_suffix}");
+        let view = view.clone();
+        PopupMenuItem::element(move |_, _| {
+            let text = label.clone();
+            let tip = tip.clone();
+            div()
+                .id(id.clone())
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(text.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                .child(text)
+        })
+        .on_click(move |_, window, cx| {
+            view.update(cx, |view, cx| match action {
+                SortMenuAction::Key(key) => view.set_library_sort(key, window, cx),
+                SortMenuAction::Direction => view.toggle_library_sort_direction(window, cx),
+            });
+        })
+    }
+
     fn render_bulk_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = self.libraries.read(cx).delegate().bulk_label();
         if label.is_empty() {
@@ -26898,25 +27352,6 @@ impl AppView {
                         .item(
                             PopupMenuItem::element(|_, _| {
                                 topbar_menu_row(
-                                    "sort-type-security",
-                                    "Sort Type|Security",
-                                    "Sort Type|Security",
-                                    "Toggle Type-then-Security display order",
-                                    None,
-                                )
-                            })
-                            .on_click({
-                                let view = tools_view.clone();
-                                move |_, window, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.toggle_type_security_sort(window, cx);
-                                    });
-                                }
-                            }),
-                        )
-                        .item(
-                            PopupMenuItem::element(|_, _| {
-                                topbar_menu_row(
                                     "open-palette",
                                     "Command palette",
                                     "Command palette (Ctrl-K)",
@@ -26977,6 +27412,7 @@ impl Render for AppView {
         let current_title = window_title_text(self.engine.running_count());
         let facet_bar = self.render_facet_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
+        let column_headers = self.render_library_column_headers(cx);
         let empty_ctas = self.render_empty_ctas(cx);
         let mut list_pane = div()
             .id("config-list")
@@ -26987,6 +27423,7 @@ impl Render for AppView {
             .min_h_0()
             .child(facet_bar)
             .child(bulk_bar)
+            .child(column_headers)
             .child(List::new(&self.libraries).flex_1());
         list_pane = list_pane.child(empty_ctas);
 
@@ -36473,7 +36910,6 @@ mod tests {
                     "resolve-domain-group",
                     "stop-testing",
                     "show-security",
-                    "sort-type-security",
                     "open-palette",
                 ][..],
             ),
@@ -36581,7 +37017,6 @@ mod tests {
                     ("resolve-domain-group", "Resolve domain group"),
                     ("stop-testing", "Stop Testing (Ctrl-.)"),
                     ("show-security", "Show security"),
-                    ("sort-type-security", "Sort Type|Security"),
                     ("open-palette", "Command palette (Ctrl-K)"),
                 ][..],
             ),
@@ -37287,7 +37722,6 @@ mod tests {
                     "resolve-domain-group",
                     "stop-testing",
                     "show-security",
-                    "sort-type-security",
                     "open-palette",
                 ][..],
             ),
@@ -38100,7 +38534,10 @@ mod tests {
         delegate.query = "port=10801:10803".to_string();
         delegate.apply_filter();
         let mut unsorted = t73_visible_ports(&delegate);
-        delegate.set_type_security_sort(true);
+        delegate.set_sort(crate::store::LibrarySort::new(
+            crate::store::LibrarySortKey::TypeSecurity,
+            crate::store::SortDirection::Ascending,
+        ));
         let mut sorted = t73_visible_ports(&delegate);
         unsorted.sort_unstable();
         sorted.sort_unstable();
@@ -38473,7 +38910,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(order(&delegate), vec!["T", "Vtls", "Vreal"]);
-        delegate.set_type_security_sort(true);
+        // T-27: the toggle retired into the sort picker; the equivalent key
+        // (direction is fixed for it) must order exactly as the toggle did.
+        delegate.set_sort(crate::store::LibrarySort::new(
+            crate::store::LibrarySortKey::TypeSecurity,
+            crate::store::SortDirection::Ascending,
+        ));
         assert_eq!(order(&delegate), vec!["T", "Vreal", "Vtls"]);
         assert_eq!(
             delegate
@@ -53809,5 +54251,539 @@ mod tests {
             "one failed probe tones its caption Failed, not neutral"
         );
         assert_eq!(sparkline_caption_tone(&[]), LatencyTone::Unknown);
+    }
+
+    // ---- T-27: header sort pickers -------------------------------------
+
+    use crate::store::ProxyConfig;
+    use crate::{LibraryDelegate, LibrarySortKey, SortDirection};
+    use std::collections::HashMap;
+
+    fn t77_row(id: &str, name: &str, protocol: &str, group: &str, port: u16) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            params: "{}".to_string(),
+            group: group.to_string(),
+            enabled: true,
+            bind_ip: "127.0.0.1".to_string(),
+            port,
+            subscription_id: None,
+            identity_key: None,
+            preset_id: None,
+        }
+    }
+
+    fn t77_names(delegate: &LibraryDelegate) -> Vec<String> {
+        delegate
+            .visible
+            .iter()
+            .map(|&index| delegate.rows[index].name.clone())
+            .collect()
+    }
+
+    fn t77_map_u64(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(id, value)| (id.to_string(), *value))
+            .collect()
+    }
+
+    fn t77_map_pair(pairs: &[(&str, u64, u64)]) -> HashMap<String, (u64, u64)> {
+        pairs
+            .iter()
+            .map(|(id, rx, tx)| (id.to_string(), (*rx, *tx)))
+            .collect()
+    }
+
+    fn t77_map_text(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, value)| (id.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn t77_sort(key: LibrarySortKey, direction: SortDirection) -> crate::store::LibrarySort {
+        crate::store::LibrarySort::new(key, direction)
+    }
+
+    /// T-27: every key ranks by its named source, both directions, and `none`
+    /// keeps the pre-feature order byte for byte.
+    #[test]
+    fn t77_sort_keys_order_correctly() {
+        use crate::store::{LibrarySortKey as Key, SortDirection as Dir};
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t77_row("1", "One", "vless", "g", 10801),
+            t77_row("2", "Two", "vless", "g", 10802),
+            t77_row("3", "Three", "vless", "g", 10803),
+            t77_row("4", "Four", "vless", "g", 10804),
+            t77_row("5", "Five", "vless", "g", 10805),
+            t77_row("6", "Six", "vless", "g", 10806),
+        ]);
+        delegate.set_latency(t77_map_u64(&[("1", 120), ("2", 40), ("3", 80)]));
+        delegate.set_data_traffic(t77_map_pair(&[
+            ("1", 100, 10),
+            ("2", 50, 90),
+            ("3", 70, 5),
+            ("4", 300, 1),
+        ]));
+        delegate.set_traffic(t77_map_pair(&[
+            ("1", 1000, 10),
+            ("2", 500, 900),
+            ("3", 700, 5),
+            ("4", 0, 0),
+            ("5", 100, 100),
+        ]));
+        delegate.set_out_ips(t77_map_text(&[
+            ("1", "203.0.113.9"),
+            ("2", "198.51.100.7"),
+            ("3", "203.0.113.10"),
+        ]));
+
+        let base = vec!["One", "Two", "Three", "Four", "Five", "Six"];
+        assert_eq!(t77_names(&delegate), base, "the default order is the base");
+
+        // `none` is the pre-feature order, unchanged by the direction.
+        delegate.set_sort(t77_sort(Key::None, Dir::Descending));
+        assert_eq!(t77_names(&delegate), base, "none ignores the direction");
+        assert_eq!(
+            delegate
+                .rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "4", "5", "6"],
+            "sorting never reorders the store rows"
+        );
+
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One", "Four", "Five", "Six"],
+            "latency asc: 40, 80, 120, then the untested rows by row id"
+        );
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Three", "Two", "Four", "Five", "Six"],
+            "latency desc reverses the known values, unknowns stay pinned last"
+        );
+
+        delegate.set_sort(t77_sort(Key::Download, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One", "Four", "Five", "Six"],
+            "download reads the current session rx counter"
+        );
+        delegate.set_sort(t77_sort(Key::Upload, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Three", "One", "Two", "Five", "Six"],
+            "upload reads the current session tx counter"
+        );
+        delegate.set_sort(t77_sort(Key::Download, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "One", "Three", "Two", "Five", "Six"],
+            "download desc"
+        );
+
+        delegate.set_sort(t77_sort(Key::TrafficTotal, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Five", "Three", "One", "Two", "Six"],
+            "traffic total is the accumulated rx+tx of the counting window"
+        );
+        delegate.set_sort(t77_sort(Key::TrafficDown, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Five", "Two", "Three", "One", "Six"],
+            "traffic down is the accumulated rx"
+        );
+        delegate.set_sort(t77_sort(Key::TrafficUp, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Three", "One", "Five", "Two", "Six"],
+            "traffic up is the accumulated tx"
+        );
+        delegate.set_sort(t77_sort(Key::TrafficTotal, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "One", "Three", "Five", "Four", "Six"],
+            "traffic total desc"
+        );
+
+        delegate.set_sort(t77_sort(Key::OutIp, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One", "Four", "Five", "Six"],
+            "out-IP compares the resolved text lexically, 203.0.113.10 < 203.0.113.9"
+        );
+        delegate.set_sort(t77_sort(Key::OutIp, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Three", "Two", "Four", "Five", "Six"],
+            "out-IP desc reverses the resolved text, unresolved rows stay last"
+        );
+    }
+
+    /// T-27: unknown/missing values are pinned last deterministically — row id
+    /// numeric as the secondary — and repeated ticks with the same maps never
+    /// reshuffle the tail.
+    #[test]
+    fn t77_unknown_values_sort_deterministically_last() {
+        use crate::store::{LibrarySortKey as Key, SortDirection as Dir};
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t77_row("100", "Hundred", "vless", "g", 10801),
+            t77_row("10", "Ten", "vless", "g", 10802),
+            t77_row("9", "Nine", "vless", "g", 10803),
+        ]);
+        delegate.set_latency(t77_map_u64(&[("10", 50)]));
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Ten", "Nine", "Hundred"],
+            "unknown values sort by numeric row id (9 before 100), not lexically"
+        );
+
+        // A second tick carrying the same mirrors must not move anything.
+        let first = t77_names(&delegate);
+        for _ in 0..3 {
+            delegate.apply_filter();
+            delegate.set_latency(t77_map_u64(&[("10", 50)]));
+            assert_eq!(t77_names(&delegate), first, "no flicker between ticks");
+        }
+
+        // A dead sample is an absent value: it joins the pinned tail.
+        delegate.set_latency(t77_map_u64(&[("10", 50), ("100", 70)]));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Ten", "Hundred", "Nine"],
+            "the row that gained a sample leaves the pinned tail"
+        );
+
+        // Unresolved out-IP rows are last too, again by numeric row id.
+        delegate.set_out_ips(t77_map_text(&[("100", "203.0.113.7")]));
+        delegate.set_sort(t77_sort(Key::OutIp, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Hundred", "Nine", "Ten"],
+            "only the resolved row ranks; unresolved ones keep the row-id tail"
+        );
+        let tail = t77_names(&delegate);
+        for _ in 0..3 {
+            delegate.apply_filter();
+            assert_eq!(t77_names(&delegate), tail, "out-IP tail is stable too");
+        }
+    }
+
+    /// T-27: the retired toggle became the `type_security` key. Its ordering is
+    /// `compare_type_security` exactly — protocol asc, security rank desc, name
+    /// — and the direction toggle does not move it.
+    #[test]
+    fn t77_type_security_key_matches_old_toggle() {
+        use crate::store::{
+            compare_type_security as compare_old, LibrarySortKey as Key, SortDirection as Dir,
+        };
+        let rows = vec![
+            t77_row("1", "Trojan", "trojan", "g", 10801),
+            t77_row("2", "VlessTls", "vless", "g", 10802),
+            t77_row("3", "VlessReality", "vless", "g", 10803),
+            t77_row("4", "Zeta", "vmess", "g", 10804),
+            t77_row("5", "Alpha", "vmess", "g", 10805),
+            t77_row("6", "Plain", "shadowsocks", "g", 10806),
+        ];
+        let mut with_security = rows.clone();
+        with_security[1].params = r#"{"security":"tls"}"#.to_string();
+        with_security[2].params = r#"{"security":"reality"}"#.to_string();
+
+        let mut sorted_rows = with_security.clone();
+        sorted_rows.sort_by(compare_old);
+        let old_toggle_order: Vec<String> =
+            sorted_rows.iter().map(|row| row.name.clone()).collect();
+        assert_eq!(
+            old_toggle_order,
+            vec![
+                "Plain",
+                "Trojan",
+                "VlessReality",
+                "VlessTls",
+                "Alpha",
+                "Zeta"
+            ],
+            "the retired toggle: protocol asc, security rank desc, name asc"
+        );
+
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(with_security.clone());
+        delegate.set_sort(t77_sort(Key::TypeSecurity, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            old_toggle_order,
+            "type_security asc == the retired toggle"
+        );
+        delegate.set_sort(t77_sort(Key::TypeSecurity, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            old_toggle_order,
+            "the key keeps the toggle's fixed direction"
+        );
+        assert_eq!(
+            delegate
+                .rows
+                .iter()
+                .map(|row| row.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "Trojan",
+                "VlessTls",
+                "VlessReality",
+                "Zeta",
+                "Alpha",
+                "Plain"
+            ],
+            "the store order survives the sort"
+        );
+    }
+
+    /// T-27: sorting runs after the port predicate and the facets — it reorders
+    /// the kept rows and never reintroduces a filtered-out one.
+    #[test]
+    fn t77_sort_composes_with_facets_and_port_filter() {
+        use crate::store::{LibrarySortKey as Key, SortDirection as Dir};
+        let mut delegate = LibraryDelegate::new();
+        delegate.set_rows(vec![
+            t77_row("1", "One", "vless", "travel", 10801),
+            t77_row("2", "Two", "vless", "travel", 10802),
+            t77_row("3", "Three", "vmess", "travel", 10803),
+            t77_row("4", "Four", "vless", "team", 10804),
+            t77_row("5", "Five", "vless", "travel", 19001),
+        ]);
+        delegate.set_latency(t77_map_u64(&[
+            ("1", 90),
+            ("2", 20),
+            ("3", 30),
+            ("4", 10),
+            ("5", 40),
+        ]));
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Ascending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Four", "Two", "Three", "Five", "One"],
+            "no filter: the whole library ranks by latency"
+        );
+
+        delegate.query = "port=10801:10803".to_string();
+        delegate.apply_filter();
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One"],
+            "the port predicate keeps its rows and the sort ranks them"
+        );
+
+        delegate.set_facet_group(Some("travel".to_string()));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "Three", "One"],
+            "the group facet ANDs with the port predicate before the sort"
+        );
+
+        delegate.set_facet_protocol(Some("vless".to_string()));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["Two", "One"],
+            "protocol facet removes Three, latency order holds"
+        );
+
+        delegate.set_sort(t77_sort(Key::Latency, Dir::Descending));
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Two"],
+            "direction change re-ranks only what the filters kept"
+        );
+
+        delegate.clear_facets();
+        delegate.query.clear();
+        delegate.apply_filter();
+        assert_eq!(
+            t77_names(&delegate),
+            vec!["One", "Five", "Three", "Two", "Four"],
+            "clearing the filters restores the full sorted set"
+        );
+    }
+
+    /// T-27: both sortable headers paint, right-click opens the picker menu,
+    /// the live choice is marked, and picking a key persists it.
+    #[gpui_kit::test]
+    fn t77_header_menu_renders_pickers(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .set_library_columns("upstream,health,traffic")
+            .expect("column choice writes");
+        store
+            .set_library_sort(crate::store::LibrarySort::new(
+                crate::store::LibrarySortKey::TrafficTotal,
+                crate::store::SortDirection::Ascending,
+            ))
+            .expect("sort choice writes");
+        store
+            .add(facet_seed("Work", "vless", "travel", "10801"))
+            .expect("seed works");
+        let (view, cx) = mount_view(store, cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.libraries.read(cx).delegate().sort),
+            crate::store::LibrarySort::new(
+                crate::store::LibrarySortKey::TrafficTotal,
+                crate::store::SortDirection::Ascending
+            ),
+            "launch reads the persisted sort beside library_columns"
+        );
+
+        cx.update(|window, _| {
+            assert!(
+                window.try_find("sort-header-health".to_string()).is_some(),
+                "the health header paints when the column is visible"
+            );
+            assert!(
+                window.try_find("sort-header-traffic".to_string()).is_some(),
+                "the traffic header paints when the column is visible"
+            );
+            assert!(
+                window.try_find("sort-header-group".to_string()).is_none(),
+                "hidden columns have no header"
+            );
+        });
+
+        cx.update(|window, cx| {
+            window.right_click("sort-header-traffic".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "sort-header-traffic-none",
+            "sort-header-traffic-traffic_total",
+            "sort-header-traffic-traffic_down",
+            "sort-header-traffic-traffic_up",
+            "sort-header-traffic-direction",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders in the traffic sort menu"
+            );
+        }
+        assert!(
+            cx.update(|window, _| window
+                .try_find("sort-header-traffic-latency".to_string())
+                .is_none()),
+            "the traffic menu offers only the traffic keys"
+        );
+        let marked = cx.update(|window, _| {
+            window
+                .try_find("sort-header-traffic-traffic_total".to_string())
+                .and_then(|snapshot| snapshot.label().map(str::to_string))
+                .unwrap_or_default()
+        });
+        assert!(
+            marked.contains('✓'),
+            "the persisted key carries the marker: {marked:?}"
+        );
+
+        cx.update(|window, cx| {
+            window.click("sort-header-traffic-direction".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| (
+                view.libraries.read(cx).delegate().sort,
+                view.store.library_sort()
+            )),
+            (
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::TrafficTotal,
+                    crate::store::SortDirection::Descending
+                ),
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::TrafficTotal,
+                    crate::store::SortDirection::Descending
+                ),
+            ),
+            "the direction toggle reaches both the list and the meta row"
+        );
+
+        cx.update(|window, cx| {
+            window.right_click("sort-header-health".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        cx.run_until_parked();
+        paint_frame(cx);
+        for id in [
+            "sort-header-health-none",
+            "sort-header-health-latency",
+            "sort-header-health-download",
+            "sort-header-health-upload",
+            "sort-header-health-out_ip",
+            "sort-header-health-type_security",
+            "sort-header-health-direction",
+        ] {
+            assert!(
+                cx.update(|window, _| window.try_find(id.to_string()).is_some()),
+                "{id} renders in the health sort menu"
+            );
+        }
+        assert!(
+            !cx.update(|window, _| window
+                .try_find("sort-header-health-none".to_string())
+                .and_then(|snapshot| snapshot.label().map(str::to_string))
+                .unwrap_or_default()
+                .contains('✓')),
+            "a key owned by the other column is not marked here"
+        );
+        let direction = cx.update(|window, _| {
+            window
+                .try_find("sort-header-health-direction".to_string())
+                .and_then(|snapshot| snapshot.label().map(str::to_string))
+                .unwrap_or_default()
+        });
+        assert!(
+            direction.contains("descending"),
+            "the direction item shows the live direction: {direction:?}"
+        );
+
+        cx.update(|window, cx| {
+            window.click("sort-header-health-latency".to_string(), cx);
+        });
+        cx.run_until_parked();
+        paint_frame(cx);
+        assert_eq!(
+            view.read_with(cx, |view, cx| (
+                view.libraries.read(cx).delegate().sort,
+                view.store.library_sort()
+            )),
+            (
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::Latency,
+                    crate::store::SortDirection::Descending
+                ),
+                crate::store::LibrarySort::new(
+                    crate::store::LibrarySortKey::Latency,
+                    crate::store::SortDirection::Descending
+                ),
+            ),
+            "picking a key keeps the direction and persists the pair"
+        );
     }
 }

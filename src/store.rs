@@ -799,6 +799,157 @@ pub fn compare_type_security(a: &ProxyConfig, b: &ProxyConfig) -> std::cmp::Orde
         })
 }
 
+/// T-27: the keys the library list can rank by. `None` is the pre-feature
+/// order, byte for byte; `TypeSecurity` is the retired `type_security_sort`
+/// toggle and keeps that toggle's fixed direction (protocol ascending, then
+/// transport security descending, then name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibrarySortKey {
+    #[default]
+    None,
+    Latency,
+    Download,
+    Upload,
+    OutIp,
+    TrafficTotal,
+    TrafficDown,
+    TrafficUp,
+    TypeSecurity,
+}
+
+impl LibrarySortKey {
+    /// Every key, in the order the pickers list them. The traffic keys live at
+    /// the end because only the traffic header menu offers them.
+    pub const ALL: [LibrarySortKey; 9] = [
+        LibrarySortKey::None,
+        LibrarySortKey::Latency,
+        LibrarySortKey::Download,
+        LibrarySortKey::Upload,
+        LibrarySortKey::OutIp,
+        LibrarySortKey::TypeSecurity,
+        LibrarySortKey::TrafficTotal,
+        LibrarySortKey::TrafficDown,
+        LibrarySortKey::TrafficUp,
+    ];
+
+    /// Canonical token: both the meta JSON value and the picker item id suffix.
+    pub fn token(self) -> &'static str {
+        match self {
+            LibrarySortKey::None => "none",
+            LibrarySortKey::Latency => "latency",
+            LibrarySortKey::Download => "download",
+            LibrarySortKey::Upload => "upload",
+            LibrarySortKey::OutIp => "out_ip",
+            LibrarySortKey::TrafficTotal => "traffic_total",
+            LibrarySortKey::TrafficDown => "traffic_down",
+            LibrarySortKey::TrafficUp => "traffic_up",
+            LibrarySortKey::TypeSecurity => "type_security",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|key| key.token() == token)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibrarySortKey::None => "None (library order)",
+            LibrarySortKey::Latency => "Latency (latest URL test)",
+            LibrarySortKey::Download => "Download (current session)",
+            LibrarySortKey::Upload => "Upload (current session)",
+            LibrarySortKey::OutIp => "Out-IP (text)",
+            LibrarySortKey::TrafficTotal => "Traffic total (counting window)",
+            LibrarySortKey::TrafficDown => "Traffic down (counting window)",
+            LibrarySortKey::TrafficUp => "Traffic up (counting window)",
+            LibrarySortKey::TypeSecurity => "Type | Security (fixed)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub fn token(self) -> &'static str {
+        match self {
+            SortDirection::Ascending => "asc",
+            SortDirection::Descending => "desc",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "asc" => Some(SortDirection::Ascending),
+            "desc" => Some(SortDirection::Descending),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortDirection::Ascending => "ascending",
+            SortDirection::Descending => "descending",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            SortDirection::Ascending => SortDirection::Descending,
+            SortDirection::Descending => SortDirection::Ascending,
+        }
+    }
+}
+
+/// T-27: one sort concept for the library list — a single key plus a direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LibrarySort {
+    pub key: LibrarySortKey,
+    pub direction: SortDirection,
+}
+
+impl LibrarySort {
+    pub fn new(key: LibrarySortKey, direction: SortDirection) -> Self {
+        Self { key, direction }
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.key == LibrarySortKey::None
+    }
+
+    /// Canonical meta payload: `{"key":"latency","direction":"asc"}`.
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\"key\":\"{}\",\"direction\":\"{}\"}}",
+            self.key.token(),
+            self.direction.token()
+        )
+    }
+
+    /// Tolerant read: a payload that is not a sort object reads as the default,
+    /// and an unknown key or direction falls back field by field, so a
+    /// hand-edited meta row can never wedge the list.
+    pub fn from_json(raw: &str) -> Self {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str(raw.trim()) else {
+            return Self::default();
+        };
+        let key = map
+            .get("key")
+            .and_then(|value| value.as_str())
+            .and_then(LibrarySortKey::from_token)
+            .unwrap_or_default();
+        let direction = map
+            .get("direction")
+            .and_then(|value| value.as_str())
+            .and_then(SortDirection::from_token)
+            .unwrap_or_default();
+        Self { key, direction }
+    }
+}
+
 /// T-22: the one clause both the export warning and the restore confirm carry.
 pub const RESTORE_REQUIRES_CLAUSE: &str =
     "Restore requires a matching ManyProxy export (schema manyproxy-library, version 1).";
@@ -7656,6 +7807,22 @@ impl Store {
             )]));
         }
         self.set_meta(Self::META_LIBRARY_COLUMNS, value.trim())
+    }
+
+    /// T-27: the persisted library sort, additive beside `library_columns`. A
+    /// missing key (or a corrupt payload) reads as `none`/ascending — the
+    /// pre-feature order.
+    pub const META_LIBRARY_SORT: &str = "library_sort";
+
+    pub fn library_sort(&self) -> LibrarySort {
+        match self.get_meta(Self::META_LIBRARY_SORT) {
+            Ok(Some(raw)) => LibrarySort::from_json(&raw),
+            _ => LibrarySort::default(),
+        }
+    }
+
+    pub fn set_library_sort(&mut self, sort: LibrarySort) -> Result<(), StoreError> {
+        self.set_meta(Self::META_LIBRARY_SORT, &sort.to_json())
     }
 
     pub const META_LIBRARY_LAST_QUERY: &str = "library_last_query";
@@ -16441,5 +16608,107 @@ mod tests {
             .set_config_preset(&row.id, Some(&empty.id))
             .expect_err("blank ref must fail");
         assert!(error.to_string().contains("empty set name"), "{error}");
+    }
+
+    /// T-27: `library_sort` rides the meta family beside `library_columns`: a
+    /// fresh store reads the default, every key/direction round-trips through a
+    /// reopen, and the `none` choice persists as the untouched order.
+    #[test]
+    fn t77_sort_model_meta_round_trip() {
+        let path = std::env::temp_dir().join("manyproxy-t77-sort.db");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        {
+            let mut store = Store::open_file(&path).expect("file store opens");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::default(),
+                "a fresh store sorts by nothing"
+            );
+            assert_eq!(
+                store.get_meta(Store::META_LIBRARY_SORT).expect("meta read"),
+                None,
+                "the default writes no meta row"
+            );
+
+            for key in LibrarySortKey::ALL {
+                for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                    let sort = LibrarySort::new(key, direction);
+                    store.set_library_sort(sort).expect("sort writes");
+                    assert_eq!(store.library_sort(), sort, "{} round-trips", key.token());
+                }
+            }
+
+            assert_eq!(
+                LibrarySort::new(LibrarySortKey::Latency, SortDirection::Descending).to_json(),
+                r#"{"key":"latency","direction":"desc"}"#,
+                "the meta payload has one canonical shape"
+            );
+            for key in LibrarySortKey::ALL {
+                assert_eq!(
+                    LibrarySortKey::from_token(key.token()),
+                    Some(key),
+                    "{} parses back from its token",
+                    key.token()
+                );
+            }
+
+            // A hand-edited payload never wedges the list: the object as a whole
+            // falls back to the default, and one unknown field keeps the other.
+            store
+                .set_meta(Store::META_LIBRARY_SORT, "not json at all")
+                .expect("corrupt meta writes");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::default(),
+                "garbage reads as the untouched order"
+            );
+            store
+                .set_meta(
+                    Store::META_LIBRARY_SORT,
+                    r#"{"key":"nope","direction":"desc"}"#,
+                )
+                .expect("unknown key writes");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::new(LibrarySortKey::None, SortDirection::Descending),
+                "an unknown key falls back to none, the direction survives"
+            );
+            store
+                .set_meta(
+                    Store::META_LIBRARY_SORT,
+                    r#"{"key":"latency","direction":"sideways"}"#,
+                )
+                .expect("unknown direction writes");
+            assert_eq!(
+                store.library_sort(),
+                LibrarySort::new(LibrarySortKey::Latency, SortDirection::Ascending),
+                "an unknown direction falls back to ascending"
+            );
+
+            store
+                .set_library_sort(LibrarySort::default())
+                .expect("none writes");
+        }
+
+        let store = Store::open_file(&path).expect("reopen works");
+        assert_eq!(
+            store.library_sort(),
+            LibrarySort::default(),
+            "the none choice survives a restart"
+        );
+        assert_eq!(
+            store
+                .get_meta(Store::META_LIBRARY_SORT)
+                .expect("meta read")
+                .as_deref(),
+            Some(r#"{"key":"none","direction":"asc"}"#),
+            "none persists explicitly instead of clearing the key"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 }
