@@ -25,7 +25,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::description_list::DescriptionList;
-use gpui_kit::component::dialog::{Confirm, Dialog, DialogButtonProps, DialogFooter};
+use gpui_kit::component::dialog::{AlertDialog, Confirm, Dialog, DialogButtonProps, DialogFooter};
 use gpui_kit::component::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::form::{field, v_form, Field};
 use gpui_kit::component::group_box::GroupBox;
@@ -1626,12 +1626,19 @@ impl LibraryDelegate {
 }
 
 /// T-31: the tone each level paints in, from the active theme. `Info` keeps the
-/// default text color, `Debug` recedes to muted, `Warn` is the theme amber, and
-/// `Error` the theme danger red; both theme modes resolve these tokens.
+/// default text color, `Debug` recedes to muted. `Warn`/`Error` are theme
+/// *background* tokens (amber, danger red): legible behind white text on a dark
+/// surface, but well under WCAG AA as text on the light theme's white — so in
+/// light mode both are backed off toward black along their own hue (the T-30
+/// `danger.blend(...)` precedent). Dark mode keeps the raw tokens.
 fn log_level_text_color(level: LogLevel, theme: &Theme) -> Hsla {
+    let text_safe = |color: Hsla, darken: f32| match theme.mode {
+        ThemeMode::Light => color.blend(hsla(0., 0., 0., darken)),
+        ThemeMode::Dark => color,
+    };
     match level {
-        LogLevel::Error => theme.danger,
-        LogLevel::Warn => theme.warning,
+        LogLevel::Error => text_safe(theme.danger, 0.35),
+        LogLevel::Warn => text_safe(theme.warning, 0.45),
         LogLevel::Info => theme.foreground,
         LogLevel::Debug => theme.muted_foreground,
     }
@@ -13633,17 +13640,84 @@ impl AppView {
         match Store::open_file(&Store::default_path()) {
             Ok(store) => Self::with_store(window, cx, store),
             Err(error) => {
-                let view = Self::with_store(
+                let mut view = Self::with_store(
                     window,
                     cx,
                     Store::open_in_memory().expect("in-memory store opens"),
                 );
-                window.push_notification(
+                view.notify_after_root(
                     Notification::warning(format!("Running without persistence: {error}")),
+                    window,
                     cx,
                 );
                 view
             }
+        }
+    }
+
+    /// Defect: boot runs inside `cx.open_window`'s closure, and the window only
+    /// adopts its `gpui_component::Root` layer after that closure returns —
+    /// `Root::new` does not install the first layer during it. A notification
+    /// or dialog pushed there panics inside `Root::update` ("window first layer
+    /// should be a gpui_component::Root"). Boot paths hand their overlay to
+    /// these helpers, which land it on the first frame, after Root exists. The
+    /// decision (message, severity, dialog content) is still taken at boot.
+    fn after_root(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        open: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        cx.on_next_frame(window, move |view, window, cx| open(view, window, cx));
+    }
+
+    fn notify_after_root(
+        &mut self,
+        notification: Notification,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.after_root(window, cx, move |_view, window, cx| {
+            window.push_notification(notification, cx);
+        });
+    }
+
+    fn open_alert_dialog_after_root<F>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: F,
+    ) where
+        F: Fn(AlertDialog, &mut Window, &mut App) -> AlertDialog + 'static,
+    {
+        self.after_root(window, cx, move |_view, window, cx| {
+            window.open_alert_dialog(cx, build);
+        });
+    }
+
+    /// Whether the window has adopted its `gpui_component::Root` first layer
+    /// yet. `Root::update` - which every `WindowExt` overlay call funnels
+    /// through - does `window.root::<Root>().flatten().expect(..)`, so this is
+    /// exactly the panic condition: it is false while `cx.open_window`'s
+    /// closure is still running, and also for a window whose root view is not
+    /// a `Root` at all (the test harness shape).
+    fn root_installed(window: &Window) -> bool {
+        window.root::<Root>().flatten().is_some()
+    }
+
+    /// A path that boots *and* runs later (`reload`): deliver now when the
+    /// window already has its Root, so ordinary use keeps its exact timing,
+    /// and hand the notification to the first frame during boot.
+    fn notify_now_or_after_root(
+        &mut self,
+        notification: Notification,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if Self::root_installed(window) {
+            window.push_notification(notification, cx);
+        } else {
+            self.notify_after_root(notification, window, cx);
         }
     }
 
@@ -13657,14 +13731,7 @@ impl AppView {
         if let Err(error) = store.set_last_clean_exit(false) {
             eprintln!("clean-exit marker reset failed: {error}");
         }
-        if let Some(notice) = unclean_exit_notice(previous_clean_exit, &last_snapshot) {
-            // The notification layer needs the Root view, which the window only
-            // adopts after this constructor returns: the decision is taken here
-            // at boot, the toast lands on the first frame — once.
-            cx.on_next_frame(window, move |_view, window, cx| {
-                window.push_notification(notice, cx);
-            });
-        }
+        let unclean_notice = unclean_exit_notice(previous_clean_exit, &last_snapshot);
         // T-33: the first read seeds the address list once (constants + every
         // row's current bind); every later read is the stored extras alone.
         let bind_hosts = store.bind_hosts();
@@ -13838,12 +13905,25 @@ impl AppView {
             started_at: std::time::Instant::now(),
         };
         let mut view = view;
+        if let Some(notice) = unclean_notice {
+            // The notification layer needs the Root view, which the window only
+            // adopts after this constructor returns: the decision was taken
+            // above at boot, the toast lands on the first frame — once.
+            view.notify_after_root(notice, window, cx);
+        }
         view.apply_engine_auto_restart();
         let rows = match view.store.list() {
             Ok(rows) => rows,
 
             Err(error) => {
-                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+                // Boot path (this constructor runs inside `cx.open_window`'s
+                // closure): the window has no Root yet, so the toast lands on
+                // the first frame instead of panicking in `Root::update`.
+                view.notify_after_root(
+                    Notification::error(db_list_error_message(&error)),
+                    window,
+                    cx,
+                );
                 Vec::new()
             }
         };
@@ -13888,18 +13968,30 @@ impl AppView {
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.notify_engine_crash(window, cx);
+        // `has_active_dialog` / `has_active_sheet` / `close_sheet` all read the
+        // Root layer, which the window only adopts after the boot closure
+        // returns — ask only once a Root is actually installed.
+        let root_ready = Self::root_installed(window);
         // T-19: an edit dialog that left no dialog active anywhere is gone —
         // stop protecting its row from auto-clear.
-        if self.edit_form_open.is_some() && !window.has_active_dialog(cx) {
+        if self.edit_form_open.is_some() && root_ready && !window.has_active_dialog(cx) {
             self.edit_form_open = None;
         }
         if let Err(error) = self.reload_inner_no_poll(cx) {
-            window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+            // Reached during boot (restore_on_launch -> commit_restore_subset)
+            // as well as from ordinary clicks: `notify_now_or_after_root`
+            // keeps the post-Root timing and defers only before Root exists.
+            self.notify_now_or_after_root(
+                Notification::error(db_list_error_message(&error)),
+                window,
+                cx,
+            );
         }
 
         if self.logs_open
             && self.log_tail
             && self.logs.push_seq() != self.logs_seen
+            && root_ready
             && window.has_active_sheet(cx)
         {
             self.log_reopen_draft = self.log_input_draft(cx);
@@ -15064,7 +15156,9 @@ impl AppView {
 
     fn notify_engine_crash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(notification) = self.service_engine_crash() {
-            window.push_notification(notification, cx);
+            // Reachable from `reload`, which the boot path calls before the
+            // window adopts its Root layer — deliver it the same safe way.
+            self.notify_now_or_after_root(notification, window, cx);
         }
     }
 
@@ -15644,10 +15738,11 @@ impl AppView {
                 cx.notify();
             }
             Err(error) => {
-                window.push_notification(
+                self.notify_after_root(
                     Notification::warning(format!(
                         "Tray unavailable ({error}) — closing still confirms"
                     )),
+                    window,
                     cx,
                 );
             }
@@ -16750,7 +16845,11 @@ impl AppView {
         let rows = match self.store.list() {
             Ok(rows) => rows,
             Err(error) => {
-                window.push_notification(Notification::error(db_list_error_message(&error)), cx);
+                self.notify_after_root(
+                    Notification::error(db_list_error_message(&error)),
+                    window,
+                    cx,
+                );
                 return;
             }
         };
@@ -16770,7 +16869,11 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if let Err(reason) = self.sync_presets_to_engine() {
-            window.push_notification(Notification::error(format!("Cannot restore: {reason}")), cx);
+            self.notify_after_root(
+                Notification::error(format!("Cannot restore: {reason}")),
+                window,
+                cx,
+            );
             return;
         }
         let mut started = 0usize;
@@ -16789,13 +16892,15 @@ impl AppView {
         }
         self.reload(window, cx);
         if failed.is_empty() {
-            window.push_notification(
+            self.notify_after_root(
                 Notification::success(format!("Restored {started} endpoint(s)")),
+                window,
                 cx,
             );
         } else {
-            window.push_notification(
+            self.notify_after_root(
                 Notification::warning(start_all_partial_message(started, &failed)),
+                window,
                 cx,
             );
         }
@@ -16816,7 +16921,7 @@ impl AppView {
             "{}\n\nThese were running before; confirm to restart them.",
             lan_confirm_description(&lan)
         );
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        self.open_alert_dialog_after_root(window, cx, move |alert, _, _| {
             let view = view.clone();
             let rows = rows.clone();
             let description = description.clone();
@@ -20261,12 +20366,15 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match intake {
-            OpenWithKind::BareHttp(url) => self.open_bare_url_chooser(url, window, cx),
+        // Boot calls this inside `cx.open_window`'s closure, before the window
+        // adopts its `Root`; the intake dialog would panic in `Root::update`.
+        // The intake decision is taken now, the dialog opens on the next frame.
+        self.after_root(window, cx, move |view, window, cx| match intake {
+            OpenWithKind::BareHttp(url) => view.open_bare_url_chooser(url, window, cx),
             OpenWithKind::Batch(text) => {
-                self.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx)
+                view.open_import_dialog(&text, DEFAULT_GROUP, None, window, cx)
             }
-        }
+        });
     }
 
     fn open_bare_url_chooser(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -28934,6 +29042,7 @@ mod tests {
     use std::rc::Rc;
 
     use crate::engine::AutoRestartConfig;
+    use crate::import::OpenWithKind;
     use crate::store::{
         AutoClearGroupConfig, HealthSnapshot, NewConfig, Store, StoreError, WindowGeometry,
     };
@@ -28942,7 +29051,7 @@ mod tests {
     use gpui_kit::component::dialog::Dialog;
     use gpui_kit::component::{Root, WindowExt};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{point, px, size, AppContext, Entity, TestAppContext};
+    use gpui_kit::{point, px, size, AppContext, Entity, Hsla, TestAppContext};
 
     fn seed_input(name: &str) -> NewConfig {
         NewConfig {
@@ -29205,8 +29314,39 @@ mod tests {
         );
     }
 
+    /// WCAG 2.1 relative luminance of `color` composited over `background`.
+    fn log_relative_luminance(color: Hsla, background: Hsla) -> f32 {
+        let front = color.to_rgb();
+        let back = background.to_rgb();
+        let channel = |value: f32| {
+            if value <= 0.039_28 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let alpha = front.a.clamp(0., 1.);
+        let mix = |front: f32, back: f32| front.mul_add(alpha, back * (1. - alpha));
+        0.2126 * channel(mix(front.r, back.r))
+            + 0.7152 * channel(mix(front.g, back.g))
+            + 0.0722 * channel(mix(front.b, back.b))
+    }
+
+    /// WCAG 2.1 contrast ratio of a text tone against the surface behind it.
+    fn log_contrast_ratio(color: Hsla, background: Hsla) -> f32 {
+        let text = log_relative_luminance(color, background);
+        let surface = log_relative_luminance(background, background);
+        let (lighter, darker) = if text >= surface {
+            (text, surface)
+        } else {
+            (surface, text)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
     /// T-31: every level resolves to its own theme tone, in both theme modes,
-    /// and the visible `[level]` prefix maps back to the ingested level.
+    /// clears WCAG AA (4.5:1) against that mode's background, and the visible
+    /// `[level]` prefix maps back to the ingested level.
     #[gpui_kit::test]
     fn t81_log_level_tones_render_all_levels(cx: &mut TestAppContext) {
         use gpui_kit::component::ThemeMode;
@@ -29223,26 +29363,16 @@ mod tests {
                 crate::Theme::change(mode, None, cx);
                 let theme = crate::Theme::global(cx);
                 assert_eq!(theme.mode, mode, "the tone check runs in {mode:?}");
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Error, theme),
-                    theme.danger,
-                    "error paints the theme danger red"
-                );
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Warn, theme),
-                    theme.warning,
-                    "warn paints the theme amber"
-                );
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Info, theme),
-                    theme.foreground,
-                    "info keeps the default text color"
-                );
-                assert_eq!(
-                    crate::log_level_text_color(crate::LogLevel::Debug, theme),
-                    theme.muted_foreground,
-                    "debug recedes to muted"
-                );
+                for level in levels {
+                    let ratio = log_contrast_ratio(
+                        crate::log_level_text_color(level, theme),
+                        theme.background,
+                    );
+                    assert!(
+                        ratio >= 4.5,
+                        "{level:?} text reaches WCAG AA in {mode:?}, got {ratio:.2}:1"
+                    );
+                }
                 for (index, left) in levels.iter().enumerate() {
                     for right in levels.iter().skip(index + 1) {
                         assert_ne!(
@@ -52119,6 +52249,9 @@ mod tests {
             .expect("seed works");
         store.set_restore_running(true).expect("opt-in writes");
         store
+            .set_last_clean_exit(true)
+            .expect("clean marker writes, no T-34 toast");
+        store
             .save_running_snapshot(&[loopback.id.clone(), lan.id.clone(), "9999".to_string()])
             .expect("snapshot writes");
 
@@ -52136,16 +52269,44 @@ mod tests {
 
         assert!(
             view.read_with(cx, |view, _| view.engine.is_running(&loopback.id)),
-            "loopback snapshot row restores"
+            "loopback snapshot row restores at boot, not a frame later"
         );
         assert!(
             !view.read_with(cx, |view, _| view.engine.is_running(&lan.id)),
             "LAN snapshot row waits for its confirm"
         );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "the restore toast lands after Root, never during boot"
+        );
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the LAN confirm lands after Root, never during boot"
+        );
+
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
         assert!(
             cx.update(|window, cx| window.has_active_dialog(cx)),
-            "LAN confirm dialog opens"
+            "LAN confirm dialog opens on the first frame after Root"
         );
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "the restore toast arrives exactly once"
+        );
+
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "the restore toast is one-shot, not one per frame"
+        );
+
         cx.update(|window, cx| window.close_all_dialogs(cx));
         assert!(
             !view.read_with(cx, |view, _| view.engine.is_running(&lan.id)),
@@ -52185,6 +52346,509 @@ mod tests {
             "opt-out restores nothing"
         );
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    /// Defect: boot runs inside `cx.open_window`'s closure, and the window does
+    /// not adopt its `gpui_component::Root` layer until that closure returns.
+    /// Pushing a notification or opening a dialog then panics inside
+    /// `Root::update` ("window first layer should be a gpui_component::Root").
+    /// A window whose root view is `AppView` itself is exactly the boot shape:
+    /// every boot path must survive it, because nothing has a Root to reach.
+    #[gpui_kit::test]
+    fn boot_paths_survive_a_window_without_root(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        let loopback = store
+            .add(restore_seed("Loop", "", "10876"))
+            .expect("seed works");
+        let lan = store
+            .add(restore_seed("Lan", "0.0.0.0", "10877"))
+            .expect("seed works");
+        store.set_restore_running(true).expect("opt-in writes");
+        store
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+        store
+            .save_running_snapshot(&[loopback.id.clone(), lan.id.clone()])
+            .expect("snapshot writes");
+
+        // No `Root::new` wrapper: this window has AppView as its first layer,
+        // which is what boot sees before the closure hands the Root back.
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppView::with_store(window, cx, store));
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                // c) restore: approval toast + LAN confirm both boot-time.
+                view.restore_on_launch(window, cx);
+                // d) open-with intake: the chooser dialog is boot-time too.
+                view.handle_launch_intake(
+                    OpenWithKind::BareHttp("https://example.com/feed".to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.engine.is_running(&loopback.id)),
+            "the restore itself still runs at boot, before any Root exists"
+        );
+        assert!(
+            !view.read_with(cx, |view, _| view.engine.is_running(&lan.id)),
+            "the LAN row still waits for its confirm"
+        );
+    }
+
+    /// Defect: the deferred intake dialog must still open — one frame later,
+    /// exactly once, and without a notification nobody asked for.
+    #[gpui_kit::test]
+    fn launch_intake_opens_the_frame_after_root(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.handle_launch_intake(
+                    OpenWithKind::BareHttp("https://example.com/feed".to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(
+            !cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the intake dialog waits for the frame after boot"
+        );
+        assert_eq!(notification_count(cx), 0, "boot intake says nothing extra");
+
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert!(
+            cx.update(|window, cx| window.has_active_dialog(cx)),
+            "the intake chooser opens once Root exists"
+        );
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "the deferred intake is not a toast"
+        );
+    }
+
+    /// Functions that run inside `cx.open_window`'s closure, before the window
+    /// adopts its `Root` layer, so none of them may reach an overlay directly:
+    /// `Root::update` panics on a window whose first layer is not a
+    /// `gpui_component::Root`. They hand the overlay to a `*_after_root`
+    /// helper, or — when the same path also serves ordinary post-Root use — to
+    /// `notify_now_or_after_root`, which decides at runtime. That helper is the
+    /// only root-checked direct push, so this list stays complete without
+    /// exceptions: `reload` boots via `restore_on_launch` ->
+    /// `commit_restore_subset` and is listed here for that reason. Its
+    /// Root-READ calls (`has_active_dialog` / `has_active_sheet` /
+    /// `close_sheet`, which panic through `Root::read` rather than
+    /// `Root::update`) are guarded by the same `root_installed` check, so they
+    /// cannot fire before the Root exists either.
+    const BOOT_FUNCTIONS: [&str; 8] = [
+        "fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {\n        match Store::open_file",
+        "fn with_store(window: &mut Window",
+        "fn create_tray(&mut self",
+        "fn restore_on_launch(&mut self",
+        "fn commit_restore_subset(",
+        "fn open_restore_lan_confirm(",
+        "fn handle_launch_intake(",
+        "fn reload(&mut self",
+    ];
+
+    /// Matched by method name, so any receiver spelling (`window.`, `handle.`,
+    /// a chained call) is caught, not just the one this file happens to use.
+    const OVERLAY_CALLS: [&str; 3] = [
+        ".push_notification(",
+        ".open_dialog(",
+        ".open_alert_dialog(",
+    ];
+
+    /// Defect pin: the functions above must not reach `push_notification` /
+    /// `open_dialog` / `open_alert_dialog` before the Root exists. Source scan,
+    /// because the failure is "no Root in this call stack", which only real
+    /// boot (or a Root-less window) reproduces. Coverage is text, so literals
+    /// and comments are stripped before the bodies are brace-matched.
+    #[test]
+    fn boot_scan_survives_crlf_line_endings() {
+        // A checkout with CRLF (Windows `core.autocrlf`) must not make the
+        // multi-line markers miss their function.
+        let source = include_str!("main.rs");
+        let crlf = source.replace("\r\n", "\n").replace("\n", "\r\n");
+        assert!(
+            crlf.contains("\r\n"),
+            "the CRLF fixture really carries CRLF endings"
+        );
+        let found = direct_overlay_calls(&crlf, &BOOT_FUNCTIONS);
+        assert!(
+            found.is_empty(),
+            "the same boot functions are clean under CRLF: {found:?}"
+        );
+    }
+
+    #[test]
+    fn boot_paths_never_push_overlays_before_root() {
+        let found = direct_overlay_calls(include_str!("main.rs"), &BOOT_FUNCTIONS);
+        assert!(
+            found.is_empty(),
+            "these boot functions reach an overlay before the Root exists; \
+             use the *_after_root / notify_now_or_after_root helper: {found:?}"
+        );
+    }
+
+    /// Hardening pin: a `}` inside a literal or a comment used to end the
+    /// brace-matched body early, which hid every later push from the scan —
+    /// a reintroduced direct push would have slipped through silently.
+    #[test]
+    fn boot_scan_sees_past_braces_in_literals_and_comments() {
+        let source = r##"
+    fn create_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let quoted = "}";
+        let ch = '}';
+        let raw = r#"}}}"#;
+        // } not a close
+        /* } neither */
+        window.push_notification(note, cx);
+    }
+"##;
+        let found = direct_overlay_calls(source, &["fn create_tray(&mut self"]);
+        assert_eq!(
+            found.len(),
+            1,
+            "the push after a brace in a literal is still seen: {found:?}"
+        );
+        assert!(found[0].contains(".push_notification("), "{found:?}");
+    }
+
+    /// Hardening pin: matching by method name catches a push on a receiver the
+    /// old `window.`-only spelling would have missed.
+    #[test]
+    fn boot_scan_matches_any_receiver() {
+        let source = r#"
+    fn handle_launch_intake(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = boot_window(window);
+        handle.push_notification(note, cx);
+        handle.open_dialog(cx, build);
+        handle.open_alert_dialog(cx, build);
+    }
+"#;
+        let found = direct_overlay_calls(source, &["fn handle_launch_intake("]);
+        assert_eq!(
+            found.len(),
+            OVERLAY_CALLS.len(),
+            "every overlay spelling is caught: {found:?}"
+        );
+    }
+
+    /// Hardening pin, the other direction: helper calls, comments about the
+    /// defect, and quoted call text must not read as violations.
+    #[test]
+    fn boot_scan_ignores_helper_calls_and_comments() {
+        let source = r#"
+    fn restore_on_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Never window.push_notification(here): it panics before the Root.
+        self.notify_after_root(Notification::error(db_list_error_message(&error)), window, cx);
+        self.notify_now_or_after_root(Notification::error(text), window, cx);
+        let quoted = "window.open_dialog(";
+    }
+"#;
+        let found = direct_overlay_calls(source, &["fn restore_on_launch(&mut self"]);
+        assert!(found.is_empty(), "no false positives: {found:?}");
+    }
+
+    /// Direct overlay calls inside `markers`, ignoring literals and comments.
+    /// Empty means every listed function defers. Each marker must name exactly
+    /// one function, so a rename cannot silently leave the scan on a body it
+    /// did not mean to check.
+    fn direct_overlay_calls(source: &str, markers: &[&str]) -> Vec<String> {
+        // Normalize line endings first: a checkout with CRLF (Windows
+        // `core.autocrlf`) would otherwise break the multi-line markers,
+        // which are written with `\n`.
+        let normalized = source.replace("\r\n", "\n");
+        let stripped = strip_literals_and_comments(&normalized);
+        let mut found = Vec::new();
+        for marker in markers {
+            assert_eq!(
+                stripped.matches(marker).count(),
+                1,
+                "marker names exactly one function: {marker}"
+            );
+            let body = function_body(&stripped, marker);
+            for call in OVERLAY_CALLS {
+                if body.contains(call) {
+                    found.push(format!("{marker} -> {call}"));
+                }
+            }
+        }
+        found
+    }
+
+    /// `source` with the contents of string/char/raw literals and of line and
+    /// block comments blanked to spaces. Newlines survive, so markers spanning
+    /// lines still match and the brace count sees only real code. `'` lifetimes
+    /// (`'a`, `'static`) stay: only a closed `'x'` / `'\n'` is a char literal.
+    fn strip_literals_and_comments(source: &str) -> String {
+        fn blanked(ch: char) -> char {
+            if ch == '\n' {
+                '\n'
+            } else {
+                ' '
+            }
+        }
+
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0usize;
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(blanked(chars[i]));
+                    i += 1;
+                }
+                continue;
+            }
+            if ch == '/' && chars.get(i + 1) == Some(&'*') {
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        out.push_str("  ");
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        out.push_str("  ");
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        out.push(blanked(chars[i]));
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            // Raw strings: r"..", r#".."#, br##".."##.
+            let raw_prefix = if ch == 'r' {
+                Some(i + 1)
+            } else if matches!(ch, 'b' | 'c') && chars.get(i + 1) == Some(&'r') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(mut j) = raw_prefix {
+                let mut hashes = 0usize;
+                while chars.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'"') {
+                    j += 1;
+                    while j < chars.len() {
+                        if chars[j] == '"' {
+                            let mut close = j + 1;
+                            let mut seen = 0usize;
+                            while seen < hashes && chars.get(close) == Some(&'#') {
+                                seen += 1;
+                                close += 1;
+                            }
+                            if seen == hashes {
+                                j = close;
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    for ch in &chars[i..j.min(chars.len())] {
+                        out.push(blanked(*ch));
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            if ch == '"' {
+                out.push(' ');
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => {
+                            out.push_str("  ");
+                            i += 2;
+                        }
+                        '"' => {
+                            out.push(' ');
+                            i += 1;
+                            break;
+                        }
+                        other => {
+                            out.push(blanked(other));
+                            i += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            let char_literal = matches!(
+                (chars.get(i + 1), chars.get(i + 2)),
+                (Some('\\'), _) | (Some(_), Some('\''))
+            );
+            if ch == '\'' && char_literal {
+                out.push(' ');
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => {
+                            out.push_str("  ");
+                            i += 2;
+                        }
+                        '\'' => {
+                            out.push(' ');
+                            i += 1;
+                            break;
+                        }
+                        other => {
+                            out.push(blanked(other));
+                            i += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+        }
+        out
+    }
+
+    /// The brace-matched body of the function starting at `marker`. Expects the
+    /// literal- and comment-free text from `strip_literals_and_comments`.
+    fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing function: {marker}"));
+        let open = start + source[start..].find('{').expect("function body opens");
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced body: {marker}");
+    }
+
+    /// Defect: `reload` boots through `restore_on_launch` ->
+    /// `commit_restore_subset`, so a failing `store.list()` reached a window
+    /// with no Root yet and panicked in `Root::update`. No Root here either: the
+    /// call must survive and leave the toast for the first frame.
+    #[gpui_kit::test]
+    fn reload_before_root_defers_the_store_error(cx: &mut TestAppContext) {
+        use crate::engine::EngineController;
+
+        cx.update(gpui_kit::init);
+
+        let mut store = Store::open_in_memory().expect("in-memory store opens");
+        store
+            .add(restore_seed("Loop", "", "10878"))
+            .expect("seed works");
+        store
+            .set_last_clean_exit(true)
+            .expect("clean marker writes");
+
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| AppView::with_store(window, cx, store));
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let (engine, _) = EngineController::fake();
+                view.engine = engine;
+            });
+        });
+        assert!(
+            cx.update(|window, _| !AppView::root_installed(window)),
+            "the boot window really has no Root layer"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.store.break_schema_for_test().expect("schema breaks");
+                view.reload(window, cx);
+            });
+        });
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.config_count(cx)),
+            1,
+            "the failed reload left the library untouched instead of panicking"
+        );
+
+        // Production installs the Root right after the boot closure returns:
+        // do the same, then run one frame. The queued toast must arrive exactly
+        // once — proving the error was deferred, not dropped.
+        cx.update(|window, cx| {
+            let view = view.clone();
+            window.replace_root(cx, move |window, cx| Root::new(view, window, cx));
+        });
+        assert_eq!(
+            notification_count(cx),
+            0,
+            "nothing was pushed into the Root-less window"
+        );
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "the boot-time store error arrives once the Root exists"
+        );
+    }
+
+    /// The same path after Root: `reload` must report the failure in the same
+    /// turn, exactly once — ordinary use keeps its timing, no extra frames.
+    #[gpui_kit::test]
+    fn reload_after_root_delivers_the_store_error_in_the_same_turn(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let (view, cx) = mount_view(store, cx);
+        view.read_with(cx, |view, _| {
+            view.store.break_schema_for_test().expect("schema breaks");
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.reload(window, cx));
+        });
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "a post-Root reload reports the failure in the same turn"
+        );
+
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(
+            notification_count(cx),
+            1,
+            "and exactly once: no duplicate on the following frame"
+        );
     }
 
     #[gpui_kit::test]
