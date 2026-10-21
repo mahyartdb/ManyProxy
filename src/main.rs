@@ -55282,7 +55282,20 @@ mod tests {
                 break;
             }
         }
-        let body: String = body.expect("export file written within 3 attempts");
+        let body: String = match body {
+            Some(text) => text,
+            None => {
+                // Name the underlying store error so a failing runner (e.g.
+                // windows-arm64) reports the cause, not just "3 attempts".
+                let detail = view
+                    .read_with(cx, |view, _| view.store.commit_export(&target, true))
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "store write reported success".to_string());
+                let _ = std::fs::remove_file(&target);
+                panic!("export file written within 3 attempts (store error: {detail})");
+            }
+        };
         assert!(
             notification_count(cx) > before,
             "commit pushes a notification per attempt"
