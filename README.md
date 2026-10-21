@@ -100,13 +100,13 @@ Start all / Stop all / Show / Quit.
 | Start selected | `F5` |
 | Stop selected | `Shift-F5` |
 | Test selected | `Ctrl-T` |
-| Stop testing | `Ctrl-.` |
+| Stop Testing | `Ctrl-.` |
 | Edit selected | `Ctrl-E` |
 | Delete selected | `Delete` |
 | Focus search | `Ctrl-F` |
-| Inspector: details | `Ctrl-1` |
-| Inspector: health | `Ctrl-2` |
-| Inspector: presets | `Ctrl-3` |
+| Inspector details | `Ctrl-1` |
+| Inspector health | `Ctrl-2` |
+| Inspector presets | `Ctrl-3` |
 | Uncheck all | `Esc` |
 | Copy URLs | `Ctrl-U` |
 | Command palette | `Ctrl-K` |
@@ -119,9 +119,10 @@ key-bound actions also have toolbar or menu entries and `Ctrl-K` palette twins.
 No system proxy switching, no TUN / virtual interface, no OS DNS rewrite, no
 routing-rule editor, no admin/elevation path, no auto-update that replaces
 binaries, no telemetry, and no silent binary downloads. The only network traffic
-the app originates is a user-initiated subscription fetch and probes through your
-own endpoints to the visible test URL. These are durable constraints, covered by
-the `assert_no_system_mutation` test family.
+the app originates is user-initiated: a subscription fetch, the GitHub release
+feed behind **Check for updates**, explicit `throne://remoteroute/` fetches, and
+probes through your own endpoints to the visible test URL. These are durable
+constraints, covered by the `assert_no_system_mutation` test family.
 
 ## Troubleshooting
 
@@ -212,7 +213,7 @@ them from `.github/workflows/live.yml` only.
 | README claim                         | Proved by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Toolbar buttons + dialogs + footers  | `Button::new("add-config"/"import-config"/"import-clipboard"/"export-library"/"subscriptions"/"engine-start-all"/"engine-stop-all"/"health-test-all"/"about-dialog"/"edit-config"/"delete-config"/"copy-urls"/"engine-start"/"engine-stop"/"health-test"/"health-ping"/"logs-open")` with shortcut-hint labels (`Add (Ctrl-N)`, `Import (Ctrl-O)`, `Start selected (F5)`, `Stop selected (Shift-F5)`, `Test selected (Ctrl-T)`, ticket 33), `open_add_dialog` / `open_edit_dialog` / `open_import_dialog` / `open_export_dialog` / `open_logs_dialog` / `open_about_dialog` / `subscription_row`, `dialog_footer` (`src/main.rs`); `dialog_footers_audit_every_plain_dialog` (ticket 18) |
-| Defaults + auto port                 | `DEFAULT_BIND/PROTOCOL/GROUP` (`src/store.rs:16`), `AUTO_PORT_START/END = 10801–10999` + spillover `AUTO_PORT_SPILL_START/END = 18081–18380` (`src/store.rs:52-59`), `parse_port_field("")` = auto, `auto_ports_are_unique`                                                                                                                                                                                                                                                                                                                                             |
+| Defaults + auto port                 | `DEFAULT_BIND/PROTOCOL/GROUP` (`src/store.rs:6/8/10`), `AUTO_PORT_START/END = 10801–10999` + spillover `AUTO_PORT_SPILL_START/END = 18081–18380` (`src/store.rs:42-46`), `parse_port_field("")` = auto, `auto_ports_are_unique`                                                                                                                                                                                                                                                                                                                                             |
 | Accepted formats                     | `src/import.rs` parsers + tickets 03/07/08/15 tests (239+ passing incl. `paste_and_drop_agree`, `conf_holding_json_or_links_sniffed`, `pasted_clash_yaml_imports`, `bom_prefixed_json_parses`)                                                                                                                                                                                                                                                                                                                 |
 | Toasts honest                        | `config_added/updated/removed_message`, `start_all/stop_all/already_stopped_message`, `export_count_message`, `coalesced_refresh_message` (`src/main.rs:1533/1543/1680/1705/1715/1790`); ticket 17 UI tests                                                                                                                                                                                                                                                                                                                              |
 | Subscriptions/auto-refresh           | `fetch_subscription_body`, `redact_subscription_url`, `due_for_refresh` + `DEFAULT_AUTO_REFRESH_SECS`, `DUE_SUBSCRIPTION_TICK_SECS`, `refresh_with_body` tests                                                                                                                                                                                                                                                                                                                                                 |

@@ -338,6 +338,23 @@ fn logs_save_path_text() -> String {
     )
 }
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Spawn a console executable with no visible console window. `creation_flags`
+/// REPLACES the whole flag word (std does `self.flags = flags`), so a future
+/// site that needs other flags must OR them in:
+/// `cmd.creation_flags(cmd.get_creation_flags() | CREATE_NO_WINDOW)`.
+pub(crate) fn spawn_hidden(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 fn group_delete_confirm_text(name: &str, count: usize) -> String {
     if count == 0 {
         format!("Delete empty group \"{name}\"? No rows move (none use it). This cannot be undone.")
@@ -28940,14 +28957,25 @@ fn install_crash_hook() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
-        let path = crate::store::app_data_dir().join(format!("manyproxy-crash-{stamp}.txt"));
-        let _ = append_crash_report(&path, &report);
+        let file_name = format!("manyproxy-crash-{stamp}.txt");
+        let path = crate::store::app_data_dir().join(&file_name);
+        if append_crash_report(&path, &report).is_err() {
+            // A panic before the first store open (the startup failures worth
+            // catching) has no `data\` yet; fall back beside the exe. Both
+            // failures are silent: the hook itself must never panic.
+            if let Some(app_dir) = crate::engine::current_app_dir() {
+                let _ = append_crash_report(&app_dir.join(&file_name), &report);
+            }
+        }
         previous_hook(info);
     }));
 }
 
-fn append_crash_report(path: &PathBuf, report: &str) -> std::io::Result<()> {
+fn append_crash_report(path: &std::path::Path, report: &str) -> std::io::Result<()> {
     use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -29209,6 +29237,28 @@ mod tests {
         assert_eq!(&bytes[0..4], &[0, 0, 1, 0], "ICO magic");
         let count = u16::from_le_bytes([bytes[4], bytes[5]]);
         assert!(count >= 1, "at least one icon image");
+    }
+
+    /// A panic before the first store open has no `data\` directory yet — the
+    /// hook must create it instead of losing the report to a swallowed error.
+    #[test]
+    fn crash_report_creates_missing_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "manyproxy-crash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock works")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("data").join("manyproxy-crash-test.txt");
+        assert!(!root.exists(), "fresh temp root");
+        let report = "panic: boom\nbacktrace:\n";
+        crate::append_crash_report(&path, report).expect("report writes");
+        let written = std::fs::read_to_string(&path).expect("report reads");
+        assert!(written.contains(report), "report text lands: {written:?}");
+        std::fs::remove_dir_all(&root).expect("temp dir cleans");
     }
 
     #[test]
