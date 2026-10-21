@@ -10023,12 +10023,12 @@ impl InspectorTab {
 
     fn a11y_label(self) -> &'static str {
         match self {
-            InspectorTab::Details => "Inspector Details tab (Ctrl-1)",
-            InspectorTab::Health => "Inspector Health tab (Ctrl-2)",
-            InspectorTab::Presets => "Inspector Presets tab (Ctrl-3)",
-            InspectorTab::Logs => "Inspector Logs tab (Ctrl-4)",
-            InspectorTab::Connections => "Inspector Connections tab (Ctrl-5)",
-            InspectorTab::Traffic => "Inspector Traffic tab (Ctrl-6)",
+            InspectorTab::Details => "Details",
+            InspectorTab::Health => "Health",
+            InspectorTab::Presets => "Presets",
+            InspectorTab::Logs => "Logs",
+            InspectorTab::Connections => "Connections",
+            InspectorTab::Traffic => "Traffic",
         }
     }
 }

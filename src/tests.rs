@@ -9711,9 +9711,9 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
         (
             "program-menu",
             &[
-                ("menu-add-config", "Add configuration (Ctrl-N)"),
-                ("menu-import-config", "Import (Ctrl-O)"),
-                ("import-clipboard", "From clipboard (Ctrl-V)"),
+                ("menu-add-config", "Add configuration"),
+                ("menu-import-config", "Import"),
+                ("import-clipboard", "From clipboard"),
                 ("import-files", "From file(s)"),
                 ("export-library", "Export"),
                 ("about-dialog", "About"),
@@ -9741,9 +9741,9 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
         (
             "tools-menu",
             &[
-                ("start-selected", "Start selected (F5)"),
-                ("stop-selected", "Stop selected (Shift-F5)"),
-                ("test-selected", "Test selected (Ctrl-T)"),
+                ("start-selected", "Start selected"),
+                ("stop-selected", "Stop selected"),
+                ("test-selected", "Test selected"),
                 ("menu-logs", "Logs"),
                 ("engine-start-all", "Start all"),
                 ("engine-stop-all", "Stop all"),
@@ -9755,9 +9755,9 @@ fn t02_toolbar_menu_items_announce_names(cx: &mut TestAppContext) {
                 ("out-ip-selected", "Resolve Out-IP selected"),
                 ("out-ip-group", "Resolve Out-IP group"),
                 ("resolve-domain-group", "Resolve domain group"),
-                ("stop-testing", "Stop Testing (Ctrl-.)"),
+                ("stop-testing", "Stop Testing"),
                 ("show-security", "Show security"),
-                ("open-palette", "Command palette (Ctrl-K)"),
+                ("open-palette", "Command palette"),
             ][..],
         ),
     ] {
@@ -16845,7 +16845,7 @@ fn t09_bulk_clear_returns_focus_to_shell(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
+fn shortcut_buttons_pin_action_names_and_key_tooltips(cx: &mut TestAppContext) {
     use gpui_kit::component::IndexPath;
     cx.update(gpui_kit::init);
     let mut store = Store::open_in_memory().expect("in-memory store opens");
@@ -16867,16 +16867,12 @@ fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
     cx.run_until_parked();
     paint_frame(cx);
 
-    cx.update(|window, cx| {
-        window.click("program-menu", cx);
-    });
-    cx.run_until_parked();
-    paint_frame(cx);
-    cx.run_until_parked();
-    paint_frame(cx);
+    // T-02: the accessible name is the action alone. The key rides in the
+    // tooltip, never inside the name.
     for (id, pinned) in [
-        ("menu-add-config", "Add configuration (Ctrl-N)"),
-        ("menu-import-config", "Import (Ctrl-O)"),
+        ("engine-start", "Start the selected endpoint"),
+        ("engine-stop", "Stop"),
+        ("health-test", "Test"),
     ] {
         let label = cx.update(|window, _| {
             window
@@ -16888,7 +16884,60 @@ fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
         assert_eq!(
             label.as_deref(),
             Some(pinned),
-            "{id} keeps its pinned accessible label"
+            "{id} announces the action alone, without the key"
+        );
+        assert!(
+            !label.as_deref().unwrap_or_default().contains('('),
+            "{id} keeps every key out of its accessible name"
+        );
+    }
+    // The key stays visible as a chip beside the button.
+    for chip in ["kbd:f5", "kbd:shift-f5", "kbd:ctrl-t"] {
+        assert!(
+            cx.debug_bounds(chip).is_some(),
+            "{chip} paints the shortcut hint as a chip on the operate row"
+        );
+    }
+    // …and the tooltip is where the key lives.
+    assert_eq!(
+        crate::app::detail::OPERATE_START_TOOLTIP,
+        "Start the selected endpoint (F5)"
+    );
+    assert_eq!(
+        crate::app::detail::OPERATE_STOP_TOOLTIP,
+        "Stop the selected endpoint (Shift-F5)"
+    );
+    assert_eq!(
+        crate::app::detail::OPERATE_TEST_TOOLTIP,
+        "Test the selected endpoint (Ctrl-T)"
+    );
+
+    cx.update(|window, cx| {
+        window.click("program-menu", cx);
+    });
+    cx.run_until_parked();
+    paint_frame(cx);
+    cx.run_until_parked();
+    paint_frame(cx);
+    for (id, pinned, chip) in [
+        ("menu-add-config", "Add configuration", "kbd:ctrl-n"),
+        ("menu-import-config", "Import", "kbd:ctrl-o"),
+    ] {
+        let label = cx.update(|window, _| {
+            window
+                .try_find(id.to_string())
+                .unwrap_or_else(|| panic!("{id} renders"))
+                .label()
+                .map(str::to_string)
+        });
+        assert_eq!(
+            label.as_deref(),
+            Some(pinned),
+            "{id} announces the action alone, without the key"
+        );
+        assert!(
+            cx.debug_bounds(chip).is_some(),
+            "{id} keeps its {chip} chip"
         );
     }
     cx.update(|window, cx| {
@@ -16906,10 +16955,10 @@ fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
     paint_frame(cx);
     cx.run_until_parked();
     paint_frame(cx);
-    for (id, pinned) in [
-        ("start-selected", "Start selected (F5)"),
-        ("stop-selected", "Stop selected (Shift-F5)"),
-        ("test-selected", "Test selected (Ctrl-T)"),
+    for (id, pinned, chip) in [
+        ("start-selected", "Start selected", "kbd:f5"),
+        ("stop-selected", "Stop selected", "kbd:shift-f5"),
+        ("test-selected", "Test selected", "kbd:ctrl-t"),
     ] {
         let label = cx.update(|window, _| {
             window
@@ -16921,7 +16970,11 @@ fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
         assert_eq!(
             label.as_deref(),
             Some(pinned),
-            "{id} keeps its pinned accessible label"
+            "{id} announces the action alone, without the key"
+        );
+        assert!(
+            cx.debug_bounds(chip).is_some(),
+            "{id} keeps its {chip} chip"
         );
     }
     cx.update(|window, cx| {
@@ -16931,24 +16984,6 @@ fn shortcut_buttons_keep_pinned_accessible_labels(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     paint_frame(cx);
-
-    for (id, pinned) in [
-        ("engine-stop", "Stop (Shift-F5)"),
-        ("health-test", "Test (Ctrl-T)"),
-    ] {
-        let label = cx.update(|window, _| {
-            window
-                .try_find(id.to_string())
-                .unwrap_or_else(|| panic!("{id} renders"))
-                .label()
-                .map(str::to_string)
-        });
-        assert_eq!(
-            label.as_deref(),
-            Some(pinned),
-            "{id} keeps its pinned accessible label"
-        );
-    }
 }
 
 #[gpui_kit::test]
@@ -19215,7 +19250,7 @@ fn r3_row_endpoint_controls_paint(cx: &mut TestAppContext) {
         "port field holds its 76px cell, got {port_w:?}"
     );
     for (slot, pinned) in [
-        ("row-serve-", "Start \"Alpha\" (F5)"),
+        ("row-serve-", "Start \"Alpha\""),
         ("row-edit-", "Edit \"Alpha\""),
     ] {
         let element = format!("{slot}{}", alpha.id);
@@ -20517,30 +20552,12 @@ fn t06_inspector_tabs_hints_order_scroll_reset(cx: &mut TestAppContext) {
         .expect("seed works");
     let (view, cx) = mount_view(store, cx);
 
-    assert_eq!(
-        crate::InspectorTab::Details.a11y_label(),
-        "Inspector Details tab (Ctrl-1)"
-    );
-    assert_eq!(
-        crate::InspectorTab::Health.a11y_label(),
-        "Inspector Health tab (Ctrl-2)"
-    );
-    assert_eq!(
-        crate::InspectorTab::Presets.a11y_label(),
-        "Inspector Presets tab (Ctrl-3)"
-    );
-    assert_eq!(
-        crate::InspectorTab::Logs.a11y_label(),
-        "Inspector Logs tab (Ctrl-4)"
-    );
-    assert_eq!(
-        crate::InspectorTab::Connections.a11y_label(),
-        "Inspector Connections tab (Ctrl-5)"
-    );
-    assert_eq!(
-        crate::InspectorTab::Traffic.a11y_label(),
-        "Inspector Traffic tab (Ctrl-6)"
-    );
+    assert_eq!(crate::InspectorTab::Details.a11y_label(), "Details");
+    assert_eq!(crate::InspectorTab::Health.a11y_label(), "Health");
+    assert_eq!(crate::InspectorTab::Presets.a11y_label(), "Presets");
+    assert_eq!(crate::InspectorTab::Logs.a11y_label(), "Logs");
+    assert_eq!(crate::InspectorTab::Connections.a11y_label(), "Connections");
+    assert_eq!(crate::InspectorTab::Traffic.a11y_label(), "Traffic");
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
@@ -26623,8 +26640,13 @@ fn t67_menu_item_shows_key_hint(cx: &mut TestAppContext) {
     });
     assert_eq!(
         label.as_deref(),
-        Some("Stop Testing (Ctrl-.)"),
-        "Tools ▸ Stop Testing announces the Ctrl-. hint like the Shift-F5 sibling"
+        Some("Stop Testing"),
+        "Tools ▸ Stop Testing announces the action alone, like the Shift-F5 sibling"
+    );
+    // The key hint stays visible as a chip beside the row, not in its name.
+    assert!(
+        cx.debug_bounds("kbd:ctrl-.").is_some(),
+        "Tools ▸ Stop Testing paints the Ctrl-. hint as a chip"
     );
 }
 

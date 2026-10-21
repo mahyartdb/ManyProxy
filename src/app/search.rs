@@ -173,7 +173,7 @@ impl AppView {
                     .child(
                         Input::new(&self.search_input)
                             .small()
-                            .aria_label("Search configurations (Ctrl-F)"),
+                            .aria_label("Search configurations"),
                     ),
             )
             .child(self.render_search_count(cx))

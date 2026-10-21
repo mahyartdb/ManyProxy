@@ -1,5 +1,12 @@
 use crate::*;
 
+/// T-02: a key never rides inside a label or an accessible name. The operate
+/// row announces the action alone and keeps the key in its tooltip, so the
+/// key-bearing tooltip text is named here and pinned by the test suite.
+pub(crate) const OPERATE_START_TOOLTIP: &str = "Start the selected endpoint (F5)";
+pub(crate) const OPERATE_STOP_TOOLTIP: &str = "Stop the selected endpoint (Shift-F5)";
+pub(crate) const OPERATE_TEST_TOOLTIP: &str = "Test the selected endpoint (Ctrl-T)";
+
 impl AppView {
     pub(crate) fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(config) = self.selected_config(cx) else {
@@ -779,9 +786,9 @@ impl AppView {
                 let mut start = Button::new("engine-start")
                     .small()
                     .label(start_label)
-                    .accessibility_label("Start the selected endpoint (F5)")
+                    .accessibility_label("Start the selected endpoint")
                     .child(shortcut_kbd("f5", "(F5)"))
-                    .tooltip("Start the selected endpoint (F5)")
+                    .tooltip(OPERATE_START_TOOLTIP)
                     .loading(self.start_in_flight)
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.start_selected_engine(window, cx);
@@ -798,9 +805,9 @@ impl AppView {
                 let mut stop = Button::new("engine-stop")
                     .small()
                     .label("Stop")
-                    .accessibility_label("Stop (Shift-F5)")
+                    .accessibility_label("Stop")
                     .child(shortcut_kbd("shift-f5", "(Shift-F5)"))
-                    .tooltip("Stop the selected endpoint")
+                    .tooltip(OPERATE_STOP_TOOLTIP)
                     .loading(self.start_in_flight)
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.stop_selected_engine(window, cx);
@@ -817,9 +824,9 @@ impl AppView {
                 let mut test = Button::new("health-test")
                     .small()
                     .label("Test")
-                    .accessibility_label("Test (Ctrl-T)")
+                    .accessibility_label("Test")
                     .child(shortcut_kbd("ctrl-t", "(Ctrl-T)"))
-                    .tooltip("Test the selected endpoint")
+                    .tooltip(OPERATE_TEST_TOOLTIP)
                     .loading(self.probe_kind_in_flight(false))
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.test_selected_health(window, cx);

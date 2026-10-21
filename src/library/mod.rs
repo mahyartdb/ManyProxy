@@ -1260,7 +1260,7 @@ impl ListDelegate for LibraryDelegate {
                                 .accessibility_label(if is_running {
                                     format!("Stop \"{}\"", row.name)
                                 } else {
-                                    format!("Start \"{}\" (F5)", row.name)
+                                    format!("Start \"{}\"", row.name)
                                 })
                                 .tooltip(if is_running {
                                     format!("Stop \"{}\"", row.name)

@@ -43,7 +43,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "menu-add-config",
                                     "Add configuration",
-                                    "Add configuration (Ctrl-N)",
+                                    "Add configuration",
                                     "Add a proxy configuration",
                                     Some(("ctrl-n", "(Ctrl-N)", "Ctrl-N")),
                                 )
@@ -62,7 +62,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "menu-import-config",
                                     "Import",
-                                    "Import (Ctrl-O)",
+                                    "Import",
                                     "Import share links or files",
                                     Some(("ctrl-o", "(Ctrl-O)", "Ctrl-O")),
                                 )
@@ -87,7 +87,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "import-clipboard",
                                     "From clipboard",
-                                    "From clipboard (Ctrl-V)",
+                                    "From clipboard",
                                     "Import from clipboard text",
                                     Some(("ctrl-v", "(Ctrl-V)", "Ctrl-V")),
                                 )
@@ -415,7 +415,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "start-selected",
                                     "Start selected",
-                                    "Start selected (F5)",
+                                    "Start selected",
                                     "Start the selected endpoint",
                                     Some(("f5", "(F5)", "F5")),
                                 )
@@ -434,7 +434,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "stop-selected",
                                     "Stop selected",
-                                    "Stop selected (Shift-F5)",
+                                    "Stop selected",
                                     "Stop the selected endpoint",
                                     Some(("shift-f5", "(Shift-F5)", "Shift-F5")),
                                 )
@@ -453,7 +453,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "test-selected",
                                     "Test selected",
-                                    "Test selected (Ctrl-T)",
+                                    "Test selected",
                                     "Test the selected endpoint",
                                     Some(("ctrl-t", "(Ctrl-T)", "Ctrl-T")),
                                 )
@@ -714,7 +714,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "stop-testing",
                                     "Stop Testing",
-                                    "Stop Testing (Ctrl-.)",
+                                    "Stop Testing",
                                     "Stop the running group test",
                                     Some(("ctrl-.", "(Ctrl-.)", "Ctrl-.")),
                                 )
@@ -790,7 +790,7 @@ impl AppView {
                                 topbar_menu_row(
                                     "open-palette",
                                     "Command palette",
-                                    "Command palette (Ctrl-K)",
+                                    "Command palette",
                                     "Every action, searchable (Ctrl-K)",
                                     Some(("ctrl-k", "(Ctrl-K)", "Ctrl-K")),
                                 )
