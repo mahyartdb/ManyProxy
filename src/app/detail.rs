@@ -543,9 +543,9 @@ impl AppView {
         };
         let crashed = self.engine.ids_on_crashed_shards().contains(&config.id);
         let badge = if is_running {
-            serving_badge(true, config.port, summary_opt)
+            serving_badge(true, &config.bind_ip, config.port, summary_opt)
         } else {
-            serving_badge(false, config.port, None)
+            serving_badge(false, &config.bind_ip, config.port, None)
         };
         div()
             .flex()

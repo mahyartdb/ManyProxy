@@ -6976,7 +6976,7 @@ fn library_row_lines(
             "{} · bind {}:{} · {state}",
             row.group, row.bind_ip, row.port
         ),
-        serving_badge(is_running, row.port, health),
+        serving_badge(is_running, &row.bind_ip, row.port, health),
     ];
     if let Some((rx, tx)) = traffic {
         if let Some(summary) = traffic_summary_text(rx, tx) {
@@ -6999,7 +6999,7 @@ fn library_row_cells(
         apply_show_security(&mut upstream_cell, row);
     }
     let health_cell = if is_running {
-        serving_badge(true, row.port, health)
+        serving_badge(true, &row.bind_ip, row.port, health)
     } else {
         String::new()
     };

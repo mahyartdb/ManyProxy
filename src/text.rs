@@ -545,13 +545,27 @@ pub(crate) fn resolve_domain_group_notification(
     };
     (severity, message)
 }
-pub(crate) fn serving_badge(is_running: bool, port: u16, health: Option<&str>) -> String {
+/// T-03: the badge carries the endpoint, not an orphaned colon — `Running ·
+/// 127.0.0.1:10801 · 87ms`. The bind belongs to the endpoint, so the string
+/// carries it; the latency segment appears only once a probe has run.
+pub(crate) fn serving_badge(
+    is_running: bool,
+    bind: &str,
+    port: u16,
+    health: Option<&str>,
+) -> String {
     if !is_running {
         return "○ Stopped".to_string();
     }
+    let bind = bind.trim();
+    let endpoint = if bind.is_empty() {
+        format!(":{port}")
+    } else {
+        format!("{bind}:{port}")
+    };
     match health.map(str::trim).filter(|summary| !summary.is_empty()) {
-        Some(summary) => format!("● Running :{port} · {summary}"),
-        None => format!("● Running :{port}"),
+        Some(summary) => format!("● Running · {endpoint} · {summary}"),
+        None => format!("● Running · {endpoint}"),
     }
 }
 pub(crate) fn serving_tone(is_running: bool, health: Option<&str>, crashed: bool) -> ServingTone {

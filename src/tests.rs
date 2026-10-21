@@ -19049,15 +19049,24 @@ fn t47_idle_cadences_minimal() {
 fn serving_badge_copy() {
     use crate::serving_badge;
     assert_eq!(
-        serving_badge(true, 10801, Some("87ms")),
-        "● Running :10801 · 87ms"
+        serving_badge(true, "127.0.0.1", 10801, Some("87ms")),
+        "● Running · 127.0.0.1:10801 · 87ms"
     );
-    assert_eq!(serving_badge(true, 10801, None), "● Running :10801");
-    assert_eq!(serving_badge(true, 10801, Some("  ")), "● Running :10801");
-    assert_eq!(serving_badge(false, 10801, Some("87ms")), "○ Stopped");
-    assert_eq!(serving_badge(false, 10801, None), "○ Stopped");
+    assert_eq!(
+        serving_badge(true, "127.0.0.1", 10801, None),
+        "● Running · 127.0.0.1:10801"
+    );
+    assert_eq!(
+        serving_badge(true, "127.0.0.1", 10801, Some("  ")),
+        "● Running · 127.0.0.1:10801"
+    );
+    assert_eq!(
+        serving_badge(false, "127.0.0.1", 10801, Some("87ms")),
+        "○ Stopped"
+    );
+    assert_eq!(serving_badge(false, "127.0.0.1", 10801, None), "○ Stopped");
     for canary in ["hunter2", "SECRET-UUID", "token=abc"] {
-        assert!(!serving_badge(true, 10801, Some("87ms")).contains(canary));
+        assert!(!serving_badge(true, "127.0.0.1", 10801, Some("87ms")).contains(canary));
     }
 }
 
@@ -19105,7 +19114,7 @@ fn row_lines_badge_follows_serving_not_flag() {
     }
     let running = library_row_lines(&row(), Some("87ms"), true, None).join("\n");
     assert!(
-        running.contains(&serving_badge(true, 10801, Some("87ms"))),
+        running.contains(&serving_badge(true, "127.0.0.1", 10801, Some("87ms"))),
         "running badge in row:\n{running}"
     );
     assert!(
@@ -26714,7 +26723,7 @@ fn t08_secrets_audit_surfaces_carry_no_credentials(cx: &mut TestAppContext) {
     assert_no_canaries(&shown, "row cells");
     let base = crate::library_row_lines(&row, Some("87ms"), true, None).join("\n");
     assert_no_canaries(&base, "base row");
-    let badge = crate::serving_badge(true, row.port, Some("87ms"));
+    let badge = crate::serving_badge(true, &row.bind_ip, row.port, Some("87ms"));
     assert_no_canaries(&badge, "serving badge");
     assert_no_canaries(
         &crate::health::redact_secrets(
