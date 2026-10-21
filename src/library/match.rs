@@ -134,6 +134,38 @@ impl PortPredicate {
     }
 }
 
+/// Parse a single `port=` token: `port=N`, `port=N:M`, `port=N:` or `port=:M`.
+/// Returns `None` for anything else — including the malformed forms (`port=`,
+/// `port=x`, `port=5:1`, `port=:`, out-of-`u16` values) which stay literal
+/// substring text instead of raising an error state.
+pub(crate) fn parse_port_predicate(token: &str) -> Option<PortPredicate> {
+    let (key, value) = token.split_once('=')?;
+    if !key.eq_ignore_ascii_case("port") {
+        return None;
+    }
+    let (lo, hi) = match value.split_once(':') {
+        // port=N — exact port.
+        None => {
+            let exact = value.parse::<u16>().ok()?;
+            (exact, exact)
+        }
+        // port=N: — open-ended range up to the last u16.
+        Some((lo_raw, "")) => (lo_raw.parse::<u16>().ok()?, u16::MAX),
+        // port=:M — open-ended range from zero.
+        Some(("", hi_raw)) => (0, hi_raw.parse::<u16>().ok()?),
+        // port=N:M — inclusive range, reversed bounds are malformed.
+        Some((lo_raw, hi_raw)) => {
+            let lo = lo_raw.parse::<u16>().ok()?;
+            let hi = hi_raw.parse::<u16>().ok()?;
+            if lo > hi {
+                return None;
+            }
+            (lo, hi)
+        }
+    };
+    Some(PortPredicate { lo, hi })
+}
+
 /// Split a query into its single `port=` predicate (if any) and the remaining
 /// substring text. The text part is token-rejoined, so `port=10801 group: api`
 /// keeps matching the blob for `group: api`. A second `port=` token is left in

@@ -1,5 +1,11 @@
 use crate::*;
 
+impl AppView {
+    pub(crate) fn render_empty_ctas(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().id("empty-ctas").test_support()
+    }
+}
+
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let app_entity = cx.entity();

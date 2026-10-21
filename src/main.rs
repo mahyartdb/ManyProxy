@@ -295,38 +295,6 @@ struct RowEndpointInputs {
     clean_port: String,
 }
 
-/// Parse a single `port=` token: `port=N`, `port=N:M`, `port=N:` or `port=:M`.
-/// Returns `None` for anything else — including the malformed forms (`port=`,
-/// `port=x`, `port=5:1`, `port=:`, out-of-`u16` values) which stay literal
-/// substring text instead of raising an error state.
-fn parse_port_predicate(token: &str) -> Option<PortPredicate> {
-    let (key, value) = token.split_once('=')?;
-    if !key.eq_ignore_ascii_case("port") {
-        return None;
-    }
-    let (lo, hi) = match value.split_once(':') {
-        // port=N — exact port.
-        None => {
-            let exact = value.parse::<u16>().ok()?;
-            (exact, exact)
-        }
-        // port=N: — open-ended range up to the last u16.
-        Some((lo_raw, "")) => (lo_raw.parse::<u16>().ok()?, u16::MAX),
-        // port=:M — open-ended range from zero.
-        Some(("", hi_raw)) => (0, hi_raw.parse::<u16>().ok()?),
-        // port=N:M — inclusive range, reversed bounds are malformed.
-        Some((lo_raw, hi_raw)) => {
-            let lo = lo_raw.parse::<u16>().ok()?;
-            let hi = hi_raw.parse::<u16>().ok()?;
-            if lo > hi {
-                return None;
-            }
-            (lo, hi)
-        }
-    };
-    Some(PortPredicate { lo, hi })
-}
-
 /// T-27: what a header-menu row does — pick a key, or reverse the direction.
 #[derive(Debug, Clone, Copy)]
 enum SortMenuAction {
@@ -20837,55 +20805,6 @@ impl AppView {
     fn detail_failed(&self, config: &ProxyConfig) -> bool {
         self.engine.ids_on_crashed_shards().contains(&config.id)
             || self.health_store.row_summary(&config.id).trim() == "dead"
-    }
-
-    /// T-23: keep the last-filter memory in step with the query. `set_value`
-    /// never emits `InputEvent::Change`, so the clear paths call this directly.
-    /// A blank query clears the key rather than storing one, and a write hiccup
-    /// only costs the memory — the live filter is unaffected.
-    fn remember_library_query(&mut self, query: &str) {
-        let _ = if query.trim().is_empty() {
-            self.store.clear_library_last_query()
-        } else {
-            self.store.set_library_last_query(query)
-        };
-    }
-
-    fn render_empty_ctas(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().id("empty-ctas").test_support()
-    }
-
-    fn sort_menu_item(
-        column: &'static str,
-        id_suffix: &'static str,
-        label: String,
-        tip: String,
-        action: SortMenuAction,
-        view: &Entity<AppView>,
-    ) -> PopupMenuItem {
-        let id = format!("sort-header-{column}-{id_suffix}");
-        let view = view.clone();
-        PopupMenuItem::element(move |_, _| {
-            let text = label.clone();
-            let tip = tip.clone();
-            div()
-                .id(id.clone())
-                .test_support()
-                .role(Role::MenuItem)
-                .aria_label(text.clone())
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                .child(text)
-        })
-        .on_click(move |_, window, cx| {
-            view.update(cx, |view, cx| match action {
-                SortMenuAction::Key(key) => view.set_library_sort(key, window, cx),
-                SortMenuAction::Direction => view.toggle_library_sort_direction(window, cx),
-            });
-        })
     }
 
     fn select_visible_checked(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

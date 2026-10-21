@@ -1,6 +1,51 @@
 use crate::*;
 
 impl AppView {
+    /// T-23: keep the last-filter memory in step with the query. `set_value`
+    /// never emits `InputEvent::Change`, so the clear paths call this directly.
+    /// A blank query clears the key rather than storing one, and a write hiccup
+    /// only costs the memory — the live filter is unaffected.
+    pub(crate) fn remember_library_query(&mut self, query: &str) {
+        let _ = if query.trim().is_empty() {
+            self.store.clear_library_last_query()
+        } else {
+            self.store.set_library_last_query(query)
+        };
+    }
+
+    pub(crate) fn sort_menu_item(
+        column: &'static str,
+        id_suffix: &'static str,
+        label: String,
+        tip: String,
+        action: SortMenuAction,
+        view: &Entity<AppView>,
+    ) -> PopupMenuItem {
+        let id = format!("sort-header-{column}-{id_suffix}");
+        let view = view.clone();
+        PopupMenuItem::element(move |_, _| {
+            let text = label.clone();
+            let tip = tip.clone();
+            div()
+                .id(id.clone())
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(text.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
+                .child(text)
+        })
+        .on_click(move |_, window, cx| {
+            view.update(cx, |view, cx| match action {
+                SortMenuAction::Key(key) => view.set_library_sort(key, window, cx),
+                SortMenuAction::Direction => view.toggle_library_sort_direction(window, cx),
+            });
+        })
+    }
+
     pub(crate) fn focus_library_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input.focus_handle(cx).focus(window, cx);
     }
