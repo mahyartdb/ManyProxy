@@ -6868,7 +6868,11 @@ impl Store {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
         }
-        harden_file_permissions(&tmp);
+        // T-34/arms: the rename must not depend on an external `icacls` call
+        // succeeding — hardening the transient temp file first could strip its
+        // inherited ACLs and leave it un-renameable (ACCESS_DENIED), which
+        // lost the whole export on the windows-arm64 runner. The shipped file
+        // is hardened right after it lands in place.
         if let Err(error) = std::fs::rename(&tmp, path).map_err(io_error) {
             let _ = std::fs::remove_file(&tmp);
             return Err(error);
