@@ -4,8 +4,11 @@ This file lists the third-party code that ships inside the
 `manyproxy-v<tag>-windows-amd64.zip` release: the Rust application and its
 Cargo.lock-pinned crate dependencies, plus the three bundled sidecar engines
 (`sing-box.exe`, `sing-box-awg.exe`, `xray.exe`). It names each component
-plainly and links the license text at its canonical upstream URL. Nothing in
-this file is marketing; it is an attribution and license list, nothing more.
+plainly, links each component's canonical upstream URL, and — for the three
+bundled engines — ships the full license text beside this file under
+`licenses/`. Crates inside `manyproxy.exe` are attributed by name and license
+string with links only; no crate license text is reproduced. Nothing in this
+file is marketing; it is an attribution and license list, nothing more.
 
 Subsection 2 was generated in-repo (committed, not built at bundle time) from
 `Cargo.lock` via `cargo metadata --locked --format-version 1`.
@@ -13,7 +16,10 @@ Subsection 2 was generated in-repo (committed, not built at bundle time) from
 ## 1. The application itself
 
 - `manyproxy` (built from this repository) — no separate license is claimed;
-  the crate manifest declares none because the app is not published.
+  the crate manifest declares none because the app is not published, and this
+  repository carries no `LICENSE` file of its own. The license texts under
+  `licenses/` cover only the three bundled engine binaries listed in section 3;
+  they make no statement about the manyproxy application itself.
 - Rust toolchain (rustc/std, built the binaries) — MIT OR Apache-2.0
   (`https://github.com/rust-lang/rust/blob/master/LICENSE-MIT`,
   `https://github.com/rust-lang/rust/blob/master/LICENSE-APACHE`).
@@ -1035,11 +1041,41 @@ The binary never fetches them (`PACKAGING-NOTES.md`, `assert_no_system_mutation`
 family); the release workflow - running as the maintainer's CI - copies the
 pins from the official upstream URLs below:
 
-| Engine (file in the ZIP) | Upstream project | Version pinned | License | Source/license URL |
-| ------------------------ | ---------------- | -------------- | ------- | ------------------ |
-| `sing-box.exe` | SagerNet/sing-box | `1.14.2` (same pin as `.github/workflows/live.yml`) | GNU GPL v3 or later | `https://github.com/SagerNet/sing-box` · LICENSE: `https://github.com/SagerNet/sing-box/blob/v1.14.2/LICENSE` |
-| `sing-box-awg.exe` | Leadaxe/sing-box-lx (sing-box fork adding AmneziaWG 2.0/3.x + XHTTP; named in `.planning/research/02-amnezia-xray.md`) | `1.14.3-lx.21` | GNU GPL v3 or later (fork keeps sing-box's LICENSE) | `https://github.com/Leadaxe/sing-box-lx` · LICENSE: `https://github.com/Leadaxe/sing-box-lx/blob/v1.14.3-lx.21/LICENSE` |
-| `xray.exe` | XTLS/Xray-core | `26.3.27` | Mozilla Public License 2.0 | `https://github.com/XTLS/Xray-core` · LICENSE: `https://github.com/XTLS/Xray-core/blob/v26.3.27/LICENSE` |
+| Engine (file in the ZIP) | Upstream project | Version pinned | License | License text in this bundle |
+| ------------------------ | ---------------- | -------------- | ------- | -------------------------- |
+| `sing-box.exe` | SagerNet/sing-box | `1.14.2` (same pin as `.github/workflows/live.yml`) | GNU GPL v3 or later (GPL-3.0-or-later) | `licenses/GPL-3.0.txt` |
+| `sing-box-awg.exe` | Leadaxe/sing-box-lx (sing-box fork adding AmneziaWG 2.0/3.x + XHTTP; named in `.planning/research/02-amnezia-xray.md`) | `1.14.3-lx.21` | GNU GPL v3 or later (the fork keeps sing-box's LICENSE) | `licenses/GPL-3.0.txt` |
+| `xray.exe` | XTLS/Xray-core | `26.3.27` | Mozilla Public License 2.0 (MPL-2.0) | `licenses/MPL-2.0.txt` |
+
+Per-engine detail — exact upstream source, release asset, and license URL:
+
+- `sing-box.exe`
+  - License name: GNU General Public License v3.0 or later (GPL-3.0-or-later).
+  - Exact upstream source: `https://github.com/SagerNet/sing-box/tree/v1.14.2`.
+  - Bundled binary asset: `https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-windows-amd64.zip`.
+  - Upstream license file: `https://github.com/SagerNet/sing-box/blob/v1.14.2/LICENSE`.
+  - License text in this bundle: `licenses/GPL-3.0.txt` (verbatim copy of
+    `https://www.gnu.org/licenses/gpl-3.0.txt`, 35,149 bytes).
+- `sing-box-awg.exe`
+  - License name: GNU General Public License v3.0 or later (GPL-3.0-or-later).
+  - Exact upstream source: `https://github.com/Leadaxe/sing-box-lx/tree/v1.14.3-lx.21`.
+  - Bundled binary asset: `https://github.com/Leadaxe/sing-box-lx/releases/download/v1.14.3-lx.21/sing-box-1.14.3-lx.21-windows-amd64.zip`.
+  - Upstream license file: `https://github.com/Leadaxe/sing-box-lx/blob/v1.14.3-lx.21/LICENSE`.
+  - License text in this bundle: `licenses/GPL-3.0.txt` (verbatim copy of
+    `https://www.gnu.org/licenses/gpl-3.0.txt`, 35,149 bytes).
+- `xray.exe`
+  - License name: Mozilla Public License 2.0 (MPL-2.0).
+  - Exact upstream source: `https://github.com/XTLS/Xray-core/tree/v26.3.27`.
+  - Bundled binary asset: `https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-windows-64.zip`.
+  - Upstream license file: `https://github.com/XTLS/Xray-core/blob/v26.3.27/LICENSE`.
+  - License text in this bundle: `licenses/MPL-2.0.txt` (verbatim copy of
+    `https://www.mozilla.org/media/MPL/2.0/index.txt`, 16,726 bytes).
+
+The license texts in `licenses/` were fetched from the canonical publishers
+above on 2026-10-21; both carry their title line and were checked as plain text
+(no HTML). Neither file is edited or condensed. The bundle contains these
+upstream binaries, not their source code — the exact tagged source trees are
+the URLs listed per engine above.
 
 The pinned versions above are recorded in `.github/workflows/release.yml` and
 verified there against each upstream's own published checksums (fork:
@@ -1071,3 +1107,10 @@ same check `.github/workflows/live.yml` performs).
 - No crate license *text* is reproduced here; each block links the canonical
   URL where the applicable text lives. This list is attribution, not legal
   advice.
+- The texts under `licenses/` are the three bundled engines' licenses only.
+  Nothing in this file grants or implies a license for the manyproxy
+  application itself: this repository has no `LICENSE` file, the crate manifest
+  declares no `license` field, and that choice belongs to the project owner.
+- The bundled engines are GPL-3.0 / MPL-2.0 binaries; their corresponding
+  source is the exact tagged upstream repository listed per engine in section 3.
+  No source code is bundled in the ZIP.

@@ -1,91 +1,213 @@
-# ManyProxy (v1)
+# ManyProxy
 
-Local-only proxy library: store configs, import share links, refresh subscriptions, and serve each config on its own `127.0.0.1:<port>` endpoint (SOCKS5 + HTTP). No system proxy, TUN, DNS, or routing changes — ever.
+ManyProxy is a Windows desktop app for a personal library of proxy/VPN
+configurations. It stores the configs, imports share links, files and
+subscriptions, and serves each config on its own loopback endpoint —
+`socks5://127.0.0.1:<port>` and `http://127.0.0.1:<port>` — so individual apps
+can be pointed at the proxy they need. Health testing (URL test, TCP ping) shows
+which endpoints actually work.
 
-## Design posture
+It is local-only by design: **no system proxy, no TUN interface, no DNS rewrite,
+no elevation.** Nothing outside the app folder and its own data folder is
+changed.
 
-- **Portable folder (ZIP):** ManyProxy ships and runs as a single self-contained folder. No AppData, no Program Files, no installers; engines and data live beside the exe and the folder can be moved anywhere.
-- **App-dir only:** sidecar binary lookup never consults `PATH` and never downloads binaries.
-- **Opt-in only:** autostart (HKCU Run) and session restore are opt-in; no auto-update that replaces binaries.
-- **Secrets sealed:** DPAPI-sealed secrets at rest; redacted logs/URLs/labels; clipboard carries `bind:port` only.
-- **Supported matrix:** supported now — windows-amd64 (`windows-arm64` lands gated via T-04); tracked-aspiration (not supported) — linux/macOS via the port epic (`EPIC-linux-macos-port.md`).
+## Supported platform
 
-Route-profile importers: `throne://route` links are accepted into the presets manager; unknown actions fail loudly at intake.
+- **Windows 10/11, x64 (windows-amd64)** — the only supported target today.
+- `windows-arm64` is drafted behind a gated release row (ticket T-04); it is not
+  supported yet.
+- Linux and macOS are tracked as an aspiration only (`EPIC-linux-macos-port.md`),
+  not supported.
 
-## Install / run
+There is no web, mobile, or CLI edition — only the native desktop app.
 
-Windows 10/11 64-bit (v1 platform). Download the ZIP from [GitHub Releases](https://github.com/QMahyar/ManyProxy/releases) — each release ships `manyproxy-v<tag>-windows-amd64.zip` plus `SHA256SUMS.txt`; unzip anywhere and run `manyproxy.exe` (sidecar binaries and `data\` live beside it).
+## Install (portable ZIP)
 
-1. Put the app exe plus sidecar binaries **in the same folder** (portable or installed, either works as long as they sit together): `sing-box`, `sing-box-awg` (AmneziaWG/Noise/XHTTP rows only), `xray` (Xray-only VLESS bridge only), plus at most one user-supplied extra-core executable (app dir only). Resolution is app-dir ONLY, never `PATH` (ticket 23, `resolve_*_binary_in`, `src/engine.rs`). Verified by `missing_binaries_state_never_downloads`.
-2. Run: `cargo run` (dev) or launch the built exe. No admin needed for default (loopback) use; no registry keys, services, or drivers (`PACKAGING-NOTES.md`).
-3. Data lives in a local user-owned SQLite file; secrets at rest are sealed with Windows DPAPI (user scope, `dpapi1:` marker, `src/dpapi.rs`) — the app is Windows-only, and off-Windows builds fail DPAPI ops loudly instead of storing plaintext; logs/health are session-only (`src/store.rs`, `src/health.rs`; tickets 06/12/13).
+1. Download `manyproxy-v<tag>-windows-amd64.zip` from
+   [GitHub Releases](https://github.com/QMahyar/ManyProxy/releases) and unzip it
+   anywhere you like (a normal folder, another drive, a USB stick). Each release
+   also publishes `SHA256SUMS.txt`.
+2. Keep the unzipped files together in one folder: `manyproxy.exe`,
+   `sing-box.exe`, `sing-box-awg.exe`, `xray.exe`, plus `README.md`,
+   `THIRD-PARTY-NOTICES.md` and `licenses/`.
+3. Run `manyproxy.exe`. No installer, no administrator rights, no AppData or
+   Program Files writes — the defaults bind to loopback only.
 
-## Add your first config manually
+The beta has no code-signing story; the published SHA-256 hashes are the
+honesty floor, so compare them if you want to verify a download.
 
-Toolbar **Add** (`add-config`, label `Add (Ctrl-N)`) → dialog **Add proxy configuration** with fields Name, Protocol (default `vless`, `DEFAULT_PROTOCOL`), Params (optional JSON), Group (default `default`, `DEFAULT_GROUP`), Bind address (default `127.0.0.1`, `DEFAULT_BIND`), Port (**blank = auto**, placeholder `Port (blank = auto)`; auto range primary `10801–10999` then spillover `18081–18380`, `AUTO_PORT_START/END` + `AUTO_PORT_SPILL_START/END` in `src/store.rs`). Confirm with OK (mouse) or the Confirm key — both run the same `DialogCommit` closure (ticket 18, `dialog_footer`, `src/main.rs:1034`). Success toast: `Added "<name>"` (`config_added_message`); invalid input keeps the dialog open with an error notification. Edit/Delete work the same way via **Edit** (`edit-config`) / **Delete** (`delete-config`, confirm names the config via `delete_confirm_text`); toasts: `Updated …` / `Removed …`. Select a row and toggle with the Enabled switch.
+**Engines must sit next to the exe.** `sing-box.exe` (standard rows),
+`sing-box-awg.exe` (AmneziaWG/Noise/XHTTP rows) and `xray.exe` (Xray-only VLESS
+rows) are resolved from the app directory only — `PATH` is never consulted and
+the app never downloads binaries. At most one extra, user-supplied core
+executable can live in the same folder; reference its plain file name in the row
+that uses it.
 
-## Import links / files / clipboard
+### Updating
 
-Toolbar **Import** (`import-config`, label `Import (Ctrl-O)`) opens **Import proxy configurations**: paste box (placeholder `One share link per line, JSON, or a WireGuard conf`) + Group field + live inline preview `X valid · Y invalid` (`import_preview_counts`, `import_preview_message`, `src/main.rs:1549/1558`; never a toast). One line per item; blank lines skipped.
+There is no auto-update. Replace the folder by hand with the new release (keep
+or move `data\` if you want to keep the old library).
 
-- **Accepted formats** (`src/import.rs`): `vless://`, `vmess://` (URI + legacy base64-JSON), `trojan://`, `ss://` / `shadowsocks://` (all three grammars), `hysteria2://` / `hy2://` (omitted port → 443) / `hysteria2+realm://`, `hysteria://` (v1, port required), `tuic://`, `wireguard://` URI, `awg://` / `amneziawg://` / `amnezia-wg://`, `socks://` / `socks5://`, `http://` / `https://`, `anytls://`, `naive://` (omitted port → 443), `throne://add/<base64-outbound-json>`, sing-box outbounds JSON arrays / full configs / single outbound objects, Xray `protocol`-shaped objects, SIP008 `servers[]` (typeless method+password infers Shadowsocks), limited Clash YAML `proxies[]` (ticket 15, `import_text`), WireGuard `.conf` (one config per `[Peer]`, names `<stem>-p<N>`).
-- **Files:** drag-drop files onto the app window (`on_drop`, `src/main.rs:10872`); one dropped `.conf` keeps its stem via `file_hint`; multi-file drops keep per-file stems/keys (`ImportForm::new_multi`, ticket 16). Pasted text that looks like a conf parses the same way (ticket 15).
-- **Clipboard:** toolbar **From clipboard** (`import-clipboard`) prefills the same dialog from clipboard text (`open_import_from_clipboard`, `src/main.rs:6783`); empty clipboard warns `Clipboard has no text to import`.
-- Commit rules: valid items land as **disabled** records in the chosen group; per-item failures list `item N (label): reason` (`format_import_failures`) — partial success closes with failures listed, total failure stays open (ticket 14); identical re-imports add nothing (identity: protocol + params, `commit_batch`); import never starts anything.
+## Where data lives
 
-`throne://addsub/…` single lines divert to subscription intake instead (record + immediate first refresh); malformed ones report the original reason (`addsub_error_message`, `is_addsub_attempt` / `parse_addsub_link`). Edited dialog group wins over payload group (`effective_addsub_group`, ticket 16). `throne://route/…` links import into routing presets (manager + per-row attach, `src/preset.rs`, `src/store.rs` preset CRUD, engine `generate_with_presets`); `throne://remoteroute/…` URLs fetch explicitly and never auto-refresh (ticket 37).
+Everything the app writes lives in `data\` **beside `manyproxy.exe`**:
 
-## Subscriptions + auto-refresh
+| Path | Contents |
+| --- | --- |
+| `data\library.db` | SQLite library: configurations, subscriptions, presets, health snapshots, usage totals |
+| `data\manyproxy-export.json` | Default export path; written only after you confirm the plaintext-secret warning |
+| `data\manyproxy-logs.txt` | Visible session logs |
+| `data\library.db.bak-*`, `data\library.db.corrupt-*` | Automatic backups and quarantine copies |
 
-Toolbar **Subscriptions** (`subscriptions`) → manager dialog: Label, Subscription URL, Group, **Auto-refresh** checkbox (default on, `SubForm`, `src/main.rs:2669`). Each row shows label, redacted URL (query/fragment/userinfo stripped, `redact_subscription_url`), group, member count, auto flag, last error, plus per-item failures (`sub-failures-<id>`, `subscription_failures_text`), with **Refresh** / **Auto on|off** / **Remove** buttons (`subscription_row`, `src/main.rs:2770`).
+Secrets at rest are sealed with Windows DPAPI (user scope, `dpapi1:` prefix);
+logs, URLs and labels are redacted, and copied URLs carry bind + port only, never
+credentials.
 
-- Refresh fetches over the platform HTTP client (`fetch_subscription_body`: 8 MiB cap, 20 s timeout, UTF-8 required; errors generic, never echo the URL), parses with the same grammar pack, merges owned members only: renames preserved, no duplicates, upstream removals only unown (hand rows untouched), failures keep last-good with `last_error` (ticket 04, `refresh_with_body` tests).
-- Auto-refresh: startup pass over subs due per their own interval (`due_for_refresh_for`, per-subscription `interval_secs`, default `DEFAULT_AUTO_REFRESH_SECS = 86400`, `src/store.rs`) plus a 5-minute background due-sub tick coalesced into at most one toast (`coalesced_refresh_message`, `DUE_SUBSCRIPTION_TICK_SECS = 300`, `src/main.rs:110/9374`); manual Refresh notifies immediately.
+**Uninstall = delete the folder.** There is no installer, no uninstaller, and no
+registry state beyond the opt-in HKCU Run autostart entry. Data outside the app
+folder is never read or migrated. The `MANYPROXY_DB`, `MANYPROXY_EXPORT` and
+`MANYPROXY_LOGS` environment variables override the paths above for testing.
 
-## Start / stop / start-all
+## First run
 
-Detail bar per selected row: **Start** (`engine-start`, label `Start`, `Starting.` while in flight) / **Stop** (`engine-stop`, label `Stop (Shift-F5)`); toolbar **Start all** (`engine-start-all`, label `Start all`) / **Stop all** (`engine-stop-all`, label `Stop all`) — key hints ride the selected-row buttons only (`start-selected: Start selected (F5)`, `stop-selected: Stop selected (Shift-F5)`). Start regenerates one combined config, runs engine `check`, then restarts the sidecar; start sets enabled, stop clears it (ticket 05, `commit_start_selected` / `commit_start_all` / `stop_all_engines`, `src/main.rs:4600/4770/4920`). Honest toasts: empty library → `Nothing to start — the library is empty`; nothing running → `Nothing to stop — no endpoints are running`; stop-on-stopped → `"<name>" is already stopped` (`start_all_message` / `stop_all_message` / `already_stopped_message`). Background ticks: 5 s engine poll (crash flagged next tick), 60 s re-probe of running rows (`ENGINE_POLL_TICK_SECS`, `REPROBE_TICK_SECS`, ticket 12).
+1. **Add** (`Ctrl-N`) a configuration, or **Import** (`Ctrl-O`) share links, a
+   file dropped on the window, clipboard text, or a WireGuard `.conf`.
+2. Leave **Port** blank to auto-assign from the primary range `10801–10999`
+   (spillover `18081–18380`), or type a port.
+3. Select the row and press **Start** (`F5`), or **Start all** for every enabled
+   row. Starting regenerates one combined engine config, runs the engine's own
+   `check`, then (re)starts the sidecar. Stop with **Stop** (`Shift-F5`) or
+   **Stop all**; stopping clears the enabled flag.
+4. **Copy URLs** (`Ctrl-U`) copies both forms for the row:
+   `socks5://127.0.0.1:<port>` and `http://127.0.0.1:<port>`. Point one app at
+   one endpoint — apps with separate SOCKS5/HTTP fields take the matching line.
+5. **Test** (`Ctrl-T`) runs a URL test against
+   `http://www.gstatic.com/generate_204`; **Ping** does a TCP ping. Results stay
+   on the row (`87ms` / `dead`) and in `health: N live · M dead` on the status
+   bar.
 
-Closing the window while endpoints run opens a confirm naming every running row (`close_confirm_description`, ticket 33: `Close ManyProxy?` dialog) — OK stops all and closes, Cancel keeps them running. Never a silent kill. A tray icon (`src/tray.rs`: tooltip, Start all / Stop all / Show / Quit, autostart via HKCU Run, LAN-gated session restore) is present; close-confirm stays the safe path and tray hiding never strands running endpoints.
+Closing the window while endpoints run opens a confirm naming every running
+row: OK stops all and closes, Cancel keeps them running. The tray icon offers
+Start all / Stop all / Show / Quit.
 
-## Pointing apps at endpoints
+## Keyboard shortcuts
 
-Each running config serves its own endpoint. Select a row → **Copy URLs** (`copy-urls`) copies both forms (`proxy_urls`, `src/store.rs:468`):
+| Action | Keys |
+| --- | --- |
+| Add configuration | `Ctrl-N` |
+| Import configurations | `Ctrl-O` |
+| Paste clipboard into Import | `Ctrl-V` |
+| Start selected | `F5` |
+| Stop selected | `Shift-F5` |
+| Test selected | `Ctrl-T` |
+| Stop testing | `Ctrl-.` |
+| Edit selected | `Ctrl-E` |
+| Delete selected | `Delete` |
+| Focus search | `Ctrl-F` |
+| Inspector: details | `Ctrl-1` |
+| Inspector: health | `Ctrl-2` |
+| Inspector: presets | `Ctrl-3` |
+| Uncheck all | `Esc` |
+| Copy URLs | `Ctrl-U` |
+| Command palette | `Ctrl-K` |
 
-```text
-socks5://127.0.0.1:10801
-http://127.0.0.1:10801
-```
+The same list appears in the About dialog and Settings → Hotkey, and these
+key-bound actions also have toolbar or menu entries and `Ctrl-K` palette twins.
 
-(bind + port only — never credentials, asserted by `copy_urls_carry_binds_not_secrets`). Point the app at the matching form: browsers/clients with separate SOCKS5 vs HTTP fields take the respective line; apps with one "proxy" field usually take the `http://…` line. Keep Bind at the default `127.0.0.1` unless you mean to expose the endpoint.
+## What ManyProxy does not do
 
-## Health testing
-
-Detail bar **Test** (`health-test`, label `Test (Ctrl-T)`: URL test of the selected running endpoint) / **Ping** (`health-ping`: TCP ping); toolbar **Test all** (`health-test-all`, label `Test all`) tests every running endpoint. Target is the user-visible default `http://www.gstatic.com/generate_204` (`DEFAULT_TEST_URL`, `src/health.rs:40`); http-only, https targets get a named error. Rows show `87ms` / `dead` summaries (`LibraryDelegate.health`, ticket 06); status bar shows `health: N live · M dead` (`health_status_text`); latest samples persist across restart (`record_and_persist`, ticket 12). Rows also show persisted per-endpoint data-plane usage (`↓rx ↑tx`, clash-controller metering in `src/engine.rs` + `src/health.rs`, totals in `src/store.rs`); probe-only bytes stay labeled `probe:` so the two never mix. Stopped rows warn `"<name>" is not running`; empty test warns `No running endpoints to test`. **Logs** (`logs-open`) opens per-selected-config (or global) sidecar lines with a filter field (`open_logs_dialog`); secrets redacted at ingest (`LogStore::push_raw`).
-
-Shortcuts (visible on the buttons and in About, bound by `bind_app_keys`): Add `Ctrl-N`, Import `Ctrl-O`, Start selected `F5`, Stop selected `Shift-F5`, Test selected `Ctrl-T`. Toolbar **About** (`about-dialog`) shows version + git hash + sidecar presence + data paths + this list (`about_body`, ticket 33).
-
-Search: the library list is searchable (`searchable(true)`); one query matches name, protocol, group, bind, port, and upstream `server`/`address` in params — never credential fields (`library_row_matches`, `src/main.rs:2110`).
-
-## Export
-
-Toolbar **Export** (`export-library`) → **Export library** confirm showing the plaintext-secret warning verbatim (`export_warning_text`, `src/store.rs:500`: _"Export carries private keys, tokens, and passwords in plaintext. Anyone with this file can use your proxies — store it somewhere safe."_) plus a preview `N config(s) → <path>` and an overwrite note when the file exists (`export_preview_description`, ticket 17). Confirm writes JSON (configs + subscriptions) to `Store::default_export_path()` — `MANYPROXY_EXPORT` override, else `manyproxy-export.json` next to the library file; cancel writes nothing (`commit_export`, `src/store.rs:3968`). Success toast is honest about re-importability: `Exported N config(s) [(M importable)] to <path>` (`export_count_message`, tickets 11/16). The payload round-trips through the import grammar (re-import = 0 added / N duplicates; hand-made metadata-only rows stay backup-only, never poison import).
+No system proxy switching, no TUN / virtual interface, no OS DNS rewrite, no
+routing-rule editor, no admin/elevation path, no auto-update that replaces
+binaries, no telemetry, and no silent binary downloads. The only network traffic
+the app originates is a user-initiated subscription fetch and probes through your
+own endpoints to the visible test URL. These are durable constraints, covered by
+the `assert_no_system_mutation` test family.
 
 ## Troubleshooting
 
-- **Missing engine binaries:** start fails with a typed error naming the rows + expected file + every directory searched, ending in `ManyProxy never downloads executables silently` (`EngineError::MissingBinary`, `src/engine.rs:498`). Fix: place `sing-box` / `sing-box-awg` / `xray` / your extra-core executable next to the app exe (app dir only — `PATH` is never consulted). A quarantine hit on a sidecar surfaces the same way — never a silent fallback (`PACKAGING-NOTES.md`).
-- **Port conflicts:** the second start fails naming both configs; the first keeps serving (ticket 05, engine conflict check + `QUICKSTART-RUN.md` scenario B). Fix: Edit one row's Port (blank = fresh auto port: primary 10801–10999, then spillover 18081–18380).
-- **LAN confirm:** any non-loopback bind (`0.0.0.0`, `::`, any non-loopback literal, `requires_lan_confirm`) stops at an explicit confirm dialog naming the config + bind before anything starts (single: `open_lan_confirm_single`; start-all: one dialog naming every LAN-bound row, `lan_confirm_description`). Dismissing changes nothing. Add/Edit dialogs show an inline hint `Starting on <bind> needs a LAN confirm — anyone on the network could use it` (`lan_hint_for_bind`); post-start a warning toast fires (`warn_for_lan_binds`). Firewall prompts for LAN binds are the OS's own and expected.
-- **Empty-list refresh:**Reload failures notify (`Cannot load library: …`, `reload`, `src/main.rs:3634`) — a broken database never renders as a silent empty list (ticket 14); background ticks stay silent by necessity (`reload_quiet`). If the list shows `No proxy configurations yet`, the store really is empty (or unreadable — in which case a toast says so).
-- **Subscription refresh failed:** row keeps last-good members and records `last error`; per-item failures render inline (`sub-failures-<id>`). Common causes: unreachable URL, non-2xx status, >8 MiB body, non-UTF8 body (`fetch_subscription_body`).
-- **No running endpoints to test / "<name>" is not running:** start the row first; health only covers running endpoints (`active_health_rows`).
-- **AV / SmartScreen:** unsigned fresh binaries + sidecar spawning + loopback listeners routinely trip heuristics; mitigations are signing, published SHA-256 hashes, no packers (`PACKAGING-NOTES.md`). Never disable AV — verify the quarantined filename against the missing-binary error instead.
+- **Engine binary not found.** Start fails with an error naming the affected
+  rows, the expected file name, and every directory searched, ending with
+  `ManyProxy never downloads executables silently`. Put the named exe
+  (`sing-box.exe`, `sing-box-awg.exe`, `xray.exe`, or your extra-core exe) next
+  to `manyproxy.exe` and start again. A file quarantined by antivirus surfaces
+  the same way — never a silent fallback.
+- **Port already in use.** The second start fails naming both configs; the first
+  one keeps serving. Edit the row's Port (blank = a fresh auto port) or stop the
+  other endpoint, then start again.
+- **Non-loopback bind.** Any non-loopback bind (`0.0.0.0`, `::`, a LAN address)
+  stops at an explicit confirm naming the config and bind before anything
+  starts; dismissing changes nothing. A firewall prompt for such a bind is
+  Windows' own and expected.
+- **The library looks empty.** A read failure shows `Cannot load library: …`
+  instead of an empty list; if the list says `No proxy configurations yet`, the
+  store really has no rows.
+- **Subscription refresh failed.** The row keeps its last-good members and shows
+  the error. Common causes: unreachable URL, non-2xx response, a body over
+  8 MiB, or a non-UTF-8 body.
+- **SmartScreen / antivirus warning.** Unsigned fresh binaries that spawn
+  sidecars and listen on loopback routinely trip heuristics. Verify the file
+  against `SHA256SUMS.txt`; never disable antivirus.
 
-## What is explicitly NOT in v1
+## Import formats
 
-No system proxy switching, no TUN / virtual interface, no OS DNS rewrite, no routing-rule editor, no admin/elevation path, no auto-update that replaces binaries, no telemetry (only user-initiated subscription fetches + probes through your own endpoints to the visible test URL), no silent binary downloads (asserted by `assert_no_system_mutation` scan over every generated config, `binary_resolution_never_elevates_or_downloads`, `missing_binaries_state_never_downloads`; `QUICKSTART-RUN.md` prohibitions). Live distinct-egress / OS-snapshot-diff verification stays manual per `QUICKSTART-RUN.md` scenarios A–D.
+Accepted: `vless://`, `vmess://` (URI and legacy base64 JSON), `trojan://`,
+`ss://` / `shadowsocks://` (all three grammars), `hysteria2://` / `hy2://` /
+`hysteria2+realm://`, `hysteria://`, `tuic://`, `wireguard://`, `awg://` /
+`amneziawg://` / `amnezia-wg://`, `socks://` / `socks5://`, `http://` /
+`https://`, `anytls://`, `naive://`, `throne://add/...`, sing-box outbound JSON
+(single object, array, or full config), Xray `protocol`-shaped objects, SIP008
+`servers[]`, limited Clash `proxies[]` YAML, and WireGuard `.conf` (one config
+per `[Peer]`).
 
-## Claim → code map (audit)
+Malformed items are listed per item as `item N (label): reason`; valid items
+still land as disabled rows, and import never starts anything. Identical
+re-imports add nothing. `throne://addsub/...` lines create a subscription and
+refresh it once; `throne://route/...` links import into routing presets and
+`throne://remoteroute/...` URLs fetch explicitly without auto-refresh.
+
+## Subscriptions and auto-refresh
+
+Toolbar **Subscriptions** opens the manager: label, subscription URL, group and
+an auto-refresh checkbox (default on, 24 h interval). Each row shows the redacted
+URL, group, member count, auto flag, last error, and per-item failures, with
+Refresh / Auto on|off / Remove buttons. Refresh fetches with an 8 MiB cap, a 20 s
+timeout and UTF-8 required; errors never echo the URL. Merges keep your renames,
+add no duplicates, un-own upstream removals but leave hand rows untouched, and
+keep the last-good set on failure. A background 5-minute tick picks up due
+subscriptions (at most one coalesced toast).
+
+## Export
+
+Toolbar **Export** opens a confirm that shows the plaintext warning verbatim
+(_"Export carries private keys, tokens, and passwords in plaintext. Anyone with
+this file can use your proxies — store it somewhere safe."_) plus a preview
+`N config(s) → <path>`. Confirm writes JSON (configs + subscriptions) to the
+default export path; cancel writes nothing. The payload round-trips through the
+import grammar, so re-import adds 0 new rows and reports duplicates.
+
+## Health, usage, and logs
+
+Each row shows persisted health samples and data-plane usage (`↓rx ↑tx`, from
+the engine's own metering); probe-only bytes stay labeled `probe:` so the two
+never mix. **Logs** opens the sidecar log for the selected config (or the global
+session log) with a filter field; secrets are redacted at ingest. Health state
+survives restarts; the health and usage counters can be cleared from Settings →
+Maintenance.
+
+## Building from source
+
+```text
+cargo run                  # dev run (no admin needed for loopback defaults)
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked        # live proofs are opt-in and skipped by default
+```
+
+Live proofs need a local `sing-box.exe` plus `MANYPROXY_SINGBOX_BIN`,
+`MANYPROXY_LIVE_CHECK=1` and (for traffic) `MANYPROXY_LIVE_TRAFFIC=1`; CI runs
+them from `.github/workflows/live.yml` only.
+
+## Reference: claim → code map (audit)
 
 | README claim                         | Proved by                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
