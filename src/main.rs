@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod appearance;
 mod consts;
@@ -27703,7 +27704,35 @@ impl Render for AppView {
     }
 }
 
+fn install_crash_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut report = format!("panic: {info}\n");
+        report.push_str(&format!(
+            "backtrace:\n{}\n",
+            std::backtrace::Backtrace::force_capture()
+        ));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let path = crate::store::app_data_dir().join(format!("manyproxy-crash-{stamp}.txt"));
+        let _ = append_crash_report(&path, &report);
+        previous_hook(info);
+    }));
+}
+
+fn append_crash_report(path: &PathBuf, report: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(report.as_bytes())
+}
+
 fn main() {
+    install_crash_hook();
     let _ = crate::tray::clear_dead_autostart_target();
 
     let launch_intake = std::env::args()
