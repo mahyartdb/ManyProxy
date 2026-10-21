@@ -99,6 +99,30 @@ jobs:
           "TAG=$ref" >> $env:GITHUB_ENV
           "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
 
+      # Release gates (same three commands as ci.yml). They run BEFORE the
+      # release build and throw on a non-zero exit, so a tag pushed on an
+      # un-gated commit can never produce a bundle or a GitHub release.
+      - name: Gate 1/3 — cargo fmt --check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed (exit $LASTEXITCODE) — a tag on an un-gated commit must not ship" }
+
+      - name: Gate 2/3 — cargo clippy --all-targets --locked -- -D warnings
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo clippy --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "cargo clippy --all-targets --locked -- -D warnings failed (exit $LASTEXITCODE) — a tag on an un-gated commit must not ship" }
+
+      - name: Gate 3/3 — cargo test --locked
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo test --locked failed (exit $LASTEXITCODE) — a tag on an un-gated commit must not ship" }
+
       - name: Build (release, locked)
         shell: pwsh
         run: |
@@ -202,7 +226,7 @@ jobs:
           }
           Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\xray.exe" -Force
 
-      - name: Assemble bundle (exactly five files) and guard the layout
+      - name: Assemble bundle (exact layout) and guard the layout
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -213,18 +237,25 @@ jobs:
           }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Path "target\release\manyproxy.exe" -Destination "$stage\manyproxy.exe" -Force
+          Copy-Item -Path "README.md" -Destination "$stage\README.md" -Force
           Copy-Item -Path "THIRD-PARTY-NOTICES.md" -Destination "$stage\THIRD-PARTY-NOTICES.md" -Force
+          Copy-Item -Path "licenses" -Destination "$stage\licenses" -Recurse -Force
           foreach ($bin in "sing-box.exe", "sing-box-awg.exe", "xray.exe") {
             Copy-Item -Path "$env:RUNNER_TEMP\bins\$bin" -Destination "$stage\$bin" -Force
           }
           $expectedFiles = @(
-            "THIRD-PARTY-NOTICES.md", "manyproxy.exe", "sing-box.exe", "sing-box-awg.exe", "xray.exe"
+            "README.md", "THIRD-PARTY-NOTICES.md", "manyproxy.exe", "sing-box.exe", "sing-box-awg.exe", "xray.exe"
           ) | Sort-Object
           $actualFiles = (Get-ChildItem -Path $stage -File | Sort-Object -Property Name).Name
           if ((@($actualFiles) -join "`n") -ne (@($expectedFiles) -join "`n")) {
-            throw ("bundle layout guard: staging must contain EXACTLY the five bundle files; found: " + (@($actualFiles) -join ", "))
+            throw ("bundle layout guard: staging must contain EXACTLY the six listed files at the top level; found: " + (@($actualFiles) -join ", "))
           }
-          Write-Output ("Staged exactly the five bundle files: " + (@($actualFiles) -join ", "))
+          $expectedLicenses = @("GPL-3.0.txt", "MPL-2.0.txt") | Sort-Object
+          $actualLicenses = (Get-ChildItem -Path "$stage\licenses" -File | Sort-Object -Property Name).Name
+          if ((@($actualLicenses) -join "`n") -ne (@($expectedLicenses) -join "`n")) {
+            throw ("bundle layout guard: licenses\ must contain EXACTLY GPL-3.0.txt and MPL-2.0.txt; found: " + (@($actualLicenses) -join ", "))
+          }
+          Write-Output ("Staged the exact bundle layout: " + (@($actualFiles) -join ", ") + " | licenses: " + (@($actualLicenses) -join ", "))
           Compress-Archive -Path $stage -DestinationPath $zip
           # SHA256SUMS.txt: the zip + each staged binary (no signature this beta —
           # hashes are the honesty floor).
@@ -260,8 +291,9 @@ jobs:
           ManyProxy $env:TAG — first beta for the windows-amd64 portable bundle.
 
           - Unzip anywhere; `manyproxy.exe` + the three sidecar engines sit beside it; no installer, no admin needed (loopback defaults).
+          - Also in the ZIP: `README.md`, `THIRD-PARTY-NOTICES.md`, and the engine license texts under `licenses/` (`GPL-3.0.txt`, `MPL-2.0.txt`).
           - Sidecar pins shipped as-is: sing-box $env:SINGBOX_VERSION (SagerNet), sing-box-awg $env:AWG_FORK_VERSION (Leadaxe/sing-box-lx AmneziaWG fork), xray $env:XRAY_VERSION (XTLS/Xray-core).
-          - windows-amd64 gate: fmt → clippy → test enforced per commit in ci.yml (see the checks on the tagged commit); sidecar pins shipped as listed above; live proofs stay opt-in in live.yml and out of the release path (amd64-only — accepted asymmetry).
+          - windows-amd64 gate: fmt → clippy → test run in this workflow BEFORE the release build (and per commit in ci.yml), so a tag on an un-gated commit ships nothing; sidecar pins shipped as listed above; live proofs stay opt-in in live.yml and out of the release path (amd64-only — accepted asymmetry).
           - ``SHA256SUMS.txt`` covers the zip and the four binaries (the beta has no code-signing story; hashes are the honesty floor).
           - No auto-update: the app never downloads or replaces executables. Updating = replacing the folder by hand. Data lives in ``data\`` beside the exe; deleting the folder uninstalls cleanly.
           "@
@@ -468,7 +500,7 @@ jobs:
           }
           Copy-Item -Path $exe.FullName -Destination "$env:RUNNER_TEMP\bins\xray.exe" -Force
 
-      - name: Assemble the arm64 bundle (exact five files) and guard the layout; withhold loudly when sing-box-awg arm64 is absent upstream
+      - name: Assemble the arm64 bundle (exact layout) and guard it; withhold loudly when sing-box-awg arm64 is absent upstream
         shell: pwsh
         env:
           AWG_PRESENT: ${{ steps.probe-awg.outputs.awg }}
@@ -493,18 +525,25 @@ jobs:
           }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Path "$env:RUST_OUT_DIR\manyproxy.exe" -Destination "$stage\manyproxy.exe" -Force
+          Copy-Item -Path "README.md" -Destination "$stage\README.md" -Force
           Copy-Item -Path "THIRD-PARTY-NOTICES.md" -Destination "$stage\THIRD-PARTY-NOTICES.md" -Force
+          Copy-Item -Path "licenses" -Destination "$stage\licenses" -Recurse -Force
           foreach ($bin in "sing-box.exe", "sing-box-awg.exe", "xray.exe") {
             Copy-Item -Path "$env:RUNNER_TEMP\bins\$bin" -Destination "$stage\$bin" -Force
           }
           $expectedFiles = @(
-            "THIRD-PARTY-NOTICES.md", "manyproxy.exe", "sing-box.exe", "sing-box-awg.exe", "xray.exe"
+            "README.md", "THIRD-PARTY-NOTICES.md", "manyproxy.exe", "sing-box.exe", "sing-box-awg.exe", "xray.exe"
           ) | Sort-Object
           $actualFiles = (Get-ChildItem -Path $stage -File | Sort-Object -Property Name).Name
           if ((@($actualFiles) -join "`n") -ne (@($expectedFiles) -join "`n")) {
-            throw ("bundle layout guard: staging must contain EXACTLY the five bundle files; found: " + (@($actualFiles) -join ", "))
+            throw ("bundle layout guard: staging must contain EXACTLY the six listed files at the top level; found: " + (@($actualFiles) -join ", "))
           }
-          Write-Output ("Staged exactly the five bundle files: " + (@($actualFiles) -join ", "))
+          $expectedLicenses = @("GPL-3.0.txt", "MPL-2.0.txt") | Sort-Object
+          $actualLicenses = (Get-ChildItem -Path "$stage\licenses" -File | Sort-Object -Property Name).Name
+          if ((@($actualLicenses) -join "`n") -ne (@($expectedLicenses) -join "`n")) {
+            throw ("bundle layout guard: licenses\ must contain EXACTLY GPL-3.0.txt and MPL-2.0.txt; found: " + (@($actualLicenses) -join ", "))
+          }
+          Write-Output ("Staged the exact bundle layout: " + (@($actualFiles) -join ", ") + " | licenses: " + (@($actualLicenses) -join ", "))
           Compress-Archive -Path $stage -DestinationPath $zip
           # SHA256SUMS-windows-arm64.txt: the arm64 row's own per-arch sums file
           # (its own block: zip + each staged arm64 binary). NOT merged into the
