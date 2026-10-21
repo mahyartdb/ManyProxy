@@ -4555,18 +4555,6 @@ pub(crate) fn current_app_dir() -> Option<PathBuf> {
         .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-fn spawn_hidden(cmd: &mut std::process::Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = cmd;
-}
-
 fn resolve_bundled_in(app_dir: Option<&Path>, file: &str) -> Result<PathBuf, String> {
     match app_dir {
         Some(dir) => {
@@ -4640,7 +4628,7 @@ pub fn probe_fork_version_with_timeout(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    spawn_hidden(&mut cmd);
+    crate::spawn_hidden(&mut cmd);
     let mut child = cmd.spawn().map_err(|error| {
         format!(
             "fork version probe failed for {} ({error})",
@@ -4961,9 +4949,10 @@ fn system_tool(name: &str) -> PathBuf {
 
 pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
     let netstat_output = if cfg!(windows) {
-        std::process::Command::new(system_tool("netstat.exe"))
-            .args(["-ano", "-p", "TCP"])
-            .output()
+        let mut cmd = std::process::Command::new(system_tool("netstat.exe"));
+        cmd.args(["-ano", "-p", "TCP"]);
+        crate::spawn_hidden(&mut cmd);
+        cmd.output()
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
             .unwrap_or_default()
     } else {
@@ -4973,10 +4962,10 @@ pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
         if !cfg!(windows) {
             return None;
         }
-        let output = std::process::Command::new(system_tool("tasklist.exe"))
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "TABLE", "/NH"])
-            .output()
-            .ok()?;
+        let mut cmd = std::process::Command::new(system_tool("tasklist.exe"));
+        cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "TABLE", "/NH"]);
+        crate::spawn_hidden(&mut cmd);
+        let output = cmd.output().ok()?;
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         parse_tasklist_table(&text)
             .into_iter()
@@ -4988,10 +4977,10 @@ pub fn production_startup_reap(our_ports: &[u16]) -> ReapReport {
             return false;
         }
 
-        std::process::Command::new(system_tool("taskkill.exe"))
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output()
-            .is_ok_and(|output| output.status.success())
+        let mut cmd = std::process::Command::new(system_tool("taskkill.exe"));
+        cmd.args(["/PID", &pid.to_string(), "/F"]);
+        crate::spawn_hidden(&mut cmd);
+        cmd.output().is_ok_and(|output| output.status.success())
     };
     startup_reap_and_sweep(
         our_ports,
@@ -5733,7 +5722,7 @@ impl EngineBackend for RealEngineBackend {
         let path = self.write_config(config_json)?;
         let mut cmd = std::process::Command::new(&binary);
         cmd.arg("check").arg("-c").arg(&path);
-        spawn_hidden(&mut cmd);
+        crate::spawn_hidden(&mut cmd);
         let output = cmd.output();
         self.remove_config_file();
         let output = output.map_err(|error| format!("engine check could not run ({error})"))?;
@@ -5759,7 +5748,7 @@ impl EngineBackend for RealEngineBackend {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
-        spawn_hidden(&mut cmd);
+        crate::spawn_hidden(&mut cmd);
         let spawn = cmd.spawn();
         let mut child = match spawn {
             Ok(child) => child,
@@ -8017,7 +8006,7 @@ mod tests {
         std::fs::write(&path, &injected).expect("temp config writes");
         let mut cmd = std::process::Command::new(&binary);
         cmd.arg("check").arg("-c").arg(&path);
-        spawn_hidden(&mut cmd);
+        crate::spawn_hidden(&mut cmd);
         let check = cmd.output().expect("check runs");
         let _ = std::fs::remove_file(&path);
         assert!(
@@ -8033,7 +8022,7 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        spawn_hidden(&mut cmd);
+        crate::spawn_hidden(&mut cmd);
         let mut child = cmd.spawn().expect("sidecar runs");
         let result = (|| -> Result<String, String> {
             use std::io::{Read as _, Write as _};
@@ -8944,12 +8933,10 @@ mod tests {
                     .unwrap_or(0)
             ));
             std::fs::write(&path, &generated.json).expect("temp config writes");
-            let output = std::process::Command::new(binary)
-                .arg("check")
-                .arg("-c")
-                .arg(&path)
-                .output()
-                .expect("check runs");
+            let mut cmd = std::process::Command::new(binary);
+            cmd.arg("check").arg("-c").arg(&path);
+            crate::spawn_hidden(&mut cmd);
+            let output = cmd.output().expect("check runs");
             let _ = std::fs::remove_file(&path);
             assert!(
                 output.status.success(),
@@ -11475,12 +11462,10 @@ mod tests {
                 .unwrap_or(0)
         ));
         std::fs::write(&path, &generated.json).expect("temp config writes");
-        let output = std::process::Command::new(&binary)
-            .arg("check")
-            .arg("-c")
-            .arg(&path)
-            .output()
-            .expect("check runs");
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("check").arg("-c").arg(&path);
+        crate::spawn_hidden(&mut cmd);
+        let output = cmd.output().expect("check runs");
         let _ = std::fs::remove_file(&path);
         assert!(
             output.status.success(),
@@ -13932,12 +13917,10 @@ Active Connections\r
                 .unwrap_or(0)
         ));
         std::fs::write(&path, &generated.json).expect("temp config writes");
-        let output = std::process::Command::new(&binary)
-            .arg("check")
-            .arg("-c")
-            .arg(&path)
-            .output()
-            .expect("check runs");
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("check").arg("-c").arg(&path);
+        crate::spawn_hidden(&mut cmd);
+        let output = cmd.output().expect("check runs");
         let _ = std::fs::remove_file(&path);
         assert!(
             output.status.success(),
@@ -14012,7 +13995,7 @@ Active Connections\r
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
-        spawn_hidden(&mut cmd);
+        crate::spawn_hidden(&mut cmd);
         let mut exiter = cmd.spawn().expect("stub spawns");
         let pipe = exiter.stderr.take().expect("stderr piped");
         let reader = std::io::BufReader::new(pipe);
@@ -14050,7 +14033,7 @@ Active Connections\r
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        spawn_hidden(&mut cmd);
+        crate::spawn_hidden(&mut cmd);
         let sleeper = cmd.spawn().expect("sleeper spawns");
         let pid = sleeper.id();
         backend.child = Some(sleeper);
@@ -14296,14 +14279,14 @@ Active Connections\r
         )
         .expect("source set writes");
         let staged = dir.join(crate::store::rule_set_file_name("living-set"));
-        let compiled = std::process::Command::new(&binary)
-            .arg("rule-set")
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("rule-set")
             .arg("compile")
             .arg("--output")
             .arg(&staged)
-            .arg(&source)
-            .output()
-            .expect("the pinned binary compiles rule sets");
+            .arg(&source);
+        crate::spawn_hidden(&mut cmd);
+        let compiled = cmd.output().expect("the pinned binary compiles rule sets");
         assert!(
             compiled.status.success(),
             "PROBE compile: {} stderr: {}",
@@ -14342,12 +14325,10 @@ Active Connections\r
 
         let path = dir.join("generated.json");
         std::fs::write(&path, &generated.json).expect("temp config writes");
-        let output = std::process::Command::new(&binary)
-            .arg("check")
-            .arg("-c")
-            .arg(&path)
-            .output()
-            .expect("check runs");
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("check").arg("-c").arg(&path);
+        crate::spawn_hidden(&mut cmd);
+        let output = cmd.output().expect("check runs");
         std::fs::remove_dir_all(&dir).ok();
         assert!(
             output.status.success(),

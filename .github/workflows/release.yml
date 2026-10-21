@@ -59,7 +59,10 @@ on:
       tag:
         description: "Rehearsal tag for bundle/file naming (builds and verifies only; no release is created)"
         required: false
-        default: "v0.0.0-test.1"
+        # Must match Cargo.toml's numeric core: the version gate below refuses a
+        # tag whose core disagrees with the manifest, so keep this in step with
+        # a manifest bump.
+        default: "v0.0.1-test.1"
 
 permissions:
   contents: write
@@ -98,6 +101,22 @@ jobs:
           $ref = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
           "TAG=$ref" >> $env:GITHUB_ENV
           "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
+
+      # The app's version comes from Cargo.toml (`APP_VERSION`), never from the
+      # tag, so a tag whose numeric core disagrees would ship a binary whose
+      # About dialog and update feed name a different version. Gate the pair
+      # before anything builds; a pre-release suffix on the tag is ignored.
+      - name: Release gate — tag version matches Cargo.toml
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifest = (Select-String -Path "Cargo.toml" -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $tagCore = ($env:TAG.TrimStart('v') -split '[-+]')[0]
+          $manifestCore = ($manifest -split '[-+]')[0]
+          Write-Output "Tag: $env:TAG (numeric core $tagCore) | Cargo.toml version: $manifest"
+          if ($tagCore -ne $manifestCore) {
+            throw "version gate: release tag '$env:TAG' has numeric core $tagCore but Cargo.toml says $manifest — bump Cargo.toml's [package] version to $tagCore before tagging (the About dialog and update feed read the manifest version, so the tag alone cannot version the app)"
+          }
 
       # Release gates (same three commands as ci.yml). They run BEFORE the
       # release build and throw on a non-zero exit, so a tag pushed on an
@@ -330,6 +349,18 @@ jobs:
           $ref = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ inputs.tag }}" }
           "TAG=$ref" >> $env:GITHUB_ENV
           "VER=$($ref.TrimStart('v'))" >> $env:GITHUB_ENV
+
+      - name: Release gate — tag version matches Cargo.toml (arm64 row)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifest = (Select-String -Path "Cargo.toml" -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $tagCore = ($env:TAG.TrimStart('v') -split '[-+]')[0]
+          $manifestCore = ($manifest -split '[-+]')[0]
+          Write-Output "Tag: $env:TAG (numeric core $tagCore) | Cargo.toml version: $manifest"
+          if ($tagCore -ne $manifestCore) {
+            throw "version gate: release tag '$env:TAG' has numeric core $tagCore but Cargo.toml says $manifest — bump Cargo.toml's [package] version to $tagCore before tagging (the About dialog and update feed read the manifest version, so the tag alone cannot version the app)"
+          }
 
       - name: Detect the arm64 toolchain form (rustc -vV echo/probe)
         shell: pwsh

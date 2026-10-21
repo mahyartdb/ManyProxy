@@ -72,15 +72,17 @@ pub fn harden_file_permissions(path: &Path) {
         let principal = current_user_sid()
             .map(|sid| format!("*{sid}"))
             .unwrap_or_else(|| "OWNER RIGHTS".to_string());
-        let _ = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/inheritance:r")
-            .output();
-        let _ = std::process::Command::new("icacls")
+        let mut revoke = std::process::Command::new("icacls");
+        revoke.arg(path).arg("/inheritance:r");
+        crate::spawn_hidden(&mut revoke);
+        let _ = revoke.output();
+        let mut grant = std::process::Command::new("icacls");
+        grant
             .arg(path)
             .arg("/grant:r")
-            .arg(format!("{principal}:(R,W)"))
-            .output();
+            .arg(format!("{principal}:(R,W)"));
+        crate::spawn_hidden(&mut grant);
+        let _ = grant.output();
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -90,12 +92,10 @@ pub fn harden_file_permissions(path: &Path) {
 
 #[cfg(windows)]
 fn current_user_sid() -> Option<String> {
-    let output = std::process::Command::new("whoami")
-        .arg("/user")
-        .arg("/fo")
-        .arg("csv")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("whoami");
+    cmd.arg("/user").arg("/fo").arg("csv");
+    crate::spawn_hidden(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }

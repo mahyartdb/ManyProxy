@@ -142,6 +142,28 @@ fn exe_icon_asset_is_valid_ico() {
     assert!(count >= 1, "at least one icon image");
 }
 
+/// A panic before the first store open has no `data\` directory yet — the
+/// hook must create it instead of losing the report to a swallowed error.
+#[test]
+fn crash_report_creates_missing_directory() {
+    let root = std::env::temp_dir().join(format!(
+        "manyproxy-crash-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock works")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let path = root.join("data").join("manyproxy-crash-test.txt");
+    assert!(!root.exists(), "fresh temp root");
+    let report = "panic: boom\nbacktrace:\n";
+    crate::append_crash_report(&path, report).expect("report writes");
+    let written = std::fs::read_to_string(&path).expect("report reads");
+    assert!(written.contains(report), "report text lands: {written:?}");
+    std::fs::remove_dir_all(&root).expect("temp dir cleans");
+}
+
 #[test]
 fn t55_app_version_is_plain_semver() {
     // T-05: the Cargo version must stay a plain `major.minor.patch`

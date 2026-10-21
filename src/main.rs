@@ -112,6 +112,23 @@ use store::{
     VALID_PROTOCOLS,
 };
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Spawn a console executable with no visible console window. `creation_flags`
+/// REPLACES the whole flag word (std does `self.flags = flags`), so a future
+/// site that needs other flags must OR them in:
+/// `cmd.creation_flags(cmd.get_creation_flags() | CREATE_NO_WINDOW)`.
+pub(crate) fn spawn_hidden(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 use appearance::*;
 use consts::*;
 use keys::*;
@@ -27716,14 +27733,25 @@ fn install_crash_hook() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
-        let path = crate::store::app_data_dir().join(format!("manyproxy-crash-{stamp}.txt"));
-        let _ = append_crash_report(&path, &report);
+        let file_name = format!("manyproxy-crash-{stamp}.txt");
+        let path = crate::store::app_data_dir().join(&file_name);
+        if append_crash_report(&path, &report).is_err() {
+            // A panic before the first store open (the startup failures worth
+            // catching) has no `data\` yet; fall back beside the exe. Both
+            // failures are silent: the hook itself must never panic.
+            if let Some(app_dir) = crate::engine::current_app_dir() {
+                let _ = append_crash_report(&app_dir.join(&file_name), &report);
+            }
+        }
         previous_hook(info);
     }));
 }
 
-fn append_crash_report(path: &PathBuf, report: &str) -> std::io::Result<()> {
+fn append_crash_report(path: &std::path::Path, report: &str) -> std::io::Result<()> {
     use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
