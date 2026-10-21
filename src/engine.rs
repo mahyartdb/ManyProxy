@@ -72,6 +72,19 @@ fn reserve_clash_port(holds: &mut Vec<std::net::TcpListener>) -> Option<u16> {
     reserve_port_in_range(holds, CLASH_PORT_START, CLASH_PORT_END)
 }
 
+/// Serializes reservations from the clash controller window: a config
+/// generation holds it for its whole reserve-and-inject section. Module scope
+/// (not a function-local `static`) so tests can take the same lock and hold the
+/// window shut while they rebind a released port — otherwise a parallel test's
+/// generation can grab the port between release and re-bind.
+fn port_window_lock() -> std::sync::MutexGuard<'static, ()> {
+    static PORT_WINDOW_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    PORT_WINDOW_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 fn reserve_port_in_range(
     holds: &mut Vec<std::net::TcpListener>,
     start: u16,
@@ -6880,12 +6893,7 @@ impl EngineController {
             ),
         };
 
-        static PORT_WINDOW_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        let port_window_guard = PORT_WINDOW_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let port_window_guard = port_window_lock();
         let mut clash_holds: Vec<std::net::TcpListener> = Vec::new();
         let mut clash: Vec<ClashTarget> = Vec::new();
         for (core, gen, rows_present) in [
@@ -11965,6 +11973,10 @@ Active Connections\r
 
     #[test]
     fn t41_clash_reservation_holds_ports() {
+        // Hold the shared reservation lock for the whole body: a parallel test's
+        // config generation reserves from this same window and would otherwise
+        // take `first` back between the drop and the re-bind.
+        let _port_window = port_window_lock();
         let mut holds = Vec::new();
         let first = reserve_clash_port(&mut holds).expect("range has room");
         assert!((CLASH_PORT_START..=CLASH_PORT_END).contains(&first));
