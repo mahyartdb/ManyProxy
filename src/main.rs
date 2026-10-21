@@ -8,6 +8,7 @@ mod engine;
 mod health;
 mod import;
 mod keys;
+mod library;
 mod preset;
 mod store;
 mod text;
@@ -132,6 +133,7 @@ pub(crate) fn spawn_hidden(cmd: &mut std::process::Command) {
 use appearance::*;
 use consts::*;
 use keys::*;
+use library::*;
 use text::*;
 
 actions!(
@@ -272,62 +274,6 @@ impl SearchableListDelegate for BindHostChoiceList {
     }
 }
 
-struct LibraryDelegate {
-    rows: Vec<ProxyConfig>,
-    search_index: Vec<RowSearchIndex>,
-    upstream_cache: HashMap<String, String>,
-    visible: Vec<usize>,
-    query: String,
-    selected: Option<IndexPath>,
-
-    health: HashMap<String, String>,
-
-    health_tone: HashMap<String, LatencyTone>,
-
-    running: HashSet<String>,
-
-    crashed: HashSet<String>,
-
-    traffic: HashMap<String, (u64, u64)>,
-
-    sub_labels: HashMap<String, String>,
-    preset_names: HashMap<String, String>,
-
-    checked: HashSet<String>,
-
-    facet_group: Option<String>,
-    facet_protocol: Option<String>,
-    facet_status: Option<FacetStatus>,
-
-    show_security: bool,
-
-    /// T-27: the one sort concept — a key plus a direction, persisted in the
-    /// `library_sort` meta key. Replaces the retired `type_security_sort` bool.
-    sort: LibrarySort,
-
-    /// T-27 mirrors the sort keys read on render. All three are pushed from
-    /// state the app already holds (health store samples, session traffic
-    /// mirror, out-IP resolutions) — the sort never polls.
-    latency: HashMap<String, u64>,
-
-    data_traffic: HashMap<String, (u64, u64)>,
-
-    out_ips: HashMap<String, String>,
-
-    row_columns: RowColumns,
-
-    app_view: Option<Entity<AppView>>,
-
-    endpoint_inputs: HashMap<String, RowEndpointInputs>,
-
-    pending_endpoint_commits: Vec<String>,
-
-    /// T-33: the bind-address menu every per-row picker draws from — constants
-    /// first, then the persisted extras. Pushed from the store on reload, so a
-    /// Settings edit reaches every picker on the next paint.
-    bind_hosts: Vec<String>,
-}
-
 struct RowEndpointInputs {
     /// The draft holder for both control shapes: the free-text field on
     /// custom-config rows, and the value a pick writes on every other row.
@@ -346,205 +292,6 @@ struct RowEndpointInputs {
     _subs: Vec<Subscription>,
     clean_bind: String,
     clean_port: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FacetStatus {
-    Enabled,
-    Disabled,
-    Running,
-    Stopped,
-    Live,
-    Dead,
-    Untested,
-}
-
-impl FacetStatus {
-    const ALL: [FacetStatus; 7] = [
-        FacetStatus::Enabled,
-        FacetStatus::Disabled,
-        FacetStatus::Running,
-        FacetStatus::Stopped,
-        FacetStatus::Live,
-        FacetStatus::Dead,
-        FacetStatus::Untested,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            FacetStatus::Enabled => "Enabled",
-            FacetStatus::Disabled => "Disabled",
-            FacetStatus::Running => "Running",
-            FacetStatus::Stopped => "Stopped",
-            FacetStatus::Live => "Live",
-            FacetStatus::Dead => "Dead",
-            FacetStatus::Untested => "Untested",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<FacetStatus> {
-        Self::ALL.into_iter().find(|status| status.label() == label)
-    }
-
-    fn matches(
-        self,
-        row: &ProxyConfig,
-        running: &HashSet<String>,
-        health: &HashMap<String, String>,
-    ) -> bool {
-        match self {
-            FacetStatus::Enabled => row.enabled,
-            FacetStatus::Disabled => !row.enabled,
-            FacetStatus::Running => running.contains(&row.id),
-            FacetStatus::Stopped => !running.contains(&row.id),
-            FacetStatus::Live => health
-                .get(&row.id)
-                .map(|summary| !summary.trim().is_empty() && summary.trim() != "dead")
-                .unwrap_or(false),
-            FacetStatus::Dead => health
-                .get(&row.id)
-                .map(|s| s.trim() == "dead")
-                .unwrap_or(false),
-            FacetStatus::Untested => health
-                .get(&row.id)
-                .map(|summary| summary.trim().is_empty())
-                .unwrap_or(true),
-        }
-    }
-}
-
-struct RowSearchIndex {
-    name: String,
-    protocol: String,
-    group: String,
-    bind: String,
-    port: String,
-    host_server: String,
-    host_address: String,
-    sub_label: String,
-    preset_name: String,
-    state_word: String,
-    serve_word: String,
-    health_text: String,
-}
-
-impl RowSearchIndex {
-    fn of(row: &ProxyConfig) -> Self {
-        let (host_server, host_address) = search_hosts(&row.params);
-        Self {
-            name: row.name.to_lowercase(),
-            protocol: row.protocol.to_lowercase(),
-            group: row.group.to_lowercase(),
-            bind: row.bind_ip.to_lowercase(),
-            port: row.port.to_string(),
-            host_server,
-            host_address,
-            sub_label: String::new(),
-            preset_name: String::new(),
-            state_word: if row.enabled {
-                "enabled".to_string()
-            } else {
-                "disabled".to_string()
-            },
-            serve_word: "stopped".to_string(),
-            health_text: String::new(),
-        }
-    }
-
-    fn enrich(
-        &mut self,
-        row: &ProxyConfig,
-        sub_labels: &HashMap<String, String>,
-        preset_names: &HashMap<String, String>,
-        running: &HashSet<String>,
-        health: &HashMap<String, String>,
-    ) {
-        self.sub_label = row
-            .subscription_id
-            .as_deref()
-            .and_then(|id| sub_labels.get(id))
-            .map(|label| label.to_lowercase())
-            .unwrap_or_default();
-        self.preset_name = row
-            .preset_id
-            .as_deref()
-            .and_then(|id| preset_names.get(id))
-            .map(|name| name.to_lowercase())
-            .unwrap_or_default();
-        self.serve_word = if running.contains(&row.id) {
-            "running".to_string()
-        } else {
-            "stopped".to_string()
-        };
-        self.health_text = health
-            .get(&row.id)
-            .map(|summary| summary.trim().to_lowercase())
-            .unwrap_or_default();
-    }
-
-    fn matches_lowered(&self, lowered: &str) -> bool {
-        if lowered.is_empty() {
-            return true;
-        }
-        if self.name.contains(lowered)
-            || self.protocol.contains(lowered)
-            || self.group.contains(lowered)
-            || self.bind.contains(lowered)
-            || self.port.contains(lowered)
-            || self.host_server.contains(lowered)
-            || self.host_address.contains(lowered)
-            || self.sub_label.contains(lowered)
-            || self.preset_name.contains(lowered)
-            || self.state_word.contains(lowered)
-            || self.serve_word.contains(lowered)
-        {
-            return true;
-        }
-        if self.health_text.is_empty() {
-            return "untested".contains(lowered);
-        }
-        if self.health_text.contains(lowered) {
-            return true;
-        }
-        let health_word = if self.health_text == "dead" {
-            "dead"
-        } else {
-            "live"
-        };
-        health_word.contains(lowered)
-    }
-}
-
-fn search_hosts(params: &str) -> (String, String) {
-    let mut server = String::new();
-    let mut address = String::new();
-    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(params) {
-        if let Some(serde_json::Value::String(host)) = map.get("server") {
-            server = host.to_lowercase();
-        }
-        if let Some(serde_json::Value::String(host)) = map.get("address") {
-            address = host.to_lowercase();
-        }
-    }
-    (server, address)
-}
-
-/// T-23: the port facet of the search grammar — one `port=` token per query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PortPredicate {
-    lo: u16,
-    hi: u16,
-}
-
-impl PortPredicate {
-    fn matches(self, port: u16) -> bool {
-        port >= self.lo && port <= self.hi
-    }
-
-    /// Canonical form shown in the status-bar filter text.
-    fn label(self) -> String {
-        format!("port: {}..{}", self.lo, self.hi)
-    }
 }
 
 /// Parse a single `port=` token: `port=N`, `port=N:M`, `port=N:` or `port=:M`.
@@ -579,823 +326,11 @@ fn parse_port_predicate(token: &str) -> Option<PortPredicate> {
     Some(PortPredicate { lo, hi })
 }
 
-/// Split a query into its single `port=` predicate (if any) and the remaining
-/// substring text. The text part is token-rejoined, so `port=10801 group: api`
-/// keeps matching the blob for `group: api`. A second `port=` token is left in
-/// the text part — it then degrades to a literal substring (documented above).
-fn split_port_query(query: &str) -> (Option<PortPredicate>, String) {
-    let mut predicate = None;
-    let mut kept: Vec<&str> = Vec::new();
-    for token in query.split_whitespace() {
-        if predicate.is_none() {
-            if let Some(parsed) = parse_port_predicate(token) {
-                predicate = Some(parsed);
-                continue;
-            }
-        }
-        kept.push(token);
-    }
-    if predicate.is_none() {
-        // No port token: keep today's query bytes untouched.
-        return (None, query.to_string());
-    }
-    (predicate, kept.join(" "))
-}
-
-/// T-27: the per-row maps the sort keys read, borrowed for one `apply_filter`
-/// pass. Everything here is a mirror the app already keeps fresh on its normal
-/// ticks, so sorting is a pure render-time computation.
-struct SortContext<'a> {
-    /// Latest successful URL-test sample per row, in milliseconds.
-    latency: &'a HashMap<String, u64>,
-    /// Per-row current (session) data-plane counters, rx then tx.
-    data_traffic: &'a HashMap<String, (u64, u64)>,
-    /// Per-row accumulated counters in the store's counting window, rx then tx.
-    totals: &'a HashMap<String, (u64, u64)>,
-    /// Resolved egress IP per row, as text.
-    out_ips: &'a HashMap<String, String>,
-}
-
 /// T-27: what a header-menu row does — pick a key, or reverse the direction.
 #[derive(Debug, Clone, Copy)]
 enum SortMenuAction {
     Key(LibrarySortKey),
     Direction,
-}
-
-impl SortContext<'_> {
-    fn numeric(&self, key: LibrarySortKey, row_id: &str) -> Option<u64> {
-        match key {
-            LibrarySortKey::Latency => self.latency.get(row_id).copied(),
-            LibrarySortKey::Download => self.data_traffic.get(row_id).map(|(rx, _)| *rx),
-            LibrarySortKey::Upload => self.data_traffic.get(row_id).map(|(_, tx)| *tx),
-            LibrarySortKey::TrafficTotal => self
-                .totals
-                .get(row_id)
-                .map(|(rx, tx)| rx.saturating_add(*tx)),
-            LibrarySortKey::TrafficDown => self.totals.get(row_id).map(|(rx, _)| *rx),
-            LibrarySortKey::TrafficUp => self.totals.get(row_id).map(|(_, tx)| *tx),
-            _ => None,
-        }
-    }
-
-    fn out_ip(&self, row_id: &str) -> Option<&str> {
-        self.out_ips
-            .get(row_id)
-            .map(String::as_str)
-            .filter(|text| !text.trim().is_empty())
-    }
-}
-
-/// T-27: the secondary order that keeps unknown/missing values stable across
-/// ticks. Row ids are numeric strings; compare them as numbers so "2" precedes
-/// "10", and fall back to bytes for anything else.
-fn row_id_order(a: &str, b: &str) -> Ordering {
-    match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(left), Ok(right)) => left.cmp(&right),
-        _ => a.cmp(b),
-    }
-}
-
-/// T-27: one key, one direction. Known values rank by the key (direction
-/// applied); unknown or missing values are pinned last regardless of direction
-/// and ordered by row id among themselves, so a list never jumps between ticks.
-/// `TypeSecurity` carries its own fixed order (the retired toggle) and ignores
-/// the direction; `None` never reaches here.
-fn compare_library_rows(
-    context: &SortContext,
-    sort: LibrarySort,
-    a: &ProxyConfig,
-    b: &ProxyConfig,
-) -> Ordering {
-    if sort.key == LibrarySortKey::TypeSecurity {
-        return compare_type_security(a, b);
-    }
-    let descending = sort.direction == SortDirection::Descending;
-    if sort.key == LibrarySortKey::OutIp {
-        return match (context.out_ip(&a.id), context.out_ip(&b.id)) {
-            (Some(left), Some(right)) => {
-                let order = left.cmp(right);
-                (if descending { order.reverse() } else { order })
-                    .then_with(|| row_id_order(&a.id, &b.id))
-            }
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => row_id_order(&a.id, &b.id),
-        };
-    }
-    match (
-        context.numeric(sort.key, &a.id),
-        context.numeric(sort.key, &b.id),
-    ) {
-        (Some(left), Some(right)) => {
-            let order = left.cmp(&right);
-            (if descending { order.reverse() } else { order })
-                .then_with(|| row_id_order(&a.id, &b.id))
-        }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => row_id_order(&a.id, &b.id),
-    }
-}
-
-/// T-27: which keys each sortable header offers. The health/status column owns
-/// the probe and identification keys, including the retired toggle's
-/// Type|Security; the traffic column owns the accumulated counters.
-fn sort_header_keys(column: &str) -> &'static [LibrarySortKey] {
-    static HEALTH: [LibrarySortKey; 6] = [
-        LibrarySortKey::None,
-        LibrarySortKey::Latency,
-        LibrarySortKey::Download,
-        LibrarySortKey::Upload,
-        LibrarySortKey::OutIp,
-        LibrarySortKey::TypeSecurity,
-    ];
-    static TRAFFIC: [LibrarySortKey; 4] = [
-        LibrarySortKey::None,
-        LibrarySortKey::TrafficTotal,
-        LibrarySortKey::TrafficDown,
-        LibrarySortKey::TrafficUp,
-    ];
-    match column {
-        "traffic" => &TRAFFIC,
-        _ => &HEALTH,
-    }
-}
-
-fn column_header_label(label: &'static str, width: f32, cx: &App) -> AnyElement {
-    div()
-        .w(px(width))
-        .flex_shrink_0()
-        .truncate()
-        .text_sm()
-        .text_color(cx.theme().muted_foreground)
-        .child(label)
-        .into_any_element()
-}
-
-/// T-27: a sortable column header — a labeled cell in the header strip that
-/// carries the sort menu on right-click (the same context-menu affordance the
-/// row cards use). The active column shows its direction in the label.
-fn sort_header_cell(
-    column: &'static str,
-    label: &'static str,
-    width: f32,
-    sort: LibrarySort,
-    view: Entity<AppView>,
-    cx: &App,
-) -> AnyElement {
-    let active = sort_header_keys(column).contains(&sort.key);
-    let marker = if active {
-        match sort.key {
-            LibrarySortKey::TypeSecurity => " ·",
-            _ if sort.direction == SortDirection::Descending => " ↓",
-            _ => " ↑",
-        }
-    } else {
-        ""
-    };
-    let tip = if active {
-        format!(
-            "{label} — sorted by {} ({}) — right-click to change",
-            sort.key.label(),
-            sort.direction.label()
-        )
-    } else {
-        format!("{label} — right-click to pick a sort key")
-    };
-    let tooltip_text = tip.clone();
-    div()
-        .id(format!("sort-header-{column}"))
-        .test_support()
-        .w(px(width))
-        .flex_shrink_0()
-        .truncate()
-        .text_sm()
-        .text_color(if active {
-            cx.theme().accent
-        } else {
-            cx.theme().muted_foreground
-        })
-        .aria_label(tip)
-        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tooltip_text.clone())).into())
-        .child(format!("{label}{marker}"))
-        .context_menu(move |menu, _, _| AppView::sort_header_menu(menu, column, sort, &view))
-        .into_any_element()
-}
-
-impl LibraryDelegate {
-    fn new() -> Self {
-        Self {
-            rows: Vec::new(),
-            search_index: Vec::new(),
-            upstream_cache: HashMap::new(),
-            visible: Vec::new(),
-            query: String::new(),
-            selected: None,
-            health: HashMap::new(),
-            health_tone: HashMap::new(),
-            running: HashSet::new(),
-            crashed: HashSet::new(),
-            traffic: HashMap::new(),
-            sub_labels: HashMap::new(),
-            preset_names: HashMap::new(),
-            checked: HashSet::new(),
-            facet_group: None,
-            facet_protocol: None,
-            facet_status: None,
-            show_security: false,
-            sort: LibrarySort::default(),
-            latency: HashMap::new(),
-            data_traffic: HashMap::new(),
-            out_ips: HashMap::new(),
-            row_columns: RowColumns::default(),
-            app_view: None,
-            endpoint_inputs: HashMap::new(),
-            pending_endpoint_commits: Vec::new(),
-            bind_hosts: Store::BIND_HOST_CONSTANTS
-                .iter()
-                .map(|host| host.to_string())
-                .collect(),
-        }
-    }
-
-    fn set_bind_hosts(&mut self, hosts: Vec<String>) {
-        self.bind_hosts = hosts;
-    }
-
-    fn set_rows(&mut self, rows: Vec<ProxyConfig>) {
-        let selected_id = self.selected_row().map(|row| row.id.clone());
-        self.search_index = rows.iter().map(RowSearchIndex::of).collect();
-        self.upstream_cache = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.id.clone(),
-                    upstream_host_port(row).unwrap_or_else(|| "no upstream".to_string()),
-                )
-            })
-            .collect();
-        self.rows = rows;
-
-        let live: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
-        self.checked.retain(|id| live.contains(id.as_str()));
-
-        self.endpoint_inputs
-            .retain(|id, _| live.contains(id.as_str()));
-        self.pending_endpoint_commits
-            .retain(|id| live.contains(id.as_str()));
-        self.refresh_search_words();
-        self.apply_filter();
-        self.selected = selected_id.and_then(|id| {
-            self.visible
-                .iter()
-                .position(|&index| self.rows[index].id == id)
-                .map(IndexPath::new)
-        });
-    }
-
-    fn upstream_for(&self, id: &str) -> Option<&str> {
-        self.upstream_cache.get(id).map(String::as_str)
-    }
-
-    fn ensure_row_inputs(
-        &mut self,
-        row_id: &str,
-        bind_default: &str,
-        port_default: &str,
-        window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) {
-        if self.endpoint_inputs.contains_key(row_id) {
-            return;
-        }
-        let bind = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("127.0.0.1")
-                .default_value(bind_default.to_string())
-        });
-        let port = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("auto")
-                .default_value(port_default.to_string())
-        });
-        let hosts = self.bind_hosts.clone();
-        let picker = cx.new(|cx| {
-            let choices = BindHostChoiceList::for_row(row_id, &hosts);
-            let selected = choices
-                .0
-                .iter()
-                .position(|choice| choice.value == bind_default)
-                .map(IndexPath::new);
-            SelectState::new(choices, selected, window, cx)
-        });
-
-        let mut subs = Vec::with_capacity(3);
-        for state in [&bind, &port] {
-            let id = row_id.to_string();
-            subs.push(cx.subscribe(
-                state,
-                move |list: &mut ListState<Self>,
-                      _emitter: Entity<InputState>,
-                      event: &InputEvent,
-                      cx: &mut Context<ListState<Self>>| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        let delegate = list.delegate_mut();
-                        if !delegate.pending_endpoint_commits.contains(&id) {
-                            delegate.pending_endpoint_commits.push(id.clone());
-                        }
-                        cx.notify();
-                    }
-                },
-            ));
-        }
-        let pick_id = row_id.to_string();
-        subs.push(cx.subscribe(
-            &picker,
-            move |list: &mut ListState<Self>,
-                  _emitter: Entity<SelectState<BindHostChoiceList>>,
-                  event: &SelectEvent<BindHostChoiceList>,
-                  cx: &mut Context<ListState<Self>>| {
-                let SelectEvent::Confirm(Some(value)) = event else {
-                    return;
-                };
-                list.delegate_mut().queue_bind_pick(&pick_id, value);
-                cx.notify();
-            },
-        ));
-        self.endpoint_inputs.insert(
-            row_id.to_string(),
-            RowEndpointInputs {
-                bind,
-                port,
-                picker,
-                picker_hosts: hosts,
-                picker_selected: Some(bind_default.to_string()),
-                pick_pending: None,
-                _subs: subs,
-                clean_bind: bind_default.to_string(),
-                clean_port: port_default.to_string(),
-            },
-        );
-    }
-
-    /// T-33: one confirmed pick — from the picker's Confirm event, or a test
-    /// driving the same seam. The host lands in the bind draft, and the row is
-    /// queued for the ordinary endpoint commit so `save_listen_gate` runs on it.
-    fn queue_bind_pick(&mut self, row_id: &str, host: &str) {
-        if let Some(inputs) = self.endpoint_inputs.get_mut(row_id) {
-            inputs.pick_pending = Some(host.to_string());
-        }
-        if !self.pending_endpoint_commits.iter().any(|id| id == row_id) {
-            self.pending_endpoint_commits.push(row_id.to_string());
-        }
-    }
-
-    fn sync_row_inputs(
-        &mut self,
-        row_id: &str,
-        bind_stored: &str,
-        port_stored: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let hosts = self.bind_hosts.clone();
-        let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
-            return;
-        };
-        if let Some(pick) = inputs.pick_pending.take() {
-            if inputs.bind.read(cx).value().as_str() != pick {
-                inputs
-                    .bind
-                    .update(cx, |state, cx| state.set_value(pick.clone(), window, cx));
-            }
-        }
-        let bind_current = inputs.bind.read(cx).value().to_string();
-        let port_current = inputs.port.read(cx).value().to_string();
-        if !inputs.bind.focus_handle(cx).is_focused(window)
-            && bind_current != bind_stored
-            && bind_current == inputs.clean_bind
-        {
-            inputs.bind.update(cx, |state, cx| {
-                state.set_value(bind_stored.to_string(), window, cx)
-            });
-            inputs.clean_bind = bind_stored.to_string();
-        }
-        if !inputs.port.focus_handle(cx).is_focused(window)
-            && port_current != port_stored
-            && port_current == inputs.clean_port
-        {
-            inputs.port.update(cx, |state, cx| {
-                state.set_value(port_stored.to_string(), window, cx)
-            });
-            inputs.clean_port = port_stored.to_string();
-        }
-        if inputs.picker_hosts != hosts {
-            inputs.picker_hosts = hosts.clone();
-            inputs.picker_selected = None;
-            let choices = BindHostChoiceList::for_row(row_id, &hosts);
-            inputs
-                .picker
-                .update(cx, |state, cx| state.set_items(choices, window, cx));
-        }
-        // A bind the list no longer holds (a hand-edited row) leaves the picker
-        // empty rather than inventing an entry — the list stays the authority.
-        let current = inputs.bind.read(cx).value().to_string();
-        if inputs.picker_selected.as_deref() != Some(current.as_str())
-            && hosts.iter().any(|host| host == &current)
-        {
-            inputs.picker.update(cx, |state, cx| {
-                state.set_selected_value(&current, window, cx)
-            });
-            inputs.picker_selected = Some(current);
-        } else if !hosts.iter().any(|host| host == &current) && inputs.picker_selected.is_some() {
-            // The selected value left the list: drop the selection so the
-            // picker shows its placeholder instead of a vanished host.
-            inputs
-                .picker
-                .update(cx, |state, cx| state.set_selected_index(None, window, cx));
-            inputs.picker_selected = None;
-        }
-    }
-
-    fn row_inputs_focused(&self, row_id: &str, window: &Window, cx: &App) -> bool {
-        let Some(inputs) = self.endpoint_inputs.get(row_id) else {
-            return false;
-        };
-        inputs.bind.focus_handle(cx).is_focused(window)
-            || inputs.port.focus_handle(cx).is_focused(window)
-    }
-
-    fn endpoint_draft_texts(&self, row_id: &str, cx: &App) -> Option<(String, String)> {
-        let inputs = self.endpoint_inputs.get(row_id)?;
-        Some((
-            inputs.bind.read(cx).value().to_string(),
-            inputs.port.read(cx).value().to_string(),
-        ))
-    }
-
-    fn endpoint_is_dirty(&self, row_id: &str, cx: &App) -> bool {
-        let Some(row) = self.rows.iter().find(|row| row.id == row_id) else {
-            return false;
-        };
-        let Some(inputs) = self.endpoint_inputs.get(row_id) else {
-            return false;
-        };
-        inputs.bind.read(cx).value().as_str() != row.bind_ip.as_str()
-            || inputs.port.read(cx).value().as_str() != row.port.to_string().as_str()
-    }
-
-    fn set_row_columns(&mut self, columns: RowColumns) {
-        self.row_columns = columns;
-    }
-
-    fn revert_row_inputs(&mut self, row_id: &str, window: &mut Window, cx: &mut App) -> bool {
-        let Some(row) = self.rows.iter().find(|row| row.id == row_id).cloned() else {
-            return false;
-        };
-        let port_stored = row.port.to_string();
-        let Some(inputs) = self.endpoint_inputs.get_mut(row_id) else {
-            return false;
-        };
-        let dirty = inputs.bind.read(cx).value().as_str() != row.bind_ip.as_str()
-            || inputs.port.read(cx).value().as_str() != port_stored.as_str();
-        if dirty {
-            inputs.bind.update(cx, |state, cx| {
-                state.set_value(row.bind_ip.clone(), window, cx)
-            });
-            inputs.port.update(cx, |state, cx| {
-                state.set_value(port_stored.clone(), window, cx)
-            });
-            inputs.clean_bind = row.bind_ip;
-            inputs.clean_port = port_stored;
-            inputs.pick_pending = None;
-            self.pending_endpoint_commits.retain(|id| id != row_id);
-        }
-        dirty
-    }
-
-    fn apply_filter(&mut self) {
-        let selected_id = self.selected_row().map(|row| row.id.clone());
-        let (port, text) = split_port_query(self.query.trim());
-        let lowered = text.to_lowercase();
-        let mut visible = Vec::new();
-        for (index, blob) in self.search_index.iter().enumerate() {
-            if !blob.matches_lowered(&lowered) {
-                continue;
-            }
-            if let Some(predicate) = port {
-                let in_range = self
-                    .rows
-                    .get(index)
-                    .is_some_and(|row| predicate.matches(row.port));
-                if !in_range {
-                    continue;
-                }
-            }
-            if !self.row_matches_facets(index) {
-                continue;
-            }
-            visible.push(index);
-        }
-
-        if !self.sort.is_none() {
-            if self.sort.key == LibrarySortKey::TypeSecurity {
-                // T-27: the retired toggle's ordering, unchanged — protocol
-                // ascending, then transport security descending, then name.
-                visible.sort_by(|&a, &b| compare_type_security(&self.rows[a], &self.rows[b]));
-            } else {
-                let context = SortContext {
-                    latency: &self.latency,
-                    data_traffic: &self.data_traffic,
-                    totals: &self.traffic,
-                    out_ips: &self.out_ips,
-                };
-                visible.sort_by(|&a, &b| {
-                    compare_library_rows(&context, self.sort, &self.rows[a], &self.rows[b])
-                });
-            }
-        }
-        self.visible = visible;
-        self.selected = selected_id.and_then(|id| {
-            self.visible
-                .iter()
-                .position(|&index| self.rows[index].id == id)
-                .map(IndexPath::new)
-        });
-    }
-
-    fn row_matches_facets(&self, index: usize) -> bool {
-        let Some(row) = self.rows.get(index) else {
-            return false;
-        };
-        if let Some(group) = &self.facet_group {
-            if &row.group != group {
-                return false;
-            }
-        }
-        if let Some(protocol) = &self.facet_protocol {
-            if row.protocol.to_lowercase() != *protocol {
-                return false;
-            }
-        }
-        if let Some(status) = &self.facet_status {
-            if !status.matches(row, &self.running, &self.health) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn facets_active(&self) -> bool {
-        self.facet_group.is_some() || self.facet_protocol.is_some() || self.facet_status.is_some()
-    }
-
-    fn active_filter_text(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(group) = &self.facet_group {
-            parts.push(format!("group: {group}"));
-        }
-        if let Some(protocol) = &self.facet_protocol {
-            parts.push(format!("protocol: {protocol}"));
-        }
-        if let Some(status) = &self.facet_status {
-            parts.push(format!("status: {}", status.label()));
-        }
-        let query = self.query.trim();
-        if !query.is_empty() {
-            let (port, text) = split_port_query(query);
-            if let Some(predicate) = port {
-                parts.push(predicate.label());
-            }
-            let text = text.trim();
-            if !text.is_empty() {
-                parts.push(format!("search: \"{text}\""));
-            }
-        }
-        parts.join(" · ")
-    }
-
-    fn bulk_label(&self) -> String {
-        if self.checked.is_empty() {
-            return String::new();
-        }
-        format!(
-            "{} checked (of {} visible)",
-            self.checked.len(),
-            self.visible.len()
-        )
-    }
-
-    fn checked_rows(&self) -> Vec<ProxyConfig> {
-        self.rows
-            .iter()
-            .filter(|row| self.checked.contains(&row.id))
-            .cloned()
-            .collect()
-    }
-
-    fn group_options(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for row in &self.rows {
-            *counts.entry(row.group.as_str()).or_default() += 1;
-        }
-        let mut options: Vec<(String, usize)> = counts
-            .into_iter()
-            .map(|(group, count)| (group.to_string(), count))
-            .collect();
-        options.sort();
-        options
-    }
-
-    fn protocol_options(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for row in &self.rows {
-            *counts.entry(row.protocol.to_lowercase()).or_default() += 1;
-        }
-        let mut options: Vec<(String, usize)> = counts.into_iter().collect();
-        options.sort();
-        options
-    }
-
-    fn status_options(&self) -> Vec<(FacetStatus, usize)> {
-        FacetStatus::ALL
-            .iter()
-            .map(|status| {
-                let count = self
-                    .rows
-                    .iter()
-                    .filter(|row| status.matches(row, &self.running, &self.health))
-                    .count();
-                (*status, count)
-            })
-            .collect()
-    }
-
-    fn set_facet_group(&mut self, group: Option<String>) {
-        self.facet_group = group;
-        self.apply_filter();
-    }
-
-    fn set_facet_protocol(&mut self, protocol: Option<String>) {
-        self.facet_protocol = protocol.map(|p| p.to_lowercase());
-        self.apply_filter();
-    }
-
-    fn set_facet_status(&mut self, status: Option<FacetStatus>) {
-        self.facet_status = status;
-        self.apply_filter();
-    }
-
-    fn set_show_security(&mut self, show: bool) {
-        self.show_security = show;
-    }
-
-    /// T-27: swap the whole sort model (key + direction) and re-rank what the
-    /// filters kept. The setter never persists — the owner (AppView) writes the
-    /// meta row, matching how the column toggles work.
-    fn set_sort(&mut self, sort: LibrarySort) {
-        self.sort = sort;
-        self.apply_filter();
-    }
-
-    fn set_latency(&mut self, latency: HashMap<String, u64>) {
-        self.latency = latency;
-        self.apply_filter();
-    }
-
-    fn set_data_traffic(&mut self, data_traffic: HashMap<String, (u64, u64)>) {
-        self.data_traffic = data_traffic;
-        self.apply_filter();
-    }
-
-    fn set_out_ips(&mut self, out_ips: HashMap<String, String>) {
-        self.out_ips = out_ips;
-        self.apply_filter();
-    }
-
-    fn clear_facets(&mut self) {
-        self.facet_group = None;
-        self.facet_protocol = None;
-        self.facet_status = None;
-        self.apply_filter();
-    }
-
-    fn toggle_checked(&mut self, id: &str) {
-        if self.checked.contains(id) {
-            self.checked.remove(id);
-            return;
-        }
-        if self.rows.iter().any(|row| row.id == id) {
-            self.checked.insert(id.to_string());
-        }
-    }
-
-    fn check_ids(&mut self, ids: &[String]) {
-        for id in ids {
-            if self.rows.iter().any(|row| &row.id == id) {
-                self.checked.insert(id.clone());
-            }
-        }
-    }
-
-    fn clear_checked(&mut self) {
-        self.checked.clear();
-    }
-
-    fn checked_position(&self, id: &str) -> Option<usize> {
-        self.rows
-            .iter()
-            .filter(|row| self.checked.contains(&row.id))
-            .position(|row| row.id == id)
-            .map(|position| position + 1)
-    }
-
-    fn visible_rows(&self) -> Vec<ProxyConfig> {
-        self.visible
-            .iter()
-            .filter_map(|&index| self.rows.get(index).cloned())
-            .collect()
-    }
-
-    fn row_at(&self, index: IndexPath) -> Option<ProxyConfig> {
-        self.visible
-            .get(index.row)
-            .and_then(|&row| self.rows.get(row))
-            .cloned()
-    }
-
-    fn selected_row(&self) -> Option<ProxyConfig> {
-        self.selected.and_then(|index| self.row_at(index))
-    }
-
-    fn clear_selection(&mut self) {
-        self.selected = None;
-    }
-
-    fn set_health(&mut self, health: HashMap<String, String>) {
-        self.health = health;
-        self.refresh_search_words();
-        self.apply_filter();
-    }
-
-    fn set_health_tone(&mut self, health_tone: HashMap<String, LatencyTone>) {
-        self.health_tone = health_tone;
-    }
-
-    fn set_running(&mut self, ids: Vec<String>) {
-        self.running = ids.into_iter().collect();
-        self.refresh_search_words();
-        self.apply_filter();
-    }
-
-    fn set_crashed(&mut self, ids: Vec<String>) {
-        self.crashed = ids.into_iter().collect();
-    }
-
-    fn set_traffic(&mut self, traffic: HashMap<String, (u64, u64)>) {
-        self.traffic = traffic;
-        self.apply_filter();
-    }
-
-    fn set_search_context(
-        &mut self,
-        sub_labels: HashMap<String, String>,
-        preset_names: HashMap<String, String>,
-    ) {
-        self.sub_labels = sub_labels;
-        self.preset_names = preset_names;
-        self.refresh_search_words();
-        self.apply_filter();
-    }
-
-    fn refresh_search_words(&mut self) {
-        for (row, entry) in self.rows.iter().zip(self.search_index.iter_mut()) {
-            entry.enrich(
-                row,
-                &self.sub_labels,
-                &self.preset_names,
-                &self.running,
-                &self.health,
-            );
-        }
-    }
-
-    fn counts(&self) -> (usize, usize) {
-        (
-            self.rows.len(),
-            self.rows.iter().filter(|row| row.enabled).count(),
-        )
-    }
-
-    #[cfg(test)]
-    fn visible_counts(&self) -> (usize, usize) {
-        (self.visible.len(), self.rows.len())
-    }
-
-    fn delegate_counts_for_search(&self) -> (usize, usize, String) {
-        (self.visible.len(), self.rows.len(), self.query.clone())
-    }
 }
 
 /// T-31: the tone each level paints in, from the active theme. `Info` keeps the
@@ -1433,706 +368,6 @@ fn parse_log_cap(raw: &str) -> Option<usize> {
         return None;
     }
     digits.parse::<usize>().ok().map(clamp_log_max_lines)
-}
-
-struct LogLinesDelegate {
-    lines: Vec<String>,
-}
-
-impl ListDelegate for LogLinesDelegate {
-    type Item = ListItem;
-
-    fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.lines.len()
-    }
-
-    fn set_selected_index(
-        &mut self,
-        _index: Option<IndexPath>,
-        _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
-    ) {
-    }
-
-    fn render_item(
-        &mut self,
-        index: IndexPath,
-        _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Option<ListItem> {
-        let line = self.lines.get(index.row)?.clone();
-        let tip = line.clone();
-        let tone = log_level_text_color(log_line_level(&line), cx.theme());
-        Some(
-            ListItem::new(format!("log-line-{}", index.row)).child(
-                div()
-                    .id(format!("log-line-text-{}", index.row))
-                    .text_sm()
-                    .text_color(tone)
-                    .truncate()
-                    .tooltip(move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into())
-                    .child(line),
-            ),
-        )
-    }
-}
-
-impl ListDelegate for LibraryDelegate {
-    type Item = ListItem;
-
-    fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.visible.len()
-    }
-
-    fn set_selected_index(
-        &mut self,
-        index: Option<IndexPath>,
-        _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
-    ) {
-        self.selected = index;
-    }
-
-    fn perform_search(
-        &mut self,
-        query: &str,
-        _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Task<()> {
-        self.query = query.to_string();
-        self.apply_filter();
-        cx.notify();
-        Task::ready(())
-    }
-
-    fn render_item(
-        &mut self,
-        index: IndexPath,
-        window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Option<ListItem> {
-        let row = self.row_at(index)?;
-        let selected = self
-            .selected
-            .map(|current| current.section == index.section && current.row == index.row)
-            .unwrap_or(false);
-
-        let health = self
-            .health
-            .get(&row.id)
-            .filter(|summary| !summary.is_empty())
-            .cloned();
-        let is_running = self.running.contains(&row.id);
-
-        let traffic = self.traffic.get(&row.id).copied();
-        let upstream = self
-            .upstream_for(&row.id)
-            .unwrap_or("no upstream")
-            .to_string();
-
-        let row_id = row.id.clone();
-        let list_view = cx.entity();
-        let is_checked = self.checked.contains(&row_id);
-        let toggle_id = row_id.clone();
-        let checkbox = Checkbox::new(format!("check-{row_id}"))
-            .small()
-            .checked(is_checked)
-            .accessibility_label(if is_checked {
-                format!("Checked {} (bulk action target)", row.name)
-            } else {
-                format!("Check {} for bulk actions", row.name)
-            })
-            .on_change(move |_, _, cx| {
-                let toggle_id = toggle_id.clone();
-                list_view.update(cx, |state, cx| {
-                    state.delegate_mut().toggle_checked(&toggle_id);
-                    cx.notify();
-                });
-            });
-
-        let port_stored = row.port.to_string();
-        self.ensure_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
-        self.sync_row_inputs(&row_id, &row.bind_ip, &port_stored, window, cx);
-
-        if self.pending_endpoint_commits.contains(&row_id) {
-            self.pending_endpoint_commits.retain(|id| id != &row_id);
-            if let Some(app_view) = self.app_view.clone() {
-                let commit_id = row_id.clone();
-                window.defer(cx, move |window, cx| {
-                    app_view.update(cx, |view, cx| {
-                        view.commit_row_endpoint(&commit_id, window, cx);
-                    });
-                });
-            }
-        }
-        let (bind_state, port_state, bind_picker) = self
-            .endpoint_inputs
-            .get(&row_id)
-            .map(|inputs| {
-                (
-                    inputs.bind.clone(),
-                    inputs.port.clone(),
-                    inputs.picker.clone(),
-                )
-            })
-            .expect("R3: row editors ensured above");
-        // T-33: custom-config rows stay JSON-governed — their listen comes from
-        // the document, so they keep the free-text bind field (no picker).
-        let custom_config_row = is_custom_config_protocol(&row.protocol);
-
-        let item = ListItem::new(format!("library-row-{}", row.id))
-            .selected(selected)
-            .px_1();
-
-        let selected_bg = if cx.theme().list.active_highlight {
-            cx.theme().list_active
-        } else {
-            cx.theme().accent
-        };
-        let mut card = div()
-            .id(format!("row-card-{row_id}"))
-            .test_support()
-            .px_2()
-            .py_1()
-            .rounded(cx.theme().radius)
-            .bg(if selected {
-                selected_bg
-            } else {
-                cx.theme().group_box
-            });
-        if is_checked {
-            card = card.border_2().border_color(cx.theme().accent);
-        } else {
-            card = card.border_1().border_color(cx.theme().border);
-        }
-        if !selected {
-            card = card.hover(|this| this.bg(cx.theme().list_hover));
-        }
-        let tone = serving_tone(
-            is_running,
-            health.as_deref(),
-            self.crashed.contains(&row.id),
-        );
-        let probe_tone = self
-            .health_tone
-            .get(&row.id)
-            .copied()
-            .unwrap_or(LatencyTone::Unknown);
-        let health_text_color = health_tone_color(probe_tone, cx);
-        let lamp_color = match tone {
-            ServingTone::Failed => cx.theme().danger,
-            ServingTone::Serving => cx.theme().success,
-            ServingTone::Stopped => cx.theme().muted_foreground,
-        };
-        let check_chip = self.checked_position(&row_id);
-        let checked_total = self.checked.len();
-        let lamp_label = lamp_access_label(tone, &row.name);
-        let columns = self.row_columns;
-        let dirty = self.endpoint_is_dirty(&row_id, cx);
-        let full_route = library_row_full_route(&row, &upstream);
-        let [upstream_text, health_text, group_text, traffic_text] = library_row_cells(
-            &row,
-            &upstream,
-            health.as_deref(),
-            is_running,
-            traffic,
-            self.show_security,
-        );
-        {
-            let name = row.name.clone();
-            let mut leading: Vec<AnyElement> = Vec::new();
-            if let Some(position) = check_chip {
-                let chip_tip = check_chip_tip(position, checked_total);
-                leading.push(
-                    div()
-                        .id(format!("row-check-chip-{row_id}"))
-                        .test_support()
-                        .text_sm()
-                        .px_1()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(cx.theme().accent)
-                        .text_color(cx.theme().accent)
-                        .tooltip({
-                            let tip = chip_tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(chip_tip)
-                        .child(format!("{position}"))
-                        .into_any_element(),
-                );
-            }
-            if dirty {
-                let dirty_tip = format!(
-                    "\"{}\" has unapplied endpoint edits — Enter applies, Esc reverts",
-                    row.name
-                );
-                leading.push(
-                    div()
-                        .id(format!("row-dirty-{row_id}"))
-                        .test_support()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(cx.theme().accent)
-                        .tooltip({
-                            let tip = dirty_tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(dirty_tip)
-                        .into_any_element(),
-                );
-            }
-            let mut cells: Vec<AnyElement> = Vec::new();
-            if columns.upstream {
-                let tip = upstream_text.clone();
-                cells.push(
-                    div()
-                        .id(format!("row-upstream-{row_id}"))
-                        .test_support()
-                        .w(px(180.))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .tooltip({
-                            let tip = tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .child(upstream_text.clone())
-                        .into_any_element(),
-                );
-            }
-            if columns.health {
-                let tip = health_text.clone();
-                cells.push(
-                    div()
-                        .id(format!("row-health-{row_id}"))
-                        .test_support()
-                        .w(px(150.))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(health_text_color)
-                        .tooltip({
-                            let tip = tip.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .child(health_text.clone())
-                        .into_any_element(),
-                );
-            }
-            if columns.group {
-                cells.push(
-                    div()
-                        .id(format!("row-group-{row_id}"))
-                        .test_support()
-                        .w(px(100.))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(group_text.clone())
-                        .into_any_element(),
-                );
-            }
-            if columns.traffic {
-                cells.push(
-                    div()
-                        .id(format!("row-traffic-{row_id}"))
-                        .test_support()
-                        .w(px(120.))
-                        .flex_shrink_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(traffic_text.clone())
-                        .into_any_element(),
-                );
-            }
-            let header = div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .id(format!("row-dot-{row_id}"))
-                        .test_support()
-                        .size(px(12.))
-                        .rounded_full()
-                        .bg(lamp_color)
-                        .tooltip({
-                            let tip = lamp_label.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .aria_label(lamp_label.clone()),
-                )
-                .child(checkbox)
-                .children(leading)
-                .child(
-                    div()
-                        .id(format!("row-name-{row_id}"))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .tooltip({
-                            let tip = full_route.clone();
-                            move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                        })
-                        .child(Label::new(name)),
-                )
-                .children(cells)
-
-
-
-
-
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .flex_shrink_0()
-                        .key_context("row-endpoint")
-                        .on_key_down(cx.listener({
-                            let revert_id = row_id.clone();
-                            move |list: &mut ListState<LibraryDelegate>,
-                                  event: &KeyDownEvent,
-                                  window: &mut Window,
-                                  cx: &mut Context<ListState<LibraryDelegate>>| {
-                                if event.keystroke.key != "escape" {
-                                    return;
-                                }
-
-
-
-
-                                let reverted = {
-                                    let delegate = list.delegate_mut();
-                                    delegate.row_inputs_focused(&revert_id, window, cx)
-                                        && delegate.revert_row_inputs(&revert_id, window, cx)
-                                };
-                                if reverted {
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            }
-                        }))
-                        .child(if custom_config_row {
-                            div()
-                                .id(format!("row-bind-{row_id}"))
-                                .test_support()
-                                .w(px(118.))
-                                .tooltip({
-                                    let tip = format!(
-                                        "Serve bind address for \"{}\" — Enter commits, Esc reverts \
-                                         (custom config: listens come from the JSON)",
-                                        row.name
-                                    );
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .child(
-                                    Input::new(&bind_state)
-                                        .id(format!("row-bind-input-{row_id}"))
-                                        .small()
-                                        .aria_label(format!("Serve bind address for {}", row.name)),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .id(format!("row-bind-{row_id}"))
-                                .test_support()
-                                .w(px(118.))
-                                .tooltip({
-                                    let tip = format!(
-                                        "Serve bind address for \"{}\" — pick one from the address \
-                                         list (Settings → Addresses); port stays free-text",
-                                        row.name
-                                    );
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .child(
-                                    Select::new(&bind_picker)
-                                        .id(format!("row-bind-picker-{row_id}"))
-                                        .small()
-                                        .placeholder("pick address")
-                                        .accessibility_label(format!(
-                                            "Serve bind address for {}",
-                                            row.name
-                                        )),
-                                )
-                                .into_any_element()
-                        })
-                        .children((!custom_config_row).then(|| {
-                            let add_app = self.app_view.clone();
-                            let add_tip = format!(
-                                "Add address… — opens Settings → Addresses; the list is the only \
-                                 source for row binds, \"{}\"",
-                                row.name
-                            );
-                            Button::new(format!("row-bind-add-{row_id}"))
-                                .small()
-                                .label("Add…")
-                                .accessibility_label("Add address…")
-                                .tooltip(add_tip)
-                                .on_click(move |_, window, cx| {
-                                    if let Some(app) = add_app.clone() {
-                                        app.update(cx, |view, cx| {
-                                            view.open_settings_dialog(window, cx);
-                                        });
-                                    }
-                                })
-                        }))
-                        .child(
-                            div()
-                                .id(format!("row-port-{row_id}"))
-                                .test_support()
-                                .w(px(76.))
-                                .tooltip({
-                                    let tip = format!(
-                                        "Local endpoint {}:{} — Enter commits, Esc reverts",
-                                        row.bind_ip, row.port
-                                    );
-                                    move |_, cx| cx.new(|_| Tooltip::new(tip.clone())).into()
-                                })
-                                .aria_label(format!("Local port {} on {}", row.port, row.bind_ip))
-                                .child(Input::new(&port_state).id(format!("row-port-input-{row_id}")).small().aria_label(format!(
-                                    "Local port for {}",
-                                    row.name
-                                ))),
-                        )
-                        .child(
-                            Button::new(format!("row-serve-{row_id}"))
-                                .small()
-                                .label(if is_running { "■ Stop" } else { "Start" })
-                                .accessibility_label(if is_running {
-                                    format!("Stop \"{}\"", row.name)
-                                } else {
-                                    format!("Start \"{}\" (F5)", row.name)
-                                })
-                                .tooltip(if is_running {
-                                    format!("Stop \"{}\"", row.name)
-                                } else {
-                                    format!("Start \"{}\" (F5)", row.name)
-                                })
-                                .on_click({
-                                    let act_app = self.app_view.clone();
-                                    let act_id = row_id.clone();
-                                    let act_running = is_running;
-                                    move |_, window, cx| {
-                                        if let Some(app) = act_app.clone() {
-                                            let id = act_id.clone();
-                                            app.update(cx, |view, cx| {
-                                                if act_running {
-                                                    view.stop_row(&id, window, cx);
-                                                } else {
-                                                    view.start_row(&id, window, cx);
-                                                }
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                        .child(
-                            Button::new(format!("row-edit-{row_id}"))
-                                .small()
-                                .label("Edit")
-                                .accessibility_label(format!("Edit \"{}\"", row.name))
-                                .tooltip(format!("Edit \"{}\"", row.name))
-                                .on_click({
-                                    let edit_app = self.app_view.clone();
-                                    let edit_id = row_id.clone();
-                                    move |_, window, cx| {
-                                        if let Some(app) = edit_app.clone() {
-                                            let id = edit_id.clone();
-                                            app.update(cx, |view, cx| {
-                                                view.commit_row_endpoint(&id, window, cx);
-                                                view.open_edit_for_row(&id, window, cx);
-                                            });
-                                        }
-                                    }
-                                }),
-                        ),
-                );
-            card = card.child(header);
-        }
-
-        if let Some((bind_text, port_text)) = self.endpoint_draft_texts(&row_id, cx) {
-            if let Some(warning) =
-                bind_port_collision_warning(&self.rows, Some(&row_id), &bind_text, &port_text)
-            {
-                card = card.child(
-                    div()
-                        .id(format!("row-endpoint-warn-{row_id}"))
-                        .test_support()
-                        .text_sm()
-                        .text_color(cx.theme().danger)
-                        .truncate()
-                        .child(warning),
-                );
-            } else if let Some(hint) = lan_hint_for_bind(bind_text.trim()) {
-                card = card.child(
-                    div()
-                        .id(format!("row-endpoint-warn-{row_id}"))
-                        .test_support()
-                        .text_sm()
-                        .truncate()
-                        .child(hint),
-                );
-            }
-        }
-
-        let rendered = match self.app_view.clone() {
-            Some(app_view) => {
-                let edit_view = app_view.clone();
-                let edit_id = row_id.clone();
-                let menu_view = app_view.clone();
-                let menu_id = row_id.clone();
-                item.child(
-                    card.on_click(move |event, window, cx| {
-                        if event.click_count() == 2 {
-                            let id = edit_id.clone();
-                            edit_view.update(cx, |view, cx| {
-                                view.open_edit_for_row(&id, window, cx);
-                            });
-                        }
-                    })
-                    .context_menu(move |menu, _, _| {
-                        AppView::row_context_menu(menu, &menu_id, &menu_view)
-                    }),
-                )
-            }
-            None => item.child(card),
-        };
-        Some(rendered)
-    }
-
-    fn render_empty(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> impl IntoElement {
-        let list_view = cx.entity();
-        if !self.rows.is_empty() && self.visible.is_empty() {
-            let (visible, total) = (self.visible.len(), self.rows.len());
-            let mut description = search_count_text(visible, total);
-            let filters = self.active_filter_text();
-            if !filters.is_empty() {
-                description.push_str(&format!(" · {filters}"));
-            }
-            let hint_view = list_view.clone();
-            let all_view = list_view.clone();
-            let hint_sync = self.app_view.clone();
-            let all_sync = self.app_view.clone();
-            return div().id("library-empty").test_support().size_full().child(
-                Empty::new()
-                    .header(
-                        EmptyHeader::new()
-                            .title(EmptyTitle::new().child(no_matches_text()))
-                            .description(EmptyDescription::new().child(description)),
-                    )
-                    .content(
-                        EmptyContent::new().child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("clear-search-hint")
-
-                                        .small()
-                                        .label("Clear search")
-                                        .tooltip("Clear the search query (keeps facet filters and checked)")
-                                        .on_click(move |_, window, cx| {
-                                            hint_view.update(cx, |state, list_cx| {
-
-
-
-
-
-                                                state.set_query("", window, list_cx);
-                                            });
-                                            if let Some(app) = hint_sync.clone() {
-                                                AppView::sync_search_box(&app, "", window, cx);
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    Button::new("clear-search-facets")
-
-                                        .small()
-                                        .label("Clear all")
-                                        .tooltip("Clear search and every filter")
-                                        .on_click(move |_, window, cx| {
-                                            all_view.update(cx, |state, list_cx| {
-                                                state.set_query("", window, list_cx);
-                                                state.delegate_mut().clear_facets();
-                                                list_cx.notify();
-                                            });
-                                            if let Some(app) = all_sync.clone() {
-                                                AppView::sync_search_box(&app, "", window, cx);
-                                            }
-                                        }),
-                                ),
-                        ),
-                    ),
-            );
-        }
-
-        let add_view = self.app_view.clone();
-        let import_view = self.app_view.clone();
-        let mut ctas = div()
-            .id("empty-library-ctas")
-            .test_support()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .gap_2();
-        if let Some(view) = add_view {
-            ctas = ctas.child(
-                Button::new("empty-add")
-                    .small()
-                    .label("Add configuration")
-                    .tooltip("Add a proxy configuration")
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.open_add_dialog(window, cx);
-                        });
-                    }),
-            );
-        }
-        if let Some(view) = import_view {
-            ctas = ctas.child(
-                Button::new("empty-import")
-                    .small()
-                    .label("Import configurations")
-                    .tooltip("Import share links or files")
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.open_import_dialog("", DEFAULT_GROUP, None, window, cx);
-                        });
-                    }),
-            );
-        }
-        div().id("library-empty").test_support().size_full().child(
-            Empty::new()
-                .header(
-                    EmptyHeader::new()
-                        .title(EmptyTitle::new().child(empty_library_text()))
-                        .description(
-                            EmptyDescription::new().child(
-                                "Add one proxy, or import many at once — new rows land here.",
-                            ),
-                        ),
-                )
-                .content(EmptyContent::new().child(ctas)),
-        )
-    }
 }
 
 fn shortcut_kbd(keystroke: &str, fallback: &str) -> AnyElement {
@@ -8399,9 +6634,6 @@ impl ImportForm {
         let mut form = v_form()
             .small()
 
-
-
-
             .child(
                 field().label_indent(false).child(
                     div()
@@ -8694,70 +6926,6 @@ const SEARCH_PLACEHOLDER: &str = "Search configurations";
 /// box, because the pinned placeholder is too narrow to carry it.
 const SEARCH_HINT: &str =
     "port=N or port=N:M filters by listen port (port=10801, port=10800:10900, port=10801:, port=:10900)";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RowColumns {
-    upstream: bool,
-    health: bool,
-    group: bool,
-    traffic: bool,
-}
-
-impl Default for RowColumns {
-    fn default() -> Self {
-        Self {
-            upstream: true,
-            health: true,
-            group: false,
-            traffic: false,
-        }
-    }
-}
-
-impl RowColumns {
-    const ORDER: [&'static str; 4] = ["upstream", "health", "group", "traffic"];
-
-    fn parse(raw: &str) -> Self {
-        if raw.trim().is_empty() {
-            return Self::default();
-        }
-        let mut columns = Self {
-            upstream: false,
-            health: false,
-            group: false,
-            traffic: false,
-        };
-        for token in raw.split(',').map(str::trim) {
-            match token {
-                "upstream" => columns.upstream = true,
-                "health" => columns.health = true,
-                "group" => columns.group = true,
-                "traffic" => columns.traffic = true,
-                _ => {}
-            }
-        }
-        columns
-    }
-
-    fn display(self) -> String {
-        if !self.upstream && !self.health && !self.group && !self.traffic {
-            return "none".to_string();
-        }
-        let mut names = Vec::with_capacity(4);
-        for name in Self::ORDER {
-            let enabled = match name {
-                "upstream" => self.upstream,
-                "health" => self.health,
-                "group" => self.group,
-                _ => self.traffic,
-            };
-            if enabled {
-                names.push(name);
-            }
-        }
-        names.join(",")
-    }
-}
 
 /// Store meta key for "Automatically restart crashed cores"; a missing or corrupt
 /// value reads as enabled, matching the engine's default.
@@ -9984,7 +8152,6 @@ impl SubForm {
                         }),
                 ),
             ))
-
 
             .child(field().label_indent(false).child(
                 div()
@@ -14940,10 +13107,6 @@ impl AppView {
         let bind_host_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 192.168.1.20 or fd00::7"));
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
-
-
-
-
             let autostart_view = view.clone();
             let restore_view = view.clone();
             let autostart_cell = autostart_state.clone();
@@ -14951,11 +13114,8 @@ impl AppView {
             let auto_restart_view = view.clone();
             let auto_restart_cell = auto_restart_state.clone();
 
-
-
             let skip_delete_view = view.clone();
             let skip_delete_cell = skip_delete_state.clone();
-
 
             let appearance_render_view = appearance_view.clone();
             let appearance_render_cell = appearance_state.clone();
@@ -14989,14 +13149,7 @@ impl AppView {
                         .flex_col()
                         .gap_2()
 
-
-
-
-
                         .pb_4()
-
-
-
 
                         .child(
                             div()
@@ -15071,7 +13224,6 @@ impl AppView {
                                 ),
                         )
 
-
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15104,7 +13256,6 @@ impl AppView {
                                     });
                                 }),
                         )
-
 
                         .child(Separator::horizontal())
                         .child(
@@ -15139,7 +13290,6 @@ impl AppView {
                                     });
                                 }),
                         )
-
 
                         .child(Separator::horizontal())
                         .child(
@@ -15203,18 +13353,12 @@ impl AppView {
                                 }),
                         )
 
-
                         .child(
                             div()
                                 .id("settings-ticks")
                                 .test_support()
                                 .child(format!("Timers: {}", tick_interval_summary())),
                         )
-
-
-
-
-
 
                         .child(
                             div()
@@ -15245,7 +13389,6 @@ impl AppView {
                                      Preset detach-deletes still ask. Default off.",
                                 ),
                         )
-
 
                         .child(Separator::horizontal())
                         .child(
@@ -15298,7 +13441,6 @@ impl AppView {
                                 }),
                         )
 
-
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15337,9 +13479,6 @@ impl AppView {
                                     });
                                 }),
                         )
-
-
-
 
                         .child(
                             div()
@@ -15399,9 +13538,6 @@ impl AppView {
                                 ),
                         )
 
-
-
-
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15435,8 +13571,6 @@ impl AppView {
                                 ),
                         )
 
-
-
                         .child(Separator::horizontal())
                         .child(
                             div()
@@ -15459,8 +13593,6 @@ impl AppView {
                                     "Attach a preset to a row from the inspector Presets pane.",
                                 ),
                         )
-
-
 
                         .child(Separator::horizontal())
                         .child(
@@ -15614,8 +13746,6 @@ impl AppView {
                             ),
                         ),
                 )
-
-
 
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
@@ -16199,9 +14329,6 @@ impl AppView {
                                 .label("Show Presets tab")
                                 .keywords(["preset", "tab"]),
 
-
-
-
                             CommandItem::new()
                                 .label("Import from clipboard")
                                 .keywords(["clipboard", "paste", "import"]),
@@ -16237,8 +14364,6 @@ impl AppView {
                             CommandItem::new()
                                 .label("Test all")
                                 .keywords(["test", "all", "probe"]),
-
-
 
                             CommandItem::new()
                                 .label("Runtime stats")
@@ -18082,19 +16207,7 @@ impl AppView {
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
 
-
             let (current_level, tail_on) = (chrome_level, chrome_tail);
-
-
-
-
-
-
-
-
-
-
-
 
             const LOG_LEVEL_LABELS: [&str; 5] = ["All", "Debug", "Info", "Warn", "Error"];
             let selected_level = LOG_LEVEL_LABELS
@@ -18103,7 +16216,6 @@ impl AppView {
             let mut level_group = RadioGroup::horizontal("log-level-options")
                 .selected_index(selected_level)
                 .on_change({
-
                     let group_view = chrome_view.clone();
                     move |ix, window, cx| {
                         let level = LOG_LEVEL_LABELS
@@ -18128,14 +16240,6 @@ impl AppView {
             let tail_view = chrome_view.clone();
             let save_view = chrome_view.clone();
             let clear_view = chrome_view.clone();
-
-
-
-
-
-
-
-
 
             let mut action_row = div()
                 .id("log-actions-row")
@@ -18200,8 +16304,6 @@ impl AppView {
                     .child(level_row)
                     .child(action_row)
 
-
-
                     .child(div().id("log-redact-note").test_support().text_sm().child(
                         "Copy and Save carry redacted lines — secrets never leave this dialog.",
                     ))
@@ -18229,16 +16331,8 @@ impl AppView {
                     ));
             let mut list = div().id("log-lines").test_support().w_full();
 
-
-
-
             let log_list_viewport = log_list_state.as_ref();
             if lines.is_empty() {
-
-
-
-
-
                 let clear_filter_view = clear_view.clone();
                 list = list.child(
                     Empty::new()
@@ -19178,9 +17272,6 @@ impl AppView {
         let sub_view = view.clone();
         let sub_url = url.clone();
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
-
-
-
             let proxy_view = proxy_view.clone();
             let proxy_url = proxy_url.clone();
             let sub_view = sub_view.clone();
@@ -19232,8 +17323,6 @@ impl AppView {
                             },
                         ),
                 )
-
-
 
                 .button_props(DialogButtonProps::default())
                 .footer(dialog_footer(
@@ -22180,10 +20269,6 @@ impl AppView {
                 );
             }
 
-
-
-
-
             {
                 let structured_view = view_for_rows.clone();
                 let remote_view = view_for_rows.clone();
@@ -22385,8 +20470,6 @@ impl AppView {
                 .child(body)
                 .button_props(
 
-
-
                     DialogButtonProps::default()
                         .on_ok(move |_, window, cx| commit_key(window, cx)),
                 )
@@ -22533,7 +20616,6 @@ impl AppView {
             let refreshing_rows = refreshing_rows.clone();
             let mut body = div().flex().flex_col().gap_2();
 
-
             let kill_now = auto_all;
             body = body.child(
                 div()
@@ -22547,8 +20629,6 @@ impl AppView {
                         Switch::new("subs-auto-all")
                             .checked(kill_now)
                             .label("Auto-refresh all")
-
-
 
                             .tooltip(
                                 "Automatic background refresh of all subscriptions. Manual Refresh always works.",
@@ -22576,9 +20656,6 @@ impl AppView {
             if subs.is_empty() {
                 body = body.child("No subscriptions yet — paste a subscription URL below");
             }
-
-
-
 
             if let Some((done, total)) = batch_progress {
                 let percent =
@@ -23415,7 +21492,6 @@ impl AppView {
             .id("config-detail")
             .test_support()
 
-
             .border_t_1()
             .border_color(cx.theme().border)
             .p_2()
@@ -23962,7 +22038,6 @@ impl AppView {
                                         cx.notify();
                                     })),
                             )
-
 
                             .child(
                                 Button::new("conn-columns-narrow")
@@ -25466,8 +23541,6 @@ impl AppView {
                 .flex()
                 .flex_row()
 
-
-
                 .flex_wrap()
                 .items_center()
                 .gap_2()
@@ -25490,8 +23563,6 @@ impl AppView {
                         })
                         .child(label),
                 )
-
-
 
                 .child(
                     Button::new("bulk-select-visible")
@@ -25557,7 +23628,6 @@ impl AppView {
                             view.open_bulk_move_dialog(window, cx);
                         })),
                 )
-
 
                 .child(Separator::vertical())
                 .child(
@@ -26151,12 +24221,7 @@ impl AppView {
         window.open_sheet(cx, move |sheet: Sheet, _, _| {
             let commit_click = commit.clone();
 
-
-
-
-
             let mut form = v_form().small();
-
 
             {
                 let current_view = view.clone();
@@ -26215,7 +24280,6 @@ impl AppView {
                 let slug = slugify_group_id(&row.name);
                 let mut buttons = div().flex().flex_row().items_center().gap_2().child(
 
-
                     Button::new(format!("group-rename-{slug}"))
                         .label("Rename")
                         .on_click(move |_, window, cx| {
@@ -26236,7 +24300,6 @@ impl AppView {
                             });
                         }),
                 );
-
 
                 if !row.sub_ids.is_empty() {
                     buttons = buttons.child(
@@ -26430,9 +24493,6 @@ impl AppView {
                                          Manual Update still works.",
                                     )
                                     .on_change({
-
-
-
                                         let skip_for_change = skip_for_change.clone();
                                         move |next: &bool, _, _| {
                                             *skip_for_change.borrow_mut() = *next;
@@ -26803,25 +24863,13 @@ impl AppView {
             .flex()
             .flex_row()
 
-
-
-
             .flex_nowrap()
             .items_center()
             .gap_1()
             .p_2()
 
-
             .border_b_1()
             .border_color(cx.theme().border)
-
-
-
-
-
-
-
-
 
             .child(
                 Button::new("program-menu")
@@ -26895,11 +24943,6 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-
-
-
-
-
                                 topbar_menu_row(
                                     "import-files",
                                     "From file(s)",
@@ -26963,8 +25006,6 @@ impl AppView {
                     }),
             )
 
-
-
             .child(
                 Button::new("settings-menu")
                     .small()
@@ -26993,9 +25034,6 @@ impl AppView {
                         )
                     }),
             )
-
-
-
 
             .child(
                 Button::new("groups-menu")
@@ -27042,8 +25080,6 @@ impl AppView {
                                 }
                             }),
                         )
-
-
 
                         .item(
                             PopupMenuItem::element(|_, _| {
@@ -27140,11 +25176,6 @@ impl AppView {
                     }),
             )
 
-
-
-
-
-
             .child(
                 Button::new("routing-menu")
                     .small()
@@ -27212,9 +25243,6 @@ impl AppView {
                     }),
             )
 
-
-
-
             .child(
                 Button::new("tools-menu")
                     .small()
@@ -27224,10 +25252,6 @@ impl AppView {
                     .dropdown_menu(move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::element(|_, _| {
-
-
-
-
                                 topbar_menu_row(
                                     "start-selected",
                                     "Start selected",
@@ -27298,9 +25322,6 @@ impl AppView {
                         )
                         .item(
                             PopupMenuItem::element(|_, _| {
-
-
-
                                 topbar_menu_row(
                                     "runtime-stats",
                                     "Runtime stats",
@@ -27394,11 +25415,6 @@ impl AppView {
                                 }
                             }),
                         )
-
-
-
-
-
 
                         .item(
                             PopupMenuItem::element(|_, _| {
@@ -27631,15 +25647,7 @@ impl AppView {
                     }),
             )
 
-
-
             .child(div().flex_1())
-
-
-
-
-
-
 
             .child(
                 Button::new("global-start-stop")
